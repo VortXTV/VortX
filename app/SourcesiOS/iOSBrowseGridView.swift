@@ -112,6 +112,88 @@ struct iOSCollectionsHub: View {
 // MARK: - Tiles
 
 /// Search the real collection/category inventory; keep its existing browse target, not a fake movie id.
+/// A person picked from Search, pushed by value onto the Search stack (the Person page).
+struct PersonRoute: Hashable {
+    let id: Int
+    let name: String
+    let profileURL: String?
+}
+
+/// "People" in Search: actors and crew whose name matches the query, as round headshots like the detail
+/// page's cast row. Tapping one opens their Person page (photo, bio, full filmography).
+struct CinemaPeopleResults: View {
+    let query: String
+    let onOpen: (PersonRoute) -> Void
+    @State private var people: [TMDBClient.PersonResult] = []
+
+    var body: some View {
+        Group {
+            if !people.isEmpty {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    Text("People").sectionTitleStyle().padding(.horizontal, Theme.Space.md)
+                    ScrollView(.horizontal, showsIndicators: true) {
+                        LazyHStack(alignment: .top, spacing: Theme.Space.md) {
+                            ForEach(people) { person in
+                                Button {
+                                    onOpen(PersonRoute(id: person.id, name: person.name, profileURL: person.profileURL))
+                                } label: { tile(person) }
+                                .buttonStyle(.plain)
+                                .accessibilityHint("Opens their filmography")
+                            }
+                        }
+                        .padding(.horizontal, Theme.Space.md)
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        // Debounced with the typing: a fresh query cancels the previous lookup before it lands.
+        .task(id: query.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.count >= 2 else { people = []; return }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            let found = await TMDBClient.searchPeople(query: trimmed)
+            guard !Task.isCancelled else { return }
+            people = found
+        }
+    }
+
+    private func tile(_ person: TMDBClient.PersonResult) -> some View {
+        VStack(spacing: Theme.Space.xs) {
+            AsyncImage(url: URL(string: person.profileURL ?? "")) { phase in
+                switch phase {
+                case .success(let image): image.resizable().aspectRatio(contentMode: .fill)
+                default:
+                    ZStack {
+                        Theme.Palette.surface2
+                        Text(person.name.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined())
+                            .font(Theme.Typography.cardTitle.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                }
+            }
+            .frame(width: 92, height: 92)
+            .clipShape(Circle())
+            .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.08), lineWidth: 1))
+            Text(person.name)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+            if let department = person.department {
+                Text(department)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: 92)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct CinemaSearchCollections: View {
     let query: String
     let onOpen: (HubTarget) -> Void
@@ -148,6 +230,7 @@ struct CinemaSearchCollections: View {
         let compact = false
         #endif
         let width = iOSPillMetrics.hubTileWidth(container: viewportWidth, compact: compact)
+        let matches = self.matches
         if !matches.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text("Collections").sectionTitleStyle().padding(.horizontal, Theme.Space.md)

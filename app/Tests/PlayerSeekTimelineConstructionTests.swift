@@ -39,6 +39,19 @@ final class ProbeThumbnails {
     func clear() { clears += 1 }
 }
 
+/// Scrub editing resets the watched-time dwell; the probe only records that it happened.
+final class ProbeWatchedDwell { private(set) var resets = 0; func reset() { resets += 1 } }
+
+/// Signature stand-ins for the engine models the extracted controls name (CoreModels.swift is app-bound).
+struct CoreStream {}
+struct CoreStreamSourceGroup { var streams: [CoreStream] = [] }
+struct PlayerLoadToken: Equatable {}
+
+/// Signature stand-in for StreamRanking (StreamRanking.swift is app-bound).
+enum StreamRanking {
+    static func hasMultipleResolutions(_ groups: [CoreStreamSourceGroup]) -> Bool { !groups.isEmpty }
+}
+
 struct PlayerScreen {
     let timePosClock: TimePosClock = {
         let clock = TimePosClock()
@@ -48,7 +61,7 @@ struct PlayerScreen {
     let effects = ProbeEffects()
     let scrubThumbnails = ProbeThumbnails()
     var coordinator: ProbeCoordinator { ProbeCoordinator(player: effects) }
-    var hideTask: Task<Void, Never>? = nil
+    @ProbeValue var hideTask: Task<Void, Never>? = nil
     @ProbeValue var isLive = false
     var isPaused = false
     var controlsVisible = true
@@ -72,6 +85,10 @@ struct PlayerScreen {
     var audioTracks: [Int] = [1]
     var hasMultipleQualities = true
     var hasAlternateSources = true
+    // The control bar now derives Quality and Sources from the current source groups.
+    var currentSourceGroups = [CoreStreamSourceGroup(streams: [CoreStream(), CoreStream()])]
+    func playableURL(for stream: CoreStream) -> URL? { URL(string: "https://example.invalid/stream") }
+    let watchedDwell = ProbeWatchedDwell()
     var isEpisodePlaybackContext = true
     var hasChapters = true
     var sleepArmed = false
@@ -149,6 +166,9 @@ enum PlayerBottomBarConstructionProbe {
                             screen.audioTracks = optionalPanels ? [1] : []
                             screen.hasMultipleQualities = optionalPanels
                             screen.hasAlternateSources = optionalPanels
+                            // Quality and Sources now follow the current source groups (two playable streams).
+                            screen.currentSourceGroups = optionalPanels
+                                ? [CoreStreamSourceGroup(streams: [CoreStream(), CoreStream()])] : []
                             screen.isEpisodePlaybackContext = optionalPanels
                             screen.hasChapters = optionalPanels
                             let bar = screen.bottomBar
@@ -389,7 +409,10 @@ struct ProbeTouchChrome: View {
             LinearGradient(colors: [Color(red: 0.12, green: 0.16, blue: 0.19), .black],
                 startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea()
             VStack(spacing: 0) {
-                PlayerTouchHeader(title: "A Long Movie Title · Episode 2", metadata: "4K  ·  HDR  ·  EAC3 6ch",
+                PlayerTouchHeader(title: "A Long Movie Title · Episode 2", metadataPills: [
+                        PlaybackMetadataPill(id: "resolution", text: "4K", systemImage: "4k.tv", accessibilityLabel: "4K"),
+                        PlaybackMetadataPill(id: "range", text: "HDR", systemImage: "sun.max", accessibilityLabel: "HDR"),
+                        PlaybackMetadataPill(id: "audio", text: "EAC3 6ch", systemImage: "speaker.wave.3", accessibilityLabel: "EAC3 six channels")],
                     close: PlayerTouchIconButton(icon: "chevron.down", label: "Close player", action: {}),
                     pictureInPicture: { AnyView(PlayerTouchIconButton(icon: "pip.enter", label: "Picture in Picture", action: {})) },
                     aspect: PlayerTouchAspectButton(mode: "original", toggle: {}, select: { _ in }),

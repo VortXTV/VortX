@@ -14,5 +14,6 @@ xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -wa
   app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
   app/SourcesShared/LegacyWatchedBitfieldDecoder.swift app/SourcesShared/LegacyWatchedBitfieldMigrationEvidence.swift \
   app/SourcesShared/VortxLegacyWatchedMigration.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+  app/SourcesShared/VortxNativeBootstrapArchive.swift \
   app/Tests/VortxLegacyBootstrapMaterialTests.swift -o "$bootstrap_test_dir/bootstrap-tests" -lz
 "$bootstrap_test_dir/bootstrap-tests"

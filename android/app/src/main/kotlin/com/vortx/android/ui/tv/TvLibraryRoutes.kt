@@ -24,7 +24,7 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 
-enum class TvLibraryRoute { LANDING, DOWNLOADS, WATCHLIST, HISTORY }
+enum class TvLibraryRoute { LANDING, DOWNLOADS, WATCHLIST, HISTORY, SMART_COLLECTIONS, NETWORK_SHARES }
 
 @Composable
 internal fun TvLibraryRouteHeader(title: String, onBack: () -> Unit) {

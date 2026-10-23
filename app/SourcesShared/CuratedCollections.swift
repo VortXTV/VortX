@@ -65,6 +65,13 @@ final class CuratedCollectionsModel: ObservableObject {
         ),
     ]
 
+    /// Resolve only the collection the common browser selected; do not start fetchAll for a folder.
+    /// Unknown IDs remain unavailable rather than acquiring a guessed catalog transport.
+    static func collectionTitles(for id: String) async -> [MetaPreview]? {
+        guard let definition = definitions.first(where: { $0.id == id }) else { return nil }
+        return await fetch(definition: definition)
+    }
+
     /// Build the editorial rails once. Idempotent: a second call while loaded (or in flight) is a no-op,
     /// so it's safe to call from `onAppear` and every Home re-emit. Pass `force: true` to rebuild after a
     /// failed first attempt.

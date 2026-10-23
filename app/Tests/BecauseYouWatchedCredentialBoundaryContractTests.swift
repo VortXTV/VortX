@@ -61,15 +61,51 @@ private struct BecauseYouWatchedCredentialBoundaryContractTests {
         }()
         check(orderingIsSafe,
               "CoreBridge rebind notification is posted before the SwiftUI refresh revision")
-        check(core.contains("StremioAccount.credentialBoundaryDidChange") &&
-                core.contains("lastCredentialBoundaryGeneration") &&
-                core.contains("generation > self.lastCredentialBoundaryGeneration") &&
-                core.contains("self.signedInWithLegacyAuthKey()") &&
-                core.contains("queue: .main"),
-              "CoreBridge deduplicates true-to-true boundaries and rebinds on main before history admission")
+        func boundedBody(_ text: String, after marker: String, until next: String) -> String {
+            guard let start = text.range(of: marker),
+                  let end = text.range(of: next, range: start.upperBound..<text.endIndex) else {
+                preconditionFailure("Missing bounded production method: " + marker)
+            }
+            return String(text[start.lowerBound..<end.lowerBound])
+        }
+        let ownLogin = boundedBody(core, after: "@MainActor func authenticateNativeOwnAccount(",
+            until: "    @MainActor private func authenticateNativeOwnerAccount(")
+        let ownerLogin = boundedBody(core, after: "@MainActor private func authenticateNativeOwnerAccount(",
+            until: "    private static func readNativeCredential")
+        let passwordLogin = boundedBody(account, after: "    func signIn(email rawEmail:",
+            until: "    enum LinkSignInOutcome:")
+        let linkLogin = boundedBody(account, after: "    func signInWithAuthKey(", until: "    func signOut()")
+        func commitsBeforePublication(_ method: String, call: String) -> Bool {
+            guard let commit = method.range(of: call),
+                  let event = method.range(of: "publishCredentialBoundary(wasSignedIn: wasSignedIn)",
+                                           range: commit.upperBound..<method.endIndex) else { return false }
+            return commit.lowerBound < event.lowerBound
+        }
+        check(commitsBeforePublication(passwordLogin,
+                call: "try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)") &&
+                commitsBeforePublication(linkLogin,
+                call: "try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)"),
+              "each password and link login commits before its own UI credential boundary")
+        check(ownLogin.contains("nativePlaybackBinding(.native(target.binding))?.0 === facade") &&
+                ownLogin.contains("CredentialScopeRegistry.shared.isCurrent(capture), nativeFacade === facade,") &&
+                ownLogin.contains("ProfileStore.shared.activeID == target.profile.id") &&
+                ownLogin.contains("try refreshNativeProfiles(reloadCredentials: false)"),
+              "own-profile native login independently fences credential, installation and selected profile before refresh")
+        check(ownerLogin.contains("nativePlaybackBinding(.native(target.binding))?.0 === facade") &&
+                ownerLogin.contains("CredentialScopeRegistry.shared.isCurrent(capture) && facade.isAvailable && facade.accountGeneration == epoch") &&
+                ownerLogin.contains("facade.profileSnapshot()?.state[\"activeProfileId\"] == .string(selectedProfileID)") &&
+                ownerLogin.contains("expectedSelection: target.expectedOwnerSelection, authority: authority, read: Self.readNativeCredential") &&
+                ownerLogin.contains("try refreshNativeProfiles(reloadCredentials: false)"),
+              "owner native login independently fences credential, account generation, selected profile and secure selection")
+        // iOS also refreshes Continue Watching on the next main turn; what matters is that each Home observes
+        // the boundary and rebuilds Top Picks from it.
         for (name, source) in [("tvOS", tv), ("iOS", ios)] {
-            check(source.contains(".onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }"),
-                  "\(name) Home observes the same-slot credential generation")
+            let observes: Bool = {
+                guard let start = source.range(of: ".onReceive(account.$credentialBoundaryGeneration) { _ in") else { return false }
+                let body = source[start.upperBound...].prefix(240)
+                return body.contains("refreshTopPicks()")
+            }()
+            check(observes, "\(name) Home observes the same-slot credential generation")
         }
 
         if failures == 0 {

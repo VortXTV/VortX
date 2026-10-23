@@ -3,12 +3,13 @@ import SwiftUI
 /// Discover, driven by the **stremio-core** engine (`CatalogWithFilters`): pick a type, catalog, and
 /// genre, see the full grid. Each chip carries the engine's own `request`, dispatched back on tap.
 struct DiscoverView: View {
-    @EnvironmentObject private var core: CoreBridge
+    @VisibleCore private var core   // observed only while this tab is on screen (EngineObservation.swift)
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false   // also hide Live types from the Discover type filter (#117 per-tab key)
-    @StateObject private var focusModel = FocusedItemModel()
+    @StateObject private var focusOwner = FocusedItemOwner()   // owned, not observed: focus re-renders only the hero
+    private var focusModel: FocusedItemModel { focusOwner.model }
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared
@@ -163,8 +164,26 @@ struct DiscoverView: View {
         if filters.isActive, !raw.isEmpty {
             filterSummary(shown: shown.count)
         }
+        if discover.hasFailedPage, !discover.isLoadingPage {
+            VStack(spacing: Theme.Space.md) {
+                Text("Couldn’t load this catalog. Try again.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                Button {
+                    if let request = discover.retryRequest { core.selectDiscover(request) }
+                    else { core.loadDiscover() }
+                } label: { Text("Retry") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+            }
+            .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+        }
         if raw.isEmpty {
-            BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+            if discover.isLoadingPage {
+                BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+            } else if !discover.hasFailedPage {
+                Text(discover.selectable.catalogs.isEmpty ? "No catalogs are available." : "No results in this catalog.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
+            }
         } else if shown.isEmpty {
             emptyFiltered
         } else {

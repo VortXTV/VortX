@@ -49,10 +49,13 @@ fun VortXTheme(
         onError = colors.textPrimary,
     )
 
+    val effects = com.vortx.android.ui.prefs.rememberVisualEffects()
+    val context = androidx.compose.ui.platform.LocalContext.current
     CompositionLocalProvider(
         LocalVortXColors provides colors,
         LocalVortXTypeScale provides typeScale,
-        LocalReducedMotion provides rememberReducedMotion(),
+        com.vortx.android.ui.prefs.LocalVisualEffects provides effects,
+        LocalReducedMotion provides (context.isAnimatorScaleZero() || !effects.motion),
     ) {
         MaterialTheme(
             colorScheme = materialColorScheme,

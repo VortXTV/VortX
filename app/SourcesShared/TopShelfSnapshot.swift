@@ -21,24 +21,106 @@ import Foundation
 /// lives in `SourcesTV/TopShelfSnapshotWriter.swift`, which the extension does NOT compile.
 enum TopShelfSnapshot {
 
-    /// App Group shared by the tvOS app and its Top Shelf extension. Both must carry this in their
-    /// entitlements for the container to exist (generated from `project.yml`).
+    /// App Group the project provisions for the tvOS app and its Top Shelf extension (`project.yml`).
     ///
     /// VortX Lite deliberately does NOT declare the group (it ships no Top Shelf extension in v1), so
     /// on Lite `containerURL` is nil, every write is a silent no-op, and nothing else changes. That is
     /// also exactly what happens in an UNSIGNED / CODE_SIGNING_ALLOWED=NO build, where the entitlement
     /// is not provisioned: the whole feature degrades to "no snapshot, static Top Shelf image", never
     /// to a crash. Every entry point here is nil-tolerant for that reason.
-    static let appGroupID = "group.com.stremiox.tv"
+    static let canonicalAppGroupID = "group.com.stremiox.tv"
+
+    /// The App Group this signed copy actually shares with its Top Shelf extension.
+    ///
+    /// A sideload signer re-signs under its own team, which cannot hold `canonicalAppGroupID`, so it grants
+    /// the app and the extension a group of its own instead (a FlareStore log shows `group.<hex>.1`). Asking
+    /// only for the canonical ID then found no container in either process, so the shelf stayed the static
+    /// image under every signing service. Both processes now resolve the same group from what their signed
+    /// copy was granted: the canonical group when held, else the first granted group with a container.
+    ///
+    /// A signer's group can be shared by every app that service signs for the viewer, so it is used only by
+    /// a bundle that ships or is the Top Shelf extension; Lite never writes there. What it carries is the
+    /// Continue Watching row the Home screen already shows. Nil means the feature is off, never an error.
+    static let appGroupID: String? = resolveAppGroupID(bundle: .main)
+
+    enum AppGroupSource: String, Sendable { case canonical, signer, none }
+
+    /// Which kind of group this copy uses, for diagnostics; the identifier itself is not logged.
+    static var appGroupSource: AppGroupSource {
+        guard let appGroupID else { return .none }
+        return appGroupID == canonicalAppGroupID ? .canonical : .signer
+    }
+
+    static func resolveAppGroupID(bundle: Bundle) -> String? {
+        let granted = carriesTopShelf(bundle) ? grantedAppGroups(bundle: bundle) : []
+        return selectAppGroup(granted: granted, canonical: canonicalAppGroupID) {
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
+        }
+    }
+
+    /// The canonical group first when this copy holds it, then the signer's groups in a stable order, so an
+    /// app and its extension granted the same groups settle on the same one. Wildcards are never groups.
+    static func selectAppGroup(granted: [String], canonical: String, hasContainer: (String) -> Bool) -> String? {
+        var seen = Set<String>()
+        let candidates = ([canonical] + granted.sorted()).filter {
+            $0.hasPrefix("group.") && !$0.contains("*") && seen.insert($0).inserted
+        }
+        return candidates.first(where: hasContainer)
+    }
+
+    /// Groups this signed bundle was granted: AltStore and SideStore record their rewritten groups in
+    /// `ALTAppGroups`, and every signer embeds the provisioning profile whose entitlements list them.
+    static func grantedAppGroups(bundle: Bundle) -> [String] {
+        var groups = bundle.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] ?? []
+        if let url = bundle.url(forResource: "embedded", withExtension: "mobileprovision"),
+           let profile = try? Data(contentsOf: url, options: .mappedIfSafe) {
+            groups += provisionedAppGroups(profile: profile)
+        }
+        return groups
+    }
+
+    /// The application groups in a provisioning profile, a signed envelope around an XML property list.
+    static func provisionedAppGroups(profile: Data) -> [String] {
+        guard let start = profile.range(of: Data("<?xml".utf8)),
+              let end = profile.range(of: Data("</plist>".utf8), in: start.lowerBound..<profile.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: profile.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any] else { return [] }
+        return entitlements["com.apple.security.application-groups"] as? [String] ?? []
+    }
+
+    /// True for the Top Shelf extension itself and for an app that embeds one.
+    static func carriesTopShelf(_ bundle: Bundle) -> Bool {
+        if isTopShelfExtension(bundle.infoDictionary) { return true }
+        guard let plugins = bundle.builtInPlugInsURL,
+              let entries = try? FileManager.default.contentsOfDirectory(at: plugins, includingPropertiesForKeys: nil)
+        else { return false }
+        return entries.contains { $0.pathExtension == "appex" && isTopShelfExtension(Bundle(url: $0)?.infoDictionary) }
+    }
+
+    static func isTopShelfExtension(_ info: [String: Any]?) -> Bool {
+        (info?["NSExtension"] as? [String: Any])?["NSExtensionPointIdentifier"] as? String == "com.apple.tv-top-shelf"
+    }
 
     /// Snapshot filename inside the group container.
     private static let filename = "top-shelf.json"
 
     /// Most items the Top Shelf row carries. The Top Shelf is a glance surface, not a browse surface:
     /// it is the resume queue's head, and the system only ever shows a handful before the row scrolls
-    /// out of reach. Capping the write also bounds the payload the extension has to decode inside its
-    /// response deadline.
+    /// out of reach. The item cap bounds constructed rows; the separate byte ceiling below bounds
+    /// the file passed to the extension's decoder.
     static let maxItems = 8
+
+    /// Ceiling for the complete UTF-8 JSON cache, including metadata and all eight items. A 256 KiB
+    /// budget allows roughly 32 KiB per row for existing titles/URLs without admitting an unbounded file into
+    /// the extension. This is a conservative cache policy, not a measured system memory allowance.
+    /// The producer also enforces this limit. An oversized publication becomes a compact display-only
+    /// projection, never a reason to retain the previous owner's visible cache.
+    static let maxSnapshotBytes = 256 * 1024
+
+    /// Overflow-only title allowance. Unicode scalars bound encoded bytes even for a pathological
+    /// single grapheme with thousands of combining marks; ordinary publications are not truncated.
+    static let maxOverflowTitleScalars = 512
 
     /// Payload schema version. Bumped when the shape changes so an OLD extension paired with a NEW
     /// app (or the reverse, mid-update) rejects a payload it cannot read instead of mis-rendering it.
@@ -62,6 +144,11 @@ enum TopShelfSnapshot {
         let poster: String?
         /// 0…1 watch progress, matching `TVTopShelfSectionedItem.playbackProgress`'s required range.
         let progress: Double
+
+        /// Home distinguishes a movie and series with the same provider id. The system shelf
+        /// needs that same distinction, while actions must keep the original provider id.
+        /// Length-prefix the type so even delimiter-bearing future types cannot collide.
+        var shelfIdentifier: String { "\(type.utf8.count):\(type):\(id)" }
     }
 
     struct Payload: Codable, Equatable, Sendable {
@@ -70,6 +157,33 @@ enum TopShelfSnapshot {
         /// stale resume row is still a useful row and the app rewrites on every Home refresh anyway.
         let writtenAt: Date
         let items: [Item]
+
+        private enum CodingKeys: String, CodingKey { case version, writtenAt, items }
+
+        init(version: Int, writtenAt: Date, items: [Item]) {
+            self.version = version
+            self.writtenAt = writtenAt
+            self.items = items
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            version = try container.decode(Int.self, forKey: .version)
+            writtenAt = try container.decode(Date.self, forKey: .writtenAt)
+            var rows = try container.nestedUnkeyedContainer(forKey: .items)
+            if let count = rows.count, count > TopShelfSnapshot.maxItems {
+                throw DecodingError.dataCorruptedError(in: rows, debugDescription: "Too many Top Shelf items")
+            }
+            var decoded: [Item] = []
+            decoded.reserveCapacity(TopShelfSnapshot.maxItems)
+            while !rows.isAtEnd {
+                guard decoded.count < TopShelfSnapshot.maxItems else {
+                    throw DecodingError.dataCorruptedError(in: rows, debugDescription: "Too many Top Shelf items")
+                }
+                decoded.append(try rows.decode(Item.self))
+            }
+            items = decoded
+        }
     }
 
     /// Pure state transitions used by the app-side private Trakt publisher. Keeping these rules in the
@@ -171,7 +285,8 @@ enum TopShelfSnapshot {
     /// The shared container, or nil when the App Group is not provisioned (unsigned build, Lite, or a
     /// profile without the capability). Callers MUST treat nil as "feature off", never as an error.
     static var containerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
+        guard let appGroupID else { return nil }
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
     }
 
     private static var fileURL: URL? {
@@ -211,6 +326,12 @@ enum TopShelfSnapshot {
     /// directory or touch disk. Callers must validate the source URL before requesting a path here.
     static func localArtworkURL(for sourceURL: String) -> URL? {
         guard !sourceURL.isEmpty, let directory = artworkDirectoryURL else { return nil }
+        return localArtworkURL(for: sourceURL, in: directory)
+    }
+
+    /// Pure path calculation also used by disposable source-unit fixtures; it never resolves an App Group.
+    static func localArtworkURL(for sourceURL: String, in directory: URL) -> URL? {
+        guard !sourceURL.isEmpty else { return nil }
         let sourceExtension = URL(string: sourceURL)?.pathExtension.lowercased()
         let allowedExtensions = Set(["jpg", "jpeg", "png", "webp", "heic", "avif", "gif"])
         let fileExtension = sourceExtension.flatMap { allowedExtensions.contains($0) ? $0 : nil } ?? "image"
@@ -247,12 +368,104 @@ enum TopShelfSnapshot {
     /// unreadable bytes, or a version we do not understand. Never throws, never traps. The extension
     /// turns [] into nil content, which is the system's cue to show the static Top Shelf image.
     static func read() -> [Item] {
-        guard let url = fileURL,
-              let data = try? Data(contentsOf: url),
-              let payload = try? decoder.decode(Payload.self, from: data),
-              payload.version == currentVersion
-        else { return [] }
-        return Array(payload.items.prefix(maxItems))
+        readResult().items
+    }
+
+    /// Fixed diagnostic vocabulary only: no paths, payload values or underlying error text.
+    enum ReadStatus: String, Sendable {
+        case noContainer, invalidFile, unavailableFile, oversized, rejectedBytes
+        case invalidPayload, unsupportedVersion, empty, ready
+    }
+
+    struct ReadResult: Sendable {
+        let status: ReadStatus
+        let items: [Item]
+    }
+
+    /// The same single bounded read used by read(); not an additional diagnostic probe.
+    static func readResult() -> ReadResult {
+        readResult(from: fileURL)
+    }
+
+    /// nil models an unavailable group without probing any real container in fixtures.
+    static func readResult(from url: URL?) -> ReadResult {
+        guard let url else { return .init(status: .noContainer, items: []) }
+        let result = inspectPayload(from: url)
+        let directory = url.deletingLastPathComponent().appendingPathComponent(artworkDirectoryName, isDirectory: true)
+        return .init(status: result.status,
+                     items: (result.payload?.items ?? []).compactMap { displayable($0, artworkDirectory: directory) })
+    }
+
+    /// An explicit file seam keeps fixtures out of the real App Group. Invalid input is read-only:
+    /// return no content without deleting, rewriting, normalizing or pruning any cache/history.
+    static func read(from url: URL) -> [Item] {
+        readResult(from: url).items
+    }
+
+    /// The snapshot file is untrusted input: under a signing service's shared group another app could have
+    /// written it. A row is shown only when its action round-trips through the app's own link parser, and
+    /// its poster only when it is https or a file inside the managed artwork folder.
+    static func displayable(_ item: Item, artworkDirectory: URL?) -> Item? {
+        guard let link = openURL(type: item.type, id: item.id), parse(link) == .open(type: item.type, id: item.id),
+              item.progress.isFinite else { return nil }
+        guard let poster = item.poster else { return item }
+        let accepted: Bool
+        if let url = URL(string: poster), url.scheme?.lowercased() == "https", url.host?.isEmpty == false {
+            accepted = true
+        } else if let url = URL(string: poster), url.isFileURL, let directory = artworkDirectory {
+            let base = directory.standardizedFileURL.resolvingSymlinksInPath().path + "/"
+            accepted = url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(base)
+        } else {
+            accepted = false
+        }
+        return accepted ? item : Item(id: item.id, type: item.type, title: item.title, poster: nil, progress: item.progress)
+    }
+
+    private static func readPayload(from url: URL) -> Payload? {
+        inspectPayload(from: url).payload
+    }
+
+    private static func inspectPayload(from url: URL) -> (payload: Payload?, status: ReadStatus) {
+        guard url.isFileURL else { return (nil, .invalidFile) }
+        do {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { return (nil, .invalidFile) }
+            if let size = values.fileSize, size > maxSnapshotBytes { return (nil, .oversized) }
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            // The existing collector deliberately conflates empty/I-O/sentinel failures. Report
+            // that bounded rejection honestly; do not retry or perform a second filesystem read.
+            guard let data = boundedSnapshotData(readChunk: { try handle.read(upToCount: $0) }) else {
+                return (nil, .rejectedBytes)
+            }
+            guard let payload = try? decoder.decode(Payload.self, from: data) else {
+                return (nil, .invalidPayload)
+            }
+            guard payload.version == currentVersion else { return (nil, .unsupportedVersion) }
+            return (payload, payload.items.isEmpty ? .empty : .ready)
+        } catch {
+            // Includes missing files, denied metadata/open and other filesystem errors.
+            return (nil, .unavailableFile)
+        }
+    }
+
+    /// FileHandle may return a short chunk before EOF. Keep reading within a single byte budget;
+    /// one extra byte distinguishes an exact-limit file from an oversized file or stale size hint.
+    /// JSONDecoder sees at most maxSnapshotBytes; only the byte reader may retain the sentinel byte.
+    static func boundedSnapshotData(readChunk: (Int) throws -> Data?) -> Data? {
+        var data = Data()
+        do {
+            while data.count <= maxSnapshotBytes {
+                let requested = min(16 * 1024, maxSnapshotBytes + 1 - data.count)
+                guard let chunk = try readChunk(requested), !chunk.isEmpty else { break }
+                guard chunk.count <= requested else { return nil }
+                data.append(chunk)
+            }
+            guard !data.isEmpty, data.count <= maxSnapshotBytes else { return nil }
+            return data
+        } catch {
+            return nil
+        }
     }
 
     // MARK: Write (app side)
@@ -268,17 +481,64 @@ enum TopShelfSnapshot {
     /// notification wakes the extension, so firing it on every unchanged Home refresh would be waste).
     @discardableResult
     static func write(_ items: [Item]) -> Bool {
-        guard let url = fileURL else { return false }
-        let capped = Array(items.prefix(maxItems))
+        writeResult(items) == .written
+    }
+
+    enum WriteResult: String, Hashable, Sendable {
+        case written, unchanged, noContainer, invalidDestination, encodingFailed, writeFailed
+    }
+
+    /// Outcomes come from the actual operation. The compatibility Bool remains true ONLY for
+    /// a changed successful write; unchanged content is not diagnosed as a failure.
+    static func writeResult(_ items: [Item]) -> WriteResult {
+        guard let url = fileURL else { return .noContainer }
+        return writeResult(items, to: url)
+    }
+
+    /// Explicit destination is for the same cache contract and disposable fixtures, not account data.
+    @discardableResult
+    static func write(_ items: [Item], to url: URL) -> Bool {
+        writeResult(items, to: url) == .written
+    }
+
+    static func writeResult(_ items: [Item], to url: URL) -> WriteResult {
+        guard url.isFileURL else { return .invalidDestination }
+        var capped = Array(items.prefix(maxItems))
         // Compare CONTENT, not the encoded bytes: `writtenAt` changes on every call, so comparing
         // payloads would always report a change and defeat the point of the check.
-        if capped == read() { return false }
-        let payload = Payload(version: currentVersion, writtenAt: Date(), items: capped)
-        guard let data = try? encoder.encode(payload) else { return false }
+        // A failed read is not evidence of an already-empty file: an explicit [] must still clear
+        // a malformed/oversized prior publication on sign-out, profile change or feature-off.
+        let previous = readPayload(from: url)
+        if let previous, capped == previous.items { return .unchanged }
+        let writtenAt = Date()
+        var payload = Payload(version: currentVersion, writtenAt: writtenAt, items: capped)
+        guard var data = try? encoder.encode(payload) else { return .encodingFailed }
+        if data.count > maxSnapshotBytes {
+            // This file is only the system's display cache, never saved history. Keep current titles
+            // actionable where possible instead of writing bytes the extension must reject. Drop art
+            // and bound titles only on overflow; raw action identities and progress are never changed.
+            var compact: [Item] = []
+            for item in capped {
+                let candidate = Item(id: item.id, type: item.type,
+                    title: String(String.UnicodeScalarView(item.title.unicodeScalars.prefix(maxOverflowTitleScalars))),
+                    poster: nil, progress: item.progress)
+                let trial = Payload(version: currentVersion, writtenAt: writtenAt, items: compact + [candidate])
+                guard let bytes = try? encoder.encode(trial) else { return .encodingFailed }
+                guard bytes.count <= maxSnapshotBytes else { continue }
+                compact.append(candidate)
+            }
+            capped = compact
+            if let previous, capped == previous.items { return .unchanged }
+            payload = Payload(version: currentVersion, writtenAt: writtenAt, items: capped)
+            guard let bounded = try? encoder.encode(payload), bounded.count <= maxSnapshotBytes else {
+                return .encodingFailed
+            }
+            data = bounded
+        }
         // Atomic: the extension can be reading this file in another process at any moment, and a
         // torn read would decode to nothing (harmless, but it would blank the shelf for a cycle).
-        do { try data.write(to: url, options: .atomic) } catch { return false }
-        return true
+        do { try data.write(to: url, options: .atomic) } catch { return .writeFailed }
+        return .written
     }
 
     // MARK: Deep links

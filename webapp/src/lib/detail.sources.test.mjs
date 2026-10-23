@@ -10,9 +10,14 @@ const mocks = {
     export const fetchStreams=(a,t,id)=>globalThis.detailFixture.streams(id);
     export const fetchSimilar=async()=>[]; export const fetchSubtitles=async()=>[];`,
   "../lib/player": `export const play=async(url,title,options)=>{globalThis.detailFixture.played.push({url,title,options});};
-    export const currentPlayToken=()=>1; export const setSkipSegments=()=>{};`,
+    export const currentPlayToken=()=>1; export const setSkipSegments=()=>{};
+    export const close=()=>{}; export const isPlayerOpen=()=>false;`,
+  "../lib/desktop": `export const isDesktop=()=>false; export const nativePlaybackOwned=()=>false;`,
+  "../lib/nativePlayer": `export const playNative=async()=>{}; export const releaseNative=()=>{};`,
   "../lib/store": `export const cwPosition=()=>0; export const cwProgress=()=>0; export const cwResumeId=()=>null;
-    export const inLibrary=()=>false; export const toggleLibrary=()=>{};`,
+    export const inLibrary=()=>false; export const toggleLibrary=()=>{};
+    export const hasNativeAccountProjection=()=>false; export const canEditAccountWatchlist=()=>false;
+    export const inAccountWatchlist=()=>false; export const setAccountWatchlist=()=>false;`,
   "../lib/settings": `export const getSettings=()=>({useAddonOrder:true,hideWords:"",requireWords:"",safetyFilter:"off"});`,
   "../lib/trailer": `export const resolveBackendTrailer=async()=>null; export const userTrailerLang=()=>"en";`,
   "../lib/skip": `export const fetchSkipSegments=async()=>[];`,

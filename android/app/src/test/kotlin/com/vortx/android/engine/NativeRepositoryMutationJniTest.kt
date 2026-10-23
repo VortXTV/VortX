@@ -207,4 +207,26 @@ class NativeRepositoryMutationJniTest {
             assertTrue(repository.installedAddons().getOrThrow().none { it.transportUrl.contains("new.invalid") })
         }
     }
+
+    @Test fun `deliberate saves and removals mirror to watchlists after the commit while plain adds never do`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session)
+            val mirrored = mutableListOf<String>()
+            val repository = NativeCatalogRepository(mirrorLibrary = { added, type, id ->
+                mirrored += "${if (added) "add" else "remove"}:${type.id}:$id"
+            }) { session }
+            repository.addToLibrary(MetaItem("tt0000001", MediaType.MOVIE, "Auto-added")).getOrThrow()
+            assertEquals(emptyList<String>(), mirrored)
+            repository.saveToLibrary(MetaItem("tt0000002", MediaType.MOVIE, "Saved from a menu")).getOrThrow()
+            assertEquals(listOf("add:movie:tt0000002"), mirrored)
+            repository.removeFromLibrary("tt0000002").getOrThrow()
+            assertEquals(listOf("add:movie:tt0000002", "remove:movie:tt0000002"), mirrored)
+            val committed = store.commits
+            store.fail = true
+            assertTrue(repository.saveToLibrary(MetaItem("tt0000003", MediaType.MOVIE, "Rejected")).isFailure)
+            assertEquals(committed, store.commits)
+            assertEquals(2, mirrored.size)
+        }
+    }
 }

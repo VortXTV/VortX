@@ -49,7 +49,8 @@ internal class NzbIndexerClient(
     }
 
     internal fun request(endpoint: URI, apiKey: String, search: NzbSearch, fallback: Boolean): URI {
-        require(NzbIndexerEndpointPolicy.validate(endpoint).isSuccess && apiKey.isNotBlank() && search.isValid())
+        require(apiKey.isNotBlank() && search.isValid())
+        val endpoint = NzbIndexerEndpointPolicy.validate(endpoint).getOrThrow()
         val params = linkedMapOf("limit" to MAX_RESULTS.toString(), "o" to "xml", "apikey" to apiKey)
         if (fallback) {
             params["t"] = "search"

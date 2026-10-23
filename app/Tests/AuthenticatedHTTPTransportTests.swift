@@ -38,7 +38,7 @@ private final class AuthenticatedTransportProbe: URLProtocol, @unchecked Sendabl
 
     override class func canInit(with request: URLRequest) -> Bool {
         guard let host = request.url?.host else { return false }
-        return host == "allowed.test" || host == "redirect-target.test"
+        return host == "allowed.test" || host == "redirect-target.test" || host == "api.vortx.tv"
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -65,6 +65,8 @@ private final class AuthenticatedTransportProbe: URLProtocol, @unchecked Sendabl
         }
 
         switch url.path {
+        case "/v1/backup", "/not-modified":
+            respond(status: 304, headers: ["Content-Length": "0", "ETag": "\"17\""], chunks: [])
         case "/redirect":
             let target = URL(string: "https://redirect-target.test/collect")!
             var redirected = request
@@ -230,6 +232,29 @@ private struct AuthenticatedHTTPTransportTests {
                "a real URLSession redirect callback is rejected")
         expect(redirectSnapshot.targetHits == 0,
                "redirect refusal never sends the bearer request to the target")
+
+        var conditional = request("/v1/backup", host: "api.vortx.tv")
+        conditional.httpMethod = "GET"
+        conditional.setValue("\"17\"", forHTTPHeaderField: "If-None-Match")
+        do {
+            let unchanged = try await transport.send(conditional, allowedHosts: ["api.vortx.tv"], maxResponseBytes: 64)
+            expect(unchanged.statusCode == 304 && unchanged.data.isEmpty && unchanged.etag == "\"17\"",
+                   "an exact conditional backup GET admits bodyless 304")
+        } catch { expect(false, "an exact conditional backup GET admits bodyless 304") }
+        for index in 0..<4 {
+            var invalid = conditional
+            if index == 0 { invalid.setValue(nil, forHTTPHeaderField: "If-None-Match") }
+            if index == 1 { invalid.httpMethod = "PUT" }
+            if index == 2 { invalid.url = URL(string: "https://api.vortx.tv/not-modified")! }
+            if index == 3 { invalid.setValue("W/\"17\"", forHTTPHeaderField: "If-None-Match") }
+            do {
+                _ = try await transport.send(invalid, allowedHosts: ["api.vortx.tv"], maxResponseBytes: 64)
+                expect(false, "unsolicited or unsupported 304 is refused (\(index))")
+            } catch {
+                expect((error as? AuthenticatedHTTPTransportError) == .redirectRejected,
+                       "unsolicited or unsupported 304 is refused (\(index))")
+            }
+        }
 
         let declared = await receives(transport, path: "/declared-too-large")
         expect(failure(declared) == .responseTooLarge,

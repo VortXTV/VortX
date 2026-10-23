@@ -23,34 +23,19 @@ struct EpisodeSourceOwner {
 
     init(core: CoreBridge = .shared, legacySources: [StreamSource], legacyAddons: [AddonDescriptor] = [],
          legacyIsCurrent: @escaping @MainActor () -> Bool) {
-#if VORTX_NATIVE_DATA_ENGINE
         let captured = core.captureNativeEpisodeSourceRegistry()
         inventory = captured.flatMap { try? JSONDecoder().decode(EpisodeSourceInventory.self, from: $0.data) }
         self.legacySources = []
         authority = { captured?.isCurrent() == true }
-#else
-        inventory = legacyAddons.isEmpty ? nil : EpisodeSourceInventory(legacyAddons: legacyAddons)
-        self.legacySources = legacySources
-        authority = legacyIsCurrent
-#endif
     }
 
     func providers(seriesID: String?, videoID: String) -> [EpisodeSourceProvider] {
         if let inventory { return inventory.providers(seriesID: seriesID, videoID: videoID) }
-#if VORTX_NATIVE_DATA_ENGINE
         return []
-#else
-        // A source-only legacy snapshot carries no proof of metadata capability.
-        return legacySources.map { EpisodeSourceProvider(source: $0, videoID: videoID, streamID: videoID, metadataID: nil) }
-#endif
     }
 
     func sources(for videoID: String) -> [StreamSource] {
-#if VORTX_NATIVE_DATA_ENGINE
         inventory?.sources(for: videoID) ?? []
-#else
-        legacySources
-#endif
     }
 
     var isCurrent: Bool {
@@ -58,11 +43,7 @@ struct EpisodeSourceOwner {
             && ContinueWatchingPreferences.selectionEpoch == profileEpoch
             && CredentialScopeRegistry.shared.isCurrent(credential)
             && authority() else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
         return inventory != nil
-#else
-        return true
-#endif
     }
 }
 

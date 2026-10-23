@@ -41,6 +41,24 @@
 		<true/>
 	</dict>
 
+	<!-- The app's own URL scheme. Infuse calls it back (x-success / x-error) with the position the
+	     viewer stopped at, so Continue Watching resumes there. $(VORTX_URL_SCHEME) is set per target in
+	     project.yml; InfuseReturnCoordinator and TopShelfSnapshot read VortXURLScheme back at runtime. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(VORTX_URL_SCHEME)</string>
+			</array>
+		</dict>
+	</array>
+	<key>VortXURLScheme</key>
+	<string>$(VORTX_URL_SCHEME)</string>
 	<!-- macOS 15+ gates reaching a host on the local network behind a privacy permission that is
 	     separate from ATS. Tailscale rides a point-to-point tunnel rather than the LAN, so it does not
 	     trip this gate (iOS has the same gate and connects to the same server without a usage string),

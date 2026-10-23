@@ -3,6 +3,128 @@ import SwiftUI
 import UIKit
 #endif
 
+/// Player-wide presentation tokens. Keep the large video scrim separate from the small control
+/// faces: thinning the backplate must not also thin the glyph's immediate contrast protection.
+enum VortXPlayerChromePolicy {
+    enum Platform: Equatable { case touch, desktop, television }
+
+    static func requiresContrast(reduceTransparency: Bool, highContrast: Bool,
+                                 glassEnabled: Bool) -> Bool {
+        reduceTransparency || highContrast || !glassEnabled
+    }
+
+    static func topScrimAlpha(for platform: Platform) -> Double {
+        switch platform {
+        case .touch: return 0.55
+        case .desktop: return 0.45
+        case .television: return 0
+        }
+    }
+
+    static func bottomScrimAlpha(for platform: Platform, requiresContrast: Bool) -> Double {
+        switch platform {
+        case .touch: return requiresContrast ? 0.75 : 0.38
+        case .desktop: return requiresContrast ? 0.38 : 0.24
+        case .television: return requiresContrast ? 0.90 : 0.58
+        }
+    }
+
+    static func backplateFillAlpha(requiresContrast: Bool) -> Double {
+        requiresContrast ? 0.28 : 0.16
+    }
+
+    static func backplateMaterialOpacity(requiresContrast: Bool) -> Double {
+        requiresContrast ? 1 : 0.42
+    }
+
+    /// Only the existing Crimson profile changes its player treatment. A lower neutral veil lets its
+    /// deeper tint read as red; the combined paint is slightly thinner than the previous face.
+    static func controlTintAlpha(active: Bool, crimson: Bool) -> Double {
+        crimson ? (active ? 0.68 : 0.52) : (active ? 0.62 : 0.46)
+    }
+
+    static func controlVeilAlpha(crimson: Bool) -> Double { crimson ? 0.48 : 0.58 }
+
+    /// Local timing-label ink only, independent of the thinner full-player scrim. Full-white time
+    /// labels keep a conservative SDR-white contrast bound without adding a long timing-row strip.
+    static func timeLabelFillAlpha(requiresContrast: Bool) -> Double { requiresContrast ? 1 : 0.62 }
+}
+
+/// The actual large video backplate, shared by touch, desktop and TV control routes. This adds no
+/// material/blur work: only the existing black gradient changes, with its old fallback alphas retained.
+struct VortXPlayerBackdrop: View {
+    let platform: VortXPlayerChromePolicy.Platform
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @AppStorage(VisualEffects.glassKey) private var glassChoice = VisualEffects.auto
+
+    private var requiresContrast: Bool {
+        VortXPlayerChromePolicy.requiresContrast(
+            reduceTransparency: reduceTransparency, highContrast: contrast == .increased,
+            glassEnabled: VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto))
+    }
+
+    private var colors: [Color] {
+        let bottom = Color.black.opacity(VortXPlayerChromePolicy.bottomScrimAlpha(
+            for: platform, requiresContrast: requiresContrast))
+        if platform == .television { return [.clear, bottom] }
+        return [.black.opacity(VortXPlayerChromePolicy.topScrimAlpha(for: platform)), .clear, bottom]
+    }
+
+    var body: some View {
+        LinearGradient(colors: colors, startPoint: .top, endPoint: .bottom)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+}
+
+/// Desktop's additional rounded bottom container. Geometry, edge light and shadow remain owned by
+/// the existing layout; accessibility and Effects-off keep a fully opaque face.
+private struct VortXPlayerBottomBackplateModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @AppStorage(VisualEffects.glassKey) private var glassChoice = VisualEffects.auto
+
+    func body(content: Content) -> some View {
+        let requiresContrast = VortXPlayerChromePolicy.requiresContrast(
+            reduceTransparency: reduceTransparency, highContrast: contrast == .increased,
+            glassEnabled: VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto))
+        content.modifier(VortXGlassModifier(
+            shape: RoundedRectangle(cornerRadius: 22, style: .continuous),
+            fillAlpha: VortXPlayerChromePolicy.backplateFillAlpha(requiresContrast: requiresContrast),
+            highlightTop: 0.14, shadow: .bar,
+            forceOpaque: requiresContrast,
+            materialOpacity: VortXPlayerChromePolicy.backplateMaterialOpacity(requiresContrast: requiresContrast),
+            tone: .scrim))
+    }
+}
+
+extension View {
+    func vortxPlayerBottomBackplate() -> some View { modifier(VortXPlayerBottomBackplateModifier()) }
+    func vortxPlayerTimeLabelProtection() -> some View { modifier(VortXPlayerTimeLabelProtectionModifier()) }
+}
+
+/// Local ink capsules hug only the bare timing labels. Background expansion never participates
+/// in layout, so the timeline's dimensions, transport targets and trickplay positions do not move.
+private struct VortXPlayerTimeLabelProtectionModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @AppStorage(VisualEffects.glassKey) private var glassChoice = VisualEffects.auto
+
+    func body(content: Content) -> some View {
+        let requiresContrast = VortXPlayerChromePolicy.requiresContrast(
+            reduceTransparency: reduceTransparency, highContrast: contrast == .increased,
+            glassEnabled: VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto))
+        content.background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.black.opacity(VortXPlayerChromePolicy.timeLabelFillAlpha(requiresContrast: requiresContrast)))
+                .padding(.horizontal, -6).padding(.vertical, -2)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
 /// VortX "liquid glass": the warm-dark translucent material that is now VortX's ELEVATION LANGUAGE
 /// across the app's chrome. It began as the floating nav bar / pill material from the approved redesign
 /// mockups; it now also backs chips, rows, primary actions, panels, fields, toasts, on-poster badges,
@@ -123,13 +245,32 @@ enum VortXGlass {
     /// a faint warm hairline border (`1px solid rgba(242,236,226,~.14)`) toward the bottom. One gradient
     /// stroke reads as both, so a single `strokeBorder` gives the mockups' lit top edge.
     static func highlight(_ top: Double = 0.14) -> LinearGradient {
-        LinearGradient(
+        // Liquid Glass rim (2026-10-15 redesign): a brightly lit top edge that fades through the sides
+        // into the warm hairline, so every surface reads as lit glass rather than a dark plate.
+        let lit = min(0.42, top * 1.9)
+        return LinearGradient(
             colors: [
-                Color.white.opacity(top),
+                Color.white.opacity(lit),
+                Color.white.opacity(lit * 0.30),
                 Color(.sRGB, red: 0.949, green: 0.925, blue: 0.886, opacity: top * 0.42)
             ],
             startPoint: .top, endPoint: .bottom
         )
+    }
+
+    /// Over real Liquid Glass (OS 26) the warm fill is scaled down so the glass itself shows: a light tint
+    /// on surfaces over VortX's own chrome, and a stronger one where the surface must hold bright media back.
+    static func liquidFillScale(_ tone: Tone) -> Double {
+        switch tone {
+        case .lift: return 0.45
+        case .scrim: return 0.70
+        }
+    }
+
+    /// The specular sheen across the top of a glass surface.
+    static var sheen: LinearGradient {
+        LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0)],
+                       startPoint: .top, endPoint: .center)
     }
 
     /// The ember active / selected fill for a nav item (mockups: `rgba(245,158,11,.16)`). The accent
@@ -201,9 +342,11 @@ enum VortXGlass {
     static func blurLayer<S: InsettableShape>(in shape: S, reduceTransparency: Bool,
                                               material: Material = .ultraThinMaterial,
                                               glassTint: Color? = nil,
+                                              interactive: Bool = false,
                                               hugsTightly: Bool = false) -> some View {
-        if reduceTransparency {
-            // No blur when transparency is reduced: an opaque warm surface keeps the chrome legible.
+        if reduceTransparency || !VisualEffects.glassEnabled {
+            // No blur when transparency is reduced, or glass is switched off in Settings > Effects and
+            // performance: an opaque warm surface keeps the chrome legible and skips the live blur.
             shape.fill(Theme.Palette.surface1)
         } else if hugsTightly {
             // Tight small circular controls (transport / hero discs): NEVER Apple glassEffect. Its ambient
@@ -215,7 +358,11 @@ enum VortXGlass {
             // in place. VortX's tint + highlight + shadow still layer on top, so identity is preserved.
             // For the prominent path `glassTint` colors the glass itself so ember reads through the gloss.
             if let glassTint {
-                shape.fill(.clear).glassEffect(.regular.tint(glassTint), in: shape)
+                if interactive {
+                    shape.fill(.clear).glassEffect(.regular.tint(glassTint).interactive(), in: shape)
+                } else {
+                    shape.fill(.clear).glassEffect(.regular.tint(glassTint), in: shape)
+                }
             } else {
                 shape.fill(.clear).glassEffect(.regular, in: shape)
             }
@@ -286,6 +433,7 @@ enum VortXGlass {
     /// system-white focused pill: neutralize the tvOS default, then let the VortX surface show. Every VortX
     /// field background is preserved exactly as authored, so this reveals the design system rather than
     /// changing it.
+    @MainActor
     static func applyTextFieldAppearance() {
         UITextField.appearance().backgroundColor = .clear
         UITextField.appearance().borderStyle = .none
@@ -297,9 +445,11 @@ enum VortXGlass {
     /// the iOS top nav bar / toolbar reads as VortX glass and matches the bottom tab bar. Under Reduce
     /// Transparency it stands down to an opaque warm `surface1` surface for legibility. Re-skin only: the
     /// caller keeps its bar's items, tint, and behavior; this only supplies the background material.
-    static func toolbarAppearance() -> UIToolbarAppearance {
+    @MainActor
+    static func toolbarAppearance(glassEnabled: Bool? = nil) -> UIToolbarAppearance {
         let appearance = UIToolbarAppearance()
-        if UIAccessibility.isReduceTransparencyEnabled {
+        let useGlass = glassEnabled ?? (!UIAccessibility.isReduceTransparencyEnabled && VisualEffects.glassEnabled)
+        if !useGlass {
             appearance.configureWithOpaqueBackground()
             appearance.backgroundColor = UIColor(Theme.Palette.surface1)
         } else {
@@ -308,7 +458,220 @@ enum VortXGlass {
         }
         return appearance
     }
+
+    /// The same material/color recipe as the toolbar, preserving the existing navigation shadow rule.
+    /// `glassEnabled` is resolved by the observed eligibility owner, not a second stored preference.
+    @MainActor
+    static func navigationBarAppearance(glassEnabled: Bool) -> UINavigationBarAppearance {
+        let toolbar = toolbarAppearance(glassEnabled: glassEnabled)
+        let appearance = UINavigationBarAppearance()
+        appearance.backgroundEffect = toolbar.backgroundEffect
+        appearance.backgroundColor = toolbar.backgroundColor
+        appearance.shadowColor = .clear
+        return appearance
+    }
     #endif
+}
+
+#if os(iOS)
+/// One shell-owned bridge refreshes current native bars as well as future bars' appearance proxy.
+/// It does not replace navigation stacks, routes, selection, profile state or player overlays.
+@MainActor
+private struct VortXNativeNavigationAppearanceModifier: ViewModifier {
+    @EnvironmentObject private var theme: ThemeManager
+    @GlassEligibility private var glassEnabled
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    func body(content: Content) -> some View {
+        content.background {
+            VortXNavigationBarAppearanceBridge(
+                glassEnabled: glassEnabled && contrast != .increased,
+                accentID: theme.accentID, oled: theme.oled)
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+@MainActor
+private struct VortXNavigationBarAppearanceBridge: UIViewControllerRepresentable {
+    let glassEnabled: Bool
+    // Values, not objectWillChange/willSet callbacks: resolve colors after the published values settle.
+    let accentID: String
+    let oled: Bool
+
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.refresh(with: VortXGlass.navigationBarAppearance(glassEnabled: glassEnabled))
+    }
+
+    final class Controller: UIViewController {
+        private var appearance: UINavigationBarAppearance?
+
+        private final class AttachmentView: UIView {
+            var onAttach: (() -> Void)?
+            override func didMoveToWindow() {
+                super.didMoveToWindow()
+                if window != nil { onAttach?() }
+            }
+        }
+
+        override func loadView() {
+            let attachment = AttachmentView(frame: .zero)
+            attachment.onAttach = { [weak self] in self?.applyCurrentAppearance() }
+            view = attachment
+            view.backgroundColor = .clear
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            applyCurrentAppearance()
+        }
+
+        func refresh(with appearance: UINavigationBarAppearance) {
+            self.appearance = appearance
+            applyCurrentAppearance()
+        }
+
+        private func applyCurrentAppearance() {
+            guard let appearance else { return }
+            Self.apply(appearance, to: UINavigationBar.appearance())
+            // A make/update pass can precede attachment; didMoveToWindow/viewDidAppear apply the saved recipe.
+            guard let root = viewIfLoaded?.window?.rootViewController else { return }
+            Self.retint(under: root, with: appearance)
+        }
+
+        static func apply(_ appearance: UINavigationBarAppearance, to bar: UINavigationBar) {
+            bar.standardAppearance = appearance
+            bar.scrollEdgeAppearance = appearance
+            bar.compactAppearance = appearance
+            bar.compactScrollEdgeAppearance = appearance
+        }
+
+        static func retint(under controller: UIViewController?, with appearance: UINavigationBarAppearance) {
+            var visited = Set<ObjectIdentifier>()
+            retint(under: controller, with: appearance, visited: &visited)
+        }
+
+        private static func retint(under controller: UIViewController?,
+                                   with appearance: UINavigationBarAppearance,
+                                   visited: inout Set<ObjectIdentifier>) {
+            guard let controller, visited.insert(ObjectIdentifier(controller)).inserted else { return }
+            if let navigation = controller as? UINavigationController {
+                apply(appearance, to: navigation.navigationBar)
+                navigation.navigationBar.setNeedsLayout()
+            }
+            controller.children.forEach { retint(under: $0, with: appearance, visited: &visited) }
+            retint(under: controller.presentedViewController, with: appearance, visited: &visited)
+        }
+    }
+}
+#endif
+
+extension View {
+    /// Apply once to the stable shell: every tab's NavigationStack and presented native bars share it.
+    @MainActor @ViewBuilder
+    func vortxNativeNavigationAppearance() -> some View {
+        #if os(iOS)
+        modifier(VortXNativeNavigationAppearanceModifier())
+        #else
+        self
+        #endif
+    }
+}
+
+// MARK: - Settings and Library inline surfaces
+
+/// One owner for inline row rhythm: the transparent gutter is reserved in the row's layout insets as
+/// well as its background. This works with macOS Form too, without relying on iOS-only listRowSpacing.
+/// The inner control padding remains 14pt on both layouts; the wider column earns a larger card gap.
+enum VortXInlineGlassPolicy {
+    static func rowGutter(wide: Bool) -> CGFloat { wide ? 8 : 6 }
+    static func rowRadius(wide: Bool) -> CGFloat { wide ? 24 : 18 }
+    static func rowInsets(wide: Bool) -> EdgeInsets {
+        let vertical = 14 + rowGutter(wide: wide)
+        let horizontal: CGFloat = wide ? 20 : 18
+        return EdgeInsets(top: vertical, leading: horizontal, bottom: vertical, trailing: horizontal)
+    }
+    static func tintAlpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.02 : 0.06
+    }
+    static func canvasAlpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.015 : 0.04
+    }
+}
+
+/// Static, bounded atmosphere from the already cached profile accent. No image, blur, animation or
+/// observation of its own; Settings and the Library doorway stack are its only consumers.
+struct VortXProfileGlassCanvas: View {
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        VortXProfileGlassCanvasSurface(tint: tint, reduceTransparency: reduceTransparency,
+                                      highContrast: contrast == .increased)
+    }
+}
+
+/// Pure surface inputs keep accessibility policy testable without changing system preferences.
+struct VortXProfileGlassCanvasSurface: View {
+    let tint: Color
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    var body: some View {
+        let alpha = VortXInlineGlassPolicy.canvasAlpha(
+            reduceTransparency: reduceTransparency, highContrast: highContrast)
+        Theme.Palette.canvas.overlay(alignment: .topLeading) {
+            if alpha > 0 {
+                RadialGradient(colors: [tint.opacity(alpha), .clear], center: .topLeading,
+                               startRadius: 0, endRadius: 520)
+                    .frame(maxWidth: .infinity, maxHeight: 520)
+                    .allowsHitTesting(false)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Form row background only: native row content and all bindings stay in the existing Section.
+/// Contained material prevents the OS-26 ambient bloom from bridging neighbouring rounded rows.
+struct VortXSettingsRowBackground: View {
+    let wide: Bool
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        VortXSettingsRowSurface(wide: wide, tint: tint, reduceTransparency: reduceTransparency,
+                               highContrast: contrast == .increased)
+    }
+}
+
+struct VortXSettingsRowSurface: View {
+    let wide: Bool
+    let tint: Color
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    var body: some View {
+        Color.clear.vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: VortXInlineGlassPolicy.rowRadius(wide: wide), style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: tint,
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: highContrast),
+            shadow: .flat,
+            contained: true,
+            forceOpaque: reduceTransparency || highContrast)
+        .padding(.vertical, VortXInlineGlassPolicy.rowGutter(wide: wide))
+    }
 }
 
 // MARK: - The reusable SwiftUI material
@@ -334,6 +697,12 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     /// Tight small circular control (disc): forward to `blurLayer` so the blur is a shape-clipped material
     /// on every OS, never `glassEffect` (which would draw an un-clipped halo around the disc). Default off.
     var hugsTightly: Bool = false
+    /// Opt-in opaque presentation for an inline surface's increased-contrast fallback. Existing glass
+    /// presets keep their own behavior; only Settings and Library doorway cards request this.
+    var forceOpaque: Bool = false
+    /// Contained inline cards need less neutral material over OLED than floating chrome. Default one
+    /// keeps every existing preset unchanged; opaque accessibility fallbacks never reduce their opacity.
+    var materialOpacity: Double = 1
     /// tvOS ONLY: a fully OPAQUE warm fill for focusable / scrolling / on-art surfaces (rows, chips,
     /// badges). When set, tvOS renders this opaque fill in place of the live blur + translucent warm tint,
     /// so the Apple TV GPU does not composite a per-frame backdrop blur (the ~5fps focus-scroll regression)
@@ -345,8 +714,10 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     /// own dark chrome; the three presets that float over bright media (disc / badge / panel) pass `.scrim`.
     var tone: VortXGlass.Tone = .lift
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @GlassEligibility private var observedGlassEligibility
 
     func body(content: Content) -> some View {
+        let _ = observedGlassEligibility
         content.background { glass }
     }
 
@@ -358,6 +729,13 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
         #else
         return nil
         #endif
+    }
+
+    /// Apple's real Liquid Glass is the blur under this surface (OS 26, glass on, not a tight disc).
+    private var realLiquidGlass: Bool {
+        guard !hugsTightly, VisualEffects.glassEnabled else { return false }
+        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *) { return true }
+        return false
     }
 
     private var glass: some View {
@@ -373,11 +751,14 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
                     shape.fill(activeFill)
                 }
             } else {
-                VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency, hugsTightly: hugsTightly)
+                VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency || forceOpaque, hugsTightly: hugsTightly)
+                    .opacity(reduceTransparency || forceOpaque ? 1 : materialOpacity)
                 // The warm-dark VortX tint over the blur is what makes Apple's neutral Liquid Glass read as
                 // VortX chrome. Skipped under Reduce Transparency, where `blurLayer` is already an opaque warm fill.
-                if !reduceTransparency {
-                    shape.fill(VortXGlass.fill(fillAlpha, tone: tone))
+                // Over real Liquid Glass it is lighter, so the glass shows through (the frosted look).
+                if !reduceTransparency && !forceOpaque {
+                    shape.fill(VortXGlass.fill(fillAlpha * (realLiquidGlass ? VortXGlass.liquidFillScale(tone) : 1), tone: tone))
+                    shape.fill(VortXGlass.sheen)
                 }
                 // Ambient profile tint remains present in the opaque Reduce Transparency fallback as a
                 // low-alpha wash, preserving the themed surface without introducing an accent slab.
@@ -414,8 +795,10 @@ private struct VortXGlassProminentModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let tint: Color
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @GlassEligibility private var observedGlassEligibility
 
     func body(content: Content) -> some View {
+        let _ = observedGlassEligibility
         content.background { glass }
     }
 
@@ -449,8 +832,10 @@ private struct VortXGlassStripModifier: ViewModifier {
     let edge: Edge
     let fillAlpha: Double
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @GlassEligibility private var observedGlassEligibility
 
     func body(content: Content) -> some View {
+        let _ = observedGlassEligibility
         content.background { glass }
     }
 
@@ -485,7 +870,52 @@ private struct VortXGlassStripModifier: ViewModifier {
     }
 }
 
+/// Opt-in chrome for profile-themed controls, separate from the neutral card/TV scrolling presets.
+/// The normal face is tinted glass itself, without the old half-opaque grey veil above the material.
+private struct VortXGlassControlModifier<S: InsettableShape>: ViewModifier {
+    let shape: S
+    let active: Bool
+    let shadow: VortXGlass.Shadow
+    @ObservedObject private var theme = ThemeManager.shared
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.isEnabled) private var enabled
+    @GlassEligibility private var observedGlassEligibility
+
+    func body(content: Content) -> some View {
+        let _ = observedGlassEligibility
+        let accent = Theme.Palette.accent
+        let opaque = reduceTransparency || contrast == .increased || !enabled
+        content
+            .background {
+                ZStack {
+                    VortXGlass.blurLayer(in: shape, reduceTransparency: opaque,
+                                        glassTint: accent.opacity(active ? 0.42 : 0.28),
+                                        interactive: true)
+                    // Older systems get the same profile wash over frosted material. Accessibility
+                    // keeps its opaque base; this wash does not compromise its text contrast.
+                    if opaque {
+                        shape.fill(accent.opacity(enabled ? (active ? 0.22 : 0.12) : 0.04))
+                    } else if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *) {
+                        EmptyView()
+                    } else {
+                        shape.fill(accent.opacity(active ? 0.28 : 0.18))
+                    }
+                }
+                .clipShape(shape)
+            }
+            .overlay(shape.strokeBorder(accent.opacity(contrast == .increased ? 0.7 : active ? 0.5 : 0.3), lineWidth: 1))
+            .clipShape(shape)
+            .contentShape(shape)
+            .shadow(color: shadow.color, radius: shadow.radius, x: shadow.x, y: shadow.y)
+    }
+}
+
 extension View {
+    func vortxGlassControl<S: InsettableShape>(in shape: S, active: Bool = false,
+                                              shadow: VortXGlass.Shadow = .flat) -> some View {
+        modifier(VortXGlassControlModifier(shape: shape, active: active, shadow: shadow))
+    }
     /// Cinema Glass's broad media and library surfaces. This stays separate from the compact row preset:
     /// cards are intentionally a little more raised and use the shared rounded Cinema radius, while still
     /// inheriting Reduce Transparency and Liquid Glass behavior from the base modifier.
@@ -499,7 +929,8 @@ extension View {
     /// `vortxGlassActive` / `activeFill`: Settings rows and Library doorway cards are ambient surfaces, not
     /// selected controls, so they get a restrained tint with the normal glass edge and no accent glow.
     /// The helper is shape-generic so list rows can keep their clipped, flat shadow while Cinema cards keep
-    /// their raised card shadow.
+    /// their raised card shadow. `contained` keeps inline glass within its silhouette and lowers only the
+    /// neutral material contribution; the shared warm lift, profile wash and opaque fallback remain.
     func vortxGlassTintedSurface<S: InsettableShape>(
         in shape: S,
         fillAlpha: Double = VortXGlass.cardFillAlpha,
@@ -507,7 +938,9 @@ extension View {
         tintAlpha: Double = VortXGlass.cinemaTintAlpha,
         highlight: Double = 0.14,
         shadow: VortXGlass.Shadow = .flat,
-        tone: VortXGlass.Tone = .lift
+        tone: VortXGlass.Tone = .lift,
+        contained: Bool = false,
+        forceOpaque: Bool = false
     ) -> some View {
         modifier(VortXGlassModifier(
             shape: shape,
@@ -516,6 +949,9 @@ extension View {
             shadow: shadow,
             accentTint: tint,
             accentTintAlpha: tintAlpha,
+            hugsTightly: contained,
+            forceOpaque: forceOpaque,
+            materialOpacity: contained ? 0.55 : 1,
             tone: tone
         ))
     }
@@ -528,7 +964,8 @@ extension View {
         fillAlpha: Double = VortXGlass.barFillAlpha,
         highlight: Double = 0.14,
         shadow: VortXGlass.Shadow = .bar,
-        tone: VortXGlass.Tone = .lift
+        tone: VortXGlass.Tone = .lift,
+        materialOpacity: Double = 1
     ) -> some View {
         // On tvOS, on-art badges (the only `vortxGlass` callers at `badgeFillAlpha`) drop to a cheap OPAQUE
         // warm capsule: over poster art a live glass badge sampled + desaturated the artwork under it, and
@@ -544,7 +981,10 @@ extension View {
         let opaqueTVFill: Color? = (fillAlpha == VortXGlass.badgeFillAlpha)
             ? VortXGlass.fill(1.0, tone: .scrim) : nil
         return modifier(VortXGlassModifier(shape: shape, fillAlpha: fillAlpha, highlightTop: highlight,
-                                           shadow: shadow, opaqueTVFill: opaqueTVFill, tone: tone))
+                                           shadow: shadow,
+                                           materialOpacity: VisualEffects.glassEnabled ? materialOpacity : 1,
+                                           opaqueTVFill: opaqueTVFill,
+                                           tone: tone))
     }
 
     /// The ember active / selected overlay for a nav item / chip: fills `shape` with the soft `tint` (accent

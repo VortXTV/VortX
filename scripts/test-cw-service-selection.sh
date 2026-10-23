@@ -28,15 +28,28 @@ const baseline = execFileSync('git', ['-C', root, 'show', `${ref}:app/SourcesSha
 writeFileSync(`${dir}/BaselineServiceSelection.swift`, baseline.replaceAll('HomeContinueWatchingSelection', 'BaselineServiceSelection'));
 const shelf = read('app/SourcesTV/TopShelfSnapshotWriter.swift');
 writeFileSync(`${dir}/FixtureTopShelfMapper.swift`, 'import Foundation\nenum FixtureTopShelfMapper {\n' +
-  ['static func items(\n', 'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
+  ['struct PublicationKey:', 'static func publicationKey(', 'static func items(\n', 'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
+// Source wiring only; the Swift cases below execute the actual key/mapper, not a second policy.
+const home = read('app/SourcesTV/HomeView.swift');
+if (!/\.onChange\(of: TopShelfSnapshotWriter\.publicationKey\(for: renderedContinueWatching\)\)\s*\{\s*_ in[\s\S]*?TopShelfSnapshotWriter\.publishCurrent\(\)/.test(home)) {
+  throw new Error('Home must republish from its exact rendered shelf key');
+}
+const app = read('app/SourcesTV/VortXTVApp.swift');
+if (!block(app, 'if phase == .background').includes('TopShelfSnapshotWriter.publishCurrent()')) {
+  throw new Error('Direct TV Home/background must publish without closing the player');
+}
 writeFileSync(`${dir}/FixtureContinueWatchingFocus.swift`, 'import Foundation\nenum FixtureContinueWatchingFocus {\n' +
   block(read('app/SourcesTV/HomeView.swift'), 'static func permitsHeroEnrichment(') + '\n}\n');
 const profiles = read('app/SourcesShared/Profiles.swift');
 const fixture = `import Foundation
 ${block(read('app/SourcesShared/ProfileSync.swift'), 'struct WatchEntry:')}
-enum VortXSyncManager { static func suppressHousekeeping(_ work: () -> Void) { work() } }
+enum VortXSyncManager {
+    static func suppressHousekeeping(_ work: () -> Void) { work() }
+    static func nativePreferenceProjectionWillMount() -> Bool { true }
+}
 final class SourcePreferences { static let shared = SourcePreferences(); func reload() {} }
 final class SourcePinStore { static let shared = SourcePinStore(); func reload() {} }
+enum FixturePreferenceGroup { case playback, discovery, theme }
 @MainActor final class MigrationFixtureProfileStore {
     var profiles: [UserProfile]; var activeID: UUID?
     var watch: [String: WatchEntry] = [:]
@@ -45,20 +58,35 @@ final class SourcePinStore { static let shared = SourcePinStore(); func reload()
     private var nativeProjectionTarget: PlaybackMutationTarget?
     private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
     private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    ${block(profiles, 'private struct NativeSwitchPreferenceCapture')}
+    private var nativeSwitchPreferenceCapture: NativeSwitchPreferenceCapture?
+    ${block(profiles, 'private struct NativePlaybackProjectionSource')}
+    ${block(profiles, 'private struct NativeDiscoveryProjectionSource')}
+    private var nativePublishedPlaybackSource: NativePlaybackProjectionSource?
+    private var nativePublishedDiscoverySource: NativeDiscoveryProjectionSource?
+    ${block(profiles, 'private struct NativeThemeProjection')}
+    private var nativePublishedTheme: NativeThemeProjection?
+    private func currentNativeThemeProjection() -> NativeThemeProjection { .init(accentID: "ember", oled: false, textScale: 1) }
     private let continueWatchingLegacyAccount = CredentialScopeRegistry.shared.capture()
     ${block(profiles, 'private struct ContinueWatchingMigrationWitness')}
     private var continueWatchingMigration: ContinueWatchingMigrationWitness?
-    private var continueWatchingMigrationInFlight = false
+    private var continueWatchingMigrationAttempt: UUID?
     var failSave = false; var suspendSave = false; var saveCount = 0
     var saving: CheckedContinuation<Void, Never>?
     init(profiles: [UserProfile], activeID: UUID?) { self.profiles = profiles; self.activeID = activeID }
-    func persist(touch: Bool = true) {}
+    var persistCount = 0
+    func persist(touch: Bool = true) { persistCount += 1 }
     func applyTheme(_ profile: UserProfile) {}
     func applyPlayback(_ profile: UserProfile, resetUnset: Bool) {}
     func currentPlaybackPrefs() -> UserProfile.PlaybackPrefs { .init() }
     func currentDiscoveryPrefs() -> ProfileDiscoveryPreferences { ProfileDiscoveryPreferencesStore.capture() }
     func applyDiscovery(_ profile: UserProfile, resetUnset: Bool = false) { ProfileDiscoveryPreferencesStore.apply(profile.discovery, resetUnset: resetUnset) }
-    func update(_ profile: UserProfile) { Task { _ = await saveNative(profile, creating: false) } }
+    // Preference-journal admission is exercised by test-apple-sync-manager; this fixture owns
+    // only the Continue Watching migration/publication path and has no pending local intent.
+    func nativePreferenceIsLocalRevert(_ profile: UserProfile, group: FixturePreferenceGroup) -> Bool { false }
+    func nativePreferenceProjectionMatches(_ target: PlaybackMutationTarget) -> Bool { nativeProjectionTarget == target && target.stillOwnsCurrentContext(core: .shared) }
+    ${block(profiles, 'private func nativeDiscoveryProjectionRepresents(')}
+    func update(_ profile: UserProfile, editedPreferenceGroups: Set<FixturePreferenceGroup>? = nil) { Task { _ = await saveNative(profile, creating: false) } }
     func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
         saveCount += 1
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
@@ -122,12 +150,12 @@ cw_inputs=(
     "$cw_build_dir/FixtureSIMKLHTTPClient.swift"
     app/Tests/ContinueWatchingServiceTests.swift
 )
-swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -D CW_SERVICE_FIXTURE -D CW_SERVICE_BASELINE "${cw_inputs[@]}" "$cw_build_dir/BaselineServiceSelection.swift" -o "$cw_build_dir/baseline"
+nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -D CW_SERVICE_FIXTURE -D CW_SERVICE_BASELINE "${cw_inputs[@]}" "$cw_build_dir/BaselineServiceSelection.swift" -o "$cw_build_dir/baseline"
 if "$cw_build_dir/baseline" > "$cw_build_dir/baseline.log" 2>&1; then
     printf '%s\n' 'FAIL: actual parent unexpectedly supports selected SIMKL'
     exit 1
 fi
 grep -F 'FAIL: actual parent selector supports selected SIMKL' "$cw_build_dir/baseline.log"
-swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -D CW_SERVICE_FIXTURE "${cw_inputs[@]}" -o "$cw_build_dir/services"
+nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -D CW_SERVICE_FIXTURE "${cw_inputs[@]}" -o "$cw_build_dir/services"
 "$cw_build_dir/services" | tee "$cw_build_dir/services.log"
 printf '%s\n' "Actual parent RED and candidate receipts: $cw_build_dir"

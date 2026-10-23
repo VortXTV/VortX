@@ -45,7 +45,7 @@ struct TVInHeroTrailerView: View {
     /// the whole trailer loops via mpv's own `loop-file=inf` (the HOME hero uses that, full muted trailer).
     var window: (start: Double, length: Double)? = nil
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     /// A muted, looping libmpv instance for the ambient clip. Owned here so it is created and torn down with
     /// the view, never shared with the main player's coordinator.

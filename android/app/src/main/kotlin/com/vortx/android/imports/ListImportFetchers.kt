@@ -132,7 +132,8 @@ internal object MdbListImportClient {
             .getOrNull().orEmpty()
         if (key.isNotEmpty()) {
             val encKey = ListImport.encodePath(key)
-            ImportHttp.fetchText("$API_HOST/lists/$u/$s/items?apikey=$encKey")?.let { text ->
+            // This provider's supported authentication is a query key. Never send it through a redirect.
+            ImportHttp.fetchText("$API_HOST/lists/$u/$s/items?apikey=$encKey", followRedirects = false)?.let { text ->
                 val entries = collectItems(text).mapNotNull(::entry)
                 if (entries.isNotEmpty()) return RawList(title = null, entries = entries)
             }

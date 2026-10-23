@@ -69,11 +69,14 @@ private func sourceSection(_ source: String?, from start: String, to end: String
     return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
-private func functionBodyBeginsWithGuardReturn(_ source: String?, condition: String) -> Bool {
+private func functionBodyBeginsWithGuardReturn(_ source: String?, condition: String,
+                                             precedingConditions: [String] = []) -> Bool {
     guard let source, let openingBrace = source.firstIndex(of: "{") else { return false }
     let body = source[source.index(after: openingBrace)...]
     let normalized = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-    return normalized.hasPrefix("guard \(condition) else { return }")
+    let prefix = (precedingConditions + [condition]).map { "guard \($0) else { return }" }
+        .joined(separator: " ")
+    return normalized.hasPrefix(prefix)
 }
 
 @MainActor @main
@@ -291,10 +294,11 @@ enum TrackSelectorAvailabilityTests {
                 condition: "TrackSelector.shouldApplyAudioSelection(id, to: audioTracks)")
                 && avSetter?.contains("beginPlaybackRemountIntent(from:") == true)
         check(
-            "audio wiring: MPV suppresses a selected-row no-op before seek-cache hold",
+            "audio wiring: MPV suppresses muted-preview and selected-row no-ops before seek-cache hold",
             functionBodyBeginsWithGuardReturn(
                 mpvSetter,
-                condition: "TrackSelector.shouldApplyAudioSelection(id, to: tracks(ofType: \"audio\"))")
+                condition: "TrackSelector.shouldApplyAudioSelection(id, to: tracks(ofType: \"audio\"))",
+                precedingConditions: ["!startMuted"])
                 && mpvSetter?.contains("armSeekCacheHold()") == true)
 
         print("")

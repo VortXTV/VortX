@@ -19,7 +19,8 @@ import com.vortx.android.engine.LegacyWatchedBitfieldMigrationEvidence.SourceRow
  * preferences beside the native projection. This is not a decoder for an unscoped device cache.
  *
  * Unsupported/ambiguous evidence fails closed: no wall-clock mutation stamps, guessed account bindings, guessed
- * library types, opaque-bitfield decoding, or treating a saved-only overlay row as a viewing event.
+ * library types, opaque-bitfield decoding, or treating a saved-only overlay row as a viewing event. A unit
+ * with such evidence is held out of the projection (reported through [held]); it never stops the account.
  */
 internal fun nativeLegacyMaterial(
     document: JSONObject,
@@ -30,6 +31,7 @@ internal fun nativeLegacyMaterial(
     accountScope: VortxAccountScope? = null,
     pendingOwnOverlays: Set<String> = emptySet(),
     watchedMigration: NativeWatchedMigrationBatch? = null,
+    held: MutableList<NativeLegacyHeld>? = null,
 ): JSONObject = withNativeOwnAccountSources(ownAccountSources) {
     watchedMigration?.requireInputs(document, roster, accountScope, ownAccountSources)
     if (ownAccountSources.isNotEmpty() || retainedOwnAccounts != null) {
@@ -37,13 +39,40 @@ internal fun nativeLegacyMaterial(
         require(roster.single { it.isOwner }.id == scope.ownerProfileID && ownAccountSources.all { it.accountID == scope.accountID })
         require(retainedOwnAccounts == null || retainedOwnAccounts.scope == scope) { "Own-account baseline scope changed" }
     }
-    LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
-        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration).build()
+    val adapter = LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
+        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration)
+    adapter.build().also { held?.addAll(adapter.held) }
 }
 
 /** Explicit migration projection: original unresolved membership evidence belongs in the encrypted
  * account archive, not in native membership registers. The strict entry point remains available. */
-internal data class NativeLegacyPreparation(val material: JSONObject, val pendingMembershipReceipts: JSONArray)
+internal data class NativeLegacyPreparation(val material: JSONObject, val pendingMembershipReceipts: JSONArray,
+                                             val held: List<NativeLegacyHeld> = emptyList())
+
+/** A source unit the native projection cannot represent (issue #262): holdable, unlike any other failure. */
+internal class LegacyReconciliationRequired(val reason: String) :
+    IllegalArgumentException("Native migration reconciliation required: $reason")
+
+/**
+ * One source unit (a library row, add-on, intent, overlay entry or watch) the projection could not
+ * represent (issue #262). It is held, never fatal: the unit stays only in the retained original
+ * document, enters no native state, and every other unit still imports. A whole-account stop for one
+ * odd row locked users out of profiles, add-ons and sync together. The kind is a fixed code; the
+ * reason can name a source key, so scrub it before logging. Matches Apple's `Held`.
+ */
+internal data class NativeLegacyHeld(val kind: String, val reason: String)
+
+/** A one-line, value-free summary of held units for diagnostics: `kind:reason(count)` pairs. */
+internal fun nativeLegacyHeldSummary(held: List<NativeLegacyHeld>): String = held
+    .groupingBy { it.kind + ":" + scrubbedLegacyReason(it.reason) }.eachCount()
+    .toSortedMap().entries.joinToString(",") { "${it.key}(${it.value})" }
+
+/** A reconciliation reason as a diagnostics code: any word that is not plain letters becomes `x`. */
+internal fun scrubbedLegacyReason(reason: String): String = reason.split(' ').filter(String::isNotEmpty)
+    .joinToString("_") { word -> if (word.all { it in 'a'..'z' || it in 'A'..'Z' || it == '-' }) word.lowercase() else "x" }
+
+/** Marks an own-account source row this projection could not read, so the adapter holds just that row. */
+internal const val NATIVE_LEGACY_HELD_REASON = "vortxHeldReason"
 
 internal fun prepareNativeLegacyMaterial(
     document: JSONObject,
@@ -59,10 +88,11 @@ internal fun prepareNativeLegacyMaterial(
     require(roster.single { it.isOwner }.id == accountScope.ownerProfileID && ownAccountSources.all { it.accountID == accountScope.accountID })
     require(retainedOwnAccounts == null || retainedOwnAccounts.scope == accountScope) { "Own-account baseline scope changed" }
     val pending = JSONArray()
-    val material = LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
-        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration, pendingMembership = pending).build()
+    val adapter = LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
+        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration, pendingMembership = pending)
+    val material = adapter.build()
     val checked = nativeLegacyMembershipJournal(accountScope, null, pending, roster.map { it.id }.toSet())
-    NativeLegacyPreparation(material, checked.getJSONArray("receipts"))
+    NativeLegacyPreparation(material, checked.getJSONArray("receipts"), adapter.held.toList())
 }
 
 private fun pendingEnvelope(scope: VortxAccountScope, receipts: JSONArray): JSONObject = JSONObject()
@@ -206,6 +236,44 @@ private class LegacyMaterialAdapter(
     private val links = linkedMapOf<String, MutableList<List<String>>>()
     private val watchSources = linkedMapOf<String, MutableMap<String, MutableMap<String, JSONObject>>>()
     private val membershipDigest by lazy { membershipSourceDigest(document) }
+    val held = mutableListOf<NativeLegacyHeld>()
+    /** One undo list per open unit; a held unit replays its own list, a kept one hands it outward. */
+    private val undo = ArrayDeque<MutableList<() -> Unit>>()
+
+    /**
+     * Projects one source unit atomically (issue #262). A unit that needs reconciliation is held:
+     * every effect it made (titles, watches, provenance, pending receipts) is undone, it is recorded,
+     * and the projection continues. Units nest; any other failure still stops the projection.
+     * Returns false when held.
+     */
+    private fun unit(kind: String, body: () -> Unit): Boolean {
+        val watchCounts = watchRows.mapValues { it.value.size }
+        val pendingCount = pendingMembership?.length() ?: 0
+        val heldCount = held.size
+        undo.addLast(mutableListOf())
+        try {
+            body()
+        } catch (error: LegacyReconciliationRequired) {
+            undo.removeLast().asReversed().forEach { it() }
+            // Watches and pending receipts only grow by appending inside a unit.
+            for ((profile, rows) in watchRows) { val keep = watchCounts[profile] ?: 0; while (rows.size > keep) rows.removeAt(rows.size - 1) }
+            pendingMembership?.let { while (it.length() > pendingCount) it.remove(it.length() - 1) }
+            while (held.size > heldCount) held.removeAt(held.size - 1)
+            held += NativeLegacyHeld((if (independentSource) "own_" else "") + kind, error.reason)
+            return false
+        }
+        val effects = undo.removeLast()
+        undo.lastOrNull()?.addAll(effects)
+        return true
+    }
+
+    /** Registers how to undo one effect of the innermost open unit. */
+    private fun onHold(step: () -> Unit) { undo.lastOrNull()?.add(step) }
+
+    /** A row an own-account source could not read arrives as a held marker; hold it here. */
+    private fun heldSource(row: JSONObject) {
+        (row.opt(NATIVE_LEGACY_HELD_REASON) as? String)?.let { fail(it) }
+    }
 
     fun build(): JSONObject {
         // Website patches have not been reconciled into the full legacy carrier. This check must
@@ -222,10 +290,15 @@ private class LegacyMaterialAdapter(
             watchSources[it.id] = linkedMapOf()
         }
         modified?.let { validClock(it, "rosterModifiedSeconds") }
-        val deleted = strings(arrayField(vortx, "deletedProfiles"), "deletedProfiles").map { raw ->
-            profiles.keys.singleOrNull { it.equals(raw, true) }
+        // A tombstone that names no valid UUID can match no profile; hold it rather than the account.
+        val deleted = mutableListOf<String>()
+        val tombstones = arrayField(vortx, "deletedProfiles")
+        for (index in 0 until (tombstones?.length() ?: 0)) unit("deleted_profile") {
+            val raw = (tombstones!!.opt(index) as? String)?.takeIf(String::isNotBlank) ?: fail("Invalid deleted profile identity")
+            val id = profiles.keys.singleOrNull { it.equals(raw, true) }
                 ?: runCatching { UUID.fromString(raw).toString().uppercase() }.getOrElse { fail("Invalid deleted profile identity") }
-        }.distinct()
+            if (id !in deleted) deleted += id
+        }
         requireMaterial(owner.id !in deleted, "Owner profile is tombstoned")
         val ownIDs = roster.filter { it.usesOwnAccount }.map { it.id }.toSet()
         requireMaterial(ownIDs.containsAll(pendingOwnOverlays), "Pending overlay names a foreign profile")
@@ -252,8 +325,9 @@ private class LegacyMaterialAdapter(
             val source = fresh[id]
             val material = source?.let {
                 val isolated = profiles.getValue(id).copy(isOwner = true, usesOwnAccount = false)
-                LegacyMaterialAdapter(it.legacyDocument(), listOf(isolated), null, independentSource = true,
-                    watchedMigration = watchedMigration).build()
+                val adapter = LegacyMaterialAdapter(it.legacyDocument(), listOf(isolated), null, independentSource = true,
+                    watchedMigration = watchedMigration)
+                adapter.build().also { held += adapter.held }
             }
             fun bucket(kind: String): Any = material?.getJSONObject(kind)?.get(id) ?: requireNotNull(retainedOwn).bucket(kind, id)
             addons.put(id, bucket("addons")); libraries.put(id, bucket("libraries"))
@@ -270,9 +344,15 @@ private class LegacyMaterialAdapter(
     }
 
     private fun profile(profile: UserProfile, own: JSONObject? = null): JSONObject {
-        requireMaterial(profile.textScale.isFinite() && profile.textScale > 0 && profile.textScale <= 100, "Invalid profile text scale")
+        // A profile cannot be held, only a preference it carries: an unrepresentable one keeps its
+        // native default and stays in the retained roster.
+        var textScale = 1000L
+        unit("profile_setting") {
+            requireMaterial(profile.textScale.isFinite() && profile.textScale > 0 && profile.textScale <= 100, "Invalid profile text scale")
+            textScale = (profile.textScale * 1000).roundToLong()
+        }
         val settings = JSONObject().put("accent", profile.accentID).put("oled", profile.oled)
-            .put("textScale", (profile.textScale * 1000).roundToLong())
+            .put("textScale", textScale)
             .put("languages", JSONArray(listOfNotNull(profile.playback?.audioLang?.takeIf(String::isNotBlank), profile.playback?.subtitleLang?.takeIf(String::isNotBlank)).distinct()))
             .put("disabledAddons", JSONArray(profile.disabledAddons.orEmpty()))
         val account = if (own != null) JSONObject().put("kind", "own").put("value", own.getString("verifiedStreamingUid"))
@@ -289,15 +369,19 @@ private class LegacyMaterialAdapter(
 
     private fun addonBucket(): JSONObject {
         val descriptors = linkedMapOf<String, JSONObject>()
-        for (rows in listOf(arrayField(vortx, "addons"), arrayField(document, "addons"))) {
-            objects(rows, "addons").forEach { row ->
+        for (rows in listOfNotNull(arrayField(vortx, "addons"), arrayField(document, "addons"))) {
+            for (index in 0 until rows.length()) unit("addon") {
+                val row = rows.optJSONObject(index) ?: fail("Malformed addons row")
+                heldSource(row)
                 val url = string(row, "transportUrl")
                 val uri = runCatching { URI(url) }.getOrNull()
                 requireMaterial(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.rawUserInfo == null && uri.rawFragment == null,
                     "Unsupported add-on transport URL")
-                PublicAddressPolicy.requireLiteralPublicOrHostname(uri!!.host)
+                requireAddonHost(uri!!.host)
                 val manifest = objectField(row, "manifest") ?: fail("URL-only add-on requires manifest reconciliation")
                 string(manifest, "id"); string(manifest, "name")
+                // Checked per descriptor so one credential-bearing manifest holds only itself.
+                requireNoCredentials(row)
                 val identity = AddonOrder.normalize(url)
                 descriptors.putIfAbsent(identity, JSONObject(row.toString()).put("transportUrl", identity))
             }
@@ -307,7 +391,7 @@ private class LegacyMaterialAdapter(
             val uri = runCatching { URI(normalized) }.getOrNull()
             requireMaterial(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() &&
                 uri.rawUserInfo == null && uri.rawFragment == null, "Unsupported add-on transport URL")
-            PublicAddressPolicy.requireLiteralPublicOrHostname(uri!!.host)
+            requireAddonHost(uri!!.host)
             // Old tombstone writers lowercased the entire URL. Match only a UNIQUE actual descriptor;
             // never lowercase configured paths or percent-encoded secrets in the native identity.
             val matches = descriptors.keys.filter { it.lowercase() == normalized.lowercase() }
@@ -317,54 +401,74 @@ private class LegacyMaterialAdapter(
             return matches.singleOrNull() ?: normalized
         }
         val intents = linkedMapOf<String, JSONObject>()
-        objectField(vortx, "deletedAddonsTs")?.let { stamps -> for (raw in stamps.keys()) {
-            val entry = stamps.optJSONObject(raw) ?: fail("Malformed add-on intent")
-            requireMaterial(entry.keys().asSequence().toSet().all { it in setOf("addedAt", "removedAt", "intentV3") }, "Unsupported add-on intent fields")
-            for (field in listOf("addedAt", "removedAt")) if (entry.has(field) && !entry.isNull(field)) validateAddonTime(entry.get(field))
-            val url = resolve(raw)
-            val target = intents.getOrPut(url) { JSONObject().put("transportUrl", url) }
-            mergeClock(entry, target, "addedAt", "addedAtMs"); mergeClock(entry, target, "removedAt", "removedAtMs")
-            if (entry.has("intentV3")) {
-                val v3 = entry.getJSONObject("intentV3")
-                validateAddonV3(v3)
-                val prior = target.optJSONObject("intentV3")
-                // Preserve all causal metadata for the shared kernel's bootstrap reducer. The V3
-                // winner can legitimately disagree with scalar maxima; never fabricate a clock.
-                target.put("intentV3", if (prior == null) NativeWebsiteAddonEdits.detached(v3) else mergeAddonV3(prior, v3))
+        val stamps = objectField(vortx, "deletedAddonsTs")
+        // Spellings of one URL merge into one intent, so they are held or kept together.
+        val spellings = linkedMapOf<String, MutableList<String>>()
+        stamps?.keys()?.asSequence()?.toList()?.forEach { raw ->
+            unit("addon_intent") { spellings.getOrPut(resolve(raw)) { mutableListOf() } += raw }
+        }
+        for ((url, raws) in spellings) unit("addon_intent") {
+            val target = JSONObject().put("transportUrl", url)
+            for (raw in raws) {
+                val entry = requireNotNull(stamps).optJSONObject(raw) ?: fail("Malformed add-on intent")
+                requireMaterial(entry.keys().asSequence().toSet().all { it in setOf("addedAt", "removedAt", "intentV3") }, "Unsupported add-on intent fields")
+                for (field in listOf("addedAt", "removedAt")) if (entry.has(field) && !entry.isNull(field)) validateAddonTime(entry.get(field))
+                mergeClock(entry, target, "addedAt", "addedAtMs"); mergeClock(entry, target, "removedAt", "removedAtMs")
+                if (entry.has("intentV3")) {
+                    val v3 = entry.optJSONObject("intentV3") ?: fail("Unsupported V3 add-on intent")
+                    validateAddonV3(v3)
+                    val prior = target.optJSONObject("intentV3")
+                    // Preserve all causal metadata for the shared kernel's bootstrap reducer. The V3
+                    // winner can legitimately disagree with scalar maxima; never fabricate a clock.
+                    target.put("intentV3", if (prior == null) NativeWebsiteAddonEdits.detached(v3) else mergeAddonV3(prior, v3))
+                }
             }
-        } }
-        for (raw in strings(arrayField(vortx, "deletedAddons"), "deletedAddons")) {
+            intents[url] = target
+        }
+        val deletedRows = arrayField(vortx, "deletedAddons")
+        for (index in 0 until (deletedRows?.length() ?: 0)) unit("addon_removal") {
+            val raw = (deletedRows!!.opt(index) as? String)?.takeIf(String::isNotBlank) ?: fail("Malformed deletedAddons identity")
             val url = resolve(raw)
             // Exact shipping AddonTombstones.MIGRATION_EPOCH_MS, not a fabricated viewing/now clock.
             if (!hasPositiveIntent(intents[url]) && intents[url]?.has("intentV3") != true)
                 intents.getOrPut(url) { JSONObject().put("transportUrl", url) }.put("removedAtMs", 1.0)
         }
         val pendingURLs = hashSetOf<String>()
-        for ((url, intent) in intents) {
-            val v3 = intent.optJSONObject("intentV3")
-            val present = if (v3 != null) v3.getString("state") == "present" else
-                intent.optDouble("addedAtMs", 0.0) > intent.optDouble("removedAtMs", 0.0)
-            if (present && url !in descriptors) {
-                requireMaterial(pendingMembership != null && v3 == null, "Present add-on intent requires an installed descriptor")
-                pendingURLs += url
-                val stamps = objectField(vortx, "deletedAddonsTs")!!
-                for (raw in stamps.keys().asSequence().filter { resolve(it) == url }.sorted())
-                    retainMembership("addon_install", raw, "/vortx/deletedAddonsTs", stamps.getJSONObject(raw))
+        for ((url, intent) in intents.entries.toList()) {
+            val kept = unit("addon_intent") {
+                val v3 = intent.optJSONObject("intentV3")
+                val present = if (v3 != null) v3.getString("state") == "present" else
+                    intent.optDouble("addedAtMs", 0.0) > intent.optDouble("removedAtMs", 0.0)
+                if (present && url !in descriptors) {
+                    requireMaterial(pendingMembership != null && v3 == null, "Present add-on intent requires an installed descriptor")
+                    for (raw in spellings[url].orEmpty().sorted())
+                        retainMembership("addon_install", raw, "/vortx/deletedAddonsTs", requireNotNull(stamps).getJSONObject(raw))
+                    pendingURLs += url
+                }
             }
+            if (!kept) intents.remove(url)
         }
-        for (raw in strings(arrayField(document, "webAddonRemovals"), "webAddonRemovals")) {
+        val webRows = arrayField(document, "webAddonRemovals")
+        for (index in 0 until (webRows?.length() ?: 0)) unit("addon_web_removal") {
+            val raw = (webRows!!.opt(index) as? String)?.takeIf(String::isNotBlank) ?: fail("Malformed webAddonRemovals identity")
             val url = resolve(raw)
             if (pendingMembership != null && url !in descriptors) {
                 retainMembership("addon_install", raw, "/webAddonRemovals", raw)
-                continue
+                return@unit
             }
             // Shipping code mints a local clock for an unseen web removal. Migration is pure: a real
             // timestamp must be reconciled by the account layer rather than fabricated here.
             requireMaterial(hasPositiveIntent(intents[url]) || intents[url]?.has("intentV3") == true,
                 "Unclocked web add-on removal requires reconciliation")
         }
-        val order = strings(arrayField(document, "addonOrder"), "addonOrder").map(::resolve).distinct()
-        requireMaterial(pendingURLs.none(order::contains), "Ordered add-on requires descriptor reconciliation")
+        val order = mutableListOf<String>()
+        val orderRows = arrayField(document, "addonOrder")
+        for (index in 0 until (orderRows?.length() ?: 0)) unit("addon_order") {
+            val raw = (orderRows!!.opt(index) as? String)?.takeIf(String::isNotBlank) ?: fail("Malformed addonOrder identity")
+            val url = resolve(raw)
+            requireMaterial(url !in pendingURLs, "Ordered add-on requires descriptor reconciliation")
+            if (url !in order) order += url
+        }
         pendingURLs.forEach(intents::remove)
         return JSONObject().put("items", JSONArray(descriptors.values)).put("order", JSONArray(order)).put("intents", JSONArray(intents.values))
     }
@@ -372,7 +476,9 @@ private class LegacyMaterialAdapter(
     private fun validateAddonV3(value: JSONObject) {
         requireMaterial(value.keys().asSequence().toSet() == setOf("version", "counter", "eventId", "state", "wallTime", "legacyRemovedSeen", "legacyAddedSeen"), "Unsupported V3 add-on intent")
         requireMaterial(value.get("version") is Number && BigDecimal(value.get("version").toString()).compareTo(BigDecimal(3)) == 0, "Unsupported add-on intent version")
-        NativeWebsiteAddonEdits.requireCounter(value.get("counter"))
+        // The shared website validator raises a plain failure; here it is a holdable reconciliation.
+        try { NativeWebsiteAddonEdits.requireCounter(value.get("counter")) }
+        catch (_: IllegalArgumentException) { fail("Malformed add-on intent counter") }
         requireMaterial(value.get("eventId") is String && Regex("[0-9a-f]{32}").matches(value.getString("eventId")), "Malformed add-on event ID")
         requireMaterial(value.get("state") in setOf("present", "removed"), "Malformed add-on intent state")
         for (field in listOf("wallTime", "legacyRemovedSeen", "legacyAddedSeen")) validateAddonTime(value.get(field))
@@ -396,43 +502,52 @@ private class LegacyMaterialAdapter(
     }
 
     private fun ownerLibrary(): JSONObject {
-        val rows = objects(arrayField(vortx, "library") ?: arrayField(document, "library"), "owner library")
+        val rows = arrayField(vortx, "library") ?: arrayField(document, "library")
         val items = linkedMapOf<String, JSONObject>()
         val intents = linkedMapOf<String, JSONObject>()
         val seen = hashSetOf<String>()
-        val declaredRemoved = hashSetOf<String>()
-        for ((index, row) in rows.withIndex()) {
+        val declaredRemoved = linkedSetOf<String>()
+        for (index in 0 until (rows?.length() ?: 0)) unit("library_row") {
+            val row = rows!!.optJSONObject(index) ?: fail("Malformed owner library row")
+            heldSource(row)
             val id = string(row, "id"); val type = contentType(row)
-            known(owner.id, id, type)
             val key = "$type:$id"
-            requireMaterial(seen.add(key), "Duplicate owner library identity")
+            requireMaterial(key !in seen, "Duplicate owner library identity")
+            known(owner.id, id, type)
             val item = JSONObject().put("kind", "standard").put("id", id).put("type", type).put("name", optionalString(row, "name").orEmpty())
             optionalString(row, "poster")?.takeIf(String::isNotEmpty)?.let { item.put("poster", it) }
             // Keep the descriptor as payload; membership clocks below decide visibility. A viewing
             // clock is never evidence for a library deletion, even if this snapshot says removed.
             val removed = optionalBoolean(row, "removed") == true
+            val temporary = optionalBoolean(row, "temp") == true
+            val locator = if (independentSource) WatchedLocator.OwnAccountLibraryResponse(index)
+                else if (arrayField(vortx, "library") != null) WatchedLocator.AuthenticatedOwnerLibrary(index)
+                else WatchedLocator.AuthenticatedLegacyRootLibrary(index)
+            // Viewing state is its own unit: a progress record the engine cannot represent is held
+            // without dropping the title's saved membership.
+            unit("library_progress") { importWatch(owner.id, id, row, ownerRow = true, locator = locator) }
+            seen += key
             if (independentSource) {
                 // Initial full-source absence evidence only. No _mtime/lastWatched deletion clock.
                 // The kernel rejects a newly observed weak deletion after acknowledged live data.
                 if (removed) intents[key] = JSONObject().put("key", key).put("removedAtMs", 1)
-                else if (optionalBoolean(row, "temp") != true) items[key] = item
+                else if (!temporary) items[key] = item
             } else {
                 items[key] = item
                 if (removed) declaredRemoved += key
             }
-            val locator = if (independentSource) WatchedLocator.OwnAccountLibraryResponse(index)
-                else if (arrayField(vortx, "library") != null) WatchedLocator.AuthenticatedOwnerLibrary(index)
-                else WatchedLocator.AuthenticatedLegacyRootLibrary(index)
-            importWatch(owner.id, id, row, ownerRow = true, locator = locator)
         }
         val historyProfiles = objectField(vortx, "byProfile")
         val historyKeys = historyProfiles?.keys()?.asSequence().orEmpty().filter {
             it.equals(owner.id, true) || !independentSource && it.equals(UserProfile.OWNER_ID, true)
         }.toList()
-        requireMaterial(historyKeys.groupBy { it.uppercase() }.values.all { it.size == 1 }, "Ambiguous owner history profile identity")
-        for (sourceProfileID in historyKeys) {
+        val ambiguousHistory = historyKeys.groupBy { it.uppercase() }.filterValues { it.size > 1 }.keys
+        for (sourceProfileID in historyKeys) unit("owner_history") {
+            requireMaterial(sourceProfileID.uppercase() !in ambiguousHistory, "Ambiguous owner history profile identity")
             val historyBucket = objectField(requireNotNull(historyProfiles), sourceProfileID)
-            for ((index, row) in objects(historyBucket?.let { arrayField(it, "ownerHistory") }, "owner history").withIndex()) {
+            val historyRows = historyBucket?.let { arrayField(it, "ownerHistory") }
+            for (index in 0 until (historyRows?.length() ?: 0)) unit("owner_history") {
+                val row = historyRows!!.optJSONObject(index) ?: fail("Malformed owner history row")
                 val id = string(row, "id"); known(owner.id, id, contentType(row))
                 importWatch(owner.id, id, row, ownerRow = true, historyOnly = true,
                     locator = if (independentSource) WatchedLocator.OwnAccountOwnerHistory(index)
@@ -447,23 +562,32 @@ private class LegacyMaterialAdapter(
             if (matched.isEmpty()) return null
             return "${matched.single().value}:${matched.single().key}"
         }
-        objectField(vortx, "deletedLibraryTs")?.let { stamps -> for (raw in stamps.keys()) {
+        val stamps = objectField(vortx, "deletedLibraryTs")
+        stamps?.keys()?.asSequence()?.toList()?.forEach { raw -> unit("library_intent") {
             val entry = stamps.optJSONObject(raw) ?: fail("Malformed library intent")
             requireMaterial(entry.keys().asSequence().toSet().all { it in setOf("addedAt", "removedAt") }, "Unsupported library intent fields")
             clockField(entry, "addedAt"); clockField(entry, "removedAt")
             val key = keyFor(raw)
-            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibraryTs", entry); continue }
+            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibraryTs", entry); return@unit }
             val target = intents.getOrPut(key) { JSONObject().put("key", key) }
             mergeClock(entry, target, "addedAt", "addedAtMs"); mergeClock(entry, target, "removedAt", "removedAtMs")
         } }
-        for (raw in strings(arrayField(vortx, "deletedLibrary"), "deletedLibrary")) {
+        val deletes = arrayField(vortx, "deletedLibrary")
+        for (index in 0 until (deletes?.length() ?: 0)) unit("library_removal") {
+            val raw = (deletes!!.opt(index) as? String)?.takeIf(String::isNotBlank) ?: fail("Malformed deletedLibrary identity")
             val key = keyFor(raw)
-            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibrary", raw); continue }
+            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibrary", raw); return@unit }
             // Exact shipping LibraryTombstones.MIGRATION_EPOCH_MS, not a fabricated viewing/now clock.
             if (!hasPositiveIntent(intents[key])) intents.getOrPut(key) { JSONObject().put("key", key) }.put("removedAtMs", 1.0)
         }
-        requireMaterial(declaredRemoved.all { (intents[it]?.opt("removedAtMs") as? Number)?.toDouble()?.let { at -> at > 0 } == true },
-            "Owner removed row requires explicit library removal intent; viewing clocks are not removal clocks")
+        for (key in declaredRemoved) {
+            // A removed row without its tombstone is neither saved nor removed, as on Apple.
+            val kept = unit("library_row") {
+                requireMaterial((intents[key]?.opt("removedAtMs") as? Number)?.toDouble()?.let { at -> at > 0 } == true,
+                    "Owner removed row requires explicit library removal intent; viewing clocks are not removal clocks")
+            }
+            if (!kept) items.remove(key)
+        }
         return JSONObject().put("items", JSONArray(items.values)).put("intents", JSONArray(intents.values))
     }
 
@@ -479,47 +603,62 @@ private class LegacyMaterialAdapter(
         val byProfile = objectField(vortx, "byProfile") ?: JSONObject()
         val webRemoved = objectField(document, "webProgress")?.let { objectField(it, "removed") }?.let { objectField(it, "byProfile") } ?: JSONObject()
         for (rawID in (byProfile.keys().asSequence().toList() + webRemoved.keys().asSequence().toList()).distinct()) {
-            // A VortX overlay cannot establish an independent streaming account's ownership.
-            if (profiles.values.any { it.usesOwnAccount && it.id.equals(rawID, true) }) continue
-            val bucket = objectField(byProfile, rawID) ?: JSONObject()
-            // The fixed historical owner-history bucket is a carrier, not a second profile identity.
-            if (rawID == UserProfile.OWNER_ID && rawID !in profiles) {
-                requireMaterial(bucket.keys().asSequence().none { it in setOf("library", "watched", "removed") }, "Ambiguous historical owner overlay")
-                continue
-            }
-            val id = profiles.keys.singleOrNull { it.equals(rawID, true) } ?: fail("Watch carrier references an unknown profile")
-            val rows = objects(arrayField(bucket, "library"), "overlay library")
-            val railTitles = rows.map { string(it, "id") }.toSet()
-            for ((index, row) in rows.withIndex()) {
-                val metaId = string(row, "id"); known(id, metaId, contentType(row))
-                importWatch(id, metaId, row, ownerRow = false,
-                    overlaySourceField = "/vortx/byProfile/$rawID/library/$index",
-                    sourcePointer = "/vortx/byProfile/$rawID/library/$index",
-                    locator = if (independentSource) WatchedLocator.OwnAccountProfileLibrary(index)
-                        else WatchedLocator.AuthenticatedProfileLibrary(index))
-            }
-            objectField(bucket, "watched")?.let { map -> for (metaId in map.keys()) {
-                requireMaterial(metaId.isNotBlank(), "Empty durable watch identity")
-                // Account-document ingress uses this ENTIRE carrier only beyond the library rail.
-                // A stale overlapping durable row must not override the current full snapshot.
-                if (metaId !in railTitles) importMarks(id, metaId, map.optJSONObject(metaId) ?: fail("Malformed durable watched row"),
-                    sourceField = "/vortx/byProfile/$rawID/watched/${pointerComponent(metaId)}")
-            } }
-            val removals = objects(arrayField(bucket, "removed"), "overlay removals").mapIndexed { index, row -> row to "/vortx/byProfile/$rawID/removed/$index" } +
-                objects(arrayField(webRemoved, rawID), "web overlay removals").mapIndexed { index, row -> row to "/webProgress/removed/byProfile/$rawID/$index" }
-            for ((removal, sourceField) in removals) {
-                val keys = strings(arrayField(removal, "keys"), "removal identity keys")
-                requireMaterial(keys.isNotEmpty(), "Empty watch removal identity")
-                val at = clockField(removal, "removedAt") ?: fail("Unclocked watch removal")
-                val matches = knownTitles.getValue(id).filter { (metaId, type) -> keys.any { key -> removalMatches(key, metaId, type) } }
-                requireMaterial(matches.size == 1 && keys.all { key -> matches.any { (metaId, type) -> removalMatches(key, metaId, type) } }, "Watch removal requires verified title reconciliation")
-                matches.forEach { (metaId, type) ->
-                    val row = JSONObject().put("metaId", metaId).put("type", type).put("removedAtMs", at)
-                    watchRows.getValue(id).add(row); recordWatchSource(id, metaId, sourceField, removal)
-                }
+            // A bucket whose profile cannot be resolved is held whole; its rows hold one by one.
+            unit("profile_overlay") { importOverlay(rawID, byProfile, webRemoved) }
+        }
+    }
+
+    private fun importOverlay(rawID: String, byProfile: JSONObject, webRemoved: JSONObject) {
+        // A VortX overlay cannot establish an independent streaming account's ownership.
+        if (profiles.values.any { it.usesOwnAccount && it.id.equals(rawID, true) }) return
+        val bucket = objectField(byProfile, rawID) ?: JSONObject()
+        // The fixed historical owner-history bucket is a carrier, not a second profile identity.
+        if (rawID == UserProfile.OWNER_ID && rawID !in profiles) {
+            requireMaterial(bucket.keys().asSequence().none { it in setOf("library", "watched", "removed") }, "Ambiguous historical owner overlay")
+            return
+        }
+        val id = profiles.keys.singleOrNull { it.equals(rawID, true) } ?: fail("Watch carrier references an unknown profile")
+        val rows = arrayField(bucket, "library")
+        // Every rail title, held or not, outranks its duplicate durable row below.
+        val railTitles = (0 until (rows?.length() ?: 0)).mapNotNull { index ->
+            rows!!.optJSONObject(index)?.let { optionalTitle(it) }
+        }.toSet()
+        for (index in 0 until (rows?.length() ?: 0)) unit("profile_overlay_row") {
+            val row = rows!!.optJSONObject(index) ?: fail("Malformed overlay library row")
+            val metaId = string(row, "id"); known(id, metaId, contentType(row))
+            importWatch(id, metaId, row, ownerRow = false,
+                overlaySourceField = "/vortx/byProfile/$rawID/library/$index",
+                sourcePointer = "/vortx/byProfile/$rawID/library/$index",
+                locator = if (independentSource) WatchedLocator.OwnAccountProfileLibrary(index)
+                    else WatchedLocator.AuthenticatedProfileLibrary(index))
+        }
+        objectField(bucket, "watched")?.let { map -> for (metaId in map.keys().asSequence().toList()) unit("profile_overlay_watched") {
+            requireMaterial(metaId.isNotBlank(), "Empty durable watch identity")
+            // Account-document ingress uses this ENTIRE carrier only beyond the library rail.
+            // A stale overlapping durable row must not override the current full snapshot.
+            if (metaId !in railTitles) importMarks(id, metaId, map.optJSONObject(metaId) ?: fail("Malformed durable watched row"),
+                sourceField = "/vortx/byProfile/$rawID/watched/${pointerComponent(metaId)}")
+        } }
+        val removalCarriers = listOf(arrayField(bucket, "removed") to "/vortx/byProfile/$rawID/removed/",
+            arrayField(webRemoved, rawID) to "/webProgress/removed/byProfile/$rawID/")
+        for ((carrier, prefix) in removalCarriers) for (index in 0 until (carrier?.length() ?: 0)) unit("profile_overlay_removal") {
+            val removal = carrier!!.optJSONObject(index) ?: fail("Malformed overlay removals row")
+            val sourceField = prefix + index
+            val keys = strings(arrayField(removal, "keys"), "removal identity keys")
+            requireMaterial(keys.isNotEmpty(), "Empty watch removal identity")
+            val at = clockField(removal, "removedAt") ?: fail("Unclocked watch removal")
+            val matches = knownTitles.getValue(id).filter { (metaId, type) -> keys.any { key -> removalMatches(key, metaId, type) } }
+            requireMaterial(matches.size == 1 && keys.all { key -> matches.any { (metaId, type) -> removalMatches(key, metaId, type) } }, "Watch removal requires verified title reconciliation")
+            matches.forEach { (metaId, type) ->
+                val row = JSONObject().put("metaId", metaId).put("type", type).put("removedAtMs", at)
+                watchRows.getValue(id).add(row); recordWatchSource(id, metaId, sourceField, removal)
             }
         }
     }
+
+    /** A rail row's title when it names one; a row without one is held in its own unit. */
+    private fun optionalTitle(row: JSONObject): String? =
+        (row.opt("id") as? String)?.takeIf(String::isNotBlank)
 
     private fun importWatch(profile: String, metaId: String, raw: JSONObject, ownerRow: Boolean, historyOnly: Boolean = false,
                             locator: WatchedLocator, overlaySourceField: String? = null, sourcePointer: String? = null) {
@@ -575,53 +714,66 @@ private class LegacyMaterialAdapter(
     private fun resolveWatchRows(profileID: String, source: List<JSONObject>): List<JSONObject> {
         val conflicts = source.groupBy { optionalString(it, "videoId") ?: it.getString("metaId") }
             .filterValues { rows -> rows.map { it.getString("metaId") }.distinct().size > 1 }.keys
-        requireMaterial(conflicts.isEmpty() || pendingMembership != null, "Watch unit belongs to conflicting title identities")
-        for (unit in conflicts.sorted()) {
-            val originals = watchSources.getValue(profileID)[unit].orEmpty()
-            requireMaterial(originals.isNotEmpty(), "Watch conflict lacks original source provenance")
-            val receipts = JSONArray(originals.toSortedMap().map { (field, raw) ->
-                JSONObject().put("sourceField", field).put("receipt", raw)
-            })
-            retainMembership("watch_identity_conflict", unit, "/vortx/byProfile/$profileID/watch_identity_conflicts",
-                JSONObject().put("sources", receipts), profileID)
+        for (identity in conflicts.sorted()) {
+            // Either way the conflicting unit leaves the projection: as a pending receipt, or held.
+            unit("watch") {
+                requireMaterial(pendingMembership != null, "Watch unit belongs to conflicting title identities")
+                val originals = watchSources.getValue(profileID)[identity].orEmpty()
+                requireMaterial(originals.isNotEmpty(), "Watch conflict lacks original source provenance")
+                val receipts = JSONArray(originals.toSortedMap().map { (field, raw) ->
+                    JSONObject().put("sourceField", field).put("receipt", raw)
+                })
+                retainMembership("watch_identity_conflict", identity, "/vortx/byProfile/$profileID/watch_identity_conflicts",
+                    JSONObject().put("sources", receipts), profileID)
+            }
         }
         val units = sortedMapOf<String, JSONObject>()
+        val contradicted = hashSetOf<String>()
         for (incoming in source) {
             val metaId = incoming.getString("metaId")
             val key = optionalString(incoming, "videoId") ?: metaId
-            if (key in conflicts) continue
+            if (key in conflicts || key in contradicted) continue
             val previous = units[key]
             if (previous == null) { units[key] = JSONObject(incoming.toString()); continue }
-            requireMaterial(previous.getString("metaId") == metaId, "Watch unit belongs to conflicting title identities")
-            val oldType = optionalString(previous, "type"); val newType = optionalString(incoming, "type")
-            requireMaterial(oldType == null || newType == null || oldType == newType, "Watch unit belongs to conflicting content types")
-            val incomingClock = clockField(incoming, "lastPlayedAtMs") ?: 0.0
-            val priorClock = clockField(previous, "lastPlayedAtMs") ?: 0.0
-            requireMaterial(incomingClock <= 0 || incomingClock != priorClock ||
-                !incoming.has("positionMs") || !previous.has("positionMs") || incoming.getLong("positionMs") == previous.getLong("positionMs"),
-                "Conflicting equal-clock progress requires reconciliation")
-            if (incomingClock > priorClock) {
-                for (field in listOf("lastPlayedAtMs", "positionMs")) {
-                    if (incoming.has(field)) previous.put(field, incoming.get(field)) else previous.remove(field)
-                }
-                if (incoming.has("durationMs")) previous.put("durationMs", incoming.get("durationMs"))
+            // A unit whose rows contradict each other is held as a whole; every other unit resolves.
+            try { mergeWatchRow(previous, incoming, metaId) } catch (error: LegacyReconciliationRequired) {
+                contradicted += key; units.remove(key)
+                held += NativeLegacyHeld((if (independentSource) "own_" else "") + "watch", error.reason)
             }
-            for (field in listOf("videoId", "name", "type", "poster")) {
-                val text = optionalString(incoming, field)
-                if (!text.isNullOrEmpty() && (incomingClock > priorClock || optionalString(previous, field).isNullOrEmpty())) previous.put(field, text)
-            }
-            for (field in listOf("markedAtMs", "resetAtMs", "removedAtMs", "timesWatched")) {
-                (incoming.opt(field) as? Number)?.let { number ->
-                    if (!previous.has(field) || number.toDouble() > (previous.get(field) as Number).toDouble()) previous.put(field, number)
-                }
-            }
-            if (incoming.opt("watched") == true) previous.put("watched", true)
         }
         units.values.forEach { row ->
             // Any explicit mark/unmark clock is more authoritative than a legacy clock-less set.
             if (row.has("markedAtMs") || row.has("resetAtMs")) row.remove("watched")
         }
         return units.values.toList()
+    }
+
+    /** Folds one more row into its unit; throws when the two rows contradict each other. */
+    private fun mergeWatchRow(previous: JSONObject, incoming: JSONObject, metaId: String) {
+        requireMaterial(previous.getString("metaId") == metaId, "Watch unit belongs to conflicting title identities")
+        val oldType = optionalString(previous, "type"); val newType = optionalString(incoming, "type")
+        requireMaterial(oldType == null || newType == null || oldType == newType, "Watch unit belongs to conflicting content types")
+        val incomingClock = clockField(incoming, "lastPlayedAtMs") ?: 0.0
+        val priorClock = clockField(previous, "lastPlayedAtMs") ?: 0.0
+        requireMaterial(incomingClock <= 0 || incomingClock != priorClock ||
+            !incoming.has("positionMs") || !previous.has("positionMs") || incoming.getLong("positionMs") == previous.getLong("positionMs"),
+            "Conflicting equal-clock progress requires reconciliation")
+        if (incomingClock > priorClock) {
+            for (field in listOf("lastPlayedAtMs", "positionMs")) {
+                if (incoming.has(field)) previous.put(field, incoming.get(field)) else previous.remove(field)
+            }
+            if (incoming.has("durationMs")) previous.put("durationMs", incoming.get("durationMs"))
+        }
+        for (field in listOf("videoId", "name", "type", "poster")) {
+            val text = optionalString(incoming, field)
+            if (!text.isNullOrEmpty() && (incomingClock > priorClock || optionalString(previous, field).isNullOrEmpty())) previous.put(field, text)
+        }
+        for (field in listOf("markedAtMs", "resetAtMs", "removedAtMs", "timesWatched")) {
+            (incoming.opt(field) as? Number)?.let { number ->
+                if (!previous.has(field) || number.toDouble() > (previous.get(field) as Number).toDouble()) previous.put(field, number)
+            }
+        }
+        if (incoming.opt("watched") == true) previous.put("watched", true)
     }
 
     private fun importMarks(profile: String, metaId: String, raw: JSONObject, decoded: List<String> = emptyList(), sourceField: String? = null) {
@@ -651,18 +803,24 @@ private class LegacyMaterialAdapter(
     private fun importOwnerIntents() {
         val raw = objectField(vortx, "ownerWatched") ?: return
         data class Intent(val title: String, val video: String, val watched: Boolean, val at: Double, val actor: String)
-        val winners = linkedMapOf<Pair<String, String>, Intent>()
-        for (key in raw.keys()) {
+        val candidates = linkedMapOf<Pair<String, String>, MutableList<Triple<String, JSONObject, Intent>>>()
+        for (key in raw.keys().asSequence().toList()) unit("owner_watched_intent") {
             val row = raw.optJSONObject(key) ?: fail("Malformed owner watched intent")
             val intent = Intent(string(row, "t"), string(row, "v"), optionalBoolean(row, "w") ?: fail("Missing watched intent"),
                 clockField(row, "u") ?: fail("Unclocked owner watched intent"), string(row, "a"))
-            recordWatchSource(owner.id, intent.video, "/vortx/ownerWatched/${pointerComponent(key)}", row)
-            val identity = intent.title to intent.video; val prior = winners[identity]
-            requireMaterial(prior == null || intent.at != prior.at || intent.actor != prior.actor || intent.watched == prior.watched,
-                "Contradictory equal-clock owner intent requires reconciliation")
-            if (prior == null || intent.at > prior.at || intent.at == prior.at && intent.actor > prior.actor) winners[identity] = intent
+            candidates.getOrPut(intent.title to intent.video) { mutableListOf() } += Triple(key, row, intent)
         }
-        for (intent in winners.values) {
+        // Every intent for one title/video is decided together, so a tie conflict holds them all.
+        for (group in candidates.values) unit("owner_watched_intent") {
+            var winner: Intent? = null
+            for ((key, row, intent) in group) {
+                recordWatchSource(owner.id, intent.video, "/vortx/ownerWatched/${pointerComponent(key)}", row)
+                val prior = winner
+                requireMaterial(prior == null || intent.at != prior.at || intent.actor != prior.actor || intent.watched == prior.watched,
+                    "Contradictory equal-clock owner intent requires reconciliation")
+                if (prior == null || intent.at > prior.at || intent.at == prior.at && intent.actor > prior.actor) winner = intent
+            }
+            val intent = winner ?: return@unit
             val type = knownTitles.getValue(owner.id)[intent.title]
             requireMaterial(intent.title != intent.video || type == "movie", "Whole-title owner intent requires verified movie or episode reconciliation")
             val row = JSONObject().put("metaId", intent.title).put("videoId", intent.video)
@@ -673,15 +831,19 @@ private class LegacyMaterialAdapter(
 
     private fun recordWatchSource(profile: String, unit: String, sourceField: String, raw: JSONObject) {
         if (pendingMembership == null) return
-        watchSources.getValue(profile).getOrPut(unit) { linkedMapOf() }.putIfAbsent(sourceField,
-            NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(raw)))
+        val fields = watchSources.getValue(profile).getOrPut(unit) { linkedMapOf() }
+        if (sourceField in fields) return
+        fields[sourceField] = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(raw))
+        onHold { fields.remove(sourceField) }
     }
 
     private fun pointerComponent(value: String): String = value.replace("~", "~0").replace("/", "~1")
 
     private fun known(profile: String, metaId: String, type: String) {
-        val previous = knownTitles.getValue(profile).putIfAbsent(metaId, type)
+        val titles = knownTitles.getValue(profile)
+        val previous = titles[metaId]
         requireMaterial(previous == null || previous == type, "Same media ID has conflicting movie/series ownership")
+        if (previous == null) { titles[metaId] = type; onHold { titles.remove(metaId) } }
     }
 
     private fun removalMatches(key: String, metaId: String, type: String): Boolean {
@@ -694,7 +856,12 @@ private class LegacyMaterialAdapter(
     }
 }
 
-private fun fail(message: String): Nothing = throw IllegalArgumentException("Native migration reconciliation required: $message")
+private fun fail(message: String): Nothing = throw LegacyReconciliationRequired(message)
+/** Saved private add-ons are representable; malformed and special endpoints still hold only their own row. */
+private fun requireAddonHost(host: String) {
+    try { PublicAddressPolicy.requireAddonLiteralOrHostname(host.removeSurrounding("[", "]")) }
+    catch (_: java.net.UnknownHostException) { fail("Unsupported add-on transport URL") }
+}
 private fun requireMaterial(condition: Boolean, message: String) { if (!condition) fail(message) }
 private fun objectField(root: JSONObject, key: String): JSONObject? {
     if (!root.has(key) || root.isNull(key)) return null

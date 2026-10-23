@@ -1,0 +1,500 @@
+{
+  "schema": 1,
+  "producer": {
+    "repository": "https://github.com/VortXTV/VortX",
+    "commit": "5b36cea26f1c204681e47438ce89c8c4693887c8",
+    "runId": 39569330051,
+    "attempt": 1,
+    "jobId": 119119285598,
+    "artifactId": 12333961054,
+    "artifactBytes": 178936583,
+    "artifactSHA256": "f18c2a090e583538920c5782af51b24c1cfb375a8be4088c6ddb7939705edf9f"
+  },
+  "artifactMembers": [
+    "apple-artifact-gate.txt",
+    "artifact-sha256.json",
+    "apple-original-library-zips.tar",
+    "apple-candidate.tar.gz",
+    "original-upstream-source.tar.gz",
+    "reviewed-inputs.sha256",
+    "result.json",
+    "build.log",
+    "source-0.patch",
+    "source-1.patch",
+    "source-2.patch",
+    "source-3.patch",
+    "toolchain.txt"
+  ],
+  "originalArchives": {
+    "apple-artifact-gate.txt": "42e6778d2144463f8f15d2f22f5ec45f60f1d73270b3686a888c0a083230c918",
+    "apple-candidate.tar.gz": "38f7f43062b574bdb61c8a166415ba871c65f4a921f2bcb2249878fd5e39c50a",
+    "apple-original-library-zips.tar": "afcf8a9a5fad7db1469ac49a99bd0cf17cf7d7ffb899268abf4350cce9c1ccda",
+    "original-upstream-source.tar.gz": "e61e98375b12b22173222875cc5473700e089219d1ee30b71d2ff3feadb7a604",
+    "result.json": "553eacf2b3a4bd09cb6f69579d357bc9f0872e12cce6c7e41f60d560a1e4acb8",
+    "reviewed-inputs.sha256": "5b32b2f624d7599d3f3d196116bc67efc2deb88397e01b48810763f40d02c678",
+    "source-0.patch": "8f0c6acdc3b786b8c5d5458273d76e62d49b20bed480cd7827df00e210580e9e",
+    "source-1.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source-2.patch": "5b36b73945a55c915d70ef027bea50be66c7cd8471b32ddf40163d847229ec74",
+    "source-3.patch": "476a25cb1e190b1d59a24221490e2f4bbb7482ad9e29a48598ee036936f12e1e",
+    "toolchain.txt": "3b3de805622f95d0a2835c2faad853db4ad74d9875edf2da20d6daae8692c661"
+  },
+  "sources": [
+    {
+      "id": "MPVKit",
+      "repo": "mpvkit/MPVKit",
+      "commit": "2103893078c5e339073b11737b86f7f22b9c4491",
+      "artifactMember": "original-upstream-source.tar.gz",
+      "sha256": "e61e98375b12b22173222875cc5473700e089219d1ee30b71d2ff3feadb7a604",
+      "stripRoot": "",
+      "component": "MPVKit",
+      "url": "https://github.com/mpvkit/MPVKit/tree/2103893078c5e339073b11737b86f7f22b9c4491"
+    },
+    {
+      "id": "mpv",
+      "repo": "mpv-player/mpv",
+      "commit": "8c67647b50059406c5c0444903597281b81516cf",
+      "url": "https://codeload.github.com/mpv-player/mpv/tar.gz/8c67647b50059406c5c0444903597281b81516cf",
+      "destination": null,
+      "archive": "mpv-8c67647b50059406c5c0444903597281b81516cf.tar.gz",
+      "sha256": "5e18e21ae7326c4c4de66ca61dc9fec1ae8f933b10ec3b86103370b222240176",
+      "bytes": 7400405,
+      "stripRoot": "mpv-8c67647b50059406c5c0444903597281b81516cf",
+      "component": "mpv"
+    },
+    {
+      "id": "ffmpeg",
+      "repo": "FFmpeg/FFmpeg",
+      "commit": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+      "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+      "destination": null,
+      "archive": "ffmpeg-946fcce07b6dcd0331c8cc609192aeff5e1924f8.tar.gz",
+      "sha256": "0aa2b1de2a5698b20a23e93d539a9a8e82ca0117496c5bdf05d198805f42bb3b",
+      "bytes": 17333895,
+      "stripRoot": "FFmpeg-946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+      "component": "ffmpeg"
+    },
+    {
+      "id": "libplacebo",
+      "repo": "videolan/libplacebo",
+      "commit": "4c426e466814536def653cb23f1d1c287ea7a7f5",
+      "url": "https://code.videolan.org/videolan/libplacebo/-/archive/4c426e466814536def653cb23f1d1c287ea7a7f5/libplacebo-4c426e466814536def653cb23f1d1c287ea7a7f5.tar.gz",
+      "destination": null,
+      "archive": "libplacebo-4c426e466814536def653cb23f1d1c287ea7a7f5.tar.gz",
+      "sha256": "add9c6df141145dffba3fbeeffdd24ce08ffac92b250cae17adeae6443cbf996",
+      "bytes": 874044,
+      "stripRoot": "libplacebo-4c426e466814536def653cb23f1d1c287ea7a7f5",
+      "component": "libplacebo"
+    },
+    {
+      "id": "Vulkan-Headers",
+      "repo": "KhronosGroup/Vulkan-Headers",
+      "commit": "74d8a6cb930c68ef617b202c3ff3c59d919e086b",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/74d8a6cb930c68ef617b202c3ff3c59d919e086b",
+      "destination": "3rdparty/Vulkan-Headers",
+      "archive": "Vulkan-Headers-74d8a6cb930c68ef617b202c3ff3c59d919e086b.tar.gz",
+      "sha256": "75967a8288ff16044a86d1af462b96d2e75c435937efb75f2bb4102ab0382f29",
+      "bytes": 3029927,
+      "stripRoot": "Vulkan-Headers-74d8a6cb930c68ef617b202c3ff3c59d919e086b",
+      "component": "libplacebo"
+    },
+    {
+      "id": "fast_float",
+      "repo": "fastfloat/fast_float",
+      "commit": "97b54ca9e75f5303507699d27c6b4f4efe4641a1",
+      "url": "https://codeload.github.com/fastfloat/fast_float/tar.gz/97b54ca9e75f5303507699d27c6b4f4efe4641a1",
+      "destination": "3rdparty/fast_float",
+      "archive": "fast_float-97b54ca9e75f5303507699d27c6b4f4efe4641a1.tar.gz",
+      "sha256": "2b132274539286e41f37857cac22aa8441d21bd86d55de825a3342b149f66801",
+      "bytes": 120200,
+      "stripRoot": "fast_float-97b54ca9e75f5303507699d27c6b4f4efe4641a1",
+      "component": "libplacebo"
+    },
+    {
+      "id": "glad",
+      "repo": "Dav1dde/glad",
+      "commit": "73db193f853e2ee079bf3ca8a64aa2eaf6459043",
+      "url": "https://codeload.github.com/Dav1dde/glad/tar.gz/73db193f853e2ee079bf3ca8a64aa2eaf6459043",
+      "destination": "3rdparty/glad",
+      "archive": "glad-73db193f853e2ee079bf3ca8a64aa2eaf6459043.tar.gz",
+      "sha256": "33dbeae44d8315ece57e14eba4b1b4a02ac5406d1c4f49cd20048c91522a6b9a",
+      "bytes": 645779,
+      "stripRoot": "glad-73db193f853e2ee079bf3ca8a64aa2eaf6459043",
+      "component": "libplacebo"
+    },
+    {
+      "id": "jinja",
+      "repo": "pallets/jinja",
+      "commit": "15206881c006c79667fe5154fe80c01c65410679",
+      "url": "https://codeload.github.com/pallets/jinja/tar.gz/15206881c006c79667fe5154fe80c01c65410679",
+      "destination": "3rdparty/jinja",
+      "archive": "jinja-15206881c006c79667fe5154fe80c01c65410679.tar.gz",
+      "sha256": "b88a20dcc2e34072fcf4159325bc6c34cd4b29a81a8b83d15d2f28ba561da296",
+      "bytes": 276954,
+      "stripRoot": "jinja-15206881c006c79667fe5154fe80c01c65410679",
+      "component": "libplacebo"
+    },
+    {
+      "id": "markupsafe",
+      "repo": "pallets/markupsafe",
+      "commit": "297fc8e356e6836a62087949245d09a28e9f1b13",
+      "url": "https://codeload.github.com/pallets/markupsafe/tar.gz/297fc8e356e6836a62087949245d09a28e9f1b13",
+      "destination": "3rdparty/markupsafe",
+      "archive": "markupsafe-297fc8e356e6836a62087949245d09a28e9f1b13.tar.gz",
+      "sha256": "da7c010c9c81a66ac73036558c1fcb6212b50482f43211cd1254035b94f82414",
+      "bytes": 83817,
+      "stripRoot": "markupsafe-297fc8e356e6836a62087949245d09a28e9f1b13",
+      "component": "libplacebo"
+    },
+    {
+      "id": "nuklear",
+      "repo": "Immediate-Mode-UI/Nuklear",
+      "commit": "242f35efa067a46c595645eeda7b1771ea1f83b1",
+      "url": "https://codeload.github.com/Immediate-Mode-UI/Nuklear/tar.gz/242f35efa067a46c595645eeda7b1771ea1f83b1",
+      "destination": "demos/3rdparty/nuklear",
+      "archive": "nuklear-242f35efa067a46c595645eeda7b1771ea1f83b1.tar.gz",
+      "sha256": "ac567995f917c10a722409e0141d226e737d06488b0a31166f6e4925da8e58f0",
+      "bytes": 2339403,
+      "stripRoot": "Nuklear-242f35efa067a46c595645eeda7b1771ea1f83b1",
+      "component": "libplacebo"
+    }
+  ],
+  "producerFiles": [
+    {
+      "path": "scripts/build-mpvkit-dvfel.sh",
+      "input": "producer/scripts/build-mpvkit-dvfel.sh",
+      "sha256": "0d1a886ab7f8aefb14bf0e6d75a2f4dd101fa10ad4f801297fda314deb6a19de",
+      "mode": 493
+    },
+    {
+      "path": "scripts/assemble-mpvkit-dvfel.sh",
+      "input": "producer/scripts/assemble-mpvkit-dvfel.sh",
+      "sha256": "c462f17cffa360fabbb904b467cf7ca2c34c6cc7594866308837ca0b057174da",
+      "mode": 493
+    },
+    {
+      "path": "scripts/mpvkit-dvfel.patch",
+      "input": "producer/scripts/mpvkit-dvfel.patch",
+      "sha256": "09b2e5f1d31bed7fa282c7648c007cb4e1d70915945b30be80644dedd32c4902",
+      "mode": 420
+    },
+    {
+      "path": "scripts/mpv-moltenvk-resize.patch",
+      "input": "producer/scripts/mpv-moltenvk-resize.patch",
+      "sha256": "c88bd8e3db721953559138dbf3cc4814cff89e71527cf667ed7b6e8c1b3e1e7d",
+      "mode": 420
+    },
+    {
+      "path": "scripts/mpv-coreaudio-hotplug-lifecycle.patch",
+      "input": "producer/scripts/mpv-coreaudio-hotplug-lifecycle.patch",
+      "sha256": "01079c34bc8dba62af7e6f5a724063d288a96f2c4b5d2fb75b1993f6085a5ec5",
+      "mode": 420
+    },
+    {
+      "path": "scripts/mpv-http-seek-interrupt.patch",
+      "input": "producer/scripts/mpv-http-seek-interrupt.patch",
+      "sha256": "3687df5112f6cdcc22fed61dec6a5e16dcff89d54a7174edcefefbddd3054c92",
+      "mode": 420
+    },
+    {
+      "path": "scripts/verify-mpvkit-dvfel-artifacts.sh",
+      "input": "producer/scripts/verify-mpvkit-dvfel-artifacts.sh",
+      "sha256": "154b2815a34c41616d79f46099359fb495a76a5c868bf24f08d9be3aa3b874fe",
+      "mode": 493
+    },
+    {
+      "path": "scripts/verify-mpvkit-dvfel-apple-tls.sh",
+      "input": "producer/scripts/verify-mpvkit-dvfel-apple-tls.sh",
+      "sha256": "0339f09a0f21ddc55d0154469b9e55c724f4db00c6283fde4098e4a1e3758426",
+      "mode": 493
+    },
+    {
+      "path": "scripts/native-media-hosted/build.sh",
+      "input": "producer/scripts/native-media-hosted/build.sh",
+      "sha256": "342082427f159035562ab7ddbcf4997e1e975486e0335e74ad3178d846c02555",
+      "mode": 420
+    },
+    {
+      "path": "scripts/native-media-hosted/evidence.py",
+      "input": "producer/scripts/native-media-hosted/evidence.py",
+      "sha256": "e681ba12fe9664b5a5d876cb7db16ffac57c2fbb7c82f5ab3b2708ba61d2fa18",
+      "mode": 420
+    },
+    {
+      "path": "scripts/native-media-hosted/inputs.sha256",
+      "input": "producer/scripts/native-media-hosted/inputs.sha256",
+      "sha256": "5b32b2f624d7599d3f3d196116bc67efc2deb88397e01b48810763f40d02c678",
+      "mode": 420
+    },
+    {
+      "path": ".github/workflows/native-media-candidates.yml",
+      "input": "producer/.github/workflows/native-media-candidates.yml",
+      "sha256": "d851974630a244b4d6ab8a41d14ba9686a0f617a3e3c731d67cda9308529feab",
+      "mode": 420
+    },
+    {
+      "path": ".github/workflows/source-contracts.yml",
+      "input": "producer/.github/workflows/source-contracts.yml",
+      "sha256": "3c3449bd02222f340c805e20e9ff028c7348d2f2f5d936eb9317224dcd345e39",
+      "mode": 420
+    }
+  ],
+  "derivedContext": {
+    "input": "derived/context_moltenvk.m",
+    "sha256": "00d2842ddb0dca5070feaf890c0190a0fe62beef9b29ec36e94e329d29a3da5e",
+    "method": "Exact 96-line new file from MPVKit0001, then exact app5b36 patch0004; recipe-derived, not an independently captured hash from the original builder"
+  },
+  "receiptSourceFiles": {
+    "MPVKit": "source-0.patch",
+    "libplacebo": "source-1.patch",
+    "mpv": "source-2.patch",
+    "ffmpeg": "source-3.patch"
+  },
+  "sourceMapEvidence": {
+    "libplacebo-tree": {
+      "url": "https://api.github.com/repos/haasn/libplacebo/git/trees/4c426e466814536def653cb23f1d1c287ea7a7f5?recursive=1",
+      "exit": 0,
+      "text": "{\n  \"sha\": \"4c426e466814536def653cb23f1d1c287ea7a7f5\",\n  \"truncated\": false,\n  \"gitlinks\": [\n    {\n      \"path\": \"3rdparty/Vulkan-Headers\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"74d8a6cb930c68ef617b202c3ff3c59d919e086b\"\n    },\n    {\n      \"path\": \"3rdparty/fast_float\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"97b54ca9e75f5303507699d27c6b4f4efe4641a1\"\n    },\n    {\n      \"path\": \"3rdparty/glad\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"73db193f853e2ee079bf3ca8a64aa2eaf6459043\"\n    },\n    {\n      \"path\": \"3rdparty/jinja\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"15206881c006c79667fe5154fe80c01c65410679\"\n    },\n    {\n      \"path\": \"3rdparty/markupsafe\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"297fc8e356e6836a62087949245d09a28e9f1b13\"\n    },\n    {\n      \"path\": \"demos/3rdparty/nuklear\",\n      \"mode\": \"160000\",\n      \"type\": \"commit\",\n      \"sha\": \"242f35efa067a46c595645eeda7b1771ea1f83b1\"\n    }\n  ],\n  \"gitmodules\": [\n    {\n      \"path\": \".gitmodules\",\n      \"mode\": \"100644\",\n      \"type\": \"blob\",\n      \"sha\": \"3245c2120aa6339799e1eb5cabdd2885ecbbbf1c\",\n      \"size\": 649,\n      \"url\": \"https://api.github.com/repos/haasn/libplacebo/git/blobs/3245c2120aa6339799e1eb5cabdd2885ecbbbf1c\"\n    }\n  ]\n}\n"
+    },
+    "mpv.gitmodules": {
+      "url": "https://raw.githubusercontent.com/mpv-player/mpv/8c67647b50059406c5c0444903597281b81516cf/.gitmodules",
+      "exit": 56,
+      "text": "curl: (56) The requested URL returned error: 404\n"
+    },
+    "mpv-tree": {
+      "url": "https://api.github.com/repos/mpv-player/mpv/git/trees/8c67647b50059406c5c0444903597281b81516cf?recursive=1",
+      "exit": 0,
+      "text": "{\n  \"sha\": \"8c67647b50059406c5c0444903597281b81516cf\",\n  \"truncated\": false,\n  \"gitlinks\": [],\n  \"gitmodules\": []\n}\n"
+    },
+    "libplacebo.gitmodules": {
+      "url": "https://code.videolan.org/videolan/libplacebo/-/raw/4c426e466814536def653cb23f1d1c287ea7a7f5/.gitmodules",
+      "exit": 0,
+      "text": "[submodule \"demos/3rdparty/nuklear\"]\n\tpath = demos/3rdparty/nuklear\n\turl = https://github.com/Immediate-Mode-UI/Nuklear.git\n[submodule \"3rdparty/glad\"]\n\tpath = 3rdparty/glad\n\turl = https://github.com/Dav1dde/glad\n[submodule \"3rdparty/jinja\"]\n\tpath = 3rdparty/jinja\n\turl = https://github.com/pallets/jinja\n[submodule \"3rdparty/markupsafe\"]\n\tpath = 3rdparty/markupsafe\n\turl = https://github.com/pallets/markupsafe\n[submodule \"3rdparty/Vulkan-Headers\"]\n\tpath = 3rdparty/Vulkan-Headers\n\turl = https://github.com/KhronosGroup/Vulkan-Headers\n[submodule \"3rdparty/fast_float\"]\n\tpath = 3rdparty/fast_float\n\turl = https://github.com/fastfloat/fast_float.git\n"
+    },
+    "ffmpeg-tree": {
+      "url": "https://api.github.com/repos/FFmpeg/FFmpeg/git/trees/946fcce07b6dcd0331c8cc609192aeff5e1924f8?recursive=1",
+      "exit": 0,
+      "text": "{\n  \"sha\": \"946fcce07b6dcd0331c8cc609192aeff5e1924f8\",\n  \"truncated\": false,\n  \"gitlinks\": [],\n  \"gitmodules\": []\n}\n"
+    }
+  },
+  "nestedGitlinkEvidence": [
+    {
+      "id": "Vulkan-Headers",
+      "url": "https://api.github.com/repos/KhronosGroup/Vulkan-Headers/git/trees/74d8a6cb930c68ef617b202c3ff3c59d919e086b?recursive=1",
+      "sha": "74d8a6cb930c68ef617b202c3ff3c59d919e086b",
+      "truncated": false,
+      "gitlinks": []
+    },
+    {
+      "id": "fast_float",
+      "url": "https://api.github.com/repos/fastfloat/fast_float/git/trees/97b54ca9e75f5303507699d27c6b4f4efe4641a1?recursive=1",
+      "sha": "97b54ca9e75f5303507699d27c6b4f4efe4641a1",
+      "truncated": false,
+      "gitlinks": []
+    },
+    {
+      "id": "glad",
+      "url": "https://api.github.com/repos/Dav1dde/glad/git/trees/73db193f853e2ee079bf3ca8a64aa2eaf6459043?recursive=1",
+      "sha": "73db193f853e2ee079bf3ca8a64aa2eaf6459043",
+      "truncated": false,
+      "gitlinks": []
+    },
+    {
+      "id": "jinja",
+      "url": "https://api.github.com/repos/pallets/jinja/git/trees/15206881c006c79667fe5154fe80c01c65410679?recursive=1",
+      "sha": "15206881c006c79667fe5154fe80c01c65410679",
+      "truncated": false,
+      "gitlinks": []
+    },
+    {
+      "id": "markupsafe",
+      "url": "https://api.github.com/repos/pallets/markupsafe/git/trees/297fc8e356e6836a62087949245d09a28e9f1b13?recursive=1",
+      "sha": "297fc8e356e6836a62087949245d09a28e9f1b13",
+      "truncated": false,
+      "gitlinks": []
+    },
+    {
+      "id": "nuklear",
+      "url": "https://api.github.com/repos/Immediate-Mode-UI/Nuklear/git/trees/242f35efa067a46c595645eeda7b1771ea1f83b1?recursive=1",
+      "sha": "242f35efa067a46c595645eeda7b1771ea1f83b1",
+      "truncated": false,
+      "gitlinks": []
+    }
+  ],
+  "externalBinaryInputs": [
+    {
+      "target": "Libcrypto",
+      "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/Libcrypto.xcframework.zip",
+      "sha256": "593283be2a90f7fd66f6e6ed331b2f099cf403e0926fe3b4ac09a7062b793965",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libssl",
+      "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/Libssl.xcframework.zip",
+      "sha256": "ff5ffd43d015d7285fd37e4a3145b25cbd8d2842740bd629a711c299a20e226a",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "gmp",
+      "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/gmp.xcframework.zip",
+      "sha256": "ad33c7a08f4cdcb9924c8f0e6d9a054dad33d7794b97667bf8b6fb2b236ae585",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "nettle",
+      "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/nettle.xcframework.zip",
+      "sha256": "0fdf3ebf8bd7b8bc8eee837cf27261cb4c52ae520b6576a2f468656aa1691e02",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "hogweed",
+      "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/hogweed.xcframework.zip",
+      "sha256": "25727c9fa67287fa0a4f4722f88bb8be669b23cd7e837e2d00870eb8a25d3f27",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "gnutls",
+      "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/gnutls.xcframework.zip",
+      "sha256": "3dbec5809339189bf9679e218c6cff387ebf8fb72745927835afc2678f5c9f4d",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libunibreak",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/Libunibreak.xcframework.zip",
+      "sha256": "940d9833cf4477d0a260d9f2b4066125bc0ff7bbc111ac3c90e774765b77a559",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libfreetype",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/Libfreetype.xcframework.zip",
+      "sha256": "496ca62488530e14b1e4624d20ee2b237c0bd675cd70c19da578a5768302d02d",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libfribidi",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/Libfribidi.xcframework.zip",
+      "sha256": "bc15e097b892f2f90424e4a27ba287070cc2f98a74a4da10e6d2481d15cf5ff9",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libharfbuzz",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/Libharfbuzz.xcframework.zip",
+      "sha256": "aa8e0b9ca0387dac74e3e93c86e34d11982bb013b28022d0e6966a8427a35b2e",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libass",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/Libass.xcframework.zip",
+      "sha256": "3f4c576d2818ceb4544aa2a20e1f55846511c5e706fd19adc3ea9fd842270498",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libsmbclient",
+      "url": "https://github.com/mpvkit/libsmbclient-build/releases/download/4.15.13-2512/Libsmbclient.xcframework.zip",
+      "sha256": "3a53375fab11bc888cc553664ea5dd902208d04f0cc21ec746302bf356246b6f",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libbluray",
+      "url": "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/Libbluray.xcframework.zip",
+      "sha256": "bc037d34e2b0b5ab7f202fb371f5fb298136cc66fdf406c2172185d06f53f18d",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libuavs3d",
+      "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-fix/Libuavs3d.xcframework.zip",
+      "sha256": "bd5256081486d16c51c868d755bf70266c424b54c895269580de44ec6707f789",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libdovi",
+      "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/Libdovi.xcframework.zip",
+      "sha256": "e693e239808350868e79c5448ef9f02e2716bc822dd8632a41a368a1eae5ca7d",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "MoltenVK",
+      "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.2/MoltenVK.xcframework.zip",
+      "sha256": "aee189c54ad7c62bf734a3dc51eb4cfad5685d1d63b0ec519ecd1b437c332418",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libshaderc_combined",
+      "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/Libshaderc_combined.xcframework.zip",
+      "sha256": "758047b615708575b580eb960a2d083f760a29dc462d6eaa360416c946ce433b",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "lcms2",
+      "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2.xcframework.zip",
+      "sha256": "dc0dce0606f6ab6841a8ec5a6bd4448e2f3ef00661a050460f806c9393dc6982",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libdav1d",
+      "url": "https://github.com/mpvkit/libdav1d-build/releases/download/1.5.3/Libdav1d.xcframework.zip",
+      "sha256": "d1a32ae6a1f0193e9f05c44c9176844af7f6d2a58cb33843f6f1b8dfd9224083",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libavcodec",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libavcodec.xcframework.zip",
+      "sha256": "136e432919a8a7b5b80155c68e9dc91b0ef3ae6623970b87bb8bd96a452543cf",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libavdevice",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libavdevice.xcframework.zip",
+      "sha256": "65713615f53352b37baffb38c5b88d88bab647d050d999bcc4684344ab636bdf",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libavformat",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libavformat.xcframework.zip",
+      "sha256": "2afb601375929640e743e7bdaa6c4a88e2b582a07e1c5f2dc95cc7f5b26a0810",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libavfilter",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libavfilter.xcframework.zip",
+      "sha256": "3e71af8633d99d365f14b88064bceafd57acb23fc64db90e55b715a9c0dca328",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libavutil",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libavutil.xcframework.zip",
+      "sha256": "5dc251c8807c501982edfb0bc9bddfee4148733142d6ebb947738c60fb3bf8d8",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libswresample",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libswresample.xcframework.zip",
+      "sha256": "d5c36acf2ff944e15706f4b7bfbf18bb1993ffc5b446c9f67f1aa79de5441f15",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libswscale",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libswscale.xcframework.zip",
+      "sha256": "4fc00de6a7a8cddcdfe0eeb73b4f919cfaf9a0fd5a442f42a43e0f56e157d7c5",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libuchardet",
+      "url": "https://github.com/mpvkit/libuchardet-build/releases/download/0.0.8/Libuchardet.xcframework.zip",
+      "sha256": "ea4f548a230a755e059144657cc9e2ff563c1cdeae03974c38f8b6e1a40303fb",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libluajit",
+      "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-fix/Libluajit.xcframework.zip",
+      "sha256": "3a171ef1627fb88260893dc452f989bd93dd8510814771ba3aff7753470d3f3e",
+      "rebuiltByThisCandidate": false
+    },
+    {
+      "target": "Libmpv",
+      "url": "https://github.com/mpvkit/MPVKit/releases/download/1.0.0/Libmpv.xcframework.zip",
+      "sha256": "c381ceb4c1504efac12da95293e56585bbeb691634aa64e3a729f517169933ba",
+      "rebuiltByThisCandidate": false
+    }
+  ],
+  "packageManifestSHA256": "8d789e985b8c2a7a5f3e7ce32bffd57c9b405e12150b0bbf00c2c10c8bf61c58"
+}

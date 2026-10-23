@@ -21,6 +21,7 @@ class PlaybackSessionLifecycle internal constructor(
     private val beginSession: suspend (PlaybackContext?, ContinueWatchingOwner?) -> PlaybackSessionToken?,
     private val reportSession: suspend (PlaybackSessionToken, Long, Long) -> Unit,
     private val endSession: suspend (PlaybackSessionToken, Long, Long) -> DurableWatchedPlaybackReceipt?,
+    private val nanoClock: () -> Long = System::nanoTime,
 ) {
     constructor(repository: CatalogRepository, scope: CoroutineScope) : this(
         scope = scope,
@@ -37,6 +38,8 @@ class PlaybackSessionLifecycle internal constructor(
 
     class Handle internal constructor() {
         internal val token = AtomicReference<PlaybackSessionToken?>(null)
+        /** The session and monotonic time of the last progress report that reached the engine. */
+        internal val lastReport = AtomicReference<Pair<PlaybackSessionToken, Long>?>(null)
     }
 
     private val orderLock = Any()
@@ -54,8 +57,17 @@ class PlaybackSessionLifecycle internal constructor(
         }
     }
 
+    /**
+     * Each report is a full native transaction that re-seals the whole account checkpoint, so the
+     * player's 5 s ticks reach the engine at most every [REPORT_INTERVAL_NANOS] (the Apple cadence).
+     * A new session reports at once, and [end] still records the final position.
+     */
     fun report(handle: Handle, positionMs: Long, durationMs: Long) {
         val token = handle.token.get() ?: return
+        val now = nanoClock()
+        val last = handle.lastReport.get()
+        if (last != null && last.first == token && now - last.second < REPORT_INTERVAL_NANOS) return
+        handle.lastReport.set(token to now)
         scope.launch { reportSession(token, positionMs, durationMs) }
     }
 
@@ -79,5 +91,9 @@ class PlaybackSessionLifecycle internal constructor(
                 block()
             }.also { it.start() }
         }
+    }
+
+    private companion object {
+        const val REPORT_INTERVAL_NANOS = 20_000_000_000L
     }
 }

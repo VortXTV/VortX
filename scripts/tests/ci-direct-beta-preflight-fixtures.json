@@ -1,0 +1,50 @@
+{
+  "description": "Independent authored beta3 fixture values plus retained beta2 identities. This does not replace any original receipt.",
+  "beta3": {
+    "tag": "v0.5.6-beta.3",
+    "source": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "runId": 123,
+    "attempt": 1,
+    "releaseId": 456,
+    "booleans": {
+      "native_only": true,
+      "publish_release": false,
+      "publish_existing_055": false,
+      "tvos_test_only": false,
+      "apple_only": false
+    },
+    "strings": ["release_tag", "recovery_source_commit", "resume_handoff", "mpvkit_artifacts_url", "mpvkit_artifacts_sha256", "release_id", "altstore_note"]
+  },
+  "beta2OriginalReceipt": {
+    "evidenceFile": "apple-original-extracted/native-ci-dispatch.json",
+    "bytes": 421,
+    "sha256": "ad2039da0759f1921efd7c508d7702ced556233fc8513d6fb08ac111981cbe42"
+  },
+  "beta2ActualEventFailure": {
+    "runId": 39175903571,
+    "jobId": 117818388226,
+    "attempt": 1,
+    "source": "96e6ca683fc60ce983d9426da186ed8d0c7bdedb",
+    "tag": "v0.5.6-beta.2",
+    "logSha256": "7d7ccf25cf7f40d66f7e2b07960f9d98d7150215d98b8228b88d4b44f5066b0e",
+    "logBytes": 217097,
+    "line1577": "2026-10-18T23:18:35.5237480Z the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway",
+    "line1578": "2026-10-18T23:18:35.5268230Z CI direct beta verification failed: GitHub read failed",
+    "typedReceiptValidationReached": false,
+    "endpointAttribution": "Apple job log is source-order inference; endpoint was not printed in actual hosted log."
+  },
+  "beta2AuthenticatedDraftSubset": {
+    "id": 416691309,
+    "tag_name": "v0.5.6-beta.2",
+    "target_commitish": "96e6ca683fc60ce983d9426da186ed8d0c7bdedb",
+    "draft": true,
+    "prerelease": true,
+    "published_at": null,
+    "html_url": "https://github.com/VortXTV/VortX/releases/tag/untagged-88b70aa43090b5e5a27d",
+    "body": "<!-- vortx-distribution: hosted-direct-beta -->",
+    "assetName": "SHA256SUMS.txt",
+    "assetUrl": "https://github.com/VortXTV/VortX/releases/download/untagged-88b70aa43090b5e5a27d/SHA256SUMS.txt",
+    "evidenceFile": "final-nine-asset-draft.json",
+    "note": "Identity/URL subset only; body shortened to marker for focused tests. Original full metadata/body remain immutable."
+  }
+}

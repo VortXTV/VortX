@@ -39,9 +39,9 @@ class CinemaNavigationPolicyTest {
     }
 
     @Test fun `merged tabs preserve Live Library Search and all hide preferences`() {
-        assertEquals(listOf(TabSlot.HOME, TabSlot.LIVE, TabSlot.LIBRARY, TabSlot.SEARCH, TabSlot.SETTINGS),
+        assertEquals(listOf(TabSlot.HOME, TabSlot.LIVE, TabSlot.LIBRARY, TabSlot.SEARCH, TabSlot.ADDONS, TabSlot.SETTINGS),
             cinemaVisibleTabs(visible, true, false))
-        assertEquals(listOf(TabSlot.HOME, TabSlot.SETTINGS), cinemaVisibleTabs(visible.copy(hideLive = true, hideLibrary = true, hideSearch = true), true, false))
+        assertEquals(listOf(TabSlot.HOME, TabSlot.ADDONS, TabSlot.SETTINGS), cinemaVisibleTabs(visible.copy(hideLive = true, hideLibrary = true, hideSearch = true), true, false))
         assertFalse(cinemaVisibleTabs(visible, true, true).contains(TabSlot.SEARCH))
         assertTrue(cinemaVisibleTabs(visible, false, false).contains(TabSlot.DISCOVER))
     }

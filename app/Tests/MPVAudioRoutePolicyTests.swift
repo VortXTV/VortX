@@ -3,8 +3,8 @@
 //   xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
 //     app/Sources/Player/AudioOutputMode.swift \
 //     app/Tests/MPVAudioRoutePolicyTests.swift \
-//     -o /tmp/mpv-audio-route-policy-tests \
-//     && /tmp/mpv-audio-route-policy-tests
+//     -o _build/mpv-audio-route-policy-tests \
+//     && _build/mpv-audio-route-policy-tests
 
 import Foundation
 
@@ -139,6 +139,24 @@ private enum MPVAudioRoutePolicyTests {
             && !refresh.localizedCaseInsensitiveContains("url")
     }
 
+    /// Source-wiring coverage only. Real audio output and route delivery need device acceptance.
+    static func hasSilentPreviewIsolation(_ source: String) -> Bool {
+        guard let setup = section(source, from: "func setupMpv()", to: "let initializationStatus = mpv_initialize(mpv)"),
+              let refresh = section(source, from: "private func refreshAudioSessionPolicy()", to: "/// mpv `audio-samplerate`"),
+              let reapply = section(source, from: "private func applyChannelPolicy(force: Bool = false)", to: "@objc private func audioRouteChanged"),
+              let route = section(source, from: "@objc private func audioRouteChanged(_ note: Notification)", to: "#endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only"),
+              let track = section(source, from: "func setAudioTrack(_ id: Int)", to: "func setSubtitleTrack(_ id: Int)") else { return false }
+        return ordered(["for (key, value) in PlaybackSettings.parsedCustomMpvOptions",
+                        "if startMuted {", "let disabledAudio = mpv_set_option_string(mpv, \"aid\", \"no\")",
+                        "guard disabledAudio >= 0 else {", "mpv = nil", "mpv_terminate_destroy(failedContext)"], in: setup)
+            && ordered(["guard !startMuted else { return }", "AVAudioSession.sharedInstance()"], in: refresh)
+            && ordered(["guard !startMuted, mpv != nil else { return }", "refreshAudioSessionPolicy()"], in: reapply)
+            && ordered(["guard !startMuted else { return }", "DispatchQueue.main.async"], in: route)
+            && ordered(["guard !startMuted else { return }", "TrackSelector.shouldApplyAudioSelection", "setString(MPVProperty.aid"], in: track)
+            && source.contains("if !startMuted, let sidecar {")
+            && source.contains("if !startMuted {\n            NotificationCenter.default.addObserver(self, selector: #selector(audioRouteChanged)")
+    }
+
     static func main() throws {
         // The policy's request uses maximum capability, while the playback choice uses the
         // realized route. A capable HDMI route can legitimately advertise 8 but currently open 2.
@@ -240,6 +258,14 @@ private enum MPVAudioRoutePolicyTests {
         check("nonzero to zero sample-rate transition clears the stale mpv property",
               clearsStaleSampleRate(controller))
         check("DiagnosticsLog receipt is bounded to route-policy facts", hasDiagnosticsReceipt(controller))
+        check("silent previews disable audio after custom options and ignore audio routes", hasSilentPreviewIsolation(controller))
+        let enabledPreviewMutant = controller.replacingOccurrences(
+            of: "let disabledAudio = mpv_set_option_string(mpv, \"aid\", \"no\")",
+            with: "let disabledAudio = mpv_set_option_string(mpv, \"aid\", \"auto\")")
+        check("hostile: audio-enabled preview fails isolation contract", !hasSilentPreviewIsolation(enabledPreviewMutant))
+        let routePreviewMutant = controller.replacingOccurrences(
+            of: "guard !startMuted, mpv != nil else { return }", with: "guard mpv != nil else { return }")
+        check("hostile: muted preview route reapply fails isolation contract", !hasSilentPreviewIsolation(routePreviewMutant))
 
         let maximumAsActualMutant = controller.replacingOccurrences(
             of: "outputChannels = actualOutputChannels",

@@ -40,27 +40,42 @@ enum OwnerHistoryInteropContractTests {
               "mixed or over-limit peer carriers are retained rather than overwritten")
         check(!sync.contains("v[\"ownerHistory\"]"),
               "export never creates the incompatible top-level ownerHistory key")
-        check(sync.contains("OwnerHistoryStore.mergeWire(history[\"ownerHistory\"], capture: capture)") &&
-              sync.contains("withRemoteApplySuppressed") && sync.contains("refreshOwnerResumeCache(from: doc)"),
-              "remote owner history is capture-fenced, self-echo-suppressed, and hydrates resume")
+        let nativeRestore = body(sync, after: "func restoreNativeCheckpoint(", until: "    /// Shared account-owner epoch.")
+        check(nativeRestore.contains("guard isSignedIn, isCurrent(capture), case .account = capture.scope else") &&
+              nativeRestore.contains("pullDocVersionedResult(credentialCapture: capture)") &&
+              nativeRestore.contains("ProfileStore.shared.activeID == selectedProfile") &&
+              nativeRestore.contains("authenticatedCheckpoint(scope: scope)"),
+              "remote history restoration requires the captured authenticated native account, profile and checkpoint")
         check(history.contains("validOwnerHistoryRow") && history.contains("History rows come first intentionally"),
               "document history admits only causal rows and keeps unsaved genuine history separate from membership")
-        check(bridge.contains("history: BecauseYouWatchedDocumentHistory.ownerHistoryItems") &&
-              bridge.contains("engine + pruneFinished(history) + pruneFinished(synthesized)"),
-              "Continue Watching can render owner history without adding it to the engine library")
+        let nativePreview = body(bridge,
+            after: "private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken,",
+            until: "/// Record an owner-tagged history receipt")
+        check(nativePreview.contains("self.publicationStillCurrent(publicationToken)") &&
+              nativePreview.contains("CredentialScopeRegistry.shared.isCurrent(credentialCapture)") &&
+              nativePreview.contains("self.continueWatching = preview") &&
+              nativePreview.contains("self.recordAcceptedHistoryReceipt(") &&
+              !nativePreview.contains("unionOwnerContinueWatching("),
+              "Continue Watching publishes the fenced native preview and receipt without resurrecting legacy history rows")
 
         let saveProgress = body(account, after: "func saveProgress(for meta: PlaybackMeta", until: "/// Fetch a single library item")
-        check(saveProgress.contains("OwnerHistoryStore.recordPlayback") && saveProgress.contains("credentialCapture") &&
-              saveProgress.contains("if let credentialCapture = target.ownerHistoryCapture") &&
-              saveProgress.contains("target.stillOwnsOwnerHistoryContext") &&
-              !saveProgress.contains("let credentialCapture = CredentialScopeRegistry.shared.capture()") &&
-              saveProgress.range(of: "OwnerHistoryStore.recordPlayback")!.lowerBound < saveProgress.range(of: "guard ProfileSync.alsoSyncToStremio")!.lowerBound,
-              "only immutable launch-captured owner progress enters history before the optional mirror gate")
-        check(ownership.contains("historyCapture: CredentialScopeRegistry.Capture?") &&
-              account.contains("profiles.activeID == UserProfile.ownerID && profiles.active?.isOwner == true") &&
-              account.contains("profileID == UserProfile.ownerID") &&
-              account.contains("CredentialScopeRegistry.shared.isCurrent(historyCapture)"),
-              "only the canonical owner profile with its original credential epoch can write history")
+        let nativeProgress = body(bridge, after: "func reportNativeProgress(", until: "private func nativeWatchedIntent(")
+        check(saveProgress.contains("let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)") &&
+              saveProgress.contains("guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }") &&
+              saveProgress.contains("CoreBridge.shared.reportNativeProgress(for: meta, positionSeconds: positionSeconds, durationSeconds: durationSeconds, target: target)\n            return") &&
+              nativeProgress.contains("nativePlaybackBinding(target)") &&
+              nativeProgress.contains("case .native(let binding?) = target, let epoch = binding.accountGeneration") &&
+              nativeProgress.contains("positionSeconds.isFinite, durationSeconds.isFinite") &&
+              nativeProgress.contains("facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)"),
+              "launch-captured native progress retains its exact profile and account generation and validates causal playback values")
+        let ownerHistoryContext = body(account, after: "func stillOwnsOwnerHistoryContext(", until: "var ownerHistoryCapture:")
+        check(ownership.contains("case native(NativeBinding?)") &&
+              ownership.contains("captured.accountGeneration != nil, binding.accountGeneration != nil") &&
+              ownership.contains("return captured == binding") &&
+              account.contains("return core.captureNativePlaybackTarget()") &&
+              account.contains("return core.nativePlaybackTargetIsCurrent(self)") &&
+              ownerHistoryContext.contains("return false"),
+              "native playback cannot revive a retired owner or duplicate progress into legacy owner-history caches")
         let manualWatch = body(bridge, after: "func markPlaybackWatched", until: "private func drainPendingEpisodeWatched")
         let libraryWatch = body(bridge, after: "func setLibraryItemWatched", until: "/// Drop finished titles")
         check(!manualWatch.contains("OwnerHistoryStore") && !libraryWatch.contains("OwnerHistoryStore"),

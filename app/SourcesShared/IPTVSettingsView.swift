@@ -94,13 +94,17 @@ struct IPTVSettingsView: View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             Text("Add a playlist").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
 
+            #if os(tvOS)
             Picker("Type", selection: $kind) {
                 ForEach(Kind.allCases) { k in Text(k.label).tag(k) }
             }
-            #if os(iOS)
-            .pickerStyle(.segmented)
-            #endif
             .tint(Theme.Palette.accent)
+            #else
+            // Chips instead of the system segmented control, whose grey selection ignores the accent.
+            VortXSegmented(options: Kind.allCases.map { .init(value: $0, title: LocalizedStringKey($0.label)) },
+                           selection: $kind)
+                .accessibilityLabel("Type")
+            #endif
 
             field("Name (optional)", text: $name, placeholder: "My IPTV", secure: false, isURL: false)
 

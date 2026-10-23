@@ -64,6 +64,37 @@ def main():
               "exactly one libvortx_ffi.so")
         check(archive("legacy-payload.apk", "lib", contents, ("lib/arm64-v8a/libstremiox_core.so", contents["arm64-v8a"])),
               "still contains legacy")
+        # The new normal SDK must expose every real owner-history JNI function on EACH ABI.
+        # Mutate only a copied ELF's .dynstr spelling; do not compile a fake native library or
+        # replace the actual callable-export predicate with text fixtures.
+        if args.source_sha in {"0c30f4782aee544a2b7e33169ad60d03630d4097", "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"}:
+            owner_methods = (
+                "nativeOwnerHistoryCanonicalize", "nativeOwnerHistoryOpen",
+                "nativeOwnerHistoryFork", "nativeOwnerHistoryRequest", "nativeOwnerHistoryClose",
+            )
+            for abi in ABIS:
+                sections_for_abi = subprocess.check_output([
+                    str(args.ndk_bin / "llvm-readelf"), "--wide", "--sections",
+                    str(args.staged_dir / abi / "libvortx_ffi.so")], text=True)
+                dynamic_strings = re.search(
+                    r"\]\s+\.dynstr\s+STRTAB\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)",
+                    sections_for_abi)
+                if not dynamic_strings:
+                    raise RuntimeError(f"cannot locate actual ELF .dynstr: {abi}")
+                start, size = (int(value, 16) for value in dynamic_strings.groups())
+                strings = contents[abi][start:start + size]
+                if not size or len(strings) != size:
+                    raise RuntimeError(f"invalid actual ELF .dynstr range: {abi}")
+                for method in owner_methods:
+                    symbol = f"Java_com_vortx_android_engine_VortxCore_{method}".encode("ascii") + b"\0"
+                    offset = strings.find(symbol)
+                    if offset < 0 or strings.find(symbol, offset + 1) >= 0:
+                        raise RuntimeError(f"expected unique real JNI name in .dynstr: {abi}/{method}")
+                    missing = bytearray(contents[abi])
+                    missing[start + offset] = ord("X")  # J -> X, unchanged section/string size.
+                    check(archive(f"missing-{abi}-{method}.apk", "lib",
+                                  contents | {abi: bytes(missing)}),
+                          f"missing JNI export {method}")
         sections = subprocess.check_output([str(args.ndk_bin / "llvm-readelf"), "--wide", "--sections",
                                            str(args.staged_dir / "arm64-v8a/libvortx_ffi.so")], text=True)
         match = re.search(r"\]\s+\.text\s+PROGBITS\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)", sections)

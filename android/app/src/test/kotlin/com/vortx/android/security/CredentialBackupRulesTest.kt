@@ -53,6 +53,10 @@ class CredentialBackupRulesTest {
         val expectedCredentialFiles = setOf(
             "vortx_sync_session.xml",
             "vortx_sync_session_plain.xml",
+            "vortx_native_provider_credentials.xml",
+            "vortx_native_provider_credentials_plain.xml",
+            "vortx_native_streaming_credentials.xml",
+            "vortx_native_streaming_credentials_plain.xml",
             "vortx_debrid_keys.xml",
             "vortx_debrid_keys_plain.xml",
             "vortx_auth_identity.xml",

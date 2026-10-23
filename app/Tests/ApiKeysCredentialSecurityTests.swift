@@ -1,12 +1,12 @@
 // Standalone adversarial executable for owner-scoped metadata and SkipDB credentials.
 //
 // Run with:
-//   swiftc -D CREDENTIAL_RETRY_COORDINATOR_STANDALONE \
-//     -swift-version 5 -strict-concurrency=complete -warnings-as-errors -o /tmp/api-keys-security \
+//   nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization \
+//     -swift-version 5 -strict-concurrency=complete -warnings-as-errors -o app/build/api-keys-security \
 //     app/SourcesShared/CredentialScope.swift \
-//     app/SourcesShared/VortXSyncManager.swift \
+//     app/SourcesShared/CredentialRetryCoordinator.swift \
 //     app/SourcesShared/ApiKeys.swift \
-//     app/Tests/ApiKeysCredentialSecurityTests.swift && /tmp/api-keys-security
+//     app/Tests/ApiKeysCredentialSecurityTests.swift && app/build/api-keys-security
 
 import Foundation
 
@@ -153,6 +153,7 @@ final class VortXSyncManager {
 private struct SourceContracts {
     let apiKeys: String
     let syncManager: String
+    let retryCoordinator: String
     let credentialScope: String
 }
 
@@ -166,6 +167,7 @@ private func contracts() -> SourceContracts {
     SourceContracts(
         apiKeys: source("SourcesShared/ApiKeys.swift"),
         syncManager: source("SourcesShared/VortXSyncManager.swift"),
+        retryCoordinator: source("SourcesShared/CredentialRetryCoordinator.swift"),
         credentialScope: source("SourcesShared/CredentialScope.swift"))
 }
 
@@ -1388,11 +1390,9 @@ private func runtimeRestoreSourceContract(_ syncManager: String) -> Bool {
         ])
 }
 
-private func credentialCompositionSourceContract(_ syncManager: String) -> Bool {
-    let coordinator = sourceRegion(
-        syncManager,
-        from: "enum CredentialRetryCoordinator",
-        to: "#if !CREDENTIAL_RETRY_COORDINATOR_STANDALONE")
+private func credentialCompositionSourceContract(_ syncManager: String, coordinatorSource: String) -> Bool {
+    let coordinator = coordinatorSource.range(of: "enum CredentialRetryCoordinator")
+        .map { String(coordinatorSource[$0.lowerBound...]) } ?? ""
     let binding = sourceRegion(
         syncManager,
         from: "private func bindCredentialOwner(",
@@ -1450,11 +1450,9 @@ private func credentialCompositionSourceContract(_ syncManager: String) -> Bool 
         && providerFinalizationIsEstablishedAndFenced
 }
 
-private func credentialOwnerRetrySourceContract(_ syncManager: String) -> Bool {
-    let coordinator = sourceRegion(
-        syncManager,
-        from: "enum CredentialRetryCoordinator",
-        to: "#if !CREDENTIAL_RETRY_COORDINATOR_STANDALONE")
+private func credentialOwnerRetrySourceContract(_ syncManager: String, coordinatorSource: String) -> Bool {
+    let coordinator = coordinatorSource.range(of: "enum CredentialRetryCoordinator")
+        .map { String(coordinatorSource[$0.lowerBound...]) } ?? ""
     let retryCore = sourceRegion(
         syncManager,
         from: "private func cancelCredentialOwnerRetry()",
@@ -1551,13 +1549,13 @@ private func credentialOwnerRetrySourceContract(_ syncManager: String) -> Bool {
 /// Signing out is a durable credential mutation, not merely a UI transition. The persisted session must be
 /// confirmed absent before any live state, realtime channel, source index, or published flag can move to the
 /// signed-out projection. A failed deletion remains inside the same bounded generation-fenced retry task.
-private func signOutDurabilitySourceContract(_ syncManager: String) -> Bool {
+private func signOutDurabilitySourceContract(_ syncManager: String, retryCoordinator: String) -> Bool {
     let addonOrder = sourceRegion(
         syncManager,
         from: "nonisolated static var appliedAddonOrder: [String]",
         to: "/// Posted")
     let coordinator = sourceRegion(
-        syncManager,
+        retryCoordinator,
         from: "enum CredentialSignOutCoordinator",
         to: "enum CredentialRetryCoordinator")
     let completion = sourceRegion(
@@ -1775,10 +1773,19 @@ private func providerAdoptionSettlementSourceContract(_ syncManager: String) -> 
             "ownerCapture: pending.capture",
             "return await SIMKLAuth.shared.adoptTokens(",
             "ownerCapture: pending.capture",
-            "guard isCurrent(capture), !providerSettlement.superseded else { return false }",
+            "guard isCurrent(capture), dataKey == capturedDataKey, !providerSettlement.superseded,",
+            "backupUploadFailure != .upgradeRequired else { return false }",
             "if !providerSettlement.completed {",
             "let failedProviderValues = pending.values.filter",
             "pendingProviderApply = PendingProviderApply(",
+            "guard await NativeForegroundSyncPolicy.mayAcknowledgeDocument(",
+            "nativeDocumentCommitted: nativeAccountDocumentCommitted,",
+            "self.isCurrent(capture) && (nativeCommittedTarget.map { CoreBridge.shared.nativePlaybackTargetIsCurrent($0) } ?? true)",
+            "ensureSession: { await self.ensureNativeCheckpoint(credentialCapture: capture) },",
+            "do { nativeCommittedTarget = try await self.commitNativePulledDocument(pulled.doc, capture: capture); return true }",
+            "guard isCurrent(capture), dataKey == capturedDataKey, backupUploadFailure != .upgradeRequired else { return false }",
+            "withRemoteApplySuppressed {",
+            "guard isCurrent(capture) else { return }",
             "pendingProviderApply = nil",
             versionStamp,
             "hasAppliedAccountDoc = true"
@@ -2306,7 +2313,7 @@ struct ApiKeysCredentialSecurityTests {
               .claimTraktLegacySlots, .finalizeTraktLegacySlots,
               .claimSIMKLLegacySlots, .finalizeSIMKLLegacySlots],
         "each provider finalization follows its own successful authenticated raw claim")
-        expect(credentialCompositionSourceContract(c.syncManager),
+        expect(credentialCompositionSourceContract(c.syncManager, coordinatorSource: c.retryCoordinator),
                "VortXSyncManager acquires optional ownership before mutation and boundedly finalizes provider migration")
         expect(ownerAcquisitionTrace(denialsBeforeSuccess: 2)
                == OwnerAcquisitionTrace(
@@ -2320,9 +2327,9 @@ struct ApiKeysCredentialSecurityTests {
                == OwnerAcquisitionTrace(
                 deniedAttemptLogs: [1], exhaustedLogs: 0, successfulApplications: 0),
                "a newer auth generation drops a stale owner retry without applying its captured intent")
-        expect(credentialOwnerRetrySourceContract(c.syncManager),
+        expect(credentialOwnerRetrySourceContract(c.syncManager, coordinatorSource: c.retryCoordinator),
                "restore, sign-out, and adopt production paths retry denied owner acquisition with logging and generation fences")
-        expect(signOutDurabilitySourceContract(c.syncManager),
+        expect(signOutDurabilitySourceContract(c.syncManager, retryCoordinator: c.retryCoordinator),
                "sign-out certifies durable session deletion before live publication and retries a failed deletion")
         let signOutExecution = executableSignOutDurabilityScenarios()
         expect(signOutExecution.failedDeletePreservesOwners,
@@ -2336,30 +2343,30 @@ struct ApiKeysCredentialSecurityTests {
                "a failed certified adopt write cannot flip owners or publish a signed-in projection")
         expect(adoptDurability.repairThenPublishesOnce,
                "a later certified adopt write flips owners and publishes exactly once")
-        let unsafeSignOutOrdering = c.syncManager.replacingOccurrences(
+        let unsafeSignOutOrdering = c.retryCoordinator.replacingOccurrences(
             of: "        guard deletePersistedSession() == .success else { return false }\n"
                 + "        guard isPreSignOutCurrent() else { return false }",
             with: "        guard isPreSignOutCurrent() else { return false }\n"
                 + "        publishSignedOutState()\n"
                 + "        guard deletePersistedSession() == .success else { return false }")
-        expect(unsafeSignOutOrdering != c.syncManager
-               && !signOutDurabilitySourceContract(unsafeSignOutOrdering),
+        expect(unsafeSignOutOrdering != c.retryCoordinator
+               && !signOutDurabilitySourceContract(c.syncManager, retryCoordinator: unsafeSignOutOrdering),
                "the sign-out gate rejects live publication moved before durable deletion")
-        let prematureSignOutBind = c.syncManager.replacingOccurrences(
+        let prematureSignOutBind = c.retryCoordinator.replacingOccurrences(
             of: "        guard deletePersistedSession() == .success else { return false }\n"
                 + "        guard isPreSignOutCurrent() else { return false }\n"
                 + "        guard bindSignedOutOwner() else { return false }",
             with: "        guard bindSignedOutOwner() else { return false }\n"
                 + "        guard deletePersistedSession() == .success else { return false }\n"
                 + "        guard isPreSignOutCurrent() else { return false }")
-        expect(prematureSignOutBind != c.syncManager
-               && !signOutDurabilitySourceContract(prematureSignOutBind),
+        expect(prematureSignOutBind != c.retryCoordinator
+               && !signOutDurabilitySourceContract(c.syncManager, retryCoordinator: prematureSignOutBind),
                "the sign-out gate rejects owner rebinding before durable deletion")
-        let ignoredSignOutDelete = c.syncManager.replacingOccurrences(
+        let ignoredSignOutDelete = c.retryCoordinator.replacingOccurrences(
             of: "guard deletePersistedSession() == .success else { return false }",
             with: "_ = deletePersistedSession()")
-        expect(ignoredSignOutDelete != c.syncManager
-               && !signOutDurabilitySourceContract(ignoredSignOutDelete),
+        expect(ignoredSignOutDelete != c.retryCoordinator
+               && !signOutDurabilitySourceContract(c.syncManager, retryCoordinator: ignoredSignOutDelete),
                "the sign-out gate rejects an ignored durable deletion result")
 
         expect(authenticatedVortXRequestSourceContract(c.syncManager),
@@ -2380,6 +2387,53 @@ struct ApiKeysCredentialSecurityTests {
                "VortX adopt certifies persistence inside owner acquisition before any owner or live session publication")
         expect(providerAdoptionSettlementSourceContract(c.syncManager),
                "VortX settles remote Trakt and SIMKL adoption before acknowledging an account document version")
+        // These exact current production anchors must exist once, so every negative control
+        // below actually corrupts the intended guard rather than passing on an unchanged input.
+        let postProviderFence =
+            "        guard isCurrent(capture), dataKey == capturedDataKey, !providerSettlement.superseded,\n"
+            + "              backupUploadFailure != .upgradeRequired else { return false }"
+        expect(occurrenceCount(c.syncManager, postProviderFence) == 1,
+               "the provider settlement negative controls bind the exact current post-await guard")
+        for (removedCondition, label) in [
+            ("isCurrent(capture), ", "credential ownership"),
+            ("dataKey == capturedDataKey, ", "captured encryption key"),
+            ("!providerSettlement.superseded,\n              ", "provider supersession"),
+            (",\n              backupUploadFailure != .upgradeRequired", "upgrade-required rejection")
+        ] {
+            let alteredFence = postProviderFence.replacingOccurrences(of: removedCondition, with: "")
+            let mutant = c.syncManager.replacingOccurrences(of: postProviderFence, with: alteredFence)
+            expect(alteredFence != postProviderFence && mutant != c.syncManager
+                   && !providerAdoptionSettlementSourceContract(mutant),
+                   "the provider settlement gate rejects removal of post-await \(label)")
+        }
+        let preAcknowledgementFence =
+            "        guard isCurrent(capture), dataKey == capturedDataKey, backupUploadFailure != .upgradeRequired else { return false }"
+        expect(occurrenceCount(c.syncManager, preAcknowledgementFence) == 1,
+               "the provider settlement negative controls bind the exact post-native-commit guard")
+        for (removedCondition, label) in [
+            ("dataKey == capturedDataKey, ", "captured encryption key"),
+            (", backupUploadFailure != .upgradeRequired", "upgrade-required rejection")
+        ] {
+            let alteredFence = preAcknowledgementFence.replacingOccurrences(of: removedCondition, with: "")
+            let mutant = c.syncManager.replacingOccurrences(of: preAcknowledgementFence, with: alteredFence)
+            expect(alteredFence != preAcknowledgementFence && mutant != c.syncManager
+                   && !providerAdoptionSettlementSourceContract(mutant),
+                   "the provider settlement gate rejects removal of post-native-commit \(label)")
+        }
+        let nativeCommitReceipt = "            nativeDocumentCommitted: nativeAccountDocumentCommitted,"
+        let nativeCommitReceiptBypass = c.syncManager.replacingOccurrences(
+            of: nativeCommitReceipt, with: "            nativeDocumentCommitted: true,")
+        expect(occurrenceCount(c.syncManager, nativeCommitReceipt) == 1
+               && nativeCommitReceiptBypass != c.syncManager
+               && !providerAdoptionSettlementSourceContract(nativeCommitReceiptBypass),
+               "the provider settlement gate rejects a fabricated native document commitment")
+        let nativeTargetFence =
+            "                self.isCurrent(capture) && (nativeCommittedTarget.map { CoreBridge.shared.nativePlaybackTargetIsCurrent($0) } ?? true)"
+        let nativeTargetFenceBypass = c.syncManager.replacingOccurrences(of: nativeTargetFence, with: "                true")
+        expect(occurrenceCount(c.syncManager, nativeTargetFence) == 1
+               && nativeTargetFenceBypass != c.syncManager
+               && !providerAdoptionSettlementSourceContract(nativeTargetFenceBypass),
+               "the provider settlement gate rejects bypassing the native publication target fence")
         let providerStampBeforeAwait = c.syncManager.replacingOccurrences(
             of: "        let providerSettlement: CredentialProviderRetryOutcome\n        if let pending = providerPlan {",
             with: "        lastSyncedVersion = max(lastSyncedVersion, pulled.version)\n"

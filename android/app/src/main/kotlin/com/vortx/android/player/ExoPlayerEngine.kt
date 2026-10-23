@@ -17,6 +17,7 @@ import androidx.media3.common.Metadata
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.extractor.metadata.id3.ChapterFrame
 import androidx.media3.extractor.metadata.id3.TextInformationFrame
 import androidx.media3.common.TrackSelectionOverride
@@ -27,6 +28,9 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DecoderCounters
+import androidx.media3.exoplayer.DecoderReuseEvaluation
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
@@ -89,6 +93,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     }
 
     private val _state = MutableStateFlow(PlayerState())
+    private val metadataInputs = ExoMetadataInputs()
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
     override val audioOutputModeAvailable: Boolean = false
 
@@ -104,10 +109,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         override fun onIsPlayingChanged(isPlaying: Boolean) = publish()
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = publish()
         override fun onTracksChanged(tracks: Tracks) = publish(tracks = tracks)
+        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) = publish()
 
         // Surface an unrecoverable decode/network error so the chrome can fall back to the ranked source
         // list instead of leaving a dead black frame (error-to-sources fallback).
         override fun onPlayerError(error: PlaybackException) {
+            metadataInputs.fail()
             _state.value = _state.value.withPlaybackError()
         }
 
@@ -126,6 +133,41 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     /// ID3 chapters discovered in the current stream, published from [Player.Listener.onMetadata]. Thread-safe
     /// because it is written on the player's callback thread and read (via [chapters]) from the chrome.
     private val chapterStore = java.util.concurrent.CopyOnWriteArrayList<PlayerChapter>()
+
+    // Media3's format getters may still describe the previous source during replacement. Only
+    // attributed decoder-input events can supply facts; ordinary callbacks never revive them.
+    private val metadataListener = object : AnalyticsListener {
+        override fun onVideoInputFormatChanged(eventTime: AnalyticsListener.EventTime,
+            format: Format, decoderReuseEvaluation: DecoderReuseEvaluation?) {
+            metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
+            metadataInputs.video(exoMetadataEventContext(eventTime), format)
+            publish()
+        }
+        override fun onAudioInputFormatChanged(eventTime: AnalyticsListener.EventTime,
+            format: Format, decoderReuseEvaluation: DecoderReuseEvaluation?) {
+            metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
+            metadataInputs.audio(exoMetadataEventContext(eventTime), format)
+            publish()
+        }
+        override fun onVideoDisabled(eventTime: AnalyticsListener.EventTime, decoderCounters: DecoderCounters) {
+            metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
+            metadataInputs.disableVideo(exoMetadataEventContext(eventTime))
+            publish()
+        }
+        override fun onAudioDisabled(eventTime: AnalyticsListener.EventTime, decoderCounters: DecoderCounters) {
+            metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
+            metadataInputs.disableAudio(exoMetadataEventContext(eventTime))
+            publish()
+        }
+        override fun onTimelineChanged(eventTime: AnalyticsListener.EventTime, reason: Int) = current(eventTime)
+        override fun onPlaybackStateChanged(eventTime: AnalyticsListener.EventTime, state: Int) = current(eventTime)
+        override fun onPositionDiscontinuity(eventTime: AnalyticsListener.EventTime,
+            oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) = current(eventTime)
+        private fun current(eventTime: AnalyticsListener.EventTime) {
+            metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
+            publish()
+        }
+    }
 
     /// The title of an ID3 chapter frame, taken from its embedded TIT2 text sub-frame, or null when it
     /// carries no title (the caller then names it by index).
@@ -151,6 +193,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     init {
         player.addListener(listener)
+        player.addAnalyticsListener(metadataListener)
         mainHandler.postDelayed(ticker, POSITION_POLL_MS)
     }
 
@@ -162,6 +205,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         ended: Boolean = _state.value.hasEnded,
         tracks: Tracks? = null,
     ) {
+        if (metadataInputs.isReleased) return
         val current = _state.value
         val (audio, subs) = if (tracks != null) mapTracks(tracks) else current.audioTracks to current.subtitleTracks
         _state.value = current.copy(
@@ -173,7 +217,29 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             hasEnded = ended,
             audioTracks = audio,
             subtitleTracks = subs,
+            metadata = activeMetadata(),
         )
+    }
+
+    private fun activeMetadata(): PlaybackMetadata {
+        val timeline = player.currentTimeline
+        val periodIndex = player.currentPeriodIndex
+        if (player.isPlayingAd || periodIndex !in 0 until timeline.periodCount) return PlaybackMetadata()
+        val period = timeline.getPeriod(periodIndex, Timeline.Period(), true)
+        if (period.windowIndex !in 0 until timeline.windowCount) return PlaybackMetadata()
+        val tag = timeline.getWindow(period.windowIndex, Timeline.Window()).mediaItem.localConfiguration?.tag
+        val (video, audio) = metadataInputs.snapshot(tag, period.uid)
+        val range = when {
+            video?.sampleMimeType == androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION ->
+                PlaybackDynamicRange.DOLBY_VISION
+            video?.colorInfo?.colorTransfer == C.COLOR_TRANSFER_ST2084 -> PlaybackDynamicRange.PQ
+            video?.colorInfo?.colorTransfer == C.COLOR_TRANSFER_HLG -> PlaybackDynamicRange.HLG
+            video?.colorInfo?.colorTransfer == C.COLOR_TRANSFER_SDR -> PlaybackDynamicRange.SDR
+            else -> PlaybackDynamicRange.UNKNOWN
+        }
+        return PlaybackMetadata(video?.width ?: 0, video?.height ?: 0, range,
+            audioSelected = audio != null, audioLanguage = audio?.language,
+            audioCodec = audio?.sampleMimeType, audioChannels = audio?.channelCount ?: 0)
     }
 
     /// Map Media3 [Tracks] to the chrome's [PlayerTrack] lists. The engine-native id is the group index
@@ -218,6 +284,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     }
 
     private fun load(playable: Playable, playWhenReady: Boolean, remountPositionMs: Long? = null) {
+        val metadataLoad = metadataInputs.begin()
         _state.value = freshPlayerStateForLoad().copy(isPaused = !playWhenReady)
         lastPlayable = playable
         // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
@@ -263,6 +330,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             }
             val videoItem = MediaItem.Builder()
                 .setUri(playable.url)
+                .setTag(metadataLoad)
                 .build()
             val videoSource = DefaultMediaSourceFactory(appContext)
                 .setDataSourceFactory(media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), playable.userAgent, playable.communityJsTransport))
@@ -291,6 +359,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
         val item = MediaItem.Builder()
             .setUri(playable.url)
+            .setTag(metadataLoad)
             .build()
 
         // ExoPlayer has no runtime setMediaSourceFactory (that is a Builder-only API); create the video
@@ -532,8 +601,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun onEnterForeground() { /* resume is the chrome's choice; keep paused-on-return conservative */ }
 
     override fun release() {
+        metadataInputs.release()
+        _state.value = _state.value.copy(metadata = PlaybackMetadata())
         mainHandler.removeCallbacks(ticker)
         player.removeListener(listener)
+        player.removeAnalyticsListener(metadataListener)
         player.release()
     }
 
@@ -617,6 +689,7 @@ internal fun PlayerState.withPlaybackError(): PlayerState = copy(
     isBuffering = false,
     hasEnded = false,
     hasError = true,
+    metadata = PlaybackMetadata(),
 )
 
 internal data class ExoMuteState(

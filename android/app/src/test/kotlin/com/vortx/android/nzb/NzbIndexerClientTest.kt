@@ -23,6 +23,22 @@ class NzbIndexerClientTest {
         assertTrue(NzbIndexerEndpointPolicy.validate("http://indexer.example/api").isFailure)
     }
 
+    @Test fun siteAddressesResolveToTheirNewznabApi() {
+        mapOf(
+            "drunkenslug.com" to "https://drunkenslug.com/api",
+            "https://ninjacentral.co.za" to "https://ninjacentral.co.za/api",
+            "https://ninjacentral.co.za/" to "https://ninjacentral.co.za/api",
+            "https://api.nzbgeek.info/api" to "https://api.nzbgeek.info/api",
+            "https://indexer.example/newznab/api" to "https://indexer.example/newznab/api",
+        ).forEach { (typed, expected) ->
+            assertEquals(typed, expected, NzbIndexerEndpointPolicy.validate(typed).getOrThrow().toString())
+        }
+        assertTrue(NzbIndexerEndpointPolicy.validate("http://drunkenslug.com").isFailure)
+        val episode = NzbSearch(title = "Show", season = 2, episode = 3)
+        val url = NzbIndexerClient().request(URI("https://drunkenslug.com"), "key", episode, fallback = false)
+        assertEquals("/api", url.path)
+    }
+
     @Test fun parserRejectsDtdAndRetainsOnlySafeRows() {
         val client = NzbIndexerClient()
         val safe = """<rss><channel><item><title>Good</title><enclosure url="https://indexer.example/get?r=token" length="42"/></item><item><title>Bad</title><enclosure url="http://bad.example/get"/></item></channel></rss>""".toByteArray()

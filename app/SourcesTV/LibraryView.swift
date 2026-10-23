@@ -68,12 +68,13 @@ private enum LibrarySmartFilter: String, CaseIterable, Identifiable {
 /// Library, driven by the **stremio-core** engine (`LibraryWithFilters`): the user's saved titles with
 /// type + sort filters. Auto-refreshes as the library changes (add/remove/mark watched), no reload.
 struct LibraryView: View {
-    @EnvironmentObject private var core: CoreBridge
+    @VisibleCore private var core   // observed only while this tab is on screen (EngineObservation.swift)
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
-    @StateObject private var focusModel = FocusedItemModel()
+    @StateObject private var focusOwner = FocusedItemOwner()   // owned, not observed: focus re-renders only the hero
+    private var focusModel: FocusedItemModel { focusOwner.model }
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
@@ -100,6 +101,26 @@ struct LibraryView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Library tab -> scroll here
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                        // Watchlist is the profile's watch-later ledger, separate from saved Library titles.
+                        // Smart collections are the profile's own rule-built rows (synced like the watchlist).
+                        HStack(spacing: Theme.Space.sm) {
+                            NavigationLink { TVWatchlistView() } label: {
+                                Label("Watchlist", systemImage: "star")
+                            }
+                            .buttonStyle(ChipButtonStyle(selected: false))
+                            if profiles.active?.isKids != true {
+                                NavigationLink { TVSmartCollectionsView() } label: {
+                                    Label("Collections", systemImage: "square.grid.2x2")
+                                }
+                                .buttonStyle(ChipButtonStyle(selected: false))
+                                // Folders on a NAS or computer (WebDAV / web folder), saved on this Apple TV.
+                                NavigationLink { TVNetworkSharesView() } label: {
+                                    Label("Network shares", systemImage: "externaldrive.connected.to.line.below")
+                                }
+                                .buttonStyle(ChipButtonStyle(selected: false))
+                            }
+                        }
+                        .padding(.horizontal, Theme.Space.screenEdge)
                         // Offline downloads (#30): a section ABOVE the saved-titles grid, shown only when at
                         // least one download exists. Plays from the local file with pause/resume/delete +
                         // total storage used, and carries the storage-eviction caption. Device-local only.

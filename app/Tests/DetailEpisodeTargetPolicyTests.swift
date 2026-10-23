@@ -25,6 +25,14 @@ private enum DetailEpisodeTargetPolicyTests {
                "missing offset does not erase an exact episode")
         expect(target("fg:0:1", 0) == .init(videoID: "fg:0:1", isResume: false),
                "explicitly selected specials remain supported")
+        expect(target("fg:6:2", 0, watched: ["fg:6:2"]) == .init(videoID: "fg:6:3", isResume: false),
+               "an up-next CW row (finished episode, no offset) targets the next unwatched episode")
+        expect(target("fg:6:2", 0, watched: ["fg:6:2", "fg:6:3"]) == .init(videoID: "fg:6:4", isResume: false),
+               "up next skips episodes already watched")
+        expect(target("fg:6:4", 0, watched: ["fg:6:4"]) == .init(videoID: "fg:6:4", isResume: false),
+               "up next on the last visible episode stays there")
+        expect(target("fg:6:2", 900, watched: ["fg:6:2"]) == .init(videoID: "fg:6:2", isResume: true),
+               "a re-watch in progress of a finished episode still resumes")
         expect(target("not-present") == nil && target(nil) == nil,
                "missing inventory identity leaves ordinary detail selection untouched")
         expect(target("fg:6:2", .nan)?.isResume == false,

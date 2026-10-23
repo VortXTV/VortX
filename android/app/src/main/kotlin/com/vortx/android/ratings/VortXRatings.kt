@@ -46,14 +46,41 @@ object VortXRatingsClient {
         if (!enabled || !imdbId.startsWith("tt")) return null
         val mediaType = if (type == "series") "series" else "movie"
         val root = getSigned("$base/v1/ratings/$mediaType/$imdbId") ?: return null
-        // IMDb on its native 0-10 scale; RT / Metacritic / TMDB as 0-100, matching the MdbListRatings model.
+        // IMDb and MyAnimeList on 0-10, Letterboxd on 0-5, the rest 0-100, matching the MdbListRatings model.
         val r = MdbListRatings(
             imdb = numeric(root, "imdb"),
             rottenTomatoes = numeric(root, "rt")?.roundToInt(),
             metacritic = numeric(root, "metacritic")?.roundToInt(),
             tmdb = numeric(root, "tmdb")?.roundToInt(),
+            rtAudience = numeric(root, "rtAudience")?.roundToInt(),
+            letterboxd = numeric(root, "letterboxd")?.let { RatingsFormat.scaled(it, 5.0) },
+            trakt = numeric(root, "trakt")?.roundToInt(),
+            mal = numeric(root, "mal")?.let { RatingsFormat.scaled(it, 10.0) },
+            simkl = numeric(root, "simkl")?.let { RatingsFormat.scaled(it, 10.0) },
+            kitsu = numeric(root, "kitsu")?.roundToInt(),
         )
         return if (r.hasAny) r else null
+    }
+
+    /// Per-episode scores for one season (`/v1/episodes/{tt}/{season}`): IMDb, TMDB and Trakt for every
+    /// episode the service has scored. Null when disabled, not an IMDb id, or the request fails, so the
+    /// caller can fall back. Mirrors Apple `VortXRatingsClient.episodes(seriesID:season:)`.
+    suspend fun episodes(seriesId: String, season: Int): Map<Int, EpisodeScores>? {
+        if (!enabled || !Regex("^tt\\d+$").matches(seriesId) || season !in 0..999) return null
+        val root = getSigned("$base/v1/episodes/$seriesId/$season") ?: return null
+        val rows = root.optJSONObject("episodes") ?: return null
+        val out = HashMap<Int, EpisodeScores>()
+        for (key in rows.keys()) {
+            val number = key.toIntOrNull() ?: continue
+            val row = rows.optJSONObject(key) ?: continue
+            val scores = EpisodeScores(
+                imdb = numeric(row, "imdb")?.takeIf { it > 0 && it <= 10 },
+                tmdb = numeric(row, "tmdb")?.roundToInt(),
+                trakt = numeric(row, "trakt")?.roundToInt(),
+            )
+            if (scores.ratings.hasAny) out[number] = scores
+        }
+        return out
     }
 
     /// GET [urlString] off the gated ratings host, edge-signed, decode a JSON object. Runs on

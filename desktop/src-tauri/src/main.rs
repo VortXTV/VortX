@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    stremiox_desktop_lib::run()
+    vortx_desktop_lib::run()
 }

@@ -5,11 +5,65 @@ const { test } = require("node:test");
 const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "../app/Sources/PlayerScreen.swift"), "utf8");
 
-function section(from, to) {
-    const start = source.indexOf(from);
-    const end = source.indexOf(to, start);
+const glassSource = fs.readFileSync(path.join(__dirname, "../app/SourcesShared/GlassStyle.swift"), "utf8");
+
+function section(from, to, input = source) {
+    const start = input.indexOf(from);
+    const end = input.indexOf(to, start);
     assert(start >= 0 && end > start, `missing source section: ${from}`);
-    return source.slice(start, end);
+    return input.slice(start, end);
+}
+
+function assertCurrentPlayerGlass(player, glass) {
+    const surface = section("private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:", player);
+    for (const contract of [
+        "@Environment(\\.accessibilityReduceTransparency)", "@Environment(\\.colorSchemeContrast)",
+        "@Environment(\\.isEnabled)", "reduceTransparencyOverride ?? systemReduceTransparency",
+        "contrastOverride ?? systemContrast", ".background { surface }",
+        ".overlay { shape.strokeBorder(border, lineWidth: 1) }", ".clipShape(shape)",
+        ".contentShape(shape)", ".shadow(color: .black.opacity(shadowOpacity)",
+        "if reduceTransparency", "|| !VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto)",
+        "|| contrast == .increased || !isEnabled", "shape.fill(neutral)",
+        "if isEnabled { shape.fill(Theme.Palette.accent.opacity(active ? 0.22 : 0.12)) }",
+        "Color(.sRGB, white: 0.08, opacity: 1)", "isEnabled ? .white : .white.opacity",
+        ".glassEffect(.clear.tint(Theme.Palette.playerGlassAccent.opacity(active ? 0.45 : 0.30)).interactive(), in: shape)",
+        "shape.fill(.ultraThinMaterial)", "VortXPlayerChromePolicy.controlTintAlpha(",
+        "active: active, crimson: Theme.Palette.playerGlassUsesCrimson",
+        "VortXPlayerChromePolicy.controlVeilAlpha(", "crimson: Theme.Palette.playerGlassUsesCrimson",
+        "contrast == .increased ? .white : Theme.Palette.playerGlassAccent"
+    ]) assert(surface.includes(contract), "current player surface contract: " + contract);
+    assert(!surface.includes("Theme.Palette.onAccent"), "playback glyphs remain white");
+    assert(!surface.includes("return Theme.Palette.accent"), "transport cannot become a solid accent disc");
+    assert(!surface.includes("shadow(color: Theme.Palette.accent"), "no accent-colored outer shadow");
+    assert(surface.indexOf("VortXPlayerChromePolicy.controlTintAlpha(") <
+        surface.indexOf("VortXPlayerChromePolicy.controlVeilAlpha("), "dark veil remains above profile tint");
+
+    const policy = section("enum VortXPlayerChromePolicy", "/// The actual large video backplate", glass);
+    assert(policy.includes("reduceTransparency || highContrast || !glassEnabled"));
+    const plate = section("private struct VortXPlayerBottomBackplateModifier:", "extension View {", glass);
+    for (const contract of [
+        "reduceTransparency: reduceTransparency, highContrast: contrast == .increased",
+        "glassEnabled: VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto)",
+        "shape: RoundedRectangle(cornerRadius: 22, style: .continuous)",
+        "highlightTop: 0.14, shadow: .bar", "forceOpaque: requiresContrast",
+        "VortXPlayerChromePolicy.backplateFillAlpha(requiresContrast: requiresContrast)",
+        "VortXPlayerChromePolicy.backplateMaterialOpacity(requiresContrast: requiresContrast)", "tone: .scrim"
+    ]) assert(plate.includes(contract), "shared backplate contract: " + contract);
+    const shared = section("private struct VortXGlassModifier", "// MARK: - The prominent", glass);
+    assert(shared.includes("reduceTransparency: reduceTransparency || forceOpaque"));
+    assert(shared.includes(".opacity(reduceTransparency || forceOpaque ? 1 : materialOpacity)"));
+    assert(shared.includes("if !reduceTransparency && !forceOpaque"));
+
+    const layout = section("private struct PlayerBottomBarLayout:", "/// Pinch is a mode change", player);
+    for (const contract of ["VStack(spacing: 10)", "VStack(spacing: 14)",
+        ".padding(.horizontal, 16).padding(.bottom, 12)",
+        ".padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 12)",
+        ".vortxPlayerBottomBackplate()", ".padding(.horizontal, 16).padding(.bottom, 16)"])
+        assert(layout.includes(contract), "retained bottom geometry: " + contract);
+    assert(player.includes("VortXPlayerBackdrop(platform: .touch)"));
+    assert(player.includes("VortXPlayerBackdrop(platform: .desktop)"));
+    assert(player.includes(".onPreferenceChange(PlayerBottomBarHeightKey.self) { bottomChromeHeight = $0 }"));
+    assert(player.includes("chromeHeight: Double(bottomChromeHeight)"));
 }
 
 test("the entire bottom bar terminates metadata at concrete rendering boundaries", () => {
@@ -67,18 +121,25 @@ test("executable probe extracts production factories and editor bodies with actu
     }
 });
 
-test("player-glass regression compiles the extracted modifier and renders accessibility and selection states", () => {
+test("player-glass regression compiles actual prepared source and renders accessibility and selection states", () => {
     const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-accent-controls.sh"), "utf8");
+    const prepare = fs.readFileSync(path.join(__dirname, "../scripts/prepare-player-accent-controls.cjs"), "utf8");
     const harness = fs.readFileSync(path.join(__dirname, "../app/Tests/PlayerAccentControlsReduceTransparencyTests.swift"), "utf8");
+    assert(runner.includes('node scripts/prepare-player-accent-controls.cjs "$accent_test_dir"'));
+    assert(runner.includes("xcrun swiftc -Onone -j 1 -num-threads 1"));
     for (const productionInput of ["PlayerControlReduceTransparencyOverrideKey",
-        "app/Tests/PlayerAccentControlsReduceTransparencyTests.swift", "xcrun swiftc -O -parse-as-library",
-        "private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:"]) {
-        assert(runner.includes(productionInput), `accent probe must compile ${productionInput}`);
+        "app/Tests/PlayerAccentControlsReduceTransparencyTests.swift", "private struct PlayerControlSurfaceModifier",
+        "private struct PlayerControlButton:", "app/SourcesShared/GlassStyle.swift", "const playerGlass = glass;",
+        "const modifier = production.slice(start, end);", "playerGlassFixture,\n  modifier,\n  harness,"]) {
+        assert(prepare.includes(productionInput), "accent preparation must compile " + productionInput);
     }
     for (const runtimeProbe of ["NSHostingView", "cacheDisplay(in: host.bounds, to: bitmap)",
-        "reducedBright.alpha >= 0.98", "white controls must keep 4.5:1 contrast",
-        "selected settings must retain an accent cue", "disabled controls must dim their white glyph"] ) {
-        assert(harness.includes(runtimeProbe), `accent probe must render ${runtimeProbe}`);
+        "dark.alpha >= 0.98 && bright.alpha >= 0.98", "white player controls must keep 4.5:1 contrast",
+        "normal off/selected controls must retain an accent cue", "disabled controls must dim their white glyph",
+        ".environment(\\.playerControlReduceTransparencyOverride, reduceTransparency)",
+        ".environment(\\.playerControlContrastOverride, contrast)", "assertOpaqueInvariant(increasedOffDark",
+        "assertOpaqueInvariant(reducedOffDark"]) {
+        assert(harness.includes(runtimeProbe), "accent probe must render " + runtimeProbe);
     }
 });
 
@@ -93,15 +154,30 @@ test("touch seek renders the stored style with a real adjustable 44pt interactio
     }
     const surface = source.slice(source.indexOf("private struct PlayerSeekSliderSurface:"),
         source.indexOf("private struct PlayerChapterMarkers:"));
-    assert(surface.includes("#if os(iOS)\n        PlayerStyledSeekSlider("));
-    assert(surface.includes("#else\n        PlayerClockSlider("), "retain native desktop seek behavior");
+    assert(surface.includes("#if os(iOS) || os(macOS)\n        PlayerStyledSeekSlider("),
+        "both touch and desktop use the actual stored-style seek surface");
+    assert(surface.includes("#else\n        PlayerClockSlider("), "other platforms retain native seek behavior");
+    for (const contract of [".onContinuousHover { phase in", "guard !scrubbing else { return }",
+        "onHoverPreviewChanged(Double(ratio))", "onHoverPreviewChanged(nil)",
+        "onScrubChanged: onScrubChanged, onEditingChanged: onEditingChanged"]) {
+        assert(surface.includes(contract), "retained shared seek/desktop-hover behavior: " + contract);
+    }
 });
 
-test("pinch changes the live engine mode and is exclusive with video taps", () => {
+test("pinch owns its multi-touch cycle without also delivering a tap", () => {
     const interaction = source.slice(source.indexOf("private struct PlayerVideoInteractionSurface:"),
         source.indexOf("private struct PlayerSizeModeFeedback:"));
-    assert(interaction.includes(".exclusively(before: TapGesture())"));
-    assert(interaction.includes("if pinchEnabled && !locked { onPinch(scale) }"));
+    for (const contract of ["UIViewRepresentable", "view.isMultipleTouchEnabled = true",
+        "UITapGestureRecognizer", "tap.numberOfTouchesRequired = 1", "UIPinchGestureRecognizer",
+        "coordinator.pinch?.isEnabled = pinchEnabled && !locked", "coordinator.ownership.invalidate()",
+        "ownership.consumeTap(tapCycle)", "pinchCycle = ownership.claimPinch()",
+        "guard attached, pinchEnabled, !locked, let pinchCycle,",
+        "ownership.consumePinch(pinchCycle)", "onPinch(recognizer.scale)"]) {
+        assert(interaction.includes(contract), "retained actual touch ownership: " + contract);
+    }
+    const ownership = section("private struct PlayerVideoTouchPolicy", "#if os(iOS)\n@MainActor private struct PlayerVideoInteractionSurface:");
+    assert(ownership.includes("expectedCycle == cycle, !multiTouchOwned, !tapDelivered"));
+    assert(ownership.includes("expectedCycle == cycle, multiTouchOwned, !pinchDelivered"));
     const enabled = source.slice(source.indexOf("private var touchPinchEnabled:"),
         source.indexOf("private func applyVideoSize("));
     for (const guard of ["!isLocked", "panel == nil", "!touchOptionsVisible", "!showExternalChooser", "!showShare", "!loadFailed", "!scrubbing"]) {
@@ -134,32 +210,8 @@ test("decorative layers preserve order, identities and non-interactive hit testi
     }
 });
 
-test("player controls use neutral clipped glass and reserve profile accent for selected settings", () => {
-    const surface = section("private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:");
-    for (const contract of [
-        "@Environment(\\.accessibilityReduceTransparency)",
-        "@Environment(\\.colorSchemeContrast)",
-        "@Environment(\\.isEnabled)",
-        ".background { surface }",
-        ".overlay { shape.strokeBorder(border, lineWidth: 1) }",
-        ".clipShape(shape)",
-        ".contentShape(shape)",
-        ".shadow(color: .black.opacity(shadowOpacity)",
-        "shape.fill(.ultraThinMaterial)",
-        "if reduceTransparency || contrast == .increased || !isEnabled",
-        "shape.fill(neutral)",
-        "if active && isEnabled",
-        "shape.fill(Theme.Palette.accent.opacity(0.16))",
-        "Color(.sRGB, white: 0.08, opacity: 1)",
-        "isEnabled ? .white : .white.opacity",
-        "active && isEnabled ? Theme.Palette.accent : .white"
-    ]) {
-        assert(surface.includes(contract), `player surface contract: ${contract}`);
-    }
-    assert(!surface.includes("Theme.Palette.onAccent"), "playback glyphs must remain white on neutral glass");
-    assert(!surface.includes("return Theme.Palette.accent"), "prominent transport must not become a solid accent disc");
-    assert(!surface.includes("shadow(color: Theme.Palette.accent"),
-        "player surface must never cast an accent-colored outer shadow");
+test("player controls retain clipped profile glass, white glyphs and shared opaque accessibility fallbacks", () => {
+    assertCurrentPlayerGlass(source, glassSource);
 
     const controls = [
         ["toolbar control", section("private struct PlayerControlButton:", "private struct PlayerTransportToolbar:")],
@@ -193,4 +245,28 @@ test("player controls use neutral clipped glass and reserve profile accent for s
         "AirPlay wrapper keeps the player glass surface without replacing AVRoutePickerView");
     assert(source.includes("private struct AVPlayerPictureInPictureButton: View"),
         "native PiP wrapper remains present");
+});
+
+
+test("current glass contracts reject missing accessibility, clipping, tint order and layout wiring", () => {
+    const mutations = [
+        ["Reduce Transparency", source.replace("if reduceTransparency\n", "if false\n"), glassSource],
+        ["increased contrast", source.replace("|| contrast == .increased || !isEnabled", "|| !isEnabled"), glassSource],
+        ["disabled controls", source.replace("|| contrast == .increased || !isEnabled", "|| contrast == .increased"), glassSource],
+        ["shape clipping", source.replaceAll(".clipShape(shape)", ".unclippedFixture()"), glassSource],
+        ["profile tint below veil", source.replace("VortXPlayerChromePolicy.controlTintAlpha(", "removedControlTint("), glassSource],
+        ["opaque shared face", source, glassSource.replace("forceOpaque: requiresContrast", "forceOpaque: false")],
+        ["opaque material opacity", source, glassSource.replace(".opacity(reduceTransparency || forceOpaque ? 1 : materialOpacity)",
+            ".opacity(materialOpacity)")],
+        ["scrim tone", source, glassSource.replace("tone: .scrim))", "tone: .lift))")],
+        ["backplate real caller", source.replace(".vortxPlayerBottomBackplate()", ".removedBackplateFixture()"), glassSource],
+        ["bottom geometry", source.replace(".padding(.horizontal, 16).padding(.bottom, 16)", ".padding(.bottom, 999)"), glassSource],
+        ["skip/chrome measurement", source.replace(".onPreferenceChange(PlayerBottomBarHeightKey.self) { bottomChromeHeight = $0 }",
+            ".onPreferenceChange(PlayerBottomBarHeightKey.self) { _ in }"), glassSource]
+    ];
+    for (const [name, mutatedPlayer, mutatedGlass] of mutations) {
+        assert(mutatedPlayer !== source || mutatedGlass !== glassSource, "negative control must mutate " + name);
+        assert.throws(() => assertCurrentPlayerGlass(mutatedPlayer, mutatedGlass), undefined,
+            "current contracts must reject removal of " + name);
+    }
 });

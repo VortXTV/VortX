@@ -4,8 +4,8 @@ project(vortx_mpv_seam CXX)
 
 # VortX seam build of the forked libmpv-android JNI glue (see README.md for provenance). The glue is
 # compiled FROM SOURCE here; the heavy libmpv/ffmpeg binaries are NEVER rebuilt or vendored -- they
-# keep coming from the dev.jdtech.mpv:libmpv:1.0.0 AAR (the same supply chain as before this module
-# existed). The AAR is resolved + its jni/<abi> .so files extracted by the Gradle task in this
+# come from the single root-selected AAR (original Maven baseline or reviewed component).
+# The AAR is resolved + its jni/<abi> .so files extracted by the Gradle task in this
 # module's build.gradle.kts into ${MPV_AAR_JNI_DIR}, purely so the linker can resolve symbols; at
 # runtime those same AAR-packaged .so files are what the app loads.
 if(NOT DEFINED MPV_AAR_JNI_DIR)

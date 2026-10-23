@@ -195,7 +195,8 @@ internal fun TvAddonsScreen(
                             addon = addon,
                             health = health[AddonHealthStore.normalizeUrl(addon.transportUrl)]
                                 ?: AddonHealth.Unknown,
-                            onClick = { if (!addon.isProtected) viewModel.toggleAddon(addon) },
+                            // A protected add-on switched off elsewhere can always be switched back on.
+                            onClick = { if (!addon.isProtected || addon.isDisabled) viewModel.toggleAddon(addon) },
                             onConfigure = if (addon.isConfigurable) {
                                 { configureAddon = addon }
                             } else {

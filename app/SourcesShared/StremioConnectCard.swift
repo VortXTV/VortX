@@ -22,20 +22,25 @@ struct StremioConnectCard: View {
     var body: some View {
         StremioProviderCard {
             Text("Stremio").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-            if account.isSignedIn {
-                Text("Connected").font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            if connecting {
+                // Keep retry UI mounted even if a partial import saved the credential already.
+                LinkLoginView(account: account)
+                Button("Cancel") { connecting = false }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+            } else if account.isSignedIn {
+                Text(account.signInError == nil ? "Connected" : "Connection needs attention")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                if let warning = account.signInError {
+                    Text(warning).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                    Button("Retry connection") { connecting = true }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                }
                 if let email = account.email, !email.isEmpty {
                     Text(email).font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
                 }
                 Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
                 Button("Disconnect") { disconnect() }
-                    .buttonStyle(ChipButtonStyle(selected: false))
-            } else if connecting {
-                // Reused, read-only. LinkLoginView owns its own polling and flips
-                // `account.isSignedIn` when the link auth completes; the sink below finishes the import.
-                LinkLoginView(account: account)
-                Button("Cancel") { connecting = false }
                     .buttonStyle(ChipButtonStyle(selected: false))
             } else {
                 Text("Bring your Stremio add-ons and library into VortX. This is optional and separate from your VortX account.")
@@ -49,18 +54,25 @@ struct StremioConnectCard: View {
         // seeds the engine and snapshots the imported add-ons into the VortX account doc, instead of just
         // flipping a flag. Never-zero guarded inside the manager if the pull is still empty.
         .onReceive(account.$isSignedIn) { signedIn in
-            guard signedIn, !didHandleSignIn else { return }
-            didHandleSignIn = true
-            connecting = false
-            core.signedInWithLegacyAuthKey()
-            Task { @MainActor in
-                await core.awaitAddonsHydrated()
-                await VortXSyncManager.shared.snapshotOwnedFromEngine()
-            }
+            handleStremioSignIn(signedIn: signedIn)
+        }
+        .onChange(of: account.credentialBoundaryGeneration) { _ in
+            handleStremioSignIn(signedIn: account.isSignedIn)
         }
         .onChange(of: account.isSignedIn) { signedIn in
             // Re-arm the one-shot latch after a disconnect so a later reconnect runs the handoff again.
             if !signedIn { didHandleSignIn = false }
+        }
+    }
+
+    private func handleStremioSignIn(signedIn: Bool) {
+        guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
+        didHandleSignIn = true
+        connecting = false
+        core.signedInWithLegacyAuthKey()
+        Task { @MainActor in
+            await core.awaitAddonsHydrated()
+            await VortXSyncManager.shared.snapshotOwnedFromEngine()
         }
     }
 

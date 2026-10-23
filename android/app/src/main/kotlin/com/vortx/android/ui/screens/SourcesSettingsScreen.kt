@@ -62,8 +62,8 @@ import java.util.Locale
 ///   - `defaultSourceSort`              -> DetailScreen's SourcesSection sort chips (Best/Size/Seeders),
 ///     remembered through DetailViewModel.setSourceSort
 ///
-/// A change here takes effect on the NEXT source list, with no restart: `EngineStremioRepository` builds a
-/// FRESH snapshot off this store and installs it on every load (EngineStremioRepository.kt:550-551), and the
+/// A change here takes effect on the NEXT source list, with no restart: the engine repository builds a
+/// FRESH snapshot off this store and installs it on every load, and the
 /// order/prefer/avoid setters additionally drop the memoized ranking scores.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

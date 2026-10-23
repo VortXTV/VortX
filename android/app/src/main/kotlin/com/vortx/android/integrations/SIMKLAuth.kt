@@ -76,19 +76,19 @@ object SIMKLAuth {
     private const val TAG = "SIMKLAuth"
 
     @Volatile private var tokenStore: TokenPersistence? = null
-    private val tokenMutations = CredentialMutationCoordinator(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderCredentials.GROUPS[1] else null)
+    private val tokenMutations = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1])
     private val sessionEpoch = AtomicLong(0L)
     private val _sessionBoundary = MutableStateFlow(0L)
 
     /** Changes after a confirmed sign-in replacement or disconnect so mounted Home rails reconcile now. */
-    internal val sessionBoundary: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _sessionBoundary.asStateFlow()
+    internal val sessionBoundary: StateFlow<Long> get() = NativeProviderAccess.revision
 
     /// Idempotent init: build the encrypted token store from the app context (see [TraktAuth.init]).
     fun init(context: Context) {
         if (tokenStore == null) {
             synchronized(this) {
                 if (tokenStore == null) {
-                    tokenStore = TokenPersistence(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.oauthStore("simkl") else SecureTokenStore(context, PREFS_FILE))
+                    tokenStore = TokenPersistence(NativeProviderAccess.oauthStore("simkl"))
                 }
             }
         }
@@ -240,8 +240,8 @@ object SIMKLAuth {
         _sessionBoundary.value = next
     }
 
-    private fun currentSessionEpoch(): Long = if (BuildConfig.NATIVE_ENGINE_ENABLED)
-        NativeProviderAccess.read(NativeProviderCredentials.GROUPS[1])?.revision ?: -1 else sessionEpoch.get()
+    private fun currentSessionEpoch(): Long =
+        NativeProviderAccess.read(NativeProviderCredentials.GROUPS[1])?.revision ?: -1
 
     internal class TokenPersistence(
         private val store: CredentialStoreAccess,

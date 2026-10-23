@@ -55,12 +55,7 @@ internal class NativeMigrationPreflight private constructor(val scope: VortxAcco
                     .put("verifiedStreamingUid", entry.getString("verifiedStreamingUid"))
                     .put("sourceDocumentBase64", entry.getString("sourceDocumentBase64"))))
             }
-            for (key in listOf("nativeWatchedMigrationEvidence", "nativeWatchedMigrationPending")) {
-                val records = archive.getJSONObject("document").optJSONArray(key) ?: continue
-                for (i in 0 until records.length()) require(records.getJSONObject(i).let {
-                    it.getString("accountId") == scope.accountID && it.getString("ownerProfileId") == scope.ownerProfileID
-                })
-            }
+            NativeWatchedMigrationStorage.read(archive.getJSONObject("document")).requireScope(scope)
             return NativeMigrationPreflight(scope, raw)
         }
     }
@@ -69,12 +64,12 @@ internal class NativeMigrationPreflight private constructor(val scope: VortxAcco
 /** Sidecars are not part of the legacy source being hashed. Never recursively archive evidence
  * inside its next consumed source snapshot. The original cloud fields remain otherwise intact. */
 internal fun nativeMigrationSourceDocument(document: JSONObject): JSONObject =
-    NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(document)).also { source ->
-        nativeMigrationSidecars.forEach(source::remove)
-    }
+    JSONObject().also { source ->
+        document.keys().asSequence().filterNot { it in nativeMigrationSidecars }.forEach { source.put(it, document.get(it)) }
+    }.let { NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(it)) }
 
 internal val nativeMigrationSidecars = setOf("authenticatedOwnAccountSources", "nativeOwnAccountPending", "nativeOwnAccountCandidates",
-    "nativeWatchedMigrationEvidence", "nativeWatchedMigrationPending", "nativeWatchlistMigrationPending", "nativeLegacyMembershipPending")
+    "nativeWatchedMigrationEvidence", "nativeWatchedMigrationPending", "nativeWatchedMigrationSources", "nativeWatchlistMigrationPending", "nativeLegacyMembershipPending")
 
 internal fun validateNativeOwnAccountCandidates(value: JSONObject): JSONObject {
     value.keys().forEach { id ->
@@ -93,28 +88,18 @@ internal fun validateNativeOwnAccountCandidates(value: JSONObject): JSONObject {
     return NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(value))
 }
 
-internal fun nativeWatchedRecordIdentity(record: JSONObject): String = listOf(record.getString("accountId"),
-    record.getString("ownerProfileId"), record.getString("profileId"), record.optString("verifiedStreamingUid"),
-    record.getString("sourceDocumentSha256"), record.getJSONObject("row").toString()).joinToString("\u0000")
+internal fun nativeWatchedRecordIdentity(record: JSONObject): String = JSONArray(listOf(record.getString("accountId"),
+    record.getString("ownerProfileId").uppercase(), record.getString("profileId").uppercase(), record.opt("verifiedStreamingUid"),
+    record.getString("sourceDocumentSha256"), watchedLocatorJSON(watchedLocator(record.getJSONObject("row"))))).toString()
 
 internal fun mergeNativeWatchedArchive(scope: VortxAccountScope, prior: JSONObject?, next: JSONObject,
-                                     evidence: JSONArray, pending: JSONArray) {
-    fun merged(key: String, added: JSONArray, validate: (JSONArray) -> JSONArray): JSONArray {
-        val unique = linkedMapOf<String, JSONObject>()
-        for (array in listOf(prior?.optJSONArray(key) ?: JSONArray(), added)) {
-            val checked = validate(array)
-            for (index in 0 until checked.length()) {
-                val record = checked.getJSONObject(index)
-                require(record.getString("accountId") == scope.accountID && record.getString("ownerProfileId") == scope.ownerProfileID)
-                unique.putIfAbsent(nativeWatchedRecordIdentity(record), record)
-            }
-        }
-        return JSONArray(unique.values.toList())
-    }
-    val accepted = merged("nativeWatchedMigrationEvidence", evidence, ::validateNativeWatchedMigrationArchive)
-    val completed = (0 until accepted.length()).map { nativeWatchedRecordIdentity(accepted.getJSONObject(it)) }.toSet()
-    val unresolved = merged("nativeWatchedMigrationPending", pending, ::validateNativeWatchedMigrationPending)
-    next.put("nativeWatchedMigrationEvidence", accepted)
-    next.put("nativeWatchedMigrationPending", JSONArray((0 until unresolved.length()).map(unresolved::getJSONObject)
-        .filterNot { nativeWatchedRecordIdentity(it) in completed }))
+                                     evidence: JSONArray, pending: JSONArray) = mergeNativeWatchedArchive(scope, prior, next,
+    NativeWatchedMigrationStorage.read(JSONObject().put(NativeWatchedMigrationStorage.EVIDENCE, evidence)
+        .put(NativeWatchedMigrationStorage.PENDING, pending)))
+
+internal fun mergeNativeWatchedArchive(scope: VortxAccountScope, prior: JSONObject?, next: JSONObject,
+                                     added: NativeWatchedMigrationStorage) {
+    val retained = NativeWatchedMigrationStorage.read(prior)
+    retained.requireScope(scope); added.requireScope(scope)
+    NativeWatchedMigrationStorage.Builder().also { it.add(retained); it.add(added) }.build().writeTo(next)
 }

@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.SwitchAccount
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
@@ -88,6 +89,9 @@ object VortXIcons {
     /// SF `play.rectangle` — a 16:9 media/episode-thumb affordance; Material has no rectangle-play
     /// glyph, `SmartDisplay` (a play triangle in a rounded rect) is the closest available shape.
     val playRectangle: ImageVector = Icons.Filled.SmartDisplay
+
+    /// SF `movieclapper`: the Trailer action, a film clapperboard, matching Apple.
+    val clapperboard: ImageVector = Icons.Filled.Movie
 
     /// SF `arrow.clockwise`: the "Re-find sources" affordance, re-query the stream add-ons fresh so an
     /// expired/dead source is replaced. `Refresh` is Material's closest clockwise-reload glyph.

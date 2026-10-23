@@ -1,0 +1,19 @@
+[
+  {"name":"movie_tvdb_only_nullable_bounds","status":200,"expect":"media","spans":[{"kind":"intro","startMs":null,"endMs":90000},{"kind":"credits","startMs":3400000,"endMs":null}],"payload":{"tvdb_id":123,"type":"movie","intro":[{"start_ms":null,"end_ms":90000}],"credits":[{"start_ms":3400000,"end_ms":null}]}},
+  {"name":"episode_multiple_all_kinds_details","status":200,"expect":"media","spans":[{"kind":"intro","startMs":10000,"endMs":40000},{"kind":"intro","startMs":80000,"endMs":95000},{"kind":"recap","startMs":null,"endMs":8000},{"kind":"credits","startMs":1500000,"endMs":null},{"kind":"preview","startMs":1600000,"endMs":1640000}],"payload":{"tvdb_id":456,"type":"tv","season":0,"episode":0,"group_duration_ms":1700000,"intro":[{"start_ms":10000,"end_ms":40000,"confidence":0.9,"submission_count":7},{"start_ms":80000,"end_ms":95000}],"recap":[{"start_ms":null,"end_ms":8000}],"credits":[{"start_ms":1500000,"end_ms":null}],"preview":[{"start_ms":1600000,"end_ms":1640000}]}},
+  {"name":"omitted_segment_arrays","status":200,"expect":"media","spans":[],"payload":{"tvdb_id":123,"type":"movie"}},
+  {"name":"episode_list_not_timestamps","status":200,"expect":"episodeList","payload":{"tvdb_id":456,"type":"tv","episodes":[]}},
+  {"name":"versions_not_timestamps","status":200,"expect":"versions","payload":{"tvdb_id":123,"type":"movie","versions":[{"duration_ms":3600000,"submission_count":5}]}},
+  {"name":"missing_tvdb_identity","status":200,"expect":"decodeFailure","payload":{"type":"movie","intro":[{"start_ms":0,"end_ms":90000}]}},
+  {"name":"invalid_media_type","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"series"}},
+  {"name":"missing_nullable_bound","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"movie","credits":[{"start_ms":3400000}]}},
+  {"name":"negative_bound","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"movie","intro":[{"start_ms":-1,"end_ms":90000}]}},
+  {"name":"wrong_segment_shape","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"movie","intro":{"start_ms":0,"end_ms":90000}}},
+  {"name":"null_segment_array","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"movie","intro":null}},
+  {"name":"mixed_response_variants","status":200,"expect":"decodeFailure","payload":{"tvdb_id":123,"type":"movie","versions":[],"intro":[]}},
+  {"name":"known_missing","status":404,"expect":"notFound","payload":{"error":"media not found"}},
+  {"name":"mapping_rejected","status":400,"expect":"httpFailure","payload":{"error":"mapping unavailable"}},
+  {"name":"request_shape_rejected","status":422,"expect":"httpFailure","payload":{"error":"expected integer"}},
+  {"name":"throttled","status":429,"expect":"httpFailure","payload":{"error":"usage limit exceeded"}},
+  {"name":"upstream_failure","status":500,"expect":"httpFailure","payload":{"error":"internal server error"}}
+]

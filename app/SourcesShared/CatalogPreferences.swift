@@ -4,6 +4,24 @@ import Foundation
 import SwiftUI
 #endif
 
+/// One immutable ordering decision per row build. Reading preferences from a sort comparator
+/// repeats storage work and can change the comparator's answer halfway through the sort.
+struct CatalogOrderSnapshot: Sendable {
+    private let firstRanks: [String: Int]
+
+    init(_ orderedKeys: [String]) {
+        var ranks: [String: Int] = [:]
+        ranks.reserveCapacity(orderedKeys.count)
+        // Retain firstIndex semantics for old or imported orders containing duplicate keys.
+        for (index, key) in orderedKeys.enumerated() where ranks[key] == nil {
+            ranks[key] = index
+        }
+        firstRanks = ranks
+    }
+
+    func rank(_ key: String) -> Int { firstRanks[key] ?? Int.max }
+}
+
 /// Pure mutation seam used by the real catalog controls and compiled directly into the portrait contract.
 /// Returning nil for an invalid move keeps the production caller fail-soft without duplicating the rules.
 enum CatalogRowMutationContract {
@@ -425,8 +443,9 @@ struct CatalogManagerView: View {
         // editor reflects how catalogs currently appear instead of an arbitrary alphabetical list (Bug 10).
         var boardIndex: [String: Int] = [:]
         for (i, row) in core.boardRows.enumerated() where boardIndex[row.id] == nil { boardIndex[row.id] = i }
+        let savedOrder = CatalogOrderSnapshot(CatalogPrefsStore.order())
         return core.allCatalogs.sorted { a, b in
-            let ra = CatalogPrefsStore.rank(a.key), rb = CatalogPrefsStore.rank(b.key)
+            let ra = savedOrder.rank(a.key), rb = savedOrder.rank(b.key)
             if ra != rb { return ra < rb }
             let ba = boardIndex[a.key] ?? Int.max, bb = boardIndex[b.key] ?? Int.max
             if ba != bb { return ba < bb }

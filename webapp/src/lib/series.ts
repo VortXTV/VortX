@@ -1,6 +1,6 @@
 import type { MetaItem, Video } from "./types";
 
-// Series helpers, a direct port of the season/episode handling in desktop/src/engine.ts (which itself
+// Series helpers, a direct port of the earlier desktop UI's season/episode handling (which itself
 // mirrors DetailView.swift's CoreSeasonedEpisodes). A series shows a season selector + episode list;
 // a movie shows streams directly.
 

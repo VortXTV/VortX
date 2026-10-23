@@ -49,8 +49,9 @@ For desktop testing without a TV: run the webapp and open it with `?tv=1` (e.g.
 
 ## Build & package
 
-Prerequisites: the shared webapp's Node 22.18+ and pinned npm 11.17.0 toolchain, with dependencies
-installed in `../webapp` using its documented Corepack setup. See [webapp/README.md](../webapp/README.md).
+Prereq: the Node/npm versions declared by `../webapp/package.json` (currently Node
+22.23.3+ and npm 12.2.0) and a pinned `npm ci` in `../webapp` (done once). The builder
+checks those declared engine requirements before building or replacing a stage.
 
 ```bash
 # From the repo root:
@@ -64,6 +65,17 @@ node platforms/gen-icons.mjs
 `build-tv.sh` runs the shared `npm run build`, copies `dist/` + the manifest + icons into
 `platforms/<p>/.stage/`, and validates the manifest. If the platform SDK CLI is installed it packages the
 `.ipk` / `.wgt`; otherwise it stages and prints the exact package command (it never fabricates an artifact).
+
+Packaged files do not receive Cloudflare Pages `_headers`. After copying the shared output,
+the builder injects the authoritative CSP from `webapp/public/_headers` into the staged
+HTML before scripts/resources. Missing/unsafe CSP stops the builder before any packaging
+command. This preserves arbitrary HTTPS provider/media hosts, HLS blob workers
+and the YouTube no-cookie trailer frame, while keeping executable scripts local. The
+Tizen manifest retains dynamic network access but no longer permits arbitrary top-level
+navigation. Source contract tests do not replace signed-package or physical-TV validation.
+The TV-only derivation additionally permits `http:` in image, media and connect directives,
+preserving existing HTTP posters/direct/HLS providers on a packaged origin. It does not
+add HTTP authority to scripts, frames or workers, or alter the HTTPS Pages policy.
 
 ### webOS (.ipk) — needs the webOS SDK CLI
 

@@ -36,10 +36,10 @@ import com.vortx.android.config.RemoteConfig
 import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.diagnostics.CrashReporter
-import com.vortx.android.engine.EngineStremioRepository
 import com.vortx.android.engine.NativeCatalogRepository
 import com.vortx.android.engine.AndroidNativePlaybackResolver
 import com.vortx.android.engine.NativeAccountCoordinator
+import com.vortx.android.engine.runNativeRetirementAttempt
 import com.vortx.android.engine.NativeProfileAccess
 import com.vortx.android.engine.VortxAccountScope
 import com.vortx.android.engine.VortxAndroidCheckpointKey
@@ -66,53 +66,24 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.map
 
-/// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
-///
-/// This matters for engine lifecycle correctness (ANDROID-PLAN.md S03: "init once at app start...
-/// safe against double-init"): [MainActivity] does not construct the engine repository itself,
-/// because an `Activity` can be torn down and recreated WITHIN THE SAME PROCESS (a config change
-/// `MainActivity`'s manifest entry doesn't cover -- e.g. a system locale/night-mode change, or "Don't
-/// keep activities" on some OEM skins) without the process (and so the JVM statics backing
-/// [com.vortx.android.engine.StremioCoreNative]) ever restarting. If each `onCreate` built its own
-/// `EngineStremioRepository`, the process-wide [com.vortx.android.engine.StremioCoreNative] object's
-/// `initialized` guard would make every [com.vortx.android.engine.StremioCoreNative.init] after the
-/// first return early WITHOUT re-registering the caller's listener -- so only the FIRST repository's
-/// event listener is ever wired to native, and every subsequent Activity instance would hold a
-/// repository whose engine event flow silently never fires again. (The native `nativeInit` itself does
-/// not orphan a re-init: reached a second time it REPLACES the stored listener global ref,
-/// last-writer-wins, and its runtime build is idempotent -- but the Kotlin-side guard means native
-/// never even sees the second call.) Building it once here, keyed to [Application] (which really does
-/// live for the process), makes that impossible: every `MainActivity.onCreate` reads the SAME
-/// instance, whether it's the first launch or the fifth recreation.
-///
-/// A genuine process death (the OS reclaiming the whole app in the background) restarts this class
-/// from scratch in a fresh process, which is the correct/expected reset: [EngineStremioRepository]
-/// re-inits the native engine, which re-hydrates its own persisted state from disk, so Home/Continue
-/// Watching/sign-in restore themselves with no extra code (see `EngineStremioRepository.start`).
+/// Owns the process-lifetime VortX engine session ([NativeAccountCoordinator]) and the repositories built on
+/// it. An `Activity` can be torn down and recreated within the same process, so every `MainActivity.onCreate`
+/// reads the same instances from here instead of building its own; a genuine process death restarts this
+/// class, and the engine re-hydrates its encrypted checkpoint from disk.
 class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     /// Process-owned recovery work. A failed cleanup cannot cancel another startup child, and IO keeps
     /// encrypted preference reads, engine add-on inspection, and Worker revocation off the main thread.
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /// Null only if native init genuinely failed (missing/incompatible `libstremiox_core.so`, an
-    /// engine-side throw). Built once, lazily, on first access (not `onCreate`) so a
-    /// [android.content.ContentProvider] or test harness that never touches the engine never pays the
-    /// native-load cost.
-    private val engine: EngineStremioRepository? by lazy {
-        runCatching { EngineStremioRepository(this) }
-            .getOrElse { error ->
-                Log.e(TAG, "Engine repository unavailable; app falls back to offline preview data", error)
-                null
-            }
-    }
-
-    private val fallbackCatalogRepository by lazy { PreviewCatalogRepository() }
-    private val fallbackAuthRepository by lazy { PreviewAuthRepository() }
     private val nativeAccounts: NativeAccountCoordinator by lazy { NativeAccountCoordinator(VortxJniBindings,
         VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
         ::VortxJniResourceTransport, { syncManager?.sessionOwnerSnapshot() == it },
-        { close -> applicationScope.launch { close() }; Unit },
+        { close -> applicationScope.launch {
+            runNativeRetirementAttempt(close) {
+                Log.w(TAG, "Native retirement could not finish; the previous writer remains reserved")
+            }
+        }; Unit },
         { withContext(Dispatchers.Main) {
             ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
         } },
@@ -129,13 +100,18 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
             } }
             gate
-        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() }) }
-    internal fun nativeStreamingAccounts(): NativeAccountCoordinator {
-        check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native streaming accounts are not enabled" }
-        return nativeAccounts
-    }
-    private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
+        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() },
+        onProgressMutation = { origin -> applicationScope.launch { syncManager?.onLocalNativeMutation(origin, progressOnly = true) }; Unit }) }
+    internal fun nativeStreamingAccounts(): NativeAccountCoordinator = nativeAccounts
+    private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess(
+        publicationAdmission = { runtime, action ->
+            val account = nativeAccounts.accountFor(runtime)
+            account != null && nativeAccounts.withProfileMutation(runtime, account, action)
+        },
+        session = { nativeAccounts.session() },
+    ) }
     private val nativeWatchlist by lazy { com.vortx.android.engine.NativeWatchlistAccess(nativeAccounts) }
+    private val nativeForYou by lazy { com.vortx.android.engine.NativeForYouAccess(nativeAccounts) }
     private val nativeStreamingAuth by lazy { com.vortx.android.engine.NativeStreamingAuthRepository(nativeAccounts, applicationScope) }
     private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
         { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },
@@ -145,6 +121,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 manager::captureLocalLibraryMutationAdmission) }
         },
         withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) },
+        mirrorLibrary = { added, type, id ->
+            if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, type, id)
+            else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, id, type)
+        },
         nzbSourceAggregator = run {
             val keys = DebridKeys(this)
             com.vortx.android.engine.NzbSourceAggregator(
@@ -171,18 +151,18 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // only bounded IPC input, so do not initialize any process-wide repositories, encrypted stores,
         // filesystem caches, or network clients in that process.
         if (isCommunityJsBrokerProcess()) return
+        // Durable, scrubbed diagnostics (always-on breadcrumb + the opt-in exportable log). Main process only.
+        com.vortx.android.diagnostics.DiagnosticsLog.install(this)
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
-        // Stand up the multi-profile core once, before anything touches the engine (the engine is built
-        // lazily on first catalog/auth access, after this). ProfileStore.init hydrates the roster, heals
-        // the owner singleton, and makes ProfileStore.shared/activeProfileId available to the source-pin
-        // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
+        // Stand up the multi-profile core once, before anything touches the engine (the engine session is
+        // built lazily on first catalog/auth access, after this). ProfileStore.init makes
+        // ProfileStore.shared/activeProfileId available to the source-pin per-profile key.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
-        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
-            com.vortx.android.library.WatchlistStore.shared(this).installNativeGateway(nativeWatchlist) { BuildConfig.NATIVE_ENGINE_ENABLED }
-        }
+        com.vortx.android.library.WatchlistStore.shared(this).installNativeGateway(nativeWatchlist) { true }
+        com.vortx.android.foryou.ForYouStore.shared(this).installNativeGateway(nativeForYou)
         // Bootstrap the RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch with ETag/304).
         // Loads the last-good cached config synchronously, then refreshes once in the background. Fail-soft:
         // every feature flag + typed value reads its baked (== shipping) default until a remote value lands.
@@ -285,7 +265,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     /// The process-lifetime VortX account sync engine, or null when it could not be stood up (a
     /// [ProfileStore] init failure, or a keystore problem building its session store). Held here for the same
-    /// reason [EngineStremioRepository] is -- one instance keyed to the [Application], never per Activity --
+    /// reason as the engine session -- one instance keyed to the [Application], never per Activity --
     /// so its debounced auto-push scope and the roster/overlay seams it installed on [ProfileStore] live for
     /// the whole process. Nullable + fail-soft: sync is OFF the critical launch path (VortX works fully
     /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
@@ -342,7 +322,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
      * (an uncovered config-change recreation) is a cheap, safe no-op rather than a wipe risk.
      */
     private fun wireAccountSync() {
-        val store = ProfileStore.sharedOrNull() ?: return   // ProfileStore init failed: leave sync dormant
+        if (ProfileStore.sharedOrNull() == null) return   // ProfileStore init failed: leave sync dormant
         val manager = runCatching {
             VortXSyncManager(this).also { manager ->
                 // Bind account ownership before either launcher can create a repository, resolver, settings
@@ -358,7 +338,6 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                             DebridAccountOwnerState.UnknownOrUnavailable
                     }
                 }
-                if (!BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachSyncSeams(store)
             }
         }
             .getOrElse {
@@ -366,7 +345,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 return
             }
         syncManager = manager
-        if (BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachNativeGateway(nativeAccounts)
+        manager.attachNativeGateway(nativeAccounts)
+        // For You switches between the account's synced fields and the signed-out local copy on sign-in.
+        applicationScope.launch { manager.account.collect { com.vortx.android.foryou.ForYouStore.shared(this@VortXApplication).reload() } }
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             /// Count of currently-started activities. Touched only from the main thread (every
             /// ActivityLifecycleCallbacks callback is delivered on the main looper), so a plain Int is safe.
@@ -397,28 +378,17 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         })
     }
 
-    /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
-    /// fail-soft boundary [MainActivity] used to own directly) so a native-side problem degrades the
-    /// UI instead of crashing it.
-    val catalogRepository: CatalogRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository else accountConnectedEngine() ?: fallbackCatalogRepository
+    /// The one [CatalogRepository] the whole app shares, backed by the VortX engine session.
+    val catalogRepository: CatalogRepository get() = nativeRepository
 
-    /// The one [AuthRepository] the whole app shares -- the SAME underlying engine instance as
-    /// [catalogRepository] when the engine is up (one repository class implements both contracts), so
-    /// a sign-in immediately shows up in every catalog call that reads `ctx`-derived state.
-    val authRepository: AuthRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeStreamingAuth else accountConnectedEngine() ?: fallbackAuthRepository
-
-    /** Keep initialization lazy; attach the real engine only when a normal app consumer requests it. */
-    private fun accountConnectedEngine(): EngineStremioRepository? = engine?.also { repository ->
-        syncManager?.attachAccountAddonGateway(repository)
-        syncManager?.attachAccountLibraryGateway(repository)
-    }
+    /// The one [AuthRepository] the whole app shares, backed by the same engine session.
+    val authRepository: AuthRepository get() = nativeStreamingAuth
 
     /// Coil3's app-wide [ImageLoader] (S03: real poster/backdrop art in [com.vortx.android.ui.
     /// components.PosterArt]). `crossfade(true)` matches DESIGN-SYSTEM.md's motion spec for image
     /// reveals; the memory cache is capped as a PERCENT of available RAM (not a flat byte count) so it
     /// scales sanely from a low-RAM Android TV stick to a flagship phone, and the disk cache is a
-    /// bounded slice of free space under this app's own cache dir (OS-purgeable, matches the engine's
-    /// own cacheDir choice in `EngineStremioRepository.start`). The OkHttp network fetcher
+    /// bounded slice of free space under this app's own cache dir (OS-purgeable). The OkHttp network fetcher
     /// (`coil-network-okhttp`) needs no manual registration -- Coil3 wires it in automatically once the
     /// dependency is on the classpath.
     override fun newImageLoader(context: PlatformContext): ImageLoader =

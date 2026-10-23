@@ -57,5 +57,7 @@ val LocalReducedMotion = staticCompositionLocalOf { false }
 @Composable
 fun rememberReducedMotion(): Boolean {
     val context = LocalContext.current
-    return context.isAnimatorScaleZero()
+    // Settings > Effects and performance > Animations off reduces motion like the system switch does.
+    val effectsMotion = com.vortx.android.ui.prefs.currentVisualEffects().motion
+    return context.isAnimatorScaleZero() || !effectsMotion
 }

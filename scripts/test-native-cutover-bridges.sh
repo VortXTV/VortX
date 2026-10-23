@@ -16,7 +16,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 "$native_test_dir/native-bridges" test/fixtures/native-resource-contract.json
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
-  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
   "$native_test_dir/UserProfile.swift" "$native_test_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"
@@ -29,9 +29,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   "$native_test_dir/SearchPublication.swift" app/Tests/CoreSearchPublicationFenceTests.swift \
   -o "$native_test_dir/search-publication"
 "$native_test_dir/search-publication"
-xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-  app/SourcesShared/VortxNativeBootstrapArchive.swift app/Tests/VortxNativeBootstrapArchiveTests.swift -o "$native_test_dir/bootstrap-archive"
-"$native_test_dir/bootstrap-archive"
+bash scripts/test-native-bootstrap-archive.sh
 xcrun swiftc -warnings-as-errors app/Tests/CoreBridgePublicationFenceContractTests.swift -o "$native_test_dir/publication-contract"
 "$native_test_dir/publication-contract"
 xcrun swiftc -warnings-as-errors app/SourcesShared/PlaybackMutationOwnershipPolicy.swift \

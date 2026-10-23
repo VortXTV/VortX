@@ -18,6 +18,13 @@ enum CinemaRailLayoutTests {
                 }
             }
         }
+        for viewport: CGFloat in [600, 768, 1024, 1180, 1440, 1980, 2560] {
+            let grid = CinemaRailLayout.episodeGrid(viewport: viewport, inset: 20, spacing: 20)
+            let row = CGFloat(grid.columns) * grid.cardWidth + CGFloat(grid.columns - 1) * 20
+            precondition(abs(row - (viewport - 40)) < 0.01, "Grid rows fill the width exactly")
+            precondition(grid.columns == 1 || grid.cardWidth >= 260, "Cards never shrink below the readable minimum")
+            precondition(grid.cardWidth < 260 * 2 + 20, "Another column is added before a card doubles")
+        }
         func source(_ path: String) throws -> String { try String(contentsOfFile: path, encoding: .utf8) }
         let detail = try source("app/SourcesiOS/iOSDetailView.swift")
         let mac = detail.components(separatedBy: "private func macDetailBody(")[1]
@@ -25,8 +32,12 @@ enum CinemaRailLayoutTests {
         precondition(mac.components(separatedBy: "ScrollView {").count == 2, "One vertical scrolling region")
         precondition(mac.range(of: "ScrollView {")!.lowerBound < mac.range(of: "heroBanner(")!.lowerBound,
                      "Hero scrolls away so a full episode card can be seen")
-        precondition(detail.contains("episodeList(viewportWidth: geo.size.width)"))
+        precondition(detail.contains("episodeList(viewportWidth: geo.size.width, pageProxy: proxy)"),
+                     "Episode rail retains the live viewport and its parent scroll proxy")
         precondition(detail.contains("ScrollView(.horizontal, showsIndicators: true)"))
+        precondition(detail.contains(".id(\"episode-rail-\\(season)\")"),
+                     "Each season gets its own rail, so a season switch never inherits the old scroll offset")
+        precondition(detail.contains("episodeRailFirstVisible = 0   // the fresh season rail starts at its first episode"))
         precondition(detail.contains("episodePageButton(forward: false") && detail.contains("episodePageButton(forward: true"))
         precondition(detail.contains("Actions for \\(episodeCoordinate(v))") && detail.contains("Mark as Unwatched"))
         let quickView = try source("app/SourcesiOS/CinemaPresentation.swift")

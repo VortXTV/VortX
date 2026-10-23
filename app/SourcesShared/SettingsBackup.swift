@@ -40,6 +40,8 @@ enum SettingsBackup {
     /// streaming server is per-device (one device may point at a custom/local server). A device that pulls a
     /// peer's settings keeps its own cache/server choice; its own choice is never pushed up to overwrite others.
     static let deviceLocalKeys: Set<String> = [
+        "vortx.addons.tmdbMetaInstalled", // descriptor-derived resolver cache, not a user preference;
+                                         // each device rebuilds it from its published add-on registry.
         "stremiox.diskCacheBytes",   // Settings -> Streaming cache (sized to the device's own storage)
         "stremiox.serverURL",        // custom streaming server URL (per-device)
         "stremiox.videoUpscaling",   // Settings -> Video upscaling (per-device: standard on Apple TV, scaled on Mac)
@@ -59,6 +61,27 @@ enum SettingsBackup {
                                          // that chose it.
         "vortx.moveSeeding.launchNagDismissedBuild", // acknowledgement of a launch reminder on THIS device;
                                                      // never suppress another device's migration reminder
+        // Update discovery metadata and collection artwork/provider caches are derived, refreshed locally,
+        // and have no cross-device value. Keep user choices such as update dismissal, refresh cadence,
+        // selected providers, and provider order syncable.
+        "stremiox.update.lastChecked",
+        "stremiox.update.cachedRelease",
+        "vortx.collections.decadeCovers",
+        "vortx.collections.decadeCoversAt",
+        "vortx.collections.decadeCoversFailedAt",
+        "vortx.collections.globalProviders.v2",
+        "vortx.collections.globalProvidersAt.v2",
+        // Settings > Effects and performance: chosen for THIS device's hardware. A weak box choosing still
+        // backdrops must not switch them off on a 4K Apple TV.
+        "vortx.effects.backdrop",
+        "vortx.effects.glass",
+        "vortx.effects.motion",
+        "vortx.effects.artwork",
+        // Infuse launches waiting for Infuse's callback on this device; meaningless anywhere else.
+        "vortx.infuse.handoffs",
+        // Network shares are addresses on this device's network, and their passwords stay in this
+        // device's Keychain, so a synced copy would arrive as a share that cannot log in.
+        "vortx.networkShares.list",
         // DELIBERATELY NOT HERE: "vortx.downloads.autoDeleteWatched". It looks like it belongs with the two
         // above, and it does not. It is a real cross-device POLICY preference ("I do not want to keep watched
         // downloads"), which is true of the user rather than of the hardware, so it must keep syncing. The test
@@ -86,6 +109,9 @@ enum SettingsBackup {
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
     static let deviceLocalKeyPrefixes: [String] = [
         "vortx.sync.",
+        // Per-account receipt that THIS device converted legacy account data into its native store.
+        // A peer's receipt must not suppress this device's conversion or appear as a user settings edit.
+        "vortx.native.legacyConversion.",
         // Effective active-viewer projections are rebuilt from the full profile roster. A peer's
         // selected profile must not overwrite this device's visibility/ranking mirrors.
         "stremiox.profile.",
@@ -103,6 +129,15 @@ enum SettingsBackup {
         // here can only evict THIS device's own resume memory and bloat the payload, so it is per-device
         // by prefix: the profile UUID in the key name is open-ended, exactly like the sync bookkeeping.
         "stremiox.lastStream.",
+        // Region-keyed collection artwork and provider data plus freshness stamps are derived caches.
+        // Their open-ended region suffixes are device-local; the collection cadence and provider-selection
+        // preferences have separate keys and remain portable.
+        "vortx.collections.genreBackdrops.",
+        "vortx.collections.genreBackdropsAt.",
+        "vortx.collections.discoverBackdrops.",
+        "vortx.collections.discoverBackdropsAt.",
+        "vortx.collections.providers.v2.",
+        "vortx.collections.providersAt.v2.",
     ]
 
     /// SECRETS, which must never leave this device in any form. Kept as its OWN list rather than folded into
@@ -310,7 +345,12 @@ enum SettingsBackup {
         // here (it is empty today, so this is a no-op now). Once `keyPrefixMigrations` is non-empty, a base
         // written by an older client will keep its old key names alongside this device's new ones and the two
         // will diverge rather than merge. Revisit this loop when that seam opens.
-        for (key, value) in local { merged[key] = value }
+        for (key, value) in local {
+            if key == "stremiox.profiles", let roster = value as? Data {
+                guard let retained = LegacySyncRetention.rosterData(existing: merged[key], replacement: roster) else { return nil }
+                merged[key] = retained
+            } else { merged[key] = value }
+        }
         // DELIBERATE-REMOVAL PASS (the baseline). A key the account holds but this device does NOT is kept by the
         // overlay above (absence is not deletion). The one exception: a key in `appliedBaseline` is one this device
         // once applied from the account, so its absence now is the user having CLEARED it (removeObject / a
@@ -325,7 +365,8 @@ enum SettingsBackup {
             merged.removeValue(forKey: key)
         }
         let app = (Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String) ?? "VortX"
-        return try? encode(domain: merged, bundleID: bundleID, app: app)
+        guard let encoded = try? encode(domain: merged, bundleID: bundleID, app: app) else { return nil }
+        return LegacySyncRetention.settingsEnvelope(existing: pulledBlob, replacement: encoded)
     }
 
     /// Apply a backup file. Merges keys (overwriting matching ones, leaving the rest), so a

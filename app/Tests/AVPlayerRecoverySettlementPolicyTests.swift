@@ -39,9 +39,59 @@ enum AVPlayerRecoverySettlementPolicyTests {
         recoveryNormalizesAcceptedForwardOriginWithoutWeakeningOutsideTolerance()
         admittedSeekDestinationSurvivesOnlyItsOwnedRecovery()
         seekDestinationWiringRetainsFailedTargetsBeforeQueuedFallback()
+        replacementPinLastsUntilCurrentRecoverySeekSettles()
+        replacementRecoveryWiring()
 
         print("===== FAILURES: \(failures) =====")
         exit(failures == 0 ? 0 : 1)
+    }
+
+    private static func replacementPinLastsUntilCurrentRecoverySeekSettles() {
+        typealias Ownership = AVPlayerRecoverySettlementPolicy.Ownership
+        var recovery = AVPlayerRecoverySettlementPolicy.RecoverySeekSettlement()
+        let owner = Ownership(generation: generation, mountIdentity: mount, revision: 80)
+        let ticket = recovery.issue(sourceSeconds: 2_009.525, playbackRequested: false,
+                                    generation: generation, mountIdentity: mount, revision: 80)
+        check("replacement clock keeps original source position", recovery.target(ownership: owner) == 2_009.525)
+        check("old generation cannot read replacement pin",
+              recovery.target(ownership: .init(generation: generation - 1, mountIdentity: mount, revision: 80)) == nil)
+        check("different mount cannot read replacement pin",
+              recovery.target(ownership: .init(generation: generation, mountIdentity: mount + 1, revision: 80)) == nil)
+        check("new viewer seek cannot read old recovery pin",
+              recovery.target(ownership: .init(generation: generation, mountIdentity: mount, revision: 81)) == nil)
+        let bound = recovery.bind(requestID: 80, ticket: ticket)
+        check("ready alone cannot release source pin", bound && recovery.target(ownership: owner) == 2_009.525)
+        let stale = recovery.finish(requestID: 79)
+        check("stale completion cannot release source pin", !stale && recovery.target(ownership: owner) == 2_009.525)
+        let finished = recovery.finish(requestID: 80)
+        check("owned native seek completion releases pin", finished && recovery.target(ownership: owner) == nil)
+        let next = recovery.issue(sourceSeconds: 377.839, playbackRequested: true,
+                                 generation: generation, mountIdentity: mount, revision: 82)
+        let nextBound = recovery.bind(requestID: 82, ticket: next)
+        recovery.supersede()
+        check("new viewer intent retires replacement pin", nextBound && recovery.target(ownership: next.ownership) == nil)
+    }
+
+    private static func replacementRecoveryWiring() {
+        let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Sources/Player/AVPlayerEngine.swift")
+        guard let engine = try? String(contentsOf: path, encoding: .utf8) else {
+            check("read replacement consumer wiring", false)
+            return
+        }
+        check("ordinary owned replacement can reuse already-ready mount",
+              engine.contains("recoveryItem: usingHDRFallbackItem || pendingReplacementSourceSeconds != nil"))
+        check("periodic presentation uses replacement source pin",
+              engine.contains("let position = pinnedPosition ?? RemuxResumePolicy.presented("))
+        check("temporary replacement clock cannot establish settled progress",
+              engine.contains("let positionSettled = pinnedPosition == nil && !self.seekEndBoundary.isPending")
+                && engine.contains("guard pinnedPosition == nil else { return }"))
+        check("producer receipt is fenced until replacement seek settles",
+              engine.contains("guard timeObserver != nil, recoveryPinnedSourceSeconds == nil,"))
+        check("both ordinary and HDR replacements have a ready deadline",
+              engine.components(separatedBy: "armReplacementReadyDeadline(for: freshItem, loadToken: loadToken)").count == 3)
+        check("replacement timeout reports error, not EOF",
+              engine.contains("self.deliverTerminal(.error(\"Playback could not resume. Please retry this source.\")"))
     }
 
     private static func admittedSeekDestinationSurvivesOnlyItsOwnedRecovery() {

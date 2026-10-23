@@ -46,7 +46,8 @@ class SeriesSourceSticky internal constructor(
         nowMs = nowMs,
     )
 
-    data class Preference(val addon: String?, val bingeGroup: String?)
+    /** [resolution] is the explicit pick's resolution: a floor so one fallback episode cannot lower the binge. */
+    data class Preference(val addon: String?, val bingeGroup: String?, val resolution: Int? = null)
 
     /** Captures both the profile and this screen's profile-switch epoch before an async resolve starts. */
     class WriteToken internal constructor(
@@ -59,8 +60,9 @@ class SeriesSourceSticky internal constructor(
         val addon: String?,
         val bingeGroup: String?,
         val timestamp: Double,
+        val resolution: Int? = null,
     ) {
-        fun preference(): Preference = Preference(addon, bingeGroup)
+        fun preference(): Preference = Preference(addon, bingeGroup, resolution)
     }
 
     private val lock = Any()
@@ -91,13 +93,13 @@ class SeriesSourceSticky internal constructor(
 
     /** Record only explicit viewer picks. Automatic selection and failover callers must never call this. */
     @MainThread
-    fun record(seriesKey: String, addon: String?, bingeGroup: String?) {
-        capture(seriesKey)?.let { record(it, addon, bingeGroup) }
+    fun record(seriesKey: String, addon: String?, bingeGroup: String?, resolution: Int? = null) {
+        capture(seriesKey)?.let { record(it, addon, bingeGroup, resolution) }
     }
 
     /** Returns false if resolve crossed a profile switch or persistence failed. */
     @MainThread
-    fun record(token: WriteToken, addon: String?, bingeGroup: String?): Boolean {
+    fun record(token: WriteToken, addon: String?, bingeGroup: String?, resolution: Int? = null): Boolean {
         if (addon.isNullOrBlank() && bingeGroup.isNullOrBlank()) return false
         synchronized(lock) {
             if (
@@ -128,6 +130,7 @@ class SeriesSourceSticky internal constructor(
                         addon = addon?.takeIf { it.isNotBlank() },
                         bingeGroup = bingeGroup?.takeIf { it.isNotBlank() },
                         timestamp = appleReferenceSeconds(nowMs()),
+                        resolution = resolution?.takeIf { it > 0 },
                     ),
                 )
             }
@@ -210,6 +213,7 @@ class SeriesSourceSticky internal constructor(
                     JSONObject().apply {
                         choice.addon?.let { put("addon", it) }
                         choice.bingeGroup?.let { put("bingeGroup", it) }
+                        choice.resolution?.let { put("resolution", it) }
                         put("ts", choice.timestamp)
                     },
                 )
@@ -227,7 +231,9 @@ class SeriesSourceSticky internal constructor(
                 require(timestamp.isFinite())
                 val addon = obj.optionalString("addon")
                 val bingeGroup = obj.optionalString("bingeGroup")
-                out[seriesKey] = Choice(addon, bingeGroup, timestamp)
+                // Older records carry no resolution: no floor until the next explicit pick.
+                val resolution = if (obj.has("resolution") && !obj.isNull("resolution")) obj.getInt("resolution") else null
+                out[seriesKey] = Choice(addon, bingeGroup, timestamp, resolution)
             }
             return out
         }

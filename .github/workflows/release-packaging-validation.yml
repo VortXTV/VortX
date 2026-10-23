@@ -23,7 +23,7 @@ name: Release packaging validation
 #     consume them. Signed archives and notarization stay in the thin protected release stage.
 #
 # Documented limits of what CAN be validated secretlessly (do not silently widen):
-#   - libstremiox_core.so / libvortx_ffi.so come from PRIVATE repos, so the Android APKs built
+#   - libvortx_ffi.so comes from a PRIVATE repository, so the Android APKs built
 #     here carry no engine .so files (the gradle tasks warn-skip exactly as on dev machines).
 #     Engine-linked packaging stays validated by the privileged push/release lanes only.
 #   - No Apple code-signing identity or notarization is exercised here (requires paid accounts).
@@ -60,17 +60,17 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
-          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
       - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
         run: |
-          yes | sdkmanager "ndk;27.2.12479018"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          yes | sdkmanager "ndk;30.0.16248370"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
-      - name: Prove native defaults and explicit comparison selection
+      - name: Prove the native-only build and rejection of removed engine selections
         run: bash scripts/test-android-native-selection.sh
 
       - name: Exercise signer parsing and strict verification fixtures
@@ -106,9 +106,12 @@ jobs:
       # Same task set as the privileged release build (android-release.yml), same fail-closed
       # signing-config path in app/build.gradle.kts (the four VORTX_* inputs are all provided,
       # pointing at the ephemeral keystore). Engines are intentionally NOT fetched and
-      # VORTX_REQUIRE_ENGINE is NOT set, so both cargo-ndk tasks take the documented dev-machine
+      # VORTX_REQUIRE_ENGINE is NOT set, so the native Cargo task takes the documented dev-machine
       # warn-and-skip path; every other packaging phase (Kotlin/Compose release compilation,
       # manifest merge, resources, libmpv native merge, DEX, AGP signing, AAB) is exercised.
+      - name: Acquire reviewed Android mpv component (public-only; baseline is a no-op)
+        run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
+
       - name: Build Full+Play release packages with the ephemeral identity
         working-directory: android
         env:
@@ -117,6 +120,51 @@ jobs:
           VORTX_KEY_ALIAS: adhoc-release
           VORTX_KEY_PASSWORD: vortx-adhoc-ci-store
         run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
+
+      # Preserve the bounded recovery filters and exercise the actual shared Media3 metadata
+      # policies. JNI-gated cases still skip without the real private native runtime.
+      - name: Test Android sync, account recovery and active-media metadata
+        working-directory: android
+        run: >-
+          ./gradlew :app:testPlayDebugUnitTest
+          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
+          --tests com.vortx.android.sync.AndroidRealtimeSyncTest
+          --tests com.vortx.android.sync.DurableSessionStateTest
+          --tests com.vortx.android.sync.NativeAccountSyncTest
+          --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
+          --tests com.vortx.android.diagnostics.DiagnosticShareOperationTest
+          --tests com.vortx.android.engine.NativeRetirementDispatchTest
+          --tests com.vortx.android.sync.NativeAccountAttemptTest
+          --tests com.vortx.android.engine.NativeWatchedMigrationProducerTest
+          --tests com.vortx.android.sync.VortXSyncManagerStaleAddonEnvelopeTest
+          --tests com.vortx.android.ui.viewmodel.PlaybackResolveFenceTest
+          --tests com.vortx.android.whatsnew.ChangelogParserTest
+          --tests com.vortx.android.player.ExoPlayerEngineStatePolicyTest
+          --tests com.vortx.android.player.PlaybackMetadataTest
+          --tests com.vortx.android.foryou.ForYouRowsModelTest
+          --tests com.vortx.android.ui.profilepicker.ProfilePickerPresentationTest
+          --tests com.vortx.android.ui.profilepicker.ProfilePickerArtworkStartupTest
+          --tests com.vortx.android.iptv.LiveGuideTest
+          --tests 'com.vortx.android.engine.NativeOwnAccountSourcesTest.malformed own row is held without losing valid siblings or raw source bytes'
+          --no-daemon --stacktrace
+
+      - name: Test Full player native-load metadata identity
+        working-directory: android
+        run: >-
+          ./gradlew :app:testFullDebugUnitTest
+          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
+          --tests com.vortx.android.player.mpv.MpvMetadataLoadIdentityTest
+          --no-daemon --stacktrace
+
+      - name: Retain current-source recovery test execution and skips
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Android-recovery-unit-results
+          path: |
+            android/app/build/test-results/testPlayDebugUnitTest/*.xml
+            android/app/build/test-results/testFullDebugUnitTest/*.xml
+          if-no-files-found: error
 
       - name: Require the exact release package set (two universal APKs, one AAB)
         run: |
@@ -236,6 +284,12 @@ jobs:
       - name: Run IPA repackaging tests
         run: bash scripts/tests/repackage-ipa.test.sh
 
+      - name: Prove all-shell failure aggregation keeps every gate fail-closed
+        run: node scripts/test-shell-validation-aggregation.mjs
+
+      - name: Test explicit watched-history retry and account readiness
+        run: bash scripts/test-native-watched-retry.sh "$GITHUB_WORKSPACE"
+
       # Pinned XcodeGen, identical version + checksum gate as release-tvos.yml so project
       # generation here observes the same generator the release lane uses.
       - name: Install pinned XcodeGen
@@ -254,55 +308,55 @@ jobs:
           "$workdir/xcodegen/bin/xcodegen" --version
           echo "$workdir/xcodegen/bin" >> "$GITHUB_PATH"
 
-      # Every dependency below is PUBLIC and checksum-pinned; none of these steps reads a secret.
-      # NodeMobile/server.js/fonts, the macOS node runtime, and the self-built MPVKit player stack
-      # are fetched exactly the way release-tvos.yml fetches them (same pins), so the only
-      # difference versus the protected lane is the ENGINE SOURCE: private repos cannot be checked
-      # out on a PR, so scripts/build-stub-engine-xcframeworks.sh generates CI-only fail-closed
-      # stand-ins that define the tracked ABI surface. This exercises compile/link/package for
-      # real; it does NOT exercise engine behavior (nothing can, secretlessly).
-      - name: Fetch server dependencies (NodeMobile, server.js, fonts)
+      # Public fonts and the player package use the protected lane's reviewed pins. The private
+      # engine and Mac daemon are represented by marked, fail-closed CI stand-ins only here.
+      # This checks real native Swift compile/link/package mechanics, not engine/server behavior.
+      - name: Fetch subtitle fonts
         run: ./scripts/fetch-server-deps.sh
-
-      - name: Fetch the macOS node runtime
-        run: ./app/scripts/fetch-node-macos.sh
 
       - name: Fetch MPVKit-DVFEL artifacts (public release asset, sha256-verified)
         env:
-          MPVKIT_ARTIFACTS_SHA256: "737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
+          MPVKIT_ARTIFACTS_SHA256: "f4e4fcc25a61997ee4e74a7ad155d46192f4d86d7953ce1a352da796b8765672"
         run: |
           set -euo pipefail
           DEST="app/Vendor/MPVKit-DVFEL"
           curl -sfL --retry 3 -o "$RUNNER_TEMP/mpvkit.zip" \
-            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-ffmpeg9-20261021/mpvkit-dvfel-ffmpeg-9.0.2-candidate.zip"
           ACTUAL="$(shasum -a 256 "$RUNNER_TEMP/mpvkit.zip" | cut -d' ' -f1)"
           if [ "$ACTUAL" != "$MPVKIT_ARTIFACTS_SHA256" ]; then
             echo "::error::MPVKit artifact checksum mismatch: expected $MPVKIT_ARTIFACTS_SHA256 got $ACTUAL"
             exit 1
           fi
           rm -rf "$DEST/artifacts"
-          unzip -q "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
+          unzip -oq "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
           bash scripts/verify-mpvkit-dvfel-artifacts.sh "$DEST"
 
       - name: Generate CI-only stub engine xcframeworks
         run: |
           ./scripts/build-stub-engine-xcframeworks.sh
-          test -f app/Vendor/StremioXCore.xcframework/STUB-CI-ONLY.txt || { echo "::error::StremioXCore stub marker missing"; exit 1; }
           test -f app/Vendor/VortxEngine.xcframework/STUB-CI-ONLY.txt || { echo "::error::VortxEngine stub marker missing"; exit 1; }
+          test -x app/Vendor/vortx-streaming-server || { echo "::error::CI-only Mac daemon is missing"; exit 1; }
+          test -f app/Vendor/vortx-streaming-server.STUB-CI-ONLY.txt || { echo "::error::CI-only Mac daemon marker missing"; exit 1; }
 
       - name: Generate the Xcode project
-        run: cd app && xcodegen generate
+        run: |
+          set -euo pipefail
+          cd app
+          # All-zero revision is an explicit CI-only sentinel; no private engine was fetched.
+          ruby ../scripts/generate-native-apple-project.rb \
+            --engine-revision 0000000000000000000000000000000000000000 \
+            --mpvkit "$PWD/Vendor/MPVKit-DVFEL" --output "$PWD/.native-ci-project.yml"
+          xcodegen generate --spec .native-ci-project.yml
 
       # Real compile/link/package per platform shell. Signing is disabled outright (no identity,
       # none needed for simulator or unsigned macOS builds). Each produced .app must carry the
       # expected bundle ID and a Mach-O executable whose engine symbols are RESOLVED (defined in
       # the linked binary), proving the link phase consumed the engine libraries.
-      # The legacy web-host `VortX` iOS target is deliberately not built here: it is the
-      # pre-native WebView shell kept until cutover, not one of the three native platform shells.
+      # All four native app targets are built, including both tvOS Lite simulator architectures.
       - name: Build and verify tvOS, iOS, and macOS shells
         run: |
           set -euo pipefail
-          build_shell() {
+          build_one_shell() {
             local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5" arch="${6:-}"
             echo "::group::xcodebuild $scheme"
             # Keep code in the executable checked below, not Xcode's Debug preview trampoline/dylib pair.
@@ -330,23 +384,39 @@ jobs:
             local defined_symbols undefined_symbols
             defined_symbols="$(nm -gU "$executable_dir/$exe")"
             undefined_symbols="$(nm -u "$executable_dir/$exe")"
-            if ! grep -q '_stremiox_core_schema_version' <<< "$defined_symbols"; then
-              echo "::error::$scheme binary does not contain the linked engine symbol _stremiox_core_schema_version"; exit 1;
+            grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_init_from_state_json$' <<< "$defined_symbols" \
+              || { echo "::error::$scheme binary lacks a defined native state-import symbol"; exit 1; }
+            grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_resource_host_new$' <<< "$defined_symbols" \
+              || { echo "::error::$scheme binary lacks a defined native resource-host symbol"; exit 1; }
+            if [ "$require_engines" = "in-process" ]; then
+              grep -Eq '[[:space:]][Tt][[:space:]]+_vortx_server_start$' <<< "$defined_symbols" \
+                || { echo "::error::$scheme binary lacks a defined in-process server symbol"; exit 1; }
             fi
-            if [ "$require_engines" = "both" ]; then
-              grep -q '_vortx_init_runtime' <<< "$defined_symbols" \
-                || { echo "::error::$scheme binary does not contain the linked engine symbol _vortx_init_runtime"; exit 1; }
+            if grep -Eq '_stremiox_core_|_node_start' <<< "$defined_symbols"; then
+              echo "::error::$scheme binary retains removed engine/runtime symbols"; exit 1;
             fi
             if grep -Eq '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; then
               echo "::error::$scheme binary still has unresolved engine symbols"; grep -E '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; exit 1
             fi
             echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved"
           }
-          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" core-only
-          # The pinned NodeMobile tvOS simulator framework supports arm64 only, matching
-          # the protected release smoke lane. Lite has no NodeMobile and retains the
-          # independent Intel simulator link check against the universal engine stubs.
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both arm64
-          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" core-only x86_64
-          build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    both
-          build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    core-only
+          # Keep every original gate fail-fast within its isolated shell, but collect all
+          # platform failures before the job fails. A Lite error must not hide an iOS/Mac error.
+          # A fresh Bash process is intentional: invoking a function directly in `if` disables
+          # errexit inside that function, even if it calls `set -e` again.
+          export -f build_one_shell
+          shell_failures=0
+          build_shell() {
+            if bash -euo pipefail -c 'build_one_shell "$@"' -- "$@"; then
+              echo "::notice::shell passed: $1 ${6:-default}"
+            else
+              echo "::error::shell failed: $1 ${6:-default}"
+              shell_failures=$((shell_failures + 1))
+            fi
+          }
+          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" native
+          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     in-process arm64
+          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" native x86_64
+          build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    in-process
+          build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    daemon
+          [ "$shell_failures" -eq 0 ] || { echo "::error::$shell_failures shell checks failed"; exit 1; }

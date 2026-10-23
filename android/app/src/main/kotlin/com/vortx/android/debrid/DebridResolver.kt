@@ -1,5 +1,6 @@
 package com.vortx.android.debrid
 
+import com.vortx.android.diagnostics.DiagnosticsLog
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +18,7 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
+import com.vortx.android.usenet.UsenetFilePattern
 
 /**
  * Pure selection policy for arrays returned by debrid providers.
@@ -67,7 +69,7 @@ internal object DebridFileSelection {
 /// Native in-client debrid resolution for Android: turn a torrent (infoHash / magnet) into a DIRECT,
 /// streamable HTTPS URL through the user's own debrid account, so cached torrents play instantly without
 /// a debrid add-on. This is the Kotlin port of the Apple `DebridResolver.swift` (RealDebrid + TorBox
-/// torrent flows), wired into [com.vortx.android.engine.EngineStremioRepository.resolve].
+/// torrent flows), wired into [com.vortx.android.engine.NativeCatalogRepository.resolve].
 ///
 /// Keys live in [DebridKeys] (EncryptedSharedPreferences), the Android analogue of the Apple Keychain.
 /// HTTP is Android's [HttpURLConnection] and JSON is `org.json` (both ship with the platform, no added
@@ -175,9 +177,11 @@ internal class DebridResolver(private val keys: DebridKeys) {
             throw cancel
         } catch (error: DebridException) {
             Log.d(TAG, "debrid resolve failed for ${chosen.displayName}: ${error.message}")
+            DiagnosticsLog.log("debrid", "resolve result=failed service=${chosen.displayName} reason=${error.javaClass.simpleName}")
             null
         } catch (error: Exception) {
             Log.d(TAG, "debrid resolve error for ${chosen.displayName}", error)
+            DiagnosticsLog.log("debrid", "resolve result=error service=${chosen.displayName} reason=${error.javaClass.simpleName}")
             null
         }
     }
@@ -887,6 +891,8 @@ internal class DebridResolver(private val keys: DebridKeys) {
         fileIdx: Int? = null,
         episode: Episode? = null,
         expectedOwner: DebridOwnerToken? = null,
+        /** False when the user has their own NNTP providers: reuse an existing TorBox job, never start one. */
+        allowCreate: Boolean = true,
     ): String = withContext(Dispatchers.IO) {
         val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridException.NoKey
         if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
@@ -896,6 +902,16 @@ internal class DebridResolver(private val keys: DebridKeys) {
         // The breaker source is the stream's stable usenet identity (the authoritative NZB md5 when its
         // emitter carried one, else the nzb link), matching the Apple `breakerSource = knownHash ?? nzbUrl`.
         withBreaker(DebridService.TOR_BOX.id, knownHash ?: nzbUrl, ProviderCircuitBreaker.Phase.RESOLVE) {
+            // 0. With own providers configured, only a job TorBox already holds may be used.
+            if (!allowCreate) {
+                val existing = usenetExisting(base, apiKey, knownHash?.lowercase() ?: usenetIdentifier(nzbUrl), owner)
+                    ?: throw DebridException.NotCached
+                if (!torBoxReady(existing)) throw DebridException.NotReady
+                val id = existing.optIntOrNull("id") ?: throw DebridException.NotCached
+                val pick = pickUsenetFile(torBoxFiles(existing), fileMustInclude, fileIdx, episode)
+                    ?: throw DebridException.NoMatchingFile
+                return@withBreaker requestForOwner(owner) { usenetRequestDl(base, apiKey, id, pick.id) }
+            }
             // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
             //    download id if the same nzb is already in the user's usenet list.
             val created = requestForOwner(owner) {
@@ -942,16 +958,32 @@ internal class DebridResolver(private val keys: DebridKeys) {
     /// as an offset into [files].
     private fun pickUsenetFile(files: List<DebridFile>, mustInclude: String?, fileIdx: Int?, episode: Episode?): DebridFile? {
         if (!mustInclude.isNullOrEmpty()) {
-            val re = runCatching { Regex(mustInclude, RegexOption.IGNORE_CASE) }.getOrNull()
+            val re = UsenetFilePattern.compile(mustInclude)
             if (re != null) {
                 val matched = files.filter { f ->
                     if (!f.isVideo) return@filter false
                     re.containsMatchIn(f.shortName.ifEmpty { f.name })
                 }
                 DebridFileSelection.pick(matched, episode, providerFileIdx = null)?.let { return it }
+                // Our episode numbers found nothing among the add-on's matches: when its pattern names exactly
+                // one video, that is its own episode mapping (anime packs are numbered differently from the
+                // catalogue), the Stremio contract for fileMustInclude.
+                if (matched.size == 1) return matched.single()
             }
         }
         return DebridFileSelection.pick(files, episode, providerFileIdx = fileIdx)
+    }
+
+    /// One scan of the usenet list for a job TorBox already holds for this NZB (by authoritative md5), ready or
+    /// not. Null when there is none. Used when a play must not start a new download.
+    private suspend fun usenetExisting(base: String, apiKey: String, hash: String, owner: DebridOwnerToken): JSONObject? {
+        val env = requestForOwner(owner) { getJson("$base/mylist?bypass_cache=true", apiKey) }
+        val list = env.optJSONArray("data") ?: return null
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            if (item.optString("hash").lowercase() == hash) return item
+        }
+        return null
     }
 
     /// The usenet `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id. Auth rides the
@@ -1310,7 +1342,7 @@ internal class DebridResolver(private val keys: DebridKeys) {
     // ------------------------------------------------------------------------------------------------
     // Provider circuit breaker (shared, process-lifetime). Guards EVERY resolve/download entry point here (the
     // single choke all callers funnel through: the DebridCoordinator's failover race + CW resume AND the
-    // engine's direct play-time resolve in EngineStremioRepository), so a provider/source pair that has been
+    // engine's direct play-time resolve in the engine repository), so a provider/source pair that has been
     // failing has a shared, cross-screen memory of that and a leg fails fast with NO network instead of
     // re-hammering a provider some OTHER caller already learned is down for this hash. Mirrors the Apple
     // DebridCoordinator breaker guards (app/SourcesShared/DebridResolver.swift ~1289-1418); on Android the

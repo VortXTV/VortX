@@ -53,9 +53,7 @@ final class WatchedIndex: ObservableObject {
     private var lastBase: Set<String> = []
     /// The profile the derived set was computed for; a change clears it in `rebuild`.
     private var lastActiveProfile: UUID?
-#if VORTX_NATIVE_DATA_ENGINE
     private var lastNativeBinding: VortxNativeCoreFacade.RegistryBinding?
-#endif
 
     /// Engine model fields whose change can move watched state: `ctx` carries the library bucket
     /// (every mark / unmark / sync lands there), `library` and `continue_watching_preview` re-emit
@@ -103,69 +101,17 @@ final class WatchedIndex: ObservableObject {
         // was computed for the OUTGOING profile, so drop it before this profile's pass so a badge never
         // leaks across profiles. Its detail view re-feeds the new profile's completion on next open.
         let currentProfile = ProfileStore.shared.activeID
-#if VORTX_NATIVE_DATA_ENGINE
         let binding = CoreBridge.shared.nativeRegistryBinding
         if lastNativeBinding != binding { derivedSeriesWatched.removeAll(); lastNativeBinding = binding }
-#endif
         if currentProfile != lastActiveProfile {
             lastActiveProfile = currentProfile
             derivedSeriesWatched.removeAll()
         }
         generation &+= 1
         let gen = generation
-#if VORTX_NATIVE_DATA_ENGINE
         let titles = CoreBridge.shared.nativePlaybackSnapshot()?["watchedTitles"]
         let counts = (try? titles?.decode([String: UInt64].self)) ?? [:]
         publish(Set(counts.filter { $0.value > 0 }.keys), ifCurrent: gen)
-        return
-#endif
-        guard ProfileStore.shared.activeUsesEngineHistory else {
-            // Overlay profile: its private overlay only. A whole-title mark records the metaId
-            // itself, episode finishes record episode ids; either way non-empty means watched.
-            let overlay = Set(ProfileStore.shared.watch.filter { !$0.value.watchedVideoIds.isEmpty }.keys)
-            publish(overlay, ifCurrent: gen)
-            return
-        }
-        // Owner profile. Live union base first: whatever engine state is already published in
-        // memory, so a fresh mark badges immediately even before the bucket persist lands.
-        var live = Set<String>()
-        for item in CoreBridge.shared.library?.catalog ?? [] where item.isWatched { live.insert(item.id) }
-        for item in CoreBridge.shared.continueWatching where item.isWatched { live.insert(item.id) }
-        // Capture the account identity NOW, on main, alongside the live state: the bucket reads
-        // below only honor files stamped with this uid (see bucketWatchedIDs). An account switch
-        // in the window before the resweep re-triggers rebuild via ctx events, and the generation
-        // guard drops these passes' publishes.
-        let expectedUID = CoreBridge.shared.currentUID()
-        // External watched shadows (additive-read, each opt-in behind its OWN import toggle): union the ids
-        // watched on Trakt AND completed on SIMKL into the badge set. Each shadow holds BOTH identity forms
-        // per title (imdb `tt…` and `tmdb:<id>`), so a cover keyed by either identity matches the plain
-        // `ids.contains(item.id)` read below (issue #143). Each returns empty when its own import toggle is
-        // off. Kick each one's throttled refresh so a stale cache re-pulls; a pull calls back into
-        // `externalShadowChanged` (one more rebuild) when it changes something. NEVER an engine write.
-        TraktSyncEngine.shared.refreshIfStale()
-        SIMKLWatchedShadow.shared.refreshIfStale()
-        let shadow = TraktSyncEngine.shared.shadowWatchedIDs()
-            .union(SIMKLWatchedShadow.shared.shadowWatchedIDs())
-        // Explicit owner intents override stale engine bucket membership for badges. They are
-        // account-scoped and bound with the credential owner, so no previous-account cache leaks.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let first = Self.bucketWatchedIDs(expectedUID: expectedUID)
-            DispatchQueue.main.async {
-                let ids = live.union(first).union(shadow)
-                self?.publish(ProfileStore.shared.active?.isOwner == true
-                    ? OwnerWatchedIntentStore.effectiveTitleIDs(engine: ids) : ids, ifCurrent: gen)
-            }
-            // Resweep: the engine persists the bucket as an async effect AFTER the NewState emit,
-            // so the first pass can read the pre-mark file. One trailing re-read settles it.
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.resweepDelay) { [weak self] in
-                let second = Self.bucketWatchedIDs(expectedUID: expectedUID)
-                DispatchQueue.main.async {
-                    let ids = live.union(second).union(shadow)
-                    self?.publish(ProfileStore.shared.active?.isOwner == true
-                        ? OwnerWatchedIntentStore.effectiveTitleIDs(engine: ids) : ids, ifCurrent: gen)
-                }
-            }
-        }
     }
 
     /// The Trakt shadow cache changed (a fresh pull, or the import toggle flipped): rebuild so the unioned

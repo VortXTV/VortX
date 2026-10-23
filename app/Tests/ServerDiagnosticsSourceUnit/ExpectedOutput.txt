@@ -1,0 +1,11 @@
+start group=empty
+pass group=empty
+start group=registration
+pass group=registration
+start group=reentrant-providers
+pass group=reentrant-providers
+start group=retired-captures
+pass group=retired-captures
+start group=concurrent-registry
+pass group=concurrent-registry
+ServerDiagnostics Swift6 production source unit: 5/5 passed

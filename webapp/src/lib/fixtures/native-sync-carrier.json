@@ -1,0 +1,752 @@
+{
+  "provenance": {
+    "kind": "Actual Apple and Android native carrier fixture exports",
+    "fixture": "carrier-fixture-k85KrT",
+    "sourceExports": "native-sync-carrier.5lL5BW/carrier-fixture-k85KrT",
+    "publicBase": "d27fb80a4ce9fca0d825436b1a9d9445abfba729",
+    "nativeLibrarySHA256": "550bea7f9d73df1e77b0d9326ede63122383ad0007cc0119943491a03007f1b1",
+    "receiptSHA256": "67e4089cd35aced037f602b19e5437e6b0414e351ae2b3b37bb19af924ac405a"
+  },
+  "ownSlotProvenance": {"kind":"Actual immutable native CABI and public host helper exports","receiptSHA256":"ec94a306cec145e378f01491b09901022db1be9e74bd46a9ebebd70856fe72d2","nativeLibrarySHA256":"550bea7f9d73df1e77b0d9326ede63122383ad0007cc0119943491a03007f1b1","sourceExports":"native-own-slot-goldens-20261009"},
+  "ownSlotCases": [
+    {"source":"07-own-A-return-schema4.document.json","sourceSHA256":"e0ce4f6dfc764ac00d6bf707e09d1bf296eab18881afbb5b2dcdc656bd6f6fb3","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000B22C":{"fields":{"avatar":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":1,"value":"🍿"},"watchlist.movie.dHQtd2F0Y2hsaXN0LW9ubHk":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":2,"value":{"addedAt":1720000000.125,"id":"tt-watchlist-only","name":"Want-to-watch, not Library","type":"movie"}}}}},"schemaVersion":1,"scope":"account.website-own-slot-fixture"},"nativeSync":{"accountSlots":{"00000000-0000-0000-0000-00000000B22C":{"activeBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":6,"transactionId":"fixture-schema4-own-A-return"},"receipts":{"fixture-schema4-own-A":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"fingerprint":"24cecc8e290e747b580022317423427eb03c1d6fc5cae80ed64ef19f45f48ca2"},"fixture-schema4-own-A-return":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":6,"transactionId":"fixture-schema4-own-A-return"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":5,"transactionId":"fixture-schema4-shared-return"},"fingerprint":"b016b67449f7ae096a84bbc5e81a03c3caef116c521bed154bfe125b8130f55f"},"fixture-schema4-own-B":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"fingerprint":"22969bc9f6693cbec467305a7eb65b9f86a462aaa48e402c792be9238f79404d"},"fixture-schema4-pending-own":{"binding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"fingerprint":"ffd2eb8b396b4760d86c369e9eafd1574de52dd615134f63a60ede527b300ba4"},"fixture-schema4-shared":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":0,"transactionId":null},"fingerprint":"daad51e8acfc223104699510262447e22290a6a0f512c85988eec8ad9683a51d"},"fixture-schema4-shared-return":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":5,"transactionId":"fixture-schema4-shared-return"},"expectedBinding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"fingerprint":"67c43f1f39e75de0ca406ae997733eb72d6f5459cb13beb73c54c926d96764da"}},"slots":{"own:45ffa5df902e0ebc0dc2d3dccc62d7b80e2ae166e1b0a1bca9069bdaae6661f6":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":["https://own-b.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-b.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-b-only"],"updatedAt":0},"records":{"movie:tt-own-b-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"}],"order":["https://own-b.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"}]},"source":{"sourceDocumentSha256":"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6","verifiedStreamingUid":"synthetic-streaming-account-B"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767312000000,"markedAtMs":null,"metaId":"tt-own-b-only","name":"B-only saved Library","positionMs":24000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-b-only","watched":null}]},"sourceHistory":{"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6":"1f0c59849a39806f550242314d1ecd685935013c47b5469443042c70d7352de1"},"watch":{"contexts":{"tt-own-b-only":{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only"}},"log":{"tt-own-b-only":{"removed_at":0,"reset_at":0,"resume_at":1767312000,"resume_ms":24000,"times_watched":1,"watched_at":0}}}},"own:86d5e2a3d69627f41d23a87c36f06a5351a97392d06e62b9fc1e429889ea5a47":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addonBinding":"own","addonBindingClock":1720000000,"addons":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]},"source":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}]},"sourceHistory":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"},"watch":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}}},"pending":{"account":{"kind":"pending_own"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}},"shared":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addonBinding":"share_primary","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}}}}},"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}}},"legacyImport":{"baseline":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[],"order":[]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]}},"deletedProfileIds":[],"identityLinks":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[],"00000000-0000-0000-0000-00000000C33D":[]},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"}]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]}},"ownAccountSources":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"}},"roster":[{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}],"rosterModifiedSeconds":1720000000.1234,"schemaVersion":2,"watches":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}],"00000000-0000-0000-0000-00000000C33D":[]}},"fingerprint":"d4cac2f5630d8c3239fb44a6404fe0401430cda9db85ff207a4919a247a00073","ownAccountImports":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","typedCarrierFingerprint":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7","verifiedStreamingUid":"synthetic-streaming-account-A"}},"ownAccountSourceHistory":{"00000000-0000-0000-0000-00000000B22C":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"}},"schemaVersion":2},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":["movie:tt-owner-only"],"updatedAt":0},"records":{"movie:tt-owner-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"},"valueAt":0}}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000B22C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000C33D":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":4,"scope":"account.website-own-slot-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000B22C":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}},"00000000-0000-0000-0000-00000000C33D":{"contexts":{},"log":{}}}}},"installedAddons":{"addons":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"kind":"installed_addons","profileId":"00000000-0000-0000-0000-00000000B22C"},"playback":{"continueWatching":[{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","offsetMs":12000,"timesWatched":1,"type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only","watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000B22C","resumeById":{"tt-own-a-only":{"durationMs":120000,"offsetMs":12000,"updatedAt":1767225600}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"06-shared-return-schema4.document.json","sourceSHA256":"6560cc11e6d50f5060c789b2f179beb3921bc73079749553286c547c026163f1","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000B22C":{"fields":{"avatar":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":1,"value":"🍿"},"watchlist.movie.dHQtd2F0Y2hsaXN0LW9ubHk":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":2,"value":{"addedAt":1720000000.125,"id":"tt-watchlist-only","name":"Want-to-watch, not Library","type":"movie"}}}}},"schemaVersion":1,"scope":"account.website-own-slot-fixture"},"nativeSync":{"accountSlots":{"00000000-0000-0000-0000-00000000B22C":{"activeBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":5,"transactionId":"fixture-schema4-shared-return"},"receipts":{"fixture-schema4-own-A":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"fingerprint":"24cecc8e290e747b580022317423427eb03c1d6fc5cae80ed64ef19f45f48ca2"},"fixture-schema4-own-B":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"fingerprint":"22969bc9f6693cbec467305a7eb65b9f86a462aaa48e402c792be9238f79404d"},"fixture-schema4-pending-own":{"binding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"fingerprint":"ffd2eb8b396b4760d86c369e9eafd1574de52dd615134f63a60ede527b300ba4"},"fixture-schema4-shared":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":0,"transactionId":null},"fingerprint":"daad51e8acfc223104699510262447e22290a6a0f512c85988eec8ad9683a51d"},"fixture-schema4-shared-return":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":5,"transactionId":"fixture-schema4-shared-return"},"expectedBinding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"fingerprint":"67c43f1f39e75de0ca406ae997733eb72d6f5459cb13beb73c54c926d96764da"}},"slots":{"own:45ffa5df902e0ebc0dc2d3dccc62d7b80e2ae166e1b0a1bca9069bdaae6661f6":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":["https://own-b.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-b.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-b-only"],"updatedAt":0},"records":{"movie:tt-own-b-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"}],"order":["https://own-b.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"}]},"source":{"sourceDocumentSha256":"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6","verifiedStreamingUid":"synthetic-streaming-account-B"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767312000000,"markedAtMs":null,"metaId":"tt-own-b-only","name":"B-only saved Library","positionMs":24000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-b-only","watched":null}]},"sourceHistory":{"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6":"1f0c59849a39806f550242314d1ecd685935013c47b5469443042c70d7352de1"},"watch":{"contexts":{"tt-own-b-only":{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only"}},"log":{"tt-own-b-only":{"removed_at":0,"reset_at":0,"resume_at":1767312000,"resume_ms":24000,"times_watched":1,"watched_at":0}}}},"own:86d5e2a3d69627f41d23a87c36f06a5351a97392d06e62b9fc1e429889ea5a47":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addonBinding":"own","addonBindingClock":1720000000,"addons":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]},"source":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}]},"sourceHistory":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"},"watch":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}}},"pending":{"account":{"kind":"pending_own"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}},"shared":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addonBinding":"share_primary","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}}}}},"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":[],"updatedAt":0},"records":{}}},"legacyImport":{"baseline":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[],"order":[]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]}},"deletedProfileIds":[],"identityLinks":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[],"00000000-0000-0000-0000-00000000C33D":[]},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"}]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]}},"ownAccountSources":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"}},"roster":[{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}],"rosterModifiedSeconds":1720000000.1234,"schemaVersion":2,"watches":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}],"00000000-0000-0000-0000-00000000C33D":[]}},"fingerprint":"d4cac2f5630d8c3239fb44a6404fe0401430cda9db85ff207a4919a247a00073","ownAccountImports":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","typedCarrierFingerprint":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7","verifiedStreamingUid":"synthetic-streaming-account-A"}},"ownAccountSourceHistory":{"00000000-0000-0000-0000-00000000B22C":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"}},"schemaVersion":2},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":["movie:tt-owner-only"],"updatedAt":0},"records":{"movie:tt-owner-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"},"valueAt":0}}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":[],"updatedAt":0},"records":{}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000B22C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000C33D":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":4,"scope":"account.website-own-slot-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000B22C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000C33D":{"contexts":{},"log":{}}}}},"installedAddons":{"addons":[],"kind":"installed_addons","profileId":"00000000-0000-0000-0000-00000000A11C"},"playback":{"continueWatching":[],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000B22C","resumeById":{},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"05-pending-own-schema4.document.json","sourceSHA256":"f20f3356150d20bbd7b8cb0c0551d5099912cc081c280836408fc727b2cb18d9","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000B22C":{"fields":{"avatar":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":1,"value":"🍿"},"watchlist.movie.dHQtd2F0Y2hsaXN0LW9ubHk":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":2,"value":{"addedAt":1720000000.125,"id":"tt-watchlist-only","name":"Want-to-watch, not Library","type":"movie"}}}}},"schemaVersion":1,"scope":"account.website-own-slot-fixture"},"nativeSync":{"accountSlots":{"00000000-0000-0000-0000-00000000B22C":{"activeBinding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"receipts":{"fixture-schema4-own-A":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"fingerprint":"24cecc8e290e747b580022317423427eb03c1d6fc5cae80ed64ef19f45f48ca2"},"fixture-schema4-own-B":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"fingerprint":"22969bc9f6693cbec467305a7eb65b9f86a462aaa48e402c792be9238f79404d"},"fixture-schema4-pending-own":{"binding":{"account":{"kind":"pending_own"},"revision":4,"transactionId":"fixture-schema4-pending-own"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"fingerprint":"ffd2eb8b396b4760d86c369e9eafd1574de52dd615134f63a60ede527b300ba4"},"fixture-schema4-shared":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":0,"transactionId":null},"fingerprint":"daad51e8acfc223104699510262447e22290a6a0f512c85988eec8ad9683a51d"}},"slots":{"own:45ffa5df902e0ebc0dc2d3dccc62d7b80e2ae166e1b0a1bca9069bdaae6661f6":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":["https://own-b.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-b.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-b-only"],"updatedAt":0},"records":{"movie:tt-own-b-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"}],"order":["https://own-b.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"}]},"source":{"sourceDocumentSha256":"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6","verifiedStreamingUid":"synthetic-streaming-account-B"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767312000000,"markedAtMs":null,"metaId":"tt-own-b-only","name":"B-only saved Library","positionMs":24000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-b-only","watched":null}]},"sourceHistory":{"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6":"1f0c59849a39806f550242314d1ecd685935013c47b5469443042c70d7352de1"},"watch":{"contexts":{"tt-own-b-only":{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only"}},"log":{"tt-own-b-only":{"removed_at":0,"reset_at":0,"resume_at":1767312000,"resume_ms":24000,"times_watched":1,"watched_at":0}}}},"own:86d5e2a3d69627f41d23a87c36f06a5351a97392d06e62b9fc1e429889ea5a47":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addonBinding":"own","addonBindingClock":1720000000,"addons":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]},"source":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}]},"sourceHistory":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"},"watch":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}}},"pending":{"account":{"kind":"pending_own"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}},"shared":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addonBinding":"share_primary","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}}}}},"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":[],"updatedAt":0},"records":{}}},"legacyImport":{"baseline":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[],"order":[]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]}},"deletedProfileIds":[],"identityLinks":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[],"00000000-0000-0000-0000-00000000C33D":[]},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"}]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]}},"ownAccountSources":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"}},"roster":[{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}],"rosterModifiedSeconds":1720000000.1234,"schemaVersion":2,"watches":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}],"00000000-0000-0000-0000-00000000C33D":[]}},"fingerprint":"d4cac2f5630d8c3239fb44a6404fe0401430cda9db85ff207a4919a247a00073","ownAccountImports":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","typedCarrierFingerprint":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7","verifiedStreamingUid":"synthetic-streaming-account-A"}},"ownAccountSourceHistory":{"00000000-0000-0000-0000-00000000B22C":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"}},"schemaVersion":2},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":["movie:tt-owner-only"],"updatedAt":0},"records":{"movie:tt-owner-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"},"valueAt":0}}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":[],"updatedAt":0},"records":{}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000B22C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"pending_own"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000C33D":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":4,"scope":"account.website-own-slot-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000B22C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000C33D":{"contexts":{},"log":{}}}}},"installedAddons":{"addons":[],"kind":"installed_addons","profileId":"00000000-0000-0000-0000-00000000B22C"},"playback":{"continueWatching":[],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000B22C","resumeById":{},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"04-own-B-schema4.document.json","sourceSHA256":"8ffdf624061c819758919de1f06c27f0d1db7410dd6dee22a66846ffc4bf5c2e","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000B22C":{"fields":{"avatar":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":1,"value":"🍿"},"watchlist.movie.dHQtd2F0Y2hsaXN0LW9ubHk":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":2,"value":{"addedAt":1720000000.125,"id":"tt-watchlist-only","name":"Want-to-watch, not Library","type":"movie"}}}}},"schemaVersion":1,"scope":"account.website-own-slot-fixture"},"nativeSync":{"accountSlots":{"00000000-0000-0000-0000-00000000B22C":{"activeBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"receipts":{"fixture-schema4-own-A":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"fingerprint":"24cecc8e290e747b580022317423427eb03c1d6fc5cae80ed64ef19f45f48ca2"},"fixture-schema4-own-B":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"revision":3,"transactionId":"fixture-schema4-own-B"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"fingerprint":"22969bc9f6693cbec467305a7eb65b9f86a462aaa48e402c792be9238f79404d"},"fixture-schema4-shared":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":0,"transactionId":null},"fingerprint":"daad51e8acfc223104699510262447e22290a6a0f512c85988eec8ad9683a51d"}},"slots":{"own:45ffa5df902e0ebc0dc2d3dccc62d7b80e2ae166e1b0a1bca9069bdaae6661f6":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"addonBinding":"own","addonBindingClock":0,"addons":{"order":{"ids":["https://own-b.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-b.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-b-only"],"updatedAt":0},"records":{"movie:tt-own-b-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"}],"order":["https://own-b.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"}]},"source":{"sourceDocumentSha256":"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6","verifiedStreamingUid":"synthetic-streaming-account-B"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767312000000,"markedAtMs":null,"metaId":"tt-own-b-only","name":"B-only saved Library","positionMs":24000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-b-only","watched":null}]},"sourceHistory":{"fcac4e19460ee18460e073218d760bfa4ce11edd9674d3b8912ff5235114fed6":"1f0c59849a39806f550242314d1ecd685935013c47b5469443042c70d7352de1"},"watch":{"contexts":{"tt-own-b-only":{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only"}},"log":{"tt-own-b-only":{"removed_at":0,"reset_at":0,"resume_at":1767312000,"resume_ms":24000,"times_watched":1,"watched_at":0}}}},"own:86d5e2a3d69627f41d23a87c36f06a5351a97392d06e62b9fc1e429889ea5a47":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addonBinding":"own","addonBindingClock":1720000000,"addons":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]},"source":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}]},"sourceHistory":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"},"watch":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}}},"shared":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addonBinding":"share_primary","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}}}}},"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["https://own-b.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-b.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"},"valueAt":0}}}},"legacyImport":{"baseline":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[],"order":[]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]}},"deletedProfileIds":[],"identityLinks":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[],"00000000-0000-0000-0000-00000000C33D":[]},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"}]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]}},"ownAccountSources":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"}},"roster":[{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}],"rosterModifiedSeconds":1720000000.1234,"schemaVersion":2,"watches":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}],"00000000-0000-0000-0000-00000000C33D":[]}},"fingerprint":"d4cac2f5630d8c3239fb44a6404fe0401430cda9db85ff207a4919a247a00073","ownAccountImports":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","typedCarrierFingerprint":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7","verifiedStreamingUid":"synthetic-streaming-account-A"}},"ownAccountSourceHistory":{"00000000-0000-0000-0000-00000000B22C":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"}},"schemaVersion":2},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":["movie:tt-owner-only"],"updatedAt":0},"records":{"movie:tt-owner-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"},"valueAt":0}}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["movie:tt-own-b-only"],"updatedAt":0},"records":{"movie:tt-own-b-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-b-only","kind":"standard","name":"B-only saved Library","type":"movie"},"valueAt":0}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000B22C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"own","value":"synthetic-streaming-account-B"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000C33D":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":4,"scope":"account.website-own-slot-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000B22C":{"contexts":{"tt-own-b-only":{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only"}},"log":{"tt-own-b-only":{"removed_at":0,"reset_at":0,"resume_at":1767312000,"resume_ms":24000,"times_watched":1,"watched_at":0}}},"00000000-0000-0000-0000-00000000C33D":{"contexts":{},"log":{}}}}},"installedAddons":{"addons":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-b","name":"Synthetic B addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-b.invalid/manifest.json"}],"kind":"installed_addons","profileId":"00000000-0000-0000-0000-00000000B22C"},"playback":{"continueWatching":[{"durationMs":120000,"metaId":"tt-own-b-only","name":"B-only saved Library","offsetMs":24000,"timesWatched":1,"type":"movie","updatedAt":1767312000,"videoId":"tt-own-b-only","watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000B22C","resumeById":{"tt-own-b-only":{"durationMs":120000,"offsetMs":24000,"updatedAt":1767312000}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"03-own-A-schema4.document.json","sourceSHA256":"143fbfd6cce4b9467dd903c48842e528acfc7446c9e33a0981299e001fd91a15","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000B22C":{"fields":{"avatar":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":1,"value":"🍿"},"watchlist.movie.dHQtd2F0Y2hsaXN0LW9ubHk":{"actor":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","clock":2,"value":{"addedAt":1720000000.125,"id":"tt-watchlist-only","name":"Want-to-watch, not Library","type":"movie"}}}}},"schemaVersion":1,"scope":"account.website-own-slot-fixture"},"nativeSync":{"accountSlots":{"00000000-0000-0000-0000-00000000B22C":{"activeBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"receipts":{"fixture-schema4-own-A":{"binding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":2,"transactionId":"fixture-schema4-own-A"},"expectedBinding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"fingerprint":"24cecc8e290e747b580022317423427eb03c1d6fc5cae80ed64ef19f45f48ca2"},"fixture-schema4-shared":{"binding":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"revision":1,"transactionId":"fixture-schema4-shared"},"expectedBinding":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"revision":0,"transactionId":null},"fingerprint":"daad51e8acfc223104699510262447e22290a6a0f512c85988eec8ad9683a51d"}},"slots":{"own:86d5e2a3d69627f41d23a87c36f06a5351a97392d06e62b9fc1e429889ea5a47":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addonBinding":"own","addonBindingClock":1720000000,"addons":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}},"library":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}},"sourceBaseline":{"addons":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]},"identityLinks":[],"library":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]},"source":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"},"watches":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}]},"sourceHistory":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"},"watch":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}}},"shared":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addonBinding":"share_primary","addonBindingClock":0,"addons":{"order":{"ids":[],"updatedAt":0},"records":{}},"library":{"order":{"ids":[],"updatedAt":0},"records":{}},"watch":{"contexts":{},"log":{}}}}}},"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["https://own-a.invalid/manifest.json"],"updatedAt":0},"records":{"https://own-a.invalid/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"},"valueAt":0}}}},"legacyImport":{"baseline":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[],"order":[]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"order":["https://own-a.invalid/manifest.json"]}},"deletedProfileIds":[],"identityLinks":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[],"00000000-0000-0000-0000-00000000C33D":[]},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"intents":[],"items":[{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"}]},"00000000-0000-0000-0000-00000000B22C":{"intents":[],"items":[{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"}]}},"ownAccountSources":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","verifiedStreamingUid":"synthetic-streaming-account-A"}},"roster":[{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0},{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}],"rosterModifiedSeconds":1720000000.1234,"schemaVersion":2,"watches":{"00000000-0000-0000-0000-00000000A11C":[],"00000000-0000-0000-0000-00000000B22C":[{"durationMs":120000,"lastPlayedAtMs":1767225600000,"markedAtMs":null,"metaId":"tt-own-a-only","name":"A-only saved Library","positionMs":12000,"poster":null,"removedAtMs":null,"resetAtMs":null,"timesWatched":1,"type":"movie","videoId":"tt-own-a-only","watched":null}],"00000000-0000-0000-0000-00000000C33D":[]}},"fingerprint":"d4cac2f5630d8c3239fb44a6404fe0401430cda9db85ff207a4919a247a00073","ownAccountImports":{"00000000-0000-0000-0000-00000000B22C":{"profileOverlaySha256":"f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a","sourceDocumentSha256":"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5","typedCarrierFingerprint":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7","verifiedStreamingUid":"synthetic-streaming-account-A"}},"ownAccountSourceHistory":{"00000000-0000-0000-0000-00000000B22C":{"7b04ac2853c664a15255369c5424b2099df38715a43d56b80feb9edd1824d7e5":"e563698769b687e82770b9150d5b655c0c4b7e3cbee814d75f58b512157336d7"}},"schemaVersion":2},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":["movie:tt-owner-only"],"updatedAt":0},"records":{"movie:tt-owner-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-owner-only","kind":"standard","name":"Owner-only saved Library","type":"movie"},"valueAt":0}}},"00000000-0000-0000-0000-00000000B22C":{"order":{"ids":["movie:tt-own-a-only"],"updatedAt":0},"records":{"movie:tt-own-a-only":{"addedAt":1,"removedAt":0,"value":{"id":"tt-own-a-only","kind":"standard","name":"A-only saved Library","type":"movie"},"valueAt":0}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000B22C":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"own","value":"synthetic-streaming-account-A"},"addons":"own","deleted":false,"id":"00000000-0000-0000-0000-00000000B22C","name":"Synthetic Own Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}},"00000000-0000-0000-0000-00000000C33D":{"fieldClocks":{"accent":1720000000,"account":1720000000,"addons":1720000000,"disabledAddons":1720000000,"familyEdit":1720000000,"kids":1720000000,"languages":1720000000,"maturityCeiling":1720000000,"name":1720000000,"oled":1720000000,"pin":1720000000,"ranking":1720000000,"textScale":1720000000},"profile":{"account":{"kind":"shared","value":"00000000-0000-0000-0000-00000000A11C"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000C33D","name":"Synthetic Shared Viewer","owner":false,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"accent":"ember","disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":4,"scope":"account.website-own-slot-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{},"log":{}},"00000000-0000-0000-0000-00000000B22C":{"contexts":{"tt-own-a-only":{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only"}},"log":{"tt-own-a-only":{"removed_at":0,"reset_at":0,"resume_at":1767225600,"resume_ms":12000,"times_watched":1,"watched_at":0}}},"00000000-0000-0000-0000-00000000C33D":{"contexts":{},"log":{}}}}},"installedAddons":{"addons":[{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"own-a","name":"Synthetic A addon","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://own-a.invalid/manifest.json"}],"kind":"installed_addons","profileId":"00000000-0000-0000-0000-00000000B22C"},"playback":{"continueWatching":[{"durationMs":120000,"metaId":"tt-own-a-only","name":"A-only saved Library","offsetMs":12000,"timesWatched":1,"type":"movie","updatedAt":1767225600,"videoId":"tt-own-a-only","watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000B22C","resumeById":{"tt-own-a-only":{"durationMs":120000,"offsetMs":12000,"updatedAt":1767225600}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}}
+  ],
+  "websiteAddonGolden": {"action":{"event":{"counter":"1","eventId":"00000000000000000000000000000001","expectedBinding":{"account":{"kind":"local_only"},"revision":0,"transactionId":null},"mutations":[{"addon":{"flags":{},"manifest":{"catalogs":[],"extension":{"2":"line\n","10":"slash/","":1e-7,"😀":1},"id":"https://fixture.invalid/a/manifest.json","name":"Fixture","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://fixture.invalid/a/manifest.json"},"state":"present","transportUrl":"https://fixture.invalid/a/manifest.json"}],"observed":{"order":{"ids":[],"updatedAt":0},"records":{}},"ownerProfileId":"owner","profileId":"owner","schemaVersion":1,"scope":"account.test","wallTime":1000000},"ownerProfileId":"owner","scope":"account.test","type":"apply_website_addon_edits"},"nativeSync":{"addons":{"owner":{"order":{"ids":[],"updatedAt":0},"records":{"https://fixture.invalid/a/manifest.json":{"addedAt":1,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"https://fixture.invalid/a/manifest.json","name":"Fixture","resources":[],"types":[],"version":"1.0.0"},"transportUrl":"https://fixture.invalid/a/manifest.json"},"valueAt":1,"webSources":{"addedAt":{"counter":"1","eventId":"00000000000000000000000000000001","fingerprint":"4698bb16ec9581e729f9fd93e2f7922ae8ad2f07d409dca3ed08a38dc6190a6a","observedClock":0,"schemaVersion":1},"valueAt":{"counter":"1","eventId":"00000000000000000000000000000001","fingerprint":"4698bb16ec9581e729f9fd93e2f7922ae8ad2f07d409dca3ed08a38dc6190a6a","observedClock":0,"schemaVersion":1}}}}}},"libraries":{},"ownerProfileId":"owner","profiles":{"owner":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"owner","name":"Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":5,"scope":"account.test","watches":{},"websiteAddonReceipts":{"00000000000000000000000000000001":{"counter":"1","eventId":"00000000000000000000000000000001","expectedBinding":{"account":{"kind":"local_only"},"revision":0,"transactionId":null},"fingerprint":"4698bb16ec9581e729f9fd93e2f7922ae8ad2f07d409dca3ed08a38dc6190a6a","ownerProfileId":"owner","profileId":"owner","schemaVersion":1,"scope":"account.test"}}},"result":{"events":[{"event":"website_addon_edits_applied","receipt":{"counter":"1","eventId":"00000000000000000000000000000001","expectedBinding":{"account":{"kind":"local_only"},"revision":0,"transactionId":null},"fingerprint":"4698bb16ec9581e729f9fd93e2f7922ae8ad2f07d409dca3ed08a38dc6190a6a","ownerProfileId":"owner","profileId":"owner","schemaVersion":1,"scope":"account.test"}}],"ok":true}},
+  "edgeProvenance": {"kind":"Actual immutable CABI exported carriers and native playback queries","receiptSHA256":"192ca2361f1995eb62fc4a47c899b9e3cfe3f87985122465613448ba1570a590","nativeLibrarySHA256":"550bea7f9d73df1e77b0d9326ede63122383ad0007cc0119943491a03007f1b1","sourceExports":"native-web-projection-edge-goldens-20261009"},
+  "edgeCases": [
+    {"source":"04-native-saved-membership-and-addon-manifest.document.json","sourceSHA256":"c0eba3a4f888a32b3827718fd51575cb14acc6438fc3dd24db2f52dcf5a0d75d","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"https://synthetic-addon.invalid/manifest.json":{"addedAt":5,"removedAt":0,"value":{"flags":{"official":false,"protected":false},"manifest":{"catalogs":[],"id":"synthetic-addon","name":"Synthetic installed addon","resources":["catalog","meta","stream"],"types":["movie","series"],"version":"1.0.0"},"transportUrl":"https://synthetic-addon.invalid/manifest.json"},"valueAt":5}}}},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tt100004":{"addedAt":2,"removedAt":0,"value":{"id":"tt100004","kind":"standard","name":"Standard saved title","type":"movie"},"valueAt":2},"native_magnet:synthetic-magnet":{"addedAt":3,"removedAt":0,"value":{"fileIdx":0,"id":"synthetic-magnet","infohash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"native_magnet","name":"Native saved magnet","trackers":["udp://tracker.invalid:80"]},"valueAt":3},"torrent_playlist:synthetic-playlist":{"addedAt":4,"removedAt":0,"value":{"entries":["synthetic-entry-a","synthetic-entry-b"],"id":"synthetic-playlist","kind":"torrent_playlist","name":"Native saved playlist"},"valueAt":4}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{}}},"playback":{"continueWatching":[],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"synthetic-magnet":null,"synthetic-playlist":null,"tt100004":null},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"03-context-unicode-tie-private-then-emoji.document.json","sourceSHA256":"63adf481b437b10d93ca4207b802e544c78b5ab846bbd9530bdf8ccc3a2c5857","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"unicode-title":{"durationMs":600000,"metaId":"unicode-title","name":"😀","type":"movie","updatedAt":100}},"log":{"unicode-title":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":1000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"unicode-title","name":"😀","offsetMs":1000,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"unicode-title":{"durationMs":600000,"offsetMs":1000,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"03-context-unicode-tie-emoji-then-private.document.json","sourceSHA256":"63adf481b437b10d93ca4207b802e544c78b5ab846bbd9530bdf8ccc3a2c5857","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"unicode-title":{"durationMs":600000,"metaId":"unicode-title","name":"😀","type":"movie","updatedAt":100}},"log":{"unicode-title":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":1000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"unicode-title","name":"😀","offsetMs":1000,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"unicode-title":{"durationMs":600000,"offsetMs":1000,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"03-context-fixed-dto-tie-B-then-A.document.json","sourceSHA256":"07bd468e8300f652f4dda2752a0a23147d3fdfa7beaf9a144b36f9b80c9ced49","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"title":{"durationMs":1,"metaId":"title","name":"Z","type":"movie","updatedAt":100}},"log":{"title":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":0,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":1,"metaId":"title","name":"Z","offsetMs":0,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"title":{"durationMs":1,"offsetMs":0,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"03-context-fixed-dto-tie-A-then-B.document.json","sourceSHA256":"07bd468e8300f652f4dda2752a0a23147d3fdfa7beaf9a144b36f9b80c9ced49","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"title":{"durationMs":1,"metaId":"title","name":"Z","type":"movie","updatedAt":100}},"log":{"title":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":0,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":1,"metaId":"title","name":"Z","offsetMs":0,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"title":{"durationMs":1,"offsetMs":0,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-09-alias-same-namespace-minlex.document.json","sourceSHA256":"4d2420c96a61b2533fc1d86b3e2a695ac62004dfdcc63781205d21b1bd1d2b57","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tmdb:9":{"addedAt":2,"removedAt":0,"value":{"id":"tmdb:9","kind":"standard","name":"Known saved alias","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"tmdb:10":{"durationMs":600000,"metaId":"tmdb:10","name":"TVDB context","type":"movie","updatedAt":100},"tmdb:9":{"durationMs":600000,"metaId":"tmdb:9","name":"TMDB latest context","type":"movie","updatedAt":101},"tvdb:42":{"durationMs":600000,"metaId":"tvdb:42","name":"TVDB context","type":"movie","updatedAt":100}},"identityLinks":[["tmdb:10","tvdb:42"]],"log":{"tmdb:10":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":12000,"times_watched":0,"watched_at":0},"tmdb:9":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":24000,"times_watched":0,"watched_at":0},"tvdb:42":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"tmdb:9","name":"TMDB latest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":101,"watched":false},{"durationMs":600000,"metaId":"tvdb:42","name":"TVDB context","offsetMs":12000,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"tmdb:10":{"durationMs":600000,"offsetMs":12000,"updatedAt":100},"tmdb:9":{"durationMs":600000,"offsetMs":24000,"updatedAt":101},"tvdb:42":{"durationMs":600000,"offsetMs":12000,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-08-alias-unknown-namespace-fallback.document.json","sourceSHA256":"85bd38bc880709cfd8135ca18a800d328737d089eb13951489f17cf8b263f681","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"alpha:42":{"durationMs":600000,"metaId":"alpha:42","name":"Unknown alias context","type":"movie","updatedAt":100},"zeta:42":{"durationMs":600000,"metaId":"zeta:42","name":"Unknown alias context","type":"movie","updatedAt":100}},"identityLinks":[["alpha:42","zeta:42"]],"log":{"alpha:42":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":12000,"times_watched":0,"watched_at":0},"zeta:42":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"zeta:42","name":"Unknown alias context","offsetMs":12000,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"alpha:42":{"durationMs":600000,"offsetMs":12000,"updatedAt":100},"zeta:42":{"durationMs":600000,"offsetMs":12000,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-07-alias-precedence-simkl.document.json","sourceSHA256":"2216ede72573058af05769023acbdb5e04691cf60f9fa846c00a3eecb1f6f18a","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:simkl:100002":{"addedAt":2,"removedAt":0,"value":{"id":"simkl:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"simkl:100002":{"durationMs":600000,"metaId":"simkl:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["simkl:100002","unknown-a:100002","unknown-z:100002"]],"log":{"simkl:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"simkl:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-06-alias-precedence-trakt.document.json","sourceSHA256":"7793be32acf2b5f6e757a525828e8486ebe594b45e86b5a29aafa0df55ab03c7","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:trakt:100002":{"addedAt":2,"removedAt":0,"value":{"id":"trakt:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"trakt:100002":{"durationMs":600000,"metaId":"trakt:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["simkl:100002","trakt:100002","unknown-a:100002","unknown-z:100002"]],"log":{"trakt:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"trakt:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-05-alias-precedence-mal.document.json","sourceSHA256":"0be3b9a4a1c04c06eced559c71355ef83b131019c4b7fb6f848cf5b3fbb41939","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:mal:100002":{"addedAt":2,"removedAt":0,"value":{"id":"mal:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"mal:100002":{"durationMs":600000,"metaId":"mal:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["mal:100002","simkl:100002","trakt:100002","unknown-a:100002","unknown-z:100002"]],"log":{"mal:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"mal:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-04-alias-precedence-kitsu.document.json","sourceSHA256":"5049f8e62ec6fdb8db0b04a76aada14dce9ba7b7adb47c61990ebf42b334a023","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:kitsu:100002":{"addedAt":2,"removedAt":0,"value":{"id":"kitsu:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"kitsu:100002":{"durationMs":600000,"metaId":"kitsu:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["kitsu:100002","mal:100002","simkl:100002","trakt:100002","unknown-a:100002","unknown-z:100002"]],"log":{"kitsu:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"kitsu:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"kitsu:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-03-alias-precedence-anilist.document.json","sourceSHA256":"f62719fb75ce1b33d810627228257ba99cc42bc12f29abf893a04b742e96100f","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:anilist:100002":{"addedAt":2,"removedAt":0,"value":{"id":"anilist:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"anilist:100002":{"durationMs":600000,"metaId":"anilist:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["anilist:100002","kitsu:100002","mal:100002","simkl:100002","trakt:100002","unknown-a:100002","unknown-z:100002"]],"log":{"anilist:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"anilist:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"anilist:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"kitsu:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-02-alias-precedence-tvdb.document.json","sourceSHA256":"e040ca3568b39214695b91431549a74255b804cdb87fa13b60eed82397dfd0e5","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tvdb:100002":{"addedAt":2,"removedAt":0,"value":{"id":"tvdb:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"tvdb:100002":{"durationMs":600000,"metaId":"tvdb:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["anilist:100002","kitsu:100002","mal:100002","simkl:100002","trakt:100002","tvdb:100002","unknown-a:100002","unknown-z:100002"]],"log":{"tvdb:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"tvdb:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"anilist:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"kitsu:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tvdb:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-01-alias-precedence-tmdb.document.json","sourceSHA256":"a6eb9c28ce580cecb5506becea080e423668049cef42b9e99d0aea085c6a8796","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tmdb:100002":{"addedAt":2,"removedAt":0,"value":{"id":"tmdb:100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"tmdb:100002":{"durationMs":600000,"metaId":"tmdb:100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["anilist:100002","kitsu:100002","mal:100002","simkl:100002","tmdb:100002","trakt:100002","tvdb:100002","unknown-a:100002","unknown-z:100002"]],"log":{"tmdb:100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"tmdb:100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"anilist:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"kitsu:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tmdb:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tvdb:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"02-00-alias-precedence-imdb.document.json","sourceSHA256":"3225390dc0bc837a93ad90f12ef70b68bdd3300b4aed56d9588c55971015e868","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tt100002":{"addedAt":2,"removedAt":0,"value":{"id":"tt100002","kind":"standard","name":"Alias saved title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"tt100002":{"durationMs":600000,"metaId":"tt100002","name":"Alias newest context","type":"movie","updatedAt":102},"unknown-a:100002":{"durationMs":600000,"metaId":"unknown-a:100002","name":"Alias old context","type":"movie","updatedAt":101}},"identityLinks":[["anilist:100002","kitsu:100002","mal:100002","simkl:100002","tmdb:100002","trakt:100002","tt100002","tvdb:100002","unknown-a:100002","unknown-z:100002"]],"log":{"tt100002":{"removed_at":0,"reset_at":0,"resume_at":102,"resume_ms":24000,"times_watched":0,"watched_at":0},"unknown-a:100002":{"removed_at":0,"reset_at":0,"resume_at":101,"resume_ms":12000,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"tt100002","name":"Alias newest context","offsetMs":24000,"timesWatched":0,"type":"movie","updatedAt":102,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"anilist:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"kitsu:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"mal:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"simkl:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tmdb:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"trakt:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tt100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"tvdb:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-a:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102},"unknown-z:100002":{"durationMs":600000,"offsetMs":24000,"updatedAt":102}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}},
+    {"source":"01-zero-offset-positive-resume-clock.document.json","sourceSHA256":"47850d0920805fb8ccdc1b945d55370914d393d12502e19027a6d5033b044c97","document":{"nativeHostPreferences":{"globals":{"fields":{}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{},"schemaVersion":1,"scope":"account.web-projection-edge-fixture"},"nativeSync":{"addons":{},"libraries":{"00000000-0000-0000-0000-00000000A11C":{"order":{"ids":[],"updatedAt":0},"records":{"movie:tt100001":{"addedAt":2,"removedAt":0,"value":{"id":"tt100001","kind":"standard","name":"Zero offset title","type":"movie"},"valueAt":2}}}},"ownerProfileId":"00000000-0000-0000-0000-00000000A11C","profiles":{"00000000-0000-0000-0000-00000000A11C":{"fieldClocks":{},"profile":{"account":{"kind":"local_only"},"addons":"share_primary","deleted":false,"id":"00000000-0000-0000-0000-00000000A11C","name":"Synthetic Edge Owner","owner":true,"parental":{"familyEdit":false,"kids":false},"rev":0,"settings":{"disabledAddons":[],"languages":[],"oled":false,"textScale":1000},"updatedAt":0}}},"schemaVersion":1,"scope":"account.web-projection-edge-fixture","watches":{"00000000-0000-0000-0000-00000000A11C":{"contexts":{"tt100001":{"durationMs":600000,"metaId":"tt100001","name":"Zero offset title","type":"movie","updatedAt":100}},"log":{"tt100001":{"removed_at":0,"reset_at":0,"resume_at":100,"resume_ms":0,"times_watched":0,"watched_at":0}}}}}},"playback":{"continueWatching":[{"durationMs":600000,"metaId":"tt100001","name":"Zero offset title","offsetMs":0,"timesWatched":0,"type":"movie","updatedAt":100,"watched":false}],"history":[],"kind":"profile_playback","profileId":"00000000-0000-0000-0000-00000000A11C","resumeById":{"tt100001":{"durationMs":600000,"offsetMs":0,"updatedAt":100}},"watchedTitles":{},"watchedVideoIdsByTitle":{}}}
+  ],
+  "cases": [
+    {
+      "source": "result-2.json",
+      "sourceSHA256": "47fec03775b77e0231507ade505ea9e9cf6e8a7e37aa8e7f6d8440ce10bd5d85",
+      "document": {
+        "nativeSync": {
+          "schemaVersion": 1,
+          "libraries": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "series:tt-saved": {
+                  "removedAt": 0,
+                  "valueAt": 1791497839,
+                  "addedAt": 1791497839,
+                  "value": {
+                    "type": "series",
+                    "kind": "standard",
+                    "id": "tt-saved",
+                    "name": "Saved series"
+                  }
+                }
+              },
+              "order": {
+                "updatedAt": 0,
+                "ids": []
+              }
+            }
+          },
+          "scope": "account.sync-fixture",
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001",
+          "profiles": {
+            "10000000-0000-0000-0000-000000000001": {
+              "profile": {
+                "updatedAt": 0,
+                "settings": {
+                  "disabledAddons": [],
+                  "oled": false,
+                  "languages": [],
+                  "textScale": 1000
+                },
+                "rev": 0,
+                "account": {
+                  "kind": "local_only"
+                },
+                "owner": true,
+                "name": "Fixture Owner",
+                "deleted": false,
+                "addons": "share_primary",
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "id": "10000000-0000-0000-0000-000000000001"
+              },
+              "fieldClocks": {}
+            },
+            "10000000-0000-0000-0000-000000000002": {
+              "profile": {
+                "updatedAt": 0,
+                "rev": 0,
+                "settings": {
+                  "oled": false,
+                  "textScale": 1000,
+                  "disabledAddons": [],
+                  "languages": []
+                },
+                "account": {
+                  "kind": "local_only"
+                },
+                "owner": false,
+                "name": "Viewer",
+                "deleted": false,
+                "addons": "share_primary",
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "id": "10000000-0000-0000-0000-000000000002"
+              },
+              "fieldClocks": {}
+            }
+          },
+          "addons": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "https://fixture.invalid/two/manifest.json": {
+                  "removedAt": 0,
+                  "valueAt": 1791497839,
+                  "addedAt": 1791497839,
+                  "value": {
+                    "transportUrl": "https://fixture.invalid/two/manifest.json",
+                    "flags": {
+                      "official": false,
+                      "protected": false
+                    },
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "catalogs": [],
+                      "name": "two",
+                      "id": "fixture.two",
+                      "version": "1.0.0",
+                      "resources": [
+                        "meta"
+                      ]
+                    }
+                  }
+                },
+                "https://fixture.invalid/one/manifest.json": {
+                  "removedAt": 0,
+                  "valueAt": 1791497839,
+                  "addedAt": 1791497839,
+                  "value": {
+                    "transportUrl": "https://fixture.invalid/one/manifest.json",
+                    "flags": {
+                      "official": false,
+                      "protected": false
+                    },
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "name": "one",
+                      "catalogs": [],
+                      "id": "fixture.one",
+                      "version": "1.0.0",
+                      "resources": [
+                        "meta"
+                      ]
+                    }
+                  }
+                }
+              },
+              "order": {
+                "updatedAt": 0,
+                "ids": []
+              }
+            }
+          },
+          "watches": {
+            "10000000-0000-0000-0000-000000000001": {
+              "contexts": {
+                "tt-history": {
+                  "durationMs": 0,
+                  "metaId": "tt-history",
+                  "name": "Watched without saving",
+                  "updatedAt": 1791497839,
+                  "type": "movie"
+                },
+                "tt-saved:1:2": {
+                  "durationMs": 1200000,
+                  "updatedAt": 1791497839,
+                  "metaId": "tt-saved",
+                  "type": "series",
+                  "name": "Saved series",
+                  "videoId": "tt-saved:1:2"
+                }
+              },
+              "log": {
+                "tt-history": {
+                  "resume_ms": 0,
+                  "times_watched": 1,
+                  "reset_at": 0,
+                  "resume_at": 0,
+                  "watched_at": 1791497839,
+                  "removed_at": 0
+                },
+                "tt-saved:1:2": {
+                  "resume_ms": 120000,
+                  "reset_at": 0,
+                  "times_watched": 0,
+                  "resume_at": 1791497839,
+                  "watched_at": 0,
+                  "removed_at": 0
+                }
+              }
+            }
+          }
+        },
+        "nativeHostPreferences": {
+          "globals": {
+            "fields": {}
+          },
+          "schemaVersion": 1,
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001",
+          "profiles": {
+            "10000000-0000-0000-0000-000000000001": {
+              "fields": {
+                "watchlist.movie.dHQtd2F0Y2hsaXN0": {
+                  "actor": "00000000-0000-4000-8000-000000000001",
+                  "clock": 2,
+                  "value": {
+                    "type": "movie",
+                    "id": "tt-watchlist",
+                    "addedAt": 123.5,
+                    "name": "Watch later"
+                  }
+                },
+                "avatar": {
+                  "actor": "00000000-0000-4000-8000-000000000001",
+                  "clock": 1,
+                  "value": "🍿"
+                }
+              }
+            }
+          },
+          "scope": "account.sync-fixture"
+        }
+      },
+      "installedAddons": [
+        "https://fixture.invalid/one/manifest.json",
+        "https://fixture.invalid/two/manifest.json"
+      ],
+      "playback": {
+        "watchedVideoIdsByTitle": {},
+        "kind": "profile_playback",
+        "continueWatching": [
+          {
+            "watched": false,
+            "timesWatched": 0,
+            "updatedAt": 1791497839,
+            "durationMs": 1200000,
+            "offsetMs": 120000,
+            "name": "Saved series",
+            "videoId": "tt-saved:1:2",
+            "metaId": "tt-saved",
+            "type": "series"
+          }
+        ],
+        "profileId": "10000000-0000-0000-0000-000000000001",
+        "history": [
+          {
+            "watched": true,
+            "timesWatched": 1,
+            "durationMs": 0,
+            "updatedAt": 1791497839,
+            "offsetMs": 0,
+            "name": "Watched without saving",
+            "metaId": "tt-history",
+            "type": "movie"
+          }
+        ],
+        "watchedTitles": {
+          "tt-history": 1
+        },
+        "resumeById": {
+          "tt-saved": null,
+          "tt-saved:1:2": {
+            "durationMs": 1200000,
+            "offsetMs": 120000,
+            "updatedAt": 1791497839
+          },
+          "tt-history": null
+        }
+      }
+    },
+    {
+      "source": "result-8.json",
+      "sourceSHA256": "45fb1dc4d569583f6b6e0f470ccf2c7bbbf66af636060659cf07a9b3593ae286",
+      "document": {
+        "nativeSync": {
+          "watches": {
+            "10000000-0000-0000-0000-000000000001": {
+              "log": {
+                "tt-saved:1:2": {
+                  "removed_at": 0,
+                  "resume_at": 1791497841,
+                  "times_watched": 0,
+                  "resume_ms": 240000,
+                  "watched_at": 0,
+                  "reset_at": 0
+                },
+                "tt-history": {
+                  "removed_at": 0,
+                  "resume_at": 0,
+                  "times_watched": 1,
+                  "resume_ms": 0,
+                  "watched_at": 1791497839,
+                  "reset_at": 1791497841
+                }
+              },
+              "contexts": {
+                "tt-saved:1:2": {
+                  "metaId": "tt-saved",
+                  "name": "Saved series",
+                  "videoId": "tt-saved:1:2",
+                  "type": "series",
+                  "durationMs": 1200000,
+                  "updatedAt": 1791497841
+                },
+                "tt-history": {
+                  "metaId": "tt-history",
+                  "name": "Watched without saving",
+                  "type": "movie",
+                  "durationMs": 0,
+                  "updatedAt": 1791497841
+                }
+              }
+            }
+          },
+          "schemaVersion": 1,
+          "addons": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "https://fixture.invalid/two/manifest.json": {
+                  "addedAt": 1791497839,
+                  "valueAt": 1791497839,
+                  "removedAt": 0,
+                  "value": {
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "catalogs": [],
+                      "name": "two",
+                      "resources": [
+                        "meta"
+                      ],
+                      "id": "fixture.two",
+                      "version": "1.0.0"
+                    },
+                    "flags": {
+                      "protected": false,
+                      "official": false
+                    },
+                    "transportUrl": "https://fixture.invalid/two/manifest.json"
+                  }
+                },
+                "https://fixture.invalid/one/manifest.json": {
+                  "addedAt": 1791497839,
+                  "valueAt": 1791497839,
+                  "removedAt": 1791497841,
+                  "value": {
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "catalogs": [],
+                      "name": "one",
+                      "resources": [
+                        "meta"
+                      ],
+                      "id": "fixture.one",
+                      "version": "1.0.0"
+                    },
+                    "flags": {
+                      "protected": false,
+                      "official": false
+                    },
+                    "transportUrl": "https://fixture.invalid/one/manifest.json"
+                  }
+                }
+              },
+              "order": {
+                "ids": [
+                  "https://fixture.invalid/two/manifest.json",
+                  "https://fixture.invalid/one/manifest.json"
+                ],
+                "updatedAt": 1791497841
+              }
+            }
+          },
+          "scope": "account.sync-fixture",
+          "profiles": {
+            "10000000-0000-0000-0000-000000000002": {
+              "profile": {
+                "owner": false,
+                "settings": {
+                  "languages": [],
+                  "oled": false,
+                  "textScale": 1000,
+                  "disabledAddons": []
+                },
+                "rev": 1,
+                "deleted": false,
+                "addons": "share_primary",
+                "name": "Renamed on Android",
+                "id": "10000000-0000-0000-0000-000000000002",
+                "account": {
+                  "kind": "local_only"
+                },
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "updatedAt": 1791497841
+              },
+              "fieldClocks": {
+                "name": 1791497841
+              }
+            },
+            "10000000-0000-0000-0000-000000000001": {
+              "profile": {
+                "owner": true,
+                "settings": {
+                  "languages": [],
+                  "oled": false,
+                  "textScale": 1000,
+                  "disabledAddons": []
+                },
+                "rev": 0,
+                "deleted": false,
+                "addons": "share_primary",
+                "name": "Sync Fixture",
+                "id": "10000000-0000-0000-0000-000000000001",
+                "account": {
+                  "kind": "local_only"
+                },
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "updatedAt": 0
+              },
+              "fieldClocks": {}
+            }
+          },
+          "libraries": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "series:tt-saved": {
+                  "addedAt": 1791497839,
+                  "valueAt": 1791497839,
+                  "removedAt": 0,
+                  "value": {
+                    "kind": "standard",
+                    "name": "Saved series",
+                    "id": "tt-saved",
+                    "type": "series"
+                  }
+                }
+              },
+              "order": {
+                "ids": [],
+                "updatedAt": 0
+              }
+            }
+          },
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001"
+        },
+        "nativeHostPreferences": {
+          "schemaVersion": 1,
+          "scope": "account.sync-fixture",
+          "globals": {
+            "fields": {}
+          },
+          "profiles": {
+            "10000000-0000-0000-0000-000000000001": {
+              "fields": {
+                "watchlist.movie.dHQtd2F0Y2hsaXN0": {
+                  "actor": "200b57a0-afb6-4517-8ebd-8698f0c550b8",
+                  "clock": 4,
+                  "value": null
+                },
+                "avatar": {
+                  "actor": "200b57a0-afb6-4517-8ebd-8698f0c550b8",
+                  "clock": 3,
+                  "value": "🎬"
+                }
+              }
+            }
+          },
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001"
+        }
+      },
+      "installedAddons": [
+        "https://fixture.invalid/two/manifest.json"
+      ],
+      "playback": {
+        "kind": "profile_playback",
+        "profileId": "10000000-0000-0000-0000-000000000002",
+        "watchedVideoIdsByTitle": {},
+        "continueWatching": [],
+        "history": [],
+        "resumeById": {},
+        "watchedTitles": {}
+      }
+    },
+    {
+      "source": "result-17.json",
+      "sourceSHA256": "9a257f89617076bc1ce1baf3e6af726e93ab9ee99bf63d69e7926e0d89d483ce",
+      "document": {
+        "nativeSync": {
+          "watches": {
+            "10000000-0000-0000-0000-000000000001": {
+              "log": {
+                "tt-saved:1:2": {
+                  "removed_at": 0,
+                  "resume_at": 1791497841,
+                  "times_watched": 0,
+                  "resume_ms": 240000,
+                  "watched_at": 0,
+                  "reset_at": 0
+                },
+                "tt-history": {
+                  "removed_at": 0,
+                  "resume_at": 0,
+                  "times_watched": 1,
+                  "resume_ms": 0,
+                  "watched_at": 1791497839,
+                  "reset_at": 1791497841
+                }
+              },
+              "contexts": {
+                "tt-saved:1:2": {
+                  "metaId": "tt-saved",
+                  "name": "Saved series",
+                  "videoId": "tt-saved:1:2",
+                  "type": "series",
+                  "durationMs": 1200000,
+                  "updatedAt": 1791497841
+                },
+                "tt-history": {
+                  "metaId": "tt-history",
+                  "name": "Watched without saving",
+                  "type": "movie",
+                  "durationMs": 0,
+                  "updatedAt": 1791497841
+                }
+              }
+            }
+          },
+          "schemaVersion": 1,
+          "addons": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "https://fixture.invalid/two/manifest.json": {
+                  "addedAt": 1791497839,
+                  "valueAt": 1791497839,
+                  "removedAt": 0,
+                  "value": {
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "catalogs": [],
+                      "name": "two",
+                      "resources": [
+                        "meta"
+                      ],
+                      "id": "fixture.two",
+                      "version": "1.0.0"
+                    },
+                    "flags": {
+                      "protected": false,
+                      "official": false
+                    },
+                    "transportUrl": "https://fixture.invalid/two/manifest.json"
+                  }
+                },
+                "https://fixture.invalid/one/manifest.json": {
+                  "addedAt": 1791497844,
+                  "valueAt": 1791497844,
+                  "removedAt": 1791497841,
+                  "value": {
+                    "manifest": {
+                      "types": [
+                        "movie",
+                        "series"
+                      ],
+                      "catalogs": [],
+                      "name": "one",
+                      "resources": [
+                        "meta"
+                      ],
+                      "id": "fixture.one",
+                      "version": "1.0.0"
+                    },
+                    "flags": {
+                      "protected": false,
+                      "official": false
+                    },
+                    "transportUrl": "https://fixture.invalid/one/manifest.json"
+                  }
+                }
+              },
+              "order": {
+                "ids": [
+                  "https://fixture.invalid/one/manifest.json",
+                  "https://fixture.invalid/two/manifest.json"
+                ],
+                "updatedAt": 1791497844
+              }
+            }
+          },
+          "scope": "account.sync-fixture",
+          "profiles": {
+            "10000000-0000-0000-0000-000000000002": {
+              "profile": {
+                "owner": false,
+                "settings": {
+                  "languages": [],
+                  "oled": false,
+                  "textScale": 1000,
+                  "disabledAddons": []
+                },
+                "rev": 1,
+                "deleted": false,
+                "addons": "share_primary",
+                "name": "Renamed on Android",
+                "id": "10000000-0000-0000-0000-000000000002",
+                "account": {
+                  "kind": "local_only"
+                },
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "updatedAt": 1791497841
+              },
+              "fieldClocks": {
+                "name": 1791497841
+              }
+            },
+            "10000000-0000-0000-0000-000000000001": {
+              "profile": {
+                "owner": true,
+                "settings": {
+                  "languages": [],
+                  "oled": false,
+                  "textScale": 1000,
+                  "disabledAddons": []
+                },
+                "rev": 0,
+                "deleted": false,
+                "addons": "share_primary",
+                "name": "Sync Fixture",
+                "id": "10000000-0000-0000-0000-000000000001",
+                "account": {
+                  "kind": "local_only"
+                },
+                "parental": {
+                  "familyEdit": false,
+                  "kids": false
+                },
+                "updatedAt": 0
+              },
+              "fieldClocks": {}
+            }
+          },
+          "libraries": {
+            "10000000-0000-0000-0000-000000000001": {
+              "records": {
+                "series:tt-saved": {
+                  "addedAt": 1791497839,
+                  "valueAt": 1791497839,
+                  "removedAt": 0,
+                  "value": {
+                    "kind": "standard",
+                    "name": "Saved series",
+                    "id": "tt-saved",
+                    "type": "series"
+                  }
+                }
+              },
+              "order": {
+                "ids": [],
+                "updatedAt": 0
+              }
+            }
+          },
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001"
+        },
+        "nativeHostPreferences": {
+          "schemaVersion": 1,
+          "scope": "account.sync-fixture",
+          "globals": {
+            "fields": {}
+          },
+          "profiles": {
+            "10000000-0000-0000-0000-000000000001": {
+              "fields": {
+                "watchlist.movie.dHQtd2F0Y2hsaXN0": {
+                  "actor": "00000000-0000-4000-8000-000000000001",
+                  "clock": 5,
+                  "value": {
+                    "addedAt": 124,
+                    "name": "Watch later",
+                    "id": "tt-watchlist",
+                    "type": "movie"
+                  }
+                },
+                "avatar": {
+                  "actor": "200b57a0-afb6-4517-8ebd-8698f0c550b8",
+                  "clock": 3,
+                  "value": "🎬"
+                }
+              }
+            }
+          },
+          "ownerProfileId": "10000000-0000-0000-0000-000000000001"
+        }
+      },
+      "installedAddons": [
+        "https://fixture.invalid/one/manifest.json",
+        "https://fixture.invalid/two/manifest.json"
+      ],
+      "playback": {
+        "kind": "profile_playback",
+        "profileId": "10000000-0000-0000-0000-000000000002",
+        "watchedVideoIdsByTitle": {},
+        "continueWatching": [],
+        "history": [],
+        "resumeById": {},
+        "watchedTitles": {}
+      }
+    }
+  ]
+}

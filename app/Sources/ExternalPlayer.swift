@@ -108,20 +108,44 @@ enum ExternalPlayer {
 
     /// Open `stream` in `target` and report the platform's actual asynchronous launch result. The
     /// completion is delivered on the main queue so callers can safely keep or dismiss the built-in
-    /// player from it.
+    /// player from it. Infuse starts at `startSeconds` (the saved resume point when nil) and reports its
+    /// stopping point back; `durationSeconds` is the runtime that position is saved against.
     @MainActor static func open(
         _ target: Target,
         stream: URL,
         metadata: PlaybackMeta? = nil,
+        startSeconds: Double? = nil,
+        durationSeconds: Double? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         let finish: @Sendable (Bool) -> Void = { launched in
             DispatchQueue.main.async { completion(launched) }
         }
-        guard target.isInstalled, let link = target.deepLink(for: stream, metadata: metadata) else {
+        guard target.isInstalled else {
             finish(false)
             return
         }
+        if target.id == infuseID {
+            Task { @MainActor in
+                guard let link = await InfuseReturnCoordinator.launchURL(
+                    stream: stream, meta: metadata, startSeconds: startSeconds, durationSeconds: durationSeconds) else {
+                    finish(false)
+                    return
+                }
+                launch(link, finish: finish)
+            }
+            return
+        }
+        guard let link = target.deepLink(for: stream, metadata: metadata) else {
+            finish(false)
+            return
+        }
+        launch(link, finish: finish)
+    }
+
+    private static let infuseID = "infuse"
+
+    @MainActor private static func launch(_ link: URL, finish: @escaping @Sendable (Bool) -> Void) {
         #if canImport(UIKit)
         UIApplication.shared.open(link, options: [:]) { launched in
             finish(launched)
@@ -193,9 +217,12 @@ enum ExternalPlayer {
         _ stream: URL,
         isTorrent: Bool,
         metadata: PlaybackMeta? = nil,
+        startSeconds: Double? = nil,
+        durationSeconds: Double? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
-        open(target, stream: stream, metadata: metadata, completion: completion)
+        open(target, stream: stream, metadata: metadata, startSeconds: startSeconds,
+             durationSeconds: durationSeconds, completion: completion)
     }
 }

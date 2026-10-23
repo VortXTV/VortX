@@ -15,6 +15,19 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
+NATIVE_PROJECT_TARGETS = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
+
+
+def project_target_fixture(name, build=221):
+    return f'  {name}:\n    settings:\n      base:\n        CURRENT_PROJECT_VERSION: "{build}"\n'
+
+
+def project_fixture(build=221, historical=False, targets=NATIVE_PROJECT_TARGETS):
+    names = (*targets, *(("VortX",) if historical else ()))
+    return ("name: VortX\ntargets:\n" + "".join(project_target_fixture(name, build) for name in names)
+            + "  CinemaUISmokeRenderer:\n    type: application\nschemes:\n  VortXTV:\n    build:\n")
+
+
 def release(tag, build, complete=True):
     assets = []
     if complete:
@@ -54,6 +67,63 @@ def source(build=220):
             {"name": "VortX (Apple TV)", "bundleIdentifier": "com.stremiox.tv", "versions": [tv_entry]},
         ],
     }
+
+
+class ProjectBuildTests(unittest.TestCase):
+    def parse(self, content):
+        encoded = base64.b64encode(content.encode()).decode()
+        with patch.object(MODULE, "gh_json", return_value={"content": encoded}):
+            return MODULE.tag_build("v0.5.6")
+
+    def test_native_five_and_historical_six_named_targets(self):
+        self.assertEqual(self.parse(project_fixture()), "221")
+        self.assertEqual(self.parse(project_fixture(historical=True)), "221")
+        self.assertEqual(self.parse(project_fixture().replace(
+            "  CinemaUISmokeRenderer:\n    type: application\n", "")), "221")
+
+    def test_missing_native_targets_in_both_layouts(self):
+        for historical in (False, True):
+            for missing in NATIVE_PROJECT_TARGETS:
+                with self.subTest(historical=historical, missing=missing):
+                    targets = tuple(name for name in NATIVE_PROJECT_TARGETS if name != missing)
+                    with self.assertRaises(MODULE.MetadataError):
+                        self.parse(project_fixture(historical=historical, targets=targets))
+
+    def test_duplicate_misplaced_incomplete_and_counterfeit_metadata(self):
+        native, historical = project_fixture(), project_fixture(historical=True)
+        field = '        CURRENT_PROJECT_VERSION: "221"\n'
+        incomplete = project_fixture(targets=tuple(name for name in NATIVE_PROJECT_TARGETS if name != "VortXTopShelf"))
+        cases = (
+            ("bare six-line counter", field * 6),
+            ("native mismatch", native.replace('"221"', '"220"', 1)),
+            ("historical mismatch", historical.replace(project_target_fixture("VortX"), project_target_fixture("VortX", 220))),
+            ("legacy target missing its build", historical.replace(project_target_fixture("VortX"), "  VortX:\n    settings:\n      base:\n")),
+            ("native target missing its build", native.replace(field, "", 1)),
+            ("duplicate field", native.replace(field, field * 2, 1)),
+            ("counterfeit six fields with a missing target", incomplete.replace(field, field * 3, 1)),
+            ("duplicate named target", native.replace("schemes:\n", project_target_fixture("VortXTV") + "schemes:\n")),
+            ("unexpected versioned target", native.replace("schemes:\n", project_target_fixture("OtherApp") + "schemes:\n")),
+            ("versioned smoke renderer", native.replace("  CinemaUISmokeRenderer:\n    type: application\n", project_target_fixture("CinemaUISmokeRenderer"))),
+            ("build outside targets", "settings:\n      base:\n" + field + native),
+            ("build in schemes", native + field),
+            ("misindented settings scope", native.replace("    settings:\n", "   settings:\n", 1)),
+            ("duplicate settings scope", native.replace("  CinemaUISmokeRenderer:\n", "    settings:\n      base:\n  CinemaUISmokeRenderer:\n")),
+            ("unquoted build", native.replace('"221"', "221", 1)),
+            ("zero build", project_fixture(build=0)),
+            ("inline targets override", native + "targets: {}\n"),
+            ("quoted targets override", native + '"targets": {}\n'),
+            ("spaced targets override", native + "targets : {}\n"),
+            ("spaced quoted targets override", native + '"targets" : {}\n'),
+            ("inline settings override", native.replace("  CinemaUISmokeRenderer:\n", "    settings: {}\n  CinemaUISmokeRenderer:\n")),
+            ("spaced settings override", native.replace("  CinemaUISmokeRenderer:\n", "    settings : {}\n  CinemaUISmokeRenderer:\n")),
+            ("inline base override", native.replace("  CinemaUISmokeRenderer:\n", "      base: {}\n  CinemaUISmokeRenderer:\n")),
+            ("spaced base override", native.replace("  CinemaUISmokeRenderer:\n", "      base : {}\n  CinemaUISmokeRenderer:\n")),
+            ("duplicate targets section", native + "targets:\n"),
+        )
+        for name, content in cases:
+            with self.subTest(name=name):
+                with self.assertRaises(MODULE.MetadataError):
+                    self.parse(content)
 
 
 class BackfillTests(unittest.TestCase):
@@ -108,7 +178,7 @@ class BackfillTests(unittest.TestCase):
                 return details[args[4]]
             if args[0] == "api":
                 tag = args[1].split("ref=", 1)[1]
-                content = (f'CURRENT_PROJECT_VERSION: "{details[tag]["build"]}"\n' * 6).encode()
+                content = project_fixture(details[tag]["build"], historical=tag.endswith(".9")).encode()
                 return {"content": base64.b64encode(content).decode()}
             raise AssertionError(args)
 

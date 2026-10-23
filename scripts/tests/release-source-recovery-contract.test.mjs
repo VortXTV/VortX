@@ -8,18 +8,43 @@ import { test } from 'node:test';
 
 const workflow = readFileSync(new URL('../../.github/workflows/release-tvos.yml', import.meta.url), 'utf8');
 const source = '844782d29a93ae51991bfadc639d50bc3619d40b', code = 'a'.repeat(40), tag = 'v0.5.0-beta.1';
-const recoveryCuts = [
-  { source, tag, releaseId: '407572242' },
-  { source: 'bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39', tag: 'v0.5.0-beta.3', releaseId: '408568690' },
-];
-function step(name) {
-  const start = workflow.indexOf(`      - name: ${name}\n`);
-  assert(start >= 0, name);
-  const end = workflow.indexOf('\n      - ', start + 1);
-  return workflow.slice(start, end < 0 ? undefined : end);
+const normalNative = '0c30f4782aee544a2b7e33169ad60d03630d4097';
+const historicalNative = '0c201563c6aa54eeb0545b55ad01582c0c3bcae3';
+const beta1RecordedNative = '7e3e68be5bf2b11c65d158c1823be94bd1608d1b';
+const playerDigest = '737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1'; // immutable historical checkout only
+const normalPlayerDigest = 'f4e4fcc25a61997ee4e74a7ad155d46192f4d86d7953ce1a352da796b8765672';
+const normalPlayerURL = 'https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-ffmpeg9-20261021/mpvkit-dvfel-ffmpeg-9.0.2-candidate.zip';
+// Retained selection lines from each immutable workflow: Beta 1 records 7e3e68b;
+// Beta 3 records 0c20156. Both authenticated recovery routes still execute 0c20156.
+// Never use the executing workflow's new normal pin as historical checkout evidence.
+function historicalPinBlocks(recordedNative) {
+  return `      - name: Fetch vortx-core (private monorepo, pinned)
+        with:
+          ref: ${recordedNative}
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
+          [ "$NATIVE_REVISION" = ${recordedNative} ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+      - name: Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)
+        run: |
+          EXPECTED="${playerDigest}"
+          URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"
+      - name: End historical pin fixture
+`;
 }
-function script(name) {
-  return step(name).split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
+const recoveryCuts = [
+  { source, tag, releaseId: '407572242', recordedNative: beta1RecordedNative },
+  { source: 'bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39', tag: 'v0.5.0-beta.3', releaseId: '408568690', recordedNative: historicalNative },
+];
+function step(name, text = workflow) {
+  const start = text.indexOf(`      - name: ${name}\n`);
+  assert(start >= 0, name);
+  const end = text.indexOf('\n      - ', start + 1);
+  return text.slice(start, end < 0 ? undefined : end);
+}
+function script(name, text = workflow) {
+  return step(name, text).split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
 }
 function fixture(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'vortx-source-recovery-'));
@@ -36,7 +61,8 @@ function admission(overrides = {}, mutations = {}, workflowText = workflow, cut 
       ...mutations
     };
     for (const [key, value] of Object.entries(records)) writeFileSync(join(dir, `${key}.json`), JSON.stringify(value));
-    return spawnSync('bash', ['-c', `
+    const output = join(dir, 'outputs');
+    const result = spawnSync('bash', ['-c', `
 gh() {
   case "\${*: -1}" in
     */git/ref/heads/main) jq -r . "$RUNNER_TEMP/main.json" ;;
@@ -47,16 +73,20 @@ gh() {
     *) return 88 ;;
   esac
 }
-${script('Validate immutable Beta 1 source recovery')}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
+${script('Validate immutable Beta 1 source recovery', workflowText)}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
       RUNNER_TEMP: dir, GH_REPO: 'VortXTV/VortX', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main', GITHUB_SHA: code,
       BUILD_SOURCE_SHA: cut.source, TAG: cut.tag, RELEASE_ID: cut.releaseId, VORTX_NATIVE_ONLY: 'true', TVOS_TEST_ONLY: 'false',
-      RESUME_HANDOFF: '', MPVKIT_URL: '', MPVKIT_SHA: '', ...overrides } });
+      RESUME_HANDOFF: '', MPVKIT_URL: '', MPVKIT_SHA: '', GITHUB_OUTPUT: output, ...overrides } });
+    const outputs = existsSync(output) ? readFileSync(output, 'utf8') : '';
+    if (result.status !== 0) assert.equal(outputs, '', 'failed admission cannot emit an accepted source or pin');
+    return { ...result, outputs };
   });
 }
 
 for (const cut of recoveryCuts) test(`actual recovery admission accepts exactly ${cut.tag} on current main with immutable tag peel`, () => {
   const admit = (overrides = {}, mutations = {}, workflowText = workflow) => admission(overrides, mutations, workflowText, cut);
   const result = admit(); assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.outputs, `source_sha=${cut.source}\nnative_revision=${historicalNative}\n`);
   assert.equal(admit({}, { tag: { object: { type: 'commit', sha: cut.source } } }).status, 0);
   assert.equal(admit({}, { comparison: { status: 'identical', merge_base_commit: { sha: cut.source } } }).status, 0);
   for (const invalid of [
@@ -81,20 +111,19 @@ for (const cut of recoveryCuts) test(`actual recovery admission accepts exactly 
   assert.equal(admit({}, withoutMarker).status === 0, cut.tag === tag, 'Beta 1 keeps its prerelease contract; Beta 3 requires Latest-beta');
   assert.equal(admit({}, { release: { id: Number(cut.releaseId), tag_name: cut.tag, draft: true, prerelease: false,
     body: 'Release notes\r\n<!-- vortx-channel: latest-beta -->\r\n' } }).status, 0);
-  const native = step('Fetch vortx-core (private monorepo, pinned)');
-  const changedNative = native.replace('0c201563c6aa54eeb0545b55ad01582c0c3bcae3', code);
-  assert.notEqual(changedNative, native, 'the negative fixture must actually mutate the current private-engine pin');
-  assert.notEqual(admit({}, {}, workflow.replace(native, changedNative)).status, 0);
   const player = step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)');
-  for (const changed of [player.replace('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/'),
-    player.replace('737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1', 'd'.repeat(64))]) {
+  for (const changed of [player.replace(normalPlayerURL, normalPlayerURL.replace('/vendor-', '/vendor-unreviewed-')),
+    player.replace(normalPlayerDigest, 'd'.repeat(64))]) {
+    assert.notEqual(changed, player, 'negative fixture must mutate the actual current player pair');
     assert.notEqual(admit({}, {}, workflow.replace(player, changed)).status, 0);
   }
 });
 
 for (const cut of recoveryCuts) test(`recovered checkout accepts only clean exact ${cut.tag} source and pinned inputs`, () => fixture(dir => {
   mkdirSync(join(dir, '.github/workflows'), { recursive: true });
-  const verify = (head = cut.source, status = '', workflowText = workflow) => {
+  const historicalWorkflow = historicalPinBlocks(cut.recordedNative);
+  const otherCut = recoveryCuts.find(other => other.source !== cut.source);
+  const verify = (head = cut.source, status = '', workflowText = historicalWorkflow, verifierWorkflow = workflow, buildSource = cut.source) => {
     writeFileSync(join(dir, '.github/workflows/release-tvos.yml'), workflowText);
     return spawnSync('bash', ['-c', `
 git() {
@@ -104,15 +133,257 @@ git() {
     *) return 88 ;;
   esac
 }
-${script('Verify immutable recovered source checkout')}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
-      BUILD_SOURCE_SHA: cut.source, CHECKOUT_HEAD: head, CHECKOUT_STATUS: status } });
+${script('Verify immutable recovered source checkout', verifierWorkflow)}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
+      BUILD_SOURCE_SHA: buildSource, CHECKOUT_HEAD: head, CHECKOUT_STATUS: status } });
   };
   assert.equal(verify().status, 0);
   assert.notEqual(verify(code).status, 0, 'wrong checkout');
   assert.notEqual(verify(cut.source, ' M app/fixture.swift').status, 0, 'dirty checkout');
-  assert.notEqual(verify(cut.source, '', workflow.replaceAll('ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3', `ref: ${code}`)).status, 0);
-  assert.notEqual(verify(cut.source, '', workflow.replaceAll('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/')).status, 0);
+  assert.notEqual(verify(code, '', historicalWorkflow, workflow, code).status, 0, 'unadmitted source cannot select a recorded profile');
+  for (const changed of [
+    historicalWorkflow.replace(`ref: ${cut.recordedNative}`, `ref: ${code}`),
+    historicalWorkflow.replace(`ref: ${cut.recordedNative}`, `ref: ${normalNative}`),
+    historicalWorkflow.replace(`ref: ${cut.recordedNative}`, `ref: ${otherCut.recordedNative}`),
+    historicalWorkflow.replace(`"$NATIVE_REVISION" = ${cut.recordedNative}`, `"$NATIVE_REVISION" = ${otherCut.recordedNative}`),
+    historicalWorkflow.replace(`"$NATIVE_REVISION" = ${cut.recordedNative}`, `"$NATIVE_REVISION" = ${normalNative}`),
+    historicalPinBlocks(otherCut.recordedNative),
+    historicalWorkflow.replace('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/'),
+    historicalWorkflow.replace(playerDigest, 'd'.repeat(64)),
+    historicalWorkflow.replace(`ref: ${cut.recordedNative}`, '') + `\n# ref: ${cut.recordedNative}\n`,
+    historicalWorkflow.replace(`          [ "$NATIVE_REVISION" = ${cut.recordedNative} ]`, '          true'),
+    workflow,
+  ]) assert.notEqual(verify(cut.source, '', changed).status, 0, 'wrong historical pin blocks');
+  const wrongProfile = workflow.replace(`${cut.source}) RECORDED_NATIVE_PIN=${cut.recordedNative}`,
+    `${cut.source}) RECORDED_NATIVE_PIN=${otherCut.recordedNative}`);
+  assert.notEqual(wrongProfile, workflow, 'negative fixture must mutate the actual source-specific profile');
+  assert.notEqual(verify(cut.source, '', historicalWorkflow, wrongProfile).status, 0, 'wrong-cut source profile');
 }));
+
+function selection(overrides = {}, workflowText = workflow) {
+  return fixture(dir => {
+    const output = join(dir, 'outputs');
+    const result = spawnSync('/bin/bash', ['-c', `
+git() {
+  case "$*" in
+    'rev-parse HEAD') printf '%s' "$CHECKOUT_HEAD" ;;
+    'status --porcelain') printf '%s' "$CHECKOUT_STATUS" ;;
+    *) return 88 ;;
+  esac
+}
+${script('Select the authenticated native source revision', workflowText)}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
+      GITHUB_OUTPUT: output, GITHUB_SHA: code, BUILD_SOURCE_SHA: code, CHECKOUT_HEAD: code, CHECKOUT_STATUS: '',
+      NORMAL_NATIVE_REVISION: workflowText.match(/^      NORMAL_NATIVE_REVISION: (.+)$/m)?.[1] ?? '',
+      RECOVERY_SOURCE: '', RECOVERY_OUTCOME: 'skipped', ADMITTED_SOURCE: '', ADMITTED_NATIVE_REVISION: '', ...overrides } });
+    const outputs = existsSync(output) ? readFileSync(output, 'utf8') : '';
+    if (result.status !== 0) assert.equal(outputs, '', 'failed selection must emit no revision');
+    return { ...result, outputs };
+  });
+}
+
+test('actual normal source selection emits only the new immutable pin and rejects ambiguous provenance', () => {
+  const valid = selection();
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(valid.outputs, `revision=${normalNative}\n`);
+  for (const invalid of [
+    { CHECKOUT_HEAD: source }, { CHECKOUT_STATUS: ' M app/fixture.swift' }, { BUILD_SOURCE_SHA: source },
+    { GITHUB_SHA: source }, { NORMAL_NATIVE_REVISION: historicalNative }, { NORMAL_NATIVE_REVISION: 'main' },
+    { NORMAL_NATIVE_REVISION: '' }, { RECOVERY_OUTCOME: 'success' }, { RECOVERY_OUTCOME: '' },
+    { ADMITTED_SOURCE: source }, { ADMITTED_NATIVE_REVISION: historicalNative }, { RECOVERY_SOURCE: source },
+  ]) assert.notEqual(selection(invalid).status, 0, JSON.stringify(invalid));
+});
+
+for (const cut of recoveryCuts) test(`actual ${cut.tag} selection consumes only successful exact historical admission outputs`, () => {
+  const admitted = admission({}, {}, workflow, cut);
+  assert.equal(admitted.status, 0, admitted.stderr);
+  const outputs = Object.fromEntries(admitted.outputs.trim().split('\n').map(line => line.split('=')));
+  const env = { BUILD_SOURCE_SHA: cut.source, CHECKOUT_HEAD: cut.source, RECOVERY_SOURCE: cut.source,
+    RECOVERY_OUTCOME: 'success', ADMITTED_SOURCE: outputs.source_sha, ADMITTED_NATIVE_REVISION: outputs.native_revision };
+  const valid = selection(env);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(valid.outputs, `revision=${historicalNative}\n`);
+  for (const invalid of [
+    { RECOVERY_OUTCOME: 'skipped' }, { RECOVERY_OUTCOME: 'failure' }, { RECOVERY_OUTCOME: '' },
+    { RECOVERY_SOURCE: '' }, { RECOVERY_SOURCE: code }, { ADMITTED_SOURCE: '' }, { ADMITTED_SOURCE: code },
+    { ADMITTED_NATIVE_REVISION: '' }, { ADMITTED_NATIVE_REVISION: normalNative }, { ADMITTED_NATIVE_REVISION: code },
+    { ADMITTED_NATIVE_REVISION: 'main' }, { CHECKOUT_HEAD: code }, { CHECKOUT_STATUS: '?? untracked' },
+    { BUILD_SOURCE_SHA: code },
+    { BUILD_SOURCE_SHA: code, CHECKOUT_HEAD: code, RECOVERY_SOURCE: code, ADMITTED_SOURCE: code },
+  ]) assert.notEqual(selection({ ...env, ...invalid }).status, 0, JSON.stringify(invalid));
+  const admissionName = 'Validate immutable Beta 1 source recovery';
+  const altered = workflow.replace(step(admissionName), step(admissionName).replace(`native_revision=${historicalNative}`, `native_revision=${normalNative}`));
+  assert.notEqual(altered, workflow, 'negative fixture must alter the actual admission output');
+  const badAdmission = admission({}, {}, altered, cut);
+  assert.equal(badAdmission.status, 0);
+  const badPin = Object.fromEntries(badAdmission.outputs.trim().split('\n').map(line => line.split('='))).native_revision;
+  assert.notEqual(selection({ ...env, ADMITTED_NATIVE_REVISION: badPin }).status, 0, 'normal pin cannot replace the historical profile');
+});
+
+test('actual private promotion exports only the fetched commit matching authenticated selection', () => fixture(dir => {
+  const body = script('Promote the vortx-core engine workspace + verify it (fail closed)');
+  // Stop before filesystem promotion; execute the exact pin checks and provenance export.
+  const guard = body.slice(0, body.indexOf('\nrm -rf vortx-core'));
+  assert(guard.includes('VORTX_ENGINE_SOURCE_REVISION='));
+  for (const selected of [normalNative, historicalNative]) {
+    for (const actual of [selected, selected === normalNative ? historicalNative : normalNative, code, '', 'main']) {
+      const output = join(dir, 'env');
+      writeFileSync(output, '');
+      const result = spawnSync('/bin/bash', ['-c', `git() { [ "$*" = '-C _vortx_core_src rev-parse HEAD^{commit}' ] || return 88; printf '%s' "$ACTUAL"; }\n${guard}`],
+        { encoding: 'utf8', env: { ...process.env, GITHUB_ENV: output, EXPECTED_NATIVE_REVISION: selected, ACTUAL: actual } });
+      assert.equal(result.status === 0, actual === selected, `selected=${selected}, actual=${actual}`);
+      assert.equal(readFileSync(output, 'utf8'), actual === selected ? `VORTX_ENGINE_SOURCE_REVISION=${actual}\n` : '');
+    }
+  }
+  for (const selected of ['', 'main', normalNative + '\ninjected=true']) {
+    const result = spawnSync('/bin/bash', ['-c', `git() { printf '%s' "$EXPECTED_NATIVE_REVISION"; }\n${guard}`],
+      { encoding: 'utf8', env: { ...process.env, GITHUB_ENV: join(dir, 'invalid'), EXPECTED_NATIVE_REVISION: selected } });
+    assert.notEqual(result.status, 0);
+  }
+}));
+
+const androidWorkflows = ['android.yml', 'android-release.yml'].map(name =>
+  readFileSync(new URL(`../../.github/workflows/${name}`, import.meta.url), 'utf8'));
+function assertNativeWiring(text = workflow, android = androidWorkflows) {
+  assert.equal(text.match(/^      NORMAL_NATIVE_REVISION: (.+)$/m)?.[1], normalNative);
+  const fetch = step('Fetch vortx-core (private monorepo, pinned)', text);
+  assert.deepEqual(fetch.match(/^          ref: .*$/gm), ['          ref: ${{ steps.native_source.outputs.revision }}']);
+  const selector = step('Select the authenticated native source revision', text);
+  for (const binding of [
+    'RECOVERY_SOURCE: ${{ inputs.recovery_source_commit }}', 'RECOVERY_OUTCOME: ${{ steps.recovery.outcome }}',
+    'ADMITTED_SOURCE: ${{ steps.recovery.outputs.source_sha }}', 'ADMITTED_NATIVE_REVISION: ${{ steps.recovery.outputs.native_revision }}',
+  ]) assert(selector.includes(`          ${binding}\n`), binding);
+  assert.doesNotMatch(selector, /^        if:/m);
+  const promote = step('Promote the vortx-core engine workspace + verify it (fail closed)', text);
+  assert(promote.includes('EXPECTED_NATIVE_REVISION: ${{ steps.native_source.outputs.revision }}'));
+  assert(promote.includes('[ "$NATIVE_REVISION" = "$EXPECTED_NATIVE_REVISION" ]'));
+  assert(promote.includes('echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"'));
+  const admission = step('Validate immutable Beta 1 source recovery', text);
+  assert(admission.includes(`echo 'native_revision=${historicalNative}' >> "$GITHUB_OUTPUT"`));
+  assert(admission.indexOf('echo "source_sha=') > admission.indexOf('then $latest != null and .prerelease == false'));
+  const cache = step('Cache vortx-ffi xcframework', text);
+  assert.match(cache, /^          key: .*\$\{\{ env\.VORTX_ENGINE_SOURCE_REVISION \}\}.*hashFiles/m);
+  assert.doesNotMatch(cache, /restore-keys:/);
+  const abi = step('Verify complete native engine ABI', text);
+  assert(abi.includes('EXPECTED_NATIVE_REVISION: ${{ steps.native_source.outputs.revision }}'));
+  const abiScript = script('Verify complete native engine ABI', text);
+  assert(abiScript.includes('case "$EXPECTED_NATIVE_REVISION" in'));
+  assert(abiScript.includes(`${normalNative})\n    ./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework owner-history ;;`));
+  assert(abiScript.includes(`${historicalNative})\n    ./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host ;;`));
+  assert(abiScript.includes('*) echo "::error::native ABI mode has no admitted source revision"; exit 1 ;;'));
+  const ordered = ['Validate immutable Beta 1 source recovery', "Preserve the workflow revision's native acceptance tool",
+    'Checkout the immutable recovered app source', 'Verify immutable recovered source checkout',
+    'Select the authenticated native source revision', 'Bind native acceptance tooling to workflow and source provenance',
+    'Fetch vortx-core (private monorepo, pinned)', 'Promote the vortx-core engine workspace + verify it (fail closed)',
+    'Cache vortx-ffi xcframework', 'Capture exact native SDK and player inputs before app compilation'];
+  const offsets = ordered.map(name => text.indexOf(`      - name: ${name}\n`));
+  assert(offsets.every(value => value >= 0));
+  assert.deepEqual(offsets, [...offsets].sort((a, b) => a - b));
+  for (const lane of android) {
+    const checkout = step('Fetch vortx-core (private monorepo, pinned)', lane);
+    assert.deepEqual(checkout.match(/^          ref: .*$/gm), [`          ref: ${normalNative}`]);
+    const promotion = step('Promote the vortx-core workspace + record the exact private source pin', lane);
+    assert(promotion.includes(`test "$vortx_sha" = "${normalNative}"`));
+    assert(promotion.includes('echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"'));
+    assert.match(lane, /^          key: .*\$\{\{ env\.VORTX_ENGINE_SOURCE_SHA \}\}.*hashFiles/m);
+  }
+}
+
+function assertDesktopNativeSource(manifest, lock) {
+  const repository = 'https://github.com/VortXTV/vortx-core';
+  const expected = ['librqbit', 'vortx-archive', 'vortx-nntp', 'vortx-nzb', 'vortx-streaming-server'];
+  assert.match(normalNative, /^[0-9a-f]{40}$/, 'normal engine source must be a full immutable SHA');
+  const dependencies = manifest.match(/^vortx-streaming-server = .+\r?$/gm) ?? [];
+  assert.equal(dependencies.length, 1, 'Desktop must declare one engine dependency');
+  const dependency = dependencies[0].match(/^vortx-streaming-server = \{ git = "([^"]+)", rev = "([0-9a-f]{40})" \}\r?$/);
+  assert.ok(dependency, 'Desktop engine dependency must retain its explicit Git repository/full revision');
+  assert.equal(dependency[1], repository, 'Desktop engine repository changed');
+  assert.equal(dependency[2], normalNative, 'Desktop engine revision differs from native shipping lanes');
+  const expectedSource = 'git+' + repository + '?rev=' + normalNative + '#' + normalNative;
+  const observed = [];
+  for (const block of lock.split(/^\[\[package\]\]\r?$/m)) {
+    const names = [...block.matchAll(/^name = "([^"]+)"\r?$/gm)];
+    const sources = [...block.matchAll(/^source = "([^"]+)"\r?$/gm)];
+    const name = names[0]?.[1];
+    if (!expected.includes(name) && !name?.startsWith('vortx-') && !/vortx-core/i.test(block)) continue;
+    assert.equal(names.length, 1, 'Engine lock record must have one package identity');
+    assert(expected.includes(name), 'Unexpected private engine package: ' + name);
+    assert.equal(sources.length, 1, 'Engine lock record must have one Git source: ' + name);
+    assert.equal(sources[0][1], expectedSource, 'Engine lock repository/query/resolved commit differs: ' + name);
+    observed.push(name);
+  }
+  assert.deepEqual(observed.sort(), [...expected].sort(),
+    'Desktop engine lock roster must contain exactly the five reviewed packages');
+}
+
+test('Desktop manifest and all engine lock records match the native shipping source', () => {
+  assertDesktopNativeSource(
+    readFileSync(new URL('../../desktop/src-tauri/Cargo.toml', import.meta.url), 'utf8'),
+    readFileSync(new URL('../../desktop/src-tauri/Cargo.lock', import.meta.url), 'utf8'));
+});
+
+test('Desktop engine source invariant rejects actual pure pin and lock mutations', () => {
+  const repository = 'https://github.com/VortXTV/vortx-core';
+  const manifest = '[dependencies]\nvortx-streaming-server = { git = "' + repository + '", rev = "' + normalNative + '" }\n';
+  const record = name => '[[package]]\nname = "' + name + '"\nversion = "0.0.1"\nsource = "git+' +
+    repository + '?rev=' + normalNative + '#' + normalNative + '"\n\n';
+  const blocks = ['librqbit', 'vortx-archive', 'vortx-nntp', 'vortx-nzb', 'vortx-streaming-server'].map(record);
+  const lock = 'version = 4\n\n' + blocks.join('');
+  const oldPin = '39bc4e7e6d34be71e3bb6d4f6407f49a182b89b9';
+  const sourceLine = 'source = "git+' + repository + '?rev=' + normalNative + '#' + normalNative + '"';
+  assertDesktopNativeSource(manifest, lock);
+  const mutations = [
+    ['old manifest pin', manifest.replace(normalNative, oldPin), lock],
+    ['short manifest pin', manifest.replace(normalNative, normalNative.slice(0, 7)), lock],
+    ['wrong manifest repository', manifest.replace(repository, 'https://github.com/Other/vortx-core'), lock],
+    ['duplicate manifest dependency', manifest + manifest.split('\n')[1] + '\n', lock],
+    ['old query revision', manifest, lock.replace('?rev=' + normalNative, '?rev=' + oldPin)],
+    ['old resolved commit', manifest, lock.replace('#' + normalNative, '#' + oldPin)],
+    ['short query revision', manifest, lock.replace('?rev=' + normalNative, '?rev=' + normalNative.slice(0, 7))],
+    ['wrong lock repository', manifest, lock.replace(repository, repository + '-other')],
+    ['missing private package', manifest, lock.replace(blocks[0], '')],
+    ['duplicate private package', manifest, lock + blocks[0]],
+    ['registry rqbit beside the reviewed Git package', manifest, lock + '[[package]]\nname = "librqbit"\nversion = "8.1.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'],
+    ['registry rqbit replacing the reviewed Git package', manifest, lock.replace(blocks[0], '[[package]]\nname = "librqbit"\nversion = "8.1.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n')],
+    ['unexpected private package', manifest, lock + record('vortx-extra')],
+    ['unexpected differently named engine package', manifest, lock + record('unexpected-private-engine')],
+    ['duplicate source field', manifest, lock.replace(sourceLine, sourceLine + '\n' + sourceLine)],
+    ['duplicate identity field', manifest, lock.replace('name = "vortx-archive"', 'name = "vortx-archive"\nname = "vortx-archive"')],
+  ];
+  for (const [name, changedManifest, changedLock] of mutations) {
+    assert(changedManifest !== manifest || changedLock !== lock, name + ': mutation must alter its input');
+    assert.throws(() => assertDesktopNativeSource(changedManifest, changedLock), name);
+  }
+});
+
+test('normal and historical native selection wiring rejects scoped workflow mutations', () => {
+  assertNativeWiring();
+  const mutations = [
+    ['Fetch vortx-core (private monorepo, pinned)', '${{ steps.native_source.outputs.revision }}', normalNative],
+    ['Select the authenticated native source revision', '${{ steps.recovery.outputs.native_revision }}', '${{ inputs.recovery_source_commit }}'],
+    ['Promote the vortx-core engine workspace + verify it (fail closed)', '${{ steps.native_source.outputs.revision }}', historicalNative],
+    ['Promote the vortx-core engine workspace + verify it (fail closed)', '[ "$NATIVE_REVISION" = "$EXPECTED_NATIVE_REVISION" ]', 'true'],
+    ['Validate immutable Beta 1 source recovery', `native_revision=${historicalNative}`, `native_revision=${normalNative}`],
+    ['Cache vortx-ffi xcframework', '${{ env.VORTX_ENGINE_SOURCE_REVISION }}', 'unbound'],
+    ['Verify complete native engine ABI', 'VortxEngine.xcframework owner-history ;;', 'VortxEngine.xcframework resource-host ;;'],
+    ['Verify complete native engine ABI', '${{ steps.native_source.outputs.revision }}', '${{ inputs.recovery_source_commit }}'],
+  ];
+  for (const [name, before, after] of mutations) {
+    const original = step(name), changed = original.replace(before, after);
+    assert.notEqual(changed, original, name);
+    assert.throws(() => assertNativeWiring(workflow.replace(original, changed)), name);
+  }
+  const wrongNormal = workflow.replace(`NORMAL_NATIVE_REVISION: ${normalNative}`, `NORMAL_NATIVE_REVISION: ${historicalNative}`);
+  assert.throws(() => assertNativeWiring(wrongNormal));
+  assert.notEqual(selection({}, wrongNormal).status, 0);
+  for (let index = 0; index < androidWorkflows.length; index++) {
+    for (const [before, after] of [[`ref: ${normalNative}`, `ref: ${historicalNative}`],
+      [`test "$vortx_sha" = "${normalNative}"`, 'true'], ['${{ env.VORTX_ENGINE_SOURCE_SHA }}', 'unbound']]) {
+      const changed = [...androidWorkflows];
+      changed[index] = changed[index].replace(before, after);
+      assert.notEqual(changed[index], androidWorkflows[index]);
+      assert.throws(() => assertNativeWiring(workflow, changed));
+    }
+  }
+});
 
 test('only the Apple build job receives the extended CI wall-clock budget', () => {
   const build = workflow.split('  build-tvos:\n')[1].split('  attach-release:\n')[0];
@@ -147,8 +418,10 @@ test('recovery preserves only the verifier outside the source checkout and retai
   assert.match(step('Verify immutable recovered source checkout'), /git status --porcelain/);
   assert.match(workflow, /environment: engine-ci/);
   assert.match(workflow, /environment: release-approval/);
-  assert.match(step('Fetch vortx-core (private monorepo, pinned)'), /ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3/);
-  assert.match(step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)'), /vendor-mpvkit-dvfel-3\/mpvkit-dvfel-artifacts-http-seek-20261009.zip/);
+  assertNativeWiring();
+  const currentPlayer = step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)');
+  assert(currentPlayer.includes(`EXPECTED="${normalPlayerDigest}"`));
+  assert(currentPlayer.includes(`URL="${normalPlayerURL}"`));
   assert.match(step('Build the content-addressed release feed artifact'), /--source-commit "\$BUILD_SOURCE_SHA"/);
   assert.doesNotMatch(step('Build the content-addressed release feed artifact'), /\$GITHUB_SHA/);
   assert.match(step('Bind the draft release, tag commit, and monotonic source before any write'), /TAG_SHA" = "\$BUILD_SOURCE_SHA/);
@@ -370,3 +643,20 @@ test('hard archive gate refuses a preexisting symlink destination without changi
   assert.equal(result.feedExists, false);
   assert.equal(result.sentinel, 'preserved');
 });
+
+test('actual Apple ABI gate binds normal owner-history and retained historical resource mode', () => fixture(dir => {
+  mkdirSync(join(dir, 'scripts'), { recursive: true });
+  const receipt = join(dir, 'abi-arguments');
+  writeFileSync(join(dir, 'scripts/verify-native-engine-abi.sh'),
+    '#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s\\n" "$*" > "$ABI_ARGUMENTS"\n', { mode: 0o755 });
+  for (const [revision, mode] of [[normalNative, 'owner-history'], [historicalNative, 'resource-host'],
+    ['', null], ['main', null], ['af29b22e4c45740a1f5b6cb415b81f8430f55b9f', null], ['a'.repeat(40), null]]) {
+    writeFileSync(receipt, '');
+    const result = spawnSync('/bin/bash', ['-c', script('Verify complete native engine ABI')], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, EXPECTED_NATIVE_REVISION: revision, ABI_ARGUMENTS: receipt }
+    });
+    assert.equal(result.status === 0, mode !== null, revision);
+    assert.equal(readFileSync(receipt, 'utf8'), mode === null ? '' :
+      `apple app/Vendor/VortxEngine.xcframework ${mode}\n`);
+  }
+}));

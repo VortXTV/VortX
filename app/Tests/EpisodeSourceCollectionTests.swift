@@ -28,10 +28,12 @@ struct StreamSource: Equatable, Sendable { let base: String; let name: String }
 enum PlaybackSettings { nonisolated(unsafe) static var directLinksOnly = false }
 @MainActor final class ProfileStore { static let shared = ProfileStore(); var activeID: UUID? = UUID() }
 @MainActor enum ContinueWatchingPreferences { static var selectionEpoch: UInt64 = 0 }
-final class CredentialScopeRegistry: Sendable {
+@MainActor final class CredentialScopeRegistry {
     static let shared = CredentialScopeRegistry()
-    func capture() -> Int { 1 }
-    func isCurrent(_ capture: Int) -> Bool { capture == 1 }
+    private(set) var generation: UInt64 = 1
+    func capture() -> UInt64 { generation }
+    func isCurrent(_ capture: UInt64) -> Bool { capture == generation }
+    func advance() { generation &+= 1 }
 }
 struct AddonResource: Decodable { let name: String; let types: [String]?; let idPrefixes: [String]? }
 struct AddonManifest: Decodable { let id: String; let name: String; let types: [String]?; let idPrefixes: [String]?; let resources: [AddonResource] }
@@ -226,23 +228,24 @@ final class EpisodeFixtureProtocol: URLProtocol, @unchecked Sendable {
         try? await Task.sleep(for: .milliseconds(10)); cancelled.cancel()
         check(await cancelled.value == nil, "parent cancellation rejects partial output")
         check(FixtureAuxiliary.clearCount == 18, "each isolated auxiliary owner cleaned exactly once")
-#if VORTX_NATIVE_DATA_ENGINE
         account.streamSources = []
         check(newOwner.isCurrent && newOwner.sources(for: "E8") == sources, "native-only inventory works without Stremio token or legacy sources")
         account.streamSources = Array(sources.reversed())
         check(newOwner.isCurrent && newOwner.sources(for: "E8") == sources, "different legacy order cannot replace native profile registry order")
+        account.credentialBoundaryGeneration += 1
+        check(newOwner.isCurrent && newOwner.sources(for: "E8") == sources, "legacy account publication cannot replace the captured native registry authority")
+        let credentialOwner = EpisodeSourceOwner(account: account)
+        check(credentialOwner.isCurrent, "native credential receipt starts current")
+        CredentialScopeRegistry.shared.advance()
+        check(!credentialOwner.isCurrent, "native credential epoch replacement retires the captured source owner without a registry change")
+        let registryOwner = EpisodeSourceOwner(account: account)
+        check(registryOwner.isCurrent, "fresh native source owner captures the replacement credential epoch")
         CoreBridge.shared.generation = UUID()
-        check(!newOwner.isCurrent, "acknowledged native registry generation retires old receipt")
+        check(!registryOwner.isCurrent, "acknowledged native registry generation independently retires a fresh credential receipt")
         CoreBridge.shared.registryData = nil
         let unavailable = EpisodeSourceOwner(account: account)
         check(!unavailable.isCurrent && unavailable.sources(for: "E8").isEmpty, "absent native registry fails closed without legacy fallback")
         CoreBridge.shared.registryData = registry(sources)
-#else
-        account.streamSources = Array(sources.reversed())
-        check(!newOwner.isCurrent, "legacy provider snapshot change retires captured owner")
-        account.streamSources = sources; account.credentialBoundaryGeneration += 1
-        check(!newOwner.isCurrent, "same-profile legacy credential rebind retires captured owner")
-#endif
         let manifests = Data(#"[{"transportUrl":"https://fixture.invalid/config/manifest.json?key=fixture","manifest":{"name":"first","types":["series"],"idPrefixes":["tt"],"resources":["stream"]}},{"transportUrl":"https://fixture.invalid/movies/manifest.json","manifest":{"name":"movie","types":["movie"],"resources":["stream"]}},{"transportUrl":"https://fixture.invalid/override/manifest.json","manifest":{"name":"override","types":["movie"],"idPrefixes":["movie"],"resources":[{"name":"stream","types":["series"],"idPrefixes":["tt"]}]}},{"transportUrl":"https://fixture.invalid/inherit/manifest.json","manifest":{"name":"inherit","types":["series"],"idPrefixes":["tt"],"resources":[{"name":"stream","types":[]}]}},{"transportUrl":"https://fixture.invalid/meta/manifest.json","manifest":{"name":"meta","types":["series"],"resources":["meta"]}},{"transportUrl":"https://fixture.invalid/all/manifest.json","manifest":{"name":"all","types":["series"],"idPrefixes":["movie"],"resources":[{"name":"stream","idPrefixes":[]}]}}]"#.utf8)
         let inventory = try! JSONDecoder().decode(EpisodeSourceInventory.self, from: manifests)
         var withMalformed = try! JSONSerialization.jsonObject(with: manifests) as! [Any]
@@ -435,12 +438,8 @@ final class EpisodeFixtureProtocol: URLProtocol, @unchecked Sendable {
             }
         }
         await fixture.awaitRequest(metaPath)
-#if VORTX_NATIVE_DATA_ENGINE
         CoreBridge.shared.registryData = try! JSONSerialization.data(withJSONObject: Array(legacyJSON.dropFirst()))
         CoreBridge.shared.generation = UUID()
-#else
-        account.addons.removeFirst()
-#endif
         fixture.release(metaPath)
         check(await held.value == nil && retiredReceipt.groups == nil && !owner.isCurrent,
               "held metadata callback from removed registry provider cannot publish E2 or a source receipt")
@@ -459,13 +458,8 @@ final class EpisodeFixtureProtocol: URLProtocol, @unchecked Sendable {
         await fixture.awaitRequest(metaPath)
         var replacedRows = objectResources
         replacedRows[0]["transportUrl"] = "https://episode.fixture/replaced/manifest.json?key=new-fixture"
-#if VORTX_NATIVE_DATA_ENGINE
         CoreBridge.shared.registryData = try! JSONSerialization.data(withJSONObject: replacedRows)
         CoreBridge.shared.generation = UUID()
-#else
-        account.addons = try! JSONDecoder().decode([AddonDescriptor].self,
-            from: JSONSerialization.data(withJSONObject: replacedRows))
-#endif
         fixture.release(metaPath)
         check(await replaced.value == nil && replacementReceipt.groups == nil && !replacementOwner.isCurrent,
               "same descriptor ID with replaced configured transport rejects held metadata and complete handoff")

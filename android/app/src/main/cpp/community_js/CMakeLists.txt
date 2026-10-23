@@ -1,17 +1,15 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(vortx_community_js C)
 
-# Official QuickJS 2025-09-13 source release from bellard.org. The SHA-256 is pinned so a changed
+# Official QuickJS 2026-06-04 source release from bellard.org. The SHA-256 is pinned so a changed
 # archive fails configuration instead of silently compiling different untrusted-code semantics.
 include(FetchContent)
 FetchContent_Declare(quickjs_source
-    URL https://bellard.org/quickjs/quickjs-2025-09-13.tar.xz
-    URL_HASH SHA256=6f1f322aea3bb3a90858db85c9fe717013fde4df7dfcafe2f57e78f5bb4b4a0c
+    URL https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz
+    URL_HASH SHA256=b376e839b322978313d929fd20663b11ba58b75df5a46c126dd19ea2fa70ad2a
 )
-FetchContent_GetProperties(quickjs_source)
-if(NOT quickjs_source_POPULATED)
-    FetchContent_Populate(quickjs_source)
-endif()
+# Supported on CMake 4: populate this Makefile-only archive without adding a subproject.
+FetchContent_MakeAvailable(quickjs_source)
 
 add_library(quickjs_runtime STATIC
     ${quickjs_source_SOURCE_DIR}/quickjs.c
@@ -21,7 +19,7 @@ add_library(quickjs_runtime STATIC
     ${quickjs_source_SOURCE_DIR}/libunicode.c
 )
 target_include_directories(quickjs_runtime PUBLIC ${quickjs_source_SOURCE_DIR})
-target_compile_definitions(quickjs_runtime PRIVATE CONFIG_VERSION="2025-09-13" _GNU_SOURCE)
+target_compile_definitions(quickjs_runtime PRIVATE CONFIG_VERSION="2026-06-04" _GNU_SOURCE)
 target_compile_options(quickjs_runtime PRIVATE -Wno-sign-compare -Wno-missing-field-initializers)
 
 add_library(vortx_community_js SHARED vortx_community_js.c)

@@ -6,11 +6,12 @@ import java.io.File
 
 class TvDetailEpisodeFocusContractTest {
     @Test
-    fun `episode rail wires previous episode and first episode to season focus`() {
+    fun `episode grid hands up from its first row to the season posters`() {
         val source = readSource()
 
         assertTrue(source.contains(".focusProperties { up = upFocusRequester }"))
-        assertTrue(source.contains("if (index == 0) seasonFocus else episodeFocusRequesters[index - 1]"))
+        assertTrue(source.contains("upFocusRequester = if (rowIndex == 0) seasonFocus else FocusRequester.Default"))
+        assertTrue(source.contains("Modifier.focusRequester(seasonFocus)"))
         assertTrue(source.contains("focusRestoreEpisodeId"))
         assertTrue(source.contains("focusRestoreRevision"))
     }

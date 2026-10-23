@@ -3716,11 +3716,15 @@ enum PlayerLiveContractTests {
               engineContract?.contains("func configureResumeOrigin(seconds: Double)") == true
                   && engine?.contains("func configureResumeOrigin(seconds: Double)") == true)
         check("wiring: a configured nonzero origin is consumed before the remux server is constructed",
+              // The server is now built off the main actor by beginColdLocalRemuxMount, which carries the origin.
               sourceContainsInOrder(engine, [
                 "resumeConfiguration.consumeForNextLoad()",
                 "let requestedRemuxOrigin = currentLoadResumeOrigin",
-                "VortXRemuxHLSServer.make(",
+                "beginColdLocalRemuxMount(",
                 "startAtSeconds: requestedRemuxOrigin",
+                "private func beginColdLocalRemuxMount(",
+                "VortXRemuxHLSServer.make(",
+                "startAtSeconds: startAtSeconds",
               ]))
         check("wiring: remux seek maps source bounds before player bounds and preserves the non-remux clamp",
               sourceContainsInOrder(remuxSeekMapping, [
@@ -3928,7 +3932,9 @@ enum PlayerLiveContractTests {
                   && tvPlayer?.contains(
                       "if DVPlaybackPolicy.isSourceCapabilityMismatch(msg)") == true)
         check("wiring: first-frame proof and start timers are owned by the current logical load",
-              tvPlayer?.contains(".hasProducedPlayableVideoFrame == true") == true
+              // First-frame proof moved into the engine's shared start evidence (161817c7a).
+              engine?.contains("renderedVideoFrame: hasProducedPlayableVideoFrame") == true
+                  && tvPlayer?.contains("AVPlayerEngineController)?.playbackStartEvidence") == true
                   && tvPlayer?.contains(
                       "ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
                   && tvPlayer?.contains(

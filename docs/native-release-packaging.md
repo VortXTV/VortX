@@ -1,25 +1,28 @@
 # Native release packaging
 
-The 0.5 shipping paths select the native engine by default and fail closed when its required
+The 0.5.6 shipping paths use only the native engine and fail closed when its required
 state or artifacts are unavailable. Source selection does not itself establish migration parity,
-physical playback, signing or publication. The retained `app/project.yml` still generates the
-legacy comparison project; the shipping workflow uses the native generator below. All migration,
+physical playback, signing or publication. Both `app/project.yml` and the shipping generator use
+the native target roster; the generator binds the reviewed source/player inputs. All migration,
 independent review, full-build and artifact gates remain required before publication.
 
 ## Pinned shipping inputs
 
 The checkout and post-checkout equality assertion in `release-tvos.yml`, `android.yml` and
-`android-release.yml` must select the identical reviewed native source revision for that release.
-Read the pin from the exact source tag and immutable handoff, not a moving documentation page.
-Updating a pin does not establish private CI, fresh cross-platform SDK, app, signing or release
-acceptance; those gates must pass against the final combined public source before shipping.
-Retained legacy comparison inputs are not shipping dependencies; native packages must not contain
-the legacy engine or Node runtime.
+`android-release.yml`, plus Desktop's manifest and resolved lock, must select one identical,
+reviewed native source revision. Their current
+source contract is `0c30f4782aee544a2b7e33169ad60d03630d4097`. Updating this pin does not establish
+private CI, fresh cross-platform SDK, app, signing or release acceptance; those gates must pass
+against the final combined public source before shipping. The Stremio comparison engine and Node
+runtime have been removed; native packages must still reject either payload if it reappears.
+
+For a downloaded release, read its pin from that exact source tag and immutable handoff rather
+than assuming a moving documentation page describes every older package.
 
 Apple shipping and secretless validation use the same fresh player archive:
 
-- URL: `https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip`
-- SHA-256: `ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb`
+- URL: `https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-ffmpeg9-20261021/mpvkit-dvfel-ffmpeg-9.0.2-candidate.zip`
+- SHA-256: `f4e4fcc25a61997ee4e74a7ad155d46192f4d86d7953ce1a352da796b8765672`
 
 The FFmpeg9/SecureTransport content and architecture/floor gates remain required after extraction.
 The retired FFmpeg8/GnuTLS digest stays explicitly rejected; an override cannot bypass that rejection.
@@ -42,7 +45,7 @@ stable feeds. See [Release artifacts](RELEASE-ARTIFACTS.md) for the current publ
 
 `scripts/generate-native-apple-project.rb` generates `app/.native-project.yml` from the retained
 spec. It selects native iOS, Mac, Full TV and Lite TV plus Top Shelf, with state/resource/data
-bridge conditions and an exact native source revision. Full iOS/TV additionally select the
+bridge and an exact native source revision. Full iOS/TV additionally select the
 real in-process server. Lite keeps its existing no-embedded-server boundary. Mac requires the
 separate native daemon and targets the reviewed arm64 SDK. The generated project omits the
 legacy core framework, NodeMobile, server.js, Node executable and Node fetch phase.
@@ -68,9 +71,8 @@ command compares the extracted IPA or mounted DMG with the accepted app payload,
 the existing signing operation; mounted Mac apps must also pass deep, strict signature validation.
 The helper requires Python 3.9 or newer and Apple's binary/signing tools.
 
-The protected Apple workflow defaults `native_only` to true and uses the same effective native
-selection on push events, where dispatch inputs are absent. Explicit false is an artifact-only
-comparison: it cannot target or publish a release, including through coordinator resume. Native
+The protected Apple workflow retains `native_only` for dispatch compatibility and requires it to
+be true. Push events also use the native selection; explicit false fails before a build. Native
 builds use the pinned reviewed MPV archive and SHA-256; an optional override must supply both and
 still passes the content gate. ABI, aggregate deployment/OSO, simulator launch/dSYM, signing,
 immutable handoff and the applicable distribution gates continue to run. Input, app and final package
@@ -85,20 +87,24 @@ or weaken guards to turn it green.
 
 ## Android
 
-Absent overrides select `vortx.nativeEngine=true` and a matching resource-host default. An explicit
-Gradle property takes precedence over the environment; false or blank retains comparison mode,
-and malformed values fail configuration. `vortx.nativeEngine=true` requires the resolved
-`vortx.nativeResourceHost=true`; both the repository selection in BuildConfig and the Cargo
-resource-host feature follow these decisions. Native mode excludes
-`libstremiox_core.so` and does not attach the legacy Cargo task/output. Explicit non-native
-comparison builds retain the legacy route.
+Every Android build selects the native repository and `jni,server,resource-host`. The former
+`vortx.nativeEngine` and `vortx.nativeResourceHost` selectors are accepted only as explicit true
+for script compatibility; false, blank and malformed values fail configuration. There is no
+comparison BuildConfig field, legacy repository or legacy Cargo task/output. Packages reject
+`libstremiox_core.so`.
 
 The protected Android workflows prove the immutable private source pin before promotion, build
-with `jni,server,resource-host`, and check the actual APK/AAB BuildConfig. The native-only archive
+with `jni,server,resource-host`. The native-only archive
 checker requires exactly the three supported VortX ABI entries, callable JNI/resource/server
 exports and the absence of the legacy library. It compares the packaged code with the freshly
 staged output after normalizing both with the pinned NDK strip tool, and records the exact source,
 features and per-ABI hashes. Production signer, version, Play GPL boundary and draft gates remain.
+
+Full runtime and its native seam consume the same checksum-addressed Android player AAR declared
+in `android/mpv-component.properties`. Its source/provenance manifest records the successful
+`5774f40f` producer and original dependency source kit. It aligns mpv/libplacebo with the Apple
+player and carries FFmpeg9.0.2. Selecting it is not a device playback or live TLS result; the
+final app must still pass the native seam, ABI, signing and packaged-content gates.
 
 Optional Stremio protocol/account import remains a separate host integration requirement. Native
 catalog selection must not route that account flow through the legacy data engine or hide it.

@@ -33,6 +33,8 @@ xcrun swiftc -O -parse-as-library \
   "$timeline_test_dir/timeline.swift" app/Sources/Player/SkipSegments.swift \
   app/SourcesShared/GlassStyle.swift app/SourcesShared/Theme.swift app/SourcesShared/ThemeManager.swift app/SourcesShared/SeekBarStyle.swift \
   app/SourcesShared/ChipButtonStyle.swift app/SourcesShared/SkipEditPolicy.swift \
+  app/SourcesShared/VisualEffects.swift app/SourcesShared/ReducedMotion.swift \
+  app/Sources/Player/PlaybackMetadataFacts.swift app/Sources/Player/PlaybackMetadataPills.swift \
   app/Tests/PlayerSeekTimelineConstructionTests.swift -o "$timeline_test_dir/construction"
 "$timeline_test_dir/construction"
 node --test test/apple-player-timeline-boundaries.test.js

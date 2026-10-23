@@ -45,6 +45,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         case authenticatedProfileLibrary(index: Int)
         case authenticatedOwnerHistory(sourceProfileID: String, index: Int)
         case ownAccountLibraryResponse(index: Int)
+        case ownerAccountLibraryResponse(index: Int)
         case ownAccountProfileLibrary(index: Int)
         case ownAccountOwnerHistory(index: Int)
 
@@ -55,6 +56,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             case .authenticatedProfileLibrary(let index): return "/vortx/byProfile/<captured-profile>/library/\(index)"
             case .authenticatedOwnerHistory(let sourceProfileID, let index): return "/vortx/byProfile/\(sourceProfileID)/ownerHistory/\(index)"
             case .ownAccountLibraryResponse(let index): return "/libraryResponseBase64/result/\(index)"
+            case .ownerAccountLibraryResponse(let index): return "/libraryResponseBase64/result/\(index)"
             case .ownAccountProfileLibrary(let index): return "/profileOverlayBase64/vortx/byProfile/<captured-profile>/library/\(index)"
             case .ownAccountOwnerHistory(let index): return "/profileOverlayBase64/vortx/byProfile/<captured-profile>/ownerHistory/\(index)"
             }
@@ -67,11 +69,17 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             }
         }
 
+        var isOwnerAccount: Bool {
+            if case .ownerAccountLibraryResponse = self { return true }
+            return false
+        }
+
         var sourceIndex: Int {
             switch self {
             case .authenticatedOwnerLibrary(let index), .authenticatedLegacyRootLibrary(let index),
                  .authenticatedProfileLibrary(let index), .authenticatedOwnerHistory(_, let index),
                  .ownAccountLibraryResponse(let index), .ownAccountProfileLibrary(let index),
+                 .ownerAccountLibraryResponse(let index),
                  .ownAccountOwnerHistory(let index): return index
             }
         }
@@ -179,6 +187,9 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         if rowLocator.isOwnAccount {
             guard scope.verifiedStreamingUID != nil, scope.profileID != scope.ownerProfileID else { throw Failure.malformed("Own source requires verified secondary streaming identity") }
             try requireOwnEnvelope(sourceTree)
+        } else if rowLocator.isOwnerAccount {
+            guard scope.verifiedStreamingUID != nil else { throw Failure.malformed("Owner source requires verified streaming identity") }
+            try requireOwnerEnvelope(sourceTree, scope: scope)
         } else {
             guard scope.verifiedStreamingUID == nil else { throw Failure.malformed("Shared source cannot claim an own identity") }
         }
@@ -220,7 +231,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             let profiles = try strictObject(strictValue(vortx, "byProfile"))
             let bucket = try profileBucket(profiles, id: id, exactKey: sourceProfileID)
             return try sharedRow(try strictArray(strictValue(bucket, "ownerHistory")), index: index)
-        case .ownAccountLibraryResponse(let index):
+        case .ownAccountLibraryResponse(let index), .ownerAccountLibraryResponse(let index):
             guard index >= 0, scope.verifiedStreamingUID != nil else { throw Failure.malformed("Own source requires verified streaming identity") }
             let envelope = try strictObject(try StrictJSON.value(try strictEnvelopeBytes(rootObject, "libraryResponseBase64")))
             let rows = try strictArray(strictValue(envelope, "result"))
@@ -267,6 +278,82 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         _ = try strictEnvelopeBytes(object, "profileOverlayBase64")
     }
 
+    private static func requireOwnerEnvelope(_ source: StrictJSON.Value, scope: Scope? = nil) throws {
+        let object = try strictObject(source)
+        let expected = ["schemaVersion", "kind", "scope", "ownerProfileId", "profileId",
+                        "verifiedStreamingUid", "libraryResponseBase64", "addonsResponseBase64"].map { Data($0.utf8) }
+        guard object.members.count == expected.count, Set(object.members.map(\.keyBytes)) == Set(expected),
+              case .number("1") = try strictValue(object, "schemaVersion"),
+              exactUTF8(try strictString(object.value("kind")), "vortx.owner-history.source/1") else {
+            throw Failure.malformed("Malformed owner source frame")
+        }
+        if let scope {
+            guard exactUTF8(try strictString(object.value("scope")), scope.accountID),
+                  exactUTF8(try strictString(object.value("ownerProfileId")), scope.ownerProfileID.uuidString),
+                  exactUTF8(try strictString(object.value("profileId")), scope.profileID.uuidString),
+                  exactUTF8(try strictString(object.value("verifiedStreamingUid")), scope.verifiedStreamingUID ?? "") else {
+                throw Failure.malformed("Owner source frame binding mismatch")
+            }
+        }
+        _ = try strictEnvelopeBytes(object, "libraryResponseBase64")
+        _ = try strictEnvelopeBytes(object, "addonsResponseBase64")
+    }
+
+    static func validateOwnerSource(scope: Scope, source: Data) throws {
+        guard scope.verifiedStreamingUID != nil else { throw Failure.malformed("Owner source requires verified streaming identity") }
+        try requireOwnerEnvelope(StrictJSON.value(source), scope: scope)
+    }
+
+    /// Temporary input for the EXISTING owner row converter, never source/receipt bytes.
+    /// The original frame and entire raw library are parsed/credential-checked first. Unknown
+    /// siblings remain in that immutable frame; only fields consumed by projectOwnLibraryRow
+    /// enter the legacy binary64 projection codec. In particular, ignored future numeric
+    /// lexemes are not a reason to reject a source or normalize its provenance.
+    static func ownerHistoryLibraryProjection(scope: Scope, source: Data) throws -> Data {
+        guard scope.verifiedStreamingUID != nil else { throw Failure.malformed("Owner source requires verified streaming identity") }
+        let frame = try StrictJSON.value(source)
+        try requireOwnerEnvelope(frame, scope: scope)
+        let library = try StrictJSON.value(try strictEnvelopeBytes(strictObject(frame), "libraryResponseBase64"))
+        // Keep the old whole-input node/Unicode-dictionary bounds without interpreting raw
+        // unknown numbers as Double. Keys count as nodes, just as in the existing witness.
+        func bounded(_ value: StrictJSON.Value, remaining: inout Int) throws {
+            guard remaining > 0 else { throw Failure.malformed("Owner library exceeds node limit") }
+            remaining -= 1
+            switch value {
+            case .object(let object):
+                guard Set(object.members.map(\.key)).count == object.members.count else {
+                    throw Failure.malformed("Ambiguous owner library JSON key")
+                }
+                for member in object.members {
+                    guard remaining > 0 else { throw Failure.malformed("Owner library exceeds node limit") }
+                    remaining -= 1
+                    try bounded(member.value, remaining: &remaining)
+                }
+            case .array(let values): for value in values { try bounded(value, remaining: &remaining) }
+            default: break
+            }
+        }
+        var remaining = 100_000
+        try bounded(library, remaining: &remaining)
+        let response = try strictObject(library)
+        let rows = try strictArray(strictValue(response, "result"))
+        let rowKeys = Set(["_id", "type", "name", "poster", "removed", "temp", "state"].map { Data($0.utf8) })
+        let stateKeys = Set(["timeOffset", "duration", "lastWatched", "video_id", "timesWatched",
+                             "flaggedWatched", "watched"].map { Data($0.utf8) })
+        let projected = rows.map { value -> StrictJSON.Value in
+            guard case .object(let row) = value else { return value }
+            let members = row.members.filter { rowKeys.contains($0.keyBytes) }.map { member -> StrictJSON.Member in
+                guard member.keyBytes == Data("state".utf8), case .object(let state) = member.value else { return member }
+                return .init(key: member.key, keyBytes: member.keyBytes,
+                    value: .object(.init(members: state.members.filter { stateKeys.contains($0.keyBytes) })))
+            }
+            return .object(.init(members: members))
+        }
+        return try StrictJSON.serialize(.object(.init(members: [
+            .init(key: "result", keyBytes: Data("result".utf8), value: .array(projected))
+        ])))
+    }
+
     private static func sharedRow(_ rows: [StrictJSON.Value], index: Int) throws -> SourceRow {
         guard let raw = rows[safe: index] else { throw Failure.malformed("Source row is absent") }
         let row = try strictObject(raw)
@@ -289,6 +376,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     static func originalAddons(source: Data, rowLocator: SourceRowLocator) throws -> [AuthorizedAddon] {
         let root = try StrictJSON.value(source)
         if rowLocator.isOwnAccount { try requireOwnEnvelope(root) }
+        if rowLocator.isOwnerAccount { try requireOwnerEnvelope(root) }
         return try sourceDescriptors(root, locator: rowLocator).map { raw in
             let descriptor = try strictObject(raw)
             let manifest = try strictValue(descriptor, "manifest")
@@ -299,7 +387,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     private static func sourceDescriptors(_ root: StrictJSON.Value, locator: SourceRowLocator) throws -> [StrictJSON.Value] {
         let rootObject = try strictObject(root)
         let descriptors: [StrictJSON.Value]
-        if locator.isOwnAccount {
+        if locator.isOwnAccount || locator.isOwnerAccount {
             let envelope = try StrictJSON.value(try strictEnvelopeBytes(rootObject, "addonsResponseBase64"))
             let result = try strictObject(strictValue(try strictObject(envelope), "result"))
             descriptors = try strictArray(strictValue(result, "addons"))
@@ -602,24 +690,32 @@ private enum StrictJSON {
             while true { values.append(try value(depth: depth)); whitespace(); if take(93) { return .array(values) }; guard take(44) else { throw failure("Array separator is missing") } }
         }
         mutating func string() throws -> String {
-            guard take(34) else { throw failure("String is missing") }; var scalar = String.UnicodeScalarView()
+            guard take(34) else { throw failure("String is missing") }
+            var utf8: [UInt8] = []
             while index < bytes.count {
-                let byte = bytes[index]; index += 1
-                if byte == 34 { return String(scalar) }
+                let byte = bytes[index]
+                if byte == 34 {
+                    index += 1
+                    guard let text = String(bytes: utf8, encoding: .utf8) else { throw failure("Invalid UTF-8 string") }
+                    return text
+                }
                 guard byte >= 32 else { throw failure("Control byte in JSON string") }
                 if byte != 92 {
-                    let start = index - 1; while index < bytes.count, bytes[index] >= 128 { index += 1 }
-                    guard let text = String(bytes: bytes[start..<index], encoding: .utf8) else { throw failure("Invalid UTF-8 string") }
-                    scalar.append(contentsOf: text.unicodeScalars); continue
+                    // Copy an unescaped run once. Appending a newly constructed scalar view for
+                    // each ASCII byte repeatedly copied megabyte settings strings during import.
+                    let start = index
+                    while index < bytes.count, bytes[index] >= 32, bytes[index] != 34, bytes[index] != 92 { index += 1 }
+                    utf8.append(contentsOf: bytes[start..<index]); continue
                 }
+                index += 1
                 guard index < bytes.count else { throw failure("Truncated JSON escape") }; let escaped = bytes[index]; index += 1
                 switch escaped {
-                case 34, 92, 47: scalar.append(UnicodeScalar(escaped))
-                case 98: scalar.append("\u{08}")
-                case 102: scalar.append("\u{0c}")
-                case 110: scalar.append("\n")
-                case 114: scalar.append("\r")
-                case 116: scalar.append("\t")
+                case 34, 92, 47: utf8.append(escaped)
+                case 98: utf8.append(8)
+                case 102: utf8.append(12)
+                case 110: utf8.append(10)
+                case 114: utf8.append(13)
+                case 116: utf8.append(9)
                 case 117:
                     let first = try hex16(); var code = first
                     if (0xD800...0xDBFF).contains(first) {
@@ -627,7 +723,8 @@ private enum StrictJSON {
                         let second = try hex16(); guard (0xDC00...0xDFFF).contains(second) else { throw failure("Unpaired JSON surrogate") }
                         code = 0x10000 + (first - 0xD800) * 0x400 + second - 0xDC00
                     } else if (0xDC00...0xDFFF).contains(first) { throw failure("Unpaired JSON surrogate") }
-                    guard let value = UnicodeScalar(code) else { throw failure("Invalid JSON scalar") }; scalar.append(value)
+                    guard let value = UnicodeScalar(code) else { throw failure("Invalid JSON scalar") }
+                    utf8.append(contentsOf: String(value).utf8)
                 default: throw failure("Invalid JSON escape")
                 }
             }

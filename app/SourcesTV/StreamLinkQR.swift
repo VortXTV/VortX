@@ -8,6 +8,10 @@ import CoreImage.CIFilterBuiltins
 struct StreamLinkQRView: View {
     let title: String
     let link: String
+    // This is an overlay, not a sheet: retire only the code, never the parent player.
+    let onClose: () -> Void
+    // The player's UIKit catcher owns physical focus; mirror its exclusive virtual target.
+    let closeHighlighted: Bool
 
     var body: some View {
         ZStack {
@@ -37,10 +41,16 @@ struct StreamLinkQRView: View {
                 Text("Scan with your phone to open this stream there  ·  Press Back to dismiss")
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textSecondary)
+                Button("Close", action: onClose)
+                    .buttonStyle(ChipButtonStyle(selected: closeHighlighted))
+                    .overlay(Capsule().strokeBorder(Theme.Palette.textPrimary,
+                                                   lineWidth: closeHighlighted ? 3 : 0))
+                    .accessibilityHidden(true) // The catcher exposes the same action without a duplicate target.
             }
             .padding(Theme.Space.screenEdge)
         }
         .transition(.opacity)
+        .onExitCommand(perform: onClose)
     }
 
     static func qrImage(for string: String) -> UIImage? {

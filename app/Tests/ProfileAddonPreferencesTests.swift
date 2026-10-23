@@ -28,6 +28,13 @@ final class CoreBridge {
     var nativeOrderWrites = 0
     func reorderAddonsForActiveProfile(_ urls: [String], profileID: UUID) { nativeOrderWrites += 1 }
 }
+#if VORTX_NATIVE_DATA_ENGINE
+/// Native-only collaborators of the extracted `capturePlayback`, shaped like production's
+/// `NativePreferenceIntentStore.Group` and `PlaybackMutationTarget` parameters.
+enum NativePreferenceGroup: Hashable { case playback, discovery, theme }
+struct FixturePlaybackTarget {}
+extension CoreBridge { func captureNativePlaybackTarget() -> FixturePlaybackTarget { FixturePlaybackTarget() } }
+#endif
 final class ProfileStore {
     var profiles: [UserProfile] = []
     var activeID: UUID?
@@ -40,6 +47,19 @@ final class ProfileStore {
         writes += 1
         if let active { applyAddonPreferences(active) }
     }
+    #if VORTX_NATIVE_DATA_ENGINE
+    // A mounted native session whose projection is current but has not yet published this profile's
+    // playback: a capture is then an ordinary playback-group edit, recorded for the assertions below.
+    var nativePublishedPlayback: UserProfile.PlaybackPrefs?
+    var editedGroups: [Set<NativePreferenceGroup>] = []
+    func nativePlaybackProjectionRepresents(_ profile: UserProfile) -> Bool { false }
+    func nativePreferenceIsLocalRevert(_ profile: UserProfile, group: NativePreferenceGroup) -> Bool { false }
+    func nativePreferenceProjectionMatches(_ target: FixturePlaybackTarget) -> Bool { true }
+    func update(_ profile: UserProfile, editedPreferenceGroups: Set<NativePreferenceGroup>) {
+        editedGroups.append(editedPreferenceGroups)
+        update(profile)
+    }
+    #endif
     func currentPlaybackPrefs() -> UserProfile.PlaybackPrefs {
         var prefs = active?.playback ?? Self.playback()
         prefs.sourceTypeOrder = UserDefaults.standard.string(forKey: SourcePreferences.orderKey)?.components(separatedBy: ",")
@@ -137,6 +157,9 @@ final class ProfileStore {
         store.capturePlayback()
         precondition(!store.activeInheritsAddonRanking && store.activeInheritsAddonVisibility)
         precondition(store.active!.addonPreferences?.rankingOverride?.sourceTypeOrder == ["debrid", "torrent"])
+        #if VORTX_NATIVE_DATA_ENGINE
+        precondition(store.editedGroups.last == [.playback], "a native capture is attributed to the playback group")
+        #endif
         store.selectForTest(owner)
         let writesBeforeStale = store.writes
         store.setAddonOrder([b, a], for: child.id)

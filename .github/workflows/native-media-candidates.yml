@@ -1,0 +1,134 @@
+name: Manual native media candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      apple:
+        description: Build Apple FFmpeg maintenance with the retained custom mpv stack
+        type: boolean
+        default: true
+      android:
+        description: Build Android media-stack candidate AAR
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      apple:
+        type: boolean
+        default: true
+      android:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-media-candidates-${{ github.ref }}-${{ inputs.apple }}-${{ inputs.android }}
+  cancel-in-progress: false
+
+jobs:
+  apple:
+    if: inputs.apple
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify reviewed recipes
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' 05e0ece6f3a15c415b2f79034209ca533b0f1f8fdea89d0e25b87ed191d5d26b scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
+          shasum -a 256 -c scripts/native-media-hosted/inputs.sha256
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: mpvkit/MPVKit
+          ref: 2103893078c5e339073b11737b86f7f22b9c4491
+          path: _native-mpvkit
+          persist-credentials: false
+      - name: Prepare hosted build tools
+        run: |
+          set -euo pipefail
+          brew install meson ninja cmake pkg-config nasm wget jq autoconf automake libtool sdl2
+      - name: Build unpromoted Apple candidate
+        run: |
+          set -euo pipefail
+          mkdir -p _build/native-media/apple
+          bash scripts/native-media-hosted/build.sh apple 2>&1 | tee _build/native-media/apple/build.log
+      - name: Retain candidate and evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-media-apple-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _build/native-media/apple/*.tar*
+            _build/native-media/apple/*.json
+            _build/native-media/apple/*.txt
+            _build/native-media/apple/*.log
+            _build/native-media/apple/*.patch
+            _build/native-media/apple/*.sha256
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: warn
+
+  android:
+    if: inputs.android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify reviewed recipes
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' 05e0ece6f3a15c415b2f79034209ca533b0f1f8fdea89d0e25b87ed191d5d26b scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
+          shasum -a 256 -c scripts/native-media-hosted/inputs.sha256
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: jarnedemeulemeester/libmpv-android
+          ref: fcf6745703dc1265bca88f12fee8fc355ddf251e
+          path: _native-publisher
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare hosted build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake pkgconf libtool ninja-build meson python3-jinja2 gperf nasm cmake python3-venv
+          # Fontconfig 2.18.3 requires Meson >=1.11; keep distro Python/packages untouched.
+          tools="$RUNNER_TEMP/vortx-native-media-tools"
+          [[ ! -e "$tools" && ! -L "$tools" ]] || exit 1
+          # Bind the wheel ABI to Ubuntu 24.04's system CPython, not a moving PATH interpreter.
+          /usr/bin/python3.12 -I -m venv "$tools"
+          "$tools/bin/python" -I -m pip --isolated --disable-pip-version-check install --require-hashes --no-index --no-deps --only-binary=:all: \
+            'https://files.pythonhosted.org/packages/57/99/36cd25f9598eef70db97577440a70a360af505f6f01c2338a18d1556079c/meson-1.12.1-py3-none-any.whl#sha256=930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02' \
+            'https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl#sha256=85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67' \
+            'https://files.pythonhosted.org/packages/4f/a7/aeedb5140afa41fc74c225e9184ab96723a6e873b6ee1c9fede7283456d8/markupsafe-3.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl#sha256=8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581' \
+            'https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl#sha256=d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce' \
+            'https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl#sha256=c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309' \
+            'https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl#sha256=98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe' \
+            'https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl#sha256=381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231' \
+            'https://files.pythonhosted.org/packages/1d/6d/b26eb1e75395925b3a142ed351cbed2ec8212f5c9d937aee3df32c701baa/rpds_py-2026.9.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=addeda51556dac7c1a2f14cda62db8b621cd12afba3091d03a96c72932387eab' \
+            'https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl#sha256=481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8'
+          echo "$tools/bin" >> "$GITHUB_PATH"
+      - name: Build unpromoted Android candidate
+        run: |
+          set -euo pipefail
+          mkdir -p _build/native-media/android
+          bash scripts/native-media-hosted/build.sh android 2>&1 | tee _build/native-media/android/build.log
+      - name: Retain candidate and evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-media-android-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _build/native-media/android/*
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: warn

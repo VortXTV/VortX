@@ -18,6 +18,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -41,8 +42,8 @@ import com.vortx.android.ui.theme.VortXTheme
 /// Live TV: the engine's live-TV / channel / events catalogs rendered as rows of square CHANNEL TILES,
 /// distinct from the 2:3 poster rails the rest of the app uses. The Android port of Apple's `iOSLiveView`:
 /// channel art is a logo on a neutral card (not box-art), tapping a channel opens the shared
-/// [DetailScreen] (whose live branch plays through the existing player), and the screen reuses the engine
-/// + player wholesale -- no EPG, no M3U import. When no installed add-on exposes a live catalog the screen
+/// [DetailScreen] (whose live branch plays through the existing player), and [LiveGuideScreen] shows the same
+/// channels against time. When no installed add-on exposes a live catalog the screen
 /// nudges the user to the Add-ons tab rather than showing a blank surface.
 @Composable
 fun LiveScreen(viewModel: LiveViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
@@ -60,18 +61,36 @@ fun LiveScreen(viewModel: LiveViewModel, onItem: (MetaItem) -> Unit, modifier: M
                     modifier,
                 )
             } else {
-                LiveContent(s.data, onItem, modifier)
+                var showGuide by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+                if (showGuide) {
+                    val channels = androidx.compose.runtime.remember(s.data) { com.vortx.android.iptv.LiveGuidePolicy.channels(s.data) }
+                    LiveGuideScreen(
+                        channels = channels,
+                        onOpen = { channel ->
+                            s.data.asSequence().flatMap { it.items.asSequence() }
+                                .firstOrNull { it.id == channel.id && it.type.id == channel.type }?.let(onItem)
+                        },
+                        onBack = { showGuide = false },
+                    )
+                } else {
+                    LiveContent(s.data, onItem, modifier, onGuide = { showGuide = true })
+                }
             }
     }
 }
 
 @Composable
-private fun LiveContent(rows: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
+private fun LiveContent(rows: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier, onGuide: () -> Unit) {
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(top = VortXTheme.spacing.md, bottom = VortXTheme.spacing.xl),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
     ) {
+        // The schedule view: every channel down the side, programmes across time.
+        item(key = "tv-guide") {
+            com.vortx.android.ui.components.Chip("TV guide", selected = false, onClick = onGuide,
+                modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge))
+        }
         items(rows, key = { it.id }) { row ->
             ChannelRail(row, onItem)
         }

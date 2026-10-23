@@ -1,6 +1,6 @@
-/// The encrypted relay accepts only a revision greater than the stored revision. A derived
-/// document must therefore propose exactly one above the base it actually read. Using a wall
-/// clock lets a later stale writer overwrite a concurrent winner without triggering a retry.
+/// A candidate carries its exact authenticated base into the relay's atomic compare-and-swap.
+/// It proposes one above that base, or zero for a positively absent row. A larger clock or a
+/// different read's revision can never substitute for that candidate's ancestry.
 enum SyncDocumentRevisionPolicy {
     static let maximumSafeRevision = 9_007_199_254_740_991
 

@@ -85,7 +85,7 @@ final class FeaturedHeroModel: ObservableObject {
     /// an id already present refreshes its value without duplicating its order slot.
     private static func cacheEnrichment(_ item: FeaturedHeroItem, for id: String) {
         if enrichmentCache[id] == nil { enrichmentOrder.append(id) }
-        enrichmentCache[id] = item
+        enrichmentCache[id] = enrichmentCache[id]?.mergingSeed(item) ?? item
         while enrichmentOrder.count > enrichmentCacheCap {
             let oldest = enrichmentOrder.removeFirst()
             enrichmentCache.removeValue(forKey: oldest)
@@ -96,9 +96,12 @@ final class FeaturedHeroModel: ObservableObject {
     /// (Cinemeta first for `tt` ids, then every installed meta add-on for tmdb:/tvdb:/kitsu: ids).
     private static var metaSourceBases: [String] = []
 
-    /// Ids with an enrichment fetch in flight, so the eager pool pre-fetch and the per-show fetch don't
-    /// double-request the same title (apply-race / wasted round-trips). MainActor-isolated.
-    private var enriching: Set<String> = []
+    /// The owned enrichment request for each title. The task is retained so `stop()`/`deinit` can cancel
+    /// every eager pool fetch; the token fences a completion that races with a retry or a successor seed.
+    /// Both dictionaries are MainActor-isolated with the model.
+    private var enrichmentTasks: [String: Task<Void, Never>] = [:]
+    private var enrichmentTokens: [String: UInt64] = [:]
+    private var nextEnrichmentToken: UInt64 = 0
 
     /// Configure the meta-enrichment sources from the installed add-ons. Accepts raw transport URLs
     /// (".../manifest.json"); only add-ons that actually serve `meta` are kept.
@@ -122,6 +125,12 @@ final class FeaturedHeroModel: ObservableObject {
     func seed(_ candidates: [FeaturedHeroItem], reduceMotion: Bool) {
         motionEnabled = !reduceMotion
         let capped = Array(candidates.prefix(Self.heroPoolCap))
+        for item in capped where Self.enrichmentCache[item.id]?.type == item.type {
+            Self.cacheEnrichment(item, for: item.id)
+        }
+        if capped.contains(where: { fresh in pool.contains { $0.id == fresh.id && $0.type != fresh.type } }) {
+            cancelAllEnrichments()
+        }
         // An empty pool means the screen has no content (e.g. after sign-out clears the rows). Clear
         // the hero and halt rotation so a stale featured title, with a working Play button, can't
         // linger. Home renders the hero unconditionally, so without this it would keep cycling
@@ -137,7 +146,17 @@ final class FeaturedHeroModel: ObservableObject {
             return
         }
 
-        if capped.map(\.id) == seededIds && hero != nil {
+        if capped.map(\.id) == seededIds && hero != nil
+            && capped.allSatisfy({ fresh in pool.contains { $0.id == fresh.id && $0.type == fresh.type } }) {
+            // Membership is stable, not metadata: a later catalog emit can supply a missing score.
+            // Upgrade in place without shuffling the pool, resetting the timer or changing the title.
+            pool = pool.map { old in
+                capped.first(where: { $0.id == old.id && $0.type == old.type }).map { old.mergingSeed($0) } ?? old
+            }
+            if let current = hero,
+               let fresh = capped.first(where: { $0.id == current.id && $0.type == current.type }) {
+                hero = current.mergingSeed(fresh)
+            }
             // Same screen content, so don't churn the pool or yank the backdrop. BUT a prior stop() (a tab
             // switch / disappear) cancels rotationTask, and this early-return used to leave it dead, so the
             // hero froze on one item when the screen reappeared with unchanged content (the "iOS hero stuck,
@@ -146,6 +165,16 @@ final class FeaturedHeroModel: ObservableObject {
             // This identical-content emit supersedes any changed-content seed still waiting out the
             // debounce; a stale pending pool must not land later.
             pendingSeedTask?.cancel(); pendingSeedTask = nil; pendingSeed = nil
+            // A prior stop() cancels every in-flight enrichment so a hidden screen cannot retain network
+            // work. Re-arm the unfinished pool immediately when the same screen reappears; the cache and
+            // per-id task lease guards keep already-complete/in-flight titles from duplicating work.
+            for item in pool { enrichIfNeeded(item) }
+            // macOS keyboard browse can feature an item outside the ambient pool. It is still the visible hero
+            // after a hide/reappear, so give that item the same immediate retry opportunity when stop() retired
+            // its request; the cache/task guard keeps this a no-op when it already completed or is in flight.
+            if let visible = hero, !pool.contains(where: { $0.id == visible.id }) {
+                enrichIfNeeded(visible)
+            }
             return
         }
 
@@ -164,7 +193,7 @@ final class FeaturedHeroModel: ObservableObject {
         pendingSeedTask = Task { [weak self] in
             try? await Task.sleep(for: Self.seedDebounce)
             guard !Task.isCancelled else { return }
-            await self?.applyPendingSeed()
+            self?.applyPendingSeed()
         }
     }
 
@@ -182,6 +211,7 @@ final class FeaturedHeroModel: ObservableObject {
     private func applySeed(_ capped: [FeaturedHeroItem]) {
         seededIds = capped.map(\.id)
         pool = capped.shuffled()
+        cancelObsoleteEnrichments(keeping: Set(pool.map(\.id)))
         pageCount = pool.count
         // Fresh content: drop any interaction hold carried over from the previous pool so it can't
         // suppress the new rotation.
@@ -190,6 +220,7 @@ final class FeaturedHeroModel: ObservableObject {
         if let currentID = hero?.id, let idx = pool.firstIndex(where: { $0.id == currentID }) {
             rotationIndex = idx
             page = idx
+            hero = hero?.mergingSeed(pool[idx])
         } else {
             rotationIndex = 0
             page = 0
@@ -233,6 +264,23 @@ final class FeaturedHeroModel: ObservableObject {
         show(pool[rotationIndex], animated: true)
     }
 
+    /// The user paged the billboard by hand (swipe, trackpad, arrow or dot): step through the pool and hold
+    /// the ambient rotation for the inactivity window like any other interaction. Works under Reduce Motion
+    /// as well, since a page the user asked for is not ambient motion (`show` then swaps without the fade).
+    func step(by delta: Int) {
+        guard pool.count > 1, delta != 0 else { return }
+        rotationIndex = ((rotationIndex + delta) % pool.count + pool.count) % pool.count
+        page = rotationIndex
+        show(pool[rotationIndex], animated: true)
+        noteInteraction()
+    }
+
+    /// Jump straight to a pager dot.
+    func select(page target: Int) {
+        guard pool.indices.contains(target) else { return }
+        step(by: target - rotationIndex)
+    }
+
     /// Stop the timer when the screen disappears (re-armed on the next `seed`).
     func stop() {
         rotationTask?.cancel()
@@ -241,6 +289,7 @@ final class FeaturedHeroModel: ObservableObject {
         // debounced seed so an off-screen pool refresh can't fire after disappear.
         resumeTask?.cancel(); resumeTask = nil
         pendingSeedTask?.cancel(); pendingSeedTask = nil; pendingSeed = nil
+        cancelAllEnrichments()
         interactionHeld = false
     }
 
@@ -251,6 +300,28 @@ final class FeaturedHeroModel: ObservableObject {
         rotationTask?.cancel()
         resumeTask?.cancel()
         pendingSeedTask?.cancel()
+        for task in enrichmentTasks.values { task.cancel() }
+    }
+
+    /// Cancel requests for candidates that are no longer in the active pool. A retained candidate keeps its
+    /// in-flight work so a quiet re-seed does not create another request; a removed candidate cannot publish
+    /// stale metadata into a later successor screen.
+    private func cancelObsoleteEnrichments(keeping ids: Set<String>) {
+        let obsolete = enrichmentTasks.keys.filter { !ids.contains($0) }
+        for id in obsolete {
+            enrichmentTasks[id]?.cancel()
+            enrichmentTasks.removeValue(forKey: id)
+            enrichmentTokens.removeValue(forKey: id)
+        }
+    }
+
+    /// Cancel every owned enrichment and invalidate its tokens before a screen is hidden. Cancellation is
+    /// cooperative, so token removal makes a response already returning from URLSession fail its final
+    /// current-request check before it can touch the shared cache or visible hero.
+    private func cancelAllEnrichments() {
+        for task in enrichmentTasks.values { task.cancel() }
+        enrichmentTasks.removeAll()
+        enrichmentTokens.removeAll()
     }
 
     /// Feature a SPECIFIC item in the hero (macOS keyboard browse: the focused poster drives the hero, the
@@ -291,7 +362,14 @@ final class FeaturedHeroModel: ObservableObject {
     /// Swap the hero to `item`, upgrading to the cached enriched version when available, and kick off
     /// a background enrichment fetch when it isn't.
     private func show(_ item: FeaturedHeroItem, animated: Bool) {
-        let resolved = Self.enrichmentCache[item.id] ?? item
+        if hero?.id == item.id, hero?.type != item.type {
+            enrichmentTasks.removeValue(forKey: item.id)?.cancel()
+            enrichmentTokens.removeValue(forKey: item.id)
+        }
+        let resolved = Self.enrichmentCache[item.id]?.mergingSeed(item) ?? item
+        if Self.enrichmentCache[item.id]?.type == item.type {
+            Self.cacheEnrichment(resolved, for: item.id)
+        }
         if animated && motionEnabled {
             withAnimation(.easeOut(duration: Self.heroCrossfade)) { hero = resolved }
         } else {
@@ -306,40 +384,110 @@ final class FeaturedHeroModel: ObservableObject {
     /// (issue #54). Cached to the session cache; applied live only if the title is still the one on
     /// screen. Self-contained (no dependency on the tvOS `FocusedItemModel`), so tvOS is untouched.
     private func enrichIfNeeded(_ item: FeaturedHeroItem) {
-        guard Self.enrichmentCache[item.id] == nil, !enriching.contains(item.id) else { return }
+        guard Self.enrichmentCache[item.id]?.type != item.type, enrichmentTasks[item.id] == nil else { return }
         let candidates = Self.metaURLs(for: item)
         guard !candidates.isEmpty else {
             NSLog("%@", "[Hero] no meta candidates for \(item.name) (id=\(item.id), type=\(item.type)); id scheme not covered by Cinemeta or any installed meta add-on")
             return
         }
-        enriching.insert(item.id)
-        Task { [weak self] in
-            for url in candidates {
-                var request = URLRequest(url: url)
-                request.timeoutInterval = 6
-                request.cachePolicy = .returnCacheDataElseLoad
-                guard let (data, response) = try? await URLSession.shared.data(for: request),
-                      (response as? HTTPURLResponse)?.statusCode == 200,
-                      let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
-                      let meta = decoded.meta,
-                      meta.description != nil || meta.background != nil || meta.logo != nil else { continue }
-                let enriched = item.enriched(with: meta)
-                NSLog("%@", "[Hero] enriched \(item.name): rating=\(enriched.imdbRating ?? "-") year=\(enriched.releaseInfo ?? "-") runtime=\(enriched.runtime ?? "-") genres=\(enriched.genres.count) via \(url.host ?? "?")")
-                await MainActor.run {
-                    Self.cacheEnrichment(enriched, for: item.id)
-                    self?.enriching.remove(item.id)
-                    guard let self, self.hero?.id == item.id else { return }
-                    // No animation here: this is an in-place content upgrade of the SAME hero, not a
-                    // swap, so cross-fading would flicker the already-visible backdrop.
-                    self.hero = enriched
-                }
+        let token = nextEnrichmentToken
+        nextEnrichmentToken &+= 1
+        enrichmentTokens[item.id] = token
+        let task = Task { [weak self] in
+            defer { self?.finishEnrichment(id: item.id, token: token) }
+            guard let result = await Self.fetchEnrichment(candidates: candidates) else {
+                guard !Task.isCancelled,
+                      let self,
+                      self.isCurrentEnrichment(id: item.id, token: token) else { return }
+                NSLog("%@", "[Hero] enrich FAILED for \(item.name) (id=\(item.id)); all \(candidates.count) candidate fetch(es) failed/empty")
                 return
             }
-            // No candidate resolved (every fetch failed / timed out / returned an empty meta), free the
-            // id to retry later, and log it so a persistently-bare hero is diagnosable on-device.
-            NSLog("%@", "[Hero] enrich FAILED for \(item.name) (id=\(item.id)); all \(candidates.count) candidate fetch(es) failed/empty")
-            await MainActor.run { self?.enriching.remove(item.id) }
+            guard !Task.isCancelled else { return }
+            self?.publishEnrichment(item: item, result: result, token: token)
         }
+        enrichmentTasks[item.id] = task
+    }
+
+    /// Fetch the first useful meta response without retaining the model. URLSession itself is asynchronous; the
+    /// JSON decode is explicitly detached because the owner is MainActor-isolated and decoding an add-on response
+    /// synchronously there would steal the UI actor. The caller fences the result before publication.
+    private static func fetchEnrichment(candidates: [URL]) async -> EnrichmentResult? {
+        for url in candidates {
+            guard !Task.isCancelled else { return nil }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 6
+            request.cachePolicy = .returnCacheDataElseLoad
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  !Task.isCancelled,
+                  (response as? HTTPURLResponse)?.statusCode == 200 else {
+                if Task.isCancelled { return nil }
+                continue
+            }
+
+            // `AddonMetaResponse` remains a regular Decodable model. Only the small value DTO crosses back
+            // from the detached decoder, avoiding a broad unchecked-Sendable annotation on the response tree.
+            guard let meta = await Self.decodeMetaOffMain(data) else {
+                if Task.isCancelled { return nil }
+                continue
+            }
+            guard !Task.isCancelled else { return nil }
+            return EnrichmentResult(meta: meta, host: url.host ?? "?")
+        }
+        return nil
+    }
+
+    /// Publish only while this exact request still owns the id. A canceled/obsolete task may return a held
+    /// response after a retry has already installed a newer token; in that case this method is a no-op and its
+    /// defer removes nothing belonging to the newer task.
+    private func publishEnrichment(
+        item: FeaturedHeroItem,
+        result: EnrichmentResult,
+        token: UInt64
+    ) {
+        guard isCurrentEnrichment(id: item.id, token: token), !Task.isCancelled else { return }
+        // The request may have started from a sparse preview. Merge the latest seed before publishing
+        // so its newly supplied rating cannot be lost to this otherwise-current async completion.
+        let latest = pool.first(where: { $0.id == item.id && $0.type == item.type })
+            ?? (hero?.id == item.id && hero?.type == item.type ? hero : nil)
+        let enriched = item.enriched(with: result.meta).mergingSeed(latest ?? item)
+        NSLog("%@", "[Hero] enriched \(item.name): rating=\(enriched.imdbRating ?? "-") year=\(enriched.releaseInfo ?? "-") runtime=\(enriched.runtime ?? "-") genres=\(enriched.genres.count) via \(result.host)")
+        Self.cacheEnrichment(enriched, for: item.id)
+        guard hero?.id == item.id, hero?.type == item.type else { return }
+        // No animation here: this is an in-place content upgrade of the SAME hero, not a swap, so
+        // cross-fading would flicker the already-visible backdrop.
+        hero = enriched
+    }
+
+    /// Decode only the fields the hero can render, off the MainActor. `FeaturedHeroMetaTransfer` is a narrow
+    /// Sendable value object made entirely of Foundation value types, so no unchecked transfer is needed.
+    private static func decodeMetaOffMain(_ data: Data) async -> FeaturedHeroMetaTransfer? {
+        await Task.detached(priority: .utility) {
+            guard let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
+                  let meta = decoded.meta,
+                  meta.description != nil || meta.background != nil || meta.logo != nil else { return nil }
+            return FeaturedHeroMetaTransfer(
+                description: meta.description,
+                imdbRating: meta.imdbRating,
+                releaseInfo: meta.releaseInfo,
+                background: meta.background,
+                runtime: meta.runtime,
+                genres: meta.genres,
+                logo: meta.logo,
+                trailerYouTubeID: meta.trailerYouTubeID,
+                defaultVideoId: meta.defaultVideoId
+            )
+        }.value
+    }
+
+    private func isCurrentEnrichment(id: String, token: UInt64) -> Bool {
+        enrichmentTokens[id] == token
+    }
+
+    /// Remove only the completion's own lease. A stale completion must not clear a newer retry's task/token.
+    private func finishEnrichment(id: String, token: UInt64) {
+        guard isCurrentEnrichment(id: id, token: token) else { return }
+        enrichmentTasks.removeValue(forKey: id)
+        enrichmentTokens.removeValue(forKey: id)
     }
 
     /// Meta endpoints to try, in priority order: Cinemeta for IMDB ids, then every installed meta
@@ -356,6 +504,25 @@ final class FeaturedHeroModel: ObservableObject {
 }
 
 // MARK: - The hero's data model
+
+/// The exact value fields needed to upgrade a hero after decoding. This transfer is deliberately narrower
+/// than `AddonMetaResponse` and is the only value returned from the detached JSON decoder.
+struct FeaturedHeroMetaTransfer: Sendable {
+    let description: String?
+    let imdbRating: String?
+    let releaseInfo: String?
+    let background: String?
+    let runtime: String?
+    let genres: [String]?
+    let logo: String?
+    let trailerYouTubeID: String?
+    let defaultVideoId: String?
+}
+
+private struct EnrichmentResult: Sendable {
+    let meta: FeaturedHeroMetaTransfer
+    let host: String
+}
 
 /// One featured title for the touch/Mac hero. Built seed-grade from the sparse catalog/library data a
 /// screen already has, then upgraded in place once enrichment resolves logo + trailer + synopsis.
@@ -391,7 +558,7 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
     /// Stremio's standard logo art (transparent PNG) for an IMDB-identified title, so the hero can show
     /// the show's LOGO as its title immediately, without waiting on (or depending on) the async meta
     /// enrichment. Enrichment still upgrades it to the add-on's own logo when one resolves; if metahub
-    /// has no logo for the id the AsyncImage fails and `titleOrLogo` falls back to the styled serif name.
+    /// has no logo for the id the bounded logo loader fails and `titleOrLogo` falls back to the styled serif name.
     /// Nil for non-IMDB ids (tmdb:/tvdb:/kitsu:), which only metahub-by-IMDB can't cover.
     static func metahubLogo(forId id: String) -> String? {
         guard id.hasPrefix("tt") else { return nil }
@@ -484,6 +651,22 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
     /// Return a copy upgraded with a fetched add-on meta response (keeps existing seed values when the
     /// response omits a field).
     func enriched(with meta: AddonMetaResponse.Meta) -> FeaturedHeroItem {
+        enriched(with: FeaturedHeroMetaTransfer(
+            description: meta.description,
+            imdbRating: meta.imdbRating,
+            releaseInfo: meta.releaseInfo,
+            background: meta.background,
+            runtime: meta.runtime,
+            genres: meta.genres,
+            logo: meta.logo,
+            trailerYouTubeID: meta.trailerYouTubeID,
+            defaultVideoId: meta.defaultVideoId
+        ))
+    }
+
+    /// Apply the detached decoder's value transfer on the MainActor, retaining every seed field the response
+    /// omitted. Keeping this transformation pure also makes a stale-completion fence easy to audit.
+    func enriched(with meta: FeaturedHeroMetaTransfer) -> FeaturedHeroItem {
         FeaturedHeroItem(
             id: id, type: type, name: name, poster: poster,
             backdrop: meta.background ?? backdrop,
@@ -495,6 +678,25 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
             genres: (meta.genres?.isEmpty == false) ? meta.genres! : genres,
             trailerYouTubeID: meta.trailerYouTubeID ?? trailerYouTubeID,
             defaultVideoId: meta.defaultVideoId ?? defaultVideoId)
+    }
+
+    /// A cached enrichment augments a fresh preview; it never substitutes for it wholesale. A supplied
+    /// finite IMDb score wins over the cached score, while a sparse preview retains known enrichment.
+    func mergingSeed(_ fresh: FeaturedHeroItem) -> FeaturedHeroItem {
+        guard id == fresh.id, type == fresh.type else { return fresh }
+        let supplied = fresh.imdbRating?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rating = supplied.flatMap { text -> String? in
+            guard let value = Double(text), value.isFinite, (0...10).contains(value) else { return nil }
+            return text
+        } ?? imdbRating
+        return FeaturedHeroItem(
+            id: id, type: type, name: fresh.name, poster: fresh.poster ?? poster,
+            backdrop: backdrop ?? fresh.backdrop, logo: logo ?? fresh.logo,
+            description: description ?? fresh.description, releaseInfo: fresh.releaseInfo ?? releaseInfo,
+            runtime: runtime ?? fresh.runtime, imdbRating: rating,
+            genres: fresh.genres.isEmpty ? genres : fresh.genres,
+            trailerYouTubeID: trailerYouTubeID ?? fresh.trailerYouTubeID,
+            defaultVideoId: defaultVideoId ?? fresh.defaultVideoId)
     }
 
     /// A copy of this seed item with its catalog id replaced by a resolved IMDb `tt` id (tmdb:->tt done

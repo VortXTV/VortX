@@ -14,14 +14,15 @@ expect(presentation.contains("@State private var sheetDetent: PresentationDetent
        && presentation.contains(".presentationDetents([.medium, .large], selection: $sheetDetent)"),
        "Quick View initially exposes the large sheet while retaining both detents")
 let detail = try source("app/SourcesiOS/iOSDetailView.swift")
+let flowLayout = try source("app/SourcesShared/FlowLayout.swift")
 let labels = detail.components(separatedBy: "struct iOSStreamLabel: View {")[1]
     .components(separatedBy: "private struct iOSLoadingRow")[0]
 expect(labels.contains("FlowLayout(spacing: 8, constrainOversizedItems: true)")
        && !labels.contains("ScrollView(.horizontal"), "source badges wrap without a hidden horizontal badge scroller")
 expect(labels.contains("SourcePresentationPolicy.text(") && labels.contains("Text(verbatim: line)"),
        "wrapping preserves the add-on's authored source details")
-expect(detail.contains("var constrainOversizedItems = false")
-       && detail.contains("guard constrainOversizedItems, natural.width > maxWidth else { return natural }"),
+expect(flowLayout.contains("var constrainOversizedItems = false")
+       && flowLayout.contains("guard constrainOversizedItems, natural.width > maxWidth else { return natural }"),
        "oversized-badge bounding is opt-in; unrelated hero/action layouts retain their behavior")
 expect(labels.contains(".lineLimit(1)") && labels.contains(".fixedSize(horizontal: false, vertical: true)"),
        "an oversized badge stays a single-line label, not vertical letters")

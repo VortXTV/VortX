@@ -66,6 +66,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if operation in retired:
                         break
                 time.sleep(0.01)
+        # "mapped": an anime pack whose file the add-on names but whose numbering disagrees with the
+        # catalogue. The strict create (with VortX's episode) is unmatched; the add-on pattern alone opens.
+        if scenario == "mapped":
+            scenario = "mismatch" if "episode" in value else "ready"
         with lock:
             cancelled = operation in retired
             if not cancelled and scenario not in ("failure", "mismatch", "malformed"):

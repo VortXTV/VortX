@@ -49,4 +49,8 @@ internal class MpvSeamBridge(
     override fun event(eventId: Int) {
         sink().forEach { it.event(eventId) }
     }
+
+    override fun eventStartFile(entryID: Long) {
+        sink().forEach { it.eventStartFile(entryID) }
+    }
 }

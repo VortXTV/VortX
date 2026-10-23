@@ -10,11 +10,11 @@ app = File.join(root, 'app')
 generator = File.join(__dir__, 'generate-native-apple-project.rb')
 revision = 'ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4'
 output = File.join(app, ".native-project-contract-#{Process.pid}.yml")
-legacy_bytes = File.binread(File.join(app, 'project.yml'))
-legacy_spec = YAML.safe_load(legacy_bytes, permitted_classes: [], permitted_symbols: [], aliases: false)
+project_bytes = File.binread(File.join(app, 'project.yml'))
+project_spec = YAML.safe_load(project_bytes, permitted_classes: [], permitted_symbols: [], aliases: false)
 native_names = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
 base_plists = native_names.to_h do |name|
-  relative = legacy_spec.dig('targets', name, 'settings', 'base', 'INFOPLIST_FILE')
+  relative = project_spec.dig('targets', name, 'settings', 'base', 'INFOPLIST_FILE')
   [name, { path: relative, bytes: File.binread(File.join(app, relative)) }]
 end
 generated_plists = []
@@ -44,10 +44,7 @@ begin
   expected[0...-1].each do |name|
     target = spec.fetch('targets').fetch(name)
     settings = target.fetch('settings').fetch('base')
-    conditions = settings.fetch('SWIFT_ACTIVE_COMPILATION_CONDITIONS').split
-    %w[VORTX_NATIVE_DATA_ENGINE VORTX_ENGINE_STATE_BRIDGE VORTX_ENGINE_RESOURCE_HOST].each do |flag|
-      abort "#{name} omitted #{flag}" unless conditions.include?(flag)
-    end
+    conditions = settings.fetch('SWIFT_ACTIVE_COMPILATION_CONDITIONS', '').split
     if %w[VortXiOSNative VortXTV].include?(name)
       abort "#{name} omitted the real in-process native server" unless conditions.include?('VORTX_ENGINE_SERVER')
       abort "#{name} native server provenance is absent" unless settings['INFOPLIST_KEY_VortXNativeTransport'] == 'in-process'
@@ -59,7 +56,7 @@ begin
     abort "#{name} retained Node resources" if target.fetch('sources').any? { |s| (s.is_a?(Hash) ? s['path'] : s).match?(/server\.js|node-darwin/) }
     abort "#{name} provenance is absent" unless settings['INFOPLIST_KEY_VortXEngineSourceRevision'] == revision
     generated_path = settings.fetch('INFOPLIST_FILE')
-    abort "#{name} still uses its provenance-free legacy plist" if generated_path == base_plists.fetch(name).fetch(:path)
+    abort "#{name} still uses its provenance-free base plist" if generated_path == base_plists.fetch(name).fetch(:path)
     expected_path = File.join('build', 'native-info', File.basename(output, '.yml'), "#{name}.plist")
     abort "#{name} generated plist escaped its spec-owned directory" unless generated_path == expected_path
     full_path = File.join(app, generated_path)
@@ -90,12 +87,20 @@ begin
   abort 'macOS unexpectedly fetches Node' if spec.dig('targets', 'VortXMac', 'preBuildScripts')
   embed = spec.dig('targets', 'VortXMac', 'postBuildScripts').fetch(0).fetch('script')
   abort 'macOS daemon is still optional' unless embed.include?('test -s "$source" && test -x "$source"')
-  abort 'legacy comparison spec was modified' unless File.binread(File.join(app, 'project.yml')) == legacy_bytes
+  abort 'project.yml was modified' unless File.binread(File.join(app, 'project.yml')) == project_bytes
+  # project.yml itself is native-only: no target links a removed engine or bundles a removed server.
+  project_spec.fetch('targets').each do |name, target|
+    frameworks = (target['dependencies'] || []).map { |d| d['framework'] }.compact
+    abort "#{name} links a removed framework in project.yml" if frameworks.any? { |f| f.match?(/StremioXCore|NodeMobile/) }
+    sources = (target['sources'] || []).map { |src| src.is_a?(Hash) ? src['path'] : src }
+    abort "#{name} bundles a removed server runtime in project.yml" if sources.any? { |p| p.match?(/server\.js|node-darwin/) }
+  end
+  abort 'project.yml still has the web-host target' if project_spec.fetch('targets').key?('VortX')
   _, _, bad_revision = Open3.capture3('ruby', generator, '--engine-revision', 'latest', '--mpvkit', app, '--output', output)
   abort 'mutable engine revision was accepted' if bad_revision.success?
   _, _, overwrite = Open3.capture3('ruby', generator, '--engine-revision', revision,
     '--mpvkit', File.join(app, 'Vendor', 'MPVKit-DVFEL'), '--output', File.join(app, 'project.yml'))
-  abort 'generator overwrote the legacy project' if overwrite.success?
+  abort 'generator overwrote project.yml' if overwrite.success?
   workflow = File.read(File.join(root, '.github', 'workflows', 'release-tvos.yml'))
   abort 'release workflow does not generate the native spec' unless workflow.include?('xcodegen generate --spec .native-project.yml')
   abort 'release workflow does not capture inputs before compilation' unless workflow.include?('verify-native-apple-package.py snapshot')

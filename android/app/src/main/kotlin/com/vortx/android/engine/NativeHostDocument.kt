@@ -20,22 +20,25 @@ internal object NativeHostDocument {
     fun archive(document: JSONObject): JSONObject = Sanitizer().archive(document)
 
     /** Validation only: never silently sanitize retained import input or rewrite an old checkpoint. */
-    fun requireCredentialFree(document: JSONObject) {
-        requireArchive(archive(document).getJSONArray("excludedCredentialPaths").length() == 0,
+    fun requireCredentialFree(document: JSONObject, maximumNodes: Int = 100_000) {
+        require(maximumNodes >= 100_000)
+        requireArchive(Sanitizer(maximumNodes).archive(document).getJSONArray("excludedCredentialPaths").length() == 0,
             "Credential-bearing retained native host material requires reconciliation")
     }
 
-    private class Sanitizer {
+    private class Sanitizer(private val maximumNodes: Int = 100_000) {
         private val excluded = sortedSetOf<String>()
         private var nodes = 0
         private var inspectedBytes = 0L
 
-        fun archive(document: JSONObject): JSONObject = JSONObject()
-            .put("document", json(document, "", 0, root = true))
-            .put("excludedCredentialPaths", JSONArray(excluded.toList()))
+        fun archive(document: JSONObject): JSONObject {
+            val clean = json(document, "", 0, root = true) as JSONObject
+            if (NativeWatchedMigrationStorage.KEYS.any(clean::has)) nativeWatchedDocumentSnapshot(clean)
+            return JSONObject().put("document", clean).put("excludedCredentialPaths", JSONArray(excluded.toList()))
+        }
 
         private fun budget(depth: Int) {
-            requireArchive(depth <= 64 && ++nodes <= 100_000, "Host document exceeds inspection limits")
+            requireArchive(depth <= 64 && ++nodes <= maximumNodes, "Host document exceeds inspection limits")
         }
 
         private fun excluded(key: String, path: String): Boolean {
@@ -70,8 +73,10 @@ internal object NativeHostDocument {
         }
 
         private fun jsonObject(value: JSONObject, path: String, depth: Int, root: Boolean = false, skip: Set<String> = emptySet()): JSONObject = JSONObject().also { result ->
+            val watched = if (NativeWatchedMigrationStorage.KEYS.any(value::has)) NativeWatchedMigrationStorage.read(value) else null
+            if (watched != null) watched.writeTo(result)
             for (key in value.keys().asSequence().toList().sorted()) {
-                if (key in skip) continue
+                if (key in skip || key in NativeWatchedMigrationStorage.KEYS) continue
                 val childPath = pointer(path, key)
                 if (excluded(key, childPath)) continue
                 val child = value.get(key)
@@ -92,10 +97,6 @@ internal object NativeHostDocument {
                 result.put(key, if (streamingUID || websiteAddonID || (profileName || watchlistName) && cannotBeEncodedText(child as String)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
-                else if (key == "nativeWatchedMigrationEvidence")
-                    validateNativeWatchedMigrationArchive(child as? JSONArray ?: reject("Malformed watched evidence archive"))
-                else if (key == "nativeWatchedMigrationPending")
-                    validateNativeWatchedMigrationPending(child as? JSONArray ?: reject("Malformed pending watched archive"))
                 else if (key == "nativeOwnAccountCandidates")
                     validateNativeOwnAccountCandidates(child as? JSONObject ?: reject("Malformed pending account candidates"))
                 else if (root && key == "settings" && child != JSONObject.NULL)

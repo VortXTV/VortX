@@ -190,6 +190,8 @@ private fun RecoveryCodeCard(code: String, warning: String?, onSaved: () -> Unit
 @Composable
 private fun ReconcileCard(viewModel: VortXAccountViewModel) {
     val colors = VortXTheme.colors
+    val syncing by viewModel.syncing.collectAsStateWithLifecycle()
+    val syncNotice by viewModel.syncNotice.collectAsStateWithLifecycle()
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(VortXTheme.spacing.lg),
@@ -201,12 +203,15 @@ private fun ReconcileCard(viewModel: VortXAccountViewModel) {
                 style = VortXTheme.type.body.copy(color = colors.textSecondary),
             )
             PrimaryButton(
-                text = "Merge both (recommended)",
+                text = if (syncing) "Syncing…" else "Merge both (recommended)",
                 onClick = viewModel::reconcileMergeBoth,
+                loading = syncing,
                 modifier = Modifier.fillMaxWidth(),
             )
-            TextAction("Use my account's data", onClick = viewModel::reconcileUseAccount)
-            TextAction("Keep this device's data", onClick = viewModel::reconcileKeepDevice)
+            TextAction("Use my account's data", onClick = viewModel::reconcileUseAccount, enabled = !syncing)
+            TextAction("Keep this device's data", onClick = viewModel::reconcileKeepDevice, enabled = !syncing)
+            syncNotice?.let { Text(it, style = VortXTheme.type.label.copy(color = colors.danger)) }
+            TextAction("Sign Out", onClick = viewModel::signOut, danger = true, enabled = !syncing)
         }
     }
 }
@@ -470,14 +475,14 @@ private fun FormField(
 
 /// A quiet inline text action (the screen's ONE gold CTA stays the PrimaryButton above it).
 @Composable
-private fun TextAction(text: String, onClick: () -> Unit, danger: Boolean = false) {
+private fun TextAction(text: String, onClick: () -> Unit, danger: Boolean = false, enabled: Boolean = true) {
     val colors = VortXTheme.colors
     Text(
         text,
-        style = VortXTheme.type.body.copy(color = if (danger) colors.danger else colors.accent),
+        style = VortXTheme.type.body.copy(color = if (!enabled) colors.textTertiary else if (danger) colors.danger else colors.accent),
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = VortXTheme.spacing.xs),
     )
 }

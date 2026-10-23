@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Fetches the two pieces the embedded streaming server needs (both gitignored).
-# Run once after cloning. No local Stremio install is required: everything has
-# a public download fallback.
+# Fetches the gitignored subtitle fallback fonts the apps bundle and installs the git hooks.
+# Run once after cloning. (The name is historical: the streaming server is now the VortX
+# engine's, built from the engine checkout by scripts/build-ffi-xcframework.sh and
+# scripts/build-mac-server.sh.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,12 +23,10 @@ if ! ./scripts/install-git-hooks.sh; then
     echo "         against pushing proprietary engine source to a public remote." >&2
 fi
 
-# Pinned SHA256s for everything downloaded below. These binaries ship inside the
-# IPA, so verify them instead of trusting the transport. When replacing a vendor
-# asset, recompute the matching hash (shasum -a 256 <file>).
-NODEMOBILE_SHA256="6abd08685c35a2e4772533aeb8aab40483404ba184cb3b19a3e89f36376689bd"
+# Pinned SHA256 for everything downloaded below. The fonts ship inside the apps, so
+# verify them instead of trusting the transport. When replacing a vendor asset,
+# recompute the matching hash (shasum -a 256 <file>).
 FONTS_SHA256="11de005861655d43e53979325cdca3172951f93af566b6fc6778e6897dd53dbb"
-SERVER_JS_4_21_0_SHA256="82175d7982bce864df071df93b4b3d567a401e65881a8ac579d7db0ce71dafd7"
 
 verify_sha256() { # <file> <expected-hash> <label>
     local actual
@@ -52,8 +51,7 @@ verify_sha256() { # <file> <expected-hash> <label>
 #
 # assert_no_symlinks_under() is the fail-closed gate that enforces the invariant "the fetched
 # tree leaves NO symlink under app/Resources/". Nothing there is legitimately a symlink:
-# server.js and node-darwin-arm64 are copied/downloaded regular files, fonts/ holds real
-# .ttf/.otf files, and shaders/ + streaming-logos/ are real folders. Detection and remediation
+# fonts/ holds real .ttf/.otf files, and shaders/ + streaming-logos/ are real folders. Detection and remediation
 # are deliberately kept separate: this gate DETECTS and FAILS; it does not delete. A gate that
 # silently scrubbed would hide recurrence and could not prove the class is actually gone, so a
 # stray link stops the fetch and names itself for a human to remove.
@@ -71,48 +69,7 @@ assert_no_symlinks_under() { # <dir> ; lists any symlink under <dir> and returns
     return 0
 }
 
-# 1) NodeMobile.xcframework. The official nodejs-mobile v18.20.4 release is
-#    iOS-only; VortX needs tvOS slices too (device + simulator), so a
-#    tvOS-enabled build is hosted as a release asset on this repo.
-NODEMOBILE_URL="https://github.com/VortXTV/VortX/releases/download/vendor-1/NodeMobile-v18.20.4-ios-tvos.xcframework.zip"
-echo "Fetching NodeMobile.xcframework (iOS + tvOS)..."
-mkdir -p app/Vendor
-curl -sfL "$NODEMOBILE_URL" -o /tmp/nodemobile.zip
-verify_sha256 /tmp/nodemobile.zip "$NODEMOBILE_SHA256" "NodeMobile.xcframework"
-rm -rf app/Vendor/nodejs-mobile
-mkdir -p app/Vendor/nodejs-mobile
-unzip -q /tmp/nodemobile.zip -d app/Vendor/nodejs-mobile
-
-# 2) server.js, the standard desktop build that runs under plain Node.
-#    Preference order:
-#      a) STREMIO_APP env var pointing at a Stremio.app bundle
-#      b) reference/macos/Stremio.app (maintainer layout, not committed)
-#      c) /Applications/Stremio.app (typical install)
-#      d) Stremio's public CDN (no local install needed)
-SERVER_DEST="app/Resources/server.js"
-SERVER_VERSION="${STREMIO_SERVER_VERSION:-4.21.0}"
-found=""
-for candidate in "${STREMIO_APP:-}" "reference/macos/Stremio.app" "/Applications/Stremio.app"; do
-    if [ -n "$candidate" ] && [ -f "$candidate/Contents/MacOS/server.js" ]; then
-        cp "$candidate/Contents/MacOS/server.js" "$SERVER_DEST"
-        found="$candidate"
-        break
-    fi
-done
-if [ -n "$found" ]; then
-    echo "server.js copied from $found"
-else
-    echo "No local Stremio.app found; downloading server.js v$SERVER_VERSION from dl.strem.io..."
-    curl -sfL "https://dl.strem.io/server/v$SERVER_VERSION/desktop/server.js" -o "$SERVER_DEST"
-fi
-if [ "$SERVER_VERSION" != "4.21.0" ]; then
-    echo "ERROR: no reviewed proxy hardening patch exists for server.js v$SERVER_VERSION" >&2
-    exit 1
-fi
-# Verify every acquisition path, including local application bundles, before applying byte-anchored patches.
-verify_sha256 "$SERVER_DEST" "$SERVER_JS_4_21_0_SHA256" "server.js v$SERVER_VERSION"
-
-# 3) Subtitle fallback fonts (Noto Sans family, OFL 1.1) so mpv renders
+# Subtitle fallback fonts (Noto Sans family, OFL 1.1) so mpv renders
 #    non-Latin subtitles. Too big for git, hosted on the same vendor release.
 #    v2 trims the CJK face to its practically-used coverage (BMP scripts, no
 #    rare plane-2 ideographs or vertical/regional variant glyphs): 7.6 MB
@@ -131,22 +88,8 @@ fi
 # so a nested fonts/fonts left by any earlier run stops the fetch loudly instead of riding into a build.
 assert_no_symlinks_under "$FONTS_DIR"
 
-echo "Done. NodeMobile + server.js + fonts ready. Next: scripts/build-core-xcframework.sh"
-echo "(+ scripts/build-ffi-xcframework.sh on the engine/apple-cutover branch), then 'xcodegen generate' in app/."
-
-# 4) Patch server.js so the /yt/:id trailer route resolves against current
-#    YouTube (the vendored ytdl-core 4.9.0 is dead). Runs AFTER the SHA256
-#    verification above so the upstream-integrity check still validates the
-#    original download. Idempotent: a fresh fetch has no marker so it re-patches.
-bash scripts/patch-server-yt.sh
-node scripts/patch-server-proxy.js "$SERVER_DEST"
-# Exercise the real vendor parser before patching, including the failing control,
-# then ship the exact deterministic split-archive repair that passed the tests.
-node test/server-usenet-archive.test.js "$SERVER_DEST"
-node test/server-nntp.test.js "$SERVER_DEST"
-node scripts/patch-server-usenet.js "$SERVER_DEST"
-node scripts/patch-server-nntp.js "$SERVER_DEST"
-node --check "$SERVER_DEST"
+echo "Done. Fonts ready. Next: scripts/build-ffi-xcframework.sh (and scripts/build-mac-server.sh for"
+echo "the Mac app) with the engine checkout, then 'xcodegen generate' in app/."
 
 # Final fail-closed gate: the fetched tree must leave NO symlink under app/Resources/. This is the
 # durable fix for the shipped fonts/fonts defect. Every path that populates app/Resources/ has run

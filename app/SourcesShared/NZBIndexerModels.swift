@@ -56,13 +56,19 @@ enum NZBIndexerEndpointPolicy {
         case malformed
     }
 
+    /// Accepts what an indexer's own site shows: a bare address (`drunkenslug.com`) gains `https://`.
     static func validate(_ raw: String) -> Result<URL, EndpointError> {
-        guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let withScheme = trimmed.contains("://") ? trimmed : "https://" + trimmed
+        guard let url = URL(string: withScheme) else {
             return .failure(.malformed)
         }
         return validate(url)
     }
 
+    /// The success value is the Newznab API URL itself: a site address with no path gets the standard
+    /// `/api` path every Newznab indexer serves (the default Sonarr/Prowlarr/AIOStreams apply). Without it
+    /// `https://drunkenslug.com` queried the indexer's homepage and silently returned no results.
     static func validate(_ url: URL) -> Result<URL, EndpointError> {
         guard url.scheme?.lowercased() == "https" else { return .failure(.notHTTPS) }
         guard url.user == nil, url.password == nil else { return .failure(.hasUserInfo) }
@@ -70,7 +76,10 @@ enum NZBIndexerEndpointPolicy {
         guard let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty else {
             return .failure(.missingHost)
         }
-        return .success(url)
+        guard url.path.isEmpty || url.path == "/",
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return .success(url) }
+        components.path = "/api"
+        return .success(components.url ?? url)
     }
 
     /// Host-only rendering for logs. nil when unparseable.

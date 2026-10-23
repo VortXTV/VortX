@@ -4,11 +4,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.sync.VortXSyncManager
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.URLEncoder
@@ -143,8 +145,24 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     private val _syncNotice = MutableStateFlow<String?>(null)
     val syncNotice: StateFlow<String?> = _syncNotice.asStateFlow()
 
+    // Form cleanup identity is independent of request completion and account authority.
+    // Editing A -> B -> A revokes old cleanup, without enabling a second concurrent submit.
+    private var authFormIdentity = Any()
+    private var activeAuthSubmission: Any? = null
+
+    private fun invalidateAuthForm() {
+        authFormIdentity = Any()
+    }
+
+    init {
+        viewModelScope.launch {
+            sync.syncProblem.collect { problem -> _syncNotice.value = problem }
+        }
+    }
+
     fun onModeChange(mode: VortXAccountMode) {
         if (_mode.value == mode) return
+        invalidateAuthForm()
         _mode.value = mode
         _formState.value = VortXAccountFormState.Idle
         _totpRequired.value = false
@@ -152,11 +170,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         if (mode != VortXAccountMode.SIGN_IN) stopQrJoiner()
     }
 
-    fun onLoginChange(value: String) { _login.value = value }
-    fun onUsernameChange(value: String) { _username.value = value }
-    fun onPasswordChange(value: String) { _password.value = value }
-    fun onTotpChange(value: String) { _totp.value = value }
-    fun onRecoveryInputChange(value: String) { _recoveryInput.value = value }
+    fun onLoginChange(value: String) { invalidateAuthForm(); _login.value = value }
+    fun onUsernameChange(value: String) { invalidateAuthForm(); _username.value = value }
+    fun onPasswordChange(value: String) { invalidateAuthForm(); _password.value = value }
+    fun onTotpChange(value: String) { invalidateAuthForm(); _totp.value = value }
+    fun onRecoveryInputChange(value: String) { invalidateAuthForm(); _recoveryInput.value = value }
 
     fun retrySessionRestore() {
         sync.retrySessionRestore()
@@ -235,12 +253,40 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             return
         }
         stopQrJoiner()
+        val identity = Any()
+        val submittedMode = _mode.value
+        val admission = sync.captureLocalLibraryMutationAdmission()
+        authFormIdentity = identity
+        activeAuthSubmission = identity
         _formState.value = VortXAccountFormState.Submitting
         viewModelScope.launch {
-            when (_mode.value) {
-                VortXAccountMode.SIGN_IN -> signIn()
-                VortXAccountMode.REGISTER -> register()
-                VortXAccountMode.RECOVER -> recover()
+            try {
+                if (authFormIdentity !== identity) return@launch
+                when (submittedMode) {
+                    VortXAccountMode.SIGN_IN -> signIn()
+                    VortXAccountMode.REGISTER -> register()
+                    VortXAccountMode.RECOVER -> recover()
+                }
+            } catch (cancel: CancellationException) {
+                if (authFormIdentity === identity) clearAuthInputs()
+                throw cancel
+            } catch (_: Exception) {
+                // Adoption revokes the old account admission, but must not leave its own
+                // original secrets live. Never clear fields belonging to an edited form.
+                if (authFormIdentity === identity) clearAuthInputs()
+                admission?.invoke {
+                    if (authFormIdentity === identity) {
+                        _formState.value = VortXAccountFormState.Error(AUTH_RETRY_NOTICE)
+                    }
+                    true
+                }
+            } finally {
+                // An edit still waits for this request, while a mode-change/new submission
+                // can already own another spinner. Neither completion clears replacement input.
+                if (activeAuthSubmission === identity) {
+                    activeAuthSubmission = null
+                    if (_formState.value == VortXAccountFormState.Submitting) _formState.value = VortXAccountFormState.Idle
+                }
             }
         }
     }
@@ -315,8 +361,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
      *  - UNREACHABLE: pushed nothing (a blip is never treated as a fresh account); realtime's guarded
      *    catch-up pull + poll retry until the doc is reachable.
      */
-    private suspend fun onAuthed() {
-        clearAuthInputs()
+    private suspend fun onAuthed() = finishPostAuth {
         when (sync.reconcileAfterSignIn()) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> {
                 _syncNotice.value = null
@@ -324,22 +369,39 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             }
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> _showReconcile.value = true
             VortXSyncManager.SignInReconcile.UNREACHABLE -> {
-                _syncNotice.value = "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
+                _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
                 sync.startRealtime()
             }
         }
     }
 
     /** QR is a deliberate transfer from an already approved device, so hydrate it without a second prompt. */
-    private suspend fun onQrAuthed() {
-        clearAuthInputs()
+    private suspend fun onQrAuthed() = finishPostAuth {
         when (sync.reconcileAfterSignIn()) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> _syncNotice.value = null
-            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> sync.useAccountData()
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> {
+                if (!sync.useAccountData()) _syncNotice.value = sync.syncProblem.value
+                    ?: "Signed in. Your saved data is preserved, but the account restore could not finish yet. Try Sync now again."
+            }
             VortXSyncManager.SignInReconcile.UNREACHABLE ->
-                _syncNotice.value = "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
+                _syncNotice.value = sync.syncProblem.value ?: "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
         }
         sync.startRealtime()
+    }
+
+    /** Shared signed-in completion boundary: a failed restore must not discard the saved session. */
+    internal suspend fun finishPostAuth(action: suspend () -> Unit) {
+        clearAuthInputs()
+        val admit = sync.captureLocalLibraryMutationAdmission()
+        try {
+            action()
+        } catch (cancel: CancellationException) { throw cancel }
+        catch (_: Exception) {
+            admit?.invoke {
+                _syncNotice.value = POST_AUTH_RETRY_NOTICE
+                true
+            }
+        }
     }
 
     private fun clearAuthInputs() {
@@ -361,13 +423,34 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     /// Keep this device's data (a push; still merged into the pulled doc, never a blind overwrite).
     fun reconcileKeepDevice() = resolveReconcile { sync.importThisDeviceLibraryAndPush() }
 
-    private fun resolveReconcile(action: suspend () -> Unit) {
-        _showReconcile.value = false
+    private fun resolveReconcile(action: suspend () -> Boolean) {
+        if (_syncing.value || !_showReconcile.value) return
+        // Reuse invocation ownership so a delayed choice cannot publish into a replacement session.
+        val admit = sync.captureLocalLibraryMutationAdmission() ?: return
+        _syncing.value = true
+        _syncNotice.value = null
         viewModelScope.launch {
-            _syncing.value = true
-            action()
-            _syncing.value = false
-            sync.startRealtime()   // the question is settled; open the live channel
+            try {
+                val reconciled = action()
+                admit {
+                    if (_showReconcile.value) {
+                        if (reconciled) {
+                            _showReconcile.value = false
+                            _syncNotice.value = null
+                            sync.startRealtime() // Only a confirmed choice settles reconciliation.
+                        } else {
+                            _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                        }
+                    }
+                    true
+                }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) {
+                admit {
+                    if (_showReconcile.value) _syncNotice.value = sync.syncProblem.value ?: RECONCILE_RETRY_NOTICE
+                    true
+                }
+            } finally { _syncing.value = false }
         }
     }
 
@@ -377,10 +460,18 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     fun syncNow() {
         if (_syncing.value) return
         _syncing.value = true
+        val admit = sync.captureLocalLibraryMutationAdmission()
         viewModelScope.launch {
-            val pushed = sync.mergeBoth()
-            _syncNotice.value = if (pushed) "Synced." else "Couldn't sync right now. It will retry automatically."
-            _syncing.value = false
+            try {
+                val pushed = sync.mergeBoth()
+                admit?.invoke {
+                    _syncNotice.value = sync.syncProblem.value ?: if (pushed) "Synced." else SYNC_RETRY_NOTICE
+                    true
+                }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) {
+                admit?.invoke { _syncNotice.value = SYNC_RETRY_NOTICE; true }
+            } finally { _syncing.value = false }
         }
     }
 
@@ -390,6 +481,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     fun signOut() {
+        invalidateAuthForm()
         if (!sync.signOut()) {
             _syncNotice.value =
                 "Secure storage is unavailable. Your VortX session was not changed. Please try again."
@@ -409,6 +501,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     private companion object {
         /// Floor for a NEW password (register/recover). Sign-in never gates: existing accounts rule.
+        const val AUTH_RETRY_NOTICE = "Could not complete this account action. Your saved data is preserved. Please try again."
+        const val POST_AUTH_RETRY_NOTICE = "Signed in. Sync could not finish. Your saved data is preserved. Try Sync now again."
+        const val SYNC_RETRY_NOTICE = "Couldn't sync right now. Your saved data is preserved. Try Sync now again."
+        const val RECONCILE_RETRY_NOTICE = "Couldn't finish syncing. Your saved data is preserved. Choose an option to retry."
         const val MIN_PASSWORD_LENGTH = 8
         const val QR_POLL_INTERVAL_MS = 2_000L
     }

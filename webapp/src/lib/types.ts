@@ -1,7 +1,6 @@
-// Stremio add-on protocol types. These are the JSON shapes add-ons return over HTTPS, ported from the
-// engine-facing types in desktop/src/engine.ts. On desktop the embedded stremio-core engine wrapped
-// these behind a Tauri `invoke` transport; the web client has no engine, so it speaks the add-on
-// protocol directly (see addon.ts) and these are the raw on-the-wire shapes.
+// Add-on protocol types. These are the JSON shapes add-ons return over HTTPS. The web client (also the
+// desktop app's UI) speaks the add-on protocol directly (see addon.ts), so these are the raw on-the-wire
+// shapes.
 //
 // See https://github.com/Stremio/stremio-addon-sdk for the protocol reference.
 

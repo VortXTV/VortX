@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Usage: verify-native-engine-abi.sh apple <xcframework> [resource-host]
-#        verify-native-engine-abi.sh android <libvortx_ffi.so> [resource-host]
-# This is an explicit new-bridge artifact gate; existing release pins are not changed by it.
+# Usage: verify-native-engine-abi.sh apple <xcframework> [resource-host|owner-history]
+#        verify-native-engine-abi.sh android <libvortx_ffi.so> [resource-host|owner-history]
+# owner-history includes every existing state/resource-host requirement on BOTH platforms.
+# It gates artifact availability only; it never enables an app/runtime routing flag.
 platform="${1:?platform required}" artifact="${2:?artifact required}" mode="${3:-state}"
-[[ "$mode" == state || "$mode" == resource-host ]] || { echo "invalid ABI mode" >&2; exit 1; }
+[[ "$mode" == state || "$mode" == resource-host || "$mode" == owner-history ]] || { echo "invalid ABI mode" >&2; exit 1; }
 state_symbols=(vortx_init_runtime vortx_init_from_state_json vortx_dispatch_json vortx_resolve_json vortx_get_state_json vortx_get_state_delta_json vortx_string_free vortx_engine_free)
 resource_symbols=(vortx_resource_host_abi_version vortx_resource_host_new vortx_resource_host_load_json vortx_resource_host_free vortx_cancel_new vortx_cancel_cancel vortx_cancel_free)
+owner_history_symbols=(vortx_owner_history_canonicalize_evidence_json vortx_owner_history_session_open vortx_owner_history_session_fork vortx_owner_history_session_json vortx_owner_history_session_free)
 if [[ "$platform" == apple ]]; then
     count=0
     for archive in "$artifact"/*/libvortx_ffi.a; do
@@ -30,7 +32,8 @@ if [[ "$platform" == apple ]]; then
         esac
         sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
         expected=("${state_symbols[@]}")
-        [[ "$mode" != resource-host ]] || expected+=("${resource_symbols[@]}")
+        [[ "$mode" == state ]] || expected+=("${resource_symbols[@]}")
+        [[ "$mode" != owner-history ]] || expected+=("${owner_history_symbols[@]}")
         for symbol in "${expected[@]}"; do
             printf '%s\n' "$exports" | grep -Fxq "_$symbol" || { echo "missing export $symbol: $archive" >&2; exit 1; }
             # A present symbol with an absent header is still unusable from Swift.
@@ -44,7 +47,9 @@ elif [[ "$platform" == android ]]; then
     readelf="${READELF:-llvm-readelf}"
     exports=$($readelf --dyn-syms --wide "$artifact")
     expected=(nativeInitRuntime nativeInitFromStateJson nativeDispatchJson nativeResolveJson nativeGetStateJson nativeGetStateDeltaJson nativeEngineFree)
-    [[ "$mode" != resource-host ]] || expected+=(nativeResourceHostAbiVersion nativeResourceHostNew nativeResourceHostLoadJson nativeResourceHostFree nativeCancelNew nativeCancelCancel nativeCancelFree)
+    [[ "$mode" == state ]] || expected+=(nativeResourceHostAbiVersion nativeResourceHostNew nativeResourceHostLoadJson nativeResourceHostFree nativeCancelNew nativeCancelCancel nativeCancelFree)
+    # Actual immutable JNI surface: canonicalizer + open/fork/request/close = FIVE functions.
+    [[ "$mode" != owner-history ]] || expected+=(nativeOwnerHistoryCanonicalize nativeOwnerHistoryOpen nativeOwnerHistoryFork nativeOwnerHistoryRequest nativeOwnerHistoryClose)
     for symbol in "${expected[@]}"; do
         awk -v wanted="Java_com_vortx_android_engine_VortxCore_$symbol" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == wanted { found=1 } END { exit !found }' <<< "$exports" || {
             echo "missing JNI export $symbol: $artifact" >&2; exit 1;

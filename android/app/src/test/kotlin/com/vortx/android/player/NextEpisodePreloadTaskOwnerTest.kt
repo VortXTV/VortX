@@ -11,12 +11,54 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.advanceTimeBy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NextEpisodePreloadTaskOwnerTest {
     private val target = NextEpisodePreloadPolicy.Target("episode-2", generation = 1L)
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun `dispatch queue cannot restart an already elapsed attempt deadline`() = kotlinx.coroutines.test.runTest {
+        var now = 100L
+        val owner = NextEpisodePreloadTaskOwner(this, nowMs = { now })
+        var preparations = 0
+        val outcomes = mutableListOf<Boolean>()
+        owner.launch(target, prepare = { preparations++; true }, onComplete = { outcomes += it }, timeoutMs = 10)
+        now = 111L
+        runCurrent()
+        assertEquals(0, preparations)
+        assertEquals(listOf(false), outcomes)
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun `real task deadline completes failure without further playback ticks`() = kotlinx.coroutines.test.runTest {
+        val owner = NextEpisodePreloadTaskOwner(this)
+        var stopped = false
+        val outcomes = mutableListOf<Boolean>()
+        owner.launch(target, prepare = {
+            try { kotlinx.coroutines.awaitCancellation() } finally { stopped = true }
+        }, onComplete = { outcomes += it })
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+        try {
+            assertTrue(stopped)
+            assertEquals(listOf(false), outcomes)
+        } finally { owner.cancel() }
+    }
+
+    @Test fun `phone and TV advance enter the acknowledged player handoff not ordinary playback flow`() {
+        val root = generateSequence(java.io.File(System.getProperty("user.dir"))) { it.parentFile }
+            .first { java.io.File(it, "src/main/kotlin/com/vortx/android/ui/VortXApp.kt").isFile }
+        for (relative in listOf("ui/VortXApp.kt", "ui/tv/TvApp.kt")) {
+            val source = java.io.File(root, "src/main/kotlin/com/vortx/android/$relative").readText()
+            assertTrue(relative, source.contains("episodeHandoffRequest ="))
+            org.junit.Assert.assertFalse(relative, source.contains(".playNextEpisode()"))
+        }
+    }
 
     @Test
     fun `cancelling mounted playback stops preparation and rejects its late completion`() = runBlocking {

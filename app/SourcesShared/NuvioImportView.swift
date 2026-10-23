@@ -1,14 +1,13 @@
 import SwiftUI
 
 /// "Import from Nuvio" - lets a Nuvio user bring the Stremio-compatible add-on(s) they already use in
-/// Nuvio into VortX. Nuvio (the open-source streaming app) has no account, sync service, or hosted API of
-/// its own: it plays through the same Stremio add-on protocol VortX speaks. So there is nothing to sign
-/// into here; the only real import action is pasting the add-on manifest URL(s) already configured in
-/// Nuvio. VortX keeps its own account and add-on list either way (see SyncSettingsView).
+/// Nuvio into VortX. This importer uses the shared Stremio add-on protocol, not Nuvio's account service.
+/// Paste manifest URL(s) already configured in Nuvio; this does not import a Nuvio account, watch
+/// history or collection layout. VortX keeps its own account and add-on list (see SyncSettingsView).
 ///
 /// Mirrors StremioImportView's batch-install card: same copy shape, same CoreBridge.installAddon path
 /// (manifest.json suffixing, already-installed dedupe, AddonURLGuard SSRF validation), same success/failure
-/// summary. It has no sign-in card, unlike StremioImportView, because there is no account to sign into.
+/// summary. It has no sign-in card because Nuvio account connection is not implemented here.
 /// VortX keeps NO curated third-party add-on list: the user brings their own manifest URL, never a bundled
 /// one.
 ///
@@ -27,9 +26,9 @@ struct NuvioImportView: View {
                 Text("Import from Nuvio").screenTitleStyle()
 
                 card {
-                    Text("No account to sign into").font(Theme.Typography.cardTitle)
+                    Text("Import using add-on links").font(Theme.Typography.cardTitle)
                         .foregroundStyle(Theme.Palette.textPrimary)
-                    Text("Nuvio plays through Stremio-compatible add-ons. Paste the add-on link you use in Nuvio to bring its catalogs and streams into VortX. VortX keeps its own account and add-on list.")
+                    Text("Paste the Stremio-compatible add-on links you use in Nuvio to bring their catalogs and streams into VortX. This import does not connect your Nuvio account or copy its watch history and collection layout. VortX keeps its own account and add-on list.")
                         .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                 }
 

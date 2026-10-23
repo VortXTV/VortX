@@ -591,12 +591,12 @@ enum SourceIndexClient {
     // MARK: - HOARD: POST /sources/contribute (signed, fire-and-forget)
 
     /// Report the assembled source descriptors for a title. Gated on consent + the fleet feature flag. Popular
-    /// titles routinely resolve far more than one POST can carry (the worker rejects a POST above
-    /// `MAX_SOURCES_PER_CONTRIBUTE` = 16), so we chunk the whole deduped set into `batchSize`-descriptor POSTs.
+    /// titles routinely resolve far more than one client batch can carry, so we chunk the whole deduped set
+    /// into `batchSize`-descriptor POSTs. The worker considers at most the first 100 input descriptors.
     /// [SourceUploadCoordinator] provides one process-wide per-(content,hash) ledger and reserves every POST a
     /// globally spaced start time, including overlapping detached detail/resume call sites. Transient transport
     /// and server failures receive a bounded, jittered retry. Validation/authentication rejection is terminal.
-    /// A descriptor becomes durably complete only after a successful response.
+    /// A descriptor becomes durably complete only after a semantic acknowledgement of its entire wire batch.
     @discardableResult
     static func contribute(
         contentID: String,
@@ -630,7 +630,7 @@ enum SourceIndexClient {
         }
         // Revalidate at the network boundary. Descriptor is intentionally a simple value type, so a caller
         // can construct one without going through descriptors(from:); no such value reaches the encoder unless
-        // it is torrent-only and carries an exact normalizable 40-hex infohash.
+        // its reference passes the kind-specific normalization and confidentiality boundary.
         let uploadable = uploadableDescriptors(descriptors)
         guard !uploadable.isEmpty else {
             diag(.contributeSkip, reason: .nothingUploadable, counts: [(.candidates, descriptors.count)])
@@ -647,7 +647,7 @@ enum SourceIndexClient {
         let lifecycle = SourceIndexLifecycleClock.snapshot()
         // Bound the whole title: a pathological title still never sends an unbounded number of batches.
         let all = Array(uploadable.prefix(perTitleCap))
-        // batchSize MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE or the whole batch is rejected.
+        // batchSize MUST stay <= the worker's input bound so no descriptors are silently left unconsidered.
         // Slice into <= batchSize chunks.
         let batches = uploadBatches(all, batchSize: chunkSize, perTitleCap: perTitleCap)
 
@@ -740,14 +740,16 @@ enum SourceIndexClient {
                                                    (.descriptors, descriptors.count)])
                     do {
                         try await runtime.transport(req)
+                        try Task.checkCancellation()
                         diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
                                                              (.succeeded, 1)])
-                        _ = await runtime.coordinator.finishAttempt(
+                        let finish = await runtime.coordinator.finishAttempt(
                             reservation,
                             result: .succeeded,
                             nowNanoseconds: runtime.nowNanoseconds(),
                             retryPolicy: runtime.retryPolicy
                         )
+                        guard finish == .completed else { return .deferred }
                         acceptedByProcess = true
                         break retryLoop
                     } catch {
@@ -1097,10 +1099,9 @@ enum SourceIndexClient {
         }
     }
 
-    /// What the REQUESTER can actually consume, so SERVE only builds rows this user can play or resolve through
-    /// their OWN account (DEC-260723-D1). Torrent rows are self-verifying and shown to everyone (resolved via
-    /// the requester's own debrid cache-check, exactly as today). A public http link is playable by anyone. A
-    /// usenet nzb needs a usenet-capable service, so it is built ONLY when the requester has one configured.
+    /// Requester facts retained for source compatibility and display. Transport admission is independent of
+    /// these capabilities: a configured HTTP/usenet consumer does not prove a pooled URL connects publicly.
+    /// Torrent identities continue through the requester's own resolver/cache checks.
     struct ServeCapabilities: Sendable {
         let canPlayDirectHTTP: Bool
         let hasUsenet: Bool
@@ -1121,12 +1122,12 @@ enum SourceIndexClient {
         static let torrentOnly = ServeCapabilities(canPlayDirectHTTP: false, hasUsenet: false)
     }
 
-    /// Turn canonical pooled rows into playable `CoreStream`s, filtered by what the requester can consume, and
+    /// Turn canonical pooled torrent identities into playable `CoreStream`s, and
     /// carrying the pool's real display metadata so a Singularity row renders like any other source (resolution
-    /// badge, size, seeders) through the SAME `StreamRanking` text parse the whole app uses. http rows become
-    /// direct-link streams only when the requester can play raw http; usenet rows become nzb streams only when
-    /// the requester has a usenet-capable service. Every row re-runs the client-side strip so a served link is
-    /// re-verified as public before it enters the user's pipeline. Fail-soft.
+    /// badge, size, seeders) through the SAME `StreamRanking` text parse the whole app uses. Pooled HTTP/NZB
+    /// references are withheld until their complete connection path pins public peers across DNS, redirects
+    /// and media subrequests. A URL syntax or credential check alone cannot provide that guarantee. The
+    /// user's own add-on and LAN sources enter through their existing groups and are unaffected. Fail-soft.
     ///
     /// EVERY pooled field is UNTRUSTED contributor data. Quality is forced through the closed vocabulary, size
     /// and seeders are clamped, the source tag is charset-stripped, and the provider hint is shown only for a
@@ -1142,7 +1143,8 @@ enum SourceIndexClient {
         var rich: [CoreStream] = []
         var anonymous: [CoreStream] = []
         for src in pooled.prefix(SourceIndexContract.maxServedSources) {
-            guard let kind = src.kind, let id = src.id, !id.isEmpty,
+            guard let kind = src.kind, SourceIndexContract.canReconstructPooledKind(kind),
+                  let id = src.id, !id.isEmpty,
                   // MIRROR the worker's serve floor; never exceed it (the worker already applied its kind-aware
                   // floor before sending). Retained purely as defence against a malformed/absent count so real
                   // policy stays backend-tunable with no app release.
@@ -1155,14 +1157,6 @@ enum SourceIndexClient {
                 // from the pool never fabricates a cached badge -- the own-key check is the authority).
                 guard let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { continue }
                 stream = make(name: display.name, description: display.description, infoHash: hash)
-            case Kind.http.rawValue:
-                guard capabilities.canPlayDirectHTTP,
-                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
-                stream = make(name: display.name, description: display.description, url: link)
-            case Kind.usenet.rawValue:
-                guard capabilities.hasUsenet,
-                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
-                stream = make(name: display.name, description: display.description, nzbUrl: link)
             default:
                 continue
             }
@@ -1367,7 +1361,7 @@ enum SourceIndexClient {
     private static let sourceIndexTransport = SourceIndexHTTPTransport.shared
     nonisolated(unsafe) private static var contributionTransportStorage:
         @Sendable (URLRequest) async throws -> Void = { request in
-            try await sourceIndexTransport.discardResponse(for: request)
+            try await sourceIndexTransport.acknowledgeContribution(for: request)
         }
     private static let contributionTransportLock = NSLock()
 
@@ -1403,9 +1397,8 @@ enum SourceIndexClient {
     }
 
     /// Pure SERVE request builder shared with standalone tests. Invalid title keys return nil before telemetry
-    /// or network work. NO `kind` filter: the client asks for ALL kinds (DEC-260723-D1) and filters client-side
-    /// by the requester's configured services, so the worker applies its per-row corroboration floor across
-    /// torrent / http / usenet in one read.
+    /// or network work. Filter on the worker BEFORE its ranked LIMIT: otherwise unplayable HTTP/NZB rows can
+    /// consume all 100 returned slots and starve torrents that this client can safely reconstruct.
     static func serveURL(contentID: String) -> URL? {
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               var components = URLComponents(
@@ -1414,6 +1407,7 @@ enum SourceIndexClient {
               ) else { return nil }
         components.queryItems = [
             URLQueryItem(name: "content_id", value: contentID),
+            URLQueryItem(name: "kind", value: Kind.torrent.rawValue),
         ]
         return components.url
     }
@@ -1431,6 +1425,8 @@ enum SourceIndexClient {
                 return .permanent
             case .invalidLength, .tooLarge:
                 return .permanent
+            case .invalidAcknowledgement:
+                return .transient
             }
         }
         if let urlError = error as? URLError {
@@ -1477,6 +1473,7 @@ enum SourceIndexTransportError: Error, Equatable, Sendable {
     case invalidLength
     case tooLarge
     case badStatus(Int)
+    case invalidAcknowledgement
 }
 
 /// Redirects are never followed, including same-origin redirects. Signed Source Index requests are valid only
@@ -1506,6 +1503,15 @@ final class SourceIndexNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @un
 final class SourceIndexHTTPTransport: @unchecked Sendable {
     static let shared = SourceIndexHTTPTransport()
 
+    /// RemoteConfig shortens request idle time within 3...8 seconds. An idle timeout resets on received
+    /// data, so it cannot bound a trickled GET/ACK. Cap Foundation's complete-resource lifetime separately.
+    static let maximumResourceTimeout: TimeInterval = 8
+
+    static func boundedResourceTimeout(_ supplied: TimeInterval) -> TimeInterval {
+        guard supplied.isFinite, supplied > 0 else { return maximumResourceTimeout }
+        return min(supplied, maximumResourceTimeout)
+    }
+
     let session: URLSession
 
     init(
@@ -1516,6 +1522,9 @@ final class SourceIndexHTTPTransport: @unchecked Sendable {
         configuration.httpCookieAcceptPolicy = .never
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
+        configuration.timeoutIntervalForResource = Self.boundedResourceTimeout(
+            configuration.timeoutIntervalForResource
+        )
         session = URLSession(
             configuration: configuration,
             delegate: SourceIndexNoRedirectDelegate(redirectObserver: redirectObserver),
@@ -1549,9 +1558,12 @@ final class SourceIndexHTTPTransport: @unchecked Sendable {
         }
     }
 
-    /// Contribution responses are semantically ignored. Drain at most a fixed 512-byte sink, buffer nothing,
-    /// and cancel the task after headers plus that minimal drain so an untrusted body cannot consume memory.
-    func discardResponse(for request: URLRequest) async throws {
+    /// Read at most 512 acknowledgement bytes and require semantic acceptance of the exact encoded batch.
+    /// Every exit cancels the task; task cancellation also tears down an in-progress response read promptly.
+    func acknowledgeContribution(for request: URLRequest) async throws {
+        guard let expected = SourceIndexContract.contributedSourceCount(in: request.httpBody) else {
+            throw SourceIndexTransportError.invalidAcknowledgement
+        }
         let (bytes, response) = try await session.bytes(for: request)
         defer { bytes.task.cancel() }
         guard let http = response as? HTTPURLResponse else {
@@ -1560,18 +1572,21 @@ final class SourceIndexHTTPTransport: @unchecked Sendable {
         guard SourceIndexClient.isSuccessfulHTTPStatus(http.statusCode) else {
             throw SourceIndexTransportError.badStatus(http.statusCode)
         }
-        let declaredLength = http.value(forHTTPHeaderField: "Content-Length")
-        if let declaredLength {
-            guard let parsed = SourceIndexContract.parsedContentLength(declaredLength),
-                  parsed < SourceIndexContract.postResponseDrainBytes else {
-                throw SourceIndexTransportError.invalidLength
+        guard var acknowledgement = SourceIndexContract.BoundedBodyAccumulator(
+            contentLength: http.value(forHTTPHeaderField: "Content-Length"),
+            maximumBytes: SourceIndexContract.maxContributionAcknowledgementBytes
+        ) else { throw SourceIndexTransportError.invalidAcknowledgement }
+        try await withTaskCancellationHandler {
+            for try await byte in bytes {
+                guard acknowledgement.append(byte) else { throw SourceIndexTransportError.invalidAcknowledgement }
             }
+            try Task.checkCancellation()
+            guard SourceIndexContract.acknowledgesContribution(
+                acknowledgement.data, expectedSourceCount: expected
+            ) else { throw SourceIndexTransportError.invalidAcknowledgement }
+        } onCancel: {
+            bytes.task.cancel()
         }
-        var iterator = bytes.makeAsyncIterator()
-        for _ in 0..<SourceIndexContract.postResponseDrainBytes {
-            guard try await iterator.next() != nil else { return }
-        }
-        throw SourceIndexTransportError.tooLarge
     }
 }
 
@@ -1931,6 +1946,14 @@ actor SourceUploadCoordinator {
         guard var stored = reservations[reservation.id], stored.inFlight else { return .released }
         switch result {
         case .succeeded:
+            // Validate ownership on the actor immediately before persisting receipt keys, after network ACK.
+            // A cancellation/session/consent/fleet change while the POST was suspended must remain retryable.
+            guard !Task.isCancelled, SourceIndexLifecycleClock.snapshot() == stored.lifecycle,
+                  SourceIndexClient.isEnabled else {
+                reservations.removeValue(forKey: reservation.id)
+                pending.subtract(stored.keys)
+                return .released
+            }
             reservations.removeValue(forKey: reservation.id)
             pending.subtract(stored.keys)
             delivered.formUnion(stored.keys)
@@ -2203,6 +2226,9 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// The sealed target for the rows currently owned by this source. The source-list assembler authorizes its
     /// merge against this value, so a detached E2 snapshot cannot be reused for E3.
     private var lastTarget: SourceIndexIdentity.PublicationTarget?
+    /// The lifecycle that established this local owner, including already-published rows. A delayed
+    /// retirement announcement may clear only owners at or below its cutoff, not a reopened scope.
+    private var ownedLifecycle: SourceIndexLifecycleSnapshot?
     var publishedTarget: SourceIndexIdentity.PublicationTarget? { lastTarget }
     private var task: Task<Void, Never>?
     /// Empty successful/failing fetches do not bump the rows epoch, so settlement has its own observable
@@ -2233,14 +2259,13 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             VortXSyncManager.shared.isSignedIn
         },
         capabilities: @escaping CapabilitiesProvider = {
-            // A public http(s) direct link is playable by anyone (no embedded server needed, plays on Lite
-            // too), so http rows are shown to every requester. A usenet nzb needs a usenet-capable service, so
-            // it is built only when the requester has TorBox configured (the one usenet backend among the four).
+            // Only pooled torrent identities have a public-transport-safe handoff today. HTTP/NZB references
+            // remain withheld even for a configured consumer; see SourceIndexContract.canReconstructPooledKind.
             // The requester's configured debrid providers are snapshotted here so an off-main reconstruction can
             // show a provider hint for a source THIS user can reach without touching main-actor state later.
             SourceIndexClient.ServeCapabilities(
-                canPlayDirectHTTP: true,
-                hasUsenet: DebridKeys.shared.isConfigured(.torBox),
+                canPlayDirectHTTP: false,
+                hasUsenet: false,
                 debridProviders: SourceIndexClient.configuredDebridProviders()
             )
         },
@@ -2285,17 +2310,18 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             invalidateLocal(clearIdentity: true)
             return
         }
-        let identityChanged = target != lastTarget
+        let lifecycle = SourceIndexLifecycleClock.snapshot()
+        let identityChanged = target != lastTarget || ownedLifecycle != lifecycle
         if identityChanged {
             invalidateLocal(clearIdentity: false)
             lastTarget = target
+            ownedLifecycle = lifecycle
             publishSettlement(contentID: target.contentID, terminal: false)
         }
 
         guard identityChanged else { return }
         let contentID = target.contentID
 
-        let lifecycle = SourceIndexLifecycleClock.snapshot()
         let generation = refreshGeneration
         let fetchPooled = self.fetchPooled
         let serveGate = self.serveGate
@@ -2340,6 +2366,8 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     }
 
     func sourceIndexLifecycleDidClose(retiredSourceGeneration: UInt64) {
+        guard let ownedLifecycle,
+              ownedLifecycle.sourceGeneration <= retiredSourceGeneration else { return }
         invalidateLocal(clearIdentity: true)
     }
 
@@ -2351,7 +2379,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         includedSingularity: Bool
     ) -> Bool {
         guard epoch == sourceEpoch, SourceIndexLifecycleClock.snapshot() == lifecycle else { return false }
-        return !includedSingularity || (serveGate() && accountGate())
+        return !includedSingularity || (ownedLifecycle == lifecycle && serveGate() && accountGate())
     }
 
     private func invalidateLocal(clearIdentity: Bool) {
@@ -2360,6 +2388,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         task = nil
         if clearIdentity {
             lastTarget = nil
+            ownedLifecycle = nil
             publishSettlement(contentID: nil, terminal: true)
         }
         if !streams.isEmpty { streams = [] }
@@ -2419,23 +2448,13 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in extra {
-            // Each pooled source is keyed by its kind's natural id: torrent by canonical infohash, http by its
-            // direct url, usenet by its nzb link. The rows were already screened + built by
-            // `streams(from:capabilities:)`.
-            let key: String?
-            if let hash = SourceIndexContract.normalizeInfoHash(s.infoHash) {
-                // Dedupe/merge against the add-on list: a pooled torrent the add-ons already return does not get
-                // a duplicate Singularity row.
-                if addonHashes.contains(hash) { continue }
-                key = "t:" + hash
-            } else if let url = s.url, !url.isEmpty {
-                key = "h:" + url
-            } else if let nzb = s.nzbUrl, !nzb.isEmpty {
-                key = "u:" + nzb
-            } else {
-                key = nil
-            }
-            guard let key else { continue }
+            // Keep the pool boundary closed even for a stale or separately assembled extra snapshot. These
+            // are community rows only; user/add-on direct URLs and intentional LAN shares in `groups` pass
+            // through unchanged. A hash accompanied by a contributor URL is not a safe torrent-only handoff.
+            guard s.url == nil, s.nzbUrl == nil,
+                  let hash = SourceIndexContract.canonicalStoredInfoHash(s.infoHash) else { continue }
+            if addonHashes.contains(hash) { continue }
+            let key = "t:" + hash
             if seen.insert(key).inserted { own.append(s) }
         }
         guard !own.isEmpty else { return groups }

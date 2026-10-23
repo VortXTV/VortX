@@ -35,40 +35,190 @@ import Combine
 /// screen labels the card accordingly. Everything is fail-soft: a missing / unreadable bucket contributes
 /// nothing rather than crashing.
 ///
-/// Threading mirrors `WatchedIndex`: the public entry points run on the main queue (the view calls `load()`
-/// from a main-actor `.task`, and the scope `didSet` fires on the main thread), the bucket JSON is parsed on
-/// a utility queue, and every `@Published` mutation is hopped back to the main queue. Not a `@MainActor`
-/// type on purpose, so the GCD hop stays isolation-clean.
+/// The main actor owns requests, cached records and a serialized presentation mailbox. Bucket parsing
+/// remains on a utility queue. A request retains its original profile/account authority through every
+/// asynchronous hop; observation can enqueue newer intent but cannot enter a nested Published setter.
+@MainActor
 final class WatchStatsModel: ObservableObject {
-    /// The computed stats for the selected scope (nil until the first load completes).
-    @Published private(set) var stats: WatchStats?
-    /// Years present in the watch history, newest first, for the "year in review" scope picker.
-    @Published private(set) var availableYears: [Int] = []
-    /// True while the first load reads + parses the buckets off the main queue. Starts true so the very
-    /// first frame (before `load()` runs from `.task`) shows the loader, not a false "no history" state.
-    @Published private(set) var isLoading = true
+    private struct Presentation {
+        var authority: Authority?
+        var stats: WatchStats?
+        var availableYears: [Int] = []
+        var isLoading = true
+        var selectedYear: Int?
+    }
 
-    /// nil = all time; otherwise a specific calendar year. Re-filters the cached records in memory (cheap),
-    /// so switching scope never re-reads the buckets.
-    @Published var selectedYear: Int? {
-        didSet { if selectedYear != oldValue { recompute() } }
+    // One Published assignment keeps the four visible values coherent. The existing view reads these
+    // properties and assigns selectedYear; it does not use the old synthesized $property publishers.
+    @Published private var presentation = Presentation()
+    var stats: WatchStats? { visiblePresentation.stats }
+    var availableYears: [Int] { visiblePresentation.availableYears }
+    var isLoading: Bool { visiblePresentation.isLoading }
+    var selectedYear: Int? {
+        get { visiblePresentation.selectedYear }
+        set {
+            guard desired.selectedYear != newValue else { return }
+            desired.selectedYear = newValue
+            retireStaleState()
+            recompute()
+            publish()
+        }
+    }
+
+    private var visiblePresentation: Presentation {
+        // A Published willSet observer may retire the owner without calling this model. The setter
+        // can still physically store its old value before returning; public reads must refuse that
+        // value's ORIGINAL authority even before the bounded drain gets its next repair opportunity.
+        guard let authority = presentation.authority, !Self.authorityIsCurrent(authority) else {
+            return presentation
+        }
+        var unavailable = Presentation()
+        unavailable.isLoading = false
+        return unavailable
+    }
+
+    /// All fields are captured before the first publication or asynchronous hop. The legacy UID remains
+    /// optional: nil is an exact identity here, while the bucket reader retains its signed-out policy.
+    private struct Authority {
+        let epoch: UUID
+        let credential: CredentialScopeRegistry.Capture
+        let profileID: UUID?
+        let profile: LegacyWatchOwnership.ProfileBinding?
+        let keychainAccount: String
+        let usesEngineHistory: Bool
+        let target: PlaybackMutationTarget
+    }
+
+    private struct LoadRequest {
+        let generation = UUID()
+        let authority: Authority
     }
 
     /// The normalized records for the active profile, cached so a scope change is an in-memory recompute.
     private var records: [WatchRecord] = []
     /// metaId (and, where known, the title's imdb video id) -> genres, joined from in-memory `CoreMeta`.
     private var genresByID: [String: [String]] = [:]
+    private var cachedAuthority: Authority?
+    private var activeRequest: LoadRequest?
+    private var libraryTask: Task<Void, Never>?
+    private var ownershipSubscription: AnyCancellable?
+
+    private var desired = Presentation()
+    private var publicationPending = false
+    private var isPublishing = false
+    private var publicationScheduled = false
+
+    init() {
+        // A settled profile/auth boundary also retires an already visible result, without asking the
+        // view to issue another load. Admission checks use the epoch directly and do not wait for this
+        // scheduled notification. A delayed notification cannot retire a newer, still-current request.
+        ownershipSubscription = NotificationCenter.default.publisher(for: LegacyWatchOwnership.sessionDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                dispatchPrecondition(condition: .onQueue(.main))
+                MainActor.assumeIsolated {
+                    guard let self, self.retireStaleState() else { return }
+                    self.publish()
+                }
+            }
+    }
+
+    private static func profileBinding(_ profiles: ProfileStore) -> LegacyWatchOwnership.ProfileBinding? {
+        profiles.active.map { .init(id: $0.id, isOwner: $0.isOwner, usesOwnAccount: $0.usesOwnAccount) }
+    }
+
+    private static func captureAuthority() -> Authority? {
+        guard let epoch = LegacyWatchOwnership.captureApplicationEpoch() else { return nil }
+        let profiles = ProfileStore.shared
+        let credential = CredentialScopeRegistry.shared.capture()
+        let authority = Authority(epoch: epoch, credential: credential, profileID: profiles.activeID,
+                                  profile: profileBinding(profiles), keychainAccount: profiles.activeKeychainAccount,
+                                  usesEngineHistory: profiles.activeUsesEngineHistory,
+                                  target: PlaybackMutationTarget.capture(core: .shared))
+        return authorityIsCurrent(authority) ? authority : nil
+    }
+
+    private static func authorityIsCurrent(_ authority: Authority) -> Bool {
+        let profiles = ProfileStore.shared
+        guard LegacyWatchOwnership.applicationEpochIsCurrent(authority.epoch),
+              CredentialScopeRegistry.shared.isCurrent(authority.credential),
+              profiles.activeID == authority.profileID, profileBinding(profiles) == authority.profile,
+              profiles.activeKeychainAccount == authority.keychainAccount,
+              profiles.activeUsesEngineHistory == authority.usesEngineHistory else { return false }
+        guard authority.target.stillOwnsCurrentContext(core: .shared) else { return false }
+        return LegacyWatchOwnership.applicationEpochIsCurrent(authority.epoch)
+            && CredentialScopeRegistry.shared.isCurrent(authority.credential)
+    }
+
+    private func isCurrent(_ request: LoadRequest) -> Bool {
+        activeRequest?.generation == request.generation && Self.authorityIsCurrent(request.authority)
+    }
+
+    /// Only transient presentation/cache state is retired; no history, account or epoch is mutated.
+    @discardableResult
+    private func retireStaleState() -> Bool {
+        var changed = false
+        if let request = activeRequest, !Self.authorityIsCurrent(request.authority) {
+            activeRequest = nil
+            libraryTask?.cancel()
+            libraryTask = nil
+            desired.isLoading = false
+            if cachedAuthority == nil { desired.authority = nil }
+            changed = true
+        }
+        if let authority = cachedAuthority, !Self.authorityIsCurrent(authority) {
+            records = []
+            genresByID = [:]
+            cachedAuthority = nil
+            desired.authority = activeRequest?.authority
+            desired.stats = nil
+            desired.availableYears = []
+            changed = true
+        }
+        return changed
+    }
 
     // MARK: Load
 
     /// Read the active profile's watch history (read only) and compute stats. Safe to call repeatedly;
     /// it fully rebuilds. The owner path parses the bucket JSON on a utility queue and republishes on main.
     func load() {
-        isLoading = true
+        // Retire the previous generation before any observer can run. Capture the ORIGINAL authority
+        // now, including UID and same-owner epoch, rather than borrowing it after the library wait.
+        activeRequest = nil
+        libraryTask?.cancel()
+        libraryTask = nil
+        retireStaleState()
+        guard let authority = Self.captureAuthority() else {
+            records = []
+            genresByID = [:]
+            cachedAuthority = nil
+            desired.authority = nil
+            desired.stats = nil
+            desired.availableYears = []
+            desired.isLoading = false
+            publish()
+            return
+        }
+        let request = LoadRequest(authority: authority)
+        activeRequest = request
         genresByID = Self.buildGenreIndex()
-#if VORTX_NATIVE_DATA_ENGINE
-        guard let playback = CoreBridge.shared.nativePlaybackSnapshot() else { records = []; stats = nil; isLoading = false; return }
-        records = (playback["history"]?.array ?? []).compactMap { row in
+        // Keep the original cache lease while a same-context reload leaves its prior stats visible.
+        if cachedAuthority == nil { desired.authority = authority }
+        desired.isLoading = true
+        publish()
+        guard isCurrent(request) else { abandon(request); return }
+        guard let playback = CoreBridge.shared.nativePlaybackSnapshot() else {
+            guard isCurrent(request) else { abandon(request); return }
+            records = []
+            cachedAuthority = authority
+            desired.authority = authority
+            desired.stats = nil
+            desired.isLoading = false
+            publish()
+            return
+        }
+        let loaded = (playback["history"]?.array ?? []).compactMap { row -> WatchRecord? in
             guard case .string(let id) = row["metaId"], case .string(let type) = row["type"],
                   WatchStats.isVODType(type), !WatchStats.isInternalID(id) else { return nil }
             let duration = (try? row["durationMs"]?.decode(Double.self)) ?? 0
@@ -84,55 +234,39 @@ final class WatchStatsModel: ObservableObject {
                                poster: try? row["poster"]?.decode(String.self), watchSeconds: WatchStats.clampSeconds(seconds),
                                plays: plays, lastWatched: timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil)
         }
-        finishLoad(); return
-#endif
-
-        guard ProfileStore.shared.activeUsesEngineHistory else {
-            // Overlay profile: its private overlay only, never the engine buckets.
-            records = Self.overlayRecords(ProfileStore.shared.watch)
-            finishLoad()
-            return
-        }
-
-        // Owner profile. Make sure the engine's OWN current-account library is loaded BEFORE we snapshot the
-        // live state: it is the authoritative, account-scoped history that also powers Continue Watching and
-        // the watched badges, and it is the fallback that keeps this screen from going empty when the persisted
-        // bucket file is skipped by the uid gate (signed out / just-switched account) or has not been written
-        // to disk yet on this device. `loadLibraryAndAwait` is idempotent and READ ONLY -- it no-ops when the
-        // library is already loaded and never mutates the account. `isLoading` stays true across the await, so
-        // the view shows the loader rather than a false "no history" frame.
-        Task { @MainActor [weak self] in
-            await CoreBridge.shared.loadLibraryAndAwait()
-            guard let self else { return }
-            let expectedUID = CoreBridge.shared.currentUID()
-            let liveLibrary = CoreBridge.shared.library?.catalog ?? []
-            let liveCW = CoreBridge.shared.continueWatching
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                let bucket = Self.bucketRecords(expectedUID: expectedUID)
-                let merged = Self.mergeLive(into: bucket, library: liveLibrary, continueWatching: liveCW)
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.records = merged
-                    self.finishLoad()
-                }
-            }
-        }
+        finishLoad(loaded, request: request)
     }
 
-    /// Common tail of both load paths: derive the scope years and compute the selected scope.
-    private func finishLoad() {
+    private func abandon(_ request: LoadRequest) {
+        guard activeRequest?.generation == request.generation else { return }
+        activeRequest = nil
+        libraryTask = nil
+        desired.isLoading = false
+        if cachedAuthority == nil { desired.authority = nil }
+        retireStaleState()
+        publish()
+    }
+
+    /// Common tail: accept only original-owner results, derive years, then use the newest scope intent.
+    private func finishLoad(_ loaded: [WatchRecord], request: LoadRequest) {
+        guard isCurrent(request) else { abandon(request); return }
+        records = loaded
+        cachedAuthority = request.authority
+        libraryTask = nil
         let years = Set(records.compactMap { $0.lastWatched.map { WatchStats.calendar.component(.year, from: $0) } })
-        availableYears = years.sorted(by: >)
-        // Drop a stale selection that no longer exists in this profile's data.
-        if let year = selectedYear, !availableYears.contains(year) { selectedYear = nil }
-        isLoading = false
+        desired.availableYears = years.sorted(by: >)
+        // Drop a stale selection only when this profile's accepted data proves it unavailable.
+        if let year = desired.selectedYear, !desired.availableYears.contains(year) { desired.selectedYear = nil }
+        desired.isLoading = false
         recompute()
+        publish()
     }
 
     /// Filter the cached records to the selected scope and compute. Pure + in-memory; runs on main.
     private func recompute() {
+        desired.authority = cachedAuthority ?? activeRequest?.authority
         let scoped: [WatchRecord]
-        if let year = selectedYear {
+        if let year = desired.selectedYear {
             scoped = records.filter { r in
                 guard let d = r.lastWatched else { return false }
                 return WatchStats.calendar.component(.year, from: d) == year
@@ -140,9 +274,45 @@ final class WatchStatsModel: ObservableObject {
         } else {
             scoped = records
         }
-        let label = selectedYear.map(String.init) ?? String(localized: "All time")
-        stats = WatchStats.compute(records: scoped, genresByID: genresByID, scopeLabel: label,
-                                   topTitles: WatchStats.topTitlesLimit, topGenres: WatchStats.topGenresLimit)
+        let label = desired.selectedYear.map(String.init) ?? String(localized: "All time")
+        desired.stats = WatchStats.compute(records: scoped, genresByID: genresByID, scopeLabel: label,
+                                          topTitles: WatchStats.topTitlesLimit, topGenres: WatchStats.topGenresLimit)
+    }
+
+    // MARK: Serialized observer publication
+
+    private func publish() {
+        publicationPending = true
+        guard !isPublishing, !publicationScheduled else { return }
+        schedulePublication()
+    }
+
+    private func drainPublications() {
+        guard !isPublishing else { return }
+        isPublishing = true
+        var remaining = 2
+        while publicationPending && remaining > 0 {
+            publicationPending = false
+            retireStaleState()
+            // No request/scope entry point writes presentation directly. Nested observers only
+            // replace desired and mark pending, so this setter cannot overwrite newer final storage.
+            presentation = desired
+            // Also repair a profile/auth change made by an observer that did not call this model.
+            if retireStaleState() { publicationPending = true }
+            remaining -= 1
+        }
+        isPublishing = false
+        guard publicationPending, !publicationScheduled else { return }
+        schedulePublication()
+    }
+
+    private func schedulePublication() {
+        publicationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.publicationScheduled = false
+            self.drainPublications()
+        }
     }
 
     // MARK: Owner path (engine buckets, read only)
@@ -158,7 +328,7 @@ final class WatchStatsModel: ObservableObject {
     /// #111). The one relaxation: when signed OUT (`expectedUID == nil`) the on-disk bucket is the user's OWN
     /// last-synced history with no other account to leak from -- and it is the same history the app already
     /// shows in Continue Watching and the watched badges -- so it is accepted rather than dropped.
-    private static func bucketRecords(expectedUID: String?) -> [String: WatchRecord] {
+    nonisolated private static func bucketRecords(expectedUID: String?) -> [String: WatchRecord] {
         var out: [String: WatchRecord] = [:]
         let dir = CoreBridge.storageDirURL
         for name in ["library.json", "library_recent.json"] {
@@ -183,7 +353,7 @@ final class WatchStatsModel: ObservableObject {
     /// history that powers Continue Watching and the watched badges. Watch time is estimated from the live
     /// state, since the published `CoreCWItem` carries no `overallTimeWatched`. Titles already in the buckets
     /// are left on the authoritative bucket value.
-    private static func mergeLive(into bucket: [String: WatchRecord],
+    nonisolated private static func mergeLive(into bucket: [String: WatchRecord],
                                   library: [CoreCWItem], continueWatching: [CoreCWItem]) -> [WatchRecord] {
         var out = bucket
         for item in (library + continueWatching) {

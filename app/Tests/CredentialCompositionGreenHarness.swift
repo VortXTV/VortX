@@ -101,6 +101,7 @@ struct CredentialCompositionGreenHarness {
     // manager. Keep one relative-path list for composition and every generated fixture so the
     // standalone credential stubs see the same dependency closure in each evaluation mode.
     private static let compilerDependencyRelativePaths = [
+        "app/SourcesShared/CredentialRetryCoordinator.swift",
         "app/SourcesShared/AddonReorderMove.swift",
         "app/SourcesShared/ProfileRosterSyncPolicy.swift",
         "app/SourcesShared/ContinueWatchingDedupe.swift",

@@ -44,6 +44,24 @@
 	     connected without it (issue #58). No effect for embedded-server users (loopback is exempt). -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>VortX connects to the streaming server you point it at, such as one you run at home on your local network or reach over Tailscale.</string>
+	<!-- The app's own URL scheme. Infuse calls it back (x-success / x-error) with the position the
+	     viewer stopped at, so Continue Watching resumes there. $(VORTX_URL_SCHEME) is set per target in
+	     project.yml; InfuseReturnCoordinator and TopShelfSnapshot read VortXURLScheme back at runtime. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(VORTX_URL_SCHEME)</string>
+			</array>
+		</dict>
+	</array>
+	<key>VortXURLScheme</key>
+	<string>$(VORTX_URL_SCHEME)</string>
 	<!-- Schemes the "Play in another app" handoff queries with canOpenURL, so it can offer the
 	     external players that are actually installed (Infuse, VLC). Without these, canOpenURL
 	     always returns false and no direct-handoff buttons ever appear. -->

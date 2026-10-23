@@ -52,6 +52,10 @@ object MdbListClient {
             rottenTomatoes = bySource["tomatoes"]?.roundToInt(),
             metacritic = bySource["metacritic"]?.roundToInt(),
             tmdb = bySource["tmdb"]?.roundToInt(),
+            rtAudience = (bySource["popcorn"] ?: bySource["audience"])?.roundToInt(),
+            letterboxd = bySource["letterboxd"]?.let { RatingsFormat.scaled(it, 5.0) },
+            trakt = bySource["trakt"]?.let { if (it <= 10) it * 10 else it }?.roundToInt(),
+            mal = bySource["myanimelist"]?.let { RatingsFormat.scaled(it, 10.0) },
         )
         return if (ratings.hasAny) ratings else null
     }

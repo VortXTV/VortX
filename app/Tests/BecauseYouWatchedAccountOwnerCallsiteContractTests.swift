@@ -28,7 +28,8 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
         guard let model = read(root, "app/SourcesShared/BecauseYouWatchedModel.swift"),
               let tv = read(root, "app/SourcesTV/HomeView.swift"),
               let ios = read(root, "app/SourcesiOS/iOSRootView.swift"),
-              let account = read(root, "app/SourcesShared/StremioAccount.swift") else {
+              let account = read(root, "app/SourcesShared/StremioAccount.swift"),
+              let bridge = read(root, "app/SourcesShared/CoreBridge.swift") else {
             print("FAIL  could not read Apple recommendation/account sources")
             exit(1)
         }
@@ -56,11 +57,34 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
                   "\(name) Home does not use the pre-fix slot/sign-in-only owner key")
         }
 
-        check(account.contains("Self.storeAuthKey(key, account: context.keychainAccount)") &&
-              account.contains("withCredentialMutation(slot: account)") &&
-                account.contains("guard authOperationStillCurrent(context) else { return }") &&
-                account.contains("if !isSignedIn { isSignedIn = true }"),
-              "Stremio sign-in writes its captured credential slot without relying on a true-to-true event")
+        func boundedBody(_ text: String, after marker: String, until next: String) -> String {
+            guard let start = text.range(of: marker),
+                  let end = text.range(of: next, range: start.upperBound..<text.endIndex) else {
+                preconditionFailure("Missing bounded production method: " + marker)
+            }
+            return String(text[start.lowerBound..<end.lowerBound])
+        }
+        let passwordLogin = boundedBody(account, after: "    func signIn(email rawEmail:",
+            until: "    enum LinkSignInOutcome:")
+        let linkLogin = boundedBody(account, after: "    func signInWithAuthKey(", until: "    func signOut()")
+        let ownLogin = boundedBody(bridge, after: "@MainActor func authenticateNativeOwnAccount(",
+            until: "    @MainActor private func authenticateNativeOwnerAccount(")
+        let ownerLogin = boundedBody(bridge, after: "@MainActor private func authenticateNativeOwnerAccount(",
+            until: "    private static func readNativeCredential")
+        check(passwordLogin.contains("captureNativeAccountLogin(importOwnerAddons: true)") &&
+                passwordLogin.contains("try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)") &&
+                passwordLogin.contains("guard authOperationStillCurrent(context) else { return }") &&
+                passwordLogin.contains("if !isSignedIn { isSignedIn = true }"),
+              "password sign-in retains its admitted native target and captured auth operation")
+        check(linkLogin.contains("captureNativeAccountLogin(importOwnerAddons: true)") &&
+                linkLogin.contains("try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)") &&
+                linkLogin.contains("CredentialScopeRegistry.shared.isCurrent(nativeCapture)") &&
+                linkLogin.contains("authOperationGeneration == context.generation") &&
+                linkLogin.contains("ProfileStore.shared.active?.id == context.profileID"),
+              "link sign-in independently retains its credential, operation and selected-profile capture")
+        check(ownerLogin.contains("expectedSelection: target.expectedOwnerSelection, authority: authority, read: Self.readNativeCredential") &&
+                ownLogin.contains("try Self.stageNativeCredential(token: token, source: source, transactionID: target.transactionID, capture: capture, authority: authority)"),
+              "owner and own-profile routes each retain their real secure credential-selection boundary")
         check(!model.contains("Keychain.string") && !tv.contains("Keychain.string") && !ios.contains("Keychain.string"),
               "recommendation ownership never reads or embeds a raw Keychain token")
 

@@ -254,17 +254,36 @@ object StreamRanking {
     fun healthPenalty(addon: String, isUnhealthy: ((String) -> Boolean)?): Int =
         if (isUnhealthy?.invoke(addon) == true) -STICKY_WEIGHT else 0
 
-    /** Shared bonus block used by best and rankedCandidates to keep their first choice identical. */
+    /**
+     * Shared bonus block used by best and rankedCandidates to keep their first choice identical.
+     *
+     * The continuity and binge-group hints describe the stream playing NOW. Below the explicitly chosen
+     * resolution they earn nothing: otherwise one fallback episode (1080p missing, 720p played) becomes the
+     * next episode's baseline and a binge slides 1080p, 720p, 480p. Lower releases keep their plain rank as
+     * fallbacks. Mirrors Apple's chosen-release quality floor.
+     */
     fun callerBonuses(
         s: StreamSource,
         addon: String,
         hint: String?,
         binge: String?,
         sticky: SeriesSourceSticky.Preference?,
-    ): Int = minOf(
-        continuityBonus(s, hint) + bingeBonus(s, binge) + stickyBonus(s, addon, sticky),
-        CALLER_BONUS_CEILING,
-    )
+    ): Int {
+        val continuing = if (meetsQualityFloor(s, sticky?.resolution)) {
+            continuityBonus(s, hint) + bingeBonus(s, binge)
+        } else {
+            0
+        }
+        return minOf(continuing + stickyBonus(s, addon, sticky), CALLER_BONUS_CEILING)
+    }
+
+    /** A release at or above the chosen [floor] resolution meets it; no recorded floor means every release does. */
+    fun meetsQualityFloor(s: StreamSource, floor: Int?): Boolean =
+        floor == null || floor <= 0 || resolutionRank(s) >= floor
+
+    /// The resolution a source advertises, null when its text carries none. Recorded with an explicit pick as
+    /// the binge quality floor. Mirrors Apple `knownResolution`.
+    fun knownResolution(s: StreamSource): Int? = knownResolution(qualityText(s))
 
     /// A user-pinned source floats above everything else. The bonus dwarfs the entire score range (quality
     /// spread 4313, cached +8000, source-type tier gap 15000) so a matching stream wins the one-press

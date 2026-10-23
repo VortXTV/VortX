@@ -68,8 +68,8 @@ func testTokens() {
     check(t[0].value == "8.3" && t[1].value == "84%" && t[2].value == "69" && t[3].value == "81%",
           "values: 8.3 / 84% / 69 (no %) / 81%")
 
-    // Card-size cap: a small tile asks for two (star + RT), a larger card for all four.
-    check(tokens(hmym, limit: 2).map { $0.label } == ["IMDb", "RT"], "limit 2 -> IMDb + RT (small card)")
+    // An explicit cap trims from the end of the priority order (cards now fit as many as their width holds).
+    check(tokens(hmym, limit: 2).map { $0.label } == ["IMDb", "RT"], "limit 2 -> IMDb + RT")
     check(tokens(hmym, limit: 4).count == 4, "limit 4 -> all four (large/tvOS card)")
 
     // Per-score fail-soft: a title carrying only IMDb yields exactly one token (shows only IMDb).

@@ -5,6 +5,9 @@ import UIKit
 #if canImport(MetricKit)
 import MetricKit
 #endif
+#if os(macOS)
+import AppKit
+#endif
 
 /// Runtime I/O half of the termination-evidence lane. Owns the receipt file, heartbeats, memory
 /// warnings, and the launch-time fold into the exportable probe log. All classification lives in
@@ -15,24 +18,72 @@ enum TerminationReceipt {
         .urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("termination-receipt.json")
 
-    /// Call once from each app's `@main` right after VortXCrashReporter.install(). Folds the prior
-    /// run's outcome into the probe log, then starts this run's receipt + a 60 s heartbeat.
-    static func install() {
-        foldPreviousRun()
-        note(phase: TerminationReceiptPolicy.phaseActive)
+    private static let receiptLock = NSLock()
+    // Access only under receiptLock. Runtime callbacks never reload a previous process's receipt.
+    nonisolated(unsafe) private static var session: TerminationReceiptPolicy.Session?
+    @MainActor private static var installed = false
+
+    /// Call from each app's `@main` right after VortXCrashReporter.install(). Inspect the prior
+    /// run once, then replace it with this process's fresh receipt before registering callbacks.
+    @MainActor static func install() {
+        guard !installed else { return }
+        installed = true
+        let previousReceipt = load()
+        foldPreviousRun(receipt: previousReceipt)
+        receiptLock.lock()
+        let fresh = TerminationReceiptPolicy.Session(now: Date().timeIntervalSince1970)
+        session = fresh
+        save(fresh.receipt)
+        receiptLock.unlock()
         startHeartbeat()
         observeMemoryWarnings()
+        observeOrdinaryQuit()
+    }
+
+    #if os(macOS)
+    @MainActor private static var quitObserver: NSObjectProtocol?
+    #endif
+
+    /// macOS has no scene phase for quitting: an ordinary Quit (after the streaming server has stopped)
+    /// posts willTerminate, so record it as an intentional exit. Every Mac quit was otherwise folded on the
+    /// next launch as "terminated while foregrounded". Force Quit and crashes never post it.
+    @MainActor private static func observeOrdinaryQuit() {
+        #if os(macOS)
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { _ in
+            markTerminating()
+        }
+        #endif
     }
 
     /// Record a phase transition (scenePhase onChange). Cheap: one bounded atomic JSON write.
     static func note(phase: String) {
-        var receipt = load() ?? TerminationReceiptPolicy.Receipt.initial(now: Date().timeIntervalSince1970)
-        receipt.lastPhase = phase
-        receipt.lastHeartbeatEpoch = Date().timeIntervalSince1970
-        save(receipt)
+        updateSession { $0.note(phase: phase, now: Date().timeIntervalSince1970) }
     }
 
-    /// Explicit clean-exit will (Mac terminate path). Next launch classifies as cleanExit.
+    private static func heartbeat() {
+        updateSession { $0.heartbeat(now: Date().timeIntervalSince1970) }
+    }
+
+    private static func memoryWarning(footprintMB: Int64) {
+        updateSession { $0.memoryWarning(now: Date().timeIntervalSince1970, footprintMB: footprintMB) }
+    }
+
+    /// Serialize state plus its atomic file replacement. No logging, observer delivery or actor
+    /// hops occur under this lock. Late callbacks cannot overwrite an intentional termination.
+    private static func updateSession(_ update: (inout TerminationReceiptPolicy.Session) -> Void) {
+        receiptLock.lock()
+        defer { receiptLock.unlock() }
+        guard var current = session else { return }
+        let before = current.receipt
+        update(&current)
+        guard current.receipt != before else { return }
+        session = current
+        save(current.receipt)
+    }
+
+    /// Explicit intentional exit. A later captured crash still takes precedence on next launch.
     static func markTerminating() {
         note(phase: TerminationReceiptPolicy.phaseTerminating)
     }
@@ -50,8 +101,7 @@ enum TerminationReceipt {
     /// Fold the PRIOR run's outcome into the exportable probe log. Mirrors
     /// VortXCrashReporter.foldPreviousCrash: the diagnostics toggle gates the FOLD only; the
     /// receipt is kept either way because this run immediately overwrites it.
-    private static func foldPreviousRun() {
-        let receipt = load()
+    private static func foldPreviousRun(receipt: TerminationReceiptPolicy.Receipt?) {
         let crashPending = VortXCrashReporter.pendingCrashMarkerExists
         let decision = TerminationReceiptPolicy.classify(
             receipt: receipt, crashMarkerExists: crashPending,
@@ -62,34 +112,29 @@ enum TerminationReceipt {
             message: TerminationReceiptPolicy.summaryLine(decision, receipt: receipt))
     }
 
-    private static var heartbeatTimer: Timer?
-    private static var currentPhase: String = TerminationReceiptPolicy.phaseActive
+    @MainActor private static var heartbeatTimer: Timer?
 
-    private static func startHeartbeat() {
-        #if canImport(UIKit)
+    @MainActor private static func startHeartbeat() {
+        // Every platform: on macOS the receipt otherwise kept its start time, so each fold reported
+        // "session ran 0s" however long the app had run.
         heartbeatTimer?.invalidate()
         // Main-runloop timer; 60 s granularity is plenty to separate "died while running" from
         // "device was off" (the policy's stale window is 24 h).
         let timer = Timer(timeInterval: 60, repeats: true) { _ in
-            currentPhase = TerminationReceiptPolicy.phaseActive
-            note(phase: currentPhase)
+            heartbeat()
         }
         RunLoop.main.add(timer, forMode: .common)
         heartbeatTimer = timer
-        #endif
     }
 
-    private static var memoryWarningObserver: NSObjectProtocol?
+    @MainActor private static var memoryWarningObserver: NSObjectProtocol?
 
-    private static func observeMemoryWarnings() {
+    @MainActor private static func observeMemoryWarnings() {
         #if canImport(UIKit)
         memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { _ in
-            var receipt = load() ?? TerminationReceiptPolicy.Receipt.initial(now: Date().timeIntervalSince1970)
-            receipt.lastMemoryWarningEpoch = Date().timeIntervalSince1970
-            receipt.lastMemoryWarningFootprintMB = currentFootprintMB()
-            save(receipt)
+            memoryWarning(footprintMB: currentFootprintMB())
         }
         #endif
         #if canImport(MetricKit) && !os(tvOS)

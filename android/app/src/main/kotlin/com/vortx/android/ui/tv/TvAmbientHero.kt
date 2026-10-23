@@ -40,6 +40,8 @@ import com.vortx.android.config.RemoteConfig
 import com.vortx.android.config.RemoteConfigDefaults
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.ui.prefs.VisualEffects
+import com.vortx.android.ui.prefs.currentVisualEffects
 import com.vortx.android.ui.theme.VortXMotion
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.rememberReducedMotion
@@ -74,16 +76,21 @@ internal fun TvAmbientHero(item: MetaItem?, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val reducedMotion = rememberReducedMotion()
     val autoplayTrailers = rememberAutoplayTrailers(context.applicationContext)
+    // Settings > Effects and performance: animated, still (no crossfade, no pan) or no focus art.
+    val backdrop = currentVisualEffects().backdrop
+    val stillBackdrop = reducedMotion || backdrop != VisualEffects.Backdrop.ANIMATED
 
     // A crossfade for both the backdrop and the overlay, keyed on the focused item so art and text swap in
-    // lockstep. Instant under reduced motion; the standard hero cross-fade otherwise.
+    // lockstep. Instant under reduced motion or a still backdrop; the standard hero cross-fade otherwise.
     val heroSpec: FiniteAnimationSpec<Float> =
-        if (reducedMotion) snap() else tween(VortXMotion.HERO_MS, easing = VortXMotion.easing)
+        if (stillBackdrop) snap() else tween(VortXMotion.HERO_MS, easing = VortXMotion.easing)
 
     Box(modifier = modifier.background(colors.canvas).clipToBounds()) {
         // 1) Backdrop layer: the still art (with Ken Burns) plus the base legibility scrims, crossfaded.
-        Crossfade(targetState = item, animationSpec = heroSpec, label = "tvHeroBackdrop") { current ->
-            TvHeroBackdropLayer(current, reducedMotion)
+        if (backdrop != VisualEffects.Backdrop.OFF) {
+            Crossfade(targetState = item, animationSpec = heroSpec, label = "tvHeroBackdrop") { current ->
+                TvHeroBackdropLayer(current, stillBackdrop)
+            }
         }
 
         // 2) Ambient trailer: a muted looping clip fades in OVER the still backdrop once focus settles and a

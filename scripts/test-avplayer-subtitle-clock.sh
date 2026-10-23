@@ -18,10 +18,11 @@ fi
 } | sed 's/private func /func /' > "$subtitle_test_dir/production-methods.swift"
 {
   printf '%s\n' 'import Foundation'
+  sed -n '/^enum SubtitleFileBudget {/,/^}/p' app/Sources/Player/SubtitleCueRenderer.swift
   # Only the real cue storage/bounds/offset/lookup are needed. Exclude parsing, downloads and native views.
-  sed -n '/^struct SubtitleCue {/,/    \/\/ MARK: - Parsing/p' \
+  sed -n '/^struct SubtitleCue:/,/    \/\/ MARK: - Parsing/p' \
     app/Sources/Player/SubtitleCueRenderer.swift | sed '$d'
-  sed -n '/    private static func boundedCues(/,/^    }/p' app/Sources/Player/SubtitleCueRenderer.swift
+  sed -n '/    nonisolated private static func boundedCues(/,/^    }/p' app/Sources/Player/SubtitleCueRenderer.swift
   printf '%s\n' '}'
 } > "$subtitle_test_dir/renderer.swift"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \

@@ -29,7 +29,14 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
     val authenticatedData: ByteArray get() = "$accountID\u0000$ownerProfileID".toByteArray(Charsets.UTF_8)
     val digest: String get() = MessageDigest.getInstance("SHA-256").digest(authenticatedData).joinToString("") { "%02x".format(it) }
 
-    fun validateSnapshot(snapshot: String, requireSync: Boolean = true): JSONObject {
+    fun validateSnapshot(snapshot: String, requireSync: Boolean = true): JSONObject =
+        validateLocalPresentation(snapshot, requireSync, ownerHistory = false)
+
+    /** Presentation only, after the typed coordinator has replayed the original raw sources. */
+    internal fun validateOwnerHistoryPresentation(snapshot: String): JSONObject =
+        validateLocalPresentation(snapshot, requireSync = true, ownerHistory = true)
+
+    private fun validateLocalPresentation(snapshot: String, requireSync: Boolean, ownerHistory: Boolean): JSONObject {
         val state = JSONObject(snapshot)
         val profiles = state.getJSONObject("roster").getJSONObject("profiles")
         val owner = profiles.getJSONObject(ownerProfileID)
@@ -43,7 +50,9 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
         val sync = state.optJSONObject("nativeSync")
         require(!requireSync || sync != null) { "Native sync artifact required" }
         if (sync != null) {
-            require(sync.getInt("schemaVersion") in 1..5 && sync.getString("scope") == accountID &&
+            val schema = sync.getInt("schemaVersion")
+            val admittedSchema = schema in 1..5 && !sync.has("ownerHistory") || ownerHistory && schema == 6
+            require(admittedSchema && sync.getString("scope") == accountID &&
                 sync.getString("ownerProfileId") == ownerProfileID) { "Native snapshot scope mismatch" }
             sync.getJSONObject("profiles"); sync.getJSONObject("addons"); sync.getJSONObject("libraries"); sync.getJSONObject("watches")
         }
@@ -76,6 +85,7 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
             NativeHostDocument.requireCredentialFree(bootstrap)
         }
         if (state.has("hostDocument")) {
+            NativeWatchedMigrationStorage.read(state.getJSONObject("hostDocument")).requireScope(this)
             state.getJSONObject("hostDocument")
             val excluded = state.getJSONArray("excludedCredentialPaths")
             (0 until excluded.length()).forEach { require(excluded.get(it) is String) }
@@ -101,17 +111,54 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
     }
 }
 
+/** Original authenticated encrypted-file observation. No raw bytes are exposed for logging or
+ * reconstruction, and copying its plaintext cannot manufacture a compare/replace capability. */
+internal class NativeCheckpointRead internal constructor(
+    val plaintext: String?,
+    private val issuer: Any,
+    private val scope: VortxAccountScope,
+    private val generation: Long,
+    sealed: ByteArray?,
+) {
+    private val ciphertext = sealed?.copyOf()
+    internal fun matches(store: Any, expectedScope: VortxAccountScope, currentGeneration: Long,
+                         currentCiphertext: ByteArray?): Boolean {
+        if (issuer !== store || scope != expectedScope || generation != currentGeneration) return false
+        return if (ciphertext == null) currentCiphertext == null
+        else currentCiphertext != null && MessageDigest.isEqual(ciphertext, currentCiphertext)
+    }
+}
+
 internal interface VortxCheckpointStore {
     /** Null means absent only; decrypt/key/I/O/malformed failures must throw. */
     fun read(scope: VortxAccountScope): String?
+    /** Authenticated raw envelope for explicit generic-or-typed routing, never absence-on-error. */
+    fun readRetained(scope: VortxAccountScope): String? = read(scope)
+    val supportsCheckpointAuthority: Boolean get() = false
     /** Full atomic replacement, durable flush and authenticated readback before returning. */
     fun commit(scope: VortxAccountScope, snapshot: String)
+    /** Typed routes require an original encrypted-file CAS; old stores cannot pretend support. */
+    fun captureCheckpoint(scope: VortxAccountScope): NativeCheckpointRead =
+        error("Authenticated checkpoint compare/replace unavailable")
+    fun requireCurrentCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead) {
+        error("Authenticated checkpoint compare/replace unavailable")
+    }
+    fun compareAndCommitCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead,
+                                   snapshot: String): NativeCheckpointRead =
+        error("Authenticated checkpoint compare/replace unavailable")
     /** Account-authenticated local recovery. Null means no locator, never a failed decrypt. */
     fun discover(accountID: String): VortxAccountScope? = null
     /** Publish the exact immutable owner only after its checkpoint has committed. */
     fun remember(scope: VortxAccountScope) {}
     /** Reject ambiguous older unindexed checkpoints before creating any blank account. */
     fun verifyFreshAccount(scope: VortxAccountScope) {}
+    fun verifyOwnerHistoryAbsence(scope: VortxAccountScope, original: NativeCheckpointRead,
+                                 preservedPreflight: NativeMigrationPreflight?) {
+        require(preservedPreflight == null) { "Retained migration requires authenticated preservation" }
+        requireCurrentCheckpoint(scope, original)
+        require(original.plaintext == null)
+        verifyFreshAccount(scope)
+    }
     /** Setup-only evidence; a missing runtime is never replaced with an empty one. */
     fun readPreflight(accountID: String): NativeMigrationPreflight? = null
     fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) {
@@ -124,7 +171,31 @@ internal class VortxEncryptedCheckpointStore(
     private val directory: File,
     private val key: (VortxAccountScope) -> SecretKey,
 ) : VortxCheckpointStore {
+    override val supportsCheckpointAuthority: Boolean get() = true
+    private val readIssuer = Any()
+    private val checkpointGenerations = mutableMapOf<String, Long>()
+    private fun checkpointGeneration(scope: VortxAccountScope) = checkpointGenerations[scope.digest] ?: 0L
+    private fun retireCheckpointRead(scope: VortxAccountScope) {
+        val previous = checkpointGeneration(scope)
+        check(previous < Long.MAX_VALUE) { "Checkpoint generation exhausted" }
+        checkpointGenerations[scope.digest] = previous + 1
+    }
     private fun file(scope: VortxAccountScope) = File(directory, "native-state-v1-${scope.digest}.sealed")
+    private fun readSealed(scope: VortxAccountScope): ByteArray? = try {
+        val target = file(scope)
+        require(Files.size(target.toPath()) <= MAX_BYTES) { "Invalid native checkpoint size" }
+        java.io.FileInputStream(target).use { input ->
+            val output = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                require(output.size().toLong() + count <= MAX_BYTES) { "Invalid native checkpoint size" }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        }
+    } catch (_: java.nio.file.NoSuchFileException) { null }
     private fun open(scope: VortxAccountScope, bytes: ByteArray): String {
         require(bytes.size in 28..MAX_BYTES) { "Invalid native checkpoint" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -178,10 +249,34 @@ internal class VortxEncryptedCheckpointStore(
             open(scope, Files.readAllBytes(target.toPath())).also(scope::validateSnapshot)
         } catch (_: java.nio.file.NoSuchFileException) { null }
     }
+    @Synchronized override fun readRetained(scope: VortxAccountScope): String? = captureCheckpoint(scope).plaintext
     @Synchronized override fun commit(scope: VortxAccountScope, snapshot: String) {
         scope.validateSnapshot(snapshot)
+        // A failed rename/readback is uncertain too; no older captured read may retry over it.
+        retireCheckpointRead(scope)
         replace(scope, file(scope), snapshot)
         check(read(scope) == snapshot) { "Native checkpoint readback failed" }
+    }
+    @Synchronized override fun captureCheckpoint(scope: VortxAccountScope): NativeCheckpointRead {
+        val sealed = readSealed(scope)
+        return NativeCheckpointRead(sealed?.let { open(scope, it) }, readIssuer, scope,
+            checkpointGeneration(scope), sealed)
+    }
+    @Synchronized override fun requireCurrentCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead) {
+        check(expected.matches(readIssuer, scope, checkpointGeneration(scope), readSealed(scope))) { "Native checkpoint changed" }
+    }
+    @Synchronized override fun compareAndCommitCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead,
+                                                         snapshot: String): NativeCheckpointRead {
+        val current = readSealed(scope)
+        check(expected.matches(readIssuer, scope, checkpointGeneration(scope), current)) { "Native checkpoint changed" }
+        // Validation/replay/whole-account budgeting is owned by the same typed Session authority;
+        // this storage layer does not turn an interpretation-only JSONObject into its raw source.
+        require(snapshot.toByteArray(Charsets.UTF_8).size <= MAX_BYTES - 28)
+        retireCheckpointRead(scope)
+        replace(scope, file(scope), snapshot, replaceExisting = current != null)
+        val accepted = captureCheckpoint(scope)
+        check(accepted.plaintext == snapshot) { "Native checkpoint readback failed" }
+        return accepted
     }
     // The locator has a separate key/AAD domain. Neither owner identity nor roster is stored in
     // plaintext. A crash between state and locator publication leaves recoverable state, not an
@@ -201,11 +296,24 @@ internal class VortxEncryptedCheckpointStore(
         val target = locatorFile(accountID)
         val scope = try { readLocator(target) } catch (_: java.nio.file.NoSuchFileException) { return null }
         require(scope.accountID == accountID)
-        checkNotNull(read(scope)) { "Native account locator has no checkpoint" }
+        validateStoredCheckpoint(scope, checkNotNull(captureCheckpoint(scope).plaintext) { "Native account locator has no checkpoint" })
         return scope
     }
     @Synchronized override fun verifyFreshAccount(scope: VortxAccountScope) {
         require(readPreflight(scope.accountID) == null) { "Authenticated native migration is still pending" }
+        verifyNoUnindexedCheckpoint(scope)
+    }
+    @Synchronized override fun verifyOwnerHistoryAbsence(scope: VortxAccountScope, original: NativeCheckpointRead,
+                                                       preservedPreflight: NativeMigrationPreflight?) {
+        requireCurrentCheckpoint(scope, original)
+        require(original.plaintext == null)
+        val retained = readPreflight(scope.accountID)
+        require(retained?.raw == preservedPreflight?.raw && (retained == null || retained.scope == scope)) {
+            "Original migration setup changed"
+        }
+        verifyNoUnindexedCheckpoint(scope)
+    }
+    private fun verifyNoUnindexedCheckpoint(scope: VortxAccountScope) {
         discover(scope.accountID)?.let { require(it == scope); return }
         val files = try { Files.list(directory.toPath()).use { paths -> paths.iterator().asSequence().map { it.toFile() }.toList() } }
             catch (_: java.nio.file.NoSuchFileException) { return }
@@ -218,20 +326,32 @@ internal class VortxEncryptedCheckpointStore(
     @Synchronized override fun remember(scope: VortxAccountScope) {
         val old = discover(scope.accountID)
         require(old == null || old == scope) { "Native account owner changed" }
-        checkNotNull(read(scope)) { "Cannot publish an absent native checkpoint" }
+        validateStoredCheckpoint(scope, checkNotNull(captureCheckpoint(scope).plaintext) { "Cannot publish an absent native checkpoint" })
         if (old == scope) return
         val descriptor = JSONObject().put("schemaVersion", 1).put("accountID", scope.accountID)
             .put("ownerProfileID", scope.ownerProfileID).toString()
         replace(locatorScope(scope.accountID), locatorFile(scope.accountID), descriptor)
         check(discover(scope.accountID) == scope) { "Native account locator readback failed" }
     }
-    private fun replace(scope: VortxAccountScope, target: File, snapshot: String) {
+    private fun validateStoredCheckpoint(scope: VortxAccountScope, snapshot: String) {
+        if (JSONObject(snapshot).optString("kind") == "vortx.owner-history.checkpoint/1") {
+            // Routing is not acceptance: the typed decoder verifies exact keys, integers,
+            // scope and canonical base64. Full source replay happens before Session publication.
+            NativeOwnerHistoryCoordinator.decodeEnvelope(snapshot.toByteArray(Charsets.UTF_8), scope)
+        } else scope.validateSnapshot(snapshot)
+    }
+    private fun replace(scope: VortxAccountScope, target: File, snapshot: String, replaceExisting: Boolean = true) {
         val sealed = seal(scope, snapshot)
         Files.createDirectories(directory.toPath())
         val pending = Files.createTempFile(directory.toPath(), "native-checkpoint-", ".pending")
         try {
             FileOutputStream(pending.toFile()).use { it.write(sealed); it.fd.sync() }
-            Files.move(pending, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            if (replaceExisting) {
+                Files.move(pending, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } else {
+                // Same-filesystem hard-link is create-only. A raced first checkpoint is never replaced.
+                Files.createLink(target.toPath(), pending)
+            }
             FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
             check(open(scope, Files.readAllBytes(target.toPath())) == snapshot) { "Native sealed readback failed" }
         } finally { Files.deleteIfExists(pending) }
@@ -276,6 +396,10 @@ internal class VortxNativeSession private constructor(
     private var websiteAddonEditPending: JSONObject,
     private val onMutation: () -> Unit,
     private val beforeOwnerChange: () -> Unit,
+    /** A committed playback-progress report: the account upload may wait for playback to go quiet. */
+    private val onProgressMutation: () -> Unit = onMutation,
+    private var ownerHistory: NativeOwnerHistorySessionAdapter? = null,
+    private val ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
 ) : AutoCloseable {
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner,
                             val bridges: MutableList<VortxResourceBridge> = mutableListOf(),
@@ -283,11 +407,20 @@ internal class VortxNativeSession private constructor(
         fun close() = bridges.forEach { it.close() }
     }
     private val slots = mutableMapOf<String, Slot>()
+    /** The kernel's reason the latest offered legacy delta was held; null once one is accepted. */
+    @Volatile var heldLegacyReconciliation: String? = null
+        private set
     private var revision = nextRevision.incrementAndGet()
     private var closed = false
+    private var retirementComplete = false
     private var checkpointUncertain = false
+    private var unconfirmedHistoryRetirement = false
+    private var acknowledgedCheckpoint: NativeCheckpointRead? = null
     private val changes = MutableStateFlow(0L)
     val updates: StateFlow<Long> get() = changes
+
+    private fun validatePresentation(snapshot: String): JSONObject = if (runtime.isTyped)
+        scope.validateOwnerHistoryPresentation(snapshot) else scope.validateSnapshot(snapshot)
 
     companion object {
         private val nextRevision = AtomicLong()
@@ -298,12 +431,24 @@ internal class VortxNativeSession private constructor(
                  initialHostPreferences: JSONObject? = null,
                  initialLegacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
                  verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
-                 onMutation: () -> Unit = {}, beforeOwnerChange: () -> Unit = {}, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
+                 onMutation: () -> Unit = {}, beforeOwnerChange: () -> Unit = {},
+                 onProgressMutation: () -> Unit = onMutation,
+                 ownerHistoryBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
+                 ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
+                 isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
             scope.rejectCredentials(initialHostProfiles)
             scope.rejectCredentials(initialHostArchive)
             bootstrapActions.forEach(scope::rejectCredentials)
-            val stored = store.read(scope)
+            val stored = store.readRetained(scope)
+            if (stored != null && NativeOwnerHistorySessionAdapter.isEnvelope(stored)) {
+                require(bootstrapActions.isEmpty()) { "Typed peer changes require the raw account route" }
+                val original = store.captureCheckpoint(scope)
+                check(original.plaintext == stored) { "Native checkpoint changed during open" }
+                return openOwnerHistory(scope, NativeOwnerHistoryCoordinator.decodeEnvelope(stored.toByteArray(Charsets.UTF_8), scope),
+                    original, bindings, ownerHistoryBindings, store, transport, requireNotNull(ownerHistoryAuthority),
+                    onMutation, beforeOwnerChange, onProgressMutation, isAccountCurrent)
+            }
             val runtime = if (stored != null) {
                 val retained = scope.validateSnapshot(stored)
                 // Earlier experimental checkpoints may contain encoded credentials in adjacent
@@ -331,8 +476,13 @@ internal class VortxNativeSession private constructor(
                 check(JSONObject(runtime.dispatch(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID).toString())).getBoolean("ok")) {
                     "Native sync artifact required"
                 }
+                var heldBootstrap: JSONObject? = null
+                var heldBootstrapReason: String? = null
                 for (action in bootstrapActions) {
-                    check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native account bootstrap rejected" }
+                    val result = runtime.dispatch(action.toString())
+                    if (JSONObject(result).optBoolean("ok")) continue
+                    check(NativeLegacyReconciliationPolicy.holdable(action) && heldBootstrap == null) { "Native account bootstrap rejected" }
+                    heldBootstrap = action; heldBootstrapReason = NativeLegacyReconciliationPolicy.rejectionCode(result)
                 }
                 val old = stored?.let(::JSONObject)
                 val storedProfiles = old?.optJSONObject("hostProfilePreferences")
@@ -357,8 +507,9 @@ internal class VortxNativeSession private constructor(
                     JSONObject(runtime.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(hostProfiles)
                 // Preserve exact typed source clocks beside the receipt, never the credential-bearing cloud document.
+                // A held material was rejected: never adopt it as the retained baseline.
                 val legacyMaterial = old?.optJSONObject("legacyImportMaterial")
-                    ?: bootstrapActions.firstOrNull { it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
+                    ?: bootstrapActions.firstOrNull { it !== heldBootstrap && it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
                 val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
                 }
@@ -390,15 +541,90 @@ internal class VortxNativeSession private constructor(
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()), hostPending, hostState,
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) },
                     legacyBootstrap?.let { JSONObject(it.toString()) },
-                    JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), NativeWebsiteAddonEdits.detached(pendingAddonEdits), onMutation, beforeOwnerChange)
+                    JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), NativeWebsiteAddonEdits.detached(pendingAddonEdits), onMutation, beforeOwnerChange,
+                    onProgressMutation = onProgressMutation, ownerHistoryAuthority = ownerHistoryAuthority)
+                    .also {
+                        it.heldLegacyReconciliation = heldBootstrapReason
+                        if (store.supportsCheckpointAuthority) {
+                            it.acknowledgedCheckpoint = store.captureCheckpoint(scope).also { read ->
+                                check(read.plaintext == snapshot) { "Native checkpoint changed after admission" }
+                            }
+                        }
+                    }
             } catch (error: Throwable) { runtime.close(); throw error }
+        }
+        internal fun openOwnerHistory(scope: VortxAccountScope, checkpoint: NativeOwnerHistoryCoordinator.Checkpoint,
+            original: NativeCheckpointRead, bindings: VortxRuntimeBindings, historyBindings: NativeOwnerHistoryBindings,
+            store: VortxCheckpointStore, transport: VortxResourceTransport, authority: NativeOwnerHistoryAuthority,
+            onMutation: () -> Unit, beforeOwnerChange: () -> Unit, onProgressMutation: () -> Unit,
+            isAccountCurrent: () -> Boolean,
+            openingAuthority: NativeOwnerHistoryAuthority = authority): VortxNativeSession {
+            val adapter = NativeOwnerHistorySessionAdapter.open(scope, checkpoint, original, historyBindings, store, authority, openingAuthority)
+            try {
+                val state = NativeProfileOverlayWitness.parseAccountDocument(adapter.presentation())
+                val raw = OHJson.Obj(checkpoint.snapshot)
+                // Explicit adjacent host projections only; raw unknown/source roots never enter
+                // JSONObject and remain in the accepted checkpoint unchanged.
+                listOf("hostDocument", "excludedCredentialPaths", "legacyImportMaterial", "legacyWebsiteBootstrap").forEach { key ->
+                    raw[key]?.let { value ->
+                        val boxed = NativeProfileOverlayWitness.parseAccountDocument(OHJson.Obj().set("value", value).encoded())
+                        state.put(key, boxed.get("value"))
+                    }
+                }
+                val host = NativeHostPreferences.local(scope, JSONObject(OHJson.utf8(checkpoint.hostPreferences)))
+                val profiles = NativeHostPreferences.projectProfiles(host, state.optJSONObject("hostProfilePreferences") ?: JSONObject(),
+                    state.getJSONObject("roster").getJSONObject("profiles"))
+                val archive = state.optJSONObject("hostDocument")?.let {
+                    JSONObject().put("document", it).put("excludedCredentialPaths", state.getJSONArray("excludedCredentialPaths"))
+                }
+                val session = VortxNativeSession(scope, bindings, store, transport, adapter.view(), isAccountCurrent,
+                    profiles, state.optBoolean("hostProfileSyncPending"), host, state.optJSONObject("legacyImportMaterial"),
+                    archive, state.optJSONObject("legacyWebsiteBootstrap"),
+                    state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
+                    state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
+                    state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
+                    onMutation, beforeOwnerChange, onProgressMutation, adapter, authority)
+                session.read() // Real typed-source validation preceded this presentation admission.
+                return session
+            } catch (failure: Throwable) { adapter.close(); throw failure }
+        }
+        /** Restore the ORIGINAL generic file for a same-monitor warm transfer, without rewriting
+         * it first. Unknown raw fields stay in the original encrypted read for the typed union. */
+        internal fun openForOwnerHistoryTransfer(scope: VortxAccountScope, original: NativeCheckpointRead,
+            bindings: VortxRuntimeBindings, store: VortxCheckpointStore, transport: VortxResourceTransport,
+            onMutation: () -> Unit, beforeOwnerChange: () -> Unit, onProgressMutation: () -> Unit,
+            isAccountCurrent: () -> Boolean, authority: NativeOwnerHistoryAuthority): VortxNativeSession {
+            store.requireCurrentCheckpoint(scope, original)
+            val raw = checkNotNull(original.plaintext)
+            val state = scope.validateSnapshot(raw)
+            val core = JSONObject(raw).also { value ->
+                listOf("hostProfilePreferences", "hostProfileSyncPending", "nativeHostPreferenceState", "legacyImportMaterial",
+                    "hostDocument", "excludedCredentialPaths", "legacyWebsiteBootstrap", "websiteProfileEditPending",
+                    "websiteProfileEditCertificates", "websiteAddonEditPending").forEach(value::remove)
+            }
+            val runtime = VortxNativeRuntime.hydrate(bindings, core.toString())
+            try {
+                store.requireCurrentCheckpoint(scope, original)
+                val archive = state.optJSONObject("hostDocument")?.let {
+                    JSONObject().put("document", it).put("excludedCredentialPaths", state.getJSONArray("excludedCredentialPaths"))
+                }
+                return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent,
+                    state.optJSONObject("hostProfilePreferences") ?: JSONObject(), state.optBoolean("hostProfileSyncPending"),
+                    NativeHostPreferences.local(scope, state.optJSONObject("nativeHostPreferenceState")), state.optJSONObject("legacyImportMaterial"),
+                    archive, state.optJSONObject("legacyWebsiteBootstrap"),
+                    state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
+                    state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
+                    state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
+                    onMutation, beforeOwnerChange, onProgressMutation, ownerHistoryAuthority = authority)
+                    .also { it.acknowledgedCheckpoint = original }
+            } catch (failure: Throwable) { runtime.close(); throw failure }
         }
     }
 
     @Synchronized fun read(): VortxNativeRead {
         check(!closed) { "Native session closed" }
         check(isAccountCurrent()) { "Native account changed" }
-        val state = scope.validateSnapshot(JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfilePreferences)
+        val state = validatePresentation(JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfilePreferences)
             .put("hostProfileSyncPending", hostProfileSyncPending)
             .put("nativeHostPreferenceState", nativeHostPreferenceState)
             .put("legacyImportMaterial", legacyImportMaterial).put("hostDocument", hostDocumentArchive?.getJSONObject("document"))
@@ -409,14 +635,98 @@ internal class VortxNativeSession private constructor(
             .put("websiteAddonEditPending", websiteAddonEditPending).toString())
         return VortxNativeRead(VortxNativeOwner(scope, state.getString("activeProfileId"), revision), state)
     }
-    @Synchronized fun requiresRecovery(): Boolean = checkpointUncertain
-    @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !checkpointUncertain && isAccountCurrent() && read().owner == owner
+    @Synchronized fun requiresRecovery(): Boolean = checkpointUncertain || ownerHistory?.requiresRecovery() == true
+    @Synchronized fun hasOwnerHistory(): Boolean = ownerHistory != null
+    @Synchronized fun rawAccount(): ByteArray? = ownerHistory?.cloudAccount()
+    @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !requiresRecovery() && isAccountCurrent() && read().owner == owner
+
+    /** One current owner/state capture, kept under Session through the caller's admission.
+     * Unlike read followed by owned, no monitor-release window needs a second full snapshot. */
+    @Synchronized internal fun <T> withCurrentRead(action: (VortxNativeRead) -> T): T {
+        check(!closed && !requiresRecovery()) { "Native owner changed" }
+        return action(read()) // Validates account, active profile and current revision while Session is held.
+    }
+
+    /** The original raw account and authority are supplied by the authenticated gateway. */
+    @Synchronized fun receiveOwnerHistory(account: NativeOwnerHistoryAccount, authority: NativeOwnerHistoryAuthority,
+                                          historyBindings: NativeOwnerHistoryBindings, remoteHost: JSONObject?): Unit = owned(read().owner) {
+        val oldRuntime = runtime
+        var next = ownerHistory
+        var newOwner = false
+        if (next == null) {
+            val original = checkNotNull(acknowledgedCheckpoint) { "Original acknowledged checkpoint authority unavailable" }
+            store.requireCurrentCheckpoint(scope, original)
+            val retained = checkNotNull(original.plaintext) { "Native checkpoint unavailable" }
+            require(!NativeOwnerHistorySessionAdapter.isEnvelope(retained)) { "Native checkpoint route changed" }
+            val local = scope.validateSnapshot(retained)
+            val shown = read().state
+            check(OHState.ROOT.all { key ->
+                if (key != "nativeSync") NativeHostPreferences.equal(local.opt(key), shown.opt(key))
+                else OHState.NATIVE.all { field -> NativeHostPreferences.equal(local.getJSONObject(key).opt(field), shown.getJSONObject(key).opt(field)) }
+            }) { "Native checkpoint changed during transfer" }
+            val carrier = requireNotNull(account.raw(NativeOwnerHistoryAccount.ARCHIVE))
+            val ownerUID = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
+            val checkpoint = NativeOwnerHistoryCoordinator.Checkpoint(scope, retained.toByteArray(Charsets.UTF_8),
+                nativeHostPreferenceState.toString().toByteArray(Charsets.UTF_8), NativeOwnerHistorySources.empty(scope).local(),
+                account.encoded(), ownerUID)
+            next = try { NativeOwnerHistorySessionAdapter.open(scope, checkpoint, original, historyBindings, store,
+                requireNotNull(ownerHistoryAuthority) { "Original mounted account authority unavailable" }, authority) }
+            catch (failure: NativeOwnerHistoryCoordinator.Uncertain) {
+                checkpointUncertain = true; unconfirmedHistoryRetirement = true
+                slots.values.forEach { it.close() }; slots.clear()
+                throw failure
+            }
+            newOwner = true
+        }
+        val adapter = requireNotNull(next)
+        try {
+            val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope, nativeHostPreferenceState), remoteHost)
+            var projected: JSONObject? = null
+            adapter.receive(account, authority, host.toString().toByteArray(Charsets.UTF_8), local = { bytes ->
+                val state = JSONObject(OHJson.utf8(bytes))
+                val profiles = NativeHostPreferences.projectProfiles(host, hostProfilePreferences,
+                    state.getJSONObject("roster").getJSONObject("profiles"))
+                NativeHostPreferences.validateProjectedProfiles(profiles)
+                projected = profiles
+                state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
+                    .put("nativeHostPreferenceState", host)
+                    .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
+                    .put("websiteAddonEditPending", websiteAddonEditPending).toString().toByteArray(Charsets.UTF_8)
+            }, beforePersist = {
+                // The generic engine is retired before typed persistence/native acceptance. No
+                // second live writer can later overwrite the transferred checkpoint.
+                if (newOwner) {
+                    try { oldRuntime.close() }
+                    catch (failure: Throwable) { checkpointUncertain = true; throw failure }
+                }
+            })
+            if (newOwner) { runtime = adapter.view(); ownerHistory = adapter }
+            hostProfilePreferences = requireNotNull(projected)
+            nativeHostPreferenceState = host
+            invalidate(); changes.value += 1
+        } catch (failure: Throwable) {
+            if (newOwner) {
+                checkpointUncertain = true
+                // Retain the reservation even if native retirement is uncertain.
+                ownerHistory = adapter
+                runCatching { adapter.close() }
+            }
+            slots.values.forEach { it.close() }; slots.clear()
+            throw failure
+        }
+    }
     @Synchronized fun resolve(request: JSONObject, owner: VortxNativeOwner = read().owner): JSONObject = owned(owner) {
         JSONObject(runtime.resolve(request.toString())).also { check(it.getString("kind") != "error") { "Native query rejected" } }
     }
     /** Destructive follow-through requires the exact current authenticated checkpoint, not an
      * action ACK or an in-memory publication. Adjacent host carriers never enter the kernel. */
     @Synchronized fun resolveCommitted(request: JSONObject, owner: VortxNativeOwner): JSONObject = owned(owner) {
+        if (runtime.isTyped) {
+            // The typed view rechecks the original authenticated envelope and native fence.
+            return@owned runtime.resolve(request.toString()).let(::JSONObject).also {
+                check(it.getString("kind") != "error" && accepts(owner)) { "Native committed query rejected" }
+            }
+        }
         val committed = scope.validateSnapshot(requireNotNull(store.read(scope)) { "Native checkpoint unavailable" })
         check(NativeHostPreferences.equal(committed, read().state)) { "Native checkpoint no longer matches the mounted state" }
         val core = JSONObject(committed.toString()).also { value ->
@@ -440,7 +750,7 @@ internal class VortxNativeSession private constructor(
     @Synchronized private fun applyWebsiteProfileEdit(event: JSONObject, retainedSource: JSONObject, owner: VortxNativeOwner): Boolean = owned(owner) {
         scope.rejectCredentials(event)
         val before = runtime.stateJson()
-        val candidate = VortxNativeRuntime.hydrate(bindings, before)
+        val candidate = runtime.fork()
         var installed = false
         try {
             val applied = try {
@@ -471,8 +781,8 @@ internal class VortxNativeSession private constructor(
             val pending = NativeWebsiteProfileEdits.remove(websiteProfileEditPending, event.getString("eventId"))
             val updated = checkpoint(candidate.stateJson(), preferences, hostProfileSyncPending, applied.host,
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, applied.certificates)
-            val state = scope.validateSnapshot(updated)
-            commitCheckpoint(updated)
+            val state = validatePresentation(updated)
+            commitCheckpoint(updated, candidate)
             check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
             val profileChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
@@ -490,7 +800,7 @@ internal class VortxNativeSession private constructor(
         val pending = NativeWebsiteProfileEdits.retain(scope, websiteProfileEditPending, event)
         val updated = checkpoint(runtime.stateJson(), hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
             legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, websiteProfileEditCertificates)
-        scope.validateSnapshot(updated); commitCheckpoint(updated)
+        validatePresentation(updated); commitCheckpoint(updated)
         check(isAccountCurrent()) { "Native account changed" }
         websiteProfileEditPending = pending; changes.value += 1
     }
@@ -507,7 +817,7 @@ internal class VortxNativeSession private constructor(
             union.filter { it.getString("eventId") in conflicts }.forEach { pending = NativeWebsiteAddonEdits.retain(scope, pending, it) }
             val updated = checkpoint(runtime.stateJson(), hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, websiteProfileEditPending, websiteProfileEditCertificates, pending)
-            scope.validateSnapshot(updated); beforeCommit(); commitCheckpoint(updated)
+            validatePresentation(updated); beforeCommit(); commitCheckpoint(updated)
             check(isAccountCurrent()) { "Native account changed" }
             websiteAddonEditPending = pending; changes.value += 1
         }
@@ -522,7 +832,7 @@ internal class VortxNativeSession private constructor(
                                                        beforeCommit: () -> Unit): Boolean = owned(owner) {
         NativeWebsiteAddonEdits.validate(scope, event)
         val before = runtime.stateJson()
-        val candidate = VortxNativeRuntime.hydrate(bindings, before)
+        val candidate = runtime.fork()
         var installed = false
         try {
             val receipt = try {
@@ -533,7 +843,7 @@ internal class VortxNativeSession private constructor(
                 val updated = checkpoint(before, hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
                     legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, websiteProfileEditPending,
                     websiteProfileEditCertificates, pending)
-                scope.validateSnapshot(updated); beforeCommit(); commitCheckpoint(updated)
+                validatePresentation(updated); beforeCommit(); commitCheckpoint(updated)
                 check(isAccountCurrent()) { "Native account changed" }
                 websiteAddonEditPending = pending; changes.value += 1
                 return@owned false
@@ -546,8 +856,8 @@ internal class VortxNativeSession private constructor(
             val updated = checkpoint(candidate.stateJson(), hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, websiteProfileEditPending,
                 websiteProfileEditCertificates, pending)
-            val state = scope.validateSnapshot(updated)
-            beforeCommit(); commitCheckpoint(updated)
+            val state = validatePresentation(updated)
+            beforeCommit(); commitCheckpoint(updated, candidate)
             check(isAccountCurrent()) { "Native account changed" }
             val registryChanged = !NativeHostPreferences.equal(JSONObject(before).getJSONObject("nativeSync").getJSONObject("addons"),
                 state.getJSONObject("nativeSync").getJSONObject("addons"))
@@ -582,16 +892,23 @@ internal class VortxNativeSession private constructor(
                               baselineHostProfiles: JSONObject? = null,
                               verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
                               beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
-                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap()): List<String> = owned(owner) {
+                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
+                              progressOnly: Boolean = false): List<String> = owned(owner) {
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
         val before = runtime.stateJson()
-        val candidate = VortxNativeRuntime.hydrate(bindings, before)
+        val candidate = runtime.fork()
         var installed = false
         try {
+            var heldAction: JSONObject? = null
+            var heldReason: String? = null
             val results = actions.map { action ->
-                candidate.dispatch(action.toString()).also { check(JSONObject(it).getBoolean("ok")) { "Native action rejected" } }
+                candidate.dispatch(action.toString()).also { result ->
+                    if (JSONObject(result).optBoolean("ok")) return@also
+                    check(NativeLegacyReconciliationPolicy.holdable(action) && heldAction == null) { "Native action rejected" }
+                    heldAction = action; heldReason = NativeLegacyReconciliationPolicy.rejectionCode(result)
+                }
             }
             // Verify the requested public projection before installing any part of a batch. A
             // successful action acknowledgement alone is not a watched/replacement receipt.
@@ -616,7 +933,7 @@ internal class VortxNativeSession private constructor(
             preferences = NativeHostPreferences.projectProfiles(hostState, preferences,
                 JSONObject(candidate.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
             NativeHostPreferences.validateProjectedProfiles(preferences)
-            val retained = legacyImportMaterial ?: actions.firstOrNull { it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
+            val retained = legacyImportMaterial ?: actions.firstOrNull { it !== heldAction && it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
             val archive = hostArchive ?: hostDocumentArchive
             val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("nativeHostPreferenceState", hostState)
@@ -624,9 +941,9 @@ internal class VortxNativeSession private constructor(
                 .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
                 .put("websiteAddonEditPending", websiteAddonEditPending).toString()
-            val state = scope.validateSnapshot(updated)
+            val state = validatePresentation(updated)
             beforeCommit()
-            commitCheckpoint(updated)
+            commitCheckpoint(updated, candidate, hostArchive)
             check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
             val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
@@ -638,13 +955,14 @@ internal class VortxNativeSession private constructor(
             hostProfileSyncPending = pendingPreferences
             nativeHostPreferenceState = hostState
             legacyImportMaterial = retained?.let { JSONObject(it.toString()) }
+            if (actions.any(NativeLegacyReconciliationPolicy::holdable)) heldLegacyReconciliation = heldReason
             hostDocumentArchive = archive?.let { JSONObject(it.toString()) }
             // Any profile/registry mutation invalidates in-flight resources. Progress does not.
             if (hostChanged || profileOrRegistryChanged || state.getString("activeProfileId") != owner.profileID || actions.any {
                     it.getString("type") in setOf("patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
                 }) invalidate()
             changes.value += 1
-            if (notifyMutation) onMutation()
+            if (notifyMutation) { if (progressOnly) onProgressMutation() else onMutation() }
             results
         } finally { if (!installed) candidate.close() }
     }
@@ -663,11 +981,17 @@ internal class VortxNativeSession private constructor(
     /** Rename may have succeeded before fsync/readback failed. Keep the previously published view
      * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
      * In particular, old runtime A must never overwrite a possibly installed binding B. */
-    private fun commitCheckpoint(snapshot: String) {
+    private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
         try {
-            store.commit(scope, snapshot)
-            check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
+            val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
+            if (!candidate.commitTypedCheckpoint(snapshot, archiveChanges)) {
+                store.commit(scope, snapshot)
+                check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
+                if (store.supportsCheckpointAuthority) {
+                    acknowledgedCheckpoint = store.captureCheckpoint(scope).also { check(it.plaintext == snapshot) }
+                }
+            }
         } catch (error: Throwable) {
             checkpointUncertain = true
             slots.values.forEach { it.close() }; slots.clear()
@@ -684,8 +1008,15 @@ internal class VortxNativeSession private constructor(
             .put("websiteProfileEditPending", websitePending).put("websiteProfileEditCertificates", certificates)
             .put("websiteAddonEditPending", addonPending).toString()
     @Synchronized override fun close() {
-        if (closed) return
-        closed = true; invalidate(); runtime.close(); (transport as? AutoCloseable)?.close()
+        if (retirementComplete) return
+        if (!closed) { closed = true; invalidate() }
+        check(!unconfirmedHistoryRetirement) { "Owner history retirement unconfirmed; writer remains reserved" }
+        // Failed retirement keeps the exact owner reachable and all admission quarantined.
+        // A second close retries it; it must not silently release the account's writer slot.
+        runtime.close()
+        ownerHistory?.close()
+        (transport as? AutoCloseable)?.close()
+        retirementComplete = true
         changes.value += 1
     }
     @Synchronized private fun begin(name: String, owner: VortxNativeOwner): Slot = owned(owner) {
@@ -706,6 +1037,13 @@ internal class VortxNativeSession private constructor(
         if (revoke && slots[name] === slot) slots.remove(name)
     }
 
+    /** Retire an exact consumer ticket, never a newer request that reused its slot name. */
+    @Synchronized fun retireResourceSlot(name: String, ticket: UUID) {
+        val slot = slots[name]?.takeIf { it.ticket == ticket } ?: return
+        slots.remove(name)
+        slot.close()
+    }
+
     /** Parsing may occur off-lock; publication must still belong to the exact latest consumer load. */
     @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>, action: () -> T): T =
         publish(name, owner, pages, null, action)
@@ -715,6 +1053,15 @@ internal class VortxNativeSession private constructor(
         check(slot != null && (ticket == null || slot.ticket == ticket) &&
             slot.completed == pages.map { it.requestId to it.generation }) { "Native request superseded" }
         action()
+    }
+
+    /** An auxiliary result may race the next provider receipt. Defer only that receipt mismatch;
+     * a replaced slot/owner is still an error and must retire the entire request, never be swallowed. */
+    @Synchronized fun <T : Any> publishIfLatestReceipt(name: String, owner: VortxNativeOwner,
+        pages: List<VortxResourceSnapshot>, ticket: UUID, action: () -> T): T? = owned(owner) {
+        val slot = slots[name]
+        check(slot != null && slot.ticket == ticket) { "Native request superseded" }
+        if (slot.completed != pages.map { it.requestId to it.generation }) null else action()
     }
 
     /** A new request replaces only its own consumer slot. Close/profile/account changes fence all slots. */

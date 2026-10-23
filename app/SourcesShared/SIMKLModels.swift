@@ -234,24 +234,34 @@ struct SIMKLListEntry: Sendable, Equatable {
 /// returns nil on a whole-second string and vice-versa), so a rating whose stamp fails to parse never silently
 /// falls back to `.distantPast` and loses a newer-wins comparison. Mirrors `TraktRatedAt`.
 enum SIMKLRatedAt {
-    private static let fractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
-    private static let whole: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
+    // Keep cached formatters nonisolated and serialize every access to their mutable state.
+    private final class LockedFormatters: @unchecked Sendable {
+        private let lock = NSLock()
+        private let fractional: ISO8601DateFormatter
+        private let whole: ISO8601DateFormatter
+        init() {
+            fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            whole = ISO8601DateFormatter()
+            whole.formatOptions = [.withInternetDateTime]
+        }
+        func string(from date: Date) -> String {
+            lock.lock(); defer { lock.unlock() }
+            return whole.string(from: date)
+        }
+        func date(from string: String) -> Date? {
+            lock.lock(); defer { lock.unlock() }
+            return whole.date(from: string) ?? fractional.date(from: string)
+        }
+    }
+    private static let formatters = LockedFormatters()
 
     /// Format a date the way SIMKL accepts on a ratings write (whole-second UTC, its documented shape).
-    static func string(from date: Date) -> String { whole.string(from: date) }
+    static func string(from date: Date) -> String { formatters.string(from: date) }
 
     /// Parse a SIMKL `rated_at` / `user_rated_at`, tolerating either the whole-second or fractional form.
     static func date(from string: String) -> Date? {
-        whole.date(from: string) ?? fractional.date(from: string)
+        formatters.date(from: string)
     }
 }
 

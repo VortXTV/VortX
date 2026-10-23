@@ -46,18 +46,56 @@ object PlayerHandoff {
      * or User-Agent still plays. Mirrors Apple's deep-link hand-off, in Android's Intent idiom.
      */
     fun openInExternalPlayer(context: Context, playable: Playable) {
-        val view = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(Uri.parse(playable.url), "video/*")
-            putExtra("title", playable.title)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            if (playable.headers.isNotEmpty()) {
-                // MX Player / VLC convention: a flat [name, value, name, value, ...] string array.
-                val flat = playable.headers.flatMap { (name, value) -> listOf(name, value) }.toTypedArray()
-                putExtra("headers", flat)
-            }
-        }
-        launch(context, Intent.createChooser(view, "Open in another player"), "No external player is installed")
+        launch(context, Intent.createChooser(externalPlayerIntent(playable, positionMs = 0L), "Open in another player"),
+            "No external player is installed")
     }
+
+    /**
+     * The same hand-off, started for a result so the viewer comes back to where they stopped (Apple's
+     * Infuse `position` + `x-success` round trip): the other player starts at [positionMs] and, through the
+     * MX Player result API that MX, Just Player and mpv-android share (VLC answers with its own keys),
+     * reports its stopping point to [launch]'s result. Read it back with [returnedPositionMs].
+     */
+    fun openInExternalPlayerForResult(context: Context, playable: Playable, positionMs: Long, launch: (Intent) -> Unit) {
+        val chooser = Intent.createChooser(externalPlayerIntent(playable, positionMs), "Open in another player")
+        runCatching { launch(chooser) }
+            .onFailure { Toast.makeText(context.applicationContext, "No external player is installed", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun externalPlayerIntent(playable: Playable, positionMs: Long) = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(Uri.parse(playable.url), "video/*")
+        putExtra("title", playable.title)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (playable.headers.isNotEmpty()) {
+            // MX Player / VLC convention: a flat [name, value, name, value, ...] string array.
+            val flat = playable.headers.flatMap { (name, value) -> listOf(name, value) }.toTypedArray()
+            putExtra("headers", flat)
+        }
+        startPositionMs(positionMs)?.let { putExtra("position", it) }
+        putExtra("return_result", true)
+    }
+
+    /** The start the MX Player API accepts (whole milliseconds as an Int), or null to start at the beginning. */
+    fun startPositionMs(positionMs: Long): Int? =
+        positionMs.takeIf { it >= MIN_START_MS && it <= Int.MAX_VALUE }?.toInt()
+
+    /**
+     * Where the viewer stopped in the external player, or null when nothing usable came back. Reads the MX
+     * Player result API (`position` / `duration` Int ms, `end_by`) and VLC's (`extra_position` /
+     * `extra_duration` Long ms) through [extra]. A finished playback lands on the end; a position under five
+     * seconds is ignored so opening and immediately closing the other player never wipes a resume point.
+     */
+    fun returnedPositionMs(ok: Boolean, extra: (String) -> Any?, knownDurationMs: Long): Long? {
+        if (!ok) return null
+        val duration = ((extra("duration") ?: extra("extra_duration")) as? Number)?.toLong()?.takeIf { it > 0 }
+            ?: knownDurationMs.takeIf { it > 0 }
+        val position = if (extra("end_by") == "playback_completion") duration
+        else ((extra("position") ?: extra("extra_position")) as? Number)?.toLong()
+        val usable = position?.takeIf { it >= MIN_START_MS } ?: return null
+        return duration?.let { minOf(usable, it) } ?: usable
+    }
+
+    private const val MIN_START_MS = 5_000L
 
     /** Start an activity fail-soft: an unresolved chooser (nothing installed) shows a toast, never crashes. */
     private fun launch(context: Context, intent: Intent, emptyMessage: String) {

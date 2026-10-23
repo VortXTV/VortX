@@ -296,6 +296,32 @@ enum BingeSourceMemoryRaceContractTests {
             sticky: preference, preserveChosenRelease: true, desiredAudioLanguage: "en").first?.id == french.id,
             "all-foreign set still resolves for actual-inventory validation")
 
+        // Quality ratchet: one fallback episode played 720p, so the next episode's continuity hints point at that
+        // 720p release. The explicit 1080p pick's resolution floor must bring the binge back once 1080p returns.
+        let ep1080 = stream(#"{"url":"https://cdn.invalid/ep3-1080.mkv","name":"Naruto 1080p WEB","behaviorHints":{"bingeGroup":"debrid|ep3-1080"}}"#)
+        let ep720 = stream(#"{"url":"https://cdn.invalid/ep3-720.mkv","name":"Naruto 720p WEB","behaviorHints":{"bingeGroup":"debrid|720"}}"#)
+        let ep480 = stream(#"{"url":"https://cdn.invalid/ep3-480.mkv","name":"Naruto 480p WEB","behaviorHints":{"bingeGroup":"debrid|480"}}"#)
+        let chosen1080 = (addon: Optional("Debrid"), bingeGroup: Optional("debrid|ep1-1080"))
+        let ratchet = [group("Debrid", [ep480, ep720, ep1080])]
+        func nextEpisode(_ groups: [CoreStreamSourceGroup], floor: Int?) -> [CoreStream] {
+            StreamRanking.rankedCandidates(groups, continuity: "naruto 720p web", binge: "debrid|720",
+                sticky: chosen1080, stickyAuthoritative: false, preserveChosenRelease: true, qualityFloor: floor)
+        }
+        expect(nextEpisode(ratchet, floor: nil).first?.id == ep720.id,
+               "fixture: without a floor the fallback's continuity hints keep the binge on 720p (the ratchet)")
+        expect(nextEpisode(ratchet, floor: 1080).first?.id == ep1080.id,
+               "the explicit pick's resolution floor returns the next episode to 1080p")
+        expect(nextEpisode(ratchet, floor: 1080).map(\.id) == [ep1080.id, ep720.id, ep480.id],
+               "below-floor releases stay in order as fallbacks, never removed")
+        expect(StreamRanking.best(ratchet, continuity: "naruto 720p web", binge: "debrid|720", sticky: chosen1080,
+                                  stickyAuthoritative: false, preserveChosenRelease: true, qualityFloor: 1080)?.id == ep1080.id,
+               "prepare and advance agree on the floored winner")
+        let rival1080 = stream(#"{"url":"https://cdn.invalid/rival-1080.mkv","name":"Naruto 1080p WEB Rival"}"#)
+        expect(nextEpisode([group("Debrid", [ep720]), group("Rival", [rival1080])], floor: 1080).first?.id == ep720.id,
+               "the floor never moves the binge off the chosen add-on")
+        expect(nextEpisode([group("Debrid", [ep720, ep480])], floor: 1080).first?.id == ep720.id,
+               "with nothing at the floor, the best remaining release in the chosen add-on plays")
+
         // Sanity on the fixtures themselves (proves the real CoreStream decode + classification we rely on).
         expect(cometDirect1080.playableURL != nil && !cometDirect1080.isTorrent && !cometDirect1080.isYouTubeTrailer,
                "fixture: the rival is a playable non-torrent, non-trailer stream")

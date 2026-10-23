@@ -1,18 +1,6 @@
+import { admit, Locks } from "./auth-adoption.fixtures.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { registerHooks } from "node:module";
-
-registerHooks({
-  resolve(specifier, context, next) {
-    if (specifier.startsWith(".") && !/\.[a-z]+$/i.test(specifier) && context.parentURL) {
-      const candidate = new URL(specifier + ".ts", context.parentURL);
-      if (existsSync(fileURLToPath(candidate))) return { url: candidate.href, shortCircuit: true };
-    }
-    return next(specifier, context);
-  },
-});
 
 const local = new Map();
 const sessionStorageValues = new Map();
@@ -27,13 +15,16 @@ globalThis.sessionStorage = storage(sessionStorageValues);
 globalThis.document = { documentElement: { dataset: {}, style: { setProperty() {}, removeProperty() {} } } };
 globalThis.window = new EventTarget();
 globalThis.matchMedia = () => ({ matches: false });
+Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: true, locks: new Locks() } });
 
 local.set("vortx.web.profiles.v1", JSON.stringify([{ id: "owner", name: "Owner", main: true }]));
 local.set("vortx.web.activeProfile.v1", "owner");
 
-const { __syncCryptoTestHooks } = await import("./vault.ts");
+const vault = await import("./vault.ts");
+const { __syncCryptoTestHooks } = vault;
 const { sealDocument, openDocument } = __syncCryptoTestHooks;
-const { adoptSession, applySyncDoc, __continueWatchingSyncTestHooks } = await import("./account.ts");
+const account = await import("./account.ts");
+const { applySyncDoc, __continueWatchingSyncTestHooks } = account;
 const { clearProgress, continueWatching, webProgressTombstones } = await import("./store.ts");
 
 async function installServer(accountSession, initialDoc) {
@@ -108,7 +99,7 @@ test("account adapter unions removals, preserves foreign fields, and respects no
   );
   clearProgress("imdb:tt0903747");
   const [browserARemoval] = webProgressTombstones();
-  adoptSession(accountSession);
+  await admit(vault, accountSession, account);
   assert.deepEqual(webProgressTombstones(), [browserARemoval], "owner tombstone uses the account base scope");
   await __continueWatchingSyncTestHooks.pushWebProgress(accountSession);
 

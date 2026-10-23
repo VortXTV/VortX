@@ -588,6 +588,47 @@ final class RedirectDelegateProbe: @unchecked Sendable {
     func values() -> [Int] { lock.withLock { statuses } }
 }
 
+/// All requests on this dedicated session are answered in-process; no URL can fall through to the network.
+final class AcknowledgementURLProtocol: URLProtocol, @unchecked Sendable {
+    struct Reply: Sendable {
+        let body: Data
+        var contentLength: String? = nil
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var replies: [Reply] = []
+    nonisolated(unsafe) private static var bodies: [Data] = []
+
+    static func reset(_ values: [Reply]) {
+        lock.withLock { replies = values; bodies = [] }
+    }
+    static func requestBodies() -> [Data] { lock.withLock { bodies } }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let reply: Reply? = Self.lock.withLock {
+            Self.bodies.append(request.httpBody ?? Data())
+            return Self.replies.isEmpty ? nil : Self.replies.removeFirst()
+        }
+        guard let reply, let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
+            return
+        }
+        let headers = reply.contentLength.map { ["Content-Length": $0] } ?? [:]
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: reply.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+final class AcknowledgementRequestCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bodies: [Data] = []
+    func record(_ request: URLRequest) { lock.withLock { bodies.append(request.httpBody ?? Data()) } }
+    func values() -> [Data] { lock.withLock { bodies } }
+}
+
 // MARK: - Assertions
 
 fileprivate func contractTarget(_ contentID: String?) -> SourceIndexIdentity.TargetResolution {
@@ -623,6 +664,223 @@ struct SourceIndexTorrentContractTests {
         } else {
             failures += 1
             print("FAIL  \(name)")
+        }
+    }
+
+    @MainActor
+    static func testTransportResourceTimeout() {
+        let defaultTransport = SourceIndexHTTPTransport()
+        expect(defaultTransport.session.configuration.timeoutIntervalForResource == 8,
+               "dedicated Source Index session caps the default complete-resource lifetime at eight seconds")
+
+        let oversized = URLSessionConfiguration.ephemeral
+        oversized.timeoutIntervalForResource = 90
+        let oversizedTransport = SourceIndexHTTPTransport(configuration: oversized)
+        expect(oversizedTransport.session.configuration.timeoutIntervalForResource == 8,
+               "an oversized injected complete-resource timeout cannot weaken the eight-second ceiling")
+
+        let smaller = URLSessionConfiguration.ephemeral
+        smaller.timeoutIntervalForResource = 1.25
+        smaller.timeoutIntervalForRequest = 2.5
+        let smallerTransport = SourceIndexHTTPTransport(configuration: smaller)
+        expect(smallerTransport.session.configuration.timeoutIntervalForResource == 1.25
+               && smallerTransport.session.configuration.timeoutIntervalForRequest == 2.5,
+               "a valid smaller resource cap is preserved independently of the idle request setting")
+
+        // Exercise invalid policy inputs before any Foundation setter can reject or reinterpret them.
+        // The actual initializer calls this exact sanitizer on the supplied configuration value.
+        for invalid in [TimeInterval.nan, .infinity, -.infinity, 0, -1] {
+            expect(SourceIndexHTTPTransport.boundedResourceTimeout(invalid) == 8,
+                   "nonfinite or nonpositive resource timeout input falls back to the finite eight-second ceiling")
+        }
+        expect(SourceIndexHTTPTransport.boundedResourceTimeout(0.25) == 0.25,
+               "the sanitizer preserves a finite positive cap below the remote idle-time floor")
+    }
+
+    @MainActor
+    static func testPooledReferenceTrustBoundary() {
+        let deniedHosts = [
+            "localhost", "router", "router.local", "router.localdomain", "media.internal", "media.lan",
+            "media.home", "media.test", "media.invalid", "media.example", "media.onion", "home.arpa",
+            "media.home.arpa", "router.local.", "0.1.2.3", "10.0.0.1", "100.64.0.1", "127.0.0.1",
+            "169.254.169.254", "172.16.0.1", "172.31.255.255", "192.0.0.1", "192.0.2.1", "192.88.99.1",
+            "192.168.1.1", "198.18.0.1", "198.19.255.255", "198.51.100.1", "203.0.113.1", "224.0.0.1",
+            "255.255.255.255", "127.1", "2130706433", "0177.0.0.1", "0x7f000001", "0x7f.0.0.1",
+            "0x7f.0.0.0x1", "127.0.0.0x1", "127.1.0x1", "0x7f000001.",
+            "[::]", "[::1]", "[fc00::1]", "[fe80::1]", "[ff02::1]", "[::ffff:127.0.0.1]",
+            "[::ffff:c0a8:101]", "[64:ff9b::a00:1]", "[2001::1]", "[2001:1ff::1]", "[2001:db8::1]",
+            "[2002:808:808::1]", "[3fff:fff::1]", "[fe80::1%25en0]", "[8.8.8.8]", "a..com", "-cdn.example.com",
+        ]
+        for host in deniedHosts {
+            expect(!SourceIndexContract.isPublicPooledHost(host), "pooled host rejects \(host)")
+            for kind in ["http", "usenet"] {
+                let url = "https://\(host)/video.mkv"
+                expect(SourceIndexContract.normalizePooledNonTorrentID(kind: kind, raw: url) == nil,
+                       "\(kind) contribution refuses nonpublic or ambiguous host \(host)")
+            }
+        }
+        for host in ["cdn.example.com", "CDN.example.com.", "8.8.8.8", "172.15.1.1", "172.32.1.1",
+                     "[2606:4700:4700::1111]", "[::ffff:8.8.8.8]"] {
+            expect(SourceIndexContract.isPublicPooledHost(host), "pooled host admits public syntax \(host)")
+            for kind in ["http", "usenet"] {
+                expect(SourceIndexContract.normalizePooledNonTorrentID(kind: kind, raw: "https://\(host)/video.mkv") != nil,
+                       "\(kind) contribution retains credential-free public syntax \(host)")
+            }
+        }
+        let hash = String(repeating: "a", count: 40)
+        let publicReferences = ["https://cdn.example.com/video.mkv", "https://8.8.8.8/video.mkv",
+                                "https://rebind.attacker.com/video.mkv", "https://redirect.attacker.com/video.mkv"]
+        let rows = publicReferences.flatMap { url in
+            ["http", "usenet"].map { kind in
+                SourceIndexClient.PooledSource(kind: kind, id: url, quality: "1080p", sizeBytes: 1,
+                                              seeders: nil, corroboration: 2)
+            }
+        } + [SourceIndexClient.PooledSource(kind: "torrent", id: hash, quality: "1080p", sizeBytes: 1,
+                                           seeders: 1, corroboration: 2)]
+        for capabilities in [SourceIndexClient.ServeCapabilities.torrentOnly,
+                             .init(canPlayDirectHTTP: true, hasUsenet: false),
+                             .init(canPlayDirectHTTP: false, hasUsenet: true),
+                             .init(canPlayDirectHTTP: true, hasUsenet: true)] {
+            let streams = SourceIndexClient.streams(from: rows, capabilities: capabilities)
+            expect(streams.count == 1 && streams.first?.infoHash == hash
+                   && streams.allSatisfy { $0.url == nil && $0.nzbUrl == nil },
+                   "consumer capability cannot authorize unpinned pooled HTTP/NZB connections")
+        }
+        expect(SourceIndexContract.canReconstructPooledKind("torrent")
+               && !SourceIndexContract.canReconstructPooledKind("http")
+               && !SourceIndexContract.canReconstructPooledKind("usenet")
+               && !SourceIndexContract.canReconstructPooledKind("file"),
+               "pool reconstruction admits only its proven identity handoff")
+        let lan = CoreStream(name: "My LAN", url: "http://192.168.1.20/movie.mkv")
+        let userNZB = CoreStream(name: "My indexer", nzbUrl: "http://indexer.local/file.nzb")
+        let ownGroup = CoreStreamSourceGroup(id: "user-addon", addon: "user-addon", streams: [lan, userNZB])
+        let merged = SourceIndexServeSource.merge(
+            authorizedBy: contractAuthorization("tt1234567"),
+            [lan, userNZB, CoreStream(name: "mixed", infoHash: hash, url: publicReferences[0]),
+             CoreStream(name: "torrent", infoHash: hash)], into: [ownGroup])
+        expect(merged.count == 2 && merged.first?.streams == ownGroup.streams
+               && merged.last?.streams.count == 1 && merged.last?.streams.first?.infoHash == hash,
+               "merge preserves user-authorized LAN/indexer sources and rejects unpinned community extras")
+        let descriptors = SourceIndexClient.descriptors(from: [ownGroup])
+        expect(descriptors.isEmpty, "intentional LAN sources stay usable but do not leak into community contributions")
+    }
+
+    @MainActor
+    static func testContributionAcknowledgements() async {
+        let valid = #"{"ok":true,"accepted":2,"rejected":0}"#
+        let invalid = [
+            "", " ", "{}", "[]", #"{"ok":true,"accepted":0,"rejected":2}"#,
+            #"{"ok":false,"accepted":0,"reason":"error"}"#, #"{"ok":true,"accepted":1,"rejected":1}"#,
+            #"{"ok":true,"accepted":2,"rejected":1}"#, #"{"ok":1,"accepted":2,"rejected":0}"#,
+            #"{"ok":true,"accepted":true,"rejected":0}"#, #"{"ok":true,"accepted":2,"rejected":false}"#,
+            #"{"ok":true,"accepted":2.0,"rejected":0}"#, #"{"ok":true,"accepted":2e0,"rejected":0}"#,
+            #"{"ok":true,"accepted":-2,"rejected":0}"#, #"{"ok":true,"accepted":02,"rejected":0}"#,
+            #"{"ok":true,"accepted":"2","rejected":0}"#, #"{"ok":true,"accepted":2,"rejected":null}"#,
+            #"{"ok":true,"accepted":18446744073709551616,"rejected":0}"#,
+            #"{"ok":true,"accepted":2,"rejected":0,"accepted":2}"#,
+            #"{"ok":true,"accepted":2,"rejected":0,"note":"new protocol"}"#,
+            #"{"ok":true,"accepted":2,"rejected":0}{}"#, #"{"ok":true,"accepted":2,"rejected":0"#,
+        ]
+        expect(SourceIndexContract.acknowledgesContribution(Data(valid.utf8), expectedSourceCount: 2),
+               "complete exact-count ACK is a delivery receipt")
+        expect(SourceIndexContract.acknowledgesContribution(
+            Data(" \n{ \"rejected\" : 0, \"accepted\" : 2, \"ok\" : true }\t".utf8), expectedSourceCount: 2),
+               "ACK accepts JSON whitespace and arbitrary required-field order")
+        for body in invalid {
+            expect(!SourceIndexContract.acknowledgesContribution(Data(body.utf8), expectedSourceCount: 2),
+                   "incomplete, ambiguous or unrecognized ACK is never delivered: \(body)")
+        }
+        expect(!SourceIndexContract.acknowledgesContribution(Data(valid.utf8), expectedSourceCount: 0),
+               "empty batches cannot obtain a delivery receipt")
+        let descriptor = SourceIndexClient.Descriptor(kind: "torrent", id: String(repeating: "a", count: 40),
+                                                       quality: "1080p", sizeBytes: 1, seeders: nil)
+        let other = SourceIndexClient.Descriptor(kind: "torrent", id: String(repeating: "b", count: 40),
+                                                 quality: "1080p", sizeBytes: 1, seeders: nil)
+        let encoded = SourceIndexClient.contributionBody(contentID: "tt1234567", descriptors: [descriptor, descriptor, other])!
+        expect(SourceIndexContract.contributedSourceCount(in: encoded) == 2,
+               "ACK expectation comes from actual encoded normalized/deduplicated batch")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AcknowledgementURLProtocol.self]
+        let transport = SourceIndexHTTPTransport(configuration: configuration)
+        var request = URLRequest(url: URL(string: "https://sources.vortx.tv/sources/contribute")!)
+        request.httpMethod = "POST"
+        request.httpBody = encoded
+        for body in invalid {
+            AcknowledgementURLProtocol.reset([.init(body: Data(body.utf8))])
+            do {
+                try await transport.acknowledgeContribution(for: request)
+                expect(false, "real transport must reject semantic 200 failure")
+            } catch {
+                expect((error as? SourceIndexTransportError) == .invalidAcknowledgement,
+                       "real transport rejects semantic 200 failure explicitly")
+            }
+        }
+        let cap = SourceIndexContract.maxContributionAcknowledgementBytes
+        let padded = Data((valid + String(repeating: " ", count: cap - valid.utf8.count)).utf8)
+        AcknowledgementURLProtocol.reset([.init(body: padded, contentLength: String(cap))])
+        do { try await transport.acknowledgeContribution(for: request); expect(true, "exact 512-byte valid ACK is accepted") }
+        catch { expect(false, "exact-cap ACK failed: \(error)") }
+        for reply in [AcknowledgementURLProtocol.Reply(body: padded + Data([32])),
+                      .init(body: Data(valid.utf8), contentLength: "513"),
+                      .init(body: Data(valid.utf8), contentLength: "1,2")] {
+            AcknowledgementURLProtocol.reset([reply])
+            do { try await transport.acknowledgeContribution(for: request); expect(false, "invalid ACK byte bound must reject") }
+            catch { expect(SourceIndexClient.contributionFailureKind(for: error) == .transient, "ACK bound failure stays retryable") }
+        }
+        expect(SourceIndexClient.contributionFailureKind(for: SourceIndexTransportError.invalidAcknowledgement) == .transient,
+               "partial, truncated, oversized and unknown-shape ACKs release/retry, never terminally reject descriptors")
+
+        let oldPlayback = SourceIndexClient.playbackActiveProvider
+        let oldConsent = MoatConsent.contributeAndConsume
+        SourceIndexClient.playbackActiveProvider = { false }
+        MoatConsent.contributeAndConsume = true
+        defer { SourceIndexClient.playbackActiveProvider = oldPlayback; MoatConsent.contributeAndConsume = oldConsent }
+        for first in [#"{"ok":true,"accepted":1,"rejected":1}"#, #"{"ok":false,"accepted":0,"reason":"error"}"#] {
+            AcknowledgementURLProtocol.reset([.init(body: Data(first.utf8)), .init(body: Data(valid.utf8))])
+            let store = MemoryContributionReceiptStore()
+            let clock = LockedNanosecondClock()
+            let requests = AcknowledgementRequestCapture()
+            let runtime = SourceContributionRuntime(
+                coordinator: SourceUploadCoordinator(maxEntries: 10, persistence: store),
+                retryPolicy: .init(maximumAttempts: 2, baseDelayNanoseconds: 1, maximumDelayNanoseconds: 1, jitterRangePermille: 0),
+                nowNanoseconds: { clock.now() }, sleepNanoseconds: { clock.advance($0) }, jitterPermille: { 0 },
+                transport: { request in requests.record(request); try await transport.acknowledgeContribution(for: request) })
+            let outcome = await SourceIndexClient.contribute(contentID: "tt1234567", descriptors: [descriptor, descriptor, other], runtime: runtime)
+            let sent = requests.values()
+            expect(outcome == .acceptedByProcess && sent.count == 2 && sent[0] == sent[1]
+                   && SourceIndexContract.contributedSourceCount(in: sent[0]) == 2 && store.state()?.delivered.count == 2,
+                   "semantic 200 failure retries the entire identical encoded batch before storing delivery receipts")
+        }
+        AcknowledgementURLProtocol.reset([.init(body: Data("{}".utf8)), .init(body: Data("{}".utf8))])
+        let exhaustedStore = MemoryContributionReceiptStore()
+        let exhaustedClock = LockedNanosecondClock()
+        let exhaustedCoordinator = SourceUploadCoordinator(maxEntries: 10, persistence: exhaustedStore)
+        let exhaustedRuntime = SourceContributionRuntime(coordinator: exhaustedCoordinator,
+            retryPolicy: .init(maximumAttempts: 2, baseDelayNanoseconds: 1, maximumDelayNanoseconds: 1, jitterRangePermille: 0),
+            nowNanoseconds: { exhaustedClock.now() }, sleepNanoseconds: { exhaustedClock.advance($0) }, jitterPermille: { 0 },
+            transport: { try await transport.acknowledgeContribution(for: $0) })
+        let exhausted = await SourceIndexClient.contribute(contentID: "tt1234567", descriptors: [descriptor], runtime: exhaustedRuntime)
+        let next = await exhaustedCoordinator.reserve(contentID: "tt1234567", descriptors: [descriptor])
+        expect(exhausted == .deferred && AcknowledgementURLProtocol.requestBodies().count == 2
+               && exhaustedStore.state() == nil && next != nil,
+               "exhausted semantic ACK retries leave no delivered/rejected receipt and release the whole reservation")
+        if let next { await exhaustedCoordinator.release(next) }
+
+        for retirement in ["session", "consent", "cancellation"] {
+            AcknowledgementURLProtocol.reset([.init(body: Data(#"{"ok":true,"accepted":1,"rejected":0}"#.utf8))])
+            let store = MemoryContributionReceiptStore()
+            let runtime = SourceContributionRuntime(coordinator: SourceUploadCoordinator(maxEntries: 10, persistence: store),
+                retryPolicy: .live, nowNanoseconds: { 0 }, sleepNanoseconds: { _ in }, jitterPermille: { 0 }, transport: { request in
+                    try await transport.acknowledgeContribution(for: request)
+                    if retirement == "session" { _ = SourceIndexLifecycleClock.mutateSession() }
+                    if retirement == "consent" { MoatConsent.contributeAndConsume = false }
+                    if retirement == "cancellation" { withUnsafeCurrentTask { $0?.cancel() } }
+                })
+            let task = Task { await SourceIndexClient.contribute(contentID: "tt1234567", descriptors: [descriptor], runtime: runtime) }
+            let outcome = await task.value
+            MoatConsent.contributeAndConsume = true
+            expect(outcome == .deferred && store.state() == nil,
+                   "\(retirement) after ACK but before receipt cannot mark retired work delivered")
         }
     }
 
@@ -825,7 +1083,7 @@ struct SourceIndexTorrentContractTests {
         request: URLRequest
     ) async -> Int? {
         do {
-            try await transport.discardResponse(for: request)
+            try await transport.acknowledgeContribution(for: request)
             return nil
         } catch let SourceIndexTransportError.badStatus(status) {
             return status
@@ -836,6 +1094,9 @@ struct SourceIndexTorrentContractTests {
 
     @MainActor
     static func main() async {
+        testTransportResourceTimeout()
+        testPooledReferenceTrustBoundary()
+        await testContributionAcknowledgements()
         testReceiptFileStorage()
         let lower = "abcdef0123456789abcdef0123456789abcdef01"
         let upper = lower.uppercased()
@@ -872,12 +1133,15 @@ struct SourceIndexTorrentContractTests {
         // type, so a tmdb key merges two unrelated titles into one pool bucket in both directions.
         expect(SourceIndexClient.serveURL(contentID: "tmdb:123:1:2") == nil,
                "serve boundary REFUSES a tmdb key: pool keys are IMDb-only")
-        // DEC-260723-D1: the serve request now asks for ALL kinds (torrent / http / usenet) and filters
-        // client-side by the requester's configured services, so the URL carries content_id and NO kind param.
+        // Filter remotely before ranked LIMIT100 so higher-ranked withheld URL rows cannot starve torrents.
         expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("content_id=tt1234567") == true,
                "serve boundary builds the content_id query for a canonical IMDb episode")
-        expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("kind=") == false,
-               "serve boundary requests ALL kinds (no kind filter) so http and usenet come back too")
+        let serveRequest = SourceIndexClient.serveURL(contentID: "tt1234568")!
+        expect(URLComponents(url: serveRequest, resolvingAgainstBaseURL: false)?.queryItems?
+            .filter { $0.name == "kind" }.map(\.value) == ["torrent"],
+               "serve request asks the worker for torrents before its ranked limit")
+        // Consumed by the separate actual-worker SQLite regression, linking its Request to production Swift.
+        print("SOURCE_INDEX_SERVE_URL \(serveRequest.absoluteString)")
 
         // Playback owns the device. Home/detail hoards must not extract and
         // contribute beside it, and a title already between batches must stop
@@ -1161,7 +1425,7 @@ struct SourceIndexTorrentContractTests {
 
             var post = URLRequest(url: URL(string: "https://redirect.test/cross-\(status)")!)
             post.httpMethod = "POST"
-            post.httpBody = Data("signed-body".utf8)
+            post.httpBody = SourceIndexClient.contributionBody(contentID: "tt1234567", descriptors: [receiptDescriptor])
             post.setValue("private-moat", forHTTPHeaderField: "X-VX-Moat")
             post.setValue("private-signature", forHTTPHeaderField: "X-VX-Sig")
             if let status = await postStatus(transport: redirectTransport, request: post) {
@@ -1205,25 +1469,11 @@ struct SourceIndexTorrentContractTests {
         ) == nil, "malformed or conflicting Content-Length fails closed")
         expect(SourceIndexClient.pooledSources(fromResponseData: Data("{not-json".utf8)).isEmpty,
                "malformed bounded JSON yields an empty source result")
-        var discardedReads = 0
-        var discardCancellations = 0
-        expect(!SourceIndexContract.discardResponseBody(
-            bytes: Array(repeating: 0x61, count: 1_024),
-            contentLength: nil,
-            didRead: { discardedReads += 1 },
-            cancel: { discardCancellations += 1 }
-        ) && discardedReads == SourceIndexContract.postResponseDrainBytes
-          && discardCancellations == 1,
-               "POST sink buffers nothing, drains at most 512 bytes, then cancels an oversized response")
-        discardedReads = 0
-        discardCancellations = 0
-        expect(!SourceIndexContract.discardResponseBody(
-            bytes: [0x61],
-            contentLength: "513",
-            didRead: { discardedReads += 1 },
-            cancel: { discardCancellations += 1 }
-        ) && discardedReads == 0 && discardCancellations == 1,
-               "declared oversized POST response cancels before draining")
+        var ackCancellations = 0
+        expect(SourceIndexContract.boundedResponseData(chunks: [Data(repeating: 0x61, count: 513)],
+            contentLength: nil, maximumBytes: SourceIndexContract.maxContributionAcknowledgementBytes,
+            cancel: { ackCancellations += 1 }) == nil && ackCancellations == 1,
+               "the actual ACK accumulator refuses cap-plus-one response bytes and cancels")
 
         expect(SourceIndexClient.contributionFailureKind(for: CancellationError()) == .cancelled,
                "task cancellation is terminal for the current retry owner")
@@ -1424,9 +1674,8 @@ struct SourceIndexTorrentContractTests {
         expect(postResponseResult.isEmpty && postResponseTransportCount == 1,
                "GET gate closing after response prevents decoded rows from escaping")
 
-        // CONTRACT CHANGED (DEC-260723-D1): merge is now a pure combine/dedup over ALREADY-SCREENED streams
-        // (the credential strip + capability gate live in `streams(from:capabilities:)`, exercised below), so
-        // merge admits torrent / http / usenet rows and only drops duplicates WITHIN Singularity's own list.
+        // Merge also defends the community boundary against an older or separately assembled snapshot.
+        // Direct HTTP/NZB rows have no proven public-only transport, even when their syntax looks public.
         let publicHTTP = "https://cdn.example.com/movie.mkv"
         let publicNZB = "https://indexer.example.com/file.nzb"
         let merged = SourceIndexServeSource.merge(
@@ -1435,13 +1684,10 @@ struct SourceIndexTorrentContractTests {
                       CoreStream(name: "direct-dup", url: publicHTTP)],
             into: []
         )
-        // served (2 torrents) + one http + one usenet, with the duplicate http collapsed by its url key.
-        expect(merged.count == 1 && merged.first?.streams.count == 4,
-               "merge admits torrent + http + usenet streams and dedups within its own list by kind-natural id")
+        expect(merged.count == 1 && merged.first?.streams.count == 2,
+               "merge admits safe torrent identities and withholds unpinned pooled HTTP/NZB rows")
 
-        // ---- Per-requester SERVE filtering (DEC-260723-D1): torrent/http/usenet built by what the requester
-        // can consume. The credential strip + playable-URL screen run here, so the privacy boundary that used
-        // to be asserted on merge now lives on streams(from:capabilities:).
+        // Consumer capability is not transport authorization: only pooled torrent identities are reconstructed.
         let rdCachedTorrent = SourceIndexClient.PooledSource(
             kind: "torrent", id: lower, quality: "1080p", sizeBytes: 1, seeders: 1, corroboration: 2,
             providers: ["rd"]
@@ -1472,31 +1718,26 @@ struct SourceIndexTorrentContractTests {
                && torrentOnlyServed.first?.name == "Singularity",
                "a torrent-only requester sees only the self-verifying torrent, with a neutral name")
 
-        // A user who can play raw http but has NO usenet service: the torrent + the PUBLIC http link, never the
-        // credential-bearing http row, never usenet.
+        // Even an HTTP-capable consumer must not receive an arbitrary pooled URL.
         let httpCapable = SourceIndexClient.streams(
             from: allKindPool,
             capabilities: SourceIndexClient.ServeCapabilities(canPlayDirectHTTP: true, hasUsenet: false)
         )
-        expect(httpCapable.count == 2
+        expect(httpCapable.count == 1
                && httpCapable.contains(where: { $0.infoHash == lower })
-               && httpCapable.contains(where: { $0.url == publicHTTP })
-               && !httpCapable.contains(where: { $0.url == privateURL })
+               && !httpCapable.contains(where: { $0.url != nil })
                && !httpCapable.contains(where: { $0.nzbUrl != nil }),
-               "an http-capable requester sees torrent + public http, never the credential http or any usenet row")
+               "an HTTP-capable requester receives only the safe torrent handoff from the community pool")
 
-        // A user WITH a usenet-capable service: also the public usenet nzb, but never the opaque (unplayable)
-        // usenet id and never the credential http.
+        // A configured usenet service does not pin the eventual contributor URL's connection either.
         let usenetCapable = SourceIndexClient.streams(
             from: allKindPool,
             capabilities: SourceIndexClient.ServeCapabilities(canPlayDirectHTTP: true, hasUsenet: true)
         )
-        expect(usenetCapable.count == 3
+        expect(usenetCapable.count == 1
                && usenetCapable.contains(where: { $0.infoHash == lower })
-               && usenetCapable.contains(where: { $0.url == publicHTTP })
-               && usenetCapable.contains(where: { $0.nzbUrl == publicNZB })
-               && !usenetCapable.contains(where: { $0.nzbUrl == "opaque-nzb-id.123" }),
-               "a usenet-capable requester also sees the public nzb, but never an opaque/unplayable usenet id")
+               && !usenetCapable.contains(where: { $0.url != nil || $0.nzbUrl != nil }),
+               "a usenet-capable requester also withholds unpinned HTTP/NZB community references")
 
         // The rd-tagged torrent is shown to EVERY requester (self-verifying); a tb-only user is never shown it
         // as a fabricated cached badge -- the pool's provider claim never becomes a played link on its own, the

@@ -3,7 +3,7 @@ import Foundation
 /// Eligibility to attempt resolution, not proof that startup or an NZB create will succeed. Ranking must
 /// never start a runtime or contact a provider. The resolver owns its bounded endpoint wait and capabilities.
 enum UsenetPlaybackAdmissionPolicy {
-    enum LocalRuntime: Equatable { case unavailable, native, legacy }
+    enum LocalRuntime: Equatable { case unavailable, native }
 
     static func canResolve(remoteConfigured: Bool, localRuntime: @autoclosure () -> LocalRuntime,
                            savedProviderConfigured: @autoclosure () -> Bool,
@@ -35,21 +35,18 @@ final class DebridPlaybackAvailability: @unchecked Sendable {
         }
     }
 
-    /// Actual selected-runtime capability. A native Full build can attempt bounded startup before it has
-    /// published an endpoint; a missing native binary/slice cannot. Never borrow a legacy listener in native
-    /// mode, and never start a process as a side effect of ranking or a Watch button's computed property.
+    /// Actual local-runtime capability. A Full build can attempt bounded startup before it has published an
+    /// endpoint; a missing server binary/slice cannot. Never start a process as a side effect of ranking or a
+    /// Watch button's computed property.
     static var localUsenetRuntime: UsenetPlaybackAdmissionPolicy.LocalRuntime {
         #if VORTX_NO_EMBEDDED_SERVER
         return .unavailable
         #else
-        if StremioServer.nativeTransportSelected {
-            #if os(macOS)
-            return Bundle.main.path(forResource: "vortx-streaming-server", ofType: nil) != nil ? .native : .unavailable
-            #else
-            return VortxNativeServerFlag.isSupported ? .native : .unavailable
-            #endif
-        }
-        return StremioServer.usenetNodeBase != nil ? .legacy : .unavailable
+        #if os(macOS)
+        return Bundle.main.path(forResource: "vortx-streaming-server", ofType: nil) != nil ? .native : .unavailable
+        #else
+        return VortxNativeServerFlag.isSupported ? .native : .unavailable
+        #endif
         #endif
     }
 

@@ -52,6 +52,32 @@ private struct TVDetailEpisodeListFocusContractTests {
                    "episode row \(index) keeps native Up navigation")
         }
 
+        // The 4-across grid: the whole first row owns the Up escape and routes every direction itself.
+        for index in 0..<4 {
+            expect(TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index, columns: 4),
+                   "grid card \(index) in the first row owns the Up escape")
+            expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: index,
+                                                              episodeCount: 10, columns: 4) == .seasonPicker,
+                   "grid card \(index) forwards Up to the season posters")
+            expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: index,
+                                                              episodeCount: 10, columns: 4) == .episode(index + 4),
+                   "grid card \(index) moves Down to the card below it")
+        }
+        expect(!TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: 4, columns: 4),
+               "second grid row keeps native Up navigation")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 3, episodeCount: 6, columns: 4)
+               == .episode(5), "Down past a short last row lands on the final episode")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 1, episodeCount: 3, columns: 4)
+               == .native, "a single short row invents no Down destination")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .left, fromEpisodeIndex: 2, episodeCount: 10, columns: 4)
+               == .episode(1)
+               && TVDetailEpisodeListFocusPolicy.destination(for: .right, fromEpisodeIndex: 2, episodeCount: 10, columns: 4)
+               == .episode(3), "first-row cards move along the row explicitly")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .left, fromEpisodeIndex: 0, episodeCount: 10, columns: 4)
+               == .native
+               && TVDetailEpisodeListFocusPolicy.destination(for: .right, fromEpisodeIndex: 3, episodeCount: 10, columns: 4)
+               == .native, "row edges keep native behaviour")
+
         // A season can grow while its rows are lazily realized. The index boundary stays at the first
         // position, so the existing stable CoreVideo.id focus identity for a deeper episode is unaffected.
         let focusedEpisodeID = "episode-10"
@@ -73,12 +99,14 @@ private struct TVDetailEpisodeListFocusContractTests {
                "episode rows retain their stable CoreVideo ids while exposing the row index")
         expect(detailView.contains("episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)"),
                "episode row focus and scroll identities remain CoreVideo.id")
-        expect(detailView.contains("TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index)"),
-               "SwiftUI asks the production boundary policy at each episode row")
+        expect(detailView.contains("TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index, columns: Self.episodeColumns)")
+                   && detailView.contains("episodeMoveHandler(from: index)")
+                   && detailView.contains("columns: Self.episodeColumns"),
+               "SwiftUI asks the production boundary policy at each grid card with the grid's column count")
         expect(detailView.contains("TVDetailEpisodeListFocusPolicy.destination("),
                "first-row directional routing is decided by the production policy")
         expect(detailView.contains("focusedEpisode = episodes[targetIndex].id"),
-               "first-row Down targets the second row through its stable CoreVideo id")
+               "first-row moves target cards through their stable CoreVideo id")
         expect(detailView.contains("proxy.scrollTo(CoreSeasonedEpisodes.seasonPickerAnchor, anchor: .center)"),
                "first-episode Up scrolls the season picker into the parent viewport")
         expect(detailView.contains(".focused($focusedSeason, equals: s)")

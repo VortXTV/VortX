@@ -20,12 +20,21 @@ final class FullscreenPlaybackGate: ObservableObject {
 
     /// Number of mounted fullscreen player screens. A COUNT rather than a Bool because two players can
     /// briefly coexist during a SwiftUI `.id`-rebuild transition (the new one can appear before the old
-    /// one disappears); the gate must stay closed across that overlap.
+    /// one disappears); the gate must stay closed across that overlap. Each screen is counted once by its
+    /// own token, so a repeated onAppear can never leave the gate stuck closed after the player is gone
+    /// (that would keep hero trailers off and the browse screens from observing the engine).
     @Published private(set) var activePlayers = 0
+    private var mounted: Set<UUID> = []
 
     /// True while at least one fullscreen player screen is mounted.
     var playerActive: Bool { activePlayers > 0 }
 
-    @MainActor func playerDidAppear() { activePlayers += 1 }
-    @MainActor func playerDidDisappear() { activePlayers = max(0, activePlayers - 1) }
+    @MainActor func playerDidAppear(_ screen: UUID) {
+        guard mounted.insert(screen).inserted else { return }
+        activePlayers = mounted.count
+    }
+    @MainActor func playerDidDisappear(_ screen: UUID) {
+        guard mounted.remove(screen) != nil else { return }
+        activePlayers = mounted.count
+    }
 }

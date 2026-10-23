@@ -57,7 +57,11 @@ data class NzbRelease(
 object NzbIndexerEndpointPolicy {
     enum class Error { MALFORMED, NOT_HTTPS, USER_INFO, FRAGMENT, MISSING_HOST, QUERY_FORBIDDEN }
 
-    fun validate(raw: String): Result<URI> = runCatching { URI(raw.trim()) }.fold(
+    /** Accepts what an indexer's own site shows: a bare address (`drunkenslug.com`) gains `https://`. */
+    fun validate(raw: String): Result<URI> = runCatching {
+        val trimmed = raw.trim()
+        URI(if (trimmed.contains("://")) trimmed else "https://$trimmed")
+    }.fold(
         onSuccess = ::validate,
         onFailure = { Result.failure(IllegalArgumentException(Error.MALFORMED.name)) },
     )
@@ -71,8 +75,15 @@ object NzbIndexerEndpointPolicy {
             !uri.rawQuery.isNullOrEmpty() -> Error.QUERY_FORBIDDEN
             else -> null
         }
-        return if (error == null) Result.success(uri.normalize())
-        else Result.failure(IllegalArgumentException(error.name))
+        if (error != null) return Result.failure(IllegalArgumentException(error.name))
+        val normalized = uri.normalize()
+        // The success value is the Newznab API URL itself: a site address with no path gets the standard
+        // `/api` path every Newznab indexer serves, so `https://drunkenslug.com` no longer searches the homepage.
+        val path = normalized.rawPath.orEmpty()
+        return Result.success(
+            if (path.isEmpty() || path == "/") URI(normalized.scheme, null, normalized.host, normalized.port, "/api", null, null)
+            else normalized,
+        )
     }
 
     /** Safe for status copy and diagnostics: it intentionally excludes path/query/credentials. */

@@ -6,7 +6,7 @@ import org.json.JSONObject
 /// Builders for the engine's JSON action payloads. These mirror the exact shapes the Apple
 /// `CoreBridge` dispatches (the engine contract is identical across platforms), so behavior matches
 /// the reference apps. Every builder returns a `{ "field": <name>, "action": <Action> }` string ready
-/// for [StremioCoreNative.dispatch].
+/// for the engine.
 ///
 /// Field names and action tags come straight from stremio-core's `RuntimeAction` / `Action` serde
 /// enums (snake_case fields, PascalCase action tags). Building them with `org.json` (bundled in the
@@ -227,7 +227,7 @@ object EngineActions {
             action("Search", JSONObject().put("searchQuery", query).put("maxResults", LOCAL_SEARCH_MAX_RESULTS)),
         )
 
-    /// The state field-selector for `local_search`, ready for [StremioCoreNative.getState].
+    /// The state field-selector for `local_search`, ready for the engine.
     fun localSearchField(): String = "\"$FIELD_LOCAL_SEARCH\""
 
     /// Load a title's meta + a guessed best stream. For a series episode, pass [streamType]/[streamId]
@@ -255,14 +255,14 @@ object EngineActions {
     /// Unload meta details (clears the engine's MetaDetails model when leaving the detail screen).
     fun unloadMeta(): String = envelope(FIELD_META_DETAILS, action("Unload", null))
 
-    /// The state field-selector for `continue_watching_preview`, ready for [StremioCoreNative.getState].
+    /// The state field-selector for `continue_watching_preview`, ready for the engine.
     /// Continue Watching is DERIVED state the engine populates from the hydrated library/ctx at
     /// construction; it emits no `NewState` of its own (mirrors Apple `CoreBridge.seedInitialState`,
     /// which reads the field directly rather than dispatching a load). So there is no "load CW" action:
     /// the repository reads this field straight, after the board load has already pumped the event loop.
     fun continueWatchingPreviewField(): String = "\"$FIELD_CONTINUE_WATCHING_PREVIEW\""
 
-    /// The state field-selector for `ctx`, ready for [StremioCoreNative.getState]. `ctx` needs no Load
+    /// The state field-selector for `ctx`, ready for the engine. `ctx` needs no Load
     /// action either: the engine hydrates `profile` (incl. a persisted sign-in) at construction, and
     /// every `ActionCtx` mutation below re-emits it via the whole-model dispatch path.
     fun ctxField(): String = "\"$FIELD_CTX\""
@@ -295,6 +295,10 @@ object EngineActions {
             ),
         )
 
+    /** stremio-core AuthRequest::LoginWithToken; replaces the local session without revoking the outgoing token. */
+    fun authenticateToken(token: String): String = ctxEnvelope(action("Authenticate",
+        JSONObject().put("type", "LoginWithToken").put("token", token)))
+
     /// Sign out. Destroys the engine's server-side session (mirrors Apple's plain `Logout`, used only
     /// for an explicit user sign-out, never for a profile switch) and clears `ctx.profile.auth`.
     fun logout(): String = ctxEnvelope(action("Logout", null))
@@ -305,7 +309,7 @@ object EngineActions {
     // vendored stremio-core crate's `ActionMetaDetails`/`ActionCtx` enums, `runtime/msg/action.rs`):
     // whole-title and per-video/season watched toggles are `Action::MetaDetails(ActionMetaDetails::…)`,
     // dispatched with field = "meta_details" (NOT a Ctx broadcast -- only library add/remove is). Every
-    // stremio-core `dispatch` runs the model update SYNCHRONOUSLY (see [EngineStremioRepository]'s class
+    // stremio-core `dispatch` runs the model update SYNCHRONOUSLY (see [NativeCatalogRepository]'s class
     // doc), and `MetaDetails::update` recomputes `library_item` from `ctx.library` on EVERY dispatched
     // message (not just its own field's actions), so a `meta_details` field re-read immediately after any
     // of these -- including the Ctx-scoped library ones below -- already reflects the mutation with no
@@ -349,7 +353,7 @@ object EngineActions {
 
     /// Load the engine `player` model for the picked stream. [selected] is the engine's `Player` selected
     /// struct (`{ stream, streamRequest, metaRequest, subtitlesPath }`), assembled by the repository from
-    /// the resident `meta_details` (see [EngineStremioRepository.beginPlaybackSession]). The library item
+    /// the resident `meta_details` (see [NativeCatalogRepository.beginPlaybackSession]). The library item
     /// keys on the META, not the specific stream, so any Ready stream + this title's requests attributes
     /// correctly, matching Apple `loadEnginePlayer`'s fallback path.
     fun loadPlayer(selected: JSONObject): String =

@@ -65,10 +65,10 @@ enum ProfileMutationPresentationTests {
 
         // Guard the platform UI seam as well as executing the real presentation coordinator above.
         let view = try! String(contentsOfFile: "app/SourcesShared/ProfilesView.swift", encoding: .utf8)
-        precondition(view.contains("await store.saveNative(profile, creating: creating, admission: admission)"))
+        precondition(view.contains("await store.saveNative(profile, creating: creating, admission: admission, preferenceBaseline: preferenceBaseline)"))
         precondition(view.contains("await store.removeNative(original, admission: admission)"))
-        precondition(view.contains("await store.selectNative(original, admission: admission)"))
-        precondition(view.contains("await store.selectNative(profile, admission: admission)"))
+        precondition(view.contains("await store.selectNative(original, admission: admission, finishPicker: false)"))
+        precondition(view.contains("await store.selectNative(profile, admission: admission, finishPicker: false)"))
         // Five admission sites: picker, account editor, removal, selection, and profile save.
         precondition(view.components(separatedBy: "let admission = core.captureNativeProfileActionAdmission()").count == 6)
         precondition(!view.contains("let target = core.captureNativePlaybackTarget()"))

@@ -23,9 +23,15 @@ enum DetailEpisodeTargetPolicy {
             let next = orderedIDs.dropFirst(index + 1).first { !watched.contains($0) }
             return Target(videoID: next ?? newerPlaybackID, isResume: false)
         }
-        guard let initialVideoID, orderedIDs.contains(initialVideoID) else { return nil }
+        guard let initialVideoID, let index = orderedIDs.firstIndex(of: initialVideoID) else { return nil }
         let seconds = initialResumeSeconds ?? 0
-        return Target(videoID: initialVideoID, isResume: seconds.isFinite && seconds > 0)
+        let isResume = seconds.isFinite && seconds > 0
+        if !isResume, watched.contains(initialVideoID) {
+            // Up next: the CW row names an episode already finished, so the next unwatched one is the target.
+            let next = orderedIDs.dropFirst(index + 1).first { !watched.contains($0) }
+            return Target(videoID: next ?? initialVideoID, isResume: false)
+        }
+        return Target(videoID: initialVideoID, isResume: isResume)
     }
 }
 

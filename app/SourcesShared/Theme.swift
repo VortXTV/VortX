@@ -27,6 +27,8 @@ enum Theme {
         // Accent is user-themeable via ThemeManager (8 curated accents). accentSoft / onAccent follow it.
         static var accent: Color { ThemeManager.shared.accent }             // focus / selection / primary / progress
         static var accentBright: Color { ThemeManager.shared.accentBright } // focus glow highlight
+        static var playerGlassAccent: Color { ThemeManager.shared.playerGlassAccent }
+        static var playerGlassUsesCrimson: Bool { ThemeManager.shared.playerGlassUsesCrimson }
         static var accentSoft: Color { accent.opacity(0.18) }
         static var onAccent: Color { ThemeManager.shared.onAccent } // accent-adaptive ink (was a fixed warm-brown that read orange on every accent)
         static let danger = rgb(0.871, 0.282, 0.337)            // #DE4856 destructive (log out, remove), a cooler red so it doesn't read as "leftover orange" next to a non-warm accent
@@ -156,6 +158,14 @@ enum Theme {
     }
 }
 
+/// Home-only atmosphere stays near black; increased contrast removes decorative color entirely.
+enum HomeAtmospherePolicy {
+    static func alpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.02 : 0.05
+    }
+}
+
 // MARK: - Text role helpers (font + tracking + default color in one place)
 
 extension View {
@@ -185,7 +195,7 @@ private struct CardFocusContent: View {
     let configuration: ButtonStyleConfiguration
     let scale: CGFloat
     @Environment(\.isFocused) private var focused
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
     @EnvironmentObject private var theme: ThemeManager   // observe so a theme change repaints this style
     #if os(macOS)
     @State private var isHovered = false   // Mac has no focus engine for cards; pointer hover drives the same lift
@@ -229,7 +239,7 @@ struct PrimaryActionStyle: ButtonStyle {
 private struct PrimaryActionContent: View {
     let configuration: ButtonStyleConfiguration
     @Environment(\.isFocused) private var focused
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
     @EnvironmentObject private var theme: ThemeManager   // observe so a theme change repaints this style
     #if os(macOS)
     @State private var isHovered = false   // Mac drives the same brighten/scale/glow from pointer hover
@@ -274,7 +284,7 @@ struct RowFocusStyle: ButtonStyle {
 private struct RowFocusContent: View {
     let configuration: ButtonStyleConfiguration
     @Environment(\.isFocused) private var focused
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
     @EnvironmentObject private var theme: ThemeManager   // observe so a theme change repaints this style
     #if os(macOS)
     @State private var isHovered = false   // Mac drives the same fill/ring/lift from pointer hover
@@ -362,7 +372,7 @@ struct CircleIconButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View { Content(configuration: configuration) }
     private struct Content: View {
         let configuration: ButtonStyleConfiguration
-        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @ReducedMotion private var reduceMotion
         #if os(macOS)
         @State private var isHovered = false
         #endif
@@ -391,7 +401,7 @@ struct HeroPlayButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View { Content(configuration: configuration) }
     private struct Content: View {
         let configuration: ButtonStyleConfiguration
-        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @ReducedMotion private var reduceMotion
         @EnvironmentObject private var theme: ThemeManager
         #if os(macOS)
         @State private var isHovered = false
@@ -443,19 +453,42 @@ struct MetaBadge: View {
 
 // MARK: - Liquid Glass (OS 26 floating-chrome material, gated with a fallback)
 
+/// Observed eligibility for the legacy glass chrome and native TV tab bar. Policy stays in
+/// VisualEffects; these readers only make preference and accessibility changes invalidate consumers.
+/// No preference is written here, and non-TV Auto keeps VisualEffects' existing full-effects default.
+@propertyWrapper
+struct GlassEligibility: DynamicProperty {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage(VisualEffects.glassKey) private var glassChoice = VisualEffects.auto
+    #if os(tvOS)
+    @AppStorage(PerformanceMode.overrideKey) private var performanceChoice = "auto"
+    #endif
+
+    var wrappedValue: Bool {
+        #if os(tvOS)
+        // Observe the override even while glass is explicit or transparency is reduced. The existing
+        // PerformanceMode resolver, not a copied hardware/override policy, still decides Auto.
+        _ = performanceChoice
+        #endif
+        return !reduceTransparency
+            && VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto)
+    }
+}
+
 /// Apple's Liquid Glass belongs on CHROME that floats OVER content: the player transport buttons, the hero
 /// back / overflow discs, floating pills and cards. It never goes on scrolling content, poster art, or an
 /// opaque background. Every use here is gated to OS 26 with the app's current material / fill as the older
-/// fallback, and it stands down to that same fallback whenever Reduce Transparency is on, so the chrome
-/// stays legible. Matches the existing player-button idiom in TVPlayerView (`glassEffect(.regular, in:)`).
+/// fallback. Reduce Transparency or ineligible app glass selects opaque surface1 on every OS, never a
+/// translucent caller fallback. Eligible glass keeps the existing player-button material idiom.
 struct GlassChromeModifier<GlassShape: Shape, Fallback: View>: ViewModifier {
     let shape: GlassShape
     let interactive: Bool
     let fallback: Fallback
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @GlassEligibility private var glassEnabled
 
     @ViewBuilder func body(content: Content) -> some View {
-        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), !reduceTransparency {
+        let useGlass = glassEnabled
+        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), useGlass {
             if interactive {
                 // Interactive glass reacts to touch / pointer. tvOS drives chrome from the remote, not a
                 // cursor, so it keeps the plain regular variant that the existing player buttons use.
@@ -467,10 +500,9 @@ struct GlassChromeModifier<GlassShape: Shape, Fallback: View>: ViewModifier {
             } else {
                 content.glassEffect(.regular, in: shape)
             }
-        } else if reduceTransparency {
-            // Reduce Transparency: stand down to an opaque warm surface1 (mirrors VortXGlass.blurLayer), not
-            // the caller's fallback material. Both call sites pass a translucent .ultraThinMaterial, which
-            // ignores Reduce Transparency, so honor the primitive's opaque-surface guarantee here instead.
+        } else if !useGlass {
+            // Match the shared blur gate: Off, reduced Auto and Reduce Transparency use an opaque
+            // surface instead of the caller's potentially translucent fallback material.
             content.background { shape.fill(Theme.Palette.surface1) }
         } else {
             content.background { fallback }
@@ -479,11 +511,11 @@ struct GlassChromeModifier<GlassShape: Shape, Fallback: View>: ViewModifier {
 }
 
 /// Groups adjacent glass chrome so OS 26 blends the panes into one continuous glass surface instead of a
-/// run of isolated discs. Passthrough (no layout change) below OS 26 and under Reduce Transparency.
+/// run of isolated discs. Passthrough below OS 26 or whenever glass is ineligible.
 struct GlassChromeClusterModifier: ViewModifier {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @GlassEligibility private var glassEnabled
     @ViewBuilder func body(content: Content) -> some View {
-        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), !reduceTransparency {
+        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), glassEnabled {
             GlassEffectContainer { content }
         } else {
             content
@@ -493,8 +525,8 @@ struct GlassChromeClusterModifier: ViewModifier {
 
 extension View {
     /// Swap a floating-chrome element's MATERIAL layer for Liquid Glass on OS 26, keeping `fallback`
-    /// (the element's current material / fill, already shaped) on older systems and under Reduce
-    /// Transparency. `interactive` opts a pressable control into the interactive glass variant.
+    /// (the element's current material / fill, already shaped) on older systems only while glass is
+    /// eligible. Otherwise use opaque surface1. `interactive` opts into the interactive glass variant.
     func glassChrome<GlassShape: Shape, Fallback: View>(
         in shape: GlassShape,
         interactive: Bool = false,
@@ -503,7 +535,7 @@ extension View {
         modifier(GlassChromeModifier(shape: shape, interactive: interactive, fallback: fallback()))
     }
 
-    /// Wrap a row of adjacent glass chrome so the panes blend on OS 26. No-op below OS 26.
+    /// Wrap adjacent eligible glass panes on OS 26. No-op below OS 26 or when glass is ineligible.
     func glassChromeCluster() -> some View {
         modifier(GlassChromeClusterModifier())
     }

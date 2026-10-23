@@ -18,7 +18,113 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
     static func check(_ value: Bool, line: UInt = #line) { precondition(value, "own account live fixture line \(line)") }
     static func raw(_ value: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(value), as: UTF8.self) }
     static func phase(_ value: String) { FileHandle.standardError.write(Data(("Own-account live phase: " + value + "\n").utf8)) }
+    static func missingOwnFirstImport() async throws {
+        let owner = UserProfile(id: UserProfile.ownerID, name: "Owner", avatar: "O", isOwner: true)
+        let own = UserProfile(id: UUID(uuidString: "00000000-0000-0000-0000-00000000C262")!, name: "Missing", avatar: "M", usesOwnAccount: true)
+        let deleted = UserProfile(id: UUID(uuidString: "00000000-0000-0000-0000-00000000D262")!, name: "Deleted", avatar: "D", usesOwnAccount: true)
+        let scope = VortxAccountScope(account: "account.first-import-missing-own", ownerProfileID: owner.id.uuidString)
+        let root = VortxJSON.object(["vortx": .object([
+            "deletedProfiles": .array([.string(deleted.id.uuidString)]),
+            "library": .array([.object(["id": .string("owner-only"), "type": .string("movie"), "name": .string("Owner")])]),
+            "byProfile": .object([own.id.uuidString: .object(["opaque-note": .string("retain exactly")])])])])
+        let bytes = try JSONEncoder().encode(root)
+        let missing: Set<UUID> = [own.id, deleted.id]
+        func prepare(_ baseline: Data? = nil, roster: [UserProfile]? = nil,
+                     slots: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline] = []) throws -> Data {
+            try VortxLegacyBootstrapMaterial.encode(document: bytes, roster: roster ?? [owner, own, deleted],
+                ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000,
+                retainedOwnAccountBaseline: baseline, retainedOwnAccountSlotBaselines: slots,
+                missingOwnAccountProfileIDs: baseline == nil ? missing : [])
+        }
+        let material = try prepare()
+        let typed = try JSONDecoder().decode(VortxJSON.self, from: material)
+        check(typed["ownAccountSources"] == nil)
+        check(typed["libraries"]?[own.id.uuidString] == .object(["items": .array([]), "intents": .array([])]))
+        let actions = try VortxNativeProfiles.pendingLegacyImportActions(material: material, profileIDs: missing, scope: scope)
+        check(actions.count == 1) // A tombstoned own profile must not receive an account CAS.
+        let transition = try JSONDecoder().decode(VortxJSON.self, from: Data(actions[0].utf8))
+        check(transition["expectedBinding"] == .object(["account": .object(["kind": .string("local_only")]), "revision": .integer(0), "transactionId": .null]))
+        check(transition["target"] == .object(["kind": .string("pending_own")]))
+        for bad in [Set([owner.id]), Set([UUID()])] {
+            do {
+                _ = try VortxLegacyBootstrapMaterial.encode(document: bytes, roster: [owner, own, deleted],
+                    ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000, missingOwnAccountProfileIDs: bad)
+                preconditionFailure("Non-own missing source accepted")
+            } catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
+        }
+        let pending = VortxJSON.object([own.id.uuidString: .object([
+            "profileOverlayBase64": .string(try VortxNativeOwnAccountProducer.overlay(document: root, profileID: own.id).base64EncodedString()),
+            "reason": .string("missing_witness")])])
+        let archive = try VortxNativeUnattributedOverlayArchive.retaining(
+            VortxNativeOwnAccountProducer.archive([], pendingOverlays: try pending.decode([String: VortxJSON].self)),
+            prior: nil, document: bytes, profileIDs: missing, scope: scope)
+        let bootstrap = try VortxNativeBootstrapArchive.encode(document: bytes, material: material, authenticatedSourceArchive: archive)
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("missing-own")
+        let key = SymmetricKey(size: .bits256)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: bootstrap, bootstrapScope: scope)
+        let initial = try raw(.object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
+            "ownerProfileId": .string(scope.ownerProfileID), "material": typed]))
+        do {
+            _ = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
+                transport: VortxCResourceTransport(), allowNewAccount: true,
+                initialActions: [initial] + actions + [#"{"type":"invalid_fixture_action"}"#], authenticatedSourceArchive: archive)
+            preconditionFailure("Partial first import committed")
+        } catch VortxNativeError.invalidResponse {}
+        check(try store.authenticatedCheckpoint(scope: scope) == nil)
+        check(try store.readHostPreferences(scope: scope) == nil)
+        let session = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
+            transport: VortxCResourceTransport(), allowNewAccount: true,
+            initialActions: [initial] + actions, authenticatedSourceArchive: archive)
+        var state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check(state["roster"]?["profiles"]?[own.id.uuidString]?["account"]?["kind"] == .string("pending_own"))
+        check(state["roster"]?["profiles"]?[deleted.id.uuidString]?["deleted"] == .bool(true))
+        check(state["nativeSync"]?["accountSlots"]?[deleted.id.uuidString] == nil)
+        check(try VortxNativeOwnAccountProducer.pendingOverlay(profileID: own.id, verifiedUID: "any-new-uid", state: state, pending: pending) == nil)
+        let baseline = try JSONEncoder().encode(state["nativeSync"]!["legacyImport"]!["baseline"]!)
+        check(try JSONDecoder().decode(VortxJSON.self, from: prepare(baseline)) == typed)
+        let authority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        let source = try await VortxNativeOwnAccountProducer.fetch(profileID: own.id, authKey: "fixture-only", authority: authority,
+            framing: .independentNetworkOnly, verify: { _ in "fixture-verified-own" }, send: { request in
+                .init(data: Data((request.url!.lastPathComponent == "datastoreGet" ? #"{"result":[]}"# : #"{"result":{"addons":[]}}"#).utf8), statusCode: 200)
+            })
+        let ownMaterial = try VortxLegacyBootstrapMaterial.encode(document: Data("{}".utf8), roster: [owner, own],
+            ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000, ownAccountSources: [source])
+        let target = try VortxNativeProfiles.ownTarget(material: JSONDecoder().decode(VortxJSON.self, from: ownMaterial), profileID: own.id)
+        for (index, destination) in [VortxNativeProfiles.AccountRebindTarget.own(target), .shared].enumerated() {
+            let request = try VortxNativeProfiles.AccountRebindRequest(scope: scope.account, ownerProfileID: scope.ownerProfileID,
+                transactionID: "missing-own-reconnect-" + String(index),
+                expected: VortxNativeProfiles.expectedBinding(state: state, profileID: own.id), target: destination)
+            _ = try await session.dispatch([raw(VortxNativeProfiles.rebindAction(profileID: own.id, request: request))], now: 1800000000 + UInt64(index),
+                sourceAuthority: authority, authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive(index == 0 ? [source] : []))
+            state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+            var current = own; current.usesOwnAccount = index == 0
+            let projected = try prepare(baseline, roster: [owner, current, deleted],
+                slots: VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: state["nativeSync"]!))
+            check(try JSONDecoder().decode(VortxJSON.self, from: projected) == typed)
+            check(try VortxNativeSession.validateLegacyCompatibility(scope: scope, ownerName: owner.name,
+                snapshot: nil, nativeSync: state["nativeSync"], material: projected, abi: VortxCABI()) == .accepted)
+        }
+        let secondRoot = VortxJSON.object(["vortx": .object(["byProfile": .object([own.id.uuidString: .object(["opaque-note": .string("second version")])])])])
+        let secondArchive = try VortxNativeUnattributedOverlayArchive.retaining(VortxNativeOwnAccountProducer.archive([]),
+            prior: archive, document: JSONEncoder().encode(secondRoot), profileIDs: [own.id], scope: scope)
+        _ = try await session.dispatch([#"{"type":"get_state"}"#], now: 1800000002, authenticatedSourceArchive: secondArchive)
+        let retained = try await session.authenticatedSourceArchive()!
+        let journal = try JSONDecoder().decode(VortxJSON.self, from: retained)["hostDocument"]![VortxNativeUnattributedOverlayArchive.key]!
+        check(try journal.decode([String: VortxJSON].self).count == 3)
+        do {
+            _ = try VortxNativeUnattributedOverlayArchive.merge(nil, journal,
+                scope: .init(account: "foreign", ownerProfileID: scope.ownerProfileID))
+            preconditionFailure("Cross-account quarantine accepted")
+        } catch VortxNativeError.invalidSnapshot {}
+        await session.close()
+        let reopened = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(),
+            store: VortxEncryptedCheckpointStore(directory: directory, key: key), transport: VortxCResourceTransport())
+        check(try await reopened.authenticatedSourceArchive() == retained)
+        await reopened.close()
+        print("Actual C ABI missing-own first import: atomic commit, isolation, tombstone, reconnect origin, quarantine union and encrypted restart passed")
+    }
     static func main() async throws {
+        try await missingOwnFirstImport()
         try await watchedMigrationCheckpoint()
         try await historicalWatchedRetryCheckpoint()
         let owner = UserProfile(id: UserProfile.ownerID, name: "Owner", avatar: "🍿", isOwner: true)
@@ -59,8 +165,8 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         for field in ["addons", "libraries", "watches", "identityLinks", "ownAccountSources"] {
             check(coldTyped[field]?[own.id.uuidString] == retainedTyped[field]?[own.id.uuidString])
         }
-        try VortxNativeSession.validateLegacyCompatibility(scope: scope, ownerName: owner.name,
-            snapshot: nil, nativeSync: state["nativeSync"], material: coldMaterial, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: scope, ownerName: owner.name,
+            snapshot: nil, nativeSync: state["nativeSync"], material: coldMaterial, abi: VortxCABI()) == .accepted)
         guard case .object(var foreign) = state["nativeSync"] else { fatalError("missing native state") }
         foreign["scope"] = .string("account.foreign")
         do {
@@ -526,10 +632,12 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
     static func watchedMigrationCheckpoint() async throws {
         phase("watched preflight draft, retry and atomic source sidecars")
         let owner = UserProfile(id: UUID(uuidString: "90000000-0000-0000-0000-000000000009")!, name: "Owner", avatar: "O", isOwner: true)
+        let own = UserProfile(id: UUID(uuidString: "90000000-0000-0000-0000-00000000C262")!, name: "Pending own", avatar: "P", usesOwnAccount: true)
         let scope = VortxAccountScope(account: "account.watched-host", ownerProfileID: owner.id.uuidString)
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("watched")
         let key = SymmetricKey(size: .bits256)
         let document = try VortxNativeBootstrapArchive.credentialFreeDocument(["apiKeys": ["tmdb": "fixture-never-archived"], "vortx": [
+            "byProfile": [own.id.uuidString: ["opaque-note": "unattributed original overlay"]],
             "library": [["id": "tt2934286", "type": "series", "name": "Fixture", "watched": "tt2934286:1:5:5:eJyTZwAAAEAAIA==",
                          "ua": ["tt2934286:1:4": 4321.5]]],
             "addons": [["transportUrl": "https://catalog.invalid/manifest.json", "manifest": ["id": "catalog", "name": "Catalog", "version": "1.0.0", "resources": ["meta"], "types": ["series"]]]]]])
@@ -538,13 +646,32 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         let pending = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
             document: document, profileIDs: [owner.id], isCurrent: { true }, fetch: { _ in throw URLError(.notConnectedToInternet) })
         check(pending.unresolved.count == 1 && pending.rows.isEmpty)
-        let empty = try VortxNativeOwnAccountProducer.archive([])
+        let rawRoot = try JSONDecoder().decode(VortxJSON.self, from: document)
+        let pendingOwn: [String: VortxJSON] = [own.id.uuidString: .object([
+            "profileOverlayBase64": .string(try VortxNativeOwnAccountProducer.overlay(document: rawRoot, profileID: own.id).base64EncodedString()),
+            "reason": .string("missing_witness")])]
+        let empty = try VortxNativeUnattributedOverlayArchive.retaining(
+            VortxNativeOwnAccountProducer.archive([], pendingOverlays: pendingOwn), prior: nil,
+            document: document, profileIDs: [own.id], pendingOriginProfileIDs: [own.id], scope: scope)
         let draft = try VortxNativeWatchedArchive.retaining(empty, evidence: pending.archives, pending: pending.pendingArchives, scope: scope)
         let probe = try VortxEncryptedCheckpointStore(directory: directory, key: key)
         try probe.retainMigrationDraft(draft, scope: scope, authority: authority)
         check(try probe.authenticatedCheckpoint(scope: scope) == nil)
         let reopened = try VortxEncryptedCheckpointStore(directory: directory, key: key)
         check(try reopened.readMigrationDraft(scope: scope) == draft)
+        let recovered = try VortxNativeUnattributedOverlayArchive.firstImportRecovery(reopened.readMigrationDraft(scope: scope), scope: scope)
+        check(recovered.pending == pendingOwn && recovered.quarantinedProfiles == [own.id])
+        let untyped = try VortxNativeUnattributedOverlayArchive.retaining(VortxNativeOwnAccountProducer.archive([]), prior: nil,
+            document: document, profileIDs: [own.id], scope: scope)
+        check(try VortxNativeUnattributedOverlayArchive.firstImportRecovery(untyped, scope: scope).pending.isEmpty)
+        // A marker added to a schema-1 record without its typed content identity is rejected.
+        var forged = try JSONDecoder().decode(VortxJSON.self, from: untyped)["hostDocument"]![VortxNativeUnattributedOverlayArchive.key]!.decode([String: VortxJSON].self)
+        let firstKey = forged.keys.sorted()[0]
+        var forgedRecord = try forged[firstKey]!.decode([String: VortxJSON].self)
+        forgedRecord["schemaVersion"] = .integer(2); forgedRecord["origin"] = .string("first_import_missing_credential")
+        forged[firstKey] = .object(forgedRecord)
+        do { _ = try VortxNativeUnattributedOverlayArchive.merge(nil, .object(forged), scope: scope); check(false) }
+        catch VortxNativeError.invalidSnapshot {}
         let accepted = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
         do { try probe.retainMigrationDraft(draft, scope: scope, authority: accepted); check(false) } catch VortxNativeError.superseded {}
         let cancelled = Task {
@@ -567,23 +694,50 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         let complete = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
             document: document, profileIDs: [owner.id], isCurrent: { true }, fetch: { .init(request: $0, raw: metadata) })
         check(complete.rows.count == 1 && complete.unresolved.isEmpty)
+        // The credential is now available. The recovered first-import disposition still supplies
+        // no own source to global material. This fixture injects availability through the real
+        // producer's verify/send seams; it does not exercise the manager or the system Keychain.
+        let reconnectAuthority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        let availableSource = try await VortxNativeOwnAccountProducer.fetch(profileID: own.id, authKey: "fixture-now-available",
+            authority: reconnectAuthority, framing: .independentNetworkOnly, verify: { _ in "fixture-independent-uid" }, send: { request in
+                .init(data: Data((request.url!.lastPathComponent == "datastoreGet" ? #"{"result":[]}"# : #"{"result":{"addons":[]}}"#).utf8), statusCode: 200)
+            })
         let archive = try VortxNativeWatchedArchive.retaining(empty, prior: draft, evidence: complete.archives, scope: scope)
         check(try VortxNativeWatchedArchive.pendingProfileIDs(archive).isEmpty)
         check(try VortxNativeWatchedArchive.entries(archive, key: VortxNativeWatchedArchive.pendingKey) == pending.pendingArchives)
         let replay = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
             document: document, profileIDs: [owner.id], archivedEvidence: VortxNativeWatchedArchive.entries(archive, key: VortxNativeWatchedArchive.evidenceKey),
             isCurrent: { true }, fetch: { _ in check(false); throw URLError(.unsupportedURL) })
-        let material = try VortxLegacyBootstrapMaterial.encode(document: document, roster: [owner], ownerProfileID: owner.id,
-            rosterModifiedSeconds: nil, accountID: scope.account, watchedEvidence: replay.rows)
+        let pendingIDs = Set(recovered.pending.keys.compactMap(UUID.init(uuidString:)))
+        let material = try VortxLegacyBootstrapMaterial.encode(document: document, roster: [owner, own], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil, missingOwnAccountProfileIDs: pendingIDs, accountID: scope.account, watchedEvidence: replay.rows)
         let bootstrap = try VortxNativeBootstrapArchive.encode(document: document, material: material, authenticatedSourceArchive: archive)
         let store = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: bootstrap, bootstrapScope: scope)
         let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID),
             "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
         let session = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
-            transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(action)], authenticatedSourceArchive: archive)
+            transport: VortxCResourceTransport(), allowNewAccount: true,
+            initialActions: [raw(action)] + VortxNativeProfiles.pendingLegacyImportActions(material: material, profileIDs: pendingIDs, scope: scope), authenticatedSourceArchive: archive)
         let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
         check(state["nativeSync"]?["legacyImport"] != nil)
+        check(state["roster"]?["profiles"]?[own.id.uuidString]?["account"]?["kind"] == .string("pending_own"))
+        check(state["nativeSync"]?["legacyImport"]?["baseline"]?["ownAccountSources"]?[own.id.uuidString] == nil)
+        check(try VortxNativeOwnAccountProducer.pendingOverlay(profileID: own.id, verifiedUID: availableSource.verifiedStreamingUID,
+            state: state, pending: .object(recovered.pending)) == nil)
+        let independentMaterial = try VortxLegacyBootstrapMaterial.encode(document: Data("{}".utf8), roster: [owner, own],
+            ownerProfileID: owner.id, rosterModifiedSeconds: nil, ownAccountSources: [availableSource])
+        let request = try VortxNativeProfiles.AccountRebindRequest(scope: scope.account, ownerProfileID: scope.ownerProfileID,
+            transactionID: "watched-draft-explicit-own-cas", expected: VortxNativeProfiles.expectedBinding(state: state, profileID: own.id),
+            target: .own(VortxNativeProfiles.ownTarget(material: JSONDecoder().decode(VortxJSON.self, from: independentMaterial), profileID: own.id)))
+        _ = try await session.dispatch([raw(VortxNativeProfiles.rebindAction(profileID: own.id, request: request))], now: 1800000000,
+            sourceAuthority: reconnectAuthority, authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([availableSource]))
+        let connected = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check(connected["roster"]?["profiles"]?[own.id.uuidString]?["account"]?["kind"] == .string("own"))
+        check(connected["nativeSync"]?["legacyImport"]?["baseline"] == state["nativeSync"]?["legacyImport"]?["baseline"])
         let persisted = try await session.authenticatedSourceArchive()
+        let retainedOrigin = try VortxNativeUnattributedOverlayArchive.firstImportRecovery(persisted, scope: scope)
+        check(retainedOrigin.pending == recovered.pending && retainedOrigin.quarantinedProfiles == [own.id])
+        print("Actual C ABI missing-own draft retry: encrypted reopen, later credential availability, isolated first commit and independent reconnect preserve the original journal")
         check(try VortxNativeWatchedArchive.entries(persisted, key: VortxNativeWatchedArchive.evidenceKey) == complete.archives)
         check(try VortxNativeWatchedArchive.pendingProfileIDs(persisted).isEmpty)
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: []) { _ in }

@@ -14,10 +14,11 @@
 //     swiftc -O app/SourcesShared/TopShelfSnapshot.swift app/Tests/TopShelfSnapshotTests.swift \
 //         -o /tmp/topshelf-tests && /tmp/topshelf-tests
 //
-// Outside an app bundle there is no App Group container and no Info.plist, so `containerURL` is nil and
-// `urlScheme` falls back to "vortx". Both are the documented degrade paths, so the parser and the codec
-// are exercised exactly as they run on device; the file I/O half is covered by the on-device check
-// (play something, then look at the tvOS Home screen).
+// These fixtures never resolve or touch a real App Group/container or local preferences. Explicit
+// disposable file/directory URLs exercise the real bounded reader/writer and pure artwork paths.
+// The harness runs with a private working directory; use that explicit base instead of Foundation's
+// temporaryDirectory, which can resolve to the user's system temporary folder despite TMPDIR.
+// URL-scheme fallback is exercised outside an app bundle. Platform rendering is a separate gate.
 
 import Foundation
 
@@ -113,6 +114,22 @@ let items = [
 ]
 let payload = TopShelfSnapshot.Payload(version: TopShelfSnapshot.currentVersion, writtenAt: Date(), items: items)
 
+section("system shelf identity retains the content type")
+let sharedMovie = TopShelfSnapshot.Item(id: "shared:id", type: "movie", title: "Movie", poster: nil, progress: 0)
+let sharedSeries = TopShelfSnapshot.Item(id: "shared:id", type: "series", title: "Series", poster: nil, progress: 0)
+check(sharedMovie.shelfIdentifier != sharedSeries.shelfIdentifier,
+      "movie and series sharing a provider id have distinct system identifiers")
+let sharedMovieRefresh = TopShelfSnapshot.Item(id: "shared:id", type: "movie", title: "Updated title", poster: "https://img/new.jpg", progress: 0.9)
+check(sharedMovie.shelfIdentifier == sharedMovieRefresh.shelfIdentifier,
+      "system identity is stable when title, artwork and progress change")
+check(sharedMovie.id == sharedSeries.id, "system identity does not rewrite provider ids")
+check(TopShelfSnapshot.parse(TopShelfSnapshot.openURL(type: sharedSeries.type, id: sharedSeries.id)!) == .open(type: "series", id: "shared:id"),
+      "namespaced system identity leaves detail actions on the original provider id")
+let delimiterType = TopShelfSnapshot.Item(id: "c", type: "a:b", title: "One", poster: nil, progress: 0)
+let delimiterID = TopShelfSnapshot.Item(id: "b:c", type: "a", title: "Two", poster: nil, progress: 0)
+check(delimiterType.shelfIdentifier != delimiterID.shelfIdentifier,
+      "length-prefixing prevents type/id delimiter ambiguity")
+
 let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
 let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
 
@@ -137,19 +154,18 @@ if let data = try? encoder.encode(TopShelfSnapshot.Payload(version: 99, writtenA
 section("private Trakt artwork gets an exact managed App Group file URL")
 
 let traktArtworkSource = "https://media.trakt.tv/images/movies/000/001/posters/medium/poster.jpg.webp"
-if let managed = TopShelfSnapshot.localArtworkURL(for: traktArtworkSource),
-   let container = TopShelfSnapshot.containerURL {
-    let managedRoot = container.appendingPathComponent(TopShelfSnapshot.artworkDirectoryName, isDirectory: true).path
+let syntheticContainer = URL(fileURLWithPath: "/synthetic-vortx-top-shelf", isDirectory: true)
+let syntheticArtwork = syntheticContainer.appendingPathComponent(TopShelfSnapshot.artworkDirectoryName, isDirectory: true)
+if let managed = TopShelfSnapshot.localArtworkURL(for: traktArtworkSource, in: syntheticArtwork) {
+    let managedRoot = syntheticArtwork.path
     check(managed.path.hasPrefix(managedRoot + "/"), "private artwork stays below the exact managed App Group directory")
     check(managed.pathExtension == "webp", "the managed file preserves a safe image extension")
-    check(TopShelfSnapshot.localArtworkURL(for: traktArtworkSource) == managed,
+    check(TopShelfSnapshot.localArtworkURL(for: traktArtworkSource, in: syntheticArtwork) == managed,
           "the same source URL maps to a stable local file")
-    check(TopShelfSnapshot.localArtworkURL(for: "https://media.trakt.tv/images/movies/000/002/posters/medium/poster.jpg.webp") != managed,
+    check(TopShelfSnapshot.localArtworkURL(for: "https://media.trakt.tv/images/movies/000/002/posters/medium/poster.jpg.webp", in: syntheticArtwork) != managed,
           "different source URLs do not collide in the managed path")
 } else {
-    // Unsigned Apple builds legitimately have no App Group. The API's nil result is the documented
-    // fail-soft path; the extension then falls back to the static Top Shelf image.
-    check(TopShelfSnapshot.containerURL == nil, "an unprovisioned App Group makes the local artwork URL nil")
+    check(false, "pure synthetic artwork path is available without an App Group lookup")
 }
 
 // MARK: Private publication policy
@@ -292,19 +308,237 @@ check(
     "a non-image response is rejected"
 )
 
-// MARK: Degrade path
+// MARK: Bounded local-file snapshot fixtures
 
-section("degrades safely with no usable App Group container")
+section("snapshot reads and writes use only a disposable local directory")
 
-// This host is macOS, where `containerURL(forSecurityApplicationGroupIdentifier:)` hands back a
-// ~/Library/Group Containers path REGARDLESS of entitlements, so it is deliberately not asserted nil
-// here: on iOS/tvOS the same call returns nil when the group is not provisioned (the unsigned-build /
-// Lite case the writer relies on), and this executable cannot stand in for that. What IS asserted is
-// the property that has to hold either way, and it holds under BOTH shapes of the failure: no
-// container at all, and a container path whose directory does not exist. Reading and writing must
-// fail soft, never throw and never trap.
-check(TopShelfSnapshot.read().isEmpty, "read returns [] rather than throwing when there is no snapshot")
-check(TopShelfSnapshot.write(items) == false, "write to an unusable container is a silent no-op rather than a crash")
+do {
+    let fixtureRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let directory = fixtureRoot.appendingPathComponent("vortx-top-shelf-bounds-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("snapshot.json", isDirectory: false)
+    let missing = directory.appendingPathComponent("absent.json", isDirectory: false)
+    let eight = (0..<TopShelfSnapshot.maxItems).map { index in
+        TopShelfSnapshot.Item(id: "tmdb:\(index)", type: index.isMultiple(of: 2) ? "movie" : "series",
+            title: "Title \(index) — नमस्ते", poster: index.isMultiple(of: 2) ? "https://fixture.invalid/poster/\(index).jpg" : directory.appendingPathComponent("top-shelf-artwork/private-poster-\(index).webp").absoluteString,
+            progress: Double(index) / 8)
+    }
+    check(TopShelfSnapshot.read(from: missing).isEmpty, "an absent explicit fixture returns no content")
+    check(TopShelfSnapshot.read(from: directory).isEmpty, "a directory is rejected before opening for snapshot bytes")
+    check(TopShelfSnapshot.read(from: URL(string: "https://fixture.invalid/snapshot.json")!).isEmpty,
+          "a non-file URL is rejected without a network reader")
+    check(!TopShelfSnapshot.write(items, to: directory.appendingPathComponent("missing-parent/snapshot.json")),
+          "an unusable explicit fixture destination fails softly")
+    let wroteEight = TopShelfSnapshot.write(eight, to: file)
+    check(wroteEight, "eight complete rows publish to the disposable file")
+    if !wroteEight {
+        let diagnostic = try encoder.encode(TopShelfSnapshot.Payload(version: TopShelfSnapshot.currentVersion,
+            writtenAt: Date(), items: Array(eight.prefix(TopShelfSnapshot.maxItems))))
+        try diagnostic.write(to: file, options: .atomic)
+        throw NSError(domain: "TopShelfSnapshotTests", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Diagnostic encode/atomic-write replay succeeded; original write check remains failed"])
+    }
+    check(TopShelfSnapshot.read(from: file) == eight, "all eight rows preserve ids, types, Unicode titles, poster URLs and progress")
+    let untrustedRows = [
+        TopShelfSnapshot.Item(id: "tt1", type: "movie", title: "Outside", poster: "file:///etc/hosts", progress: 0),
+        TopShelfSnapshot.Item(id: "tt2", type: "movie", title: "Plain", poster: "http://fixture.invalid/p.jpg", progress: 0),
+        TopShelfSnapshot.Item(id: "", type: "movie", title: "No id", poster: nil, progress: 0),
+    ]
+    let untrusted = directory.appendingPathComponent("untrusted.json")
+    _ = TopShelfSnapshot.write(untrustedRows, to: untrusted)
+    let shown = TopShelfSnapshot.read(from: untrusted)
+    check(shown.map(\.id) == ["tt1", "tt2"], "a row whose action does not round-trip through the link parser is not shown")
+    check(shown.allSatisfy { $0.poster == nil },
+          "a poster outside the managed artwork folder or not https is dropped, the row kept")
+    let original = try Data(contentsOf: file)
+    check(!TopShelfSnapshot.write(eight, to: file), "unchanged readable content does not rewrite the cache")
+    check(try Data(contentsOf: file) == original, "unchanged publication preserves exact cache bytes")
+
+    let link = directory.appendingPathComponent("snapshot-link.json")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+    check(TopShelfSnapshot.read(from: link).isEmpty, "a symbolic-link snapshot is rejected")
+    check(try Data(contentsOf: file) == original, "rejecting a link leaves its regular target intact")
+
+    var exact = original
+    exact.append(Data(repeating: 0x20, count: TopShelfSnapshot.maxSnapshotBytes - exact.count))
+    try exact.write(to: file)
+    check(TopShelfSnapshot.read(from: file) == eight, "valid JSON exactly at the byte ceiling is accepted")
+    var oversized = exact; oversized.append(0x20)
+    try oversized.write(to: file)
+    check(TopShelfSnapshot.read(from: file).isEmpty, "even valid JSON one byte over the ceiling is rejected")
+    check(try Data(contentsOf: file) == oversized, "an oversized read never deletes or repairs cache bytes")
+    check(TopShelfSnapshot.write([], to: file), "an explicit empty publication clears an unreadable oversized cache")
+    check(TopShelfSnapshot.read(from: file).isEmpty, "the explicit clear reads back as empty")
+    let cleared = try decoder.decode(TopShelfSnapshot.Payload.self, from: Data(contentsOf: file))
+    check(cleared.version == TopShelfSnapshot.currentVersion && cleared.items.isEmpty,
+          "clear writes a valid current-schema empty payload")
+
+    let nine = eight + [eight[0]]
+    let nineBytes = try encoder.encode(TopShelfSnapshot.Payload(version: TopShelfSnapshot.currentVersion, writtenAt: Date(), items: nine))
+    try nineBytes.write(to: file)
+    check(TopShelfSnapshot.read(from: file).isEmpty, "a ninth item is rejected rather than decoded then silently prefixed")
+    check((try? decoder.decode(TopShelfSnapshot.Payload.self, from: nineBytes)) == nil,
+          "the actual payload decoder enforces the item bound")
+    check(try Data(contentsOf: file) == nineBytes, "too-many-item reads preserve the source bytes")
+
+    for malformed in [Data(), Data([0xff]), Data("{\"version\":1,\"items\":[".utf8)] {
+        try malformed.write(to: file)
+        check(TopShelfSnapshot.read(from: file).isEmpty, "empty, invalid UTF-8 and torn JSON fail softly")
+        check(try Data(contentsOf: file) == malformed, "a malformed read is data-preserving")
+    }
+    let foreign = try encoder.encode(TopShelfSnapshot.Payload(version: 99, writtenAt: Date(), items: eight))
+    try foreign.write(to: file)
+    check(TopShelfSnapshot.read(from: file).isEmpty, "a complete foreign schema retains the existing version gate")
+    check(try Data(contentsOf: file) == foreign, "a foreign version is not rewritten on read")
+    check(TopShelfSnapshot.write(eight, to: file), "a later valid publication replaces an invalid cache normally")
+    let huge = TopShelfSnapshot.Item(id: "large", type: "movie", title: String(repeating: "x", count: TopShelfSnapshot.maxSnapshotBytes + 1), poster: nil, progress: 0.5)
+    check(TopShelfSnapshot.write([huge], to: file), "a new oversized publication still replaces the prior owner's cache")
+    check(TopShelfSnapshot.read(from: file).first?.id == huge.id, "an oversized title remains a current actionable tile, not an unreadable cache")
+    let rawHuge = try decoder.decode(TopShelfSnapshot.Payload.self, from: Data(contentsOf: file))
+    check(rawHuge.items.first?.title.unicodeScalars.count == TopShelfSnapshot.maxOverflowTitleScalars,
+          "overflow compacts only the display title without changing saved history or identity")
+    check(try Data(contentsOf: file).count <= TopShelfSnapshot.maxSnapshotBytes,
+          "the producer never publishes oversized JSON for the bounded reader")
+    let compactBytes = try Data(contentsOf: file)
+    check(!TopShelfSnapshot.write([huge], to: file), "an unchanged compact overflow projection does not churn the cache")
+    check(try Data(contentsOf: file) == compactBytes, "unchanged overflow preserves exact cache bytes")
+    let hugeIdentity = TopShelfSnapshot.Item(id: String(repeating: "i", count: TopShelfSnapshot.maxSnapshotBytes + 1), type: "movie", title: "Identity too large", poster: nil, progress: 0)
+    check(TopShelfSnapshot.write([hugeIdentity, items[1]], to: file), "a huge identity does not prevent a later valid current row from replacing old content")
+    check(TopShelfSnapshot.read(from: file) == [items[1]], "overflow excludes an unrepresentable row without truncating its action identity")
+    check(TopShelfSnapshot.write([hugeIdentity], to: file), "a wholly unrepresentable new owner replaces old content with a valid empty cache")
+    check(TopShelfSnapshot.read(from: file).isEmpty, "an overflow-only clear cannot retain previous-owner rows")
+    check(TopShelfSnapshot.write(eight, to: file), "a normal publication after overflow restores full original metadata")
+    check(TopShelfSnapshot.read(from: file) == eight, "normal titles, artwork and progress are never compacted")
+    check(TopShelfSnapshot.write([], to: file), "explicit privacy clear still replaces valid content")
+
+    // Diagnostic outcomes must not change the compatibility reader/writer or valid-empty semantics.
+    let diagnosticFile = directory.appendingPathComponent("diagnostic.json")
+    check(TopShelfSnapshot.readResult(from: nil).status == .noContainer,
+          "an unavailable supplied container is distinguished without a real group lookup")
+    check(TopShelfSnapshot.readResult(from: missing).status == .unavailableFile,
+          "missing fixture bytes are unavailable, not a valid empty snapshot")
+    check(TopShelfSnapshot.readResult(from: directory).status == .invalidFile,
+          "directory rejection has a fixed diagnostic status")
+    check(TopShelfSnapshot.writeResult(eight, to: diagnosticFile) == .written,
+          "a changed successful write is distinguished from unchanged content")
+    let ready = TopShelfSnapshot.readResult(from: diagnosticFile)
+    check(ready.status == .ready && ready.items == eight,
+          "a ready result carries exactly the same bounded rows")
+    let diagnosticOriginal = try Data(contentsOf: diagnosticFile)
+    check(TopShelfSnapshot.writeResult(eight, to: diagnosticFile) == .unchanged,
+          "unchanged is a successful no-op, not a write failure")
+    let repeatedWrite = TopShelfSnapshot.write(eight, to: diagnosticFile)
+    let afterRepeatedWrite = try Data(contentsOf: diagnosticFile)
+    check(!repeatedWrite && afterRepeatedWrite == diagnosticOriginal,
+          "the Bool wrapper still returns false and preserves bytes for unchanged content")
+    let unencodable = TopShelfSnapshot.Item(id: "fixture", type: "movie", title: "Fixture", poster: nil, progress: .nan)
+    check(TopShelfSnapshot.writeResult([unencodable], to: diagnosticFile) == .encodingFailed,
+          "encoding rejection has a distinct fixed outcome")
+    check(try Data(contentsOf: diagnosticFile) == diagnosticOriginal,
+          "encoding rejection preserves the previous file")
+    check(TopShelfSnapshot.writeResult(eight, to: directory.appendingPathComponent("absent-parent/diagnostic.json")) == .writeFailed,
+          "an atomic-write failure is not mislabeled unchanged")
+    check(TopShelfSnapshot.writeResult(eight, to: URL(string: "https://fixture.invalid/diagnostic")!) == .invalidDestination,
+          "a non-file destination fails without network I/O")
+    try Data("{}".utf8).write(to: diagnosticFile)
+    check(TopShelfSnapshot.readResult(from: diagnosticFile).status == .invalidPayload,
+          "malformed payload is distinct from valid empty content")
+    try foreign.write(to: diagnosticFile)
+    check(TopShelfSnapshot.readResult(from: diagnosticFile).status == .unsupportedVersion,
+          "a complete foreign version retains its diagnostic and rejection")
+    try oversized.write(to: diagnosticFile)
+    // Use a never-inspected URL for the metadata branch; the reused URL may cache resource values.
+    let diagnosticOversizedFile = directory.appendingPathComponent("diagnostic-oversized.json")
+    try oversized.write(to: diagnosticOversizedFile)
+    check(TopShelfSnapshot.readResult(from: diagnosticOversizedFile).status == .oversized,
+          "metadata-confirmed oversize is distinguished without decoding")
+    check(TopShelfSnapshot.writeResult([], to: diagnosticFile) == .written,
+          "explicit empty still clears a rejected prior publication")
+    let emptyResult = TopShelfSnapshot.readResult(from: diagnosticFile)
+    check(emptyResult.status == .empty && emptyResult.items.isEmpty,
+          "valid empty is explicitly empty, never invalid or unavailable")
+    check(TopShelfSnapshot.writeResult([], to: diagnosticFile) == .unchanged && !TopShelfSnapshot.write([], to: diagnosticFile),
+          "repeated explicit empty preserves the original no-change Bool")
+} catch {
+    check(false, "disposable snapshot fixture failed: \(error)")
+}
+
+section("bounded byte collection handles short reads, errors and the sentinel byte")
+
+let shortBytes = try! encoder.encode(payload)
+var shortOffset = 0
+var shortRequests: [Int] = []
+let shortResult = TopShelfSnapshot.boundedSnapshotData { requested in
+    shortRequests.append(requested)
+    guard shortOffset < shortBytes.count else { return nil }
+    let count = min(3, min(requested, shortBytes.count - shortOffset))
+    defer { shortOffset += count }
+    return shortBytes.subdata(in: shortOffset..<(shortOffset + count))
+}
+check(shortResult == shortBytes, "partial chunks are collected through EOF without truncating JSON")
+check(shortRequests.allSatisfy { $0 > 0 && $0 <= 16 * 1024 }, "each byte request is positive and at most 16 KiB")
+var supplied = 0
+var oversizeRequests: [Int] = []
+let sentinelResult = TopShelfSnapshot.boundedSnapshotData { requested in
+    oversizeRequests.append(requested)
+    let beforeSentinel = TopShelfSnapshot.maxSnapshotBytes - supplied
+    let count = beforeSentinel > 0 ? min(1_003, min(requested, beforeSentinel)) : 1
+    supplied += count
+    return Data(repeating: 0x20, count: count)
+}
+check(sentinelResult == nil && supplied == TopShelfSnapshot.maxSnapshotBytes + 1,
+      "an unknown/growing-length source is rejected after exactly ceiling plus one supplied bytes")
+check(oversizeRequests.last == 1, "the final request is the single oversize sentinel byte")
+enum FixtureReadError: Error { case failed }
+var failedCalls = 0
+check(TopShelfSnapshot.boundedSnapshotData { _ in
+    failedCalls += 1
+    if failedCalls == 1 { return Data([0x7b]) }
+    throw FixtureReadError.failed
+} == nil && failedCalls == 2, "an I/O error after a partial chunk does not decode a partial snapshot")
+check(TopShelfSnapshot.boundedSnapshotData { _ in Data() } == nil, "an empty first chunk is EOF rather than a retry loop")
+check(TopShelfSnapshot.boundedSnapshotData { requested in Data(repeating: 0, count: requested + 1) } == nil,
+      "a reader violating its requested byte budget is rejected")
+
+// MARK: App Group under a re-signing service
+
+section("the shared group follows what the signed copy was granted")
+
+let canonicalGroup = TopShelfSnapshot.canonicalAppGroupID
+let signerGroup = "group.b0eaaf9ad1ed3ea5.1"
+check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == canonicalGroup } == canonicalGroup,
+      "the project's own group wins when this copy holds it")
+check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { $0 == signerGroup } == signerGroup,
+      "a re-signed copy uses the group its signer granted instead of finding no container")
+let grantedA = ["group.zz.second", signerGroup], grantedB = [signerGroup, "group.zz.second"]
+let both = { (id: String) in id == signerGroup || id == "group.zz.second" }
+check(TopShelfSnapshot.selectAppGroup(granted: grantedA, canonical: canonicalGroup, hasContainer: both)
+      == TopShelfSnapshot.selectAppGroup(granted: grantedB, canonical: canonicalGroup, hasContainer: both),
+      "an app and its extension granted the same groups in any order settle on the same one")
+check(TopShelfSnapshot.selectAppGroup(granted: ["group.*", "com.example.notagroup"], canonical: canonicalGroup) { _ in true } == canonicalGroup,
+      "wildcards and non-group identifiers are never used")
+check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { _ in false } == nil,
+      "no granted container leaves the feature off")
+
+let profilePlist = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Entitlements</key><dict>
+<key>com.apple.security.application-groups</key><array><string>\(signerGroup)</string></array>
+</dict></dict></plist>
+"""
+var envelope = Data([0x30, 0x82, 0x2a, 0x1f, 0x06, 0x09])
+envelope.append(Data(profilePlist.utf8))
+envelope.append(Data([0xa0, 0x82, 0x0b, 0x00]))
+check(TopShelfSnapshot.provisionedAppGroups(profile: envelope) == [signerGroup],
+      "groups are read from the plist inside the signed profile envelope")
+check(TopShelfSnapshot.provisionedAppGroups(profile: Data([0x30, 0x82, 0x00])).isEmpty,
+      "an unreadable profile grants nothing")
+check(TopShelfSnapshot.isTopShelfExtension(["NSExtension": ["NSExtensionPointIdentifier": "com.apple.tv-top-shelf"]]),
+      "the Top Shelf extension is recognised by its extension point")
+check(!TopShelfSnapshot.isTopShelfExtension(["NSExtension": ["NSExtensionPointIdentifier": "com.apple.widgetkit-extension"]])
+      && !TopShelfSnapshot.isTopShelfExtension(nil), "other bundles are not the Top Shelf extension")
 
 // MARK: Result
 

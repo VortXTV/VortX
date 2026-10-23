@@ -1,0 +1,47 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 2a728f0..35689a5 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -1,5 +1,5 @@
+ [versions]
+-android-plugin = "9.1.0"
++android-plugin = "9.4.1"
+ maven-publish = "0.36.0"
+ 
+ [plugins]
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 5b59ea8..3174e00 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,7 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-9.4.1-bin.zip
++distributionUrl=https\://services.gradle.org/distributions/gradle-9.7.0-bin.zip
++distributionSha256Sum=84fbba45c7f4c64abc77460e1c00f541e9f960e3c7ed2538f1ede19eacd873ae
+ networkTimeout=10000
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+diff --git a/libmpv/build.gradle.kts b/libmpv/build.gradle.kts
+index 56a1313..ca035c6 100755
+--- a/libmpv/build.gradle.kts
++++ b/libmpv/build.gradle.kts
+@@ -9,13 +9,16 @@ plugins {
+ 
+ android {
+     namespace = "dev.jdtech.mpv"
+-    compileSdk = 36
++    compileSdk = 37
+     buildToolsVersion = "37.0.0"
+-    ndkVersion = "29.0.14206865"
++    ndkVersion = "30.0.16248370"
+ 
+     defaultConfig {
+         minSdk = 26
+         consumerProguardFiles("proguard-rules.pro")
++        ndk {
++            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
++        }
+         externalNativeBuild {
+             cmake {
+                 arguments += listOf(

@@ -174,6 +174,8 @@ class MpvPlayer private constructor(
     private val subtitleLoadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val subtitleLoadGeneration = AtomicLong()
     private val subtitleGenerationGate = Any()
+    // Metadata only; all access is under subtitleGenerationGate, not the terminal/audio locks.
+    private val metadataLoadIdentity = MpvMetadataLoadIdentity()
     private val released = AtomicBoolean(false)
     private val audioHealthLock = Any()
     private var audioHealthJob: Job? = null
@@ -246,16 +248,29 @@ class MpvPlayer private constructor(
         }
 
         override fun eventProperty(name: String, value: String) {
-            // track-list is read via the property API (refreshTracks), not delivered as a string here.
+            if (name == "video-params/gamma" || name == "video-out-params/gamma") {
+                refreshTracks(rearmHealth = false)
+            }
         }
 
         override fun eventTerminal(event: MpvTerminalEvent) {
+            synchronized(subtitleGenerationGate) {
+                metadataLoadIdentity.ended()
+                _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
+            }
             // The gate drops the callback entirely when teardown won the race, when a duplicate
             // arrives after the first terminal, or inside the replacement-suppression window; it
             // publishes under its lock only for a state-changing verdict.
             val applied = terminalGate.onTerminal(event)
             if (applied?.nativeError != null) {
                 Log.e(TAG, "mpv terminal ${applied.reason}; native error=${applied.nativeError}")
+            }
+        }
+
+        override fun eventStartFile(entryID: Long) {
+            synchronized(subtitleGenerationGate) {
+                metadataLoadIdentity.started(entryID)
+                _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
             }
         }
 
@@ -274,6 +289,7 @@ class MpvPlayer private constructor(
                     scheduleAudioOutputHealthCheck()
                 }
                 MPVLib.Event.FILE_LOADED -> {
+                    synchronized(subtitleGenerationGate) { metadataLoadIdentity.loaded() }
                     synchronized(audioHealthLock) {
                         audioFileLoadedGeneration = subtitleLoadGeneration.get()
                         audioTrackListObservedGeneration = 0L
@@ -283,7 +299,14 @@ class MpvPlayer private constructor(
                     scheduleAudioOutputHealthCheck(replaceExisting = true)
                 }
                 MPVLib.Event.VIDEO_RECONFIG -> refreshTracks()
-                MPVLib.Event.AUDIO_RECONFIG -> scheduleAudioOutputHealthCheck()
+                MPVLib.Event.AUDIO_RECONFIG -> {
+                    refreshTracks(rearmHealth = false)
+                    scheduleAudioOutputHealthCheck()
+                }
+                MPVLib.Event.QUEUE_OVERFLOW -> synchronized(subtitleGenerationGate) {
+                    metadataLoadIdentity.queueOverflow()
+                    _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
+                }
             }
         }
     }
@@ -349,13 +372,18 @@ class MpvPlayer private constructor(
         mpv.observeProperty(PROP_PAUSED_FOR_CACHE, MPVLib.Format.FLAG)
         mpv.observeProperty(PROP_DEMUXER_CACHE_TIME, MPVLib.Format.DOUBLE)
         mpv.observeProperty(PROP_TRACK_LIST, MPVLib.Format.NONE)
+        mpv.observeProperty("video-params/gamma", MPVLib.Format.STRING)
+        mpv.observeProperty("video-out-params/gamma", MPVLib.Format.STRING)
         mpv.addObserver(observer)
     }
 
     override fun load(playable: Playable) {
         if (released.get()) return
         val loadGeneration = synchronized(subtitleGenerationGate) {
-            subtitleLoadGeneration.incrementAndGet()
+            subtitleLoadGeneration.incrementAndGet().also { generation ->
+                metadataLoadIdentity.begin(generation)
+                _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
+            }
         }
         // Reset terminal classification and invalidate the previous source's opportunity tokens before
         // cancelling its jobs. Their finally blocks may run immediately; completion must be a no-op for
@@ -444,7 +472,13 @@ class MpvPlayer private constructor(
         }
 
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
-        mpv.command(arrayOf("loadfile", playable.url, "replace"))
+        val metadataEntryID = mpv.loadFileWithEntryID(playable.url)
+        synchronized(subtitleGenerationGate) {
+            metadataLoadIdentity.commandReturned(loadGeneration, metadataEntryID)
+        }
+        // START/FILE_LOADED can precede command return. Reconcile both arrival orders without
+        // republishing tracks, rearming audio health, or issuing another native load command.
+        refreshTracks(rearmHealth = false, metadataOnly = true)
 
         // WHY audit 07.5: never hand an untrusted remote subtitle URL to mpv. Download under the same
         // 8 MiB / 20s bounds as Apple, then mount only the local cache file. Failure never affects playback.
@@ -1049,6 +1083,8 @@ class MpvPlayer private constructor(
         if (!released.compareAndSet(false, true)) return
         synchronized(subtitleGenerationGate) {
             subtitleLoadGeneration.incrementAndGet()
+            metadataLoadIdentity.retire()
+            _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
         }
         // Retire every held terminal/opportunity before cancellation. A cancelled audio-health coroutine
         // runs its `finally` and may complete its old opportunity immediately; after reset that completion
@@ -1077,14 +1113,55 @@ class MpvPlayer private constructor(
 
     /// Re-read `track-list` (a JSON array of track objects) and republish the audio + subtitle tracks.
     /// Called on file-loaded / video-reconfig / track-list change, mirroring the Apple track observer.
-    private fun refreshTracks(rearmHealth: Boolean = true) {
+    private fun refreshTracks(rearmHealth: Boolean = true, metadataOnly: Boolean = false) {
         val generation = subtitleLoadGeneration.get()
-        val snapshot = parseMpvTrackSnapshot(mpv.getPropertyString(PROP_TRACK_LIST)) ?: return
+        val metadataRead = synchronized(subtitleGenerationGate) {
+            if (released.get() || subtitleLoadGeneration.get() != generation) null
+            else metadataLoadIdentity.capture(generation, currentPlayingEntryID())
+        }
+        val selectedAudioID = mpv.getPropertyString("aid")?.toIntOrNull()
+        val snapshot = parseMpvTrackSnapshot(mpv.getPropertyString(PROP_TRACK_LIST)) ?: run {
+            synchronized(subtitleGenerationGate) {
+                if (!released.get() && subtitleLoadGeneration.get() == generation) {
+                    _state.update { it.copy(metadata = com.vortx.android.player.PlaybackMetadata()) }
+                }
+            }
+            return
+        }
         synchronized(subtitleGenerationGate) {
             if (released.get() || subtitleLoadGeneration.get() != generation) return
-            _state.update { it.copy(audioTracks = snapshot.audio, subtitleTracks = snapshot.subtitles) }
-            trackListUpdated(snapshot.audio.isNotEmpty(), rearmHealth)
+            val selected = snapshot.audio.singleOrNull { it.selected && it.id == selectedAudioID }
+            val observed = if (metadataRead == null) com.vortx.android.player.PlaybackMetadata()
+                else com.vortx.android.player.PlaybackMetadata(
+                width = mpv.getPropertyInt("video-params/w") ?: 0,
+                height = mpv.getPropertyInt("video-params/h") ?: 0,
+                dynamicRange = com.vortx.android.player.PlaybackMetadata.mpvRange(
+                    mpv.getPropertyString("video-out-params/gamma")
+                        ?: mpv.getPropertyString("video-params/gamma")),
+                audioSelected = selected != null, audioLanguage = selected?.lang,
+                audioCodec = if (selected != null) mpv.getPropertyString("audio-codec-name") else null,
+                audioChannels = if (selected != null) mpv.getPropertyInt("audio-params/channel-count") ?: 0 else 0)
+            val admitted = if (metadataRead != null && metadataLoadIdentity.accepts(
+                    metadataRead, generation, currentPlayingEntryID())) observed
+                else com.vortx.android.player.PlaybackMetadata()
+            // Selection can change between independent libmpv property reads. Retain video facts but
+            // omit audio rather than combine the old language with the new track's codec/channels.
+            val metadata = if (selectedAudioID == mpv.getPropertyString("aid")?.toIntOrNull()) admitted
+                else admitted.copy(audioSelected = false, audioLanguage = null,
+                    audioCodec = null, audioChannels = 0)
+            _state.update {
+                if (metadataOnly) it.copy(metadata = metadata)
+                else it.copy(audioTracks = snapshot.audio, subtitleTracks = snapshot.subtitles, metadata = metadata)
+            }
+            if (!metadataOnly) trackListUpdated(snapshot.audio.isNotEmpty(), rearmHealth)
         }
+    }
+
+    /** Keep INT64 identity intact; getPropertyInt narrows through JNI jint. No path/URL inference. */
+    private fun currentPlayingEntryID(): Long? {
+        val index = mpv.getPropertyString("playlist-playing-pos")?.toIntOrNull()
+            ?.takeIf { it >= 0 } ?: return null
+        return mpv.getPropertyString("playlist/$index/id")?.toLongOrNull()?.takeIf { it >= 0L }
     }
 
     /**

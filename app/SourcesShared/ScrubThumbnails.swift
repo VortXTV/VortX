@@ -69,6 +69,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     private var communityRemotePhase = CommunityRemotePhase.idle
     private var communityFetchTask: Task<Void, Never>?; private var communityFetchEpoch: UInt64 = 0
     private var communityFetchKey: String?; private var activeScrubTime: Double?; private var pendingLocalReadToken: Int?
+    private var pendingLocalReadLease: TrickplayLocalReadLease?
     /// The shareable identity for the current title, set by `configureCommunity`. nil for ad-hoc plays.
     private var communityKey: String?
     private var communityImdb: String?
@@ -134,7 +135,15 @@ final class ScrubThumbnailsStore: ObservableObject {
         )
     }
 
-    deinit { communityFetchTask?.cancel() }
+    deinit {
+        pendingLocalReadLease?.cancel()
+        communityFetchTask?.cancel()
+    }
+
+    private func cancelPendingLocalRead() {
+        pendingLocalReadLease?.cancel()
+        pendingLocalReadLease = nil
+    }
 
     private func cancelCommunityFetch() {
         communityFetchEpoch &+= 1; communityFetchTask?.cancel(); communityFetchTask = nil; communityFetchKey = nil
@@ -145,6 +154,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             from: self.localCacheKey,
             to: localCacheKey
         ) == .reset else { return }
+        cancelPendingLocalRead()
         retireCommunityUploadIfNeeded()
         _ = communityIdentityGeneration.advance()
         cancelCommunityFetch()
@@ -331,6 +341,8 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// MAIN THREAD during scrubbing; that read+decode is now hopped off the main actor and the resolved frame
     /// is assigned back on the MainActor, gated by `showToken` so a stale late result can't overwrite a newer one.
     func show(time: Double) {
+        // Retire queued I/O even when the newest preview resolves from community or memory.
+        cancelPendingLocalRead()
         activeScrubTime = time; showToken &+= 1; pendingLocalReadToken = nil; image = nil
         if CommunityTrickplay.isEnabled,
            let sheet = communitySheet, let crop = sheet.crop(at: time) {
@@ -356,10 +368,13 @@ final class ScrubThumbnailsStore: ObservableObject {
         previewState = .loading
         // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
         let token = showToken
+        let lease = TrickplayLocalReadLease()
+        pendingLocalReadLease = lease
         pendingLocalReadToken = token
-        Self.localFrameCache.imageAsync(for: key, time: time) { [weak self] resolved in
+        Self.localFrameCache.imageAsync(for: key, time: time, lease: lease) { [weak self] resolved in
             Task { @MainActor in
                 guard let self,
+                      self.pendingLocalReadLease === lease,
                       TrickplayPreviewReadGate.accepts(
                           requestToken: token,
                           requestMediaKey: key,
@@ -367,6 +382,7 @@ final class ScrubThumbnailsStore: ObservableObject {
                           currentMediaKey: self.localCacheKey
                       ), self.pendingLocalReadToken == token else { return }
                 self.pendingLocalReadToken = nil
+                self.pendingLocalReadLease = nil
                 if resolved == nil, let fallback = self.nearestCommunityFallback() {
                     self.image = fallback; self.previewState = .ready
                 } else {
@@ -377,6 +393,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     }
 
     func clear() {
+        cancelPendingLocalRead()
         showToken &+= 1; activeScrubTime = nil; pendingLocalReadToken = nil; image = nil; previewState = .hidden
     }
 
@@ -747,11 +764,14 @@ private final class LocalTrickplayFrameCache {
     /// wider than the at-or-before lookback. NSCache is thread-safe, so this is callable from the main actor
     /// (instant warm path, bounded radius) and from `ioQueue` (full range). Returns nil when nothing for this
     /// media is resident within `maxRadius` buckets of the scrub position.
-    func nearestResidentImage(for key: String, time: Double, maxRadius: Int) -> ScrubImage? {
+    func nearestResidentImage(for key: String, time: Double, maxRadius: Int,
+                              cancellation: TrickplayLocalReadLease? = nil) -> ScrubImage? {
+        if cancellation?.isCancelled == true { return nil }
         let target = bucketFor(time)
         if let hit = memory.object(forKey: memKey(key, target)) { return hit }
         var radius = 1
         while radius <= maxRadius {
+            if cancellation?.isCancelled == true { return nil }
             if let hit = memory.object(forKey: memKey(key, target + radius)) { return hit }
             let low = target - radius
             if low >= 0, let hit = memory.object(forKey: memKey(key, low)) { return hit }
@@ -768,15 +788,23 @@ private final class LocalTrickplayFrameCache {
     /// Off-main-thread read + JPEG decode of the nearest stored frame. Runs on the private `ioQueue` and calls
     /// `completion` (also on `ioQueue`) with the decoded image or nil. Kept async so scrubbing never blocks the
     /// main thread on a disk read + decode; the in-memory fast path is `memoryImage(for:)` above.
-    func imageAsync(for key: String, time: Double, completion: @escaping (ScrubImage?) -> Void) {
+    func imageAsync(for key: String, time: Double, lease: TrickplayLocalReadLease,
+                    completion: @escaping (ScrubImage?) -> Void) {
         let target = bucketFor(time)
         ioQueue.async {
+            guard !lease.isCancelled else { return }
             // 1) At-or-before within the primary lookback: the accurate trickplay frame for this position.
             let minBucket = max(0, target - self.maxLookbackBuckets)
             for bucket in stride(from: target, through: minBucket, by: -1) {
-                if let cached = self.memory.object(forKey: self.memKey(key, bucket)) { completion(cached); return }
-                guard let data = self.diskStore.data(mediaKey: key, bucket: bucket),
-                      let decoded = ScrubImage(data: data) else { continue }
+                guard !lease.isCancelled else { return }
+                if let cached = self.memory.object(forKey: self.memKey(key, bucket)) {
+                    guard !lease.isCancelled else { return }
+                    completion(cached); return
+                }
+                guard let data = self.diskStore.data(mediaKey: key, bucket: bucket) else { continue }
+                guard !lease.isCancelled else { return }
+                guard let decoded = ScrubImage(data: data) else { continue }
+                guard !lease.isCancelled else { return }
                 self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
                 completion(decoded)
                 return
@@ -785,15 +813,26 @@ private final class LocalTrickplayFrameCache {
             //    either direction rather than "unavailable" (a scrub past what has been captured, or into a
             //    gap). Try the resident set first (cheap, no I/O), then a one-shot directory scan for the
             //    nearest frame that was evicted from memory but is still on disk.
-            if let resident = self.nearestResidentImage(for: key, time: time, maxRadius: self.maxNearestBuckets) {
+            guard !lease.isCancelled else { return }
+            if let resident = self.nearestResidentImage(for: key, time: time,
+                                                       maxRadius: self.maxNearestBuckets, cancellation: lease) {
+                guard !lease.isCancelled else { return }
                 completion(resident); return
             }
-            if let hit = self.diskStore.nearest(mediaKey: key, targetBucket: target),
-               let decoded = ScrubImage(data: hit.data) {
+            guard !lease.isCancelled else { return }
+            if let hit = self.diskStore.nearest(mediaKey: key, targetBucket: target,
+                                                shouldContinue: { !lease.isCancelled }) {
+                guard !lease.isCancelled else { return }
+                guard let decoded = ScrubImage(data: hit.data) else {
+                    guard !lease.isCancelled else { return }
+                    completion(nil); return
+                }
+                guard !lease.isCancelled else { return }
                 self.memory.setObject(decoded, forKey: self.memKey(key, hit.bucket))
                 completion(decoded)
                 return
             }
+            guard !lease.isCancelled else { return }
             completion(nil)
         }
     }

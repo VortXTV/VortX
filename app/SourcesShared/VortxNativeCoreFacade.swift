@@ -17,19 +17,42 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var registrySnapshot: [VortxResourceAddon] { lock.withLock { registry } }
     // Dispatch admission is one synchronous transaction, including nested begin/enqueue helpers.
     // This prevents a profile change/rebind from slipping between a UI identity read and enqueue.
-    private let lock = NSRecursiveLock()
+    private let lock: NSRecursiveLock
+    private let mutationFIFO: VortxNativeFIFOAdmission
     private var values: [String: VortxJSON] = [:]
+    private var externalMetadataReceipts: [Data: (Data, UUID)] = [:]
+    private var externalMetadataObservation = UUID()
     private var selections: [String: VortxJSON] = [:]
     private var generations: [String: UUID] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var closed = false
+    // A commit may have reached disk before readback failed. Keep the last acknowledged
+    // projections readable, but only a new authenticated session may certify more writes.
+    private var checkpointReopenRequired = false
     private let changed: @Sendable ([String]) -> Void
     private let mutationAccepted: @Sendable () -> Void
+    /// Playback progress alone; nil keeps reporting it through `mutationAccepted`.
+    private let progressAccepted: (@Sendable () -> Void)?
     private var failure: String?
     private var resourceRegistryValid = true
     // Full engine materialization: includes protected and profile-disabled members. Resource/UI
     // visibility is separate, and no host comparison of membership clocks is authoritative.
     private var addonInventories: [String: [VortxJSON]] = [:]
+    /// Ephemeral acknowledgement of one submitted add-on operation. Kernel-normalized manifests
+    /// cannot be compared with their wire input to confirm an update. Keep both privately, bound
+    /// to the exact accepted owner/profile/registry and the latest attempted operation instead.
+    private struct AddonConfirmation {
+        let operation: UUID
+        let account: UUID
+        let profile: String
+        let owner: String
+        let registry: UUID
+        let url: String
+        let submittedManifest: VortxJSON
+        let acceptedDescriptor: VortxJSON
+    }
+    private var addonOperation = UUID()
+    private var addonConfirmation: AddonConfirmation?
     /// FIFO tasks are unstructured, so cancellation belongs to the original import operation.
     /// The latch linearizes cancellation with the final checkpoint, not merely queue admission.
     private final class ImportCommitAuthority: VortxMutationAuthority, @unchecked Sendable {
@@ -51,7 +74,23 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var accountEpoch = UUID()
     private var watchlistProfileGeneration = UUID()
     private var sourceArchive: Data?
+    private var ownerHistoryActive = false
+    private var ownerHistoryACKGeneration = UUID()
+    var hasOwnerHistorySession: Bool { lock.withLock { ownerHistoryActive && !closed } }
+    private struct HeldOwnerProgress {
+        let raw: String
+        let binding: WatchlistBinding
+    }
+    private var heldOwnerProgress: HeldOwnerProgress?
+    private var lastOwnerProgressCommit: TimeInterval?
     var authenticatedSourceArchive: Data? { lock.withLock { sourceArchive } }
+    func migrationDraft(isCurrent: @escaping @Sendable () -> Bool = { true },
+        checkpoint: (@Sendable () async throws -> Void)? = nil) async throws -> Data? {
+        try await session.migrationDraft(isCurrent: isCurrent, checkpoint: checkpoint)
+    }
+    func retainMigrationProgress(_ archive: Data, expected: Data?, authority: any VortxMutationAuthority) async throws {
+        try await session.retainMigrationProgress(archive, expected: expected, authority: authority)
+    }
     var accountGeneration: UUID { lock.withLock { accountEpoch } }
     /// Queued host/sync edits are busy work, not a new owner. Only acknowledged identity changes
     /// retire this fence; FIFO admission will recheck it after any preceding profile transaction.
@@ -83,7 +122,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var playback: VortxJSON?
     private var libraryRequest: VortxJSON?
     var lastFailure: String? { lock.withLock { failure } }
-    var isAvailable: Bool { lock.withLock { !closed } }
+    var isAvailable: Bool { lock.withLock { !closed && !checkpointReopenRequired } }
+    var requiresCheckpointReopen: Bool { lock.withLock { !closed && checkpointReopenRequired } }
     func cachedResumeSeconds(id: String) -> Double? {
         lock.withLock {
             guard !closed, pendingProfileTransitions == 0, let value = playback?["resumeById"]?[id] else { return nil }
@@ -136,9 +176,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},
+                       progressAccepted: (@Sendable () -> Void)? = nil,
                        changed: @escaping @Sendable ([String]) -> Void) async throws -> VortxNativeCoreFacade {
         guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
-        let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted, changed: changed)
+        let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted,
+                                           progressAccepted: progressAccepted, changed: changed)
         let addonSnapshot = try await session.addonSnapshot()
         let state = addonSnapshot.state
         facade.addonInventories = addonSnapshot.inventories
@@ -147,14 +189,34 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
         facade.values["native_own_overlay_pending"] = try await session.pendingOwnAccountOverlays()
         facade.sourceArchive = try await session.authenticatedSourceArchive()
+        facade.ownerHistoryActive = await session.usesOwnerHistory()
         return facade
     }
-    private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void, changed: @escaping @Sendable ([String]) -> Void) {
+    private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void,
+                 progressAccepted: (@Sendable () -> Void)?, changed: @escaping @Sendable ([String]) -> Void) {
+        let lock = NSRecursiveLock()
+        self.lock = lock; self.mutationFIFO = VortxNativeFIFOAdmission(lock: lock)
         self.session = session; self.registry = registry; self.changed = changed; self.mutationAccepted = mutationAccepted
+        self.progressAccepted = progressAccepted
     }
+    func ownsSession(_ candidate: VortxNativeSession) -> Bool { session === candidate }
     func stateData(_ field: String) -> Data? {
-        lock.lock(); defer { lock.unlock() }; guard !closed, let value = values[field] else { return nil }
+        // VortxJSON is a copy-on-write value. Encoding a large board under this shared lock
+        // stalls main-thread profile/binding reads even when the encoder runs off-main.
+        guard let value = lock.withLock({ closed ? nil : values[field] }) else { return nil }
         return try? JSONEncoder().encode(value)
+    }
+    /// Owned, copy-on-write playback value for an exact accepted account/profile generation.
+    /// This is deliberately not a generic state getter: a body-time history read must not
+    /// serialize the whole projection, nor cross a queued transition or profile/account ABA.
+    func playbackSnapshot(expected: WatchlistBinding) -> VortxJSON? {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, expected.scope == session.scope,
+                  expected.accountGeneration == accountEpoch,
+                  expected.profileGeneration == watchlistProfileGeneration,
+                  values["native_state"]?["activeProfileId"] == .string(expected.profileID) else { return nil }
+            return values["native_playback"]
+        }
     }
     func profileSnapshot() -> (state: VortxJSON, host: VortxJSON, pending: VortxJSON, generation: UUID)? {
         lock.withLock {
@@ -163,11 +225,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
     }
     func close() {
-        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); lock.unlock()
+        lock.lock(); closed = true; mutationFIFO.close(); let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
         session.revoke()
         old.forEach { $0.cancel() }; Task { await session.close() }
     }
-    func shutdown() async { close(); await session.close() }
+    func shutdown() async {
+        if lock.withLock({ ownerHistoryActive }) {
+            await withCheckedContinuation { continuation in flushPendingProgress { continuation.resume() } }
+        }
+        close(); await session.close()
+    }
     var registryBinding: RegistryBinding? {
         lock.withLock {
             guard !closed, pendingProfileTransitions == 0, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
@@ -201,6 +268,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             // enter the session actor. Wait for that exact FIFO member before invalidating the
             // resource host; otherwise a rebind can land between the facade check and dispatch.
             let predecessor = tasks["native_state"]
+            addonConfirmation = nil; addonOperation = UUID()
             invalidateResourcePublications(); return (true, predecessor)
         }
         guard admission.0 else { throw VortxNativeError.superseded }
@@ -220,6 +288,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// Called under lock. Keep the durable-state publication, discard only prior resource ownership.
     private func invalidateResourcePublications() {
+        externalMetadataReceipts.removeAll()
         addonInventories = [:]
         resourceRegistryValid = false
         for (field, task) in tasks where field != "native_state" { task.cancel() }
@@ -251,6 +320,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             let projected = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
             if values[$0.key] != projected { changedFields.append($0.key) }
             values[$0.key] = projected
+            if $0.key == "meta_details" { observeExternalMetadata(projected) }
         }
         lock.unlock()
         if !changedFields.isEmpty { changed(changedFields.sorted()) }
@@ -292,25 +362,59 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
                                  actions: [String]? = nil, hostRemote: VortxJSON? = nil,
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
+                                 hostFieldCAS: VortxHostFieldCAS? = nil,
+                                 checkpointValidator: (any VortxProspectiveCheckpointValidator)? = nil,
                                  legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                  admission: (@Sendable () throws -> Bool)? = nil,
                                  websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
+                                 fifoMember: VortxNativeFIFOAdmission.Member? = nil, forceProfileTransition: Bool = false,
+                                 forceProgress: Bool = false,
+                                 ownerOperation: (@Sendable () async throws -> Void)? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
+        guard !checkpointReopenRequired else { return fail("checkpoint_uncertain_reopen_required") }
+        if !forceProgress, !admitProgress(type: type, raw: raw), completion == nil { return true }
+        if type == "report_progress", let held = heldOwnerProgress {
+            let old = try? JSONDecoder().decode(VortxJSON.self, from: Data(held.raw.utf8))
+            let next = try? JSONDecoder().decode(VortxJSON.self, from: Data(raw.utf8))
+            if old?["metaId"] != next?["metaId"] || old?["videoId"] != next?["videoId"] {
+                guard flushHeldOwnerProgress() else { return false }
+            }
+        }
+        if ownerHistoryActive, type == "report_progress", !forceProgress,
+           completion == nil, fifoMember == nil, sourceAuthority == nil,
+           let binding = watchlistBinding, let last = lastOwnerProgressCommit,
+           ProcessInfo.processInfo.systemUptime - last < VortxNativeSession.progressCommitInterval {
+            heldOwnerProgress = HeldOwnerProgress(raw: raw, binding: binding)
+            return true // retained intent only; no native mutation/publication/ACK
+        }
+        if type != "report_progress", !flushHeldOwnerProgress() { return false }
+        let queueMember: VortxNativeFIFOAdmission.Member
+        let mutationAuthority: (any VortxMutationAuthority)?
+        do {
+            if let fifoMember {
+                mutationAuthority = try mutationFIFO.capturedAuthority(for: fifoMember)
+                queueMember = fifoMember
+            } else { queueMember = try mutationFIFO.admit(); mutationAuthority = sourceAuthority }
+        } catch { return fail("native_fifo_unavailable") }
+        if type == "report_progress" { heldOwnerProgress = nil }
         let predecessor = tasks["native_state"]
         let ticket = UUID(); generations["native_state"] = ticket
-        let profileTransition = ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile", "rebind_profile_account"].contains(type)
+        let profileTransition = forceProfileTransition || ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile", "rebind_profile_account"].contains(type)
         if profileTransition { pendingProfileTransitions += 1 }
         // State intents are FIFO, never latest-wins: dropping one would lose progress/profile edits.
         tasks["native_state"] = Task { [weak self] in
             await predecessor?.value
+            defer { queueMember.finish() }
             guard let self else { completion?(.failure(VortxNativeError.closed)); return }
             var transitionReleased = false
             defer { if profileTransition && !transitionReleased { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
             var durableCommitted = false
             do {
                 try Task.checkCancellation()
+                try queueMember.begin()
+                if fifoMember != nil { try mutationAuthority?.withActive {} }
                 // Resource-backed gestures may wait behind an add-on/profile mutation.  Their
                 // metadata was accepted for an earlier registry generation, so revalidate at
                 // the FIFO boundary rather than treating the pre-enqueue check as durable.
@@ -319,9 +423,15 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     completion?(.failure(VortxNativeError.superseded))
                     return
                 }
-                _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
-                                               hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: websiteBaseline,
-                                               sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
+                if let ownerOperation { try await ownerOperation() }
+                else {
+                    _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
+                        hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists,
+                        websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: websiteBaseline,
+                        sourceAuthority: mutationAuthority, authenticatedSourceArchive: authenticatedSourceArchive,
+                        hostFieldCAS: hostFieldCAS, checkpointValidator: checkpointValidator,
+                        fifoAuthority: queueMember.runningAuthority)
+                }
                 durableCommitted = true
                 let addonSnapshot = try await session.addonSnapshot()
                 let state = addonSnapshot.state
@@ -351,6 +461,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                         self.watchlistProfileGeneration = UUID()
                     }
                     self.failure = nil
+                    if ownerOperation != nil { self.ownerHistoryActive = true }
+                    if self.ownerHistoryActive { self.ownerHistoryACKGeneration = UUID() }
+                    if self.ownerHistoryActive, type == "report_progress" {
+                        self.lastOwnerProgressCommit = ProcessInfo.processInfo.systemUptime
+                    }
                     self.playback = playback
                     self.sourceArchive = sourceArchive
                     if identityChanged {
@@ -380,11 +495,35 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     let saved = publication?.fields["library"]?["catalog"]?.array?.count ?? 0
                     NSLog("[VortXNative] mutation=%@ result=acknowledged continueWatching=%ld savedLibrary=%ld", type, count, saved)
                 }
-                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged { self.mutationAccepted() }
+                if type == "report_progress", hostEdits.isEmpty, !websiteChanged, let progressAccepted = self.progressAccepted {
+                    progressAccepted()
+                } else if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged {
+                    self.mutationAccepted()
+                }
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
+                if ownerOperation != nil {
+                    let owns = await session.usesOwnerHistory()
+                    self.lock.withLock { self.ownerHistoryActive = owns }
+                }
+                self.lock.withLock { self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain() }
                 _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
             } catch {
+                if ownerOperation != nil || self.lock.withLock({ self.ownerHistoryActive }) {
+                    let status = await session.ownerHistoryRouteStatus()
+                    self.lock.withLock {
+                        self.ownerHistoryActive = status.ownsHistory
+                        if status.requiresAuthenticatedReopen {
+                            self.checkpointReopenRequired = true
+                            self.mutationFIFO.markUncertain()
+                        }
+                    }
+                    if status.requiresAuthenticatedReopen {
+                        _ = self.fail("checkpoint_uncertain_reopen_required")
+                        completion?(.failure(VortxNativeError.checkpointUncertain))
+                        return
+                    }
+                }
                 if durableCommitted {
                     // The acknowledged snapshot exists, but its required projection failed. Do
                     // not relabel the previous/empty history as the successful new profile state.
@@ -395,17 +534,87 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         return true
     }
+    /// One playback tick reaches the engine through two lanes on Apple (the player's TimeChanged and the
+    /// account save) as two identical report_progress mutations, and each mutation rewrites the whole sealed
+    /// checkpoint. The second is dropped: same active profile and title (a movie's videoId equal to its metaId
+    /// counts as none), within 3 s and 1.5 s of position of the last admitted report. Any other mutation, a
+    /// different title or episode, or a real move still goes through. Caller holds `lock`.
+    private struct ProgressAdmission {
+        let profile: String, metaId: String, videoId: String?, positionMs: UInt64, at: TimeInterval
+    }
+    private var lastProgressAdmission: ProgressAdmission?
+    private static let progressDuplicateWindow: TimeInterval = 3
+    private static let progressDuplicateDistanceMs: UInt64 = 1_500
+    private func admitProgress(type: String, raw: String) -> Bool {
+        guard type == "report_progress",
+              let action = try? JSONDecoder().decode(VortxJSON.self, from: Data(raw.utf8)),
+              let metaId = string(action["metaId"]), let profile = string(values["native_state"]?["activeProfileId"]),
+              let position = try? action["positionMs"]?.decode(UInt64.self) else {
+            lastProgressAdmission = nil
+            return true
+        }
+        let videoId = string(action["videoId"]).flatMap { $0 == metaId ? nil : $0 }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let last = lastProgressAdmission, last.profile == profile, last.metaId == metaId, last.videoId == videoId,
+           now - last.at < Self.progressDuplicateWindow,
+           (position > last.positionMs ? position - last.positionMs : last.positionMs - position) <= Self.progressDuplicateDistanceMs {
+            return false
+        }
+        lastProgressAdmission = ProgressAdmission(profile: profile, metaId: metaId, videoId: videoId, positionMs: position, at: now)
+        return true
+    }
+    /// Caller owns the existing Facade lock. Install on the SAME native_state FIFO before
+    /// the following profile/control intent. Rejected/cancelled work never gets an ACK.
+    private func flushHeldOwnerProgress() -> Bool {
+        guard let held = heldOwnerProgress else { return true }
+        heldOwnerProgress = nil
+        let accepted = enqueueMutation(type: "report_progress", raw: held.raw,
+            admission: { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock { self.watchlistBinding == held.binding }
+            }, forceProgress: true)
+        if !accepted { heldOwnerProgress = held }
+        return accepted
+    }
+    /// Make progress the session held back durable now (player pause or close, app background or quit). It
+    /// queues behind every mutation already admitted, and the next progress report is also written at once,
+    /// so a save still on its way from the player is not held back either.
+    func flushPendingProgress(completion: (@Sendable () -> Void)? = nil) {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, !checkpointReopenRequired else { completion?(); return }
+        guard flushHeldOwnerProgress() else { completion?(); return }
+        lastOwnerProgressCommit = nil
+        guard let queueMember = try? mutationFIFO.admit() else { completion?(); return }
+        let predecessor = tasks["native_state"]
+        tasks["native_state"] = Task { [weak self] in
+            await predecessor?.value
+            defer { queueMember.finish() }
+            guard let self else { completion?(); return }
+            do {
+                try Task.checkCancellation()
+                try queueMember.begin()
+                try await self.session.flushPendingProgress()
+            }
+            catch VortxNativeError.checkpointUncertain {
+                self.lock.withLock { self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain() }
+                _ = self.fail("checkpoint_uncertain_reopen_required")
+            } catch {
+                _ = self.fail("native_progress_flush_failed")
+            }
+            completion?()
+        }
+    }
     /// Resource-backed public actions need a durable result, unlike synchronous UI wires whose
     /// Bool only reports admission.  In particular, a registry may change while this intent is
     /// waiting behind another state mutation; report that rejection to the card caller.
     private func enqueueWatchedMutation(type: String, actions: [String], admission: @escaping @Sendable () -> Bool) async -> Bool {
         await withCheckedContinuation { continuation in
-            let admitted = enqueueMutation(type: type, raw: "", actions: actions, admission: admission) { result in
+            let admitted = enqueueMutation(type: type, raw: "", actions: actions, admission: admission, completion: { result in
                 switch result {
                 case .success: continuation.resume(returning: true)
                 case .failure: continuation.resume(returning: false)
                 }
-            }
+            })
             if !admitted { continuation.resume(returning: false) }
         }
     }
@@ -448,6 +657,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
     }
     func mutateProfiles(_ actions: [VortxJSON], hostEdits: [VortxNativeHostPreferences.Edit], expectedProfileID: String, expectedAccountGeneration: UUID,
+                        preferenceAdmission: (@Sendable (VortxJSON, VortxJSON) -> Bool)? = nil,
                         sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock(); defer { lock.unlock() }
@@ -455,7 +665,24 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                   actions.allSatisfy({ ["add_profile", "patch_profile", "delete_profile", "switch_profile", "rebind_profile_account"].contains(string($0["type"]) ?? "") }) else { continuation.resume(throwing: VortxNativeError.superseded); return }
             do {
                 let raw = try actions.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+                let admission: (@Sendable () throws -> Bool)?
+                if let preferenceAdmission {
+                    admission = { [weak self] in
+                        guard let self else { return false }
+                        let context = self.lock.withLock { () -> (VortxJSON, VortxJSON)? in
+                            guard !self.closed, self.accountEpoch == expectedAccountGeneration,
+                                  let state = self.values["native_state"], state["activeProfileId"] == .string(expectedProfileID),
+                                  let host = self.values["native_host_preferences"] else { return nil }
+                            return (state, host)
+                        }
+                        guard let context else { return false }
+                        // The acknowledged FIFO snapshot is immutable. Evaluate the composed
+                        // Bridge/credential fence outside this lock to avoid lock-order inversion.
+                        return preferenceAdmission(context.0, context.1)
+                    }
+                } else { admission = nil }
                 if !enqueueMutation(type: "patch_profile", raw: "", actions: raw, hostEdits: hostEdits,
+                                    admission: admission,
                                     sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive,
                                     completion: { result in continuation.resume(with: result.map { _ in () }) }) {
                     continuation.resume(throwing: VortxNativeError.closed)
@@ -494,6 +721,23 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 }) { continuation.resume(throwing: VortxNativeError.closed) }
         }
     }
+    /// One `forYou.` profile field (interests or a smart collection). Same fence as `setWatchlist`:
+    /// the edit lands only for the profile and account generation it was captured on, and the
+    /// continuation resumes after the durable commit, not on admission.
+    func setForYouField(_ field: String, value: VortxJSON, expected: WatchlistBinding) async throws {
+        try VortxNativeHostPreferences.validateForYouField(field, value: value)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock(); defer { lock.unlock() }
+            guard watchlistBinding == expected else { continuation.resume(throwing: VortxNativeError.superseded); return }
+            if !enqueueMutation(type: "edit_for_you", raw: "", actions: [],
+                hostEdits: [.init(profileID: expected.profileID, fields: [field: value])], admission: { [weak self] in
+                    guard let self else { return false }
+                    return self.lock.withLock { self.watchlistBinding == expected }
+                }, completion: { result in continuation.resume(with: result.map { _ in () }) }) {
+                continuation.resume(throwing: VortxNativeError.closed)
+            }
+        }
+    }
     /// A synchronous UI admission receipt, not a durable-write acknowledgement. The native FIFO
     /// owns persistence and rejects stale profile gestures before resolving their effective bucket.
     func reorderAddonURLs(_ urls: [String], profileID: String) -> Bool {
@@ -510,12 +754,23 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// Deliberate authenticated owner import. Keep every existing live member and its position,
     /// append new imported identities in source order, and commit the complete batch before success.
-    func importOwnerAddons(_ imported: [VortxJSON], expectedProfileID: String, expectedAccountGeneration: UUID,
-                           sourceAuthority: any VortxMutationAuthority) async throws {
+    /// Only this Facade's own durable add-on completion constructs this stage receipt.
+    /// It authorizes deliberate post-own-ACK capture, never recovery from a rejected source.
+    struct OwnerAddonImportReceipt: Sendable {
+        fileprivate let facade: ObjectIdentifier
+        fileprivate let binding: WatchlistBinding
+        fileprivate let registry: RegistryBinding
+        fileprivate let state: VortxJSON
+        fileprivate init(facade: ObjectIdentifier, binding: WatchlistBinding, registry: RegistryBinding, state: VortxJSON) {
+            self.facade = facade; self.binding = binding; self.registry = registry; self.state = state
+        }
+    }
+    @discardableResult func importOwnerAddons(_ imported: [VortxJSON], expectedProfileID: String, expectedAccountGeneration: UUID,
+                           sourceAuthority: any VortxMutationAuthority) async throws -> OwnerAddonImportReceipt {
         let operationAuthority = ImportCommitAuthority(source: sourceAuthority)
-        try await withTaskCancellationHandler(operation: {
+        return try await withTaskCancellationHandler(operation: {
             try Task.checkCancellation()
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OwnerAddonImportReceipt, Error>) in
                 lock.lock(); defer { lock.unlock() }
                 let owner = session.scope.ownerProfileID
                 guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0,
@@ -546,7 +801,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                 && self.registryGeneration == capturedRegistry
                                 && self.values["native_state"]?["activeProfileId"] == .string(expectedProfileID)
                         }
-                    }, sourceAuthority: operationAuthority, completion: { result in continuation.resume(with: result.map { _ in () }) }) else {
+                    }, sourceAuthority: operationAuthority, completion: { [weak self] result in
+                        do {
+                            _ = try result.get()
+                            guard let self else { throw VortxNativeError.closed }
+                            let receipt = try self.lock.withLock { () throws -> OwnerAddonImportReceipt in
+                                guard !self.closed, self.accountEpoch == expectedAccountGeneration,
+                                      let binding = self.watchlistBinding, let registry = self.registryBinding,
+                                      binding.profileID == expectedProfileID,
+                                      let state = self.values["native_state"] else { throw VortxNativeError.superseded }
+                                return OwnerAddonImportReceipt(facade: ObjectIdentifier(self),
+                                    binding: binding, registry: registry, state: state)
+                            }
+                            continuation.resume(returning: receipt)
+                        } catch { continuation.resume(throwing: error) }
+                    }) else {
                         throw VortxNativeError.closed
                     }
                 } catch { continuation.resume(throwing: error) }
@@ -557,7 +826,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// actions deliberately contain only opaque IDs supplied by the current metadata response:
     /// a title-level mark would incorrectly claim future or unavailable episodes are watched.
     func setWatchedVideos(metaID: String, videoIDs: [String], name: String, type: String, poster: String?, watched: Bool,
-                          profileID: String, expectedAccountGeneration: UUID) -> Bool {
+                          profileID: String, expectedAccountGeneration: UUID,
+                          completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard accountEpoch == expectedAccountGeneration else { return fail("stale_watched_account") }
         let uniqueIDs = Array(Set(videoIDs.filter { !$0.isEmpty })).sorted()
@@ -587,8 +857,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                           let current = self.acceptedMetadataInventory(metaID: metaID, type: type) else { return false }
                     return Set(uniqueIDs).isSubset(of: Set(current))
                 }
-            })
+            }, completion: completion)
         } catch { return fail("invalid_watched_inventory") }
+    }
+    /// Shares the exact metadata/registry fences with bulk watched intents, but reports durable
+    /// rejection to a manual episode caller instead of treating FIFO admission as success.
+    func setWatchedVideosAcknowledged(metaID: String, videoIDs: [String], name: String, type: String, poster: String?, watched: Bool,
+                                      profileID: String, expectedAccountGeneration: UUID) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let admitted = setWatchedVideos(metaID: metaID, videoIDs: videoIDs, name: name, type: type, poster: poster,
+                watched: watched, profileID: profileID, expectedAccountGeneration: expectedAccountGeneration,
+                completion: { continuation.resume(with: $0.map { _ in () }) })
+            if !admitted {
+                continuation.resume(throwing: requiresCheckpointReopen ? VortxNativeError.checkpointUncertain : VortxNativeError.superseded)
+            }
+        }
     }
     /// Card actions may not have a resident detail page. Resolve their exact metadata through the
     /// native resource host without publishing into the navigation slot, then recheck the captured
@@ -664,6 +947,46 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             } catch { continuation.resume(throwing: error) }
         }
     }
+    /// A manual library gesture is complete only after its checkpoint and accepted projection.
+    /// Bind the intent at both enqueue and execution so a queued profile switch cannot redirect it.
+    func setLibraryMembership(id: String, type: String, name: String, poster: String?, present: Bool,
+                              profileID: String, expectedAccountGeneration: UUID) async throws {
+        guard !id.isEmpty, !type.isEmpty, !name.isEmpty else { throw VortxNativeError.invalidResponse }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock(); defer { lock.unlock() }
+            guard !closed else { continuation.resume(throwing: VortxNativeError.closed); return }
+            guard !checkpointReopenRequired else { continuation.resume(throwing: VortxNativeError.checkpointUncertain); return }
+            guard accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0,
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else {
+                continuation.resume(throwing: VortxNativeError.superseded); return
+            }
+            let profileGeneration = watchlistProfileGeneration
+            let action: VortxJSON = present
+                ? .object(["type": .string("add_library_item"), "profileId": .string(profileID),
+                           "item": .object(["kind": .string("standard"), "id": .string(id), "type": .string(type),
+                                            "name": .string(name), "poster": poster.map(VortxJSON.string) ?? .null])])
+                : .object(["type": .string("remove_library_item"), "profileId": .string(profileID),
+                           "key": .string(type + ":" + id)])
+            do {
+                let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+                let accepted = enqueueMutation(type: present ? "add_library_item" : "remove_library_item", raw: raw,
+                    admission: { [weak self] in
+                        guard let self else { return false }
+                        return self.lock.withLock {
+                            !self.closed && !self.checkpointReopenRequired && self.accountEpoch == expectedAccountGeneration
+                                && self.watchlistProfileGeneration == profileGeneration
+                                && self.values["native_state"]?["activeProfileId"] == .string(profileID)
+                        }
+                    }, completion: { continuation.resume(with: $0.map { _ in () }) })
+                if !accepted { continuation.resume(throwing: VortxNativeError.closed) }
+            } catch { continuation.resume(throwing: error) }
+        }
+    }
+    /// Profile admission waits for durable state FIFO work, never unrelated provider responses.
+    func settleNativeMutations() async {
+        let pending = lock.withLock { tasks["native_state"] }
+        await pending?.value
+    }
     /// Testing/integration receipt: waits for currently admitted operations, never launches UI/media.
     func settled() async {
         let pending = lock.withLock { Array(tasks.values) }
@@ -715,7 +1038,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             } else {
                 guard let id = string(action["args"]?["args"]) else { return fail("invalid_library_id") }
                 let matches = state?["libraries"]?[profile]?["items"]?.array?.filter { $0["id"] == .string(id) && $0["kind"] == .string("standard") } ?? []
-                guard matches.count == 1, let type = string(matches[0]["type"]) else { return fail("ambiguous_library_id") }
+                // A watched-only Library title is removed under its own watch type (the engine records it).
+                let watchedType = matches.isEmpty ? VortxNativePreviouslyWatched.type(of: id, playback: lock.withLock { playback }) : nil
+                guard let type = matches.count == 1 ? string(matches[0]["type"]) : watchedType else { return fail("ambiguous_library_id") }
                 native["type"] = .string("remove_library_item"); native["key"] = .string(type + ":" + id)
             }
             guard let bytes = try? JSONEncoder().encode(VortxJSON.object(["action": .string("Vortx"), "args": .object(native)])) else { return false }
@@ -822,23 +1147,22 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             let chosen: (VortxResourceAddon, VortxResourceRequest)?
             if let supplied, let request = try? path(supplied["path"]), let addon = registrySnapshot.first(where: { .string($0.transportUrl) == supplied["base"] }), validCatalogRequest(request, addon: addon) { chosen = (addon, request) }
             else if supplied == nil { chosen = requests.first } else { return fail("invalid_catalog_request") }
-            guard let chosen else { return fail("no_catalogs") }
-            guard let loading = try? loadingEntry(chosen.0, chosen.1) else { return fail("invalid_catalog_request") }
-            let initial = discoverProjection(pages: [loading], chosen: chosen, requests: requests)
-            return enqueue(field, initial: initial) { [self] in
-                let board = try await session.loadCatalog(.discover, request: chosen.1, addons: [chosen.0])
-                let pages = board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? []
-                return [field: discoverProjection(pages: pages, chosen: chosen, requests: requests)]
+            guard let chosen else {
+                guard let ticket = begin(field) else { return false }
+                publish([field: .object(["catalog": .array([]), "selectable": .object([
+                    "types": .array([]), "catalogs": .array([]), "extra": .array([]), "next_page": .null])])], field: field, ticket: ticket)
+                return true
             }
+            let previous = values[field]?["catalog"]?.array ?? []
+            let retryPage = supplied != nil && supplied == values[field]?["retryRequest"]
+                && chosen.1.extra.contains { $0.first == "skip" }
+                && previous.first?["request"] != supplied
+            return enqueueDiscover(chosen: chosen, requests: requests, append: retryPage)
         }
         if name == "CatalogWithFilters", string(action["args"]?["action"]) == "LoadNextPage", field == "discover" {
             guard let pages = values[field]?["catalog"]?.array else { return fail("missing_selection") }
             guard let next = nextCatalogPage(pages) else { return true }
-            let requests = catalogRequests(extra: [], type: nil)
-            return enqueue(field) { [self] in
-                let board = try await session.loadCatalog(.discover, request: next.1, addons: [next.0], append: true)
-                return [field: discoverProjection(pages: board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? [], chosen: next, requests: requests)]
-            }
+            return enqueueDiscover(chosen: next, requests: catalogRequests(extra: [], type: nil), append: true)
         }
         if name == "Load", model == "LibraryWithFilters", field == "library" {
             let request = action["args"]?["args"]?["request"]
@@ -885,13 +1209,54 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func addonMemberKey(_ url: String) -> String? {
         VortxNativeWebsiteAddonEdits.memberKey(url)
     }
+    /// The input comparison ties this caller to the acknowledged operation; it does not compare
+    /// unsupported wire fields with the canonical manifest or reproduce the kernel normalizer.
+    func confirmsInstalledAddon(_ identity: String, submittedManifest: VortxJSON) -> Bool {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+                  let receipt = addonConfirmation, receipt.operation == addonOperation,
+                  receipt.account == accountEpoch, receipt.registry == registryGeneration,
+                  receipt.url == identity, receipt.submittedManifest == submittedManifest,
+                  let state = values["native_state"], string(state["activeProfileId"]) == receipt.profile,
+                  addonOwner(for: state) == receipt.owner,
+                  addonInventories[receipt.owner]?.contains(receipt.acceptedDescriptor) == true else { return false }
+            return true
+        }
+    }
     private func dispatchAddonMutation(subaction: String, args: VortxJSON?) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !closed, pendingProfileTransitions == 0, let state = values["native_state"], let owner = addonOwner(for: state) else {
+        // A rejected or superseding call cannot borrow the previous operation's acknowledgement.
+        addonConfirmation = nil; addonOperation = UUID()
+        let operation = addonOperation, account = accountEpoch
+        guard !closed, pendingProfileTransitions == 0, let state = values["native_state"], let owner = addonOwner(for: state),
+              let profile = string(state["activeProfileId"]) else {
             return fail("stale_or_invalid_addon_owner")
         }
         guard let current = installedAddonURLs(state: state, owner: owner) else { return fail("invalid_native_addon_inventory") }
         func raw(_ action: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(action), as: UTF8.self) }
+        func enqueueInstall(type: String, actions: [String], descriptor: (url: String, addon: VortxJSON)) -> Bool {
+            enqueueMutation(type: type, raw: "", actions: actions, admission: { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    !self.closed && self.accountEpoch == account
+                        && self.string(self.values["native_state"]?["activeProfileId"]) == profile
+                        && self.values["native_state"].flatMap(self.addonOwner) == owner
+                }
+            }, completion: { [weak self] result in
+                guard case .success = result, let self else { return }
+                self.lock.withLock {
+                    guard !self.closed, self.pendingProfileTransitions == 0,
+                          self.addonOperation == operation, self.accountEpoch == account,
+                          self.string(self.values["native_state"]?["activeProfileId"]) == profile,
+                          self.values["native_state"].flatMap(self.addonOwner) == owner,
+                          let accepted = self.addonInventories[owner]?.first(where: { self.string($0["transportUrl"]) == descriptor.url }),
+                          let submitted = descriptor.addon["manifest"] else { return }
+                    self.addonConfirmation = .init(operation: operation, account: account, profile: profile, owner: owner,
+                                                  registry: self.registryGeneration, url: descriptor.url,
+                                                  submittedManifest: submitted, acceptedDescriptor: accepted)
+                }
+            })
+        }
         do {
             switch subaction {
             case "InstallAddon", "InstallAddonLocal":
@@ -899,9 +1264,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                       !current.contains(where: { addonMemberKey($0) == identity }) else {
                     return fail("invalid_or_duplicate_addon")
                 }
-                return enqueueMutation(type: "install_addon", raw: try raw(.object([
+                return enqueueInstall(type: "install_addon", actions: [try raw(.object([
                     "type": .string("install_addon"), "profileId": .string(owner), "addon": descriptor.addon,
-                ])))
+                ]))], descriptor: descriptor)
             case "UninstallAddon", "UninstallAddonLocal":
                 guard let descriptor = addonDescriptor(args), let identity = addonMemberKey(descriptor.url),
                       current.contains(where: { addonMemberKey($0) == identity }) else {
@@ -928,7 +1293,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // key before installing its replacement; install-then-remove would tombstone the
                 // newly written record and make the following canonical reorder fail.
                 let actions = oldIdentity == newIdentity ? [remove, install, reorder] : [install, remove, reorder]
-                return enqueueMutation(type: "replace_addon", raw: "", actions: try actions.map(raw))
+                return enqueueInstall(type: "replace_addon", actions: try actions.map(raw), descriptor: new)
             default: return fail("unsupported_addon_mutation")
             }
         } catch { return fail("invalid_addon_mutation") }
@@ -1010,7 +1375,37 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return .object(["name": .string(name), "options": .array(choices)])
         }
         let next = nextCatalogPage(pages).map { VortxJSON.object(["request": catalogRequest($0.0, $0.1)]) } ?? .null
-        return .object(["catalog": .array(pages), "selectable": .object(["types": .array(types), "catalogs": .array(catalogs), "extra": .array(extras), "next_page": next])])
+        let retry = pages.first(where: { $0["content"]?["type"] == .string("Err") })?["request"] ?? .null
+        return .object(["catalog": .array(pages), "retryRequest": retry,
+                        "selectable": .object(["types": .array(types), "catalogs": .array(catalogs), "extra": .array(extras), "next_page": next])])
+    }
+    /// Keep Discover decodable through a failed first page. Its selectable controls and exact
+    /// failed request (including genre/skip) remain available to retry, under enqueue's ticket fence.
+    private func enqueueDiscover(chosen: (VortxResourceAddon, VortxResourceRequest),
+                                 requests: [(VortxResourceAddon, VortxResourceRequest)], append: Bool) -> Bool {
+        guard let loading = try? loadingEntry(chosen.0, chosen.1) else { return fail("invalid_catalog_request") }
+        let previous = values["discover"]?["catalog"]?.array ?? []
+        let sameSelection = previous.first?["request"] == catalogRequest(chosen.0, chosen.1)
+        let retained = append || sameSelection ? previous.filter { $0["content"]?["type"] == .string("Ready") } : []
+        let initial = discoverProjection(pages: retained + [loading], chosen: chosen, requests: requests)
+        return enqueue("discover", initial: initial) { [self] in
+            let pages: [VortxJSON]
+            do {
+                let board = try await session.loadCatalog(.discover, request: chosen.1, addons: [chosen.0], append: append)
+                let received = board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? []
+                // A transport can return an Err group without throwing. Retain last good content
+                // for a refresh failure just as for a thrown failure; success replaces it normally.
+                pages = !append && received.contains(where: { $0["content"]?["type"] == .string("Err") })
+                    ? retained + received : received
+            } catch {
+                try Task.checkCancellation()
+                if case VortxNativeError.superseded = error { throw error }
+                let failed = try VortxResourceProjection.entry(.failed(addonId: chosen.0.id,
+                    failure: .from(error)), request: chosen.1, registry: [chosen.0])
+                pages = retained + [failed]
+            }
+            return ["discover": discoverProjection(pages: pages, chosen: chosen, requests: requests)]
+        }
     }
     private func loadingEntry(_ addon: VortxResourceAddon, _ request: VortxResourceRequest) throws -> VortxJSON {
         .object(["request": .object(["base": .string(addon.transportUrl), "path": try VortxResourceProjection.path(request)]), "content": .object(["type": .string("Loading")])])
@@ -1027,23 +1422,44 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
         }
     }
-    private func projectedLibraryItems(_ state: VortxJSON) throws -> [VortxJSON] {
+    /// The Library: every saved title, then every title watched or started, most recent
+    /// first. A watched title leaves only when the viewer removed it from the Library after its last
+    /// watch; watching it again brings it back.
+    private func projectedLibraryItems(_ state: VortxJSON, formatter: ISO8601DateFormatter = ISO8601DateFormatter()) throws -> [VortxJSON] {
         guard let active = string(state["activeProfileId"]), let library = state["libraries"]?[active] else { throw VortxNativeError.invalidSnapshot }
-        return (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
-            guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
-            // Exact native selected-unit projection, never max(old episode offsets). A saved
-            // membership without watch evidence stays unwatched and out of Continue Watching.
-            let resume = playback?["continueWatching"]?.array?.first { $0["metaId"] == .string(id) }
-            let offset = resume?["offsetMs"] ?? .integer(0)
-            let duration = resume?["durationMs"] ?? .integer(0)
-            let watched = playback?["watchedTitles"]?[id] ?? .integer(0)
-            return .object(["_id": .string(id), "type": .string(type), "name": item["name"] ?? .string(id), "poster": item["poster"] ?? .null,
-                            "state": .object(["timeOffset": offset, "duration": duration,
-                                              "video_id": resume?["videoId"] ?? .null, "lastWatched": isoTimestamp(resume?["updatedAt"]),
-                                              "flaggedWatched": watched, "timesWatched": watched])])
+        // Preserve the selected-unit, first-match semantics even if an input repeats a title.
+        // One index replaces a full Continue Watching scan for every saved/history row.
+        var resumeByID: [String: VortxJSON] = [:]
+        for row in playback?["continueWatching"]?.array ?? [] {
+            if case .string(let id)? = row["metaId"], resumeByID[id] == nil { resumeByID[id] = row }
         }
+        let saved = (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
+            guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
+            return libraryRow(id: id, type: type, name: item["name"] ?? .string(id), poster: item["poster"] ?? .null, resume: resumeByID[id], formatter: formatter)
+        }
+        let savedIDs = Set(saved.compactMap { string($0["_id"]) })
+        let records = state["nativeSync"]?["libraries"]?[active]?["records"]
+        return saved + VortxNativePreviouslyWatched.titles(playback: playback, excluding: savedIDs) { type, id in
+            try? records?[type + ":" + id]?["removedAt"]?.decode(UInt64.self)
+        }.map { libraryRow(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, previouslyWatched: true, resume: resumeByID[$0.id], formatter: formatter) }
     }
-    private func libraryProjection(state: VortxJSON, request: VortxJSON?) -> VortxJSON? {
+    /// `previouslyWatched` marks a watched-only row: listed in the Library, but not saved membership, so Detail
+    /// still offers Add to Library and a removal never edits a Trakt/SIMKL watchlist.
+    private func libraryRow(id: String, type: String, name: VortxJSON, poster: VortxJSON, previouslyWatched: Bool = false,
+                            resume: VortxJSON?, formatter: ISO8601DateFormatter) -> VortxJSON {
+        // Exact native selected-unit projection, never max(old episode offsets). A saved
+        // membership without watch evidence stays unwatched and out of Continue Watching.
+        let offset = resume?["offsetMs"] ?? .integer(0)
+        let duration = resume?["durationMs"] ?? .integer(0)
+        let watched = playback?["watchedTitles"]?[id] ?? .integer(0)
+        var row: [String: VortxJSON] = ["_id": .string(id), "type": .string(type), "name": name, "poster": poster,
+                        "state": .object(["timeOffset": offset, "duration": duration,
+                                          "video_id": resume?["videoId"] ?? .null, "lastWatched": isoTimestamp(resume?["updatedAt"], formatter: formatter),
+                                          "flaggedWatched": watched, "timesWatched": watched])]
+        if previouslyWatched { row["previouslyWatched"] = .bool(true) }
+        return .object(row)
+    }
+    private func libraryProjection(state: VortxJSON, request: VortxJSON?, projected: [VortxJSON]? = nil) -> VortxJSON? {
         let requestedType: String?
         switch request?["type"] {
         case nil, .some(.null): requestedType = nil
@@ -1058,7 +1474,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         guard ["lastwatched", "name", "namereverse", "timeswatched", "watched", "notwatched"].contains(sort),
               request?["page"] == nil || request?["page"] == .integer(1),
-              let all = try? projectedLibraryItems(state) else { return nil }
+              let all = projected ?? (try? projectedLibraryItems(state)) else { return nil }
         var availableTypes = Array(Set(all.compactMap { string($0["type"]) })).sorted()
         if let requestedType, !availableTypes.contains(requestedType) { availableTypes.append(requestedType); availableTypes.sort() }
         var rows = all.enumerated().map { (index: $0.offset, row: $0.element) }
@@ -1097,33 +1513,389 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         return .object(["searchResults": .array(Array(matches))])
     }
     private func stateFields(_ state: VortxJSON) throws -> [String: VortxJSON] {
-        let projected = try projectedLibraryItems(state)
+        // The formatter is local to this complete pass: no mutable formatter crosses threads.
+        let formatter = ISO8601DateFormatter()
+        let projected = try projectedLibraryItems(state, formatter: formatter)
         let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
         var fields: [String: VortxJSON] = ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
                 "native_playback": playback ?? .null,
-                "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap(playbackRow))]),
-                "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap(playbackRow))]),
-                "library": libraryProjection(state: state, request: libraryRequest) ?? .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
+                "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap { playbackRow($0, formatter: formatter) })]),
+                "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap { playbackRow($0, formatter: formatter) })]),
+                "library": libraryProjection(state: state, request: libraryRequest, projected: projected) ?? .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
         if let detail = values["meta_details"] { fields["meta_details"] = metaWithPlayback(detail, library: projected) }
         return fields
     }
     private func metaWithPlayback(_ detail: VortxJSON, library: [VortxJSON]) -> VortxJSON {
         guard case .object(var fields) = detail, let id = string(detail["selected"]?["metaPath"]?["id"]) else { return detail }
-        fields["libraryItem"] = library.first { $0["_id"] == .string(id) } ?? .null
+        // Saved membership only: a watched-only Library row must leave Detail offering Add to Library.
+        fields["libraryItem"] = library.first { $0["_id"] == .string(id) && $0["previouslyWatched"] != .bool(true) } ?? .null
         fields["watchedVideoIds"] = playback?["watchedVideoIdsByTitle"]?[id] ?? .array([])
         return .object(fields)
     }
-    private func isoTimestamp(_ value: VortxJSON?) -> VortxJSON {
+    private func isoTimestamp(_ value: VortxJSON?, formatter: ISO8601DateFormatter) -> VortxJSON {
         guard let seconds = try? value?.decode(UInt64.self), seconds <= 253_402_300_799 else { return .null }
-        return .string(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(seconds))))
+        return .string(formatter.string(from: Date(timeIntervalSince1970: Double(seconds))))
     }
-    private func playbackRow(_ row: VortxJSON) -> VortxJSON? {
+    private func playbackRow(_ row: VortxJSON, formatter: ISO8601DateFormatter) -> VortxJSON? {
         guard let id = string(row["metaId"]), let type = string(row["type"]), !type.isEmpty,
               let offset = try? row["offsetMs"]?.decode(UInt64.self), let duration = try? row["durationMs"]?.decode(UInt64.self),
               let count = try? row["timesWatched"]?.decode(UInt64.self), case .bool(let watched) = row["watched"] else { return nil }
         return .object(["_id": .string(id), "type": .string(type), "name": row["name"] ?? .string(id), "poster": row["poster"] ?? .null,
                         "state": .object(["timeOffset": .unsigned(offset), "duration": .unsigned(duration),
-                                          "video_id": row["videoId"] ?? .null, "lastWatched": isoTimestamp(row["updatedAt"]),
+                                          "video_id": row["videoId"] ?? .null, "lastWatched": isoTimestamp(row["updatedAt"], formatter: formatter),
                                           "flaggedWatched": .integer(watched ? 1 : 0), "timesWatched": .unsigned(count)])])
+    }
+}
+
+// MARK: - Original read capability to own running FIFO member
+extension VortxNativeCoreFacade {
+    typealias OriginalReadCapability = VortxNativeFIFOAdmission.ReadCapability
+
+    // Only explicitly prepared titles, bounded to 32 receipts. These are not service states.
+    private func externalMetadataFingerprint(_ raw: VortxJSON) -> (value: VortxJSON, bytes: Data)? {
+        guard case .string(let id) = raw["id"], !id.isEmpty,
+              raw["type"] == .string("series"), let videos = raw["videos"]?.array,
+              !videos.isEmpty, videos.count <= 20_000 else { return nil }
+        let value = VortxJSON.object(["id": .string(id), "type": .string("series"), "videos": .array(videos.map {
+            .object(["id": $0["id"] ?? .null, "season": $0["season"] ?? .null, "episode": $0["episode"] ?? .null])
+        })])
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let bytes = try? encoder.encode(value), bytes.count <= 1_048_576 else { return nil }
+        return (value, bytes)
+    }
+    private func observeExternalMetadata(_ detail: VortxJSON) {
+        guard let id = string(detail["selected"]?["metaPath"]?["id"]),
+              detail["selected"]?["metaPath"]?["type"] == .string("series"),
+              let rows = detail["metaItems"]?.array, !rows.isEmpty,
+              rows.allSatisfy({ [.string("Ready"), .string("Err")].contains($0["content"]?["type"] ?? .null) }) else { return }
+        externalMetadataObservation = UUID()
+        guard let captured = externalMetadataReceipts[Data(("series|" + id).utf8)] else { return }
+        let ready = rows.filter { $0["content"]?["type"] == .string("Ready") }
+            .compactMap { $0["content"]?["content"] }
+        // A conflicting accepted response cannot silently reinterpret an already offered unit.
+        // No ready response, wrong title, or any differing provider inventory retires the receipt.
+        if ready.isEmpty || ready.contains(where: { externalMetadataFingerprint($0)?.bytes != captured.0 }) {
+            externalMetadataReceipts.removeValue(forKey: Data(("series|" + id).utf8))
+        }
+    }
+    func captureExternalCWRead(expected: WatchlistBinding, registry expectedRegistry: RegistryBinding,
+                               sourceAuthority: any VortxMutationAuthority) throws -> VortxNativeExternalCW.Read {
+        let original = try captureNativeMutationRead(expected: expected, registry: expectedRegistry, sourceAuthority: sourceAuthority)
+        var capturedAddons: [VortxResourceAddon] = []
+        try original.withActive { capturedAddons = registry }
+        let addons = capturedAddons
+        return .init(original: original, metadataCurrent: { [weak self] held in
+            guard let self else { return false }
+            return self.lock.withLock { held.allSatisfy {
+                self.externalMetadataReceipts[Data(($0.type + "|" + $0.id).utf8)]?.1 == $0.receipt
+            } }
+        }, prepare: { [weak self, session] id in
+            guard let self else { throw VortxNativeError.closed }
+            try Task.checkCancellation()
+            var observation: UUID?
+            try original.withActive { observation = self.externalMetadataObservation }
+            // Existing independent resource-host slot: no visible detail load or synthetic ID.
+            let raw = try await session.libraryMetadata(id: id, type: "series", profileID: expected.profileID, addons: addons)
+            try Task.checkCancellation()
+            var accepted: VortxNativeExternalCW.Metadata?
+            try original.withActive {
+                guard observation == self.externalMetadataObservation else { throw VortxNativeError.superseded }
+                guard case .string(let actualID) = raw["id"], actualID.utf8.elementsEqual(id.utf8),
+                      let fingerprint = self.externalMetadataFingerprint(raw),
+                      let rows = fingerprint.value["videos"]?.array else { throw VortxNativeError.invalidResponse }
+                func coordinate(_ raw: VortxJSON?) throws -> Int? {
+                    guard let raw, raw != .null else { return nil }; return try raw.decode(Int.self)
+                }
+                let videos: [VortxNativeExternalCW.Metadata.Video] = try rows.map { row in
+                    guard case .string(let unit) = row["id"], !unit.isEmpty, unit.utf8.count <= 512 else {
+                        throw VortxNativeError.invalidResponse
+                    }
+                    return .init(id: unit, season: try coordinate(row["season"]), episode: try coordinate(row["episode"]))
+                }
+                let key = Data(("series|" + id).utf8)
+                if self.externalMetadataReceipts[key]?.0 != fingerprint.bytes {
+                    self.externalMetadataReceipts[key] = (fingerprint.bytes, UUID())
+                    self.externalMetadataObservation = UUID()
+                }
+                while self.externalMetadataReceipts.count > 32 {
+                    guard let victim = self.externalMetadataReceipts.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }).first(where: { $0 != key }) else { break }
+                    self.externalMetadataReceipts.removeValue(forKey: victim)
+                }
+                guard let receipt = self.externalMetadataReceipts[key]?.1 else { throw VortxNativeError.superseded }
+                accepted = .init(id: id, type: "series", videos: videos, receipt: receipt)
+            }
+            guard let accepted else { throw VortxNativeError.invalidResponse }
+            return accepted
+        }, resolve: { [session] candidates in
+            try await session.externalCWEligibility(candidates, profileID: expected.profileID, original: original)
+        })
+    }
+
+
+    /// Call before provider awaits, without holding the Facade lock. Original source authority
+    /// owns credential/account/install/cancellation checks; no credential bytes are copied here.
+    func captureNativeMutationRead(expected: WatchlistBinding, registry expectedRegistry: RegistryBinding,
+                                   sourceAuthority: any VortxMutationAuthority) throws -> OriginalReadCapability {
+        let originalSession = ObjectIdentifier(session)
+        return try mutationFIFO.capture(source: sourceAuthority) { [weak self] in
+            guard let self, !self.closed, !self.checkpointReopenRequired,
+                  ObjectIdentifier(self.session) == originalSession, self.resourceRegistryValid,
+                  self.heldOwnerProgress == nil,
+                  expected.scope == self.session.scope, expectedRegistry.scope == expected.scope,
+                  expectedRegistry.profileID == expected.profileID,
+                  expected.accountGeneration == self.accountEpoch,
+                  expected.profileGeneration == self.watchlistProfileGeneration,
+                  expectedRegistry.generation == self.registryGeneration,
+                  self.values["native_state"]?["activeProfileId"] == .string(expected.profileID) else {
+                throw VortxNativeError.superseded
+            }
+            // Deliberately no pendingProfileTransitions/latest-enqueued-generation test here:
+            // later FIFO intents cannot revoke this earlier member. Actual ACK identity can.
+        }
+    }
+
+    /// Generic current-Session adapter, not an owner-history import or a source-to-action
+    /// converter. The supplied actions still pass the real Session candidate/checkpoint path.
+    /// Owner-history requires a separate typed Session method and raw publication integration.
+    func dispatchCapturedNativeActions(_ actions: [String], read: OriginalReadCapability,
+                                       checkpointValidator: any VortxProspectiveCheckpointValidator) async throws -> VortxJSON {
+        guard !actions.isEmpty else { throw VortxNativeError.invalidSnapshot }
+        let types = try actions.map { raw -> String in
+            let action = try JSONDecoder().decode(VortxJSON.self, from: Data(raw.utf8))
+            guard case .string(let type) = action["type"] else { throw VortxNativeError.invalidSnapshot }
+            return type
+        }
+        let transitionTypes: Set<String> = ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile", "rebind_profile_account"]
+        let transition = types.contains { transitionTypes.contains($0) }
+        let type = types.allSatisfy { $0 == "get_state" } ? "get_state" : "captured_native_mutation"
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<VortxJSON, Error>) in
+                do {
+                    // Source -> Facade lock. Consume and install the task in the SAME critical
+                    // section; competing dispatch cannot slip between validation and insertion.
+                    try mutationFIFO.admit(read) { member in
+                        guard enqueueMutation(type: type, raw: "", actions: actions,
+                            checkpointValidator: checkpointValidator,
+                            fifoMember: member, forceProfileTransition: transition,
+                            completion: { continuation.resume(with: $0) }) else {
+                            member.finish()
+                            continuation.resume(throwing: VortxNativeError.closed)
+                            return
+                        }
+                    }
+                } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: { read.cancel() })
+    }
+}
+
+// MARK: - Typed owner source import and authenticated raw peer checkpoint
+extension VortxNativeCoreFacade {
+    /// Called only after the retained login gesture's own add-on ACK. Original credential
+    /// selection/token/gesture authority stays external; receipt binds ONLY its own native ACK.
+    func captureOwnerHistoryLoginRead(receipt: OwnerAddonImportReceipt, verifiedUID: String,
+        sourceAuthority: any VortxMutationAuthority) async throws -> VortxNativeSession.OwnerHistoryAcknowledgedRead {
+        let stage = ImportCommitAuthority(source: sourceAuthority)
+        let original = try mutationFIFO.capture(source: stage) { [weak self] in
+            guard let self, !self.closed, !self.checkpointReopenRequired,
+                  self.heldOwnerProgress == nil,
+                  receipt.facade == ObjectIdentifier(self),
+                  self.watchlistBinding == receipt.binding, self.registryBinding == receipt.registry,
+                  self.values["native_state"] == receipt.state else { throw VortxNativeError.superseded }
+        }
+        do {
+            guard let profile = UUID(uuidString: receipt.binding.profileID) else { throw VortxNativeError.invalidSnapshot }
+            return try await session.captureOwnerHistoryAcknowledgedRead(
+                target: .init(profileID: profile, verifiedUID: verifiedUID), read: original)
+        } catch { original.cancel(); throw error }
+    }
+    func importOwnerHistory(_ prepared: OwnerHistoryLoginPreparation) async throws -> Bool {
+        let read = prepared.acknowledged.originalRead
+        let pending: Bool
+        switch prepared.outcome { case .pending: pending = true; case .prepared: pending = false }
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                do {
+                    try mutationFIFO.admit(read) { member in
+                        guard enqueueMutation(type: "import_owner_history", raw: "", actions: [],
+                            fifoMember: member, ownerOperation: { [session] in
+                                let result = try await session.applyOwnerHistoryLogin(prepared)
+                                guard (result.receipt == nil) == pending else { throw VortxNativeError.invalidResponse }
+                            }, completion: { result in continuation.resume(with: result.map { _ in !pending }) }) else {
+                            member.finish(); continuation.resume(throwing: VortxNativeError.closed); return
+                        }
+                    }
+                } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: { read.cancel() })
+    }
+    func captureOwnerHistoryCheckpointRead(expected: WatchlistBinding, registry: RegistryBinding,
+        sourceAuthority: any VortxMutationAuthority) async throws -> VortxNativeSession.OwnerHistoryCheckpointRead {
+        let read = try captureNativeMutationRead(expected: expected, registry: registry, sourceAuthority: sourceAuthority)
+        do { return try await session.captureOwnerHistoryCheckpointRead(read: read) }
+        catch { read.cancel(); throw error }
+    }
+    struct OwnerHistoryPeerCommit: Sendable {
+        let publication: OwnerHistorySessionPublication
+        let binding: WatchlistBinding
+        let registry: RegistryBinding
+        fileprivate let facade: ObjectIdentifier
+        fileprivate let generation: UUID
+    }
+    private final class OwnerHistoryPeerResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: OwnerHistorySessionPublication?
+        func set(_ value: OwnerHistorySessionPublication) { lock.withLock { stored = value } }
+        var value: OwnerHistorySessionPublication? { lock.withLock { stored } }
+    }
+    func isCurrentOwnerHistoryPeerCommit(_ receipt: OwnerHistoryPeerCommit) -> Bool {
+        lock.withLock {
+            !closed && receipt.facade == ObjectIdentifier(self)
+                && receipt.generation == ownerHistoryACKGeneration
+                && receipt.binding == watchlistBinding && receipt.registry == registryBinding
+        }
+    }
+    func mergeOwnerHistoryPeer(_ prepared: OwnerHistoryPeerPreparation,
+        hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> OwnerHistoryPeerCommit {
+        let read = prepared.acknowledged.originalRead
+        let accepted = OwnerHistoryPeerResult()
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OwnerHistoryPeerCommit, Error>) in
+                do {
+                    try mutationFIFO.admit(read) { member in
+                        guard enqueueMutation(type: "merge_native_sync", raw: "", actions: [],
+                            fifoMember: member, forceProfileTransition: true, ownerOperation: { [session] in
+                                accepted.set(try await session.mergeOwnerHistoryPeer(prepared, hostEdits: hostEdits))
+                            }, completion: { [weak self] result in
+                                do {
+                                    _ = try result.get()
+                                    guard let self, let publication = accepted.value else { throw VortxNativeError.closed }
+                                    let receipt = try self.lock.withLock { () throws -> OwnerHistoryPeerCommit in
+                                        guard !self.closed, let binding = self.watchlistBinding,
+                                              let registry = self.registryBinding else { throw VortxNativeError.superseded }
+                                        return .init(publication: publication, binding: binding, registry: registry,
+                                            facade: ObjectIdentifier(self), generation: self.ownerHistoryACKGeneration)
+                                    }
+                                    continuation.resume(returning: receipt)
+                                } catch { continuation.resume(throwing: error) }
+                            }) else {
+                            member.finish(); continuation.resume(throwing: VortxNativeError.closed); return
+                        }
+                    }
+                } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: { read.cancel() })
+    }
+    func ownerHistoryCompleteAccount(read: OriginalReadCapability, writeV2: Bool) async throws -> Data {
+        try await session.ownerHistoryCompleteAccount(read: read, writeV2: writeV2)
+    }
+}
+
+// MARK: - One captured safe host-profile field
+extension VortxNativeCoreFacade {
+    typealias HostFieldAdmission = @Sendable ([String: VortxJSON]) throws -> Void
+    struct CapturedHostProfileSnapshot: Sendable {
+        let registers: [String: VortxJSON]
+        let registry: [VortxResourceAddon]
+    }
+    private func capturedHostBindingMatches(_ expected: WatchlistBinding, registry expectedRegistry: RegistryBinding) -> Bool {
+        !closed && !checkpointReopenRequired && pendingProfileTransitions == 0
+            && watchlistBinding == expected && registryBinding == expectedRegistry && resourceRegistryValid
+    }
+    /// Called under the facade lock. Missing publication is UNKNOWN, not an empty profile.
+    /// Registry rebind intentionally retires this carrier until a real get_state ACK restores it.
+    private func capturedHostProfileFields(_ expected: WatchlistBinding) throws -> [String: VortxJSON] {
+        guard let carrier = values["native_host_preferences"],
+              let document = try? carrier.decode(VortxNativeHostPreferences.Document.self),
+              document.schemaVersion == 1, document.scope == expected.scope.account,
+              document.ownerProfileId == expected.scope.ownerProfileID,
+              case .object(let profiles) = carrier["profiles"] else { throw VortxNativeError.invalidSnapshot }
+        // Only an absent profile INSIDE an acknowledged, well-shaped carrier is empty.
+        guard let profile = profiles[expected.profileID] else { return [:] }
+        guard case .object(let fields) = profile["fields"] else { throw VortxNativeError.invalidSnapshot }
+        return fields // Preserve exact original raw registers, never re-encode the validated DTO.
+    }
+    func capturedHostProfileSnapshot(expected: WatchlistBinding, registry expectedRegistry: RegistryBinding) -> CapturedHostProfileSnapshot? {
+        lock.withLock {
+            guard capturedHostBindingMatches(expected, registry: expectedRegistry),
+                  let fields = try? capturedHostProfileFields(expected) else { return nil }
+            return .init(registers: fields, registry: registry)
+        }
+    }
+    private final class CapturedHostFieldAuthority: VortxMutationAuthority, @unchecked Sendable {
+        private let facade: VortxNativeCoreFacade
+        private let expected: WatchlistBinding
+        private let registry: RegistryBinding
+        private let edit: VortxNativeHostFieldEdit
+        private let source: any VortxMutationAuthority
+        private let admission: HostFieldAdmission?
+        init(facade: VortxNativeCoreFacade, expected: WatchlistBinding, registry: RegistryBinding,
+             edit: VortxNativeHostFieldEdit, source: any VortxMutationAuthority, admission: HostFieldAdmission?) {
+            self.facade = facade; self.expected = expected; self.registry = registry; self.edit = edit; self.source = source
+            self.admission = admission
+        }
+        func withActive(_ operation: () throws -> Void) throws {
+            // Lock order: export observation -> provider store -> session lease -> publication lease
+            // -> Bridge -> original gesture lifetime -> facade -> operation latch -> validate/store.
+            // No worker read of MainActor ProfileStore and no broad CoreBridge Sendable conformance.
+            try source.withActive {
+                try facade.lock.withLock {
+                    try facade.validateCapturedHostEdit(edit, expected: expected, registry: registry, admission: admission)
+                    try operation()
+                }
+            }
+        }
+    }
+    private func validateCapturedHostEdit(_ edit: VortxNativeHostFieldEdit, expected: WatchlistBinding,
+                                          registry expectedRegistry: RegistryBinding, admission: HostFieldAdmission?) throws {
+        guard capturedHostBindingMatches(expected, registry: expectedRegistry) else { throw VortxNativeError.superseded }
+        let fields = try capturedHostProfileFields(expected)
+        guard edit.baselineMatches(fields[edit.field]) else { throw VortxNativeHostFieldMutationError.staleRegister }
+        try admission?(fields)
+    }
+    /// Unlike a profile patch, this changes no kernel-owned setting, account binding or add-on.
+    /// The exact raw register CAS is checked at enqueue, FIFO admission, inside the session's
+    /// candidate BEFORE edit, and under the final owner/cancellation authority before checkpoint.
+    func setCapturedHostProfileField(_ edit: VortxNativeHostFieldEdit, expected: WatchlistBinding,
+                                     registry expectedRegistry: RegistryBinding, sourceAuthority: any VortxMutationAuthority,
+                                     checkpointValidator: any VortxProspectiveCheckpointValidator,
+                                     admission: HostFieldAdmission? = nil) async throws -> VortxJSON {
+        guard !edit.field.isEmpty else { throw VortxNativeError.invalidSnapshot }
+        let owner = CapturedHostFieldAuthority(facade: self, expected: expected, registry: expectedRegistry, edit: edit, source: sourceAuthority, admission: admission)
+        let operation = VortxNativeHostFieldCommitLatch(source: owner)
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<VortxJSON, Error>) in
+                do {
+                    lock.lock(); defer { lock.unlock() }
+                    try validateCapturedHostEdit(edit, expected: expected, registry: expectedRegistry, admission: admission)
+                    guard enqueueMutation(type: "edit_captured_host_field", raw: "", actions: [],
+                        hostEdits: [.init(profileID: expected.profileID, fields: [edit.field: edit.value])],
+                        hostFieldCAS: .init(profileID: expected.profileID, field: edit.field, register: edit.expectedRegister),
+                        checkpointValidator: checkpointValidator,
+                        admission: { [weak self] in
+                            guard let self, !operation.isCancelled else { throw VortxNativeHostFieldMutationError.cancelled }
+                            return try self.lock.withLock {
+                                try self.validateCapturedHostEdit(edit, expected: expected, registry: expectedRegistry, admission: admission); return true
+                            }
+                        }, sourceAuthority: operation, completion: { [weak self] result in
+                            do {
+                                _ = try result.get()
+                                guard let self else { throw VortxNativeError.closed }
+                                let register = try self.lock.withLock { () throws -> VortxJSON in
+                                    guard self.capturedHostBindingMatches(expected, registry: expectedRegistry),
+                                          let accepted = self.values["native_host_preferences"]?["profiles"]?[expected.profileID]?["fields"]?[edit.field],
+                                          VortxNativeHostFieldEvidence.json(accepted["value"], edit.value) else { throw VortxNativeError.superseded }
+                                    return accepted
+                                }
+                                continuation.resume(returning: register)
+                            } catch { continuation.resume(throwing: error) }
+                        }) else { throw VortxNativeError.closed }
+                } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: { operation.cancel() })
     }
 }

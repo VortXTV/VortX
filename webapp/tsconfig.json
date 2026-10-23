@@ -11,7 +11,7 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "lib": ["ES2021", "DOM", "DOM.Iterable"],
-    "types": []
+    "types": ["vite/client"]
   },
   "include": ["src"]
 }

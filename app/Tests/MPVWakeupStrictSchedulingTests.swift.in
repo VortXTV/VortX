@@ -1,0 +1,162 @@
+@main
+private enum MPVWakeupStrictSchedulingTests {
+    static func main() {
+        var checks = 0
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            checks += 1
+            guard condition() else {
+                print("WAKEUP_ASSERTION_FAILED: \(message)")
+                exit(1)
+            }
+        }
+        func fixture(_ body: (MPVMetalViewController, Native) -> Void) {
+            Hooks.shared.afterUnlock = nil
+            let native = Native(0x100)
+            let controller = MPVMetalViewController(native: native)
+            controller.register()
+            body(controller, native)
+            Hooks.shared.afterUnlock = nil
+            controller.queue.beforeEnqueue = nil
+            native.onWait = nil
+            controller.queue.drain()
+            DispatchQueue.main.drain()
+            controller.releaseFixtureAfterQuiescence()
+        }
+
+        fixture { c, n in
+            for _ in 0..<10_000 { n.wake() }
+            check(c.queue.pending.count == 1, "burst schedules exactly one preview consumer")
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1, "one drain consumes preceding wakes")
+        }
+        fixture { c, n in
+            c.queue.beforeEnqueue = {
+                c.queue.beforeEnqueue = nil
+                n.wake()
+            }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1,
+                  "first-enqueue gap retains one scheduled consumer")
+        }
+        fixture { c, n in
+            n.events = [MPV_EVENT_TEST_PAYLOAD, MPV_EVENT_NONE]
+            var once = false
+            n.onWait = { if !once { once = true; n.wake() } }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2 && n.waitCalls == 3,
+                  "reentrant wake under native-dequeue lock has one continuation")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                    n.wake()
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "wake after native selected NONE survives finish")
+        }
+        fixture { c, n in
+            var installed = false
+            n.onWait = {
+                if !installed {
+                    installed = true
+                    Hooks.shared.afterUnlock = { lock in
+                        guard lock !== c.loadTokenLock else { return }
+                        Hooks.shared.afterUnlock = nil
+                        n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                        n.wake()
+                    }
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "wake after finish-idle transition schedules itself")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    n.wake()
+                    c.queue.beforeEnqueue = {
+                        c.queue.beforeEnqueue = nil
+                        n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                        n.wake()
+                    }
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "continuation enqueue gap retains its pending event")
+        }
+        fixture { c, n in
+            n.wake()
+            c.wakeupRelay!.takeUnretainedValue().retire()
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 0, "actual relay retirement rejects queued/late admission")
+        }
+        fixture { c, n in
+            n.events = [MPV_EVENT_SHUTDOWN]
+            n.onWait = { n.wake() }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1,
+                  "actual shutdown case retires pending continuation")
+        }
+        fixture { c, n in
+            n.wake()
+            c.mpv = nil
+            c.queue.drain()
+            check(n.waitCalls == 0, "actual nil-context guard rejects polling")
+            c.mpv = n.handle
+        }
+        fixture { c, n in
+            let successor = Native(0x200)
+            NativeRegistry.shared.contexts[successor.handle] = successor
+            n.wake()
+            c.mpv = successor.handle
+            c.queue.drain()
+            check(n.waitCalls == 0 && successor.waitCalls == 0,
+                  "actual expected-context guard rejects a different native lifetime")
+            c.mpv = n.handle
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    c.activeLoadToken = 2
+                    n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                    n.wake()
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [2] && c.queue.enqueues == 2,
+                  "logical source replacement preserves the context's pending wake")
+        }
+        for (muted, looping) in [(false, true), (true, false), (false, false)] {
+            let native = Native(0x500)
+            let controller = MPVMetalViewController(native: native)
+            controller.startMuted = muted
+            controller.loopPlayback = looping
+            controller.register()
+            for _ in 0..<10 { native.wake() }
+            check(controller.queue.pending.count == 10, "non-full-muted scheduling stays unchanged")
+            controller.queue.drain()
+            check(native.waitCalls == 10, "main/windowed previews keep all scheduled drains")
+            controller.releaseFixtureAfterQuiescence()
+        }
+        print("PASS: \(checks) strict-Swift6 NEW scheduling adapter assertions; production teardown/native/thread/device EXCLUDED")
+    }
+}

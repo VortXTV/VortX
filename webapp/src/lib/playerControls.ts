@@ -139,9 +139,9 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
       </div>
 
       <div class="pl-center">
-        <button class="pl-icon pl-skip" id="pl-rew" aria-label="Skip back ${ctx.skipStep} seconds">${icon("rewind") || "⟲"}<small>${ctx.skipStep}</small></button>
+        <button class="pl-icon pl-skip" id="pl-rew" aria-label="Skip back ${escapeHtml(String(ctx.skipStep))} seconds">${icon("rewind") || "⟲"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
         <button class="pl-icon pl-bigplay" id="pl-bigplay" aria-label="Play/pause"></button>
-        <button class="pl-icon pl-skip" id="pl-ff" aria-label="Skip forward ${ctx.skipStep} seconds">${icon("fast-forward") || "⟳"}<small>${ctx.skipStep}</small></button>
+        <button class="pl-icon pl-skip" id="pl-ff" aria-label="Skip forward ${escapeHtml(String(ctx.skipStep))} seconds">${icon("fast-forward") || "⟳"}<small>${escapeHtml(String(ctx.skipStep))}</small></button>
       </div>
 
       <div class="pl-bottom">

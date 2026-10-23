@@ -383,7 +383,7 @@ final class BatchDownloadCoordinator: ObservableObject {
             }
         }
         let downloadCandidates = candidates.filter { job.downloadOwner.allows($0) }
-        let requiresNativeOwner = StremioServer.nativeTransportSelected && downloadCandidates.contains { $0.isUsenet }
+        let requiresNativeOwner = downloadCandidates.contains { $0.isUsenet }
         guard let selected = await iOSResolveRankedEpisodeCandidate(
             downloadCandidates, episode: ep, deadline: slotPolicy.startedAt + slotPolicy.maximumDuration,
             stillCurrent: {

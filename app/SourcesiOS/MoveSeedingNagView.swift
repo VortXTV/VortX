@@ -14,6 +14,14 @@ struct MoveSeedingNagView: View {
     @State private var showBackupExporter = false
     @State private var backupDocument: BackupDocument?
     @State private var exportError: String?
+    @State private var setupFailed = false
+    @State private var savingBackup = false
+
+    private var presentation: MoveSeeding.Presentation {
+        MoveSeeding.presentation(isSignedIn: sync.isSignedIn,
+                                 completedFirstSync: sync.hasCompletedFirstSync,
+                                 restoreState: sync.accountRestoreState)
+    }
 
     var body: some View {
         ScrollView {
@@ -23,14 +31,15 @@ struct MoveSeedingNagView: View {
                     .foregroundStyle(Theme.Palette.accent)
                     .padding(.top, Theme.Space.xl)
 
-                if sync.hasCompletedFirstSync {
-                    confirmation
-                } else {
-                    nag
+                switch presentation {
+                case .nag: nag
+                case .confirmation: confirmation
+                case .restoring, .retry, .setup: accountLoading
                 }
             }
             .padding(.horizontal, Theme.Space.lg)
             .padding(.bottom, Theme.Space.xl)
+            .multilineTextAlignment(.center)
             .frame(maxWidth: 520)
             .frame(maxWidth: .infinity)
         }
@@ -38,6 +47,46 @@ struct MoveSeedingNagView: View {
         .sheet(isPresented: $showSignIn) { iOSSignInView() }
         .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                       contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { _ in }
+        .onChange(of: sync.accountRestoreState) { state in
+            // A real applied backup, not just successful authentication, completes this handoff.
+            if state == .ready, sync.hasCompletedFirstSync { dismiss() }
+        }
+    }
+
+    @ViewBuilder private var accountLoading: some View {
+        if presentation == .restoring || savingBackup {
+            ProgressView().controlSize(.large)
+            Text(savingBackup ? "Saving your backup…" : "Restoring your account…")
+                .font(Theme.Typography.screenTitle)
+            Text(savingBackup ? "Keeping this device's data in your VortX account."
+                              : "Loading your profiles, library, and settings. This can take a moment.")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        } else {
+            Text(presentation == .retry || setupFailed ? "Couldn't finish loading your account." : "You're signed in")
+                .font(Theme.Typography.screenTitle)
+            Text(presentation == .retry || setupFailed
+                 ? "Your saved data has not been replaced. Try again."
+                 : "This account has no backup yet. You can back up this device now.")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            Button(presentation == .retry || setupFailed ? "Try again" : "Back up now") {
+                Task { @MainActor in
+                    savingBackup = true
+                    defer { savingBackup = false }
+                    guard await sync.retryAccountRestore() else { setupFailed = true; return }
+                    if !sync.hasCompletedFirstSync { setupFailed = !(await sync.pushThisDevice()) }
+                    if sync.hasCompletedFirstSync { dismiss() }
+                }
+            }
+            .buttonStyle(PrimaryActionStyle())
+        }
+        Button("Not now") {
+            MoveSeeding.recordLaunchNagDismissal()
+            dismiss()
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Theme.Palette.textSecondary)
     }
 
     // MARK: Not seeded yet
@@ -97,7 +146,10 @@ struct MoveSeedingNagView: View {
     // MARK: Seeded (reached mid-flow when the sign-in lands and the first sync completes)
 
     @ViewBuilder private var confirmation: some View {
-        Text(MoveSeeding.backedUpLine)
+        Text(MoveSeeding.backedUpLine(
+            synchronizationIsComplete: sync.synchronizationIsComplete,
+            pendingSettingsMessage: sync.pendingSettingsMessage
+        ))
             .font(Theme.Typography.screenTitle)
             .foregroundStyle(Theme.Palette.textPrimary)
             .multilineTextAlignment(.center)

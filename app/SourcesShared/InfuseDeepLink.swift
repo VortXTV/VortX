@@ -8,17 +8,37 @@ import Foundation
 enum InfuseDeepLink {
     private static let fallbackExtension = "mkv"
 
-    static func playURL(stream: URL, metadata: PlaybackMeta?) -> URL? {
+    /// `startSeconds` becomes Infuse's `position`; `success`/`failure` become `x-success`/`x-error`, the
+    /// callbacks that bring the viewer and their stopping point back to VortX.
+    static func playURL(stream: URL, metadata: PlaybackMeta?, startSeconds: Double? = nil,
+                        success: URL? = nil, failure: URL? = nil) -> URL? {
         var components = URLComponents()
         components.scheme = "infuse"
         components.host = "x-callback-url"
         components.path = "/play"
-        components.queryItems = [
+        var items = [
             URLQueryItem(name: "url", value: stream.absoluteString),
             URLQueryItem(name: "filename", value: filename(for: stream, metadata: metadata))
         ]
+        if let start = InfuseReturnPolicy.startPosition(startSeconds) {
+            items.append(URLQueryItem(name: "position", value: String(start)))
+        }
+        if let success { items.append(URLQueryItem(name: "x-success", value: success.absoluteString)) }
+        if let failure { items.append(URLQueryItem(name: "x-error", value: failure.absoluteString)) }
+        components.queryItems = items
+        // URLComponents leaves `&`, `=`, `+` and `?` unescaped inside values; the nested stream and
+        // callback URLs must not split Infuse's own query.
+        components.percentEncodedQueryItems = components.queryItems?.map {
+            URLQueryItem(name: $0.name, value: $0.value?.addingPercentEncoding(withAllowedCharacters: queryValueAllowed))
+        }
         return components.url
     }
+
+    private static let queryValueAllowed: CharacterSet = {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return allowed
+    }()
 
     static func filename(for stream: URL, metadata: PlaybackMeta?) -> String {
         let title = sanitizedComponent(metadata?.name ?? stream.deletingPathExtension().lastPathComponent)

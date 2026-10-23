@@ -15,6 +15,8 @@ struct LinkLoginView: View {
     @State private var status = ""
     @State private var errorMessage: String?
     @State private var pollTask: Task<Void, Never>?
+    @State private var pollGeneration = UUID()
+    @State private var signingIn = false
 
     private static let pollInterval: Duration = .seconds(2)
     private static let timeout: TimeInterval = 5 * 60
@@ -117,51 +119,73 @@ struct LinkLoginView: View {
         Button {
             start()
         } label: {
-            Text(busy ? "Creating code…" : "Refresh code").frame(width: Self.controlWidth)
+            Text(signingIn ? "Signing in…" : busy ? "Creating code…" : "Refresh code").frame(width: Self.controlWidth)
         }
         .buttonStyle(PrimaryActionStyle())
-        .disabled(busy)
+        .disabled(busy || signingIn)
     }
 
+    @MainActor
     private func start() {
         stop()
+        let generation = pollGeneration
+        let profileID = ProfileStore.shared.active?.id
+        let credential = CredentialScopeRegistry.shared.capture()
+        let admission = account.captureLinkLoginAdmission()
         busy = true
         code = nil
         qrImage = nil
         errorMessage = nil
         status = "Creating a sign-in code…"
 
-        pollTask = Task {
+        pollTask = Task { @MainActor in
+            // The account operation owns its own mutation fence. This separate presentation fence
+            // prevents a cancelled/refreshed QR task from repainting the replacement panel.
+            @MainActor func presentationIsCurrent() -> Bool {
+                !Task.isCancelled && pollGeneration == generation
+                    && ProfileStore.shared.active?.id == profileID
+                    && CredentialScopeRegistry.shared.isCurrent(credential)
+            }
+            @MainActor func preflightIsCurrent() -> Bool {
+                guard presentationIsCurrent() else { return false }
+                guard admission() else {
+                    status = ""
+                    errorMessage = "This sign-in was interrupted. Refresh the code to try again."
+                    return false
+                }
+                return true
+            }
+            defer {
+                if presentationIsCurrent() { busy = false; signingIn = false }
+            }
             do {
                 let created = try await LinkAuthService.create()
+                guard preflightIsCurrent() else { return }
                 let image = Self.makeQRCodeImage(created.link)
-                await MainActor.run {
-                    code = created
-                    qrImage = image
-                    busy = false
-                    status = "Waiting for sign-in…"
-                }
+                code = created
+                qrImage = image
+                busy = false
+                status = "Waiting for sign-in…"
 
                 let deadline = Date().addingTimeInterval(Self.timeout)
                 // A single network blip must not kill the flow, but a persistent failure (server
                 // down, DNS gone, the link service erroring) must NOT spin silently forever, after
                 // a short run of consecutive failures we surface the last error so the user can act.
                 var consecutiveFailures = 0
-                while !Task.isCancelled {
+                while presentationIsCurrent() {
                     if Date() >= deadline {
-                        await MainActor.run {
-                            status = ""
-                            errorMessage = "This code expired. Refresh it to try again."
-                        }
+                        status = ""
+                        errorMessage = "This code expired. Refresh it to try again."
                         return
                     }
                     do {
-                        switch try await LinkAuthService.read(code: created.code) {
+                        let result = try await LinkAuthService.read(code: created.code)
+                        guard preflightIsCurrent() else { return }
+                        switch result {
                         case .authKey(let token):
-                            await MainActor.run {
-                                status = "Signing in…"
-                                errorMessage = nil
-                            }
+                            signingIn = true
+                            status = "Signing in…"
+                            errorMessage = nil
                             // `read` only proves the link service handed back a key, NOT that the
                             // main account API still honours it. A rejected/expired token is gated
                             // here: validate against api.strem.io first, and only commit to a
@@ -172,34 +196,37 @@ struct LinkLoginView: View {
                             do {
                                 try await LinkAuthService.validate(authKey: token)
                             } catch {
-                                let message = error.localizedDescription
-                                await MainActor.run {
-                                    status = ""
-                                    errorMessage = message
-                                }
+                                guard preflightIsCurrent() else { return }
+                                status = ""
+                                errorMessage = error.localizedDescription
                                 return
                             }
-                            await account.signInWithAuthKey(token)
+                            guard preflightIsCurrent() else { return }
+                            let outcome = await account.signInWithAuthKey(token)
+                            guard presentationIsCurrent() else { return }
+                            status = ""
+                            switch outcome {
+                            case .signedIn: errorMessage = nil
+                            case .failed(let message): errorMessage = message
+                            case .superseded:
+                                errorMessage = "This sign-in was interrupted. Refresh the code to try again."
+                            }
                             return
                         case .pending:
                             consecutiveFailures = 0
-                            await MainActor.run {
-                                if status.isEmpty { status = "Waiting for sign-in…" }
-                                errorMessage = nil
-                            }
+                            if status.isEmpty { status = "Waiting for sign-in…" }
+                            errorMessage = nil
                         }
                     } catch is CancellationError {
                         return
                     } catch {
+                        guard preflightIsCurrent() else { return }
                         // Tolerate a few transient failures, then make the problem visible instead
                         // of leaving the panel stuck on "Waiting for sign-in…".
                         consecutiveFailures += 1
                         if consecutiveFailures >= Self.maxConsecutiveFailures {
-                            let message = error.localizedDescription
-                            await MainActor.run {
-                                status = ""
-                                errorMessage = message
-                            }
+                            status = ""
+                            errorMessage = error.localizedDescription
                             return
                         }
                     }
@@ -208,19 +235,21 @@ struct LinkLoginView: View {
             } catch is CancellationError {
                 return
             } catch {
-                let message = error.localizedDescription
-                await MainActor.run {
-                    busy = false
-                    status = ""
-                    errorMessage = message
-                }
+                guard preflightIsCurrent() else { return }
+                busy = false
+                status = ""
+                errorMessage = error.localizedDescription
             }
         }
     }
 
+    @MainActor
     private func stop() {
+        pollGeneration = UUID()
         pollTask?.cancel()
         pollTask = nil
+        busy = false
+        signingIn = false
     }
 
     private static func makeQRCodeImage(_ string: String) -> CGImage? {

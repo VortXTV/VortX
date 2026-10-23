@@ -369,7 +369,8 @@ struct RemoteCover: View {
 struct TVCategoryBrowse: View {
     let target: HubTarget
 
-    @StateObject private var focusModel = FocusedItemModel()
+    @StateObject private var focusOwner = FocusedItemOwner()   // owned, not observed: focus re-renders only the hero
+    private var focusModel: FocusedItemModel { focusOwner.model }
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.

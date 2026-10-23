@@ -112,6 +112,14 @@ object SettingsBackup {
         "vortx.downloads.maxConcurrent",
         "vortx.moveSeeding.launchNagDismissedBuild",
         "vortx.subtitleOffsetMemory.v1",
+        // Settings > Effects and performance: chosen for THIS device's hardware (Apple twin lists the same).
+        "vortx.effects.backdrop",
+        "vortx.effects.glass",
+        "vortx.effects.motion",
+        "vortx.effects.artwork",
+        // Network shares are addresses on this device's network with passwords in this device's encrypted
+        // store, so a synced copy would arrive as a share that cannot log in.
+        "vortx.networkShares.list",
     )
 
     /** Per-account sync bookkeeping and Keychain mutation state belong only to the current device. */

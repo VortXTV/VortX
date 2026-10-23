@@ -7,7 +7,7 @@ import com.vortx.android.security.FailClosedCredentialStore
 /// Account row, the account screen) before the engine's own `ctx` read has had a chance to land.
 ///
 /// The engine is the actual source of truth for the account (invariant: "the engine is the truth" --
-/// ANDROID-PLAN.md §0.3): [com.vortx.android.engine.EngineStremioRepository] hydrates its
+/// ANDROID-PLAN.md §0.3): [com.vortx.android.engine.NativeCatalogRepository] hydrates its
 /// `AuthState` from `ctx.profile.auth`, which the native side persists itself (its own storage under
 /// the app's files dir), and that is what every sign-in/sign-out actually reads and writes. This store
 /// holds nothing the engine needs back -- no auth token, no session key, just the display email/uid --

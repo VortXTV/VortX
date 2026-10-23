@@ -131,17 +131,79 @@ enum AppleAVStartWatchdogPolicy {
 /// Startup and recovery rules shared by every Apple player surface. A timer belongs to the source
 /// that armed it, and AVPlayer can prove its first rendered frame while its media clock is still zero.
 enum ApplePlaybackStartPolicy {
-    static func hasStarted(positionSeconds: Double, avPlayerRenderedFrame: Bool) -> Bool {
-        positionSeconds.isFinite && positionSeconds >= 0
-            && (positionSeconds > 0 || avPlayerRenderedFrame)
+    struct AVPlayerEvidence: Equatable {
+        let requiresVideoFrame: Bool
+        let renderedVideoFrame: Bool
+        let settledNativeClockAdvanced: Bool
+        var positionSettled = true
+    }
+
+    /// Native audio-only/HLS playback may never expose video tracks or a player-layer frame. Preserve that
+    /// route with observed native-clock advancement, never an initial resume position or a seek target.
+    /// Known video routes (DV and remux) still require the exact item's existing picture receipt.
+    struct NativeClockProgress: Equatable {
+        private var generation: UInt64?
+        private var previousPosition: Double?
+        private var advanced = false
+        private var pendingSeekRequest: UInt64?
+
+        mutating func reset(generation: UInt64?) {
+            self.generation = generation
+            previousPosition = nil
+            advanced = false
+            pendingSeekRequest = nil
+        }
+
+        mutating func beginSeek(generation: UInt64, requestID: UInt64) {
+            guard self.generation == generation else { return }
+            previousPosition = nil
+            advanced = false
+            pendingSeekRequest = requestID
+        }
+
+        mutating func finishSeek(generation: UInt64, requestID: UInt64) {
+            guard self.generation == generation, pendingSeekRequest == requestID else { return }
+            pendingSeekRequest = nil
+            previousPosition = nil
+        }
+
+        func isSeekPending(generation: UInt64) -> Bool {
+            self.generation == generation && pendingSeekRequest != nil
+        }
+
+        mutating func observe(generation: UInt64, playerSeconds: Double,
+                              transportRunning: Bool, positionSettled: Bool) {
+            guard self.generation == generation else { return }
+            guard pendingSeekRequest == nil, playerSeconds.isFinite, playerSeconds >= 0,
+                  transportRunning, positionSettled else {
+                previousPosition = nil
+                return
+            }
+            if let previousPosition, playerSeconds > previousPosition { advanced = true }
+            previousPosition = playerSeconds
+        }
+
+        func hasAdvanced(generation: UInt64) -> Bool {
+            self.generation == generation && advanced
+        }
+    }
+
+    static func hasStarted(positionSeconds: Double, positionSettled: Bool = true,
+                           avPlayerEvidence: AVPlayerEvidence? = nil) -> Bool {
+        guard positionSeconds.isFinite, positionSeconds >= 0, positionSettled else { return false }
+        guard let avPlayerEvidence else { return positionSeconds > 0 }
+        guard avPlayerEvidence.positionSettled else { return false }
+        return avPlayerEvidence.renderedVideoFrame
+            || (!avPlayerEvidence.requiresVideoFrame && avPlayerEvidence.settledNativeClockAdvanced)
     }
 
     static func shouldIgnoreIssuedAdvanceTick(
         positionSeconds: Double,
-        avPlayerRenderedFrame: Bool
+        positionSettled: Bool = true,
+        avPlayerEvidence: AVPlayerEvidence? = nil
     ) -> Bool {
-        !positionSeconds.isFinite || positionSeconds < 0
-            || (positionSeconds == 0 && !avPlayerRenderedFrame)
+        !hasStarted(positionSeconds: positionSeconds, positionSettled: positionSettled,
+                    avPlayerEvidence: avPlayerEvidence)
     }
 
     static func genericLoadTimeoutDefersToRemuxWatchdog(

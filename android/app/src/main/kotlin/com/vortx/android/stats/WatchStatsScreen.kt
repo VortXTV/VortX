@@ -74,8 +74,7 @@ import kotlin.math.roundToInt
 fun WatchStatsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
-    val model = remember(context) { WatchStatsModel(context.applicationContext.filesDir,
-        if (BuildConfig.NATIVE_ENGINE_ENABLED) (context.applicationContext as? VortXApplication)?.catalogRepository else null) }
+    val model = remember(context) { WatchStatsModel((context.applicationContext as? VortXApplication)?.catalogRepository) }
     val state by model.state.collectAsStateWithLifecycle()
     androidx.compose.runtime.LaunchedEffect(Unit) { model.load() }
 

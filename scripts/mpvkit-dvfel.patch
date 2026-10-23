@@ -28,16 +28,16 @@ index e5f872c..dcaca5b 100644
 +    //   libplacebo 4c426e466814 (master, 2026-07-24) - carries 801b6812 FEL merging,
 +    //              187b1bd1 pl_frame.enhancement_layer, dbf8dd89 nlq_active/nlq,
 +    //              6e66d6d5 libav NLQ mapping. PL_API_VER 371 (>= 367 required by mpv).
-+    //   FFmpeg     6e85193417f8 (release/9.0 tip, 2026-07-25) - libavcodec 63.1.100 carries
++    //   FFmpeg     946fcce07b6d (n9.0.2 maintenance) - libavcodec 63.1.102 retains
 +    //              6026988b75 the `dovi_split` bitstream filter and 5f6dff5e7d hvcE ->
 +    //              AV_PKT_DATA_HEVC_CONF, which is what mpv's single-track interleaved
 +    //              Profile 7 splitter needs. libavformat 63.1.100 clears the >= 62.19.100
 +    //              gate on demux_lavf's dual-track Dolby Vision grouping. release/9.0 is a
-+    //              branch, not a tag: no n9* tag existed at pin time, so the SHA is the pin.
++    //              descendant of original 6e851934; pin the released tag and exact commit.
 +    static let mpvPinnedSHA = "8c67647b50059406c5c0444903597281b81516cf"
 +    static let placeboPinnedSHA = "4c426e466814536def653cb23f1d1c287ea7a7f5"
-+    static let ffmpegPinnedSHA = "6e85193417f898868f04f8f6fc30db92a874a8cf"
-+    static let ffmpegPinnedBranch = "release/9.0"
++    static let ffmpegPinnedSHA = "946fcce07b6dcd0331c8cc609192aeff5e1924f8"
++    static let ffmpegPinnedBranch = "n9.0.2"
 +
      var version: String {
          switch self {
@@ -54,7 +54,7 @@ index e5f872c..dcaca5b 100644
 +            // returned NULL and single-track interleaved DV rendered base layer only.
 +            // Cloned by BuildFFMPEG.beforeBuild, not by --branch: `git clone --branch` cannot
 +            // take a bare SHA, and this SHA is not reachable from master.
-+            return "9.0-\(Library.ffmpegPinnedSHA.prefix(8))"
++            return "9.0.2-\(Library.ffmpegPinnedSHA.prefix(8))"
          case .openssl:
              return "3.3.5"
          case .gnutls:

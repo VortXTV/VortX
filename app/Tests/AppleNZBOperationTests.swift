@@ -74,6 +74,19 @@ extension UsenetNodeClient {
             if value { passed += 1; print("PASS " + name) }
             else { failed += 1; print("FAIL " + name) }
         }
+        #if !NZB_OPERATION_BASELINE
+        let gib: Int64 = 1024 * 1024 * 1024
+        check(UsenetDiskAllowance.bytes(stored: nil, freeDisk: 100 * gib) == nil,
+              "an untouched Streaming cache leaves the engine's own usenet disk default")
+        check(UsenetDiskAllowance.bytes(stored: 0, freeDisk: 100 * gib) == 0, "Off turns the usenet disk download off")
+        check(UsenetDiskAllowance.bytes(stored: -1, freeDisk: 100 * gib) == 50 * gib,
+              "Unlimited allows half of free space, enough for a whole film")
+        check(UsenetDiskAllowance.bytes(stored: 20 * gib, freeDisk: 100 * gib) == 20 * gib, "a chosen size is used as is")
+        check(UsenetDiskAllowance.bytes(stored: 80 * gib, freeDisk: 100 * gib) == 50 * gib,
+              "a chosen size never exceeds half of free space")
+        check(UsenetDiskAllowance.bytes(stored: -1, freeDisk: nil) == 2 * gib,
+              "unknown free space falls back to 2 GB")
+        #endif
         let selected = try await create(selection: .init(fileIdx: 0, fileMustInclude: "/S01E02/i", episode: .init(season: 1, episode: 2)))
         let first = try await creates().last!
         let id = selected.lease!.id
@@ -219,6 +232,29 @@ extension UsenetNodeClient {
               && (routedBody["episode"] as? [String: Int]) == ["season": 0, "episode": 1],
               "actual local resolver forwards selection and retains native lease")
         routed.nativeLease?.close()
+        #if !NZB_OPERATION_BASELINE
+        let mappedBefore = try await creates().count
+        let mapped = try await UsenetLocalResolver.resolveRouted(
+            nzbURLs: ["https://fixture.invalid/mapped"], servers: ["nntps://fixture:one@one.invalid:563/2"],
+            selection: .init(fileIdx: 3, fileMustInclude: "/Naruto - 088/i", episode: .init(season: 2, episode: 53)),
+            ownerIsCurrent: { true })!
+        let mappedCreates = Array(try await creates().dropFirst(mappedBefore))
+        check(mappedCreates.count == 2 && mappedCreates[0]["episode"] != nil
+              && mappedCreates[1]["episode"] == nil && mappedCreates[1]["fileIdx"] == nil
+              && mappedCreates[1]["fileMustInclude"] as? String == "/Naruto - 088/i" && mapped.nativeLease != nil,
+              "strict episode mismatch retries once with only the add-on's file pattern")
+        mapped.nativeLease?.close()
+        let silentBefore = try await creates().count
+        do {
+            _ = try await UsenetLocalResolver.resolveRouted(
+                nzbURLs: ["https://fixture.invalid/mapped"], servers: ["nntps://fixture:one@one.invalid:563/2"],
+                selection: .init(episode: .init(season: 2, episode: 53)), ownerIsCurrent: { true })
+            check(false, "without an add-on pattern an episode mismatch is not retried")
+        } catch {
+            check(try await creates().count - silentBefore == 1,
+                  "without an add-on pattern an episode mismatch is not retried")
+        }
+        #endif
         let coordinator = CoordinatorFixture()
         let stream = FixtureStream(usenetURLs: ["https://fixture.invalid/ready"],
                                    usenetServers: ["nntps://fixture:one@one.invalid:563/2"],
@@ -280,6 +316,26 @@ extension UsenetNodeClient {
         let cloudAfterNormalFallback = await FixtureCloudResolver.shared.calls
         check(ordinaryFallback?.usenetRoute == .torBoxCloud && cloudAfterNormalFallback == cloudAfterRetirement + 1,
               "actual live-owner local failure preserves configured cloud fallback")
+        let fallbackAllowedCreate = await FixtureCloudResolver.shared.lastAllowCreate
+        check(fallbackAllowedCreate == true, "without own providers the cloud fallback may start a download")
+        let ownProviders = CoordinatorFixture(savedServers: [
+            .init(name: "Fixture", host: "saved.invalid", port: 563, username: "fixture", password: "synthetic",
+                  maxConnections: 2, useSSL: true)
+        ])
+        let ownProvidersResult = await ownProviders.resolvedPlaybackRef(for: failureStream)
+        let ownProvidersAllowedCreate = await FixtureCloudResolver.shared.lastAllowCreate
+        check(ownProvidersResult == nil && ownProvidersAllowedCreate == false,
+              "with own providers a failed local play never starts a new cloud download")
+        let ownExplicit = await ownProviders.resolveExplicitUsenetPlayback(for: failureStream)
+        if case .failed(let message) = ownExplicit {
+            check(message == UsenetFailureMessage.forLocalReason("http_503_resource_limit"),
+                  "explicit failure explains the provider route's actual reason")
+        } else { check(false, "explicit failure explains the provider route's actual reason") }
+        check(UsenetFailureMessage.forLocalReason("http_504_provider_timeout")?.contains("in time") == true
+              && UsenetFailureMessage.forLocalReason("selection_unmatched")?.contains("episode") == true
+              && UsenetFailureMessage.forLocalReason("http_502_provider_unavailable")?.contains("couldn't fetch") == true
+              && UsenetFailureMessage.forLocalReason("cancelled") == nil,
+              "failure messages map only the engine's fixed reason codes")
 
         await FixtureCloudResolver.shared.setExistingJob(true)
         let localBeforeCloudRetry = try await creates().count
@@ -290,8 +346,8 @@ extension UsenetNodeClient {
         let cloudBeforeGate = await FixtureCloudResolver.shared.calls
         let gatedRetry = await CoordinatorFixture().resolvedPlaybackRef(for: stream, confirmedUsenetURLs: [])
         let cloudAfterGate = await FixtureCloudResolver.shared.calls
-        check(gatedRetry == nil && cloudBeforeGate == cloudAfterGate,
-              "existing cloud job does not bypass unattended cache gate")
+        check(gatedRetry?.usenetRoute == .torBoxCloud && cloudAfterGate == cloudBeforeGate + 1,
+              "same owned cloud job resumes despite a stale negative cache snapshot")
         await FixtureCloudResolver.shared.setDelay(.seconds(5))
         let deadlineStarted = ContinuousClock.now
         let deadlineResult = await CoordinatorFixture().resolvedPlaybackRef(
@@ -311,9 +367,12 @@ extension UsenetNodeClient {
         let fallbackWarmGate = FixtureWarmGate()
         let fallbackCoordinator = CoordinatorFixture(warmGate: fallbackWarmGate)
         let fallbackAuthority = UsenetLocalResolver.captureNativeOwner()
+        let fallbackCapture = CredentialScopeRegistry.shared.capture()
+        let fallbackRevision: UInt64 = 0
         let cloudBeforeWarm = await FixtureCloudResolver.shared.calls
         let fallbackWarm = Task { try? await fallbackCoordinator.resolveUsenet(nzbUrl: "https://fixture.invalid/failure",
-            fileMustInclude: nil, fileIdx: nil, episode: nil, inheritedNativeOwner: fallbackAuthority) }
+            fileMustInclude: nil, fileIdx: nil, episode: nil, expectedCapture: fallbackCapture,
+            expectedRevision: fallbackRevision, inheritedNativeOwner: fallbackAuthority) }
         _ = await eventually { await fallbackWarmGate.entered }
         let fallbackProfile = ProfileStore.shared.activeID
         ProfileStore.shared.activeID = UUID(); CoreBridge.shared.generation = UUID()
@@ -327,9 +386,12 @@ extension UsenetNodeClient {
         let breakerGate = FixtureWarmGate()
         await ProviderCircuitBreaker.shared.gateAdmission(breakerGate)
         let breakerAuthority = UsenetLocalResolver.captureNativeOwner()
+        let breakerCapture = CredentialScopeRegistry.shared.capture()
+        let breakerRevision: UInt64 = 0
         let cloudBeforeBreaker = await FixtureCloudResolver.shared.calls
         let breakerWait = Task { try? await CoordinatorFixture().resolveUsenet(nzbUrl: "https://fixture.invalid/failure",
-            fileMustInclude: nil, fileIdx: nil, episode: nil, inheritedNativeOwner: breakerAuthority) }
+            fileMustInclude: nil, fileIdx: nil, episode: nil, expectedCapture: breakerCapture,
+            expectedRevision: breakerRevision, inheritedNativeOwner: breakerAuthority) }
         _ = await eventually { await breakerGate.entered }
         CoreBridge.shared.generation = UUID()
         await breakerGate.release()
@@ -341,12 +403,45 @@ extension UsenetNodeClient {
         let outputGate = FixtureWarmGate()
         await FixtureCloudResolver.shared.gateOutput(outputGate)
         let outputAuthority = UsenetLocalResolver.captureNativeOwner()
+        let outputCapture = CredentialScopeRegistry.shared.capture()
+        let outputRevision: UInt64 = 0
         let outputWait = Task { try? await CoordinatorFixture().resolveUsenet(nzbUrl: "https://fixture.invalid/failure",
-            fileMustInclude: nil, fileIdx: nil, episode: nil, inheritedNativeOwner: outputAuthority) }
+            fileMustInclude: nil, fileIdx: nil, episode: nil, expectedCapture: outputCapture,
+            expectedRevision: outputRevision, inheritedNativeOwner: outputAuthority) }
         _ = await eventually { await outputGate.entered }
         CoreBridge.shared.generation = UUID()
         await outputGate.release()
         check(await outputWait.value == nil, "actual cloud worker rejects result after original owner retires")
+
+        await FixtureCloudResolver.shared.setError(nil)
+        let cloudOnlyGate = FixtureWarmGate()
+        await ProviderCircuitBreaker.shared.gateAdmission(cloudOnlyGate)
+        let cloudOnlyCapture = CredentialScopeRegistry.shared.capture()
+        let cloudOnlyCalls = await FixtureCloudResolver.shared.calls
+        let cloudOnlyWait = Task { try? await CoordinatorFixture().resolveUsenet(
+            nzbUrl: "https://fixture.invalid/cloud-only", fileMustInclude: nil, fileIdx: nil, episode: nil,
+            expectedCapture: cloudOnlyCapture, expectedRevision: 0, inheritedNativeOwner: nil
+        ) }
+        _ = await eventually { await cloudOnlyGate.entered }
+        CredentialScopeRegistry.shared.retire()
+        await cloudOnlyGate.release()
+        let cloudOnlyResult = await cloudOnlyWait.value
+        let cloudOnlyCallsAfter = await FixtureCloudResolver.shared.calls
+        check(cloudOnlyResult == nil && cloudOnlyCallsAfter == cloudOnlyCalls,
+              "actual cloud-only coordinator admission keeps original capture across breaker await")
+
+        let cloudOutputGate = FixtureWarmGate()
+        await FixtureCloudResolver.shared.gateOutput(cloudOutputGate)
+        let cloudOutputCapture = CredentialScopeRegistry.shared.capture()
+        let cloudOutputWait = Task { try? await CoordinatorFixture().resolveUsenet(
+            nzbUrl: "https://fixture.invalid/cloud-only-output", fileMustInclude: nil, fileIdx: nil, episode: nil,
+            expectedCapture: cloudOutputCapture, expectedRevision: 0, inheritedNativeOwner: nil
+        ) }
+        _ = await eventually { await cloudOutputGate.entered }
+        CredentialScopeRegistry.shared.retire()
+        await cloudOutputGate.release()
+        check(await cloudOutputWait.value == nil,
+              "actual cloud-only coordinator rejects result after original capture retires")
         #endif
 
         let warmGate = FixtureWarmGate()

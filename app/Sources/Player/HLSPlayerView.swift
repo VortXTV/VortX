@@ -220,7 +220,7 @@ extension HLSPlayerView {
         }
 
         private var bufferingOverlay: some View {
-            ProgressView().controlSize(.large).tint(.white).transition(.opacity)
+            ProgressView().controlSize(.large).tint(Theme.Palette.accent).transition(.opacity)
         }
 
         // MARK: Control helpers (match PlayerScreen's iconButton / seekButton / timeString)

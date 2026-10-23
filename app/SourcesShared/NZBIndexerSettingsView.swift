@@ -7,7 +7,6 @@ struct NZBIndexerSettingsView: View {
     @State private var document = NZBIndexerStore.load()
     @State private var storeError: String?
     @State private var editing: NZBIndexerConfig?
-    @State private var showingEditor = false
     var body: some View {
         List {
             Section {
@@ -17,7 +16,7 @@ struct NZBIndexerSettingsView: View {
             }
             Section("Indexers") {
                 ForEach(document.indexers) { indexer in
-                    Button { editing = indexer; showingEditor = true } label: {
+                    Button { editing = indexer } label: {
                         HStack { VStack(alignment: .leading) { Text(indexer.name); Text(NZBIndexerEndpointPolicy.hostOnly(indexer.endpoint) ?? "Invalid endpoint").font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(indexer.enabled ? "On" : "Off").foregroundStyle(.secondary) }
                     }
                 }
@@ -26,12 +25,14 @@ struct NZBIndexerSettingsView: View {
                     for offset in offsets { _ = NZBIndexerStore.remove(indexerID: document.indexers[offset].id, scope: scope) }
                     reload(); CoreBridge.shared.nzbIndexerConfigurationDidChange()
                 }
-                Button { editing = NZBIndexerConfig(name: "NZBGeek", endpoint: "https://api.nzbgeek.info/api"); showingEditor = true } label: { Label("Add Newznab indexer", systemImage: "plus") }
+                Button { editing = NZBIndexerConfig(name: "NZBGeek", endpoint: "https://api.nzbgeek.info/api") } label: { Label("Add Newznab indexer", systemImage: "plus") }
             }
         }
         .navigationTitle("NZB indexers")
-        .sheet(isPresented: $showingEditor, onDismiss: { editing = nil }) {
-            if let editing { NZBIndexerEditor(config: editing, scope: scope) { reload(); showingEditor = false } }
+        // Item-driven, so the sheet always receives the indexer it was opened for. A flag plus a separately
+        // set optional could present before the value landed: an empty sheet with no way to cancel.
+        .sheet(item: $editing) { config in
+            NZBIndexerEditor(config: config, scope: scope) { reload(); editing = nil }
         }
         .onAppear { scope = NZBIndexerStore.captureScope(); reload() }
     }
@@ -57,6 +58,11 @@ private struct NZBIndexerEditor: View {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { apiKey = ""; dismiss() } }
             ToolbarItem(placement: .confirmationAction) { Button("Save") { save() } }
         }}
+        #if os(macOS)
+        // A macOS sheet sizes to its content, and a Form in a NavigationStack has none: give it a real size.
+        .formStyle(.grouped)
+        .frame(minWidth: 460, idealWidth: 520, minHeight: 360)
+        #endif
     }
     private func save() {
         guard NZBIndexerStore.isCurrent(scope) else { apiKey = ""; dismiss(); return }

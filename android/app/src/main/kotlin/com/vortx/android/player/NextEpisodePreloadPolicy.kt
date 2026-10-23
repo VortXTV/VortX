@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Pure scheduling state for next-episode preparation.
@@ -213,6 +214,7 @@ internal class NextEpisodePreloadPolicy {
  */
 internal class NextEpisodePreloadTaskOwner(
     private val scope: CoroutineScope,
+    private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
 ) {
     private data class Lease(val id: Long, val target: NextEpisodePreloadPolicy.Target)
 
@@ -225,13 +227,16 @@ internal class NextEpisodePreloadTaskOwner(
         target: NextEpisodePreloadPolicy.Target,
         prepare: suspend () -> Boolean,
         onComplete: (Boolean) -> Unit,
+        timeoutMs: Long = NextEpisodePreloadPolicy.ATTEMPT_TIMEOUT_MS,
     ) = synchronized(lock) {
         activeJob?.cancel()
         val lease = Lease(++nextId, target)
         active = lease
+        val admittedAt = nowMs()
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val prepared = try {
-                prepare()
+                val remaining = (timeoutMs - (nowMs() - admittedAt).coerceAtLeast(0L)).coerceAtLeast(0L)
+                withTimeoutOrNull(remaining) { prepare() } == true
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Throwable) {

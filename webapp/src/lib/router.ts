@@ -17,7 +17,16 @@ export type Route =
 
 /** Parse the current `location.hash` into a typed Route, defaulting to Home. */
 export function parseRoute(): Route {
-  const hash = location.hash.replace(/^#\/?/, "");
+  try {
+    return parseHash(location.hash);
+  } catch {
+    // A malformed percent escape in a shared/hand-edited hash must not disable navigation.
+    return { name: "home" };
+  }
+}
+
+function parseHash(rawHash: string): Route {
+  const hash = rawHash.replace(/^#\/?/, "");
   const [rawPath, ...rest] = hash.split("/");
   const path = rawPath.split("?")[0]; // strip a query string (e.g. #/approve?c=..&k=..)
   const tail = rest.join("/");

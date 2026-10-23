@@ -368,6 +368,46 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 /// after libmpv emitted the seek boundary, for the same source, at a target provably away from a known
 /// finite duration.  The short lifetime only prevents an old seek from reclassifying a genuine EOF much
 /// later in playback.
+/// A consumed same-source reopen is evidence about one seek transaction, not content completion.
+/// The property-event envelope supplies source ownership; the generation fences queued same-file events.
+struct SeekEOFRecoveryExhaustion: Equatable, Sendable {
+    let transportGeneration: UInt64
+    let target: Double
+    let duration: Double
+    let reason: String
+    var message: String { "Seek recovery failed: " + reason }
+}
+
+/// Continuation after a proven exhausted seek recovery. Ordinary source errors retain their existing
+/// recovery ladder. A deliberate pick stays selected; only automatic playback may choose an alternate.
+struct SeekEOFTerminalParkPolicy<Owner: Equatable> {
+    private(set) var owner: Owner?
+    private(set) var pausedIntent: Bool?
+    mutating func park(owner: Owner, pausedIntent: Bool) { self.owner = owner; self.pausedIntent = pausedIntent }
+    mutating func updateIntent(paused: Bool) -> Bool {
+        guard owner != nil else { return false }
+        pausedIntent = paused
+        return true
+    }
+    mutating func acceptedFreshLoad() -> Bool? {
+        let intent = pausedIntent
+        reset()
+        return intent
+    }
+    mutating func reset() { owner = nil; pausedIntent = nil }
+}
+
+enum SeekEOFRecoveryContinuationPolicy {
+    enum Action: Equatable { case ordinaryRecovery, chooseSource, tryAlternateSource }
+    static func action(exhaustion: SeekEOFRecoveryExhaustion?, live: Bool, trailer: Bool,
+                       explicitPick: Bool, resumedPlayback: Bool) -> Action {
+        guard let exhaustion, !live, !trailer, exhaustion.duration.isFinite, exhaustion.duration > 0,
+              exhaustion.target.isFinite, exhaustion.target >= 0,
+              exhaustion.target < exhaustion.duration - 8 else { return .ordinaryRecovery }
+        return explicitPick && !resumedPlayback ? .chooseSource : .tryAlternateSource
+    }
+}
+
 struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     enum Origin: Equatable { case viewer, resume, cacheReanchor }
     enum Phase: Equatable {
@@ -402,13 +442,32 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     }
 
     private(set) var current: Intent?
+    private struct Attempt {
+        var owner: Owner
+        let transportGeneration: UInt64
+        let target: Double
+        let duration: Double
+        var restoredPosition: Double?
+        var lastPosition: Double?
+        var lastSampleAt: TimeInterval?
+        var settledAdvance: Double = 0
+    }
+    private var attempt: Attempt?
+    private var generationOwner: Owner?
     private var nextTransportGeneration: UInt64 = 0
     /// Survives `supersedeForNewExplicitSeek()` through the caller's cancel -> begin sequence.
     private var pendingUnsettledSeekAmbiguity = false
 
     mutating func begin(owner: Owner, target: Double, wasPaused: Bool, duration: Double,
                         origin: Origin, now: TimeInterval) {
+        // Cache maintenance is not a fresh viewer decision. Keep the spent same-source receipt and
+        // any in-flight restore; only explicit viewer/resume intent, accepted source reset or proven
+        // settled advancement can replenish that budget. Raw seek-settlement fencing remains separate.
+        if origin == .cacheReanchor, attempt?.owner == owner { return }
+        attempt = nil
+        generationOwner = nil
         guard target.isFinite, target >= 0, now.isFinite else { current = nil; return }
+        generationOwner = owner
         precondition(nextTransportGeneration < UInt64.max)
         nextTransportGeneration += 1
         let inheritedAmbiguity = pendingUnsettledSeekAmbiguity || (current.map { !$0.hasObservedLanding } ?? false)
@@ -504,6 +563,10 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     mutating func consumeEOFForReload(owner: Owner) -> Intent? {
         guard var intent = current, intent.owner == owner, intent.phase == .seekObserved else { return nil }
         intent.phase = .awaitingReloadFile
+        if let duration = intent.durationAtIssue {
+            attempt = Attempt(owner: owner, transportGeneration: intent.transportGeneration,
+                              target: intent.target, duration: duration)
+        }
         current = intent
         return intent
     }
@@ -511,6 +574,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     mutating func adoptReload(owner: Owner) -> Intent? {
         guard var intent = current, intent.phase == .awaitingReloadFile else { return nil }
         intent.owner = owner
+        attempt?.owner = owner
+        generationOwner = owner
         current = intent
         return intent
     }
@@ -526,8 +591,51 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         guard let intent = current, intent.owner == owner,
               intent.phase == .awaitingReloadPosition,
               position.isFinite, abs(position - intent.target) <= 2 else { return nil }
+        if attempt?.owner == owner, attempt?.transportGeneration == intent.transportGeneration {
+            attempt?.restoredPosition = position
+            attempt?.lastPosition = position
+        }
         current = nil
         return intent
+    }
+
+    /// Retain the spent attempt after a first target landing. A source that plays only another second
+    /// and repeats EOF has not healed. Only owned, attributed, settled forward samples can re-arm it.
+    /// Thirty seconds of observed advancement is a recovery budget, never a watched/completion threshold.
+    mutating func observeRecoveredProgress(owner: Owner, position: Double, now: TimeInterval,
+                                          settled: Bool) {
+        guard settled, var receipt = attempt, receipt.owner == owner,
+              generationOwner == owner, receipt.transportGeneration == nextTransportGeneration,
+              let restored = receipt.restoredPosition, position.isFinite, position >= 0, now.isFinite else { return }
+        if let previous = receipt.lastPosition, let previousAt = receipt.lastSampleAt {
+            let delta = position - previous, elapsed = now - previousAt
+            // A large discontinuity is not continuous playback evidence, even if a delayed callback
+            // arrives with the same source token. A new explicit seek retires this receipt separately.
+            if elapsed >= 0, delta > 0, delta <= max(2, elapsed * 4) {
+                receipt.settledAdvance += delta
+            } else if delta < -0.25 || delta > max(2, max(0, elapsed) * 4) || elapsed < 0 {
+                receipt.settledAdvance = 0
+            }
+        }
+        receipt.lastPosition = position
+        receipt.lastSampleAt = now
+        if receipt.settledAdvance >= 30, position >= restored + 30 { attempt = nil }
+        else { attempt = receipt }
+    }
+
+    func exhaustion(owner: Owner, reason: String) -> SeekEOFRecoveryExhaustion? {
+        guard let receipt = attempt, receipt.owner == owner, generationOwner == owner,
+              receipt.transportGeneration == nextTransportGeneration else { return nil }
+        return SeekEOFRecoveryExhaustion(transportGeneration: receipt.transportGeneration,
+            target: receipt.target, duration: receipt.duration, reason: reason)
+    }
+
+    /// Cancellation can queue an error before another same-file seek. Cancellation itself preserves the
+    /// generation; any new seek or real source reset makes the old queued exhaustion inadmissible.
+    func acceptsExhaustion(_ exhaustion: SeekEOFRecoveryExhaustion, owner: Owner) -> Bool {
+        guard let receipt = attempt, receipt.owner == owner,
+              receipt.transportGeneration == exhaustion.transportGeneration else { return false }
+        return generationOwner == owner && exhaustion.transportGeneration == nextTransportGeneration
     }
 
     func reloadIsInFlight(owner: Owner) -> Bool {
@@ -556,6 +664,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     /// An explicit new seek supersedes a forced-pause recovery. Return its latest intent so the controller can
     /// restore it before issuing the new seek; otherwise the new seek inherits the recovery's temporary pause.
     mutating func supersedeReload() -> Intent? {
+        attempt = nil
+        generationOwner = nil
         guard let intent = current else { return nil }
         switch intent.phase {
         case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition:
@@ -570,6 +680,9 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     /// carries an ambiguity bit forward: callbacks already queued for the old same-source seek cannot be
     /// attributed to the replacement because MPV_EVENT_SEEK exposes no request identifier.
     mutating func supersedeForNewExplicitSeek() -> Intent? {
+        attempt = nil
+        // Retire queued exhaustion even if the prior restore already cleared current.
+        generationOwner = nil
         guard let intent = current else { return nil }
         pendingUnsettledSeekAmbiguity = !intent.hasObservedLanding
         current = nil
@@ -585,6 +698,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     /// supersession intentionally uses `supersedeForNewExplicitSeek` instead, so it retains the bit until B.
     mutating func reset() {
         current = nil
+        attempt = nil
+        generationOwner = nil
         pendingUnsettledSeekAmbiguity = false
     }
 }

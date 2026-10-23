@@ -8,14 +8,12 @@ import android.util.Log
 /// VortxBridge: everything crosses the boundary as JSON on the engine's frozen wire, and the
 /// symbols wrap the SAME kernel seam calls as the 7-symbol C ABI.
 ///
-/// This binding is the Phase 7 slice-1 SHADOW lane only: [VortxRankingShadow] drives
-/// [nativeResolveJson] behind a default-OFF flag to measure rank agreement. The shipping engine
-/// remains [StremioCoreNative] (`libstremiox_core.so`); nothing user-visible reads this object yet.
+/// This is the app's engine binding (`libvortx_ffi.so`).
 ///
 /// The package + class are `com.vortx.android.engine.VortxCore` and the Rust exports in
 /// `vortx-core/crates/ffi/src/jni.rs` are derived from that exact package + class
 /// (`Java_com_vortx_android_engine_VortxCore_*`), so renaming either side breaks the dynamic link.
-/// Do not rename without updating both sides together (the same rule as [StremioCoreNative]).
+/// Do not rename without updating both sides together.
 ///
 /// Threading: the handle is one-call-at-a-time (the engine crate's documented discipline).
 /// [VortxRankingShadow] serializes its calls; any future caller must do the same per handle.
@@ -79,4 +77,13 @@ object VortxCore {
     external fun nativeCancelNew(): Long
     external fun nativeCancelCancel(cancel: Long)
     external fun nativeCancelFree(cancel: Long)
+
+    // Additive byte-oriented owner-history ABI. These handles are opaque registry IDs, NOT
+    // nativeInitRuntime Engine* values. No automatic activation or fallback to the old ABI.
+    // The verifier is borrowed synchronously for ONE call; exceptions reject it.
+    external fun nativeOwnerHistoryCanonicalize(evidence: ByteArray): ByteArray?
+    external fun nativeOwnerHistoryOpen(snapshot: ByteArray, verifier: NativeOwnerHistoryVerifier): Long
+    external fun nativeOwnerHistoryFork(handle: Long, fence: ByteArray, verifier: NativeOwnerHistoryVerifier): Long
+    external fun nativeOwnerHistoryRequest(handle: Long, json: ByteArray, now: Long, verifier: NativeOwnerHistoryVerifier): ByteArray?
+    external fun nativeOwnerHistoryClose(handle: Long): Boolean
 }

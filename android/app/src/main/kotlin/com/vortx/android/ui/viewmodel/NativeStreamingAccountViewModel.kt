@@ -22,7 +22,13 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
     class Prepared internal constructor(internal val target: NativeAccountCoordinator.StreamingTarget) { val profile get() = target.profile }
     class Editor internal constructor(internal val target: NativeProfileAccess.EditTarget,
                                      internal val account: com.vortx.android.sync.SessionOwnerSnapshot.Account)
-    private val profiles = NativeProfileAccess { accounts.session() }
+    private val profiles = NativeProfileAccess(
+        publicationAdmission = { runtime, action ->
+            val account = accounts.accountFor(runtime)
+            account != null && accounts.withProfileMutation(runtime, account, action)
+        },
+        session = { accounts.session() },
+    )
     data class State(val mounted: Boolean = false, val profiles: List<UserProfile> = emptyList(), val activeID: String? = null,
                      val streaming: List<NativeAccountCoordinator.StreamingProfile> = emptyList(),
                      val migration: NativeAccountCoordinator.MigrationStatus? = null,

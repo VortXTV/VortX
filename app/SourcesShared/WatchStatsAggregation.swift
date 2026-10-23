@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The PURE, dependency-free core of Watch Stats: the normalized watch record, the computed stats, and the
 /// deterministic aggregation that turns records into the numbers the screen renders. Nothing here touches the
@@ -6,7 +7,7 @@ import Foundation
 /// isolation (see `Tests/WatchStatsAggregation`). `WatchStatsModel` owns the engine-coupled orchestration
 /// (which buckets / overlay / live models to read) and funnels everything through these pure helpers.
 ///
-/// Kept Foundation-only ON PURPOSE: it carries its OWN tolerant ISO-8601 parser rather than reusing the
+/// Kept independent of app dependencies: Foundation parsing and an os lock replace any need for the
 /// engine's `ISO8601DateFormatter.epg*` extensions (CoreModels.swift), so the aggregation compiles and runs
 /// with no app types in scope.
 
@@ -230,14 +231,23 @@ extension WatchStats {
                            plays: clampPlayCount(timesWatched), lastWatched: last)
     }
 
-    // Self-contained ISO-8601 formatters (mirrors CoreModels' `epg`/`epgFractional` but kept local so this
-    // file has no app dependency). `static let` so the parse reuses one instance per form.
-    private static let isoPlain = ISO8601DateFormatter()
-    private static let isoFractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
+    // Preserve the exact Foundation parsers/options without sharing their non-Sendable references.
+    // Both instances are created here, owned only by the private lock state, and never escape withLock.
+    private struct ISOFormatters {
+        let plain: ISO8601DateFormatter
+        let fractional: ISO8601DateFormatter
+
+        init() {
+            plain = ISO8601DateFormatter()
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            fractional = formatter
+        }
+    }
+
+    // The uncheckedState initializer transfers these freshly created, otherwise unaliased references
+    // into the lock. Every subsequent formatter access uses checked withLock and returns only Date?.
+    private static let isoFormatters = OSAllocatedUnfairLock(uncheckedState: ISOFormatters())
 
     /// Tolerant ISO-8601 parse for a stored `lastWatched`. The engine writes up to nanosecond fractional
     /// seconds (e.g. "2026-05-13T05:50:02.786798226Z"), which the standard fractional formatter rejects, so
@@ -246,8 +256,9 @@ extension WatchStats {
     /// enough; nil when absent / unparseable.
     static func parseISODate(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
-        if let d = isoFractional.date(from: raw) { return d }
-        if let d = isoPlain.date(from: raw) { return d }
+        if let date = isoFormatters.withLock({ formatters in
+            formatters.fractional.date(from: raw) ?? formatters.plain.date(from: raw)
+        }) { return date }
         guard raw.count >= 10 else { return nil }
         let f = DateFormatter()
         f.calendar = Calendar(identifier: .iso8601)

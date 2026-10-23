@@ -5,19 +5,31 @@ import SwiftUI
 struct HomeView: View {
     var isActive: Bool = true
     @Environment(\.scenePhase) private var scenePhase
-    @EnvironmentObject private var core: CoreBridge
+    /// The engine bridge, observed through `engineGate` only while Home is on screen: a pushed detail page
+    /// streaming sources, the player, or another tab no longer re-evaluate Home underneath.
+    private var core: CoreBridge { CoreBridge.shared }
+    @StateObject private var engineGate = EngineChangeGate()
+    @State private var homeContentVisible = true
+    private var engineOpen: Bool { isActive && homeContentVisible && presenter.request == nil }
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
-    @StateObject private var focusModel = FocusedItemModel()
+    @StateObject private var focusModels = HomeFocusModels()   // owned, not observed: focus re-renders only the hero layers
+    private var focusModel: FocusedItemModel { focusModels.focus }
+    private var heroTrailer: HomeHeroTrailerModel { focusModels.trailer }
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var becauseYouWatched = BecauseYouWatchedModel()   // "Because you watched <title>" rail, seeded from recent watches
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
     @StateObject private var simklRails = SIMKLRailsModel()   // SIMKL plan-to-watch as a client-side rail (dormant with empty creds)
     @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
+    @StateObject private var forYouRows = ForYouRowsModel()   // For You interest rows + smart collections pinned to Home
+    @ObservedObject private var forYou = ForYouStore.shared   // the profile's interests and smart collections (synced)
+    @State private var interestsPresentation: ForYouInterestsPresentation?
+    /// Profiles already offered the interests picker this session, so dismissing it with Menu is "not now".
+    @State private var interestsOffered: Set<UUID> = []
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
@@ -25,10 +37,10 @@ struct HomeView: View {
     @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
     @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
     @State private var traktContinueWatchingRevision = 0
-    @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
+    @State private var traktNextEpisodeTarget: TraktNextEpisodeHomeRoute?
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared   // #105: rails vs poster-wall Home layout
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
@@ -92,7 +104,7 @@ struct HomeView: View {
     }
 
     var body: some View {
-        homeChangeHandlers
+        homeForYouHandlers
     }
 
     /// The Home shell: the hero backdrop, the rail strip, and the header overlay. Split out of
@@ -100,6 +112,7 @@ struct HomeView: View {
     /// as its own expression.
     private var homeShell: some View {
         let renderedContinueWatching = continueWatchingSnapshot
+        let renderedNextEpisodes = renderedContinueWatching.nextEpisodes.filter(TraktNextEpisodeHomeRow.permitsOpening)
         return NavigationStack {
             ZStack {
                 // The living backdrop: whichever poster is focused fills the screen with its
@@ -125,13 +138,13 @@ struct HomeView: View {
                     // decoding its looping 1080p trailer under the whole movie (micro stutter + audio crackle
                     // on every stream). Unmounting tears it down the moment the player presents; it remounts
                     // fresh on close.
-                    if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-                       !reduceMotion, presenter.request == nil, let url = heroTrailer.url {
-                        TVInHeroTrailerView(url: url)
-                            .ignoresSafeArea()
-                            .allowsHitTesting(false)
-                    }
+                    HomeHeroTrailerLayer(model: heroTrailer,
+                                         enabled: autoplayTrailers && RemoteConfig.snapshot.isFeatureOn("trailers", default: true)
+                                            && !reduceMotion && presenter.request == nil)
                 }
+                // Leaves the hierarchy when a detail page is pushed over Home (or the tab is hidden).
+                .onAppear { homeContentVisible = true }
+                .onDisappear { homeContentVisible = false }
                 // The rails live in a bottom strip. The focus engine centers focused rows inside
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {
@@ -165,6 +178,10 @@ struct HomeView: View {
                             Text(status).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                                 .padding(.horizontal, Theme.Space.screenEdge)
                         }
+                        TraktNextEpisodeHomeRow(offers: renderedNextEpisodes) { offer in
+                            guard TraktNextEpisodeHomeRow.permitsOpening(offer) else { return }
+                            traktNextEpisodeTarget = TraktNextEpisodeHomeRoute(offer: offer)
+                        }
                         // Every other Home section renders in the user's arranged order, minus the hidden ones
                         // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this
                         // is a no-op until the user customizes via the "Customize Home" manage screen.
@@ -173,7 +190,7 @@ struct HomeView: View {
                                 homeSection(section)
                             }
                         }
-                        if continueWatching.isEmpty && core.boardRows.isEmpty {
+                        if renderedContinueWatching.selection.items.isEmpty && renderedNextEpisodes.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn || vortxSync.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
                         }
                     }
@@ -183,6 +200,17 @@ struct HomeView: View {
                 .heroBottomStrip()
                 // Re-selecting the active Home tab scrolls the rail strip back to the top.
                 .scrollToTopOnBump(TabScrollKeys.home)
+                .task(id: isActive && scenePhase == .active && continueWatchingSource == "trakt") {
+                    guard isActive, scenePhase == .active, continueWatchingSource == "trakt" else { return }
+                    HomeContinueWatchingSelection.refreshVisibleTraktNextEpisodes(core: core, profiles: profiles)
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(nanoseconds: 300_000_000_000) }
+                        catch { return }
+                        guard !Task.isCancelled, isActive, scenePhase == .active,
+                              continueWatchingSource == "trakt" else { return }
+                        HomeContinueWatchingSelection.refreshVisibleTraktNextEpisodes(core: core, profiles: profiles)
+                    }
+                }
             }
             .overlay(alignment: .topLeading) {
                 header
@@ -191,6 +219,16 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationDestination(for: XperienceHomeRoute.self) { _ in
+                XperienceCollectionsBrowserView()
+            }
+            .navigationDestination(item: $traktNextEpisodeTarget) { target in
+                TraktNextEpisodeHomeDestination(offer: target.offer)
+            }
+        }
+        .onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching)) { _ in
+            // Re-read and validate the CURRENT context; never publish rows captured by an older render.
+            TopShelfSnapshotWriter.publishCurrent()
         }
     }
 
@@ -248,6 +286,9 @@ struct HomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in
             traktContinueWatchingRevision &+= 1; seed()
         }
+        .onReceive(NotificationCenter.default.publisher(for: TraktHomeNextEpisodeProducer.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
+        }
         .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
             traktContinueWatchingRevision &+= 1
             seed()
@@ -273,9 +314,6 @@ struct HomeView: View {
         // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
         .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
-        // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
-        // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
-        .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
         // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
         .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
         // SIMKL disconnect: same contract as Trakt above, drop the plan-to-watch rail now.
@@ -284,9 +322,61 @@ struct HomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
     }
 
+    /// Third pass: For You and smart collections follow the profile's synced choices, and the interests
+    /// picker is offered once per profile the first time its choices are known and still undecided.
+    private var homeForYouHandlers: some View {
+        homeChangeHandlers
+        .onAppear { engineGate.setOpen(engineOpen, announce: false) }
+        .onChange(of: engineOpen) { open in engineGate.setOpen(open, announce: true) }
+        .onChange(of: forYou.interests) { _ in refreshForYou() }
+        .onChange(of: forYou.collections) { _ in refreshForYou() }
+        .onChange(of: forYou.ready) { _ in refreshForYou() }
+        .onChange(of: forYou.profileID) { _ in refreshForYou() }
+        .onChange(of: isActive) { _ in offerInterestsIfNeeded() }
+        .onChange(of: presenter.request == nil) { _ in offerInterestsIfNeeded() }
+        .onChange(of: profiles.needsPicker) { _ in offerInterestsIfNeeded() }
+        .fullScreenCover(item: $interestsPresentation) { presentation in
+            ForYouInterestsView(session: presentation.session, firstRun: presentation.firstRun) {
+                if interestsPresentation?.id == presentation.id { interestsPresentation = nil }
+            }
+            .environmentObject(theme)
+        }
+    }
+
+    private var forYouEnabled: Bool {
+        forYou.ready && forYou.profileID == profiles.activeID && profiles.active?.isKids != true
+    }
+
+    /// Refetches only when the profile, interests or pinned rules change; library and Continue Watching
+    /// changes just re-filter the rows already fetched.
+    private func refreshForYou() {
+        let owned = Set((continueWatching + libraryItems)
+            .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }.map(\.id))
+        forYouRows.refresh(profileID: profiles.activeID, interests: forYou.interests, collections: [],
+                           owned: owned, watched: WatchedIndex.shared.ids, enabled: forYouEnabled)
+        offerInterestsIfNeeded()
+    }
+
+    private func offerInterestsIfNeeded() {
+        // Only once a viewer is chosen ("Who's watching?" settled) and this profile's own choices have loaded:
+        // before that the store reads nil interests, which looks undecided for every profile.
+        guard isActive, interestsPresentation == nil, presenter.request == nil, forYouEnabled, !profiles.needsPicker,
+              let profile = profiles.activeID, forYou.ready, forYou.profileID == profile,
+              forYou.interests?.decided != true, !interestsOffered.contains(profile),
+              let session = try? forYou.captureInterestsEdit() else { return }
+        interestsOffered.insert(profile)
+        interestsPresentation = ForYouInterestsPresentation(firstRun: true, session: session)
+    }
+
+    private func tuneInterests() {
+        guard let session = try? forYou.captureInterestsEdit() else { return }
+        interestsPresentation = ForYouInterestsPresentation(firstRun: false, session: session)
+    }
+
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
+        refreshForYou()
         // These independently owned rails do not require the engine-history recommendation receipt.
         // Keep their throttled refreshes live even while personalized history admission is settling.
         traktRails.refresh()
@@ -344,7 +434,7 @@ struct HomeView: View {
             historySnapshot: historySnapshot
         )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         if becauseYouWatched.historyInputReady {
-            topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: localLibrary)
+            topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: localLibrary, ownerKey: becauseYouWatchedOwnerKey)
         } else {
             topPicks.clear()
         }
@@ -398,10 +488,23 @@ struct HomeView: View {
     @ViewBuilder
     private func homeSection(_ section: HomeRail) -> some View {
         switch section {
+        case .forYou:
+            // Rows built from the profile's stated interests, each labelled with its reason. Never on a
+            // kids profile, and never before this profile's saved choices are known on this device.
+            if forYouEnabled {
+                ForYouHomeSectionTV(rows: forYouRows.interestRows, showInvite: forYou.interests?.isEmpty ?? true,
+                                    focusModel: focusModel,
+                                    onTune: { tuneInterests() })
+            }
+        case .smartCollections:
+            if forYouEnabled {
+                CurationCollectionsHome(resolved: .init(interests: forYouRows.interestRows.flatMap(\.items)))
+            }
         case .collectionsHub:
             // Collections hub (Discover cards, Streaming-service tiles, Genre tiles). Each tile opens a
             // sub-catalog browse grid. Needs a TMDB key; hidden without one.
             if showCollectionsHub, CollectionsHubModel.isAvailable {
+                CurationDefaultsHomeShelf()
                 TVCollectionsHub(model: collectionsHub)
             }
         case .topPicks:
@@ -527,6 +630,34 @@ struct HomeView: View {
 /// Trailer button plays; `StremioServer.trailerResolverBase` picks the in-process route on full builds and
 /// the public `trailer.vortx.tv/yt` resolver on Lite, so Lite plays hero trailers too). The retired R2
 /// `/clip` snippet is gone (owner directive). A resolve miss 404s into the player's still-backdrop fallback.
+/// Home's focus-driven models, owned without HomeView observing them. A focus move re-renders only the
+/// hero backdrop and the trailer layer, which observe these themselves, never the rails below.
+@MainActor final class HomeFocusModels: ObservableObject {
+    let focus = FocusedItemModel()
+    let trailer = HomeHeroTrailerModel()
+
+    init() {
+        // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
+        // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
+        focus.onHeroIDChange = { [weak trailer] hero in trailer?.focusChanged(to: hero) }
+    }
+}
+
+/// The hero's ambient trailer, observing the trailer model itself so a resolved or cleared clip re-renders
+/// only this layer.
+private struct HomeHeroTrailerLayer: View {
+    @ObservedObject var model: HomeHeroTrailerModel
+    let enabled: Bool
+
+    var body: some View {
+        if enabled, let url = model.url {
+            TVInHeroTrailerView(url: url)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        }
+    }
+}
+
 @MainActor final class HomeHeroTrailerModel: ObservableObject {
     /// The settled item's resolved trailer URL, or nil while debouncing / when no trailer exists. Mounting
     /// `TVInHeroTrailerView` on this means clearing it tears the libmpv layer down at once.
@@ -730,7 +861,7 @@ struct CoreContinueWatchingRow: View {
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
-    @EnvironmentObject private var core: CoreBridge
+    private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @State private var detailTarget: CWDetailTarget?
     @State private var unavailableContinueWatching: String?
     @State private var resumeHoardTask: Task<Void, Never>?
@@ -831,6 +962,10 @@ struct CoreContinueWatchingRow: View {
         // Resolve its captured target through Detail; never borrow this device's last stream.
         guard intent?.source != .simkl else { return nil }
         let pid = profiles.activeID
+        // Up next: the remembered link is the finished episode. Detail picks the next one.
+        if item.isUpNext {
+            LastStreamStore.logResume("upNext", libraryId: item.id, profileID: pid); return nil
+        }
         guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
             LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
         }
@@ -1042,7 +1177,7 @@ struct CoreCatalogRowView: View {
     let row: CoreBoardRow
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
-    @EnvironmentObject private var core: CoreBridge   // for per-row horizontal pagination (#95)
+    private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
 
@@ -1084,7 +1219,7 @@ struct CoreCatalogWallSection: View {
     let row: CoreBoardRow
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
-    @EnvironmentObject private var core: CoreBridge   // for per-catalog pagination (#95), same as the rail
+    private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
 

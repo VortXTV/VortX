@@ -12,25 +12,19 @@ struct SettingsView: View {
     // SERVE read. The Singularity toggle gates on THIS, not the Stremio `account` -- a Stremio-only sign-in
     // mints no token, so the toggle must require the VortX sign-in that the helper text already names.
     @EnvironmentObject private var vortxSync: VortXSyncManager
-    @EnvironmentObject private var core: CoreBridge
+    @VisibleCore private var core   // observed only while this tab is on screen (EngineObservation.swift)
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
     @FocusState private var updateCheckFocused: Bool
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
-    /// Settings search query. Empty shows the full settings tree; a non-empty query filters the sections
-    /// below to those whose title or any of their row keywords contain it (case-insensitive substring).
+    /// Empty shows the category landing page. A query searches every section, across all categories.
     @State private var settingsQuery = ""
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     // Match Frame Rate: HDRDisplayMode owns both the key and the display-mode behavior it drives, so the key
     // string lives there rather than being duplicated as a literal across the Settings screens.
     @AppStorage(HDRDisplayMode.matchFrameRateKey) private var matchFrameRate = HDRDisplayMode.defaultMatchFrameRate
-    /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
-    /// Same key as iOSSettingsView (settings parity); the row renders only in builds whose linked
-    /// VortxEngine slice carries the server (VortxNativeServerFlag.isSupported), which today is no
-    /// tvOS build (the tier-3 server cross-compile walls), so this stays invisible until it can work.
-    @AppStorage(VortxNativeServerFlag.key) private var engineServerOn = false
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
@@ -78,6 +72,10 @@ struct SettingsView: View {
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(VXProbe.defaultsKey) private var probeLogging = false   // gated diagnostic logging + heartbeat
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
+    @AppStorage(VisualEffects.backdropKey) private var effectsBackdrop = VisualEffects.auto
+    @AppStorage(VisualEffects.glassKey) private var effectsGlass = VisualEffects.auto
+    @AppStorage(VisualEffects.motionKey) private var effectsMotion = VisualEffects.auto
+    @AppStorage(VisualEffects.artworkKey) private var effectsArtwork = VisualEffects.auto
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     // Streaming/seek cache budget, raw byte count (0 = Off, -1 = Unlimited). Int-typed @AppStorage; Int
@@ -148,42 +146,10 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Text("Settings").screenTitleStyle()
-                    // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the
-                    // search field, ungated by the settings filter so the move state is ALWAYS inspectable
-                    // here. Not launch-gated (unlike the nag sheet): un-seeded it prompts, seeded it confirms.
-                    seedingBanner
-                    // Focusable search field: typing filters the sections below (additive, the whole tree
-                    // stays intact and returns the moment the field is cleared). Each section is gated by
-                    // `sectionMatches`, so an empty query shows everything and a query keeps only the hits.
-                    searchSection
-                    if isSearching && !hasAnySettingsMatch {
-                        noSettingsMatchSection
-                    }
-                    if sectionMatches(.profiles) { profilesSection }
-                    if sectionMatches(.account) { accountSection }
-                    if sectionMatches(.stremioMirror) { stremioMirrorSection }
-                    if sectionMatches(.playback) { playbackSection }
-                    if sectionMatches(.downloads) { downloadsSection }
-                    if sectionMatches(.notifications) { notificationsSection }
-                    if sectionMatches(.streams) { streamsSection }
-                    if sectionMatches(.community) { communitySection }
-                    if sectionMatches(.server) { serverSection }
-                    if sectionMatches(.tabBar) { tabBarSection }
-                    if sectionMatches(.appearance) { appearanceSection }
-                    if sectionMatches(.audioSubtitle) { audioSubtitleSection }
-                    if sectionMatches(.subtitle) { subtitleSection }
-                    if sectionMatches(.advanced) { advancedSection }
-                    if sectionMatches(.backup) { backupSection }
-                    if sectionMatches(.about) { aboutSection }
+            settingsLanding
+                .navigationDestination(for: TVSettingsCategory.self) { category in
+                    settingsCategoryPage(category)
                 }
-                .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.vertical, Theme.Space.xl)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .background(Theme.Palette.canvas.ignoresSafeArea())
         }
         .fullScreenCover(isPresented: $showDiagExport, onDismiss: {
             VXDiagExport.shared.stop()
@@ -217,14 +183,11 @@ struct SettingsView: View {
         .onChange(of: sourcePrefs.rankingSignature) { ProfileStore.shared.capturePlayback() }
         .onAppear {
             refreshExternalPlayerChoices()   // six canOpenURL IPC probes, once per appearance
-            SettingsChangeLog.prime()        // I-settings: baseline the [settings] change log for this visit
         }
         // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
-        // SettingsChangeLog). This covers all the @AppStorage controls without ~120 scattered .onChange
-        // modifiers, which would also blow this body's type-check budget (see the rankingSignature note above).
-        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
-            SettingsChangeLog.logChanges()
-        }
+        // SettingsChangeLog), only while this tab is on screen. This covers all the @AppStorage controls without
+        // ~120 scattered .onChange modifiers, which would also blow this body's type-check budget.
+        .modifier(SettingsChangeRecorder())
         .task {
             // Live server monitor that NEVER gives up. The embedded server cold-starts well after
             // launch on a real Apple TV (node boots while the engine and sync are also busy), and
@@ -243,32 +206,126 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Category navigation
+
+    private var settingsLanding: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                Text("Settings").screenTitleStyle()
+                // Keep the move state visible above both categories and global search results.
+                seedingBanner
+                searchSection
+                if isSearching {
+                    if !hasAnySettingsMatch { noSettingsMatchSection }
+                    ForEach(matchingSettingsSections, id: \.self) { id in
+                        settingsSection(id)
+                    }
+                } else {
+                    settingsCategories
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.vertical, Theme.Space.xl)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+    }
+
+    /// Native links keep remote Back and focus restoration on the existing navigation stack.
+    private var settingsCategories: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            ForEach(TVSettingsCategory.allCases) { category in
+                NavigationLink(value: category) {
+                    HStack(spacing: Theme.Space.md) {
+                        Image(systemName: category.systemImage)
+                            .font(Theme.Typography.cardTitle)
+                            .foregroundStyle(Theme.Palette.accent)
+                            .frame(width: 46)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                            Text(category.title)
+                                .font(Theme.Typography.cardTitle)
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                            Text(category.summary)
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .accessibilityHidden(true)
+                    }
+                    .padding(Theme.Space.lg)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(RowFocusStyle())
+                .accessibilityLabel(category.title)
+                .accessibilityHint(category.summary)
+            }
+        }
+        .focusSection()
+    }
+
+    private func settingsCategoryPage(_ category: TVSettingsCategory) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                Text(category.title).screenTitleStyle()
+                ForEach(category.sections, id: \.self) { id in
+                    settingsSection(id)
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.vertical, Theme.Space.xl)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+    }
+
+    // Keep routing type-erased like section(); avoid a sixteen-case opaque SwiftUI return type.
+    // Both navigation and global search reuse the same controls, bindings and presentation owners.
+    private func settingsSection(_ id: SettingsSearchSection) -> AnyView {
+        switch id {
+        case .profiles: return AnyView(profilesSection)
+        case .account: return AnyView(accountSection)
+        case .stremioMirror: return AnyView(stremioMirrorSection)
+        case .playback: return AnyView(playbackSection)
+        case .downloads: return AnyView(downloadsSection)
+        case .notifications: return AnyView(notificationsSection)
+        case .streams: return AnyView(streamsSection)
+        case .community: return AnyView(communitySection)
+        case .server: return AnyView(serverSection)
+        case .tabBar: return AnyView(tabBarSection)
+        case .appearance: return AnyView(appearanceSection)
+        case .audioSubtitle: return AnyView(audioSubtitleSection)
+        case .subtitle: return AnyView(subtitleSection)
+        case .advanced: return AnyView(advancedSection)
+        case .backup: return AnyView(backupSection)
+        case .about: return AnyView(aboutSection)
+        }
+    }
+
     // MARK: Settings search
 
-    /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
+    /// The normalized query determines whether the landing page shows categories or global results.
     private var trimmedSettingsQuery: String {
-        settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        SettingsSearchSection.normalizedQuery(settingsQuery)
     }
 
     /// Whether the user is actively filtering. An empty (or whitespace-only) field is treated as no filter.
     private var isSearching: Bool { !trimmedSettingsQuery.isEmpty }
 
-    /// A section shows when there is no query, or when the query is a case-insensitive substring of the
-    /// section's title or any of its row keywords.
-    private func sectionMatches(_ id: SettingsSearchSection) -> Bool {
-        let q = trimmedSettingsQuery
-        guard !q.isEmpty else { return true }
-        if id.title.lowercased().contains(q) { return true }
-        return id.keywords.contains { $0.contains(q) }
+    /// Search starts from the complete section inventory, independently of the category routes.
+    private var matchingSettingsSections: [SettingsSearchSection] {
+        SettingsSearchSection.matchingSections(for: settingsQuery)
     }
 
     /// True when at least one section matches the current query (drives the empty-state card).
     private var hasAnySettingsMatch: Bool {
-        SettingsSearchSection.allCases.contains { sectionMatches($0) }
+        !matchingSettingsSections.isEmpty
     }
 
     /// The focusable search field at the top of Settings. Focusing it opens the tvOS keyboard; typing
-    /// filters the sections below and the Clear chip (or emptying the field) restores the full tree. Sits
+    /// filters all sections and the Clear chip (or emptying the field) restores the categories. Sits
     /// on the same settings-card glass as every section so it reads as part of the same surface.
     private var searchSection: some View {
         HStack(spacing: Theme.Space.md) {
@@ -280,11 +337,13 @@ struct SettingsView: View {
                 .font(Theme.Typography.body)
                 .foregroundStyle(Theme.Palette.textPrimary)
                 .autocorrectionDisabled(true)
+                .accessibilityLabel("Search all settings")
             if !settingsQuery.isEmpty {
                 Button { settingsQuery = "" } label: {
                     Label("Clear", systemImage: "xmark.circle.fill")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                .accessibilityLabel("Clear settings search")
             }
         }
         .padding(Theme.Space.lg)
@@ -363,7 +422,10 @@ struct SettingsView: View {
                     Image(systemName: "checkmark.icloud.fill")
                         .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(MoveSeeding.backedUpLine)
+                        Text(MoveSeeding.backedUpLine(
+                            synchronizationIsComplete: vortxSync.synchronizationIsComplete,
+                            pendingSettingsMessage: vortxSync.pendingSettingsMessage
+                        ))
                             .font(Theme.Typography.body.weight(.semibold))
                             .foregroundStyle(Theme.Palette.textPrimary)
                         Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
@@ -825,8 +887,7 @@ struct SettingsView: View {
             } else {
                 Text(StremioServer.base)
                     .font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
-                // When the embedded server is unreachable, explain itself: node's run state and the
-                // server's own last log lines, so a dead server is diagnosable from the couch.
+                // Show the in-process server state when the embedded endpoint is unreachable.
                 if serverOnline == false && !StremioServer.isCustom {
                     #if !VORTX_NO_EMBEDDED_SERVER
                     Text(NodeServer.statusDescription)
@@ -837,8 +898,7 @@ struct SettingsView: View {
                     }
                     #endif
                 }
-                // Apple TV has no user-facing force quit, and a dead embedded server can
-                // only come back with a fresh process (node starts once per process).
+                // Offer an explicit app restart to reclaim process memory and restart the streaming server.
                 Button { showRestartConfirm = true } label: {
                     Label("Restart App", systemImage: "arrow.clockwise.circle")
                 }
@@ -846,6 +906,7 @@ struct SettingsView: View {
                 .confirmationDialog("Restart VortX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
                     Button("Quit Now", role: .destructive) {
                         DiagnosticsLog.logSync("app", "user requested app restart from Settings")
+                        TerminationReceipt.markTerminating()
                         exit(0)
                     }
                     Button("Cancel", role: .cancel) {}
@@ -858,30 +919,6 @@ struct SettingsView: View {
                     Label("Configure server", systemImage: "server.rack")
                 }
                 .buttonStyle(PrimaryActionStyle())
-                // Mobile runtimes cannot be swapped in-process: persist the next-launch choice.
-                if VortxNativeServerFlag.isSupported && !NativeTransportPolicy.isRequired {
-                    Button {
-                        engineServerOn.toggle()
-                    } label: {
-                        HStack(alignment: .center, spacing: Theme.Space.lg) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Engine streaming server (experimental)")
-                                    .font(Theme.Typography.cardTitle)
-                                    .foregroundStyle(Theme.Palette.textPrimary)
-                                Text("Restart VortX after changing the streaming engine.")
-                                    .font(Theme.Typography.label)
-                                    .foregroundStyle(Theme.Palette.textSecondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            Spacer(minLength: Theme.Space.md)
-                            TogglePill(isOn: engineServerOn)
-                        }
-                        .padding(Theme.Space.md)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-                    }
-                    .buttonStyle(RowFocusStyle())
-                }
             }
             // EXTERNAL ENGINE MODE, client side. Keep this beside the server rows because people
             // looking for a Mac that serves this Apple TV will look under Streaming Server first.
@@ -1064,12 +1101,29 @@ struct SettingsView: View {
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Performance"), [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
-            Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
+            Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced shrinks playback buffers and sets the effects below to their light options so the remote stays responsive on weak hardware. Restart the app after changing this.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Effects and performance: each one Auto (follows Performance) or an explicit choice. Applies
+            // as you move around; nothing here needs a restart. Kept on this Apple TV only.
+            choiceRow(String(localized: "Focus backdrop"), [("auto", "Auto"), ("animated", "Animated"), ("still", "Still"), ("off", "Off")],
+                      selection: $effectsBackdrop)
+            Text("The art of the title you focus fills the screen. Still swaps it without a fade; Off keeps a plain background and only the details change.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Glass and blur"), [("auto", "Auto"), ("on", "On"), ("off", "Off")], selection: $effectsGlass)
+            Text("Off draws solid surfaces instead of translucent glass and blurred artwork, which is much lighter to render.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Animations"), [("auto", "Auto"), ("on", "On"), ("off", "Off")], selection: $effectsMotion)
+            Text("Off removes fades, focus and layout animations, and autoplaying hero trailers.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Artwork"), [("auto", "Auto"), ("full", "Full quality"), ("hd", "HD")], selection: $effectsArtwork)
+            Text("HD caps backdrops at 1080p on a 4K TV, so each one loads faster and uses less memory.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
         .confirmationDialog("Apply language?", isPresented: $showLangRestart, titleVisibility: .visible) {
             Button("Quit Now", role: .destructive) {
                 DiagnosticsLog.logSync("app", "user requested app restart to apply language")
+                TerminationReceipt.markTerminating()
                 exit(0)
             }
             Button("Later", role: .cancel) {}
@@ -1528,7 +1582,7 @@ struct SettingsView: View {
             manualUpdateResult
             infoRow(String(localized: "Version"), appVersion)
             infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
-            infoRow(String(localized: "Server"), String(localized: "Stremio streaming server (nodejs-mobile)"))
+            infoRow(String(localized: "Server"), String(localized: "VortX streaming server"))
             NavigationLink { TVWhatsNewView() } label: {
                 Label("What's New", systemImage: "sparkles")
             }
@@ -1618,78 +1672,6 @@ struct SettingsView: View {
             Text(value).foregroundStyle(Theme.Palette.textSecondary)
         }
         .font(Theme.Typography.body)
-    }
-}
-
-/// The searchable Settings sections on Apple TV. Each case carries the section's on-screen title plus the
-/// row keywords it should match, so the search field can filter the tree by a case-insensitive substring of
-/// any title or row label. Keywords are stored lowercased so matching is a plain `contains`. Kept in sync
-/// with the sections `SettingsView` actually renders (the iOS `iOSSettingsView` keeps its own equivalent).
-private enum SettingsSearchSection: CaseIterable {
-    case profiles, account, stremioMirror, playback, downloads, notifications, streams, community,
-         server, tabBar, appearance, audioSubtitle, subtitle, advanced, backup, about
-
-    var title: String {
-        switch self {
-        case .profiles: return "Profiles"
-        case .account: return "Account"
-        case .stremioMirror: return "Stremio mirror"
-        case .playback: return "Playback"
-        case .downloads: return "Downloads"
-        case .notifications: return "Notifications"
-        case .streams: return "Streams"
-        case .community: return "Community"
-        case .server: return "Streaming Server"
-        case .tabBar: return "Tab Bar"
-        case .appearance: return "Appearance"
-        case .audioSubtitle: return "Audio & Subtitles"
-        case .subtitle: return "Subtitle Style"
-        case .advanced: return "Advanced (mpv options)"
-        case .backup: return "Backup & Restore"
-        case .about: return "About"
-        }
-    }
-
-    var keywords: [String] {
-        switch self {
-        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
-        case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
-                               "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
-                               "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
-                               "media server", "plex", "jellyfin", "emby", "api key"]
-        case .stremioMirror: return ["mirror", "two-way sync", "add-ons", "library", "continue watching"]
-        case .playback: return ["direct links only", "audio output", "video upscaling", "streaming cache",
-                                "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
-                                "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
-                                "trickplay", "autoplay trailers", "trailer language", "default volume",
-                                "auto-add watched", "play in", "external player", "still watching", "idle"]
-        case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
-        case .notifications: return ["new episode alerts", "episode", "notification"]
-        case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
-                               "safety filter", "regex", "max quality", "minimum quality", "max file size",
-                               "compact source rows", "pinned sources", "resolution"]
-        case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
-        case .server: return ["server", "configure server", "restart", "embedded", "node",
-                              "external engine", "use a mac", "mac as engine", "engine host",
-                              "seek anywhere", "pair a mac"]
-        case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
-        case .appearance: return ["accent", "background", "oled", "app language", "language",
-                                  "cinematic catalog cards", "hide poster labels", "poster style",
-                                  "collections on home", "collections on discover", "refresh collections",
-                                  "streaming services", "discover & region", "budget & box office", "spoiler",
-                                  "blur", "dolby vision", "hdr", "match frame rate", "frame rate", "judder",
-                                  "24p", "refresh rate", "text size", "performance",
-                                  "top shelf", "tv home screen", "home screen", "continue watching",
-                                  // INS-260722-02: the re-homed Home rows editor ("Customize Home"),
-                                  // so search reaches it under Appearance.
-                                  "customize home", "home rows", "top picks", "collections", "order", "hide"]
-        case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
-                                     "subtitles", "forced", "match audio to subtitle"]
-        case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
-        case .advanced: return ["mpv", "custom options", "diagnostic logging", "diagnostic log", "export log"]
-        case .backup: return ["backup", "restore", "export library", "import library"]
-        case .about: return ["version", "player", "what's new", "update", "libmpv", "mpvkit"]
-        }
     }
 }
 

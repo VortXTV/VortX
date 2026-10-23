@@ -7,29 +7,10 @@
 // SettingsBackup.swift AND Keychain.swift in. A re-typed copy of a filter would only ever prove the copy is
 // right, which for a security control is worth nothing.
 //
-// RUN (positive: every assertion must pass, exit 0):
-//
-//     xcrun swiftc -o /tmp/sbtest \
-//         app/SourcesShared/SettingsBackup.swift \
-//         app/SourcesShared/CredentialScope.swift \
-//         app/SourcesShared/Keychain.swift \
-//         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbtest
-//
-// RUN (NEGATIVE CONTROL: mandatory, and the actual point of the file). A guard that has never been shown to
-// FAIL is indistinguishable from a guard that CANNOT fail, so break it on purpose and confirm the tests
-// notice. Emptying `secretKeyPrefixes` must turn T1.1/T1.2/T1.3/T2.1/T3.1/T3.3/T5.4 RED and exit 1:
-//
-//     mkdir -p /tmp/sbctrl && cp app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift /tmp/sbctrl/
-//     sed 's|static let secretKeyPrefixes: \[String\] = \[Keychain.fallbackKeyPrefix\]|static let secretKeyPrefixes: [String] = []|' \
-//         app/SourcesShared/SettingsBackup.swift > /tmp/sbctrl/SettingsBackup.swift
-//     xcrun swiftc -o /tmp/sbctrl/bin /tmp/sbctrl/SettingsBackup.swift /tmp/sbctrl/CredentialScope.swift /tmp/sbctrl/Keychain.swift \
-//         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbctrl/bin   # expect exit 1
-//
-// A second negative control removes `Keychain.invalidationKeyPrefix` from `deviceLocalKeyPrefixes`.
-// T1.5/T2.3/T3.4/T5.5 must then turn RED and the executable must exit 1.
-//
-// When last run, that control printed the plaintext token and dataKey straight out of the backup blob, which
-// is what upgraded the leak from "plausible" to "demonstrated on the pre-fix code path".
+// RUN: node test/settings-backup-secrets.mjs
+// The runner embeds a fresh test-only bundle identifier, checks missing/mismatched identity rejection,
+// and preserves positive plus cache/secret/invalidation negative-control receipts under app/build.
+// Never run a bare executable with an "unknown" or production defaults domain.
 //
 // NOTE for whoever wires up a real test target: the stubs below are top-level types that SHADOW the real
 // app types of the same name. They exist only so the file under test links standalone. This file is not in
@@ -38,6 +19,10 @@
 // stubs behind the target's own doubles at that point.
 
 import Foundation
+
+// NativeForegroundSyncPolicy's unrelated carrier-comparison signature needs an Equatable token.
+// The conversion record, encoder, digest and decision under test are the actual production source.
+struct VortxJSON: Equatable {}
 
 // MARK: - Stubs (only for what SettingsBackup.reloadLiveStores touches; no test calls it)
 
@@ -92,6 +77,36 @@ struct SettingsBackupSecretsTests {
     static var leakedTraktKey: String { Keychain.fallbackKeyPrefix + "vortx.trakt.accessToken" }
     // Non-secret Keychain invalidation state is device-local and must not move to another device.
     static var invalidationKey: String { Keychain.invalidationKeyPrefix + "vortx.sync.session.v1" }
+    // Independent source-derived cache names for the bounded update and Collections cache fix.
+    // Production key builders append the region. Exercise both common source regions to guard the dynamic tail.
+    static let derivedCacheExactKeys = [
+        "stremiox.update.lastChecked",
+        "stremiox.update.cachedRelease",
+        "vortx.collections.decadeCovers",
+        "vortx.collections.decadeCoversAt",
+        "vortx.collections.decadeCoversFailedAt",
+        "vortx.collections.globalProviders.v2",
+        "vortx.collections.globalProvidersAt.v2",
+    ]
+    static let derivedRegionCachePrefixes = [
+        "vortx.collections.genreBackdrops.",
+        "vortx.collections.genreBackdropsAt.",
+        "vortx.collections.discoverBackdrops.",
+        "vortx.collections.discoverBackdropsAt.",
+        "vortx.collections.providers.v2.",
+        "vortx.collections.providersAt.v2.",
+    ]
+    static let derivedCacheRegions = ["GB", "US"]
+    /// Per-device choices and state (effects, Infuse handoffs, network shares) that must never travel either.
+    static let deviceOnlyKeys = [
+        "vortx.effects.backdrop", "vortx.effects.glass", "vortx.effects.motion", "vortx.effects.artwork",
+        "vortx.infuse.handoffs", "vortx.networkShares.list",
+    ]
+    static var derivedCacheKeys: [String] {
+        derivedCacheExactKeys + deviceOnlyKeys + derivedRegionCachePrefixes.flatMap { prefix in
+            derivedCacheRegions.map { prefix + $0 }
+        }
+    }
 
     /// Raw decode that does NOT go through `decodeDomain`'s filter, so a test can see what was actually
     /// ENCODED rather than what the read side is willing to hand back. Without this, the read-side filter
@@ -112,10 +127,158 @@ struct SettingsBackupSecretsTests {
         return flat.contains(secretToken) || flat.contains(secretDataKey)
     }
 
-    static func main() {
-        let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+    @MainActor
+    static func testNativeLegacyConversionCursor(bundleID: String) {
+        typealias Record = NativeForegroundSyncPolicy.LegacyConversionRecord
+        let defaults = UserDefaults.standard
+        let cursorA = "vortx.native.legacyConversion.0123456789abcdef"
+        let cursorB = "vortx.native.legacyConversion.fedcba9876543210"
+        let cursorKeys = [cursorA, cursorB]
+        let preference = "stremiox.accentColor"
+        let nativeSibling = "vortx.native.futurePreference"
+        let peerSibling = "vortx.native.futurePeerPreference"
+        let adjacent = "vortx.native.legacyConversionPolicy"
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        // This is the account document to be converted later, separate from the transferred backup file.
+        // A matching copied record would skip conversion; a fresh device must instead have no record.
+        let conversionSource: [String: Any] = ["library": ["fixture-title": ["watched": true]], "futureField": 7]
+        guard let digest = Record.digest(of: conversionSource, excluding: []),
+              let peerRecordData = try? JSONEncoder().encode(Record(digest: digest, convertedAt: now)),
+              let localRecordData = try? JSONEncoder().encode(Record(digest: String(repeating: "a", count: 64), convertedAt: now)),
+              let otherLocalData = try? JSONEncoder().encode(Record(digest: String(repeating: "b", count: 64), convertedAt: now)),
+              let updatedRecordData = try? JSONEncoder().encode(Record(digest: digest, convertedAt: now.addingTimeInterval(1))) else {
+            check("T9.0 actual legacy conversion record fixture encodes", false)
+            return
+        }
+        check("T9.1 every account-suffixed conversion cursor is device-local",
+              cursorKeys.allSatisfy { !SettingsBackup.isSyncable($0) })
+        check("T9.2 the exact prefix preserves genuine and unknown neighboring preferences",
+              [preference, nativeSibling, peerSibling, adjacent, "vortx.downloads.autoDeleteWatched"].allSatisfy(SettingsBackup.isSyncable))
 
-        let seeded: [String: Any] = [
+        defaults.setPersistentDomain([
+            cursorA: localRecordData, cursorB: otherLocalData, preference: "local-blue",
+            nativeSibling: ["unknown": [1, 2]], adjacent: "user-policy", "vortx.downloads.autoDeleteWatched": true
+        ], forName: bundleID)
+        guard let exported = try? SettingsBackup.makeBackup() else {
+            check("T9.0 actual cursor backup exports", false)
+            return
+        }
+        let exportedRaw = rawPayload(exported) // Must bypass decodeDomain so export cannot hide a leak.
+        check("T9.3 actual user backup never encodes either local conversion cursor",
+              cursorKeys.allSatisfy { exportedRaw[$0] == nil })
+        check("T9.4 actual export retains user policy and unknown native sibling fields",
+              exportedRaw[preference] as? String == "local-blue"
+                && exportedRaw[adjacent] as? String == "user-policy"
+                && exportedRaw["vortx.downloads.autoDeleteWatched"] as? Bool == true
+                && SettingsDirtyKeys.valuesEqual(exportedRaw[nativeSibling], ["unknown": [1, 2]]))
+
+        let peerDomain: [String: Any] = [cursorA: peerRecordData, cursorB: peerRecordData,
+                                       preference: "peer-red", peerSibling: ["future": ["retained": true]]]
+        guard let encoded = try? SettingsBackup.encode(domain: peerDomain, bundleID: bundleID, app: "VortX"),
+              var peerEnvelope = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] else {
+            check("T9.0 original peer backup fixture encodes", false)
+            return
+        }
+        peerEnvelope["futureEnvelope"] = ["version": 7, "note": "keep-original"]
+        guard let peerBackup = try? JSONSerialization.data(withJSONObject: peerEnvelope, options: [.sortedKeys]),
+              let decoded = try? SettingsBackup.decodeDomain(from: peerBackup) else {
+            check("T9.0 original peer backup fixture decodes", false)
+            return
+        }
+        let originalPeerBytes = peerBackup
+        let peerRecord = try? JSONDecoder().decode(Record.self, from: peerRecordData)
+        check("T9.5 raw old peer backup really contains a matching skip-capable cursor",
+              rawPayload(peerBackup)[cursorA] as? Data == peerRecordData
+                && Record.decide(peerRecord, digest: digest, hasLinkedAccounts: false, now: now) == .skip)
+        check("T9.6 actual decoder and applied baseline exclude every peer cursor",
+              cursorKeys.allSatisfy { decoded[$0] == nil }
+                && Set(cursorKeys).isDisjoint(with: SettingsBackup.appliedKeys(from: peerBackup)))
+        check("T9.7 filtering preserves the original peer bytes and unknown preference values",
+              peerBackup == originalPeerBytes
+                && rawPayload(peerBackup)[cursorA] as? Data == peerRecordData
+                && SettingsDirtyKeys.valuesEqual(decoded[peerSibling], peerDomain[peerSibling]))
+
+        // All defaults access is inside the existing fresh embedded test-domain guard in main().
+        // A fresh local cursor stays absent; an existing other-account cursor stays byte-identical.
+        defaults.removeObject(forKey: cursorA)
+        let restored = try? SettingsBackup.restore(from: peerBackup)
+        check("T9.8 actual restore cannot install a peer cursor or replace another local cursor",
+              restored == decoded.count && defaults.data(forKey: cursorA) == nil
+                && defaults.data(forKey: cursorB) == otherLocalData)
+        let afterPeerCopy = defaults.data(forKey: cursorA).flatMap { try? JSONDecoder().decode(Record.self, from: $0) }
+        check("T9.9 actual conversion decision still requires first local conversion after peer copy",
+              Record.decide(afterPeerCopy, digest: digest, hasLinkedAccounts: false, now: now) == .first)
+        defaults.set(localRecordData, forKey: cursorA)
+        _ = try? SettingsBackup.restore(from: peerBackup)
+        check("T9.10 an existing local cursor remains byte-identical across explicit file restore",
+              defaults.data(forKey: cursorA) == localRecordData)
+        check("T9.11 actual restore still applies user preferences and unknown peer fields",
+              defaults.string(forKey: preference) == "peer-red"
+                && SettingsDirtyKeys.valuesEqual(defaults.object(forKey: peerSibling), peerDomain[peerSibling]))
+
+        let beforeWrite = defaults.persistentDomain(forName: bundleID) ?? [:]
+        // Same real Data write shape as recordNativeLegacyConversion; no manager implementation copy.
+        defaults.set(updatedRecordData, forKey: cursorA)
+        let afterWrite = defaults.persistentDomain(forName: bundleID) ?? [:]
+        let directDelta = SettingsDirtyKeys.changedSyncableKeys(from: beforeWrite, to: afterWrite,
+                                                               isSyncable: SettingsBackup.isSyncable)
+        let withoutCursor = beforeWrite.filter { $0.key != cursorA }
+        let addedDelta = SettingsDirtyKeys.changedSyncableKeys(from: withoutCursor, to: afterWrite,
+                                                              isSyncable: SettingsBackup.isSyncable)
+        let removedDelta = SettingsDirtyKeys.changedSyncableKeys(from: afterWrite, to: withoutCursor,
+                                                                isSyncable: SettingsBackup.isSyncable)
+        let observerDelta = SettingsDirtyKeys.changedSyncableKeys(
+            from: beforeWrite.filter { SettingsBackup.isSyncable($0.key) },
+            to: afterWrite.filter { SettingsBackup.isSyncable($0.key) }, isSyncable: SettingsBackup.isSyncable)
+        var dirty: [String: Double] = [preference: 100]
+        SettingsDirtyKeys.mark(observerDelta, at: 200, into: &dirty)
+        check("T9.12 actual conversion Data write creates no user-dirty delta and preserves prior user dirty",
+              defaults.data(forKey: cursorA) == updatedRecordData
+                && directDelta.isEmpty && addedDelta.isEmpty && removedDelta.isEmpty
+                && observerDelta.isEmpty && dirty == [preference: 100])
+        defaults.set("user-green", forKey: preference)
+        let afterUserEdit = defaults.persistentDomain(forName: bundleID) ?? [:]
+        let userDelta = SettingsDirtyKeys.changedSyncableKeys(from: beforeWrite, to: afterUserEdit,
+                                                            isSyncable: SettingsBackup.isSyncable)
+        check("T9.13 a genuine user preference edit is still tracked exactly",
+              userDelta == Set([preference]))
+
+        // This tests the legacy helper directly. Modern native export preserves doc.settings unchanged.
+        guard let merged = SettingsBackup.mergedSyncBlob(onto: peerBackup.base64EncodedString()),
+              let mergedEnvelope = (try? JSONSerialization.jsonObject(with: merged)) as? [String: Any] else {
+            check("T9.0 actual legacy settings helper merges", false)
+            return
+        }
+        let mergedRaw = rawPayload(merged)
+        check("T9.14 legacy merged settings output excludes local and old peer cursors",
+              cursorKeys.allSatisfy { mergedRaw[$0] == nil })
+        check("T9.15 legacy helper preserves genuine preferences and unknown payload/envelope fields",
+              mergedRaw[preference] as? String == "user-green"
+                && SettingsDirtyKeys.valuesEqual(mergedRaw[nativeSibling], ["unknown": [1, 2]])
+                && SettingsDirtyKeys.valuesEqual(mergedRaw[peerSibling], peerDomain[peerSibling])
+                && SettingsDirtyKeys.valuesEqual(mergedEnvelope["futureEnvelope"], peerEnvelope["futureEnvelope"]))
+        check("T9.16 original peer backup remains byte-identical and retains its original raw cursor",
+              peerBackup == originalPeerBytes && rawPayload(peerBackup)[cursorA] as? Data == peerRecordData)
+    }
+
+    @MainActor
+    static func main() {
+        let prefix = "tv.vortx.tests.settings-backup."
+        guard let expected = ProcessInfo.processInfo.environment["VORTX_SETTINGS_TEST_BUNDLE_ID"],
+              expected.hasPrefix(prefix),
+              let uuid = UUID(uuidString: String(expected.dropFirst(prefix.count))),
+              expected == prefix + uuid.uuidString.lowercased(),
+              let bundleID = Bundle.main.bundleIdentifier,
+              bundleID == expected else {
+            print("REFUSED: a unique embedded test bundle identifier is required")
+            exit(2)
+        }
+        guard (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:]).isEmpty else {
+            print("REFUSED: the test defaults domain must be empty")
+            exit(2)
+        }
+
+        var seeded: [String: Any] = [
             leakedKey: sessionBlob,
             leakedTraktKey: "SECRET-TOKEN-trakt-zzz",
             invalidationKey: true,
@@ -123,12 +286,20 @@ struct SettingsBackupSecretsTests {
             "vortx.downloads.autoDeleteWatched": true,
             "vortx.downloads.queueOrder": ["11111111-1111-1111-1111-111111111111"],
             "vortx.downloads.maxConcurrent": 5,
+            "vortx.addons.tmdbMetaInstalled": true,
+            "vortx.addons.userPolicy": "preserved",
+            "vortx.collections.refreshCadence": "twiceDaily",
+            "vortx.collections.selectedProviders": "8,12",
+            "vortx.collections.providerOrder": [12, 8],
+            "vortx.collections.userPolicy": "local-collection-policy",
+            "stremiox.update.dismissedVersion": "v0.5.0-beta.4",
             "stremiox.diskCacheBytes": 12_345,
             "vortx.pgsSubtitleOCR": false,
             "vortx.sync.lastSyncedVersion.acct_1": 42,
             "vortx.owner.resumeCache.v2.11111111-1111-1111-1111-111111111111": ["tt-a": ["t": 123]],
             "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
         ]
+        for key in derivedCacheKeys { seeded[key] = "local-cache:\(key)" }
         UserDefaults.standard.setPersistentDomain(seeded, forName: bundleID)
 
         print("\n=== T1: makeBackup() must not carry the secret (export + push write side) ===")
@@ -144,28 +315,56 @@ struct SettingsBackupSecretsTests {
               backupRaw["stremiox.accentColor"] as? String == "blue")
         check("T1.5 device-local invalidation absent from backup", backupRaw[invalidationKey] == nil)
         check("T1.6 owner resume cache absent from backup", backupRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+        check("T1.7 derived update and Collections caches absent from export",
+              derivedCacheKeys.allSatisfy { backupRaw[$0] == nil })
+        check("T1.8 collection preferences and update dismissal remain in export",
+              backupRaw["vortx.collections.refreshCadence"] as? String == "twiceDaily"
+                && backupRaw["vortx.collections.selectedProviders"] as? String == "8,12"
+                && backupRaw["vortx.collections.providerOrder"] as? [Int] == [12, 8]
+                && backupRaw["stremiox.update.dismissedVersion"] as? String == "v0.5.0-beta.4"
+                && backupRaw["vortx.collections.userPolicy"] as? String == "local-collection-policy")
 
         print("\n=== T2: decodeDomain() must not APPLY a secret (restore + pull-apply read side) ===")
         // Encode a POISONED blob directly, bypassing the write-side filter. This is an account doc or backup
         // file written by a PRE-FIX build, which is the case that exists in the wild right now.
-        guard let poisoned = try? SettingsBackup.encode(
-            domain: [
+        var poisonedDomain: [String: Any] = [
                 leakedKey: sessionBlob,
                 invalidationKey: true,
                 "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
                 "stremiox.accentColor": "red",
-            ],
+                "vortx.addons.tmdbMetaInstalled": false,
+                "vortx.addons.userPolicy": "peer-policy",
+                "vortx.collections.refreshCadence": "daily",
+                "vortx.collections.selectedProviders": "3,8",
+                "vortx.collections.providerOrder": [3, 8],
+                "vortx.collections.userPolicy": "peer-collection-policy",
+                "stremiox.update.dismissedVersion": "v0.5.1",
+            ]
+        for key in derivedCacheKeys { poisonedDomain[key] = "peer-cache:\(key)" }
+        guard let poisoned = try? SettingsBackup.encode(
+            domain: poisonedDomain,
             bundleID: bundleID,
             app: "VortX")
         else { print("  FAIL  T2.0 encode threw"); exit(1) }
         check("T2.0 poisoned blob really does contain the secret (test is honest)",
               rawPayload(poisoned)[leakedKey] != nil)
+        check("T2.0a poisoned blob really contains every derived-cache fixture",
+              derivedCacheKeys.allSatisfy { rawPayload(poisoned)[$0] != nil })
         let decoded = (try? SettingsBackup.decodeDomain(from: poisoned)) ?? [:]
         check("T2.1 secret filtered out on read", decoded[leakedKey] == nil,
               "found: \(String(describing: decoded[leakedKey]))")
         check("T2.2 ordinary pref still applied", decoded["stremiox.accentColor"] as? String == "red")
         check("T2.3 incoming invalidation cannot cross devices", decoded[invalidationKey] == nil)
         check("T2.4 incoming owner resume receipt cannot cross accounts", decoded.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+        check("T2.5 incoming derived caches are filtered on read",
+              derivedCacheKeys.allSatisfy { decoded[$0] == nil })
+        let poisonedAppliedKeys = SettingsBackup.appliedKeys(from: poisoned)
+        check("T2.6 imported baseline omits derived caches but keeps user choices",
+              Set(derivedCacheKeys).isDisjoint(with: poisonedAppliedKeys)
+                && poisonedAppliedKeys.contains("vortx.collections.refreshCadence")
+                && poisonedAppliedKeys.contains("vortx.collections.selectedProviders")
+                && poisonedAppliedKeys.contains("vortx.collections.providerOrder")
+                && poisonedAppliedKeys.contains("stremiox.update.dismissedVersion"))
 
         print("\n=== T3: mergedSyncBlob() scrubs a secret already in the account doc (self-heal) ===")
         guard let merged = SettingsBackup.mergedSyncBlob(onto: poisoned.base64EncodedString()) else {
@@ -178,6 +377,17 @@ struct SettingsBackupSecretsTests {
         check("T3.3 secret bytes absent from pushed blob", !containsSecret(merged))
         check("T3.4 stale invalidation not carried into pushed blob", mergedRaw[invalidationKey] == nil)
         check("T3.5 stale owner resume state not carried into pushed blob", mergedRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+
+        print("\n=== T3.6: derived caches are removed from merged settings without losing sibling preferences ===")
+        check("T3.6a all derived cache families scrubbed from merged payload",
+              derivedCacheKeys.allSatisfy { mergedRaw[$0] == nil })
+        check("T3.6b local collections and update user choices survive merge",
+              mergedRaw["vortx.collections.refreshCadence"] as? String == "twiceDaily"
+                && mergedRaw["vortx.collections.selectedProviders"] as? String == "8,12"
+                && mergedRaw["vortx.collections.providerOrder"] as? [Int] == [12, 8]
+                && mergedRaw["vortx.collections.userPolicy"] as? String == "local-collection-policy"
+                && mergedRaw["stremiox.update.dismissedVersion"] as? String == "v0.5.0-beta.4"
+                && mergedRaw["vortx.addons.userPolicy"] as? String == "preserved")
 
         print("\n=== T4: device-local download keys (manager item A) ===")
         check("T4.1 queueOrder excluded", !SettingsBackup.isSyncable("vortx.downloads.queueOrder"))
@@ -211,7 +421,59 @@ struct SettingsBackupSecretsTests {
         check("T5.4 isSyncable false for the leaked key", !SettingsBackup.isSyncable(leakedKey))
         check("T5.5 invalidation is device-local", !SettingsBackup.isSyncable(invalidationKey))
 
+        print("\n=== T6: descriptor-derived add-on cache is not portable user intent ===")
+        check("T6.1 resolver cache cannot dirty syncable preferences",
+              !SettingsBackup.isSyncable("vortx.addons.tmdbMetaInstalled"))
+        check("T6.2 unrelated add-on preferences remain syncable",
+              SettingsBackup.isSyncable("vortx.addons.userPolicy"))
+        check("T6.3 resolver cache is absent from the actual exported payload",
+              backupRaw["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.4 unrelated add-on preference remains in the actual export",
+              backupRaw["vortx.addons.userPolicy"] as? String == "preserved")
+        check("T6.5 old portable resolver cache cannot override this device",
+              decoded["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.6 unrelated incoming add-on preference remains readable",
+              decoded["vortx.addons.userPolicy"] as? String == "peer-policy")
+        check("T6.7 merge scrubs the old resolver cache from the pushed payload",
+              mergedRaw["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.8 merge retains the unrelated local add-on preference",
+              mergedRaw["vortx.addons.userPolicy"] as? String == "preserved")
+
+        print("\n=== T8: update and Collections cache keys stay device-local ===")
+        check("T8.1 all source-defined cache keys and region families are classified device-local",
+              derivedCacheKeys.allSatisfy { !SettingsBackup.isSyncable($0) })
+        check("T8.2 refresh cadence, provider choices/order, update dismissal and sibling prefs remain syncable",
+              SettingsBackup.isSyncable("vortx.collections.refreshCadence")
+                && SettingsBackup.isSyncable("vortx.collections.selectedProviders")
+                && SettingsBackup.isSyncable("vortx.collections.providerOrder")
+                && SettingsBackup.isSyncable("stremiox.update.dismissedVersion")
+                && SettingsBackup.isSyncable("vortx.collections.userPolicy")
+                && SettingsBackup.isSyncable("vortx.addons.userPolicy"))
+        let restoredCount: Int?
+        do {
+            restoredCount = try SettingsBackup.restore(from: poisoned)
+        } catch {
+            restoredCount = nil
+        }
+        check("T8.3 actual restore applies the allowed incoming preferences",
+              restoredCount == decoded.count
+                && UserDefaults.standard.string(forKey: "vortx.collections.refreshCadence") == "daily"
+                && UserDefaults.standard.string(forKey: "vortx.collections.selectedProviders") == "3,8"
+                && UserDefaults.standard.array(forKey: "vortx.collections.providerOrder") as? [Int] == [3, 8]
+                && UserDefaults.standard.string(forKey: "stremiox.update.dismissedVersion") == "v0.5.1"
+                && UserDefaults.standard.string(forKey: "vortx.collections.userPolicy") == "peer-collection-policy"
+                && UserDefaults.standard.string(forKey: "vortx.addons.userPolicy") == "peer-policy")
+        check("T8.4 actual restore leaves every device-local cache value untouched",
+              derivedCacheKeys.allSatisfy {
+                  UserDefaults.standard.string(forKey: $0) == "local-cache:\($0)"
+              })
+
+        print("\n=== T9: native legacy conversion cursors are per-device bookkeeping ===")
+        testNativeLegacyConversionCursor(bundleID: bundleID)
+
         UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        check("T7.1 only the owned test defaults domain is retired",
+              (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:]).isEmpty)
 
         print("\n----------------------------------------")
         print("passes: \(passes)  failures: \(failures)")

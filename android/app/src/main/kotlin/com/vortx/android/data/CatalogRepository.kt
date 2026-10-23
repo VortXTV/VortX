@@ -203,9 +203,14 @@ interface CatalogRepository {
     suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
         Result.success(emptyList())
 
-    /// Add a title to the Library (the "Save"/bookmark action from a poster's long-press menu or the
-    /// detail page).
+    /// Add a title to the Library. Auto-add on play, played links and import call this directly, so they
+    /// never edit an external watchlist.
     suspend fun addToLibrary(item: MetaItem): Result<Unit>
+
+    /// A deliberate save from a poster's long-press menu (Apple `addToLibraryFromMenu`). The native
+    /// repository also mirrors it to Trakt/SIMKL watchlists once persisted; the legacy engine already
+    /// mirrors every account add at its own chokepoint, so the default is the plain add.
+    suspend fun saveToLibrary(item: MetaItem): Result<Unit> = addToLibrary(item)
 
     /// Remove a title from the Library (the Library grid's per-poster "x" control, DESIGN-SYSTEM.md §4
     /// "Library").
@@ -383,9 +388,12 @@ interface CatalogRepository {
         episode: Episode? = null,
     ): Result<Playable>
 
+    /** A separate preparation context is required; legacy/preview repositories keep the cold path. */
+    fun openSourcePreparation(type: MediaType, id: String, episode: Episode): SourcePreparation? = null
+
     /// Resolve a pasted DIRECT/debrid/usenet http(s) link into a [Playable] (SD-1). The URL is already
     /// resolved by the user's service, so it plays as-is (no debrid round-trip, no keys). Overridden by
-    /// [com.vortx.android.engine.EngineStremioRepository]; the preview cannot play ad-hoc links.
+    /// [com.vortx.android.engine.NativeCatalogRepository]; the preview cannot play ad-hoc links.
     suspend fun resolveDirectLink(url: String, title: String): Result<Playable> =
         Result.failure(UnsupportedOperationException("Playing a link is not available here."))
 
@@ -400,7 +408,7 @@ interface CatalogRepository {
     //
     // Mirrors Apple's `CoreBridge` Player lifecycle so Continue Watching + resume track on Android too.
     // Default bodies are benign no-ops, so the offline preview (whose progress is not engine-backed) and
-    // any future one-shot implementation satisfy the contract without change; [EngineStremioRepository]
+    // any future one-shot implementation satisfy the contract without change; [NativeCatalogRepository]
     // overrides them for the real engine dispatch.
 
     /// Load the engine Player for the title currently open in `meta_details` and return the opaque
@@ -462,7 +470,7 @@ interface CatalogRepository {
     // step (ticks/progress/library-chip flip live) instead of a separate reload. Default bodies just
     // re-fetch [meta] unchanged, so an implementation that predates this session (the offline preview,
     // any future repository that doesn't model mutation) still satisfies the contract with a benign
-    // no-op rather than a compile break; [EngineStremioRepository] overrides every one of these for the
+    // no-op rather than a compile break; [NativeCatalogRepository] overrides every one of these for the
     // real engine dispatch.
 
     /// Mark the whole title (movie, or every episode of a series) watched/unwatched.
@@ -485,6 +493,10 @@ interface CatalogRepository {
     /// Save the open title to the library.
     suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
         meta(type, id)
+
+    /// The detail page's deliberate save, mirrored to watchlists like [saveToLibrary].
+    suspend fun saveToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
+        addToLibrary(type, id, name, poster)
 
     /// Remove the open title from the library.
     suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = meta(type, id)

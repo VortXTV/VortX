@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
-# Generate the explicit native release project without modifying the retained legacy spec.
+# Generate the release project spec from project.yml without modifying it: release targets only, the
+# verified MPVKit package, engine provenance in each app's Info.plist, and linker maps.
 # All source and package paths remain relative to app/, where XcodeGen reads this file.
 require 'optparse'
 require 'yaml'
@@ -22,7 +23,7 @@ abort 'an output spec path is required' unless options[:output]
 app = File.realpath(File.join(__dir__, '..', 'app'))
 output = File.expand_path(options[:output])
 abort 'generated spec must be directly inside app/' unless File.dirname(output) == app
-abort 'refusing to replace the retained legacy project.yml' if output == File.join(app, 'project.yml')
+abort 'refusing to replace project.yml' if output == File.join(app, 'project.yml')
 native_info_stem = File.basename(output, '.yml')
 abort 'generated spec must have a non-collapsed directory name' if %w[. ..].include?(native_info_stem)
 mpvkit = File.realpath(options[:mpvkit])
@@ -40,22 +41,14 @@ FileUtils.mkdir_p(File.join(app, native_info_directory))
 
 native_targets.each do |name|
   target = spec.fetch('targets').fetch(name)
-  target.fetch('dependencies').reject! do |dependency|
-    %w[Vendor/StremioXCore.xcframework Vendor/nodejs-mobile/NodeMobile.xcframework].include?(dependency['framework'])
-  end
-  unless target.fetch('dependencies').any? { |dependency| dependency['framework'] == 'Vendor/VortxEngine.xcframework' }
-    target.fetch('dependencies') << { 'framework' => 'Vendor/VortxEngine.xcframework', 'embed' => false }
-  end
-  target.fetch('sources').reject! do |source|
-    path = source.is_a?(Hash) ? source['path'] : source
-    %w[Resources/server.js Resources/node-darwin-arm64].include?(path)
-  end
+  frameworks = target.fetch('dependencies').map { |dependency| dependency['framework'] }.compact
+  abort "#{name} must link Vendor/VortxEngine.xcframework" unless frameworks.include?('Vendor/VortxEngine.xcframework')
+  abort "#{name} links a framework outside the release set: #{frameworks}" unless (frameworks - ['Vendor/VortxEngine.xcframework']).empty?
+  resources = target.fetch('sources').map { |source| source.is_a?(Hash) ? source['path'] : source }
+  abort "#{name} bundles a removed server runtime" if resources.any? { |path| path.match?(/server\.js|node-darwin/) }
   settings = target.fetch('settings').fetch('base')
-  conditions = settings.fetch('SWIFT_ACTIVE_COMPILATION_CONDITIONS', '$(inherited)').split
-  conditions.concat(%w[VORTX_NATIVE_DATA_ENGINE VORTX_ENGINE_STATE_BRIDGE VORTX_ENGINE_RESOURCE_HOST])
-  conditions << 'VORTX_ENGINE_SERVER' if %w[VortXiOSNative VortXTV].include?(name)
-  settings['SWIFT_ACTIVE_COMPILATION_CONDITIONS'] = conditions.uniq.join(' ')
-  settings['SWIFT_INCLUDE_PATHS'] = '$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx'
+  in_process = settings.fetch('SWIFT_ACTIVE_COMPILATION_CONDITIONS', '').split.include?('VORTX_ENGINE_SERVER')
+  abort "#{name} in-process server selection changed; review the generator" unless in_process == %w[VortXiOSNative VortXTV].include?(name)
   settings['INFOPLIST_KEY_VortXNativeDataEngine'] = true
   settings['INFOPLIST_KEY_VortXNativeResourceHost'] = true
   settings['INFOPLIST_KEY_VortXEngineSourceRevision'] = options[:revision]
@@ -82,23 +75,11 @@ native_targets.each do |name|
 end
 
 mac = spec.fetch('targets').fetch('VortXMac')
-mac.delete('preBuildScripts') # The native package contains no Node runtime to fetch.
-mac['postBuildScripts'] = [{
-  'name' => 'Embed required native streaming server',
-  'basedOnDependencyAnalysis' => false,
-  'inputFiles' => ['$(SRCROOT)/Vendor/vortx-streaming-server'],
-  'outputFiles' => ['$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/vortx-streaming-server'],
-  'script' => <<~SCRIPT
-    set -euo pipefail
-    source="${SRCROOT}/Vendor/vortx-streaming-server"
-    test -s "$source" && test -x "$source" || { echo "error: native Mac server is required" >&2; exit 1; }
-    destination="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/vortx-streaming-server"
-    cp -f "$source" "$destination"
-    chmod +x "$destination"
-  SCRIPT
-}]
-# The reviewed VortxEngine Mac SDK and daemon currently contain arm64, never an implicit universal build.
-mac.fetch('settings').fetch('base')['ARCHS'] = 'arm64'
+abort 'macOS must not fetch a separate runtime before build' if mac['preBuildScripts']
+embed = mac.fetch('postBuildScripts', []).map { |phase| phase['script'].to_s }.join("\n")
+abort 'macOS must embed the required native streaming server' unless embed.include?('test -s "$source" && test -x "$source"')
+# The reviewed VortxEngine Mac SDK and daemon contain arm64, never an implicit universal build.
+abort 'macOS must build arm64 only' unless mac.fetch('settings').fetch('base')['ARCHS'] == 'arm64'
 
 File.write(output, YAML.dump(spec))
 puts "Generated native Apple project spec: #{output} (engine #{options[:revision]})"

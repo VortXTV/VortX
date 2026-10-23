@@ -31,6 +31,7 @@ private func occurrences(of needle: String, in text: String) -> Int {
 let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
 guard let app = source("app/SourcesiOS/VortXiOSApp.swift", root: root),
       let rootView = source("app/SourcesiOS/iOSRootView.swift", root: root),
+      let navigation = source("app/SourcesiOS/CinemaNavigationArtwork.swift", root: root),
       let settings = source("app/SourcesiOS/iOSSettingsView.swift", root: root) else {
     fputs("FAIL  read Mac shell sources\n", stderr)
     exit(1)
@@ -52,13 +53,17 @@ require(!rootView.contains("@Environment(\\.openSettings)"), "root does not use 
 require(!rootView.contains("SettingsLink"), "root has no SettingsLink")
 require(rootView.contains("private var macDesktopShell: some View"), "root has a dedicated desktop shell")
 require(!rootView.contains("macSidebar"), "desktop main navigation has no rejected sidebar")
-require(rootView.contains(".safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }"),
+require(rootView.contains("CinemaNavigationShell {\n            cinematicTopBar\n        } content: {\n            measuredTabContent")
+        && navigation.contains(".safeAreaBar(edge: .top, spacing: 0) { navigation }")
+        && navigation.contains("content.safeAreaInset(edge: .top, spacing: 0) {"),
         "desktop shell hosts horizontal TV-inspired top navigation without obscuring forms")
 require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n                horizontalTabButton(item)"),
         "horizontal navigation uses the same visibility-filtered destinations")
 require(rootView.contains("ViewThatFits(in: .horizontal)") && rootView.contains("horizontalTabItems.fixedSize(horizontal: true, vertical: true)"),
         "wide horizontal navigation hugs its destinations with a scrolling overflow fallback")
-require(rootView.contains("if topNavigation { cinematicTopBar }\n                measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)\n                if !topNavigation { bottomTabBarRow }"),
+require(rootView.contains("if topNavigation {\n                    CinemaNavigationShell {")
+        && rootView.contains("CinemaCompactNavigationShell {\n                        measuredTabContent\n                    } navigation: {\n                        bottomTabBarRow")
+        && rootView.contains(".safeAreaInset(edge: .bottom, spacing: 0) { navigation }"),
         "mobile shell reserves real top/bottom chrome space outside the detail viewport")
 require(rootView.contains("ScrollView(.horizontal, showsIndicators: false)") && rootView.contains("proxy.scrollTo(item.rawValue, anchor: .center)"),
         "narrow desktop navigation scrolls selected routes into view")

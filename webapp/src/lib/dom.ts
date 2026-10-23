@@ -14,6 +14,14 @@ export function httpUrl(value: string | undefined): string {
   return value && /^https?:\/\//i.test(value) ? value : "";
 }
 
+/** A quoted CSS URL is a different context from HTML. Escape before HTML attribute encoding;
+ *  entity-escaping an apostrophe alone is insufficient because HTML decodes it before CSS parsing. */
+export function cssImageURL(value: string): string {
+  const escaped = value.replace(/[\x00-\x1f\x7f"\\]/g,
+    (character) => "\\" + (character === "\0" ? "fffd" : character.charCodeAt(0).toString(16)) + " ");
+  return `url("${escaped}")`;
+}
+
 /** Look up an element by id (typed). */
 export function el<T extends HTMLElement = HTMLElement>(id: string): T | null {
   return document.getElementById(id) as T | null;

@@ -313,16 +313,44 @@ actor TraktService {
         try expectSuccess(status)
     }
 
+    /// Read-only per-show next-episode evidence. The caller retains its exact Home intent and
+    /// native eligibility authority; this never changes local or remote watched/progress state.
+    func nextEpisodeProgress(
+        show: TraktShow, expectedSession: TraktSessionID, now: Date = Date()
+    ) async throws -> TraktNextEpisodeProgress.Result {
+        try Task.checkCancellation()
+        guard let id = show.ids.trakt, id > 0 else { throw TraktNextEpisodeProgress.Failure.invalidShow }
+        do {
+            let (data, status) = try await sendSessionBoundRead(
+                path: "/shows/\(id)/progress/watched?hidden=false&specials=false&include_stats=false",
+                expectedSession: expectedSession,
+                maxResponseBytes: TraktNextEpisodeProgress.maximumResponseBytes
+            )
+            try Task.checkCancellation()
+            try expectSuccess(status)
+            let result = try await TraktNextEpisodeProgress.decode(data, show: show, now: now)
+            try Task.checkCancellation()
+            guard await auth.sessionID == expectedSession else { throw TraktAuthError.sessionChanged }
+            return result
+        } catch {
+            try Task.checkCancellation()
+            throw error
+        }
+    }
+
     // MARK: - HTTP plumbing
 
     /// Exact-session read. Account replacement may proceed while the request is in flight, but its
     /// response is rejected before publication if the session no longer matches.
     private func sendSessionBoundRead(
         path: String,
-        expectedSession: TraktSessionID
+        expectedSession: TraktSessionID,
+        maxResponseBytes: Int = AuthenticatedHTTPTransport.snapshotResponseLimit
     ) async throws -> (Data, Int) {
+        try Task.checkCancellation()
         guard let url = URL(string: TraktAuth.apiBase + path) else { throw TraktServiceError.badURL }
         let token = try await auth.validToken(for: expectedSession)
+        try Task.checkCancellation()
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 20
@@ -333,8 +361,9 @@ actor TraktService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let result = try await perform(
             request,
-            maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+            maxResponseBytes: maxResponseBytes
         )
+        try Task.checkCancellation()
         guard await auth.sessionID == expectedSession else { throw TraktAuthError.sessionChanged }
         if result.1 == 401 {
             await auth.signOut(ifCurrent: expectedSession)

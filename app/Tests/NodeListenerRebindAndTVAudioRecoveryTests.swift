@@ -1,4 +1,4 @@
-// Executable policy and source-contract tests for post-suspension listener recovery and shared Apple
+// Source-contract tests for native server lifecycle wiring and executable policy tests for shared Apple
 // same-source remount selection retention. Run with: bash scripts/test-apple-playback-recovery.sh
 
 import Foundation
@@ -25,97 +25,47 @@ private func sourceContainsInOrder(_ source: String, _ needles: [String]) -> Boo
 }
 
 @main
-private enum NodeListenerRebindAndTVAudioRecoveryTests {
+private enum NativeServerAndTVAudioRecoveryTests {
     @MainActor
     static func main() {
-        let cooldown = 60.0
-        var state = NodeListenerRebindPolicy.State()
-
-        guard case let .start(epoch: firstEpoch, attempt: firstAttempt, attemptID: attemptA) = state.observe(.refused, now: 0, cooldown: cooldown) else {
-            check("first refusal starts recovery", false)
-            finish()
-            return
-        }
-        check("first refusal starts recovery", firstEpoch == 0 && firstAttempt == 1)
-        check("concurrent duplicate is suppressed in flight", state.observe(.refused, now: 1, cooldown: cooldown) == .suppressInFlight)
-        state.finishRebind(attemptA, relistened: false)
-        check("failed same-episode duplicate is cooldown-suppressed", state.observe(.refused, now: 2, cooldown: cooldown) == .suppressDuplicate)
-
-        var successfulState = NodeListenerRebindPolicy.State()
-        guard case let .start(_, _, successfulAttemptA) = successfulState.observe(.refused, now: 0, cooldown: cooldown) else {
-            check("confirmed relisten starts an owned attempt", false)
-            finish()
-            return
-        }
-        successfulState.finishRebind(successfulAttemptA, relistened: true)
-        guard case let .start(epoch: freshEpoch, attempt: freshAttempt, attemptID: attemptB) = successfulState.observe(.refused, now: 22, cooldown: cooldown) else {
-            check("confirmed relisten creates a fresh refusal epoch inside cooldown", false)
-            finish()
-            return
-        }
-        check("confirmed relisten creates a fresh refusal epoch inside cooldown", freshEpoch == 1 && freshAttempt == 2)
-        successfulState.watchdogExpired(successfulAttemptA)
-        successfulState.finishRebind(successfulAttemptA, relistened: false)
-        check("late A watchdog and settle cannot retire B", successfulState.activeAttemptID == attemptB)
-        successfulState.finishRebind(attemptB, relistened: false)
-        guard case .start(epoch: 1, attempt: 3, attemptID: _) = successfulState.observe(.refused, now: 83, cooldown: cooldown) else {
-            check("second failed attempt starts after same-episode cooldown", false)
-            finish()
-            return
-        }
-        check("second failed attempt starts after same-episode cooldown", true)
-        successfulState.finishRebind(successfulState.activeAttemptID ?? 0, relistened: false)
-        check("failed attempts cap truthfully", successfulState.observe(.refused, now: 144, cooldown: cooldown) == .exhausted(epoch: 1))
-
-        var responseState = NodeListenerRebindPolicy.State()
-        check("timeout never rebinds", responseState.observe(.timeoutOrOther, now: 0, cooldown: cooldown) == .ignore)
-        check("non-refusal leaves a zero attempt budget", responseState.attempts == 0)
-        check("response never rebinds", responseState.observe(.response, now: 1, cooldown: cooldown) == .ignore)
-        check("response resets the attempt budget", responseState.attempts == 0)
-        check("new wake resets a consumed failure budget", {
-            var exhausted = NodeListenerRebindPolicy.State()
-            if case let .start(_, _, id) = exhausted.observe(.refused, now: 0, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
-            if case let .start(_, _, id) = exhausted.observe(.refused, now: 61, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
-            if case let .start(_, _, id) = exhausted.observe(.refused, now: 122, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
-            exhausted.beginNewWake()
-            guard case .start(epoch: 1, attempt: 1, attemptID: _) = exhausted.observe(.refused, now: 123, cooldown: cooldown) else { return false }
-            return exhausted.attempts == 1
-        }())
-        check("new wake invalidates old listener completion", {
-            var wake = NodeListenerRebindPolicy.State()
-            guard case let .start(_, _, oldAttempt) = wake.observe(.refused, now: 0, cooldown: cooldown) else { return false }
-            wake.beginNewWake()
-            wake.finishRebind(oldAttempt, relistened: true)
-            return wake.activeAttemptID == nil && !wake.relistenConfirmedSinceRefusal
-        }())
-        check("stale onListen after terminal error cannot mark relisten", {
-            var stale = NodeListenerRebindPolicy.State()
-            guard case let .start(_, _, attempt) = stale.observe(.refused, now: 0, cooldown: cooldown) else { return false }
-            stale.finishRebind(attempt, relistened: false)
-            stale.finishRebind(attempt, relistened: true)
-            return !stale.relistenConfirmedSinceRefusal
-        }())
-
-        let nodeSourcePath = "app/Sources/NodeServer.swift"
-        guard let nodeSource = try? String(contentsOfFile: nodeSourcePath, encoding: .utf8),
-              let preloadStart = nodeSource.range(of: "var __rb={busy:false,lastAttemptAt:0"),
-              let preloadEnd = nodeSource.range(of: "// Event-loop heartbeat", range: preloadStart.upperBound..<nodeSource.endIndex) else {
+        // Node's listener-rebind state machine and preload have been retired with that runtime.
+        // Inspect the replacement lifecycle wiring; do not fabricate a second server implementation.
+        guard let facade = try? String(contentsOfFile: "app/Sources/NodeServer.swift", encoding: .utf8),
+              let native = try? String(contentsOfFile: "app/SourcesShared/VortxNativeServer.swift", encoding: .utf8) else {
             failures += 1
-            print("FAIL  Node listener rebind preload source contract readable")
+            print("FAIL  native server lifecycle source contract readable")
             finish()
             return
         }
-        let preload = String(nodeSource[preloadStart.lowerBound..<preloadEnd.lowerBound])
+        check("platform facade starts only the native in-process server",
+              facade.contains("VortxNativeServer.startIfNeeded()")
+              && !facade.contains("node_start(") && !facade.contains("import NodeMobile"))
+        check("server ABI remains gated to server-inclusive targets", native.contains("#if VORTX_ENGINE_SERVER"))
         check(
-            "Node preload opens a new refusal epoch only after confirmed relisten",
-            sourceContainsInOrder(preload, [
-                "function __ownsAttempt(attemptID)",
-                "function __retireAttempt(attemptID)",
-                "function __beginFreshFailureAfterRelisten()",
-                "if(!__rb.relistenConfirmed) return;",
-                "__beginFreshFailureAfterRelisten();",
-                "skip (same failure episode cooldown)",
-                "__rb.relistenConfirmed=true"
+            "native startup serializes ownership and publishes the actual bound port",
+            sourceContainsInOrder(native, [
+                "static func startIfNeeded()",
+                "queue.async {",
+                "guard handle == nil else { return }",
+                "vortx_server_start($0)",
+                "handle = h",
+                "let port = Int(vortx_server_port(h))",
+                "publish(port: port, baseURL: base)"
+            ]))
+        check(
+            "native shutdown retires handle and address before consuming the server",
+            sourceContainsInOrder(native, [
+                "private static func stopOnQueue()",
+                "guard let h = handle else { return }",
+                "handle = nil",
+                "publish(port: nil, baseURL: nil)",
+                "vortx_server_stop(h)"
+            ]))
+        check(
+            "native background stop enters the lifecycle FIFO immediately",
+            sourceContainsInOrder(native, [
+                "static func stopOnBackground()",
+                "queue.async { stopOnQueue() }"
             ]))
 
         let manualAudio = PlayerRecoveryAudioChoice(language: " EN ", title: "Main Mix")

@@ -112,22 +112,6 @@ class DebridPlaybackProvenanceTest {
     }
 
     @Test
-    fun normalUsenetPlaybackUsesCoordinatorNativeFallbackInsteadOfTorBoxOnlyResolver() {
-        val repository = source("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt")
-        val usenetBranch = repository.substringAfter("if (source.isUsenet) {")
-            .substringBefore("} else if (!source.isTorrent")
-
-        assertTrue(usenetBranch.contains("debridCoordinator.resolvePlaybackRef("))
-        assertTrue(usenetBranch.contains("DebridCoordinator.DebridCandidate("))
-        assertFalse(usenetBranch.contains("debridResolver.resolveUsenet("))
-        assertTrue(usenetBranch.contains("} catch (cancel: CancellationException)"))
-        assertTrue(usenetBranch.contains("throw usenetPlaybackFailure(error)"))
-        assertTrue(repository.contains("appContext = appContext"))
-        assertTrue(repository.contains("debridKeys::mutateCurrentOwner"))
-        assertFalse(repository.contains("DebridResolver(DebridKeys(appContext))"))
-    }
-
-    @Test
     fun coordinatorTriesSavedNntpInPriorityBeforeTorBoxCloudAndDoesNotSwallowCancellation() {
         val coordinator = source("src/main/kotlin/com/vortx/android/debrid/DebridCoordinator.kt")
         val usenetBranch = coordinator.substringAfter("// USENET first:")

@@ -55,8 +55,8 @@ import kotlinx.coroutines.delay
 /// rows of square CHANNEL TILES. The Android TV port of Apple's tvOS `LiveView`: driven by the SAME engine
 /// board (via [LiveViewModel], which keeps only the live-TV / channel / events catalogs), channel art is a
 /// logo on a neutral surface card, and selecting a channel opens the shared [TvDetailScreen] whose live
-/// branch plays through the existing player -- no EPG, no M3U import. Empty state nudges to the Add-ons
-/// screen rather than a blank surface.
+/// branch plays through the existing player. The TV guide ([TvLiveGuideScreen]) shows the same channels
+/// against time. Empty state nudges to the Add-ons screen rather than a blank surface.
 @Composable
 fun TvLiveScreen(viewModel: LiveViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -71,13 +71,26 @@ fun TvLiveScreen(viewModel: LiveViewModel, onItem: (MetaItem) -> Unit, modifier:
                     modifier,
                 )
             } else {
-                TvLiveContent(s.data, onItem, modifier)
+                var showGuide by remember { mutableStateOf(false) }
+                if (showGuide) {
+                    val channels = remember(s.data) { com.vortx.android.iptv.LiveGuidePolicy.channels(s.data) }
+                    TvLiveGuideScreen(
+                        channels = channels,
+                        onOpen = { channel ->
+                            s.data.asSequence().flatMap { it.items.asSequence() }
+                                .firstOrNull { it.id == channel.id && it.type.id == channel.type }?.let(onItem)
+                        },
+                        onBack = { showGuide = false },
+                    )
+                } else {
+                    TvLiveContent(s.data, onItem, modifier, onGuide = { showGuide = true })
+                }
             }
     }
 }
 
 @Composable
-private fun TvLiveContent(rows: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
+private fun TvLiveContent(rows: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier, onGuide: () -> Unit) {
     val colors = VortXTheme.colors
     var heroItem by remember(rows.firstOrNull()?.id) {
         mutableStateOf(rows.firstOrNull()?.items?.firstOrNull())
@@ -93,6 +106,11 @@ private fun TvLiveContent(rows: List<Catalog>, onItem: (MetaItem) -> Unit, modif
             contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
         ) {
+            // The schedule view: every channel down the side, programmes across time.
+            item(key = "tv-guide") {
+                TvFilterChip("TV guide", selected = false, onClick = onGuide,
+                    modifier = Modifier.padding(horizontal = TvDimens.edge))
+            }
             itemsIndexed(rows, key = { _, c -> c.id }) { index, catalog ->
                 TvChannelRow(
                     catalog = catalog,

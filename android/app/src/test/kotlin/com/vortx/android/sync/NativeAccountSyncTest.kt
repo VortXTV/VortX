@@ -18,6 +18,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.advanceTimeBy
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -134,7 +136,7 @@ class NativeAccountSyncTest {
         }
     }
 
-    @Test fun `native push never claims pending host settings were uploaded or clears dirty intent`() = runBlocking {
+    @Test fun `unsupported host settings remain dirty while native push may read its merge base`() = runBlocking {
         val context = TestContext(); val manager = VortXSyncManager(context); val gateway = Gateway()
         var requests = 0
         val storageKey = "vortx.sync.dirtySettings.${account.id}"
@@ -144,12 +146,88 @@ class NativeAccountSyncTest {
             installNative(manager, gateway)
             context.getSharedPreferences("vortx_sync_dirty", 0).edit().putString(storageKey, "{\"stremiox.audioLang\":123.25}").commit()
             assertFalse(manager.syncUp())
-            assertEquals(0, requests)
+            assertEquals(1, requests)
             assertEquals("{\"stremiox.audioLang\":123.25}", context.getSharedPreferences("vortx_sync_dirty", 0).getString(storageKey, null))
         } finally { manager.cancelSyncTestWork() }
     }
 
-    @Test fun `real JNI native and host fields sync separately with failed push cold persistence and exact event acknowledgement`() = runBlocking {
+    @Test fun `real native library checkpoint retries past retained theme dirty stamp and receives peer after cold restart`() = kotlinx.coroutines.test.runTest {
+        org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
+        val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "native-retained-setting-").toFile()
+        val checkpoints = VortxEncryptedCheckpointStore(directory) { javax.crypto.spec.SecretKeySpec(key, "AES") }
+        val context = TestContext()
+        val principal = SessionOwnerSnapshot.Account(account.id, 1)
+        val dirtyKey = "vortx.sync.dirtySettings.${account.id}"
+        val retained = "{\"stremiox.theme.oled\":123.25}"
+        val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)
+        var cloud = JSONObject().put("vortx", JSONObject().put("roster", org.json.JSONArray().put(owner.encode()))
+            .put("rosterModified", 123.5).put("library", org.json.JSONArray()).put("addons", org.json.JSONArray()))
+        var version = 100L
+        var puts = 0
+        var failPut = true
+        var manager = VortXSyncManager(context, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() +
+            kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)))
+        fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { it == principal }, { it() },
+            project = {}, onMutation = { manager.onLocalNativeMutation(it) })
+        var runtime = coordinator()
+        fun install() {
+            manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->
+                if (method == "GET") 200 to JSONObject().put("version", version).put("document",
+                    VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, version, true))
+                else {
+                    puts++
+                    if (failPut) 500 to null else {
+                        val sent = requireNotNull(body); version = sent.getLong("version")
+                        cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, sent.getString("document"), account.id, version))))
+                        200 to JSONObject().put("accepted", true)
+                    }
+                }
+            })
+            installNative(manager, runtime)
+        }
+        try {
+            install(); assertTrue(manager.syncDown(true))
+            context.getSharedPreferences("vortx_sync_dirty", 0).edit().putString(dirtyKey, retained).commit()
+            val read = runtime.session().read()
+            runtime.session().dispatch(listOf(JSONObject().put("type", "add_library_item").put("profileId", owner.id)
+                .put("item", JSONObject().put("kind", "standard").put("id", "tt-dirty-stamp").put("type", "movie")
+                    .put("name", "Synthetic library edit").put("poster", JSONObject.NULL))), read.owner)
+            runCurrent()
+            advanceTimeBy(2_501); runCurrent()
+            assertEquals(1, puts)
+            assertTrue(context.getSharedPreferences("vortx_sync_state", 0).getBoolean("pendingPush.${account.id}", false))
+            runtime.retire(); manager.cancelSyncTestWork()
+            manager = VortXSyncManager(context, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() +
+                kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)))
+            runtime = coordinator(); install(); failPut = false
+            assertFalse(manager.syncDown()) // Reopen the real encrypted checkpoint, then retry its durable edit.
+            runCurrent()
+            advanceTimeBy(2_501); runCurrent()
+            assertEquals(2, puts)
+            assertTrue(cloud.getJSONObject("nativeSync").toString().contains("tt-dirty-stamp"))
+            assertFalse(context.getSharedPreferences("vortx_sync_state", 0).getBoolean("pendingPush.${account.id}", false))
+            assertEquals(retained, context.getSharedPreferences("vortx_sync_dirty", 0).getString(dirtyKey, null))
+            val peerDirectory = directory.resolve("peer")
+            // An independent checkpoint receives the real encrypted cloud carrier.
+            val receiving = NativeAccountCoordinator(bindings(), VortxEncryptedCheckpointStore(peerDirectory) {
+                javax.crypto.spec.SecretKeySpec(key, "AES") }, { noNetwork() }, { it == principal }, { it() }, {})
+            try {
+                assertTrue(receiving.applyDocument(principal, cloud) { true })
+                NativeProfileAccess { receiving.session() }.let { profiles ->
+                    profiles.save(profiles.read().profiles.single().copy(name = "Peer received and edited"), false)
+                }
+                val exported = requireNotNull(receiving.exportDocument(principal))
+                cloud.put("nativeSync", exported.nativeSync).put("nativeHostPreferences", exported.hostPreferences); version++
+            } finally { receiving.retire() }
+            assertTrue(manager.syncDown())
+            assertEquals("Peer received and edited", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
+            assertTrue(runtime.session().read().state.getJSONObject("nativeSync").toString().contains("tt-dirty-stamp"))
+            assertEquals(retained, context.getSharedPreferences("vortx_sync_dirty", 0).getString(dirtyKey, null))
+        } finally { runtime.retire(); manager.cancelSyncTestWork(); directory.deleteRecursively() }
+    }
+
+    @Test fun `real JNI native and host fields sync separately with failed push cold persistence and exact event acknowledgement`() = kotlinx.coroutines.test.runTest {
         org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
         System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
         val bindings = object : VortxRuntimeBindings {
@@ -169,7 +247,8 @@ class NativeAccountSyncTest {
         val checkpointKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val checkpoints = VortxEncryptedCheckpointStore(directory) { checkpointKey }
         val context = TestContext()
-        val manager = VortXSyncManager(context)
+        val manager = VortXSyncManager(context, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() +
+            kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)))
         fun coordinator() = NativeAccountCoordinator(bindings, checkpoints, { noNetwork }, { true }, { it() }, {})
         var runtime = coordinator()
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Legacy owner", avatar = "star", isOwner = true)
@@ -197,7 +276,9 @@ class NativeAccountSyncTest {
             val pin = UserProfile.pinHash("1234", owner.id)
             profiles.save(profiles.read().profiles.single().copy(name = "Native name", pin = pin), false)
             assertFalse(runtime.session().read().state.getBoolean("hostProfileSyncPending"))
-            assertTrue(manager.syncUp()); assertEquals(1, uploads)
+            // Initial native import already armed the production causal-republish worker.
+            assertFalse(manager.syncUp()); runCurrent(); advanceTimeBy(2_501); runCurrent()
+            assertEquals(1, uploads)
             val nativeProfile = cloud.getJSONObject("nativeSync").getJSONObject("profiles").getJSONObject(owner.id).getJSONObject("profile")
             assertEquals("Native name", nativeProfile.getString("name")); assertEquals(pin, nativeProfile.getString("pin"))
             assertEquals("Legacy owner", cloud.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).getString("name"))
@@ -216,7 +297,9 @@ class NativeAccountSyncTest {
             context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", true).commit()
             context.getSharedPreferences("vortx_sync_dirty", 0).edit().putString("vortx.sync.dirtySettings.${account.id}", "{\"stremiox.autoSkip\":123.25}").commit()
             whileUploading = { profiles.save(profiles.read().profiles.single().copy(avatar = "sun"), false) }
-            assertTrue(manager.syncUp()); assertEquals(2, uploads)
+            // Cold recovery likewise owns a pending repair; let that exact worker upload it.
+            assertFalse(manager.syncUp()); runCurrent(); advanceTimeBy(2_501); runCurrent()
+            assertEquals(2, uploads)
             assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
             assertEquals("sun", profiles.read().profiles.single().avatar)
             val fields = cloud.getJSONObject("nativeHostPreferences").getJSONObject("profiles").getJSONObject(owner.id).getJSONObject("fields")

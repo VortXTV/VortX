@@ -102,6 +102,12 @@ class MpvSeam private constructor() {
     }
     private external fun nativeCommand(instance: Long, cmd: Array<String>)
 
+    /** Actual loadfile result, not a later read of whichever entry is current. No retry on null. */
+    fun loadFileWithEntryID(url: String): Long? = handleGate?.withHandle(-1L) { instance ->
+        nativeLoadFileWithEntryID(instance, url)
+    }?.takeIf { it >= 0L }
+    private external fun nativeLoadFileWithEntryID(instance: Long, url: String): Long
+
     fun setOptionString(name: String, value: String): Int {
         return handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE) { instance ->
             nativeSetOptionString(instance, name, value)
@@ -207,6 +213,10 @@ class MpvSeam private constructor() {
         dispatchEvent { it.event(eventId) }
     }
 
+    fun eventStartFile(entryID: Long) {
+        dispatchEvent { it.eventStartFile(entryID) }
+    }
+
     fun addLogObserver(o: LogObserver) {
         logObservers.add(o)
     }
@@ -230,6 +240,7 @@ class MpvSeam private constructor() {
         /// (see [MpvEndFileReason]); [error] is the mpv error code when reason ==
         /// MPV_END_FILE_REASON_ERROR, else 0.
         fun eventEndFile(reason: Int, error: Int)
+        fun eventStartFile(entryID: Long) {}
         fun event(eventId: Int)
     }
 

@@ -65,6 +65,25 @@ version_major_pattern() {
   esac
 }
 
+# 9.0.2 keeps major 63; a major-only check would accept the superseded 63.1.100 build.
+verify_ffmpeg_maintenance() {
+  local target="$1" headers="$2" slice="$3" prefix candidate found
+  case "$target" in
+    Libavcodec-GPL) prefix=LIBAVCODEC ;;
+    Libavformat-GPL) prefix=LIBAVFORMAT ;;
+    *) fail "unknown maintenance target $target" ;;
+  esac
+  found=0
+  while IFS= read -r candidate; do
+    if grep -Eq "^[[:space:]]*#define[[:space:]]+${prefix}_VERSION_MINOR[[:space:]]+1([[:space:]]|$)" "$candidate" &&
+       grep -Eq "^[[:space:]]*#define[[:space:]]+${prefix}_VERSION_MICRO[[:space:]]+102([[:space:]]|$)" "$candidate"; then
+      found=1
+      break
+    fi
+  done < <(find "$headers" -type f -name 'version.h' | LC_ALL=C sort)
+  [ "$found" = 1 ] || fail "$target/$slice does not declare required FFmpeg 9.0.2 ABI 63.1.102"
+}
+
 expected_arches() {
   case "$1" in
     ios-arm64) echo 'arm64' ;;
@@ -119,6 +138,7 @@ for target in Libavcodec-GPL Libavformat-GPL Libmpv-GPL; do
         fi
       done < <(find "$headers" -type f \( -name 'version_major.h' -o -name 'version.h' \) | LC_ALL=C sort)
       [ -n "$version_header" ] || fail "$target/$slice does not declare required FFmpeg 9 major 63"
+      verify_ffmpeg_maintenance "$target" "$headers" "$slice"
     fi
 
     # dovi_split is an externally defined libavcodec capability. Keep the check per exact
@@ -150,4 +170,4 @@ done
 # stop after a checksum/unzip or accidentally skip the security backend proof.
 "$REPO/scripts/verify-mpvkit-dvfel-apple-tls.sh" "$PKG"
 
-echo "MPVKit-DVFEL ARTIFACT VERIFY PASSED: FFmpeg 9 (libavcodec/libavformat major 63), dovi_split, and Apple TLS gates"
+echo "MPVKit-DVFEL ARTIFACT VERIFY PASSED: FFmpeg 9.0.2 (libavcodec/libavformat 63.1.102), dovi_split, and Apple TLS gates"

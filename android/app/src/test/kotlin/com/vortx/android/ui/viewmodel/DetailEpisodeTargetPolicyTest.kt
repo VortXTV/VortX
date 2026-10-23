@@ -9,6 +9,8 @@ import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.sources.SourceRequestFence
+import com.vortx.android.engine.StreamRanking
+import com.vortx.android.sources.SourcePrefsSnapshot
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -22,6 +24,57 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DetailEpisodeTargetPolicyTest {
+    @Test
+    fun `warm and cold binge ranking share explicit playing language without changing detail or global preferences`() {
+        val preference = PlaybackBingeAudioPreference()
+        val global = listOf("en")
+        val detailHint = "de"
+        val english = StreamSource("en", "Fixture", "Show 1080p English", url = "https://fixture.invalid/en")
+        val french = english.copy(id = "fr", title = "Show 1080p French", url = "https://fixture.invalid/fr")
+        val groups = listOf(StreamGroup("Fixture", listOf(english, french)))
+        preference.select("fr")
+        val coldPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(detailHint, global))
+        val warmPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(detailHint, global))
+        val settled = com.vortx.android.engine.SourceListState(groups = groups, best = english)
+        assertEquals("fr", StreamRanking.best(settled.groups, prefs = coldPrefs)?.id)
+        assertEquals("fr", StreamRanking.best(groups, prefs = warmPrefs)?.id)
+        assertEquals(warmPrefs.audioLanguages, coldPrefs.audioLanguages)
+        assertEquals("de", detailHint)
+        assertEquals(listOf("en"), global)
+        preference.reset()
+        val resetPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(null, global))
+        assertEquals("en", StreamRanking.best(groups, prefs = resetPrefs)?.id)
+    }
+
+    @Test
+    fun `binge audio reset ends preference lifetime and every selection or reset fences ABA`() {
+        val preference = PlaybackBingeAudioPreference()
+        preference.select("fr")
+        val first = preference.revision
+        preference.select("en"); preference.select("fr")
+        assertTrue(preference.revision > first)
+        assertEquals(listOf("fr"), preference.languages(null, listOf("en")))
+        val beforeReset = preference.revision
+        preference.reset()
+        assertTrue(preference.revision > beforeReset)
+        assertNull(preference.language)
+        assertEquals(listOf("de"), preference.languages("de", listOf("en")))
+        assertEquals(listOf("en"), preference.languages(null, listOf("en")))
+        preference.select("und")
+        assertNull(preference.language)
+        assertEquals(listOf("en"), preference.languages(null, listOf("en")))
+    }
+
+    @Test
+    fun `episode rollback uses accepted season and has a first-selection fallback without accepting a provisional target`() {
+        val episodes = listOf(Episode("E1", "First", 1, 1), Episode("E2", "Second", 2, 1))
+        assertEquals(EpisodeSwitchRollbackTarget("E1", 1), episodeSwitchRollbackTarget("E1", "E2", 2, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget("E2", 2), episodeSwitchRollbackTarget(null, "E2", 2, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget(null, null), episodeSwitchRollbackTarget(null, null, null, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget("missing-accepted", null),
+            episodeSwitchRollbackTarget("missing-accepted", "E2", 2, episodes))
+    }
+
     @Test
     fun `route hint chooses its exact actual episode regardless of metadata order or title`() {
         val episodes = listOf(
@@ -53,6 +106,25 @@ class DetailEpisodeTargetPolicyTest {
         )
 
         assertEquals("new-id", target?.id)
+    }
+
+    @Test
+    fun `an up-next hint opens the next unwatched episode and never replays the finished one`() {
+        val episodes = listOf(
+            Episode("s0e1", "Special", season = 0, episode = 1),
+            Episode("s2e21", "Twenty-one", season = 2, episode = 21),
+            Episode("s2e22", "Twenty-two", season = 2, episode = 22),
+            Episode("s3e1", "Premiere", season = 3, episode = 1),
+        )
+        val upNext = PreferredEpisode(2, 21, "s2e21", upNext = true)
+        assertEquals("s2e22", detailEpisodeTargetForRoute(episodes, upNext, null, setOf("s2e21"))?.id)
+        assertEquals("s3e1", detailEpisodeTargetForRoute(episodes, upNext, null, setOf("s2e21", "s2e22"))?.id)
+        assertEquals("s3e1", detailEpisodeTargetForRoute(episodes, PreferredEpisode(3, 1, "s3e1", upNext = true), null,
+            setOf("s3e1"))?.id)
+        // Not watched (the mark was reset) or not up next: the exact hinted episode, as before.
+        assertEquals("s2e21", detailEpisodeTargetForRoute(episodes, upNext, null, emptySet())?.id)
+        assertEquals("s2e21", detailEpisodeTargetForRoute(episodes, upNext.copy(upNext = false), null, setOf("s2e21"))?.id)
+        assertEquals("s0e1", detailEpisodeTargetForRoute(episodes, upNext, "s0e1", setOf("s2e21"))?.id)
     }
 
     @Test

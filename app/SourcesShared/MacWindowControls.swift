@@ -4,7 +4,8 @@ import AppKit
 /// Keep AppKit's own buttons reachable without reviving SwiftUI's collapsed titlebar or its toolbar.
 @MainActor
 enum MacWindowControls {
-    static func restore(in window: NSWindow) {
+    /// `visible` false keeps the buttons placed but faded out (the player hides them with its controls).
+    static func restore(in window: NSWindow, visible: Bool = true) {
         guard !window.styleMask.contains(.fullScreen) else { return }
         let needed: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
         if !window.styleMask.isSuperset(of: needed) { window.styleMask.formUnion(needed) }
@@ -26,8 +27,12 @@ enum MacWindowControls {
         if frameView.subviews.last !== host {
             frameView.addSubview(host, positioned: .above, relativeTo: nil)
         }
-        if host.isHidden { host.isHidden = false }
-        if host.alphaValue != 1 { host.alphaValue = 1 }
+        if host.wantsVisible != visible || (visible && host.isHidden) { host.applyVisibility(visible) }
+    }
+
+    /// Fade the buttons in or out in place; the player calls this as its controls show and hide.
+    static func setVisible(_ visible: Bool, in window: NSWindow) {
+        buttonHost(in: window)?.animateVisibility(visible)
     }
 
     /// Let AppKit own its native fullscreen titlebar and hover behavior during the entire transition.
@@ -48,6 +53,30 @@ enum MacWindowControls {
         }
         private var placements: [Placement] = []
         private(set) var buttonRowSize = NSSize.zero
+        private(set) var wantsVisible = true
+
+        func applyVisibility(_ visible: Bool) {
+            wantsVisible = visible
+            alphaValue = visible ? 1 : 0
+            isHidden = !visible
+        }
+
+        /// Hidden after the fade so invisible buttons never take clicks meant for the video.
+        func animateVisibility(_ visible: Bool) {
+            guard visible != wantsVisible else { return }
+            wantsVisible = visible
+            if visible { isHidden = false }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                animator().alphaValue = visible ? 1 : 0
+            }
+            guard !visible else { return }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(220))
+                guard let self, !self.wantsVisible else { return }
+                self.isHidden = true
+            }
+        }
 
         func installButtons(from window: NSWindow) {
             let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]

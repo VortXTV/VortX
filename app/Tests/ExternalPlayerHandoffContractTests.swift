@@ -1,8 +1,8 @@
 // Focused source contract for the Apple external-player handoff.
 //
-// Run without an Xcode build:
+// Run without an Xcode build (scripts/test-infuse-return.sh runs this):
 //   swiftc -parse-as-library -warnings-as-errors \
-//     app/SourcesShared/InfuseDeepLink.swift app/Sources/ExternalPlayer.swift \
+//     app/SourcesShared/InfuseReturn.swift app/SourcesShared/InfuseDeepLink.swift app/Sources/ExternalPlayer.swift \
 //     app/Tests/ExternalPlayerHandoffContractTests.swift \
 //     -o /tmp/external-player-handoff-contract-tests && \
 //   /tmp/external-player-handoff-contract-tests
@@ -19,6 +19,15 @@ struct PlaybackMeta: Hashable {
     let poster: String?
     let season: Int?
     let episode: Int?
+}
+
+// Production InfuseReturnCoordinator registers the handoff with CoreBridge/ProfileStore; this harness
+// only needs the link it returns.
+@MainActor
+enum InfuseReturnCoordinator {
+    static func launchURL(stream: URL, meta: PlaybackMeta?, startSeconds: Double?, durationSeconds: Double?) async -> URL? {
+        InfuseDeepLink.playURL(stream: stream, metadata: meta, startSeconds: startSeconds)
+    }
 }
 
 @MainActor private var failures = 0
@@ -67,7 +76,7 @@ private func tvDefaultRouteKeepsTrailersNative(_ source: String) -> Bool {
         "guard let player = ExternalPlayers.defaultPlayer(),",
         "!isTrailer,",
         "!isTorrentPlayback",
-        "ExternalPlayers.open(u, in: player, metadata: curMeta)"
+        "ExternalPlayers.open(u, in: player, metadata: curMeta, startSeconds: resumeSeconds,"
     ], in: route)
 }
 
@@ -184,20 +193,23 @@ private enum ExternalPlayerHandoffContractTests {
               ordered(["ExternalPlayer.open", "externalHandoff.matches", "if launched"], in: explicitChooser))
 
         check("iOS and macOS player handoffs forward the current media identity",
-              playerScreen.contains("routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta)")
-                  && playerScreen.contains("ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta)"))
+              playerScreen.contains("routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta, startSeconds: resumeSeconds,")
+                  && playerScreen.contains("ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta, startSeconds: currentTime,"))
         check("tvOS player handoffs forward the current media identity",
               tvPlayerView.components(separatedBy: "ExternalPlayers.open(").count == 3
-                  && tvPlayerView.contains("ExternalPlayers.open(url, in: player, metadata: curMeta)")
-                  && tvPlayerView.contains("ExternalPlayers.open(u, in: player, metadata: curMeta)"))
+                  && tvPlayerView.contains("ExternalPlayers.open(url, in: player, metadata: curMeta, startSeconds: currentTime,")
+                  && tvPlayerView.contains("ExternalPlayers.open(u, in: player, metadata: curMeta, startSeconds: resumeSeconds,"))
         check("detail handoffs forward movie, episode, and live identities",
-              tvDetail.contains("ExternalPlayers.open(url, in: player, metadata: meta)")
+              tvDetail.contains("ExternalPlayers.open(url, in: player, metadata: meta, durationSeconds: traktDurationSeconds)")
                   && iosDetail.contains("playbackMeta: moviePlaybackMeta")
                   && iosDetail.contains("playbackMeta: livePlaybackMeta")
                   && iosDetail.contains("metadata: playbackMeta"))
         check("both Apple target catalogs use the shared Infuse metadata link",
               externalPlayer.contains("InfuseDeepLink.playURL(stream: stream, metadata: metadata)")
                   && tvExternalPlayers.contains("InfuseDeepLink.playURL(stream: stream, metadata: metadata)"))
+        check("Infuse launches on every Apple platform register the return callback",
+              externalPlayer.contains("await InfuseReturnCoordinator.launchURL(")
+                  && tvExternalPlayers.contains("await InfuseReturnCoordinator.launchURL("))
 
         infuseMetadataChecks()
 

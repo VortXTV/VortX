@@ -1,11 +1,17 @@
 package com.vortx.android.engine
 
+import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.data.*
 import com.vortx.android.model.*
 import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,7 +41,9 @@ internal fun nativeContinueWatchingItem(item: JSONObject, saved: List<MetaItem>)
     val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
     return MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
         progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f, resumeSeconds = offset / 1000.0,
-        preferredEpisode = continueWatchingEpisodeFromVideoIdentity(type, item.optStringOrNull("videoId")),
+        preferredEpisode = continueWatchingEpisodeFromVideoIdentity(type, item.optStringOrNull("videoId"))
+            // A finished latest episode keeps its series here with no offset, flagged watched: up next.
+            ?.let { if (item.optBoolean("watched") && offset == 0L) it.copy(upNext = true) else it },
         continueWatchingActivityAtMillis = item.optLong("updatedAt", 0).takeIf { it > 0 })
 }
 
@@ -52,6 +60,9 @@ internal class NativeCatalogRepository(
     private val captureReclaimAdmission: ((VortxNativeSession, VortxNativeOwner) -> ((() -> Boolean) -> Boolean)?)? = null,
     private val withReclaimLifecycle: ((() -> Boolean) -> Boolean) = { action -> action() },
     private val nzbSourceAggregator: NzbSourceAggregator? = null,
+    /** Mirrors a deliberate save or removal to Trakt/SIMKL watchlists once the native checkpoint persisted it
+     *  (Apple `ScrobbleCoordinator.addedToLibrary` / `removedFromLibrary`): added, type, id. */
+    private val mirrorLibrary: (Boolean, MediaType, String) -> Unit = { _, _, _ -> },
     private val sessionProvider: () -> VortxNativeSession,
 ) : CatalogRepository, AuthRepository {
     private data class CatalogSpec(val addon: VortxResourceAddon, val catalog: JSONObject) {
@@ -78,7 +89,112 @@ internal class NativeCatalogRepository(
                                         val admit: (() -> Boolean) -> Boolean)
     private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
     private class SourceBinding(val owner: VortxNativeOwner, @Volatile var context: PlaybackContext)
-    private val sourceBindings = mutableMapOf<String, SourceBinding>()
+    private sealed interface StreamEvent {
+        data class Providers(val update: NativeProviderUpdate, val ticket: java.util.UUID,
+            val accepted: CompletableDeferred<Unit>) : StreamEvent
+        data class Indexer(val result: Result<NzbSourceAggregation>) : StreamEvent
+        data object ProvidersFinished : StreamEvent
+    }
+    private var foregroundSources: SourceContext? = null
+
+    /** Loading, bindings and resolver authority are private to one source consumer. */
+    private inner class SourceContext(
+        val session: VortxNativeSession,
+        val read: VortxNativeRead,
+        val type: MediaType,
+        val id: String,
+        val episodeId: String?,
+        val episode: Episode?,
+        val slot: String,
+        val prepared: Boolean,
+    ) : SourcePreparation {
+        val addons = registry(read)
+        // Capture nullable scope before any provider suspension; never retarget an absent participant.
+        val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
+        val bindings = mutableMapOf<String, SourceBinding>()
+        val resolutionSequence = AtomicLong()
+        var ticket: java.util.UUID? = null
+        var started = false
+        var closed = false
+        var adopted = false
+        var latestGroups = emptyList<StreamGroup>()
+        var indexerResult = NzbSourceAggregation.empty()
+        override val owner: ContinueWatchingOwner get() = owner(read.owner)
+        override val groups: List<StreamGroup> get() = synchronized(this@NativeCatalogRepository) { latestGroups }
+
+        override fun isCurrent(): Boolean = runCatching {
+            session.owned(read.owner) { synchronized(this@NativeCatalogRepository) {
+                sessionProvider() === session && !closed && (!adopted || foregroundSources === this) &&
+                    (nzbSourceAggregator?.isAdmitted(indexerResult) != false)
+            } }
+        }.getOrDefault(false)
+
+        override fun updates(): Flow<StreamLoadUpdate> = sourceUpdates(this)
+
+        override suspend fun resolve(source: StreamSource): Result<Playable> = resolveAttempt {
+            check(isCurrent()) { "Native preparation expired" }
+            val binding = synchronized(this@NativeCatalogRepository) { bindings[source.nativePlaybackToken] }
+            check(binding != null && binding.owner == read.owner && binding.context.videoId == episodeId) { "Native prepared source expired" }
+            resolveOwned(session, read, source, episode, binding, this, resolutionSequence)
+                .copy(playbackContext = binding.context)
+        }
+
+        override fun adopt(): SourcePreparationAdoption? = runCatching {
+            session.owned(read.owner) { synchronized(this@NativeCatalogRepository) {
+                if (!prepared || adopted || !isCurrent() || latestGroups.isEmpty()) return@owned null
+                val previous = foregroundSources
+                adopted = true
+                foregroundSources = this
+                resolveSequence.incrementAndGet()
+                object : SourcePreparationAdoption {
+                    override val groups = latestGroups
+                    private var rolledBack = false
+                    override fun rollback() {
+                        synchronized(this@NativeCatalogRepository) {
+                            if (rolledBack) return
+                            rolledBack = true
+                            if (foregroundSources === this@SourceContext) {
+                                foregroundSources = previous
+                                resolveSequence.incrementAndGet()
+                            }
+                            closed = true
+                            resolutionSequence.incrementAndGet()
+                        }
+                        retireTicket()
+                    }
+                }
+            } }
+        }.getOrNull()
+
+        fun retireTicket() {
+            val captured = synchronized(this@NativeCatalogRepository) { ticket.also { ticket = null } }
+            if (captured != null) session.retireResourceSlot(slot, captured)
+        }
+
+        override fun close() {
+            synchronized(this@NativeCatalogRepository) {
+                if (adopted || closed) return
+                closed = true
+                resolutionSequence.incrementAndGet()
+            }
+            retireTicket()
+        }
+    }
+
+    private fun sourceContext(type: MediaType, id: String, episodeId: String?, episode: Episode?, prepared: Boolean): SourceContext {
+        val session = session(); val read = session.read()
+        return session.owned(read.owner) {
+            check(sessionProvider() === session) { "Native account changed" }
+            SourceContext(session, read, type, id, episodeId, episode,
+                if (prepared) "prepared-streams-${java.util.UUID.randomUUID()}" else "streams", prepared)
+                .also { check(sessionProvider() === session) { "Native account changed" } }
+        }
+    }
+
+    override fun openSourcePreparation(type: MediaType, id: String, episode: Episode): SourcePreparation? {
+        if (type != MediaType.SERIES || episode.id.isBlank()) return null
+        return sourceContext(type, id, episode.id, episode, prepared = true)
+    }
     private val resolveSequence = AtomicLong()
     private val playbackSequence = AtomicLong()
     private val nativeAuth = MutableStateFlow<AuthState>(AuthState.SignedOut)
@@ -90,6 +206,17 @@ internal class NativeCatalogRepository(
         try { Result.success(action()) } catch (error: CancellationException) { throw error }
         catch (error: Exception) { Result.failure(error) }
         catch (_: LinkageError) { Result.failure(IllegalStateException("Native artifact is missing or incompatible")) }
+    }
+    /** The IO hop itself can reject a successful return through prompt cancellation. Own the
+     * produced lease across that hop; resolveOwned still owns failures before it returns. */
+    private suspend fun resolveAttempt(action: suspend () -> Playable): Result<Playable> {
+        var produced: Playable? = null
+        return try {
+            attempt { action().also { produced = it } }
+        } catch (failure: Throwable) {
+            runCatching { produced?.playbackLease?.close() }
+            throw failure
+        }
     }
     private fun unsupported(capability: String): Nothing = throw UnsupportedOperationException("Native $capability is not enabled in this build")
     private fun session() = sessionProvider()
@@ -402,10 +529,18 @@ internal class NativeCatalogRepository(
     }
 
     override fun streamUpdates(type: MediaType, id: String, episodeId: String?, rememberedQuality: String?, wantedAddon: String?, forceRefresh: Boolean): Flow<StreamLoadUpdate> = flow {
-        val session = session(); val read = session.read(); val addons = registry(read)
-        // Capture the direct-source owner/profile before native resource loading can suspend. Passing
-        // this exact nullable scope later prevents a profile/account switch from retargeting the query.
-        val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
+        sourceUpdates(sourceContext(type, id, episodeId, null, prepared = false)).collect { emit(it) }
+    }.flowOn(Dispatchers.IO)
+
+    private fun sourceUpdates(context: SourceContext): Flow<StreamLoadUpdate> = flow {
+        synchronized(this@NativeCatalogRepository) {
+            check(!context.started && !context.closed) { "Native source consumer already used" }
+            context.started = true
+        }
+        val session = context.session; val read = context.read; val addons = context.addons
+        val type = context.type; val id = context.id; val episodeId = context.episodeId
+        val indexerScope = context.indexerScope
+        val slot = context.slot
         val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
         val metaRequest = VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id)
         val legs = addons.map { NativeProviderLeg(metaRequest, it) } + addons.map { NativeProviderLeg(stream, it) }
@@ -414,22 +549,34 @@ internal class NativeCatalogRepository(
         var initializedBindings = false
         var lastUpdate = NativeProviderUpdate(emptyList(), 0, legs.size)
         var lastTicket: java.util.UUID? = null
-        var lastDetail: MetaDetail? = null
-        fun publish(update: NativeProviderUpdate, ticket: java.util.UUID, direct: NzbSourceAggregation = NzbSourceAggregation.empty(), terminal: Boolean): StreamLoadUpdate = session.publish("streams", read.owner, update.pages, ticket) {
+        var approvedSearch: com.vortx.android.nzb.NzbSearch? = null
+        var direct = NzbSourceAggregation.empty()
+        var providersFinished = false
+        var indexerStarted = false
+        var indexerFinished = indexerScope == null
+        fun publish(update: NativeProviderUpdate, ticket: java.util.UUID, terminal: Boolean): StreamLoadUpdate? = session.publishIfLatestReceipt(slot, read.owner, update.pages, ticket) {
             coroutine.ensureActive()
             check(sessionProvider() === session) { "Native account changed" }
-            val allowed = update.pages.map { if (it.request.resource == VortxResourceRequest.Resource.META) policyPage(it, read, "streams", update.pages, ticket) else it }
+            check(synchronized(this@NativeCatalogRepository) { !context.closed }) { "Native source consumer closed" }
+            val allowed = update.pages.map { if (it.request.resource == VortxResourceRequest.Resource.META) policyPage(it, read, slot, update.pages, ticket) else it }
             val projection = VortxResourceProjection.providerDetails(allowed, metaRequest, stream, addons)
-            val detail = EngineState.parseMetaDetail(projection, appliedAddonOrder = emptyList()) ?: synchronized(this) { detailCache[type to id]?.takeIf { it.first == read.owner }?.second }
+            val currentDetail: MetaDetail? = EngineState.parseMetaDetail(projection, appliedAddonOrder = emptyList())
+            val detail: MetaDetail? = currentDetail ?: synchronized(this) { detailCache[type to id]?.takeIf { it.first == read.owner }?.second }
             check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
-            val approved = !parental(read) || detail != null && if (type == MediaType.SERIES) {
-                episodeId != null && detail.videos.any { it.id == episodeId }
+            // Prepared metadata must be approved in this exact request, never borrowed from a
+            // foreground cached title; include the expected episode coordinates, not just its id.
+            val identityDetail = if (context.prepared) currentDetail else detail
+            val approved = !context.prepared && !parental(read) || identityDetail != null && if (type == MediaType.SERIES) {
+                episodeId != null && identityDetail.videos.any { it.id == episodeId &&
+                    (context.episode == null || it.season == context.episode.season && it.episode == context.episode.episode) }
             } else episodeId == null || episodeId == id
             if (!approved) {
                 if (terminal) error("Stream identity is not in approved metadata")
-                return@publish StreamLoadUpdate(emptyList(), update.settled, update.total, false)
+                return@publishIfLatestReceipt StreamLoadUpdate(emptyList(), update.settled, update.total, false)
             }
-            lastDetail = detail
+            // A same-owner cached detail is useful for display, not authorization for a fresh
+            // indexer query. Wait for this request's identity-checked, parental-approved metadata.
+            if (currentDetail != null) approvedSearch = nativeNzbSearch(currentDetail, type, id, episodeId)
             val rawGroups = EngineState.parseStreamGroups(projection, episodeId ?: id)
             val selectedEpisode = detail?.videos?.find { it.id == episodeId }
             val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
@@ -442,39 +589,99 @@ internal class NativeCatalogRepository(
             }
             val bound = synchronized(this) {
                 if (detail != null) detailCache[type to id] = read.owner to detail
-                if (!initializedBindings) { sourceBindings.clear(); initializedBindings = true }
+                if (!initializedBindings) {
+                    if (!context.prepared) {
+                        foregroundSources = context
+                        resolveSequence.incrementAndGet()
+                    }
+                    initializedBindings = true
+                }
                 groups.map { group -> group.copy(streams = group.streams.map { source ->
                     // A later partial must not revoke the source token already being resolved.
                     val token = tokens.getOrPut(source.addon to source.id) { java.util.UUID.randomUUID().toString() }
-                    val context = PlaybackContext(
+                    val playbackContext = PlaybackContext(
                         PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
                         selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
                         PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision)
-                    val binding = sourceBindings.getOrPut(token) { SourceBinding(read.owner, context) }
-                    check(binding.owner == read.owner && binding.context.identityKey == context.identityKey) { "Native source identity changed" }
+                    val binding = context.bindings.getOrPut(token) { SourceBinding(read.owner, playbackContext) }
+                    check(binding.owner == read.owner && binding.context.identityKey == playbackContext.identityKey) { "Native source identity changed" }
                     // Metadata may arrive after this stream. Enrich the stable binding, never replace its
                     // admission identity or revoke a resolver that already captured that exact object.
-                    if (detail != null) binding.context = context
+                    if (detail != null) binding.context = playbackContext
                     source.copy(nativePlaybackToken = token)
                 }) }
             }
+            synchronized(this@NativeCatalogRepository) {
+                context.latestGroups = bound
+                context.indexerResult = direct
+            }
             StreamLoadUpdate(bound, update.settled, update.total, terminal,
-                selectionReady = terminal || bound.any { it.streams.isNotEmpty() } &&
+                selectionReady = terminal || indexerFinished && bound.any { it.streams.isNotEmpty() } &&
                     update.resourceSettled(VortxResourceRequest.Resource.STREAM, addons.size))
         }
-        session.loadProviders("streams", read.owner, legs) { update, ticket ->
-            lastUpdate = update; lastTicket = ticket
-            emit(publish(update, ticket, terminal = !update.pending && indexerScope == null))
-        }
-        if (indexerScope != null) {
-            val search = nativeNzbSearch(lastDetail, type, id, episodeId)
-            val direct = if (search != null) {
-                try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
-                catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { NzbSourceAggregation.empty() }
-            } else NzbSourceAggregation.empty()
-            emit(publish(lastUpdate, requireNotNull(lastTicket), direct, terminal = true))
-        }
+        try { coroutineScope {
+            val events = Channel<StreamEvent>(capacity = 1)
+            var indexerJob: Job? = null
+            val ownerWatcher = launch {
+                session.updates.first { !session.accepts(read.owner) || sessionProvider() !== session }
+                error("Native account changed")
+            }
+            val providers = launch {
+                session.loadProviders(slot, read.owner, legs) { update, ticket ->
+                    synchronized(this@NativeCatalogRepository) {
+                        check(!context.closed) { "Native source consumer closed" }
+                        context.ticket = ticket
+                    }
+                    val accepted = CompletableDeferred<Unit>()
+                    events.send(StreamEvent.Providers(update, ticket, accepted))
+                    // Backpressure prevents provider receipts from outrunning this coordinator.
+                    accepted.await()
+                }
+                events.send(StreamEvent.ProvidersFinished)
+            }
+            try {
+                while (!providersFinished || !indexerFinished) {
+                    val event = events.receive()
+                    when (event) {
+                        is StreamEvent.Providers -> {
+                            lastUpdate = event.update; lastTicket = event.ticket
+                            val snapshot = publish(lastUpdate, event.ticket, terminal = false)
+                            if (!indexerStarted && indexerScope != null) approvedSearch?.let { search ->
+                                indexerStarted = true
+                                indexerJob = launch {
+                                    val result = try { Result.success(nzbSourceAggregator!!.aggregate(search, indexerScope)) }
+                                    catch (cancelled: CancellationException) {
+                                        // Caller/owner retirement already cancels the coordinator. A
+                                        // contributor's own cancellation must reach it too, not strand
+                                        // the request forever waiting for an unreported completion.
+                                        currentCoroutineContext().ensureActive()
+                                        Result.failure(cancelled)
+                                    }
+                                    catch (_: Exception) { Result.success(NzbSourceAggregation.empty()) }
+                                    events.send(StreamEvent.Indexer(result))
+                                }
+                            }
+                            snapshot?.let { emit(it) }
+                            event.accepted.complete(Unit)
+                        }
+                        is StreamEvent.Indexer -> { direct = event.result.getOrThrow(); indexerFinished = true }
+                        StreamEvent.ProvidersFinished -> {
+                            providersFinished = true
+                            // No current approved metadata: suppress, rather than retarget, the query.
+                            if (!indexerStarted) indexerFinished = true
+                        }
+                    }
+                    if (event !is StreamEvent.Providers) {
+                        // A provider may have advanced its receipt just before sending its event.
+                        // Defer that one partial; the queued callback will publish the retained direct
+                        // result with the newer receipt. Slot/owner replacement still throws.
+                        publish(lastUpdate, requireNotNull(lastTicket), providersFinished && indexerFinished)?.let { emit(it) }
+                    }
+                }
+            } finally {
+                providers.cancel(); indexerJob?.cancel(); ownerWatcher.cancel(); events.cancel()
+            }
+        } } finally { context.retireTicket() }
     }.flowOn(Dispatchers.IO)
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
@@ -507,7 +714,14 @@ internal class NativeCatalogRepository(
         val request = requestJson?.let(::JSONObject) ?: JSONObject().put("type", "all").put("sort", "recent")
         val type = request.getString("type"); val sort = request.getString("sort")
         require(sort in setOf("recent", "name"))
-        val all = visibleLocal(savedItems(read), read); var items = all.filter { type == "all" || it.type.id == type }
+        // Saved titles, then every title watched or started that the viewer has not removed (twin of Apple).
+        val saved = savedItems(read)
+        val records = read.state.optJSONObject("nativeSync")?.optJSONObject("libraries")
+            ?.optJSONObject(read.owner.profileID)?.optJSONObject("records")
+        val watched = NativePreviouslyWatched.titles(playback(read), saved.map { it.id }.toSet()) { kind, id ->
+            records?.optJSONObject("$kind:$id")?.optLong("removedAt", 0)
+        }
+        val all = visibleLocal(saved + watched, read); var items = all.filter { type == "all" || it.type.id == type }
         if (sort == "name") items = items.sortedBy { it.name.lowercase() }
         fun wire(t: String = type, s: String = sort) = JSONObject().put("type", t).put("sort", s).toString()
         session.owned(read.owner) { LibraryResult(items, LibraryFilters(
@@ -526,16 +740,34 @@ internal class NativeCatalogRepository(
     private fun addAction(item: MetaItem, read: VortxNativeRead) = action("add_library_item").put("profileId", read.owner.profileID)
         .put("item", JSONObject().put("kind", "standard").put("id", item.id).put("type", item.type.id).put("name", item.name).put("poster", item.poster))
     override suspend fun addToLibrary(item: MetaItem) = attempt { val session = session(); val read = session.read(); session.dispatch(listOf(addAction(item, read)), read.owner); Unit }
+    // A dispatch returns only after the checkpoint committed, so each mirror below follows a persisted change.
+    override suspend fun saveToLibrary(item: MetaItem) = addToLibrary(item).onSuccess { mirrorLibrary(true, item.type, item.id) }
     override suspend fun removeFromLibrary(id: String) = attempt {
-        val session = session(); val read = session.read(); val item = savedItems(read).filter { it.id == id }.single()
-        session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${item.type.id}:$id")), read.owner); Unit
+        DiagnosticsLog.log("library", "action=remove_saved surface=library")
+        val session = session(); val read = session.read(); val saved = savedItems(read).filter { it.id == id }
+        if (saved.isEmpty()) {
+            // Watched-only Library title (twin of Apple): record the removal under its watch type. It was never
+            // saved, so no watchlist was written for it and none is edited.
+            val kind = checkNotNull(NativePreviouslyWatched.type(playback(read), id)) { "Unknown native library title" }
+            session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "$kind:$id")), read.owner)
+        } else {
+            val item = saved.single()
+            session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${item.type.id}:$id")), read.owner)
+            mirrorLibrary(false, item.type, id)
+        }
+        Unit
     }
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> = attempt {
         addToLibrary(MetaItem(id, type, name, poster)).getOrThrow(); peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
+    override suspend fun saveToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> = attempt {
+        saveToLibrary(MetaItem(id, type, name, poster)).getOrThrow(); peekMeta(type, id) ?: meta(type, id).getOrThrow()
+    }
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = attempt {
+        DiagnosticsLog.log("library", "action=remove_saved surface=detail")
         val session = session(); val read = session.read()
         session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${type.id}:$id")), read.owner)
+        mirrorLibrary(false, type, id)
         peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
     private fun requireWatchIdentity(read: VortxNativeRead, type: MediaType, id: String) {
@@ -543,6 +775,7 @@ internal class NativeCatalogRepository(
         check(savedItems(read).none { it.id == id && it.type != type }) { "Ambiguous native watch media identity" }
     }
     override suspend fun removeFromContinueWatching(target: ContinueWatchingDismissal) = attempt {
+        DiagnosticsLog.log("library", "action=dismiss_continue_watching surface=menu")
         val session = session(); val read = session.read(); check(owner(read.owner) == target.owner)
         requireWatchIdentity(read, target.type, target.id)
         session.dispatch(listOf(action("remove_from_continue_watching").put("metaId", target.id)), read.owner); Unit
@@ -774,7 +1007,10 @@ internal class NativeCatalogRepository(
                 if (playing !== current) return@owned
                 session.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
                     .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
-                    .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)
+                    .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner,
+                    // A periodic tick: its account upload may wait for playback to go quiet. The final report at
+                    // the end of playback stays an ordinary edit, so a finish reaches other devices promptly.
+                    progressOnly = true)
             }
         }
     }
@@ -836,23 +1072,29 @@ internal class NativeCatalogRepository(
             }
         } }
     } }.getOrDefault(false)
-    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = attempt {
+    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
-        val binding = synchronized(this) { sourceBindings[source.nativePlaybackToken] }
+        val context = synchronized(this) { foregroundSources }
+        val binding = synchronized(this) { context?.bindings?.get(source.nativePlaybackToken) }
         check(binding != null && binding.owner == read.owner) { "Native source selection expired; reload sources" }
         check(episode == null || episode.id == binding.context.videoId) { "Native episode selection changed" }
-        resolveOwned(session, read, source, episode, binding).copy(playbackContext = binding.context)
+        resolveOwned(session, read, source, episode, binding, context).copy(playbackContext = binding.context)
     }
-    private suspend fun resolveOwned(session: VortxNativeSession, read: VortxNativeRead, source: StreamSource, episode: Episode?, binding: SourceBinding? = null): Playable {
-        val sequence = resolveSequence.incrementAndGet()
+    private suspend fun resolveOwned(session: VortxNativeSession, read: VortxNativeRead, source: StreamSource,
+        episode: Episode?, binding: SourceBinding? = null, context: SourceContext? = null,
+        sequenceOwner: AtomicLong = resolveSequence): Playable {
+        val sequence = sequenceOwner.incrementAndGet()
         val sourceToken = source.nativePlaybackToken
         val resolutionCoroutine = currentCoroutineContext()
         // The resolver may await local preparation. Its retirement probe uses the same captured
         // owner and selection checks as final admission, without capturing a newer session/owner.
         fun requireCurrent() {
             resolutionCoroutine.ensureActive()
-            check(sessionProvider() === session && resolveSequence.get() == sequence) { "Native playback superseded" }
-            if (binding != null) synchronized(this) { check(sourceBindings[sourceToken] === binding) { "Native source selection expired" } }
+            check(sessionProvider() === session && sequenceOwner.get() == sequence) { "Native playback superseded" }
+            if (binding != null) synchronized(this) {
+                check(context != null && context.isCurrent() && context.bindings[sourceToken] === binding &&
+                    (sequenceOwner !== resolveSequence || foregroundSources === context)) { "Native source selection expired" }
+            }
         }
         val playable = try {
             playbackResolver.resolve(source, episode,
@@ -877,16 +1119,16 @@ internal class NativeCatalogRepository(
                     playable.copy(startPositionMs = resume.optJSONObject("resume")?.getLong("offsetMs") ?: 0L)
                 }
             }
-        } catch (error: Throwable) { playable.playbackLease?.close(); throw error }
+        } catch (error: Throwable) { runCatching { playable.playbackLease?.close() }; throw error }
     }
-    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = attempt {
+    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
         check(!parental(read)) { "Uncertified direct links are blocked by parental settings" }
         val source = StreamSource(id = url, addon = "Direct link", title = title, url = url)
         requireNotNull(nativeDirectPlayable(source)) { "Only HTTP(S) direct links are supported" }
         resolveOwned(session, read, source, null)
     }
-    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = attempt {
+    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
         check(!parental(read)) { "Uncertified magnets are blocked by parental settings" }
         require(Regex("[a-fA-F0-9]{40}").matches(infoHash) && (fileIdx == null || fileIdx >= 0))

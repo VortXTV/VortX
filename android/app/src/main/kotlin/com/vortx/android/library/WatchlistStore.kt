@@ -306,7 +306,7 @@ class WatchlistStore internal constructor(
                 ),
                 activeProfileId = { ProfileStore.shared.activeProfileId },
                 registerProfileSwitch = { ProfileStore.shared.addSwitchListener(it) },
-                initialNativeEnabled = { com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED },
+                initialNativeEnabled = { true },
             ).also { instance = it }
         }
     }

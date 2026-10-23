@@ -83,9 +83,21 @@ enum ExternalPlayers {
         return candidates.first { $0.id == id }
     }
 
-    /// Open `streamURL` in `player`. `metadata` enriches only Infuse's documented filename field.
-    @discardableResult
-    static func open(_ streamURL: URL, in player: Player, metadata: PlaybackMeta? = nil) -> Bool {
+    /// Open `streamURL` in `player`. `metadata` names the title for Infuse, which also starts at
+    /// `startSeconds` (the saved resume point when nil) and reports its stopping point back to VortX;
+    /// `durationSeconds` is the runtime that position is saved against.
+    @MainActor @discardableResult
+    static func open(_ streamURL: URL, in player: Player, metadata: PlaybackMeta? = nil,
+                     startSeconds: Double? = nil, durationSeconds: Double? = nil) -> Bool {
+        if player.scheme == "infuse" {
+            Task { @MainActor in
+                guard let url = await InfuseReturnCoordinator.launchURL(
+                    stream: streamURL, meta: metadata, startSeconds: startSeconds, durationSeconds: durationSeconds) else { return }
+                // Inside a Task this resolves to the async open(_:options:); the Bool is not needed.
+                _ = await UIApplication.shared.open(url)
+            }
+            return true
+        }
         guard let url = player.launch(streamURL, metadata) else { return false }
         UIApplication.shared.open(url)
         return true

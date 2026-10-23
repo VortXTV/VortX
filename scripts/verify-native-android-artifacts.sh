@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Inspect shipped archives. Default mode preserves the legacy two-engine comparison contract.
-# Release workflows opt into --native-only to require just the reviewed VortX resource-host engine,
-# prove its ABI/JNI surface, and compare it with fresh staged bytes after identical AGP strip handling.
-mode=legacy-both
+# Inspect shipped archives: require just the reviewed VortX resource-host engine, prove its ABI/JNI
+# surface, and compare it with fresh staged bytes after identical AGP strip handling. `--native-only`
+# is accepted for existing callers; it is the only mode.
+abi_mode=resource-host
 staged_dir=""
 source_sha=""
 artifacts=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --native-only) mode=native-only; shift ;;
+        --native-only) shift ;;
         --staged-dir)
             [[ $# -ge 2 ]] || { echo "--staged-dir requires a path" >&2; exit 1; }
             staged_dir="$2"; shift 2 ;;
@@ -26,11 +26,17 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 readelf="${READELF:?set READELF to the pinned NDK llvm-readelf}"
 [[ -x "$readelf" ]] || { echo "NDK llvm-readelf unavailable: $readelf" >&2; exit 1; }
 strip="${STRIP:-}"
-if [[ "$mode" == native-only ]]; then
-    [[ -n "$staged_dir" && -d "$staged_dir" ]] || { echo "native-only mode requires the staged jniLibs directory" >&2; exit 1; }
-    [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "native-only mode requires the exact 40-character VortX engine source SHA" >&2; exit 1; }
-    [[ -n "$strip" && -x "$strip" ]] || { echo "STRIP must point to the pinned NDK llvm-strip" >&2; exit 1; }
-fi
+[[ -n "$staged_dir" && -d "$staged_dir" ]] || { echo "native-only mode requires the staged jniLibs directory" >&2; exit 1; }
+[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "native-only mode requires the exact 40-character VortX engine source SHA" >&2; exit 1; }
+[[ -n "$strip" && -x "$strip" ]] || { echo "STRIP must point to the pinned NDK llvm-strip" >&2; exit 1; }
+# Normal source must prove its added owner-history JNI ABI. Explicit beta2 interpretation
+# retains its real old surface; an arbitrary 40-character string is not an admitted mode.
+case "$source_sha" in
+    0c30f4782aee544a2b7e33169ad60d03630d4097) abi_mode=owner-history ;;
+    a3169f338f3f05da4ad3adb39a1e557c3ddcac33) abi_mode=owner-history ;;
+    af29b22e4c45740a1f5b6cb415b81f8430f55b9f) abi_mode=resource-host ;;
+    *) echo "native-only ABI mode has no admitted source revision" >&2; exit 1 ;;
+esac
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -52,7 +58,7 @@ verify_elf() {
 
 verify_vortx_abi() {
     local file="$1" artifact="$2" symbols symbol required
-    READELF="$readelf" bash "$repo_root/scripts/verify-native-engine-abi.sh" android "$file" resource-host
+    READELF="$readelf" bash "$repo_root/scripts/verify-native-engine-abi.sh" android "$file" "$abi_mode"
     required="Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
     symbols="$("$readelf" --dyn-syms --wide "$file")"
     for symbol in $required; do
@@ -62,42 +68,29 @@ verify_vortx_abi() {
     done
 }
 
-verify_legacy_pair() {
-    local artifact="$1" prefix="$2" abi="$3" lib="$4" entry extracted symbols required symbol
-    entry="$prefix/$abi/$lib"
-    extracted="$scratch/legacy-${artifact_index}-$(basename "$artifact").$abi.$lib"
-    unzip -p "$artifact" "$entry" > "$extracted" || { echo "missing $entry: $artifact" >&2; return 1; }
-    [[ -s "$extracted" ]] || { echo "empty $entry: $artifact" >&2; return 1; }
-    verify_elf "$extracted" "$abi" "$artifact"
-    if [[ "$lib" == libvortx_ffi.so ]]; then
-        verify_vortx_abi "$extracted" "$artifact"
-    else
-        required="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion Java_com_vortx_android_engine_StremioCoreNative_nativeRestoreLibrary Java_com_vortx_android_engine_StremioCoreNative_nativeReadLibraryEvents"
-        symbols="$("$readelf" --dyn-syms --wide "$extracted")"
-        for symbol in $required; do
-            awk -v wanted="$symbol" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == wanted { found=1 } END { exit !found }' <<< "$symbols" || {
-                echo "missing callable $symbol in $artifact ($abi)" >&2; return 1;
-            }
-        done
-    fi
-}
-
 verify_native_only() {
     local artifact="$1" prefix="$2" abi entry extracted staged normalized_package normalized_staged digest
-    local expected_entries actual_entries
+    local expected_entries actual_entries listing
     expected_entries="$scratch/expected-$artifact_index"
     actual_entries="$scratch/actual-$artifact_index"
+    listing="$scratch/listing-$artifact_index"
+    # Consume a successful complete listing first. An early grep match in a pipe can cause unzip
+    # to exit on SIGPIPE under pipefail, making an if rejection accidentally evaluate false.
+    unzip -Z1 "$artifact" > "$listing" || {
+        echo "could not list Android artifact: $artifact" >&2
+        return 1
+    }
     printf '%s\n' \
         "$prefix/arm64-v8a/libvortx_ffi.so" \
         "$prefix/armeabi-v7a/libvortx_ffi.so" \
         "$prefix/x86_64/libvortx_ffi.so" | LC_ALL=C sort > "$expected_entries"
-    unzip -Z1 "$artifact" | awk -F/ '$NF == "libvortx_ffi.so" { print }' | LC_ALL=C sort > "$actual_entries"
+    awk -F/ '$NF == "libvortx_ffi.so" { print }' "$listing" | LC_ALL=C sort > "$actual_entries"
     if ! cmp -s "$expected_entries" "$actual_entries"; then
         echo "native-only artifact must contain exactly one libvortx_ffi.so for each shipped ABI, with no extra engine ABI: $artifact" >&2
         diff -u "$expected_entries" "$actual_entries" >&2 || true
         return 1
     fi
-    if unzip -Z1 "$artifact" | grep -Eq '(^|/)libstremiox_core\.so$'; then
+    if grep -Eq '(^|/)libstremiox_core\.so$' "$listing"; then
         echo "native-only artifact still contains legacy libstremiox_core.so: $artifact" >&2
         return 1
     fi
@@ -140,14 +133,5 @@ for artifact in "${artifacts[@]}"; do
         *.aab) prefix=base/lib ;;
         *) echo "unsupported Android artifact: $artifact" >&2; exit 1 ;;
     esac
-    if [[ "$mode" == native-only ]]; then
-        verify_native_only "$artifact" "$prefix"
-    else
-        for abi in arm64-v8a armeabi-v7a x86_64; do
-            for lib in libvortx_ffi.so libstremiox_core.so; do
-                verify_legacy_pair "$artifact" "$prefix" "$abi" "$lib"
-            done
-        done
-        echo "verified packaged native engines: $artifact"
-    fi
+    verify_native_only "$artifact" "$prefix"
 done

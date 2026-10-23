@@ -1,7 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for the StremioX main window.",
+  "description": "The VortX web client in the main window: Tauri core events plus the shell's streaming-server and player commands, for the VortX web origin only.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "remote": {
+    "urls": ["https://web.vortx.tv/*"]
+  },
+  "permissions": [
+    "core:default",
+    "allow-server-status",
+    "allow-server-base-url",
+    "allow-mpv-play",
+    "allow-mpv-set-paused",
+    "allow-mpv-seek-relative",
+    "allow-mpv-stop",
+    "allow-mpv-status"
+  ]
 }

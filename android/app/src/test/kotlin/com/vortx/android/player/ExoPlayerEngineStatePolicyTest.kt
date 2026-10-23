@@ -1,6 +1,9 @@
 package com.vortx.android.player
 
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.Format
+import androidx.media3.common.Timeline
+import androidx.media3.exoplayer.source.MediaSource.MediaPeriodId
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
@@ -174,6 +177,129 @@ class ExoPlayerEngineStatePolicyTest {
         assertTrue(chrome.contains("if (secondarySubtitleAvailable && state.subtitleTracks.size >= 2)"))
         assertTrue(visibleAudioOutputModes(available = false).isEmpty())
         assertEquals(AudioOutputMode.entries, visibleAudioOutputModes(available = true))
+    }
+
+    @Test
+    fun `metadata replacement uses distinct load identity even for same URL ABA`() {
+        val inputs = ExoMetadataInputs()
+        val format = Format.Builder().setWidth(3840).setHeight(2160).build()
+        val first = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("A", 1L))
+        inputs.observeCurrent(first); inputs.video(first, format)
+        assertEquals(format, inputs.snapshot(first.load, "A").first)
+        val second = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("B", 2L))
+        inputs.observeCurrent(second)
+        inputs.video(first, format) // Delayed old decoder event cannot label B.
+        assertNull(inputs.snapshot(second.load, "B").first)
+        val third = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("A", 3L))
+        inputs.observeCurrent(third); inputs.video(first, format)
+        assertNull(inputs.snapshot(third.load, "A").first)
+        inputs.video(third, format)
+        assertEquals(format, inputs.snapshot(third.load, "A").first)
+        assertNull(inputs.snapshot(first.load, "A").first)
+    }
+
+    @Test
+    fun `metadata current period and sequence must match decoder event`() {
+        val inputs = ExoMetadataInputs()
+        val tag = inputs.begin()
+        val current = ExoMetadataInputs.Context(tag, MediaPeriodId("period", 1L))
+        val future = ExoMetadataInputs.Context(tag, MediaPeriodId("period", 2L))
+        val format = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_AAC).build()
+        inputs.observeCurrent(current); inputs.audio(future, format)
+        assertNull(inputs.snapshot(tag, "period").second)
+        inputs.observeCurrent(future)
+        assertEquals(format, inputs.snapshot(tag, "period").second)
+        assertNull(inputs.snapshot(tag, "foreign-period").second)
+        inputs.observeCurrent(null)
+        assertNull(inputs.snapshot(tag, "period").second)
+    }
+
+    @Test
+    fun `metadata failure is sticky until fresh load and release cannot reopen`() {
+        val inputs = ExoMetadataInputs()
+        val first = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("A", 1L))
+        val format = Format.Builder().setWidth(1920).setHeight(1080).build()
+        inputs.observeCurrent(first); inputs.video(first, format); inputs.fail()
+        inputs.observeCurrent(first); inputs.video(first, format)
+        assertNull(inputs.snapshot(first.load, "A").first)
+        val second = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("B", 2L))
+        inputs.observeCurrent(second); inputs.video(second, format)
+        assertEquals(format, inputs.snapshot(second.load, "B").first)
+        inputs.release()
+        val afterRelease = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("C", 3L))
+        inputs.observeCurrent(afterRelease); inputs.video(afterRelease, format)
+        assertTrue(inputs.isReleased)
+        assertNull(inputs.snapshot(afterRelease.load, "C").first)
+        val state = PlayerState(positionMs = 42L, metadata = PlaybackMetadata(1920, 1080)).withPlaybackError()
+        assertEquals(PlaybackMetadata(), state.metadata)
+        assertEquals(42L, state.positionMs)
+        assertTrue(state.hasError)
+        assertFalse(state.hasEnded)
+    }
+
+    @Test
+    fun `disabled renderer clears only its attributed lane`() {
+        val inputs = ExoMetadataInputs()
+        val active = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("A", 1L))
+        val format = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_AAC).build()
+        inputs.observeCurrent(active); inputs.video(active, format); inputs.audio(active, format)
+        val other = ExoMetadataInputs.Context(ExoMetadataInputs.Load(), MediaPeriodId("other", 2L))
+        inputs.disableAudio(other)
+        assertEquals(format, inputs.snapshot(active.load, "A").second)
+        inputs.disableAudio(active)
+        assertNull(inputs.snapshot(active.load, "A").second)
+        assertEquals(format, inputs.snapshot(active.load, "A").first)
+        inputs.disableVideo(null) // Missing attribution omits facts; it never fabricates a period.
+        assertNull(inputs.snapshot(active.load, "A").first)
+    }
+
+    @Test
+    fun `same load disable retires prebuffered input from another reading period`() {
+        val inputs = ExoMetadataInputs()
+        val tag = inputs.begin()
+        val playing = ExoMetadataInputs.Context(tag, MediaPeriodId("P1", 1L))
+        val reading = ExoMetadataInputs.Context(tag, MediaPeriodId("P2", 2L))
+        val format = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_AAC).build()
+        inputs.observeCurrent(playing)
+        inputs.audio(reading, format); inputs.video(reading, format)
+        inputs.disableAudio(playing); inputs.disableVideo(playing)
+        inputs.observeCurrent(reading)
+        assertNull(inputs.snapshot(tag, "P2").first)
+        assertNull(inputs.snapshot(tag, "P2").second)
+        inputs.audio(reading, format); inputs.video(reading, format)
+        assertEquals(format, inputs.snapshot(tag, "P2").first)
+        assertEquals(format, inputs.snapshot(tag, "P2").second)
+    }
+
+    @Test
+    fun `metadata adapter rejects missing timeline period and negative sequence`() {
+        assertNull(exoMetadataContext(Timeline.EMPTY, 0, null))
+        assertNull(exoMetadataContext(Timeline.EMPTY, 0, MediaPeriodId("missing", 1L)))
+        val inputs = ExoMetadataInputs()
+        val invalid = ExoMetadataInputs.Context(inputs.begin(), MediaPeriodId("A", -1L))
+        inputs.observeCurrent(invalid)
+        inputs.video(invalid, Format.Builder().setWidth(1920).setHeight(1080).build())
+        assertNull(inputs.snapshot(invalid.load, "A").first)
+    }
+
+    @Test
+    fun `metadata engine hooks retire before release and never sample retained format caches`() {
+        val source = readSource("ExoPlayerEngine.kt")
+        val metadataStart = source.indexOf("private fun activeMetadata()")
+        val metadataEnd = source.indexOf("private fun mapTracks(", metadataStart)
+        assertTrue(metadataStart >= 0 && metadataEnd > metadataStart)
+        val metadata = source.substring(metadataStart, metadataEnd)
+        assertFalse(metadata.contains("player.videoFormat"))
+        assertFalse(metadata.contains("player.audioFormat"))
+        assertEquals(2, source.split(".setTag(metadataLoad)").size - 1)
+        assertTrue(source.contains("player.addAnalyticsListener(metadataListener)"))
+        assertTrue(source.contains("player.removeAnalyticsListener(metadataListener)"))
+        val releaseStart = source.indexOf("override fun release()")
+        val release = source.substring(releaseStart, source.indexOf("@Composable", releaseStart))
+        assertTrue(release.indexOf("metadataInputs.release()") < release.indexOf("player.release()"))
+        assertTrue(release.indexOf("copy(metadata = PlaybackMetadata())") < release.indexOf("player.release()"))
+        assertTrue(source.contains("if (metadataInputs.isReleased) return"))
+        assertTrue(source.contains("metadataInputs.fail()\n            _state.value = _state.value.withPlaybackError()"))
     }
 
     private fun readSource(name: String): String {

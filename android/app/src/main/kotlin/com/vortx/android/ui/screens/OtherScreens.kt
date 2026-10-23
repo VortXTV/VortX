@@ -1,5 +1,8 @@
 package com.vortx.android.ui.screens
 
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.FilterList
+import com.vortx.android.diagnostics.DiagnosticsLog
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -287,6 +290,8 @@ fun LibraryScreen(
     onDownloads: (() -> Unit)? = null,
     onWatchlist: (() -> Unit)? = null,
     onPreviouslyWatched: (() -> Unit)? = null,
+    onSmartCollections: (() -> Unit)? = null,
+    onNetworkShares: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
@@ -303,8 +308,8 @@ fun LibraryScreen(
 
     val libraryHeader: @Composable () -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
-            if (onDownloads != null || onWatchlist != null || onPreviouslyWatched != null) {
-                LibraryEntryCards(onDownloads, onWatchlist, onPreviouslyWatched)
+            if (onDownloads != null || onWatchlist != null || onPreviouslyWatched != null || onSmartCollections != null || onNetworkShares != null) {
+                LibraryEntryCards(onDownloads, onWatchlist, onPreviouslyWatched, onSmartCollections, onNetworkShares)
             }
             when (val landing = landingState) {
                 is UiState.Loading -> Unit
@@ -354,11 +359,21 @@ private fun LibraryEntryCards(
     onDownloads: (() -> Unit)?,
     onWatchlist: (() -> Unit)?,
     onPreviouslyWatched: (() -> Unit)?,
+    onSmartCollections: (() -> Unit)? = null,
+    onNetworkShares: (() -> Unit)? = null,
 ) {
+    val smartTitle = androidx.compose.ui.res.stringResource(com.vortx.android.R.string.smart_collections_title)
+    val smartSubtitle = androidx.compose.ui.res.stringResource(com.vortx.android.R.string.smart_collections_library_subtitle)
     val entries: @Composable (Modifier) -> Unit = { cardModifier ->
         onDownloads?.let { LibraryEntryCard("Downloads", "Offline", VortXIcons.download, it, cardModifier) }
         onWatchlist?.let { LibraryEntryCard("Watchlist", "Plan to watch", VortXIcons.starFill, it, cardModifier) }
         onPreviouslyWatched?.let { LibraryEntryCard("Watched", "History", VortXIcons.clock, it, cardModifier) }
+        onSmartCollections?.let {
+            LibraryEntryCard(smartTitle, smartSubtitle, androidx.compose.material.icons.Icons.Filled.FilterList, it, cardModifier)
+        }
+        onNetworkShares?.let {
+            LibraryEntryCard("Network shares", "NAS and computers", androidx.compose.material.icons.Icons.Filled.Storage, it, cardModifier)
+        }
     }
     BoxWithConstraints(Modifier.fillMaxWidth().padding(vertical = VortXTheme.spacing.sm)) {
         if (maxWidth >= 600.dp) {
@@ -618,6 +633,7 @@ fun SettingsScreen(
     onWatchStatsClick: () -> Unit,
     onWhatsNewClick: () -> Unit,
     settingsScrollState: ScrollState,
+    onDiagnosticsClick: (() -> Unit)? = null,
     debridServicesFocusRequester: FocusRequester,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
@@ -745,6 +761,9 @@ fun SettingsScreen(
         // (com.vortx.android.stats). It reads the engine buckets (owner) or the private overlay (shared
         // profile) per the history boundary and never writes any watched state.
         SettingRow(VortXIcons.checkmarkCircle, "Watch Stats", "Your year in review", onClick = onWatchStatsClick)
+        onDiagnosticsClick?.let {
+            SettingRow(VortXIcons.download, "Diagnostics", if (DiagnosticsLog.probeEnabled) "Logging on" else "Logging off", onClick = it)
+        }
         SettingRow(
             VortXIcons.checkmarkCircle,
             "What's New",

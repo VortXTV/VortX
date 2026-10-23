@@ -76,6 +76,31 @@ class EngineStateStreamProgressTest {
     }
 
     @Test
+    fun streamDetailsFallBackToTheOlderTitleField() {
+        // Debridio and Torrentio-style add-ons put the file name and size in `title`, newer ones in `description`.
+        val json =
+            """
+            {
+              "streams": [
+                {
+                  "request":{"base":"https://debridio.invalid","path":{"id":"tt1"}},
+                  "content":{"type":"Ready","content":[
+                    {"name":"Debridio 1080p","title":"Movie.2024.1080p.WEB.mkv\n4.2 GB","url":"https://a.invalid/1"},
+                    {"name":"Newer 4K","description":"Movie.2024.2160p.mkv\n18 GB","title":"ignored","url":"https://a.invalid/2"},
+                    {"name":"Bare 720p","url":"https://a.invalid/3"}
+                  ]}
+                }
+              ]
+            }
+            """.trimIndent()
+        val streams = EngineState.parseStreamGroups(json).single().streams
+        assertEquals("Movie.2024.1080p.WEB.mkv\n4.2 GB", streams[0].description)
+        assertEquals("Movie.2024.2160p.mkv\n18 GB", streams[1].description)
+        assertEquals(null, streams[2].description)
+        assertEquals("Debridio 1080p", streams[0].title)
+    }
+
+    @Test
     fun newerStreamLoadGenerationSupersedesOlderRequest() {
         val fence = StreamLoadDispatchGate()
         val old = fence.begin()

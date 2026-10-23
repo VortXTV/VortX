@@ -42,6 +42,9 @@ typealias PlayerLoadToken = Int
     var nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()
     var nativePreAttachTask: Task<Void, Never>?
     var nativePreAttachDeadlineTask: Task<Void, Never>?
+    var replacementReadyDeadlineTask: Task<Void, Never>?
+    var coldRemuxCancellations = 0
+    func cancelColdLocalRemuxPreparation() { coldRemuxCancellations += 1 }
     var nativeDisplayCriteria: AVDisplayCriteria?
     var fatalErrorEmitted = false
     var terminalLatch = Terminal()
@@ -117,7 +120,12 @@ typealias PlayerLoadToken = Int
         let stopped = PreflightFixtureEngine(), stoppedAsset = AVAsset(), stoppedItem = AVPlayerItem()
         start(stopped, stoppedAsset, stoppedItem)
         await flush()
+        let replacementDeadline = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        stopped.replacementReadyDeadlineTask = replacementDeadline
         stopped.invalidateLoadToken() // Same production cancellation used first by stop().
+        check("stop invalidation cancels replacement deadline and cold remux ownership",
+              replacementDeadline.isCancelled && stopped.replacementReadyDeadlineTask == nil
+                && stopped.coldRemuxCancellations == 1)
         stoppedAsset.finish(AVDisplayCriteria())
         await flush()
         check("stop invalidation prevents late attach and criteria", stopped.player.currentItem == nil

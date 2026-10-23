@@ -1,37 +1,25 @@
 package com.vortx.android.ui.components
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.Placeable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.vortx.android.ratings.CardRatingStore
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.RatingsFormat
 import com.vortx.android.ui.theme.VortXGlass
-import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
-import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 
 /**
@@ -42,8 +30,9 @@ import com.vortx.android.ui.theme.vortxGlass
  * passes `!PosterArtwork.bakesRatings(forId = id)`), i.e. when the art is clean.
  *
  * It renders the SAME cross-provider set the detail row and the baked poster do (IMDb + RT + MC + TMDB,
- * formatted once in [RatingsFormat]), capped by [maxScores]. Values are looked up by id from VortX's own
- * keyless ratings service (the SAME numbers the baker uses), async and fail-soft via the process-memoized
+ * formatted once in [RatingsFormat]), as many as fit the card's width ([maxScores] caps it outright).
+ * Values are looked up by id from VortX's own keyless ratings service (the SAME numbers the baker
+ * uses), async and fail-soft via the process-memoized
  * [CardRatingStore]: nothing shows until a rating resolves, a miss (non-`tt` id, offline, or no rating)
  * shows nothing, and a title carrying only IMDb shows only IMDb. Results are memoized per id so scrolling a
  * rail never refetches.
@@ -53,9 +42,8 @@ fun CardRatingBadge(
     id: String,
     type: String,
     active: Boolean = true,
-    glyphSize: Int = 8,
     textSize: Int = 10,
-    maxScores: Int = 2,
+    maxScores: Int? = null,
     modifier: Modifier = Modifier,
 ) {
     var ratings by remember(id) { mutableStateOf<MdbListRatings?>(null) }
@@ -70,29 +58,38 @@ fun CardRatingBadge(
     if (!active || resolved == null) return
     val tokens = RatingsFormat.tokens(resolved, limit = maxScores)
     if (tokens.isEmpty()) return
-    RatingBadgePlate(tokens = tokens, glyphSize = glyphSize, textSize = textSize, modifier = modifier)
+    RatingBadgePlate(tokens = tokens, textSize = textSize, modifier = modifier)
 }
 
 /**
- * The badge itself: ONE capsule of VortX glass, sized tight to its scores, floating over the artwork. The
- * IMDb value is the anchor (a third larger, its decimal set apart), a hairline divider sets it off from the
- * aggregators, and each aggregator is a tracked uppercase lettermark followed by its value. Digits are
- * monospaced so a scrolling rail never reflows. Mirrors Apple `RatingBadgePlate`.
+ * The plate for scores already in hand (an episode's IMDb / TMDB / Trakt), with the same fit-to-width
+ * behaviour as [CardRatingBadge].
+ */
+@Composable
+fun RatingScoresPlate(
+    ratings: MdbListRatings,
+    textSize: Int = 11,
+    modifier: Modifier = Modifier,
+) {
+    val tokens = RatingsFormat.tokens(ratings)
+    if (tokens.isEmpty()) return
+    RatingBadgePlate(tokens = tokens, textSize = textSize, modifier = modifier)
+}
+
+/**
+ * The badge itself: ONE capsule of VortX glass, sized tight to its scores, floating over the artwork. Each score
+ * is its service's mark beside the value ([RatingScore]), so the plate reads at a glance with no lettermarks to
+ * decode. Every score is measured at its natural size, then as many as the card's width holds are placed, in
+ * priority order (headline scores first); nothing is squeezed or wrapped. Mirrors Apple `RatingBadgePlate`.
  */
 @Composable
 private fun RatingBadgePlate(
     tokens: List<RatingsFormat.Token>,
-    glyphSize: Int,
     textSize: Int,
     modifier: Modifier = Modifier,
 ) {
-    val colors = VortXTheme.colors
-    val figure = (textSize * 1.3f)
-    val decimal = (figure * 0.76f)
-    val valueSize = maxOf(textSize * 0.88f, 9f)
-    val markSize = maxOf(textSize * 0.72f, 8f)
-
-    Row(
+    val gap = (textSize * 0.75f).dp
+    Layout(
         modifier = modifier
             .clip(VortXShapes.pill)
             .vortxGlass(
@@ -100,106 +97,31 @@ private fun RatingBadgePlate(
                 fillAlpha = VortXGlass.badgeFillAlpha,
                 shadow = VortXGlass.Shadow.disc,
             )
-            .padding(horizontal = 7.dp, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        tokens.forEachIndexed { index, token ->
-            if (index > 0) {
-                if (tokens[index - 1].isImdb) {
-                    // Hairline divider that sets the anchor apart from the aggregators (Apple `divider`).
-                    Box(
-                        modifier = Modifier
-                            .padding(horizontal = 5.dp)
-                            .size(width = 1.dp, height = (figure * 0.72f).dp)
-                            .clip(VortXShapes.pill)
-                            .background(colors.textPrimary.copy(alpha = 0.22f)),
-                    )
-                } else {
-                    Spacer(Modifier.width((textSize * 0.5f).dp))
-                }
-            }
-            if (token.isImdb) {
-                Anchor(token, colors.accent, colors.textPrimary, colors.textSecondary, figure, decimal, glyphSize)
-            } else {
-                Aggregator(token, colors.textTertiary, colors.textSecondary, markSize, valueSize)
+            .padding(start = (textSize * 0.4f).dp, end = (textSize * 0.7f).dp, top = (textSize * 0.36f).dp,
+                bottom = (textSize * 0.36f).dp)
+            .semantics {
+                contentDescription = "Ratings: " + tokens.joinToString(", ") { "${it.label} ${it.value}" }
+            },
+        content = { tokens.forEach { token -> RatingScore(token, textSize) } },
+    ) { measurables, constraints ->
+        val gapPx = gap.roundToPx()
+        val placed = ArrayList<Placeable>(measurables.size)
+        var width = 0
+        var height = 0
+        for (measurable in measurables) {
+            val placeable = measurable.measure(Constraints())
+            val next = width + (if (placed.isEmpty()) 0 else gapPx) + placeable.width
+            if (placed.isNotEmpty() && next > constraints.maxWidth) break
+            placed += placeable
+            width = next
+            height = maxOf(height, placeable.height)
+        }
+        layout(width, height) {
+            var x = 0
+            for (placeable in placed) {
+                placeable.placeRelative(x, (height - placeable.height) / 2)
+                x += placeable.width + gapPx
             }
         }
     }
-}
-
-@Composable
-private fun Anchor(
-    token: RatingsFormat.Token,
-    accent: Color,
-    primary: Color,
-    secondary: Color,
-    figureSize: Float,
-    decimalSize: Float,
-    glyphSize: Int,
-) {
-    val (head, tail) = splitDecimal(token.value)
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        Icon(
-            imageVector = VortXIcons.starFill,
-            contentDescription = null,
-            tint = accent,
-            modifier = Modifier.size(glyphSize.dp),
-        )
-        Row(verticalAlignment = Alignment.Bottom) {
-            Text(
-                text = head,
-                color = primary,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = figureSize.sp,
-            )
-            if (tail.isNotEmpty()) {
-                Text(
-                    text = tail,
-                    color = secondary,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = decimalSize.sp,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun Aggregator(
-    token: RatingsFormat.Token,
-    labelColor: Color,
-    valueColor: Color,
-    markSize: Float,
-    valueSize: Float,
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        Text(
-            text = token.label.uppercase(),
-            color = labelColor,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = markSize.sp,
-            textAlign = TextAlign.Center,
-        )
-        Text(
-            text = token.value,
-            color = valueColor,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = valueSize.sp,
-        )
-    }
-}
-
-/** "8.3" -> ("8", ".3"); a percentage or a bare metascore comes back whole. Apple `splitDecimal`. */
-private fun splitDecimal(v: String): Pair<String, String> {
-    val dot = v.indexOf('.')
-    return if (dot < 0) v to "" else v.substring(0, dot) to v.substring(dot)
 }

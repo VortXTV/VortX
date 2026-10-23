@@ -162,7 +162,7 @@ function preferredFocus(roots: HTMLElement[]): HTMLElement | null {
     if (entry) return entry;
   }
   const activeTab = document.querySelector<HTMLElement>(".tab.active");
-  if (activeTab && isDisplayed(activeTab)) return activeTab;
+  if (activeTab && roots.some((root) => root.contains(activeTab)) && isDisplayed(activeTab)) return activeTab;
   return focusablesIn(roots)[0] ?? null;
 }
 

@@ -51,7 +51,7 @@ private struct BackToTopButton: ViewModifier {
     let bottomInset: CGFloat   // clearance so the button floats ABOVE the bottom tab bar
 
     @ObservedObject private var visibility = BackToTopVisibility.shared
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     func body(content: Content) -> some View {
         // Gate on `active` too, so a stale latch on a hidden/opacity-0 screen (or a screen swapped to a

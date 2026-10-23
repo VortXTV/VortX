@@ -106,9 +106,11 @@ class VortXAppDebridOwnerContractTest {
             settingsSource.contains("Modifier.focusRequester(debridServicesFocusRequester)")
 
     private companion object {
+        // The generation also carries the Continue Watching admission identity; the source epoch is the
+        // part this contract protects.
         const val BOUNDED_OWNER_GENERATION =
             """detail?.let {
-                "${'$'}{it.type}:${'$'}{it.id}:${'$'}{detailEpisodeRouteKey(it.preferredEpisode)}:${'$'}detailSourceEpoch"
+                "${'$'}{it.type}:${'$'}{it.id}:${'$'}{detailEpisodeRouteKey(it.preferredEpisode)}:${'$'}detailSourceEpoch:${'$'}{it.continueWatchingAdmission?.let(System::identityHashCode)}"
             }"""
         const val PLAYER_BOUNDED_OWNER =
             """viewModelStoreOwner = detailVmOwner,

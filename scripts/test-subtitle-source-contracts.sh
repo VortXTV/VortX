@@ -5,6 +5,17 @@ cd "$repo_root"
 build_dir="$repo_root/app/build/source-contracts"
 mkdir -p "$build_dir"
 
+{
+  printf '%s\n' 'import Foundation' 'enum MPVSubtitleAdmission {'
+  sed -n '/^    private static func acceptsExternalSubtitleURL(/,/^    }/p' \
+    app/Sources/Player/MPVMetalViewController.swift | sed 's/private static func/static func/'
+  printf '%s\n' '}'
+} > "$build_dir/mpv-subtitle-url-admission.swift"
+swiftc -parse-as-library -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+  "$build_dir/mpv-subtitle-url-admission.swift" app/Tests/MPVSubtitleURLAdmissionTests.swift \
+  -o "$build_dir/mpv-subtitle-url-admission"
+"$build_dir/mpv-subtitle-url-admission"
+
 swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/SubtitleStyle.swift app/Tests/SubtitleStyleBackgroundTests.swift \
   -o "$build_dir/subtitle-style-background"

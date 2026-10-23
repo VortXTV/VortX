@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -218,23 +219,99 @@ private fun TvSourceListContent(
         // These tabs scroll to a section in the complete ordered list; selecting an add-on never filters
         // away its neighbors or changes the user's installed add-on order.
         if (groups.size > 1) {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-                item(key = "sources-all") {
-                    TvFilterChip("All ($total)", jumpGroupKey == null, onClick = { requestJump(null) }, modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() })
-                }
-                itemsIndexed(groups, key = { index, group -> tvSourceGroupKey(group, index) }) { index, group ->
-                    val key = tvSourceGroupKey(group, index)
-                    TvFilterChip(
-                        label = "${group.addon} (${group.streams.size})",
-                        selected = jumpGroupKey == key,
-                        onClick = { requestJump(key) },
-                        modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() },
-                    )
-                }
-            }
+            TvSourceSectionTabs(
+                groups = groups,
+                total = total,
+                jumpGroupKey = jumpGroupKey,
+                onJump = ::requestJump,
+                onFocused = ::acceptFocus,
+            )
         }
+        TvSourceResultsList(
+            items = items,
+            listState = listState,
+            total = total,
+            best = best,
+            resolving = resolving,
+            failure = failure,
+            downloadNotice = downloadNotice,
+            pin = pin,
+            entryNoun = entryNoun,
+            pinMenuFor = pinMenuFor,
+            groupFocus = groupFocus,
+            hasMore = hasMore,
+            remainingRows = expandableTotal - shownRows,
+            onToggle = { entry ->
+                collapsed = if (entry.collapsed) collapsed - entry.key else collapsed + entry.key
+            },
+            onPinMenuChange = { pinMenuFor = it },
+            onShowMore = { renderLimit += TV_SOURCE_WINDOW_STEP },
+            onFocused = ::acceptFocus,
+            onPlay = onPlay,
+            onPlayWithEngine = onPlayWithEngine,
+            onDownload = onDownload,
+            onPin = onPin,
+            onUnpin = onUnpin,
+            modifier = Modifier.fillMaxWidth().weight(1f),
+        )
+    }
+}
+
+/// Rendering-only leaf: state, jump leases and FocusRequesters stay in TvSourceListContent.
+@Composable
+private fun TvSourceSectionTabs(
+    groups: List<StreamGroup>,
+    total: Int,
+    jumpGroupKey: String?,
+    onJump: (String?) -> Unit,
+    onFocused: () -> Unit,
+) {
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+        item(key = "sources-all") {
+            TvFilterChip("All ($total)", jumpGroupKey == null, onClick = { onJump(null) }, modifier = Modifier.onFocusChanged { if (it.isFocused) onFocused() })
+        }
+        itemsIndexed(groups, key = { index, group -> tvSourceGroupKey(group, index) }) { index, group ->
+            val key = tvSourceGroupKey(group, index)
+            TvFilterChip(
+                label = "${group.addon} (${group.streams.size})",
+                selected = jumpGroupKey == key,
+                onClick = { onJump(key) },
+                modifier = Modifier.onFocusChanged { if (it.isFocused) onFocused() },
+            )
+        }
+    }
+}
+
+/// Keep the bounded keyed list in its own non-inline Compose method, not the state owner's body.
+@Composable
+private fun TvSourceResultsList(
+    items: List<TvSourceItem>,
+    listState: LazyListState,
+    total: Int,
+    best: StreamSource?,
+    resolving: Boolean,
+    failure: String?,
+    downloadNotice: String?,
+    pin: DetailViewModel.PinUi,
+    entryNoun: String,
+    pinMenuFor: String?,
+    groupFocus: Map<String, FocusRequester>,
+    hasMore: Boolean,
+    remainingRows: Int,
+    onToggle: (TvSourceItem.Header) -> Unit,
+    onPinMenuChange: (String?) -> Unit,
+    onShowMore: () -> Unit,
+    onFocused: () -> Unit,
+    onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
+    onDownload: (StreamSource) -> Unit,
+    onPin: (StreamSource, SourcePinScope) -> Unit,
+    onUnpin: (SourcePinScope) -> Unit,
+    modifier: Modifier,
+) {
+    val colors = VortXTheme.colors
     LazyColumn(
-        modifier = Modifier.fillMaxWidth().weight(1f),
+        modifier = modifier,
         state = listState,
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
         contentPadding = PaddingValues(bottom = TvDimens.edge),
@@ -252,7 +329,7 @@ private fun TvSourceListContent(
         // source straight away (the same [DetailViewModel.bestSource] the hero Watch button uses).
         best?.let { top ->
             item(key = "sources-best") {
-                TvBestSourceRow(source = top, enabled = !resolving, onPlay = { onPlay(top) }, onFocused = ::acceptFocus)
+                TvBestSourceRow(source = top, enabled = !resolving, onPlay = { onPlay(top) }, onFocused = onFocused)
             }
         }
 
@@ -279,10 +356,8 @@ private fun TvSourceListContent(
                     collapsed = entry.collapsed,
                     modifier = Modifier
                         .then(groupFocus[entry.key]?.let { Modifier.focusRequester(it) } ?: Modifier)
-                        .onFocusChanged { if (it.isFocused) acceptFocus() },
-                    onToggle = {
-                        collapsed = if (entry.collapsed) collapsed - entry.key else collapsed + entry.key
-                    },
+                        .onFocusChanged { if (it.isFocused) onFocused() },
+                    onToggle = { onToggle(entry) },
                 )
                 is TvSourceItem.Row -> {
                     val menuKey = "${entry.groupKey}|${entry.source.id}"
@@ -295,14 +370,14 @@ private fun TvSourceListContent(
                         pin = pin,
                         entryNoun = entryNoun,
                         menuOpen = pinMenuFor == menuKey,
-                        onOpenMenu = { pinMenuFor = menuKey },
-                        onDismissMenu = { pinMenuFor = null },
+                        onOpenMenu = { onPinMenuChange(menuKey) },
+                        onDismissMenu = { onPinMenuChange(null) },
                         onPlay = onPlay,
                         onPlayWithEngine = onPlayWithEngine,
                         onDownload = onDownload,
                         onPin = onPin,
                         onUnpin = onUnpin,
-                        onFocused = ::acceptFocus,
+                        onFocused = onFocused,
                     )
                 }
             }
@@ -311,14 +386,13 @@ private fun TvSourceListContent(
         if (hasMore) {
             item(key = "sources-show-more") {
                 TvFilterChip(
-                    label = "Show more · ${expandableTotal - shownRows} more",
+                    label = "Show more · $remainingRows more",
                     selected = false,
-                    onClick = { renderLimit += TV_SOURCE_WINDOW_STEP },
-                    modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() },
+                    onClick = onShowMore,
+                    modifier = Modifier.onFocusChanged { if (it.isFocused) onFocused() },
                 )
             }
         }
-    }
     }
 }
 

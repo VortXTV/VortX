@@ -19,7 +19,11 @@ class NativeNzbRoutingTest {
         val calls = mutableListOf<List<String>>()
         val result = NativeNzbRouting.resolve(mirrors, addon, saved, null, true, isCurrent = { true },
             local = { urls, providers -> assertEquals(mirrors, urls); calls += providers; throw NativeNzbTransport.Unavailable() },
-            torBox = { url -> assertEquals(mirrors.first(), url); calls += listOf("cloud"); "https://cloud.invalid/media" })
+            torBox = { url, allowCreate ->
+                assertEquals(mirrors.first(), url)
+                assertFalse("own providers saved: cloud may only reuse an existing job", allowCreate)
+                calls += listOf("cloud"); "https://cloud.invalid/media"
+            })
         assertEquals(listOf(addon, saved, listOf("cloud")), calls)
         assertEquals("https://cloud.invalid/media", result?.url)
     }
@@ -28,7 +32,7 @@ class NativeNzbRoutingTest {
         var closed = 0
         val result = NativeNzbRouting.resolve(mirrors, addon, saved, null, true, isCurrent = { true },
             local = { _, providers -> assertEquals(addon, providers); NativeNzbPlayback("http://127.0.0.1:1/stream", AutoCloseable { closed++ }) },
-            torBox = { fail("Unexpected cloud"); null })
+            torBox = { _, _ -> fail("Unexpected cloud"); null })
         assertEquals(0, closed)
         requireNotNull(result).lease.close()
         assertEquals(1, closed)
@@ -37,13 +41,38 @@ class NativeNzbRoutingTest {
     @Test fun `positively cached TorBox mirror is selected without any local route`() = runBlocking {
         val result = NativeNzbRouting.resolve(mirrors, addon, saved, setOf(mirrors[1]), true, isCurrent = { true },
             local = { _, _ -> error("Cached cloud selection must not open native NNTP") },
-            torBox = { assertEquals(mirrors[1], it); "https://cloud.invalid/cached" })
+            torBox = { url, allowCreate -> assertEquals(mirrors[1], url); assertTrue(allowCreate); "https://cloud.invalid/cached" })
         assertEquals("https://cloud.invalid/cached", result?.url)
     }
 
     @Test fun `uncached gate permits local but never cloud add`() = runBlocking {
         assertNull(NativeNzbRouting.resolve(mirrors, emptyList(), emptyList(), emptySet(), true,
-            isCurrent = { true }, local = { _, _ -> error("No providers") }, torBox = { error("Not cache confirmed") }))
+            isCurrent = { true }, local = { _, _ -> error("No providers") }, torBox = { _, _ -> error("Not cache confirmed") }))
+    }
+
+    @Test fun `without saved providers the cloud fallback may start a download`() = runBlocking {
+        var allowed: Boolean? = null
+        NativeNzbRouting.resolve(mirrors, addon, emptyList(), null, true, isCurrent = { true },
+            local = { _, _ -> throw NativeNzbTransport.Unavailable() },
+            torBox = { _, allowCreate -> allowed = allowCreate; "https://cloud.invalid/media" })
+        assertEquals(true, allowed)
+    }
+
+    @Test fun `add-on pattern alone is the second selection only when the add-on gave one`() {
+        val strict = NativeNzbTransport.Selection(3, "/Naruto - 088/i", 2, 53)
+        assertEquals(NativeNzbTransport.Selection(fileMustInclude = "/Naruto - 088/i"), strict.addonPatternOnly)
+        assertNull(NativeNzbTransport.Selection(3, null, 2, 53).addonPatternOnly)
+        assertNull(NativeNzbTransport.Selection(fileMustInclude = "/x/").addonPatternOnly)
+    }
+
+    @Test fun `file patterns accept bare and JavaScript forms`() {
+        assertTrue(UsenetFilePattern.compile("/naruto - 088/i")!!.containsMatchIn("Naruto - 088.mkv"))
+        assertFalse(UsenetFilePattern.compile("naruto")!!.containsMatchIn("Naruto.mkv"))
+        assertTrue(UsenetFilePattern.compile("/a\\/b/")!!.containsMatchIn("x a/b y"))
+        assertNull(UsenetFilePattern.compile("/x/q"))
+        assertNull(UsenetFilePattern.compile("/x/ii"))
+        assertNull(UsenetFilePattern.compile(""))
+        assertNull(UsenetFilePattern.compile("/(/"))
     }
 
     @Test fun `owner change cancels pending resolve and never proceeds to saved or cloud`() = runBlocking {
@@ -56,7 +85,7 @@ class NativeNzbRoutingTest {
                     local = { _, providers ->
                         assertEquals(addon, providers); entered.complete(Unit)
                         try { awaitCancellation() } finally { released.complete(Unit) }
-                    }, torBox = { error("Retired cloud request") })
+                    }, torBox = { _, _ -> error("Retired cloud request") })
             } catch (_: CancellationException) { null }
         }
         entered.await(); active.set(false)
@@ -70,7 +99,7 @@ class NativeNzbRoutingTest {
         try {
             NativeNzbRouting.resolve(mirrors, addon, saved, null, false, isCurrent = { active },
                 local = { _, _ -> active = false; NativeNzbPlayback("local", AutoCloseable { closed++ }) },
-                torBox = { error("No cloud") })
+                torBox = { _, _ -> error("No cloud") })
             fail("Retired result accepted")
         } catch (_: CancellationException) { }
         assertEquals(1, closed)
@@ -81,7 +110,7 @@ class NativeNzbRoutingTest {
         try {
             NativeNzbRouting.resolve(mirrors, addon, saved, null, true, isCurrent = { true },
                 local = { _, _ -> attempted++; throw CancellationException("fixture") },
-                torBox = { error("Cancellation must not start cloud") })
+                torBox = { _, _ -> error("Cancellation must not start cloud") })
             fail("Cancellation swallowed")
         } catch (_: CancellationException) { }
         assertEquals(1, attempted)

@@ -38,7 +38,7 @@ actor FixtureWarmGate {
     func release() { continuation?.resume(); continuation = nil }
 }
 enum DebridService: String, Sendable { case torBox }
-enum DebridError: Error, Equatable { case noKey, sessionChanged, notReady, providerError(String) }
+enum DebridError: Error, Equatable { case noKey, sessionChanged, notReady, notCached, providerError(String) }
 enum DebridPlaybackAvailability {
     struct Availability { let canResolveUsenetRemotely = true }
     static let shared = Availability()
@@ -56,14 +56,22 @@ actor FixtureCloudResolver {
     func setError(_ value: DebridError?) { responseError = value }
     func hasJob(nzbURL: String, knownHash: String?) -> Bool { existingJob }
     func isWaiting(nzbURL: String, knownHash: String?) -> Bool { existingJob && responseError == .notReady }
+    /// Whether the last cloud resolve was allowed to start a new provider download.
+    var lastAllowCreate: Bool?
     func gateOutput(_ gate: FixtureWarmGate?) { outputGate = gate }
     func resolve(nzbUrl: String, knownHash: String?, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
+                 allowCreate: Bool = true,
                  ownerIsCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> URL {
+        guard await ownerIsCurrent() else { throw CancellationError() }
         calls += 1
+        lastAllowCreate = allowCreate
+        // Mirrors the real resolver: with no job to reuse, a withheld create is "not cached".
+        if !allowCreate, !existingJob { throw DebridError.notCached }
         if let delay { try await Task.sleep(for: delay) }
         if let responseError { throw responseError }
         let gate = outputGate; outputGate = nil
         await gate?.wait()
+        guard await ownerIsCurrent() else { throw CancellationError() }
         return URL(string: "https://fixture.invalid/cloud")!
     }
 }

@@ -18,7 +18,7 @@
 # WHAT IS PINNED (exact SHAs, never a moving master, so builds are reproducible)
 #   mpv        8c67647b50059406c5c0444903597281b81516cf  master, 2026-07-24
 #   libplacebo 4c426e466814536def653cb23f1d1c287ea7a7f5  master, 2026-07-24, PL_API_VER 371
-#   FFmpeg     6e85193417f898868f04f8f6fc30db92a874a8cf  release/9.0 tip, 2026-07-25
+#   FFmpeg     946fcce07b6dcd0331c8cc609192aeff5e1924f8  n9.0.2 maintenance
 #
 # FFmpeg MOVED, and this paragraph is the record of why and of what it cost. The pin was n8.1.2
 # (libavcodec 62.28.102, libavformat 62.12.102). At that version the `dovi_split` bitstream filter
@@ -47,10 +47,10 @@
 # with no trust anchors and every open fails with EIO. SecureTransport uses the Apple trust store
 # while retaining certificate and hostname verification.
 #
-# release/9.0 is a BRANCH, not a tag. No n9* tag existed when this pin was taken, so the SHA is the
-# pin and BuildFFMPEG.beforeBuild clones `--branch release/9.0` before detaching onto it: the tip of
-# a maintenance branch is not reachable from master, so a default-branch clone would not contain it
-# at any depth. Re-verify the SHA if you re-cut this; take the n9.0 tag once it exists.
+# The original release/9.0 pin was 6e85193417f898868f04f8f6fc30db92a874a8cf. n9.0.2 is its
+# descendant (169 commits ahead / none behind), retaining the DV/FEL APIs while adding maintenance
+# fixes. BuildFFMPEG.beforeBuild now clones the exact n9.0.2 tag and detaches at 946fcce07b6d.
+# The versioned FFmpeg-9.0.2-946fcce0 source/output directory cannot reuse the old 9.0 source cache.
 #
 # WHAT THE REBASE ACTUALLY COST, measured rather than feared. MPVKit ships NO FFmpeg patches at all
 # (Sources/BuildScripts/patch/ contains only libmpv/), so there was nothing to rebase. The entire

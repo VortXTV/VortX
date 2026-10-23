@@ -67,74 +67,80 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
     data class MetadataRequest(val scope: Scope, val addon: AuthorizedAddon, val type: String, val metaID: String)
     class MetadataResponse(val request: MetadataRequest, raw: ByteArray) { val raw: ByteArray = raw.copyOf() }
 
-    class Evidence(
-        val scope: Scope,
-        val rowLocator: SourceRowLocator,
-        val metaID: String,
-        val watchedBitfield: String,
-        val addon: AuthorizedAddon,
-        source: ByteArray,
-        val sourceSHA256: String,
-        metadata: ByteArray,
-        val metadataSHA256: String,
-        val inventory: List<LegacyWatchedBitfieldEpisode>,
-        /** Bare source facts only; `ma` / `ua` precedence remains with the legacy reducer. */
+    /** Immutable strict source capture shared by every row from the same authenticated source.
+     * Public byte getters are defensive; no caller can mutate a retained evidence source. */
+    class SourceMaterial(source: ByteArray) {
+        private val snapshot = source.copyOf()
+        private val tree = StrictJson.value(snapshot)
+        val sha256: String = sha256(snapshot)
+        val base64: String by lazy { Base64.getEncoder().encodeToString(snapshot) }
+        fun bytes(): ByteArray = snapshot.copyOf()
+        fun sameSource(other: SourceMaterial): Boolean = this === other || snapshot.contentEquals(other.snapshot)
+        fun validate(scope: Scope, locator: SourceRowLocator) { validatedSourceRow(tree, scope, locator) }
+        fun metaID(scope: Scope, locator: SourceRowLocator) = validatedSourceRow(tree, scope, locator).metaID
+        fun addons(locator: SourceRowLocator): List<AuthorizedAddon> {
+            if (isOwn(locator)) requireOwnEnvelope(tree)
+            return descriptorValues(tree, locator).map { value ->
+                val row = strictObject(value)
+                AuthorizedAddon(strictString(row["transportUrl"]), StrictJson.encode(row.getValue("manifest")))
+            }
+        }
+        suspend fun capture(scope: Scope, locator: SourceRowLocator, addon: AuthorizedAddon,
+                            isCurrent: () -> Boolean, fetch: suspend (MetadataRequest) -> MetadataResponse): Evidence {
+            currentCoroutineContext().ensureActive()
+            require(isCurrent()) { "Migration account admission revoked" }
+            val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
+            val row = validatedSourceRow(tree, scope, locator)
+            requireOriginalAddon(tree, locator, addonSnapshot)
+            val request = MetadataRequest(scope, addonSnapshot, "series", row.metaID)
+            val response = fetch(request)
+            currentCoroutineContext().ensureActive()
+            require(isCurrent()) { "Migration account admission revoked" }
+            require(response.request == request) { "Metadata response belongs to another request" }
+            return replay(scope, locator, addonSnapshot, response.raw, isCurrent)
+        }
+        fun replay(scope: Scope, locator: SourceRowLocator, addon: AuthorizedAddon,
+                   metadata: ByteArray, isCurrent: () -> Boolean): Evidence {
+            require(isCurrent()) { "Migration account admission revoked" }
+            val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
+            val row = validatedSourceRow(tree, scope, locator)
+            requireOriginalAddon(tree, locator, addonSnapshot)
+            val metadataSnapshot = metadata.copyOf()
+            val inventory = inventory(metadataSnapshot, row.metaID)
+            val watched = LegacyWatchedBitfieldDecoder.decode(row.watchedBitfield, inventory)
+            require(isCurrent()) { "Migration account admission revoked" }
+            return Evidence(scope, locator, row.metaID, row.watchedBitfield, addonSnapshot, this,
+                metadataSnapshot, sha256(metadataSnapshot), inventory, watched)
+        }
+    }
+
+    class Evidence internal constructor(
+        val scope: Scope, val rowLocator: SourceRowLocator, val metaID: String,
+        val watchedBitfield: String, val addon: AuthorizedAddon, internal val sourceMaterial: SourceMaterial,
+        metadata: ByteArray, val metadataSHA256: String, val inventory: List<LegacyWatchedBitfieldEpisode>,
+        /** Bare source facts only; clocked reset/mark precedence remains with the reducer. */
         val watchedVideoIDs: List<String>,
-    ) { private val sourceBytes = source.copyOf(); private val metadataBytes = metadata.copyOf(); val source get() = sourceBytes.copyOf(); val metadata get() = metadataBytes.copyOf() }
+    ) {
+        private val metadataBytes = metadata.copyOf()
+        val source get() = sourceMaterial.bytes()
+        val sourceSHA256 get() = sourceMaterial.sha256
+        val metadata get() = metadataBytes.copyOf()
+    }
 
     suspend fun capture(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
                         isCurrent: () -> Boolean, fetch: suspend (MetadataRequest) -> MetadataResponse): Evidence {
         currentCoroutineContext().ensureActive()
         require(isCurrent()) { "Migration account admission revoked" }
-        val sourceSnapshot = source.copyOf()
-        val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
-        val sourceTree = StrictJson.value(sourceSnapshot)
-        val row = validatedSourceRow(sourceTree, scope, rowLocator)
-        requireOriginalAddon(sourceTree, rowLocator, addonSnapshot)
-        val request = MetadataRequest(scope, addonSnapshot, "series", row.metaID)
-        val response = fetch(request)
-        currentCoroutineContext().ensureActive()
-        require(isCurrent()) { "Migration account admission revoked" }
-        require(response.request == request) { "Metadata response belongs to another request" }
-        return replay(scope, sourceSnapshot, rowLocator, addonSnapshot, response.raw, isCurrent)
+        return SourceMaterial(source).capture(scope, rowLocator, addon, isCurrent, fetch)
     }
-
-    /** Cold replay re-runs the same strict source/descriptor/inventory/bitmap validation without
-     * trusting archived decoded IDs or performing a metadata request. */
     fun replay(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
                metadata: ByteArray, isCurrent: () -> Boolean): Evidence {
         require(isCurrent()) { "Migration account admission revoked" }
-        val sourceSnapshot = source.copyOf()
-        val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
-        val sourceTree = StrictJson.value(sourceSnapshot)
-        val row = validatedSourceRow(sourceTree, scope, rowLocator)
-        requireOriginalAddon(sourceTree, rowLocator, addonSnapshot)
-        val metadataSnapshot = metadata.copyOf()
-        val inventory = inventory(metadataSnapshot, row.metaID)
-        val watched = LegacyWatchedBitfieldDecoder.decode(row.watchedBitfield, inventory)
-        require(isCurrent()) { "Migration account admission revoked" }
-        return Evidence(scope, rowLocator, row.metaID, row.watchedBitfield, addonSnapshot, sourceSnapshot, sha256(sourceSnapshot),
-            metadataSnapshot, sha256(metadataSnapshot), inventory, watched)
+        return SourceMaterial(source).replay(scope, rowLocator, addon, metadata, isCurrent)
     }
-
-    fun validateSource(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator) {
-        validatedSourceRow(StrictJson.value(source.copyOf()), scope, rowLocator)
-    }
-
-    /** A retry may select metadata only for the series proven by its archived source/locator. */
-    fun sourceMetaID(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator): String =
-        validatedSourceRow(StrictJson.value(source.copyOf()), scope, rowLocator).metaID
-
-    /** Preserve original manifest number lexemes while extracting source-authorized candidates.
-     * A platform JSONObject reserialization can otherwise change the descriptor being attested. */
-    fun originalAddons(source: ByteArray, rowLocator: SourceRowLocator): List<AuthorizedAddon> {
-        val tree = StrictJson.value(source.copyOf())
-        if (isOwn(rowLocator)) requireOwnEnvelope(tree)
-        return descriptorValues(tree, rowLocator).map { value ->
-            val row = strictObject(value)
-            AuthorizedAddon(strictString(row["transportUrl"]), StrictJson.encode(row.getValue("manifest")))
-        }
-    }
+    fun validateSource(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator) = SourceMaterial(source).validate(scope, rowLocator)
+    fun sourceMetaID(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator): String = SourceMaterial(source).metaID(scope, rowLocator)
+    fun originalAddons(source: ByteArray, rowLocator: SourceRowLocator): List<AuthorizedAddon> = SourceMaterial(source).addons(rowLocator)
 
     private fun validatedSourceRow(root: StrictJson.Value, scope: Scope, locator: SourceRowLocator): SourceRow {
         val index = when (locator) {

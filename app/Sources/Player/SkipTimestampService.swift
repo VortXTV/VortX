@@ -93,48 +93,40 @@ enum SkipTimestampService {
     /// Layer 2a: TheIntroDB crowd spans (any media, keyed by imdb/tmdb/tvdb id).
     private static func theIntroDB(imdbId: String, season: Int?, episode: Int?,
                                    durationSeconds: Double) async -> [SegmentCandidate] {
-        guard let idItem = queryItem(for: imdbId) else { return [] }
-        let durationBucket = Int(durationSeconds / 10) * 10
-        let key = "\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
+        guard let lookup = TheIntroDBV4.lookup(metaId: imdbId, season: season, episode: episode,
+                                              durationSeconds: durationSeconds) else { return [] }
+        let key = lookup.cacheKey
         if let cached = await SkipTimestampStore.shared.entry(for: key) {
             log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
             return candidates(from: cached.spans, duration: durationSeconds)
         }
 
-        var components = URLComponents(string: "https://api.theintrodb.org/v3/media")!
-        var items = [idItem]
-        if let season, let episode {
-            items.append(URLQueryItem(name: "season", value: String(season)))
-            items.append(URLQueryItem(name: "episode", value: String(episode)))
-        }
-        if durationSeconds > 0 {
-            // Lets the API pick the release version (theatrical/extended) closest to this rip.
-            items.append(URLQueryItem(name: "duration_ms", value: String(Int(durationSeconds * 1000))))
-        }
-        components.queryItems = items
-        guard let url = components.url else { return [] }
-
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: lookup.url)
         request.timeoutInterval = 5
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { return [] }
-            if http.statusCode == 404 {                       // known-missing: cache so we retry daily, not per play
-                log.info("\(key, privacy: .public): not in the database")
+            switch try TheIntroDBV4.read(statusCode: http.statusCode, data: data) {
+            case .notFound:
                 await SkipTimestampStore.shared.store(.miss(), for: key)
                 return []
-            }
-            guard http.statusCode == 200 else {               // rate-limit / server error: retry next play
-                log.info("\(key, privacy: .public): HTTP \(http.statusCode, privacy: .public)")
+            case .media(let spans):
+                let stored = spans.map { StoredSpan(kind: $0.kind, startMs: $0.startMs, endMs: $0.endMs) }
+                let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: stored)
+                await SkipTimestampStore.shared.store(entry, for: key)
+                return candidates(from: stored, duration: durationSeconds)
+            case .episodeList, .versions:
+                // A non-timestamp 200 is not a durable miss. Other selected providers still contribute.
+                log.info("TheIntroDB v4 returned a non-timestamp response")
+                return []
+            case .httpFailure(let status):
+                // Invalid requests, throttling, and outages are not missing media. Never retry on v3.
+                log.info("TheIntroDB v4 HTTP \(status, privacy: .public)")
                 return []
             }
-            let media = try JSONDecoder().decode(MediaResponse.self, from: data)
-            log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans fetched")
-            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans)
-            await SkipTimestampStore.shared.store(entry, for: key)
-            return candidates(from: media.spans, duration: durationSeconds)
         } catch {
-            log.info("\(key, privacy: .public): failed, \(String(describing: error), privacy: .public)")
+            // Do not persist transport/decode failure or expose the response/request in diagnostics.
+            log.info("TheIntroDB v4 transport or response failure")
             return []
         }
     }
@@ -219,24 +211,8 @@ enum SkipTimestampService {
         }
     }
 
-    /// Maps a Stremio meta id to the API's id parameter. Stremio ids are IMDB ("tt123…") from
-    /// Cinemeta, or namespaced "tmdb:123" / "tvdb:123" from TMDB/TVDB-based catalog add-ons. TMDB is
-    /// actually the database's canonical key, so those hit directly with no server-side resolution.
-    private static func queryItem(for metaId: String) -> URLQueryItem? {
-        if metaId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil {
-            return URLQueryItem(name: "imdb_id", value: metaId)
-        }
-        if metaId.hasPrefix("tmdb:"), let id = Int(metaId.dropFirst(5)) {
-            return URLQueryItem(name: "tmdb_id", value: String(id))
-        }
-        if metaId.hasPrefix("tvdb:"), let id = Int(metaId.dropFirst(5)) {
-            return URLQueryItem(name: "tvdb_id", value: String(id))
-        }
-        return nil
-    }
-
     static func supports(metaId: String) -> Bool {
-        queryItem(for: metaId) != nil || AniSkipService.supports(metaId: metaId)
+        TheIntroDBV4.supports(metaId: metaId) || AniSkipService.supports(metaId: metaId)
     }
 
     private static func candidates(from spans: [StoredSpan], duration: Double,
@@ -246,26 +222,6 @@ enum SkipTimestampService {
             let start = span.startMs.map { Double($0) / 1000 } ?? 0          // null intro start = from 0
             let end = span.endMs.map { Double($0) / 1000 } ?? duration       // null credits end = to end of file
             return SegmentCandidate(kind: kind, start: start, end: end, source: .crowdAPI, confidence: confidence)
-        }
-    }
-
-    /// TheIntroDB `/v3/media` shape: up to four arrays of `{start_ms, end_ms}`, either side nullable.
-    private struct MediaResponse: Decodable {
-        struct Span: Decodable {
-            let start_ms: Int?
-            let end_ms: Int?
-        }
-        let intro: [Span]?
-        let recap: [Span]?
-        let credits: [Span]?
-        let preview: [Span]?
-
-        var spans: [StoredSpan] {
-            func stored(_ spans: [Span]?, _ kind: String) -> [StoredSpan] {
-                (spans ?? []).map { StoredSpan(kind: kind, startMs: $0.start_ms, endMs: $0.end_ms) }
-            }
-            return stored(intro, "intro") + stored(recap, "recap")
-                + stored(credits, "credits") + stored(preview, "preview")
         }
     }
 

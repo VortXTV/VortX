@@ -1,6 +1,13 @@
 import { escapeHtml, actionOf } from "../lib/dom";
 import { currentSession } from "../lib/account";
-import { qrApprove } from "../lib/vault";
+import { qrApprove, createAuthSurface, retireAuthSurface, beginAuthAttempt, authAttemptCurrent, captureSessionOwnership, onSessionAuthority, pendingAuthOperation, type AuthSurface, type Session } from "../lib/vault";
+let shown: { host: HTMLElement; surface: AuthSurface; session: Session; code: string; key: string; owns: () => boolean } | undefined;
+let removeOwnerListener: (() => void) | undefined;
+export function disposeApprove(): void {
+  if (shown) { retireAuthSurface(shown.surface); shown.host.querySelectorAll(".approve-code").forEach((node) => { node.textContent = ""; }); }
+  shown = undefined; removeOwnerListener?.(); removeOwnerListener = undefined;
+  window.removeEventListener("pagehide", disposeApprove);
+}
 
 // The QR device-approval surface (#/approve?c=CODE&k=DEVICE_PUBKEY). A device that is ALREADY signed in
 // opens this link (the URL encoded in the QR a signing-in device shows) and approves it: qrApprove wraps
@@ -15,6 +22,7 @@ function approveParams(): { code: string; key: string } {
 }
 
 export function renderApprove(host: HTMLElement): void {
+  disposeApprove();
   const { code, key } = approveParams();
   const session = currentSession();
   if (!session) {
@@ -41,6 +49,14 @@ export function renderApprove(host: HTMLElement): void {
       </div>`;
     return;
   }
+  const surface = createAuthSurface();
+  shown = { host, surface, session, code, key, owns: captureSessionOwnership(session) };
+  removeOwnerListener = onSessionAuthority(() => {
+    if (!shown) return;
+    const target = shown.host; disposeApprove();
+    target.innerHTML = '<p role="status">Account changed. Reopen the approval link to review its owner.</p>';
+  });
+  window.addEventListener("pagehide", disposeApprove);
   const who = session.account.username || session.account.email;
   host.innerHTML = `
     <div class="auth-screen">
@@ -60,33 +76,32 @@ export function renderApprove(host: HTMLElement): void {
 /** Global click hook (parity with handleLoginClick); returns true if it consumed the click. */
 export function handleApproveClick(target: EventTarget | null): boolean {
   const hit = actionOf(target);
-  if (!hit || hit.action !== "approve-device") return false;
+  if (!hit || hit.action !== "approve-device" || !shown?.host.contains(hit.node)) return false;
   void doApprove(hit.node as HTMLButtonElement);
   return true;
 }
 
 async function doApprove(btn: HTMLButtonElement): Promise<void> {
-  const session = currentSession();
-  const { code, key } = approveParams();
-  if (!session || !code || !key) return;
-  btn.disabled = true;
-  btn.textContent = "Approving…";
-  const err = document.getElementById("approve-err");
-  if (err) err.hidden = true;
+  const captured = shown, params = approveParams();
+  if (!captured || !captured.owns() || params.code !== captured.code || params.key !== captured.key) return;
+  const err = captured.host.querySelector<HTMLElement>("#approve-err");
+  let attempt;
+  try { attempt = beginAuthAttempt("approve", captured.surface); }
+  catch { if (err) { err.textContent = "An account action is unresolved. Keep this tab open."; err.hidden = false; } return; }
+  const live = () => shown === captured && captured.owns() && authAttemptCurrent(attempt) &&
+    approveParams().code === captured.code && approveParams().key === captured.key;
+  btn.disabled = true; btn.textContent = "Approving…"; if (err) err.hidden = true;
   try {
-    await qrApprove(session, code, key);
+    await qrApprove(captured.session, captured.code, captured.key, attempt);
+    if (!live()) return;
     const card = btn.closest(".surface-card");
-    if (card) {
-      card.innerHTML = `<h2 class="t-section">Device approved</h2>
-        <p class="t-body muted">The other device is signing in now. You can close this tab.</p>
-        <a class="chip" href="#/">Done</a>`;
-    }
-  } catch (x: unknown) {
+    if (card) card.innerHTML = '<h2 class="t-section">Device approved</h2><p class="t-body muted">The other device is signing in now.</p><a class="chip" href="#/">Done</a>';
+  } catch {
+    if (!live()) return;
     if (err) {
-      err.textContent = x instanceof Error && x.message ? x.message : "Could not approve the sign-in.";
+      err.textContent = pendingAuthOperation()?.outcome === "unknown" ? "Approval outcome is unknown. Keep this tab open; do not send it again." : "Approval was not completed.";
       err.hidden = false;
     }
-    btn.disabled = false;
-    btn.textContent = "Approve";
+    btn.disabled = pendingAuthOperation()?.outcome === "unknown"; btn.textContent = "Approve";
   }
 }

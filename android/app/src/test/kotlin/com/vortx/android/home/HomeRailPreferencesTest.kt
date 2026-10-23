@@ -20,6 +20,20 @@ class HomeRailPreferencesTest {
     }
 
     @Test
+    fun `newly shipped sections land where they ship, not at the bottom`() {
+        val tv = HomeRail.tvDefaultOrder
+        assertEquals(listOf(HomeRail.FOR_YOU, HomeRail.SMART_COLLECTIONS), tv.take(2))
+        val arranged = HomeRailPolicy.normalizedOrder(listOf("addonCatalogs", "collectionsHub", "topPicks", "laterRail"), tv)
+        assertEquals(listOf(HomeRail.FOR_YOU, HomeRail.SMART_COLLECTIONS, HomeRail.ADDON_CATALOGS, HomeRail.COLLECTIONS_HUB, HomeRail.TOP_PICKS),
+            arranged.take(5))
+        assertEquals(arranged.indexOf(HomeRail.TOP_PICKS) + 1, arranged.indexOf(HomeRail.BECAUSE_YOU_WATCHED))
+        assertEquals(tv.toSet(), arranged.toSet())
+        assertEquals(tv.size, arranged.size)
+        assertEquals(HomeRail.FOR_YOU, HomeRail.forCatalog(catalog("vortx.home.forYou:forYou.genre.scifi")))
+        assertEquals(HomeRail.SMART_COLLECTIONS, HomeRail.forCatalog(catalog("vortx.home.smartCollections:0f8fad5b-d9cb-469f-a165-70867728950e")))
+    }
+
+    @Test
     fun `continue watching stays first while sections reorder and hide`() {
         val rows = listOf(
             catalog(HomeRail.CONTINUE_CATALOG_ID),

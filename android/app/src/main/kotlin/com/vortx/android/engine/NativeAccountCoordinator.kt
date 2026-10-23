@@ -1,9 +1,11 @@
 package com.vortx.android.engine
 
 import com.vortx.android.backup.SettingsBackup
+import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.NativeAccountGateway
 import com.vortx.android.sync.NativeAccountExport
+import com.vortx.android.sync.NativeAccountMountToken
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.sync.VortXSyncDoc
 import java.util.UUID
@@ -33,12 +35,17 @@ internal class NativeAccountCoordinator(
     private val watchedProducer: NativeWatchedMigrationProducer = NativeWatchedMigrationProducer(),
     private val captureOwnAccountAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = { null },
     private val onAuthorityChanged: () -> Unit = {},
+    /** A committed playback-progress report; defaults to the ordinary mutation callback. */
+    private val onProgressMutation: (SessionOwnerSnapshot.Account) -> Unit = onMutation,
+    private val historyBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
 ) : NativeAccountGateway {
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
     private val lifecycleLock = Any()
     private val mutex = Mutex()
+    /** Native cleanup uncertainty survives retire/sign-out in this process; never open a rival. */
+    private val uncertainHistoryAccounts = mutableSetOf<String>()
     private data class PendingImport(val id: UUID, val account: SessionOwnerSnapshot.Account, val document: JSONObject,
                                      val profiles: List<UserProfile>, val isCurrent: () -> Boolean,
                                      val sources: List<NativeOwnAccountSource>, val preflight: NativeMigrationPreflight)
@@ -62,13 +69,14 @@ internal class NativeAccountCoordinator(
         internal val owner: VortxNativeOwner?, internal val update: Long?, internal val pendingID: UUID?)
     fun migrationStatus(): MigrationStatus? {
         mounted.get()?.takeIf { accountCurrent(it.account) }?.let { current ->
-            val count = current.session.read().state.optJSONObject("hostDocument")?.optJSONArray("nativeWatchedMigrationPending")?.length() ?: 0
-            val candidates = current.session.read().state.optJSONObject("hostDocument")?.optJSONObject("nativeOwnAccountCandidates")?.length() ?: 0
-            val watchlists = current.session.read().state.optJSONObject("hostDocument")?.optJSONArray("nativeWatchlistMigrationPending")?.length() ?: 0
+            val document = current.session.read().state.optJSONObject("hostDocument")
+            val count = NativeWatchedMigrationStorage.unresolvedCountForStatus(document)
+            val candidates = document?.optJSONObject("nativeOwnAccountCandidates")?.length() ?: 0
+            val watchlists = document?.optJSONArray("nativeWatchlistMigrationPending")?.length() ?: 0
             return MigrationStatus(count, false, watchlists).takeIf { count > 0 || candidates > 0 || watchlists > 0 }
         }
         val pending = pendingImport?.takeIf { it.isCurrent() && accountCurrent(it.account) } ?: return null
-        return MigrationStatus(pending.document.optJSONArray("nativeWatchedMigrationPending")?.length() ?: 0, true,
+        return MigrationStatus(NativeWatchedMigrationStorage.unresolvedCountForStatus(pending.document), true,
             pending.document.optJSONArray("nativeWatchlistMigrationPending")?.length() ?: 0)
     }
     fun captureMigrationTarget(): MigrationTarget {
@@ -94,10 +102,9 @@ internal class NativeAccountCoordinator(
         val operationJob = currentCoroutineContext()[Job]
         val current = { operationJob?.isActive != false && migrationTargetCurrent(target) }
         check(current()) { "Migration target changed" }
-        val history = watchedProducer.retryPending(target.scope, target.document.optJSONArray("nativeWatchedMigrationPending") ?: JSONArray(),
-            target.document.optJSONArray("nativeWatchedMigrationEvidence"), current)
+        val history = watchedProducer.retryPending(target.scope, NativeWatchedMigrationStorage.read(target.document), current)
         val retained = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(target.document))
-            .put("nativeWatchedMigrationEvidence", history.archive()).put("nativeWatchedMigrationPending", history.pending())
+        history.storage().writeTo(retained)
         check(current()) { "Migration target changed" }
         // Retrying A never grants authority to import A into a changed B. Current B gets its own
         // capture/batch; historical A evidence is only retained for exact source-bound replay.
@@ -261,39 +268,59 @@ internal class NativeAccountCoordinator(
         }
     }
 
+    override fun currentMountToken(account: SessionOwnerSnapshot.Account): NativeAccountMountToken? {
+        val current = mounted.get()?.takeIf { it.account == account && accountCurrent(account) } ?: return null
+        if (current.session.requiresRecovery()) return null
+        val revision = current.session.updates.value
+        return if (mounted.get() === current && accountCurrent(account)) NativeAccountMountToken(current, revision) else null
+    }
+
     override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean = mutex.withLock {
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
+        check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }?.let { return@withLock true }
         retire()
-        while (true) { val prior = retired.poll() ?: break; prior.close() }
+        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
         val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
         val scope = checkpoints.discover(namespace) ?: run {
             val retained = checkpoints.readPreflight(namespace) ?: return@withLock false
-            if (checkpoints.read(retained.scope) != null) retained.scope // State committed before locator publication.
+            if (checkpoints.readRetained(retained.scope) != null) retained.scope // State committed before locator publication.
             else {
                 restorePreflight(account, retained, isCurrent)
                 changes.value += 1
                 return@withLock false
             }
         }
-        val state = scope.validateSnapshot(checkNotNull(checkpoints.read(scope)))
-        state.optJSONObject("hostDocument")?.optJSONObject("nativeLegacyMembershipPending")?.let { journal ->
+        val raw = checkNotNull(checkpoints.readRetained(scope))
+        val typed = if (NativeOwnerHistorySessionAdapter.isEnvelope(raw))
+            NativeOwnerHistoryCoordinator.decodeEnvelope(raw.toByteArray(Charsets.UTF_8), scope) else null
+        val state = if (typed == null) scope.validateSnapshot(raw) else null
+        val ownerName = if (typed != null) {
+            val retained = OHJson.Obj(typed.snapshot)
+            retained.obj("roster").obj("profiles").obj(scope.ownerProfileID).text("name")
+        } else requireNotNull(state).getJSONObject("roster").getJSONObject("profiles").getJSONObject(scope.ownerProfileID).getString("name")
+        state?.optJSONObject("hostDocument")?.optJSONObject("nativeLegacyMembershipPending")?.let { journal ->
             nativeLegacyMembershipJournal(scope, journal, JSONArray(),
                 state.getJSONObject("roster").getJSONObject("profiles").keys().asSequence().toSet())
         }
-        requireNotNull(state.getJSONObject("nativeSync").optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
-        val ownerName = state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(scope.ownerProfileID).getString("name")
+        if (state != null) requireNotNull(state.getJSONObject("nativeSync").optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
         val resources = transport()
         val candidate = try { VortxNativeSession.open(scope, ownerName, bindings, checkpoints, resources,
-            onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } }
-            catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
+            onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged,
+            onProgressMutation = { onProgressMutation(account) }, ownerHistoryBindings = historyBindings,
+            ownerHistoryAuthority = ownerHistoryAuthority(account) { accountCurrent(account) }) { accountCurrent(account) } }
+            catch (error: Throwable) {
+                if (error is NativeOwnerHistoryCoordinator.Uncertain) uncertainHistoryAccounts.add(account.id)
+                (resources as? AutoCloseable)?.close(); throw error
+            }
         try { withAccountAdmission(account, isCurrent) { checkpoints.remember(scope) } }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         publish(account, candidate, isCurrent)
     }
 
     override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject {
         if (reopenCheckpoint(account, isCurrent)) {
+            require(!session().hasOwnerHistory()) { "Existing owner-history backup disappeared" }
             val read = session().read()
             return session().owned(read.owner) {
                 check(isCurrent() && accountCurrent(account))
@@ -333,15 +360,26 @@ internal class NativeAccountCoordinator(
         }
     }
 
+    /** Keep the exact unpublished writer until close is confirmed, including cancellation and
+     * projection failures. A failed close must not make a rival writer eligible for this account. */
+    private fun retireUnpublished(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession) {
+        if (!retired.contains(candidate)) retired.add(candidate)
+        try { candidate.close(); retired.remove(candidate) }
+        catch (failure: Throwable) {
+            uncertainHistoryAccounts.add(account.id)
+            throw failure
+        }
+    }
+
     private suspend fun publish(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession, isCurrent: () -> Boolean): Boolean {
         try { currentCoroutineContext().ensureActive() }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         val next = Mounted(account, candidate)
         // Authentication may take its own lock; never invoke it while holding lifecycleLock.
         val current = isCurrent() && accountCurrent(account)
         val installed = current && synchronized(lifecycleLock) { onAuthorityChanged(); mounted.compareAndSet(null, next) }
         if (!installed) {
-            candidate.close(); error("Native account changed")
+            retireUnpublished(account, candidate); error("Native account changed")
         }
         try {
             project(candidate)
@@ -350,19 +388,143 @@ internal class NativeAccountCoordinator(
             return true
         } catch (error: Throwable) {
             val removed = synchronized(lifecycleLock) { mounted.compareAndSet(next, null) }
-            if (removed) candidate.close()
+            if (removed) retireUnpublished(account, candidate)
             throw error
         }
     }
 
     override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+        require(!document.has(NativeOwnerHistoryAccount.ARCHIVE) && document.optJSONObject("nativeSync")?.optInt("schemaVersion") != 6) {
+            "Original authenticated account bytes required"
+        }
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local migration evidence is not an authenticated cloud source" }
         applyDocumentLocked(account, document, isCurrent)
+    }
+    override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, raw: ByteArray, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+        check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
+        check(isCurrent() && accountCurrent(account)) { "Native account changed" }
+        val exact = NativeOwnerHistoryAccount(raw)
+        val document = NativeProfileOverlayWitness.parseAccountDocument(raw)
+        require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local evidence is not a cloud source" }
+        val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
+        val located = checkpoints.discover(namespace)
+        val current = mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }
+        val localTyped = current?.session?.hasOwnerHistory() == true || located?.let { scope ->
+            checkpoints.readRetained(scope)?.let(NativeOwnerHistorySessionAdapter::isEnvelope)
+        } == true
+        val incoming = exact.raw("nativeSync")?.let { OHJson.Obj(it) }
+        val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
+        if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
+            return@withLock applyDocumentLocked(account, document, isCurrent)
+        val native = requireNotNull(incoming) { "Owner-history native carrier missing" }
+        require(native.text("scope") == namespace)
+        val scope = VortxAccountScope(namespace, native.text("ownerProfileId"))
+        located?.let { require(it == scope) { "Native account owner changed" } }
+        val job = currentCoroutineContext()[Job]
+        val active = { job?.isActive != false && isCurrent() && accountCurrent(account) }
+        val original = ownerHistoryAuthority(account, active)
+        val mountedCurrent = { accountCurrent(account) }
+        val mountedAuthority = ownerHistoryAuthority(account, mountedCurrent)
+        val remoteHost = document.optJSONObject("nativeHostPreferences")
+        if (document.has("nativeHostPreferences")) requireNotNull(remoteHost)
+        remoteHost?.let { NativeHostPreferences.validate(scope, it) }
+        if (current != null) {
+            require(current.session.scope == scope)
+            val read = current.session.read()
+            current.session.owned(read.owner) {
+                original.withActive {
+                    check(withMountedSession(current.session, account) {
+                        current.session.receiveOwnerHistory(exact, original, historyBindings, remoteHost); true
+                    }) { "Native account changed" }
+                }
+            }
+            applyTypedWebsiteEvents(current.session, account, document, active)
+            project(current.session)
+            check(active() && mounted.get() === current)
+            pendingImport = null
+            return@withLock true
+        }
+        retire()
+        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
+        val stored = checkpoints.captureCheckpoint(scope)
+        val resources = transport()
+        var candidate: VortxNativeSession? = null
+        try {
+            candidate = if (stored.plaintext != null) {
+                if (NativeOwnerHistorySessionAdapter.isEnvelope(stored.plaintext)) {
+                    VortxNativeSession.openOwnerHistory(scope,
+                        NativeOwnerHistoryCoordinator.decodeEnvelope(stored.plaintext.toByteArray(Charsets.UTF_8), scope), stored,
+                        bindings, historyBindings, checkpoints, resources, mountedAuthority, { onMutation(account) }, onAuthorityChanged,
+                        { onProgressMutation(account) }, mountedCurrent, original)
+                } else VortxNativeSession.openForOwnerHistoryTransfer(scope, stored, bindings, checkpoints, resources,
+                    { onMutation(account) }, onAuthorityChanged, { onProgressMutation(account) }, mountedCurrent, mountedAuthority)
+            } else {
+                // Original absence is create-only. Preserve unresolved older setup in the SAME
+                // typed envelope and leave its original encrypted preflight file untouched.
+                val preflight = checkpoints.readPreflight(namespace)?.also { require(it.scope == scope) }
+                checkpoints.verifyOwnerHistoryAbsence(scope, stored, preflight)
+                val carrier = requireNotNull(exact.raw(NativeOwnerHistoryAccount.ARCHIVE))
+                val uid = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
+                val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope), remoteHost)
+                val archiveInput = JSONObject(document.toString()).also { it.remove("nativeSync"); it.remove(NativeOwnerHistoryAccount.ARCHIVE) }
+                val archive = preflight?.archive ?: NativeHostDocument.archive(archiveInput)
+                val localObject = OHJson.Obj().set("hostDocument", archive.getJSONObject("document").toString().toByteArray(Charsets.UTF_8))
+                    .set("excludedCredentialPaths", archive.getJSONArray("excludedCredentialPaths").toString().toByteArray(Charsets.UTF_8))
+                    .set("nativeHostPreferenceState", host.toString().toByteArray(Charsets.UTF_8))
+                preflight?.let { localObject.set("nativeMigrationPreflightRetained", OHJson.quote(it.raw)) }
+                val local = localObject.encoded()
+                val prepared = NativeOwnerHistoryCoordinator.prepareColdPeer(scope,
+                    NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), exact, host.toString().toByteArray(Charsets.UTF_8),
+                    historyBindings, original, { NativeOwnerHistoryAccount(it).validateBudget(true) },
+                    { NativeOwnerHistorySessionAdapter.projection(scope, it) }, local)
+                val committed = original.withActive {
+                    checkpoints.verifyOwnerHistoryAbsence(scope, stored, preflight)
+                    checkpoints.compareAndCommitCheckpoint(scope, stored, OHJson.utf8(prepared.envelope()))
+                }
+                VortxNativeSession.openOwnerHistory(scope, prepared, committed, bindings, historyBindings, checkpoints, resources,
+                    mountedAuthority, { onMutation(account) }, onAuthorityChanged, { onProgressMutation(account) }, mountedCurrent, original)
+            }
+            // First peer was fully admitted by prepareColdPeer; other mounts must join it against
+            // the original local state rather than replacing an existing native checkpoint.
+            val session = requireNotNull(candidate)
+            if (stored.plaintext != null) session.receiveOwnerHistory(exact, original, historyBindings, remoteHost)
+            applyTypedWebsiteEvents(session, account, document, active)
+            original.withActive { checkpoints.remember(scope) }
+            pendingImport = null
+            publish(account, session, active)
+        } catch (failure: Throwable) {
+            if (failure is NativeOwnerHistoryCoordinator.Uncertain) uncertainHistoryAccounts.add(account.id)
+            candidate?.let { owned -> runCatching { retireUnpublished(account, owned) }.onFailure { failure.addSuppressed(it) } }
+                ?: (resources as? AutoCloseable)?.close()
+            throw failure
+        }
+    }
+    private fun applyTypedWebsiteEvents(session: VortxNativeSession, account: SessionOwnerSnapshot.Account,
+                                        document: JSONObject, active: () -> Boolean) {
+        NativeWebsiteProfileEdits.events(document).forEach { session.applyWebsiteProfileEdit(it) }
+        session.applyWebsiteAddonEdits(NativeWebsiteAddonEdits.events(document, session.scope), beforeCommit = {
+            check(active() && accountCurrent(account)) { "Native website account changed" }
+        })
+        document.opt("profileEdits")?.takeIf { it != JSONObject.NULL }?.let { session.applyLegacyWebsiteAggregate(it) }
+    }
+    private fun ownerHistoryAuthority(account: SessionOwnerSnapshot.Account, active: () -> Boolean): NativeOwnerHistoryAuthority {
+        val original = captureOwnAccountAdmission(account)
+        check(ownCredentials == null || original != null) { "Native account admission unavailable" }
+        return object : NativeOwnerHistoryAuthority {
+            override fun <T> withActive(block: () -> T): T {
+                check(active() && accountCurrent(account)) { "Native account changed" }
+                if (original == null) return block().also { check(active() && accountCurrent(account)) }
+                var result: Result<T>? = null
+                check(original { if (!active() || !accountCurrent(account)) false else { result = runCatching(block); true } }) { "Native account changed" }
+                return requireNotNull(result).getOrThrow()
+            }
+        }
     }
     private suspend fun applyDocumentLocked(account: SessionOwnerSnapshot.Account, incomingDocument: JSONObject, isCurrent: () -> Boolean,
                                            suppliedSources: List<NativeOwnAccountSource> = emptyList(),
                                            retainedWatched: JSONObject? = null,
                                            operationCurrent: () -> Boolean = isCurrent): Boolean {
+        check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native account changed" }
         val operationJob = currentCoroutineContext()[Job]
         val document = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(incomingDocument))
@@ -452,9 +614,20 @@ internal class NativeAccountCoordinator(
                 && (capturedUpdate == null || old!!.session.updates.value == capturedUpdate)
         }
         val watched = watchedProducer.prepare(scope, materialDocument, roster, sources,
-            priorArchive?.optJSONArray("nativeWatchedMigrationEvidence"), migrationCurrent)
-        val preparation = if (unavailable.isNotEmpty() || !watched.isComplete) null else prepareNativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds,
-            sources, ownBaseline, scope, pendingOverlays, watchedMigration = watched)
+            retainedStorage = NativeWatchedMigrationStorage.read(priorArchive), isCurrent = migrationCurrent)
+        val preparation = if (unavailable.isNotEmpty() || !watched.isComplete) null else try {
+            prepareNativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds,
+                sources, ownBaseline, scope, pendingOverlays, watchedMigration = watched)
+        } catch (error: LegacyReconciliationRequired) {
+            // A whole-account stop names its reconciliation reason, scrubbed of source values.
+            DiagnosticsLog.log("native-profiles", "restore result=failed stage=legacy_preparation detail=${scrubbedLegacyReason(error.reason)}")
+            throw error
+        }
+        // Held units (issue #262) stay only in the retained original document; name them without values.
+        preparation?.let { prepared ->
+            val held = if (prepared.held.isEmpty()) "" else " held=${prepared.held.size} held_units=${nativeLegacyHeldSummary(prepared.held)}"
+            DiagnosticsLog.log("native-profiles", "prepare result=ready pending_membership_receipts=${prepared.pendingMembershipReceipts.length()}$held")
+        }
         val material = preparation?.material
         // Retain exact unresolved source receipts in the same sealed candidate checkpoint as the
         // accepted material. Never turn a historical receipt into an install, removal or clock.
@@ -483,7 +656,7 @@ internal class NativeAccountCoordinator(
         priorArchive?.optJSONObject("nativeOwnAccountCandidates")?.let {
             archivedDocument.put("nativeOwnAccountCandidates", validateNativeOwnAccountCandidates(it))
         }
-        mergeNativeWatchedArchive(scope, priorArchive, archivedDocument, watched.archive(), watched.pending())
+        mergeNativeWatchedArchive(scope, priorArchive, archivedDocument, watched.storage())
         val archivedSources = retainedSources?.let { JSONObject(it.toString()) } ?: JSONObject()
         sources.forEach { source -> archivedSources.put(source.profileID, JSONObject().put("verifiedStreamingUid", source.verifiedUID)
             .put("sourceDocumentBase64", source.archiveBase64())) }
@@ -507,6 +680,8 @@ internal class NativeAccountCoordinator(
             }
             pending.put(id, record)
         } })
+        // Admission applies to the complete retained host, not just its compact watched journal.
+        nativeWatchedDocumentSnapshot(archivedDocument)
         if (!hasNative && material == null) {
             // Preserve setup across a restart, but do not create a native runtime, publish a
             // checkpoint locator, acknowledge the legacy receipt, or drop unresolved originals.
@@ -548,6 +723,7 @@ internal class NativeAccountCoordinator(
                         remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources,
                         beforeCommit = { operationJob?.ensureActive(); check(migrationCurrent()) { "Native migration changed before commit" } },
                         legacyWatchlists = watchlists.profiles)
+                    reportLegacyReconciliation(old.session, stage = "sync")
                     true
                 }) { "Native account changed" } }
             } }
@@ -571,7 +747,7 @@ internal class NativeAccountCoordinator(
         retire()
         // Close is deferred out of the auth lock to avoid lock inversion, but a replacement writer
         // must join every retired transaction before reading or replacing the same account file.
-        while (true) { val prior = retired.poll() ?: break; prior.close() }
+        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
         val resources = transport()
         val hostProfiles = baselineHost
         // The captured setup target was admitted before intentional retirement. The coroutine and
@@ -582,7 +758,9 @@ internal class NativeAccountCoordinator(
             VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
             initialHostPreferences = remoteHost, initialLegacyWatchlists = watchlists.profiles,
-            verifyCandidate = verifySources, onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } } } }
+            verifyCandidate = verifySources, onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged,
+            onProgressMutation = { onProgressMutation(account) }, ownerHistoryBindings = historyBindings,
+            ownerHistoryAuthority = ownerHistoryAuthority(account) { accountCurrent(account) }) { isCurrent() && accountCurrent(account) } } } }
             catch (error: Throwable) {
                 (resources as? AutoCloseable)?.close()
                 // Cancellation did not consume the durable setup source. Restore its setup-only
@@ -591,19 +769,27 @@ internal class NativeAccountCoordinator(
                     runCatching { restorePreflight(account, preflight, isCurrent) }
                 throw error
             }
+        reportLegacyReconciliation(candidate, stage = "restore")
         try { websiteEvents.forEach { event -> candidate.applyWebsiteProfileEdit(event) } }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         try { candidate.owned(candidate.read().owner) {
             withAccountAdmission(account, isCurrent) { candidate.applyWebsiteAddonEdits(websiteAddonEvents, beforeCommit = {
                 operationJob?.ensureActive(); check(isCurrent() && accountCurrent(account)) { "Native website add-on account changed" }
             }) }
         } }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         try { legacyAggregate?.let { aggregate -> candidate.applyLegacyWebsiteAggregate(aggregate) } }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         try { checkpoints.remember(scope) }
-        catch (error: Throwable) { candidate.close(); throw error }
+        catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         return publish(account, candidate, isCurrent)
+    }
+
+    /** A held old-format delta is reported, never fatal: native sync keeps landing (Apple 0.5.0 Beta 6). */
+    private fun reportLegacyReconciliation(session: VortxNativeSession, stage: String) {
+        session.heldLegacyReconciliation?.let { reason ->
+            android.util.Log.i("VortXNative", "legacy_reconcile result=held stage=$stage reason=$reason")
+        }
     }
 
     private fun recoverPreflightSources(account: SessionOwnerSnapshot.Account, retained: NativeMigrationPreflight): List<NativeOwnAccountSource> {
@@ -654,7 +840,7 @@ internal class NativeAccountCoordinator(
             val host = read.state.getJSONObject("hostProfilePreferences")
             NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
                 read.state.getBoolean("hostProfileSyncPending"), read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document"),
-                read.state.optJSONObject("hostDocument")?.opt("settings"))
+                read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount())
         }
     }
 

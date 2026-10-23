@@ -1,13 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VortX",
-  "version": "0.3.0",
-  "identifier": "com.stremiox.desktop",
+  "mainBinaryName": "vortx",
+  "version": "0.5.6",
+  "identifier": "com.vortx.desktop",
   "build": {
-    "beforeDevCommand": "bash scripts/fetch-server-deps.sh && npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/fetch-server-deps.sh && npm run build",
-    "frontendDist": "../dist"
+    "beforeDevCommand": "bash scripts/fetch-mpv.sh",
+    "devUrl": "https://web.vortx.tv",
+    "beforeBuildCommand": "bash scripts/fetch-mpv.sh",
+    "frontendDist": "https://web.vortx.tv"
   },
   "app": {
     "windows": [
@@ -18,26 +19,30 @@
         "minWidth": 960,
         "minHeight": 600,
         "resizable": true,
-        "center": true
+        "center": true,
+        "label": "main"
       }
     ],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage", "nsis", "app", "dmg"],
+    "targets": [
+      "deb",
+      "appimage",
+      "nsis",
+      "app",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "resources": {
-      "resources/server.cjs": "server.cjs",
-      "resources/node-*": ""
-    }
+    ]
   }
 }

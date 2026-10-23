@@ -47,14 +47,19 @@ internal class NativeOwnAccountSource private constructor(
         requireOwnAccountSourceCredentialFree(library); requireOwnAccountSourceCredentialFree(addons)
         val rows = library.getJSONArray("result")
         val descriptors = addons.getJSONObject("result").also { require(it.keys().asSequence().toSet() == setOf("addons")) }.getJSONArray("addons")
+        // A row or descriptor this view cannot carry becomes a held marker (issue #262): the material
+        // adapter holds just that one unit, and the exact response bytes stay bound to the source proof.
         val projected = JSONArray()
-        for (index in 0 until rows.length()) projected.put(projectLibrary(rows.getJSONObject(index)))
+        for (index in 0 until rows.length()) projected.put(projectLibraryOrHeld(rows.opt(index)))
         val order = JSONArray()
+        val kept = JSONArray()
         for (index in 0 until descriptors.length()) {
-            val addon = descriptors.getJSONObject(index)
-            order.put(ownString(addon, "transportUrl"))
-            val manifest = addon.getJSONObject("manifest")
-            for (key in listOf("id", "name", "version")) ownString(manifest, key)
+            val addon = descriptors.optJSONObject(index)
+            val manifest = addon?.optJSONObject("manifest")
+            val url = (addon?.opt("transportUrl") as? String)?.takeIf(String::isNotBlank)
+            val complete = manifest != null && listOf("id", "name", "version").all { (manifest.opt(it) as? String)?.isNotBlank() == true }
+            if (addon != null && url != null && complete) { order.put(url); kept.put(addon) }
+            else kept.put(JSONObject().put(NATIVE_LEGACY_HELD_REASON, "Own-account add-on requires a manifest"))
         }
         require(NativeHostPreferences.equal(nativeOwnAccountOverlay(overlay, profileID), overlay)) { "Foreign own-account overlay carrier" }
         requireOwnAccountSourceCredentialFree(overlay)
@@ -64,8 +69,16 @@ internal class NativeOwnAccountSource private constructor(
         vortx.optJSONObject("byProfile")?.optJSONObject(profileID)?.let { bucket ->
             require(!bucket.has("deletedLibraryTs") && !bucket.has("deletedLibrary")) { "Unsupported own library intent carrier" }
         }
-        vortx.put("library", projected).put("addons", descriptors)
+        vortx.put("library", projected).put("addons", kept)
         overlay.put("addonOrder", order)
+    }
+    private fun projectLibraryOrHeld(raw: Any?): JSONObject = try {
+        projectLibrary(raw as? JSONObject ?: error("Malformed own-account library row"))
+    } catch (error: Exception) {
+        // Android's JSONException is a checked Exception, unlike some JVM org.json versions.
+        // Only the same malformed-row cases become held markers; all other exceptions escape.
+        if (error !is IllegalStateException && error !is IllegalArgumentException && error !is org.json.JSONException) throw error
+        JSONObject().put(NATIVE_LEGACY_HELD_REASON, "Malformed own-account library row")
     }
     private fun projectLibrary(raw: JSONObject): JSONObject {
         val row = JSONObject().put("id", ownString(raw, "_id")).put("type", ownString(raw, "type"))

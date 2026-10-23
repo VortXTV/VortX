@@ -10,10 +10,12 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -141,13 +143,16 @@ object TMDBPersonClient {
             placeOfBirth = obj.optStringOrNull("place_of_birth"),
             profileUrl = obj.optStringOrNull("profile_path")?.let { "$IMAGE_BASE/w342$it" },
             knownForDepartment = obj.optStringOrNull("known_for_department"),
+            imdbId = obj.optStringOrNull("imdb_id"),
+            birthdayIso = obj.optStringOrNull("birthday"),
+            deathdayIso = obj.optStringOrNull("deathday"),
         )
     }
 
     /// A person's filmography via `/person/{id}/combined_credits`, mapped onto the same [MetaItem] cards
     /// the hub rails use (id = "tmdb:<id>", type from `media_type`, poster from `poster_path`). Ported
     /// from `TMDBClient.personCredits(id:)`: deduped by id, entries with no poster or title dropped,
-    /// sorted most-popular first then newest. [] on a non-positive id or any error.
+    /// sorted newest first (undated last), then by popularity. [] on a non-positive id or any error.
     suspend fun personCredits(id: Int): List<MetaItem> {
         if (id <= 0) return emptyList()
         val obj = getJson("/person/$id/combined_credits") ?: return emptyList()
@@ -172,14 +177,68 @@ object TMDBPersonClient {
                     name = name,
                     poster = "$IMAGE_BASE/w342$posterPath",
                     year = date.take(4).takeIf { it.length == 4 },
+                    // The 16:9 backdrop for a landscape Poster Style.
+                    background = entry.optStringOrNull("backdrop_path")?.let { "$IMAGE_BASE/w780$it" },
                 ),
                 popularity = entry.optDouble("popularity", 0.0),
                 date = date,
             )
         }
+        // Newest first (undated last), then the more popular, matching Apple's filmography order.
         return ranked
-            .sortedWith(compareByDescending<Ranked> { it.popularity }.thenByDescending { it.date })
+            .sortedWith(compareBy<Ranked> { it.date.isEmpty() }.thenByDescending { it.date }.thenByDescending { it.popularity })
             .map { it.item }
+    }
+
+    /// Season poster art for a series keyed by season number (0 = Specials), from `/tv/{id}`. Accepts a `tt` id
+    /// (resolved through `/find`) or `tmdb:<id>`; anything else, a miss or an error gives an empty map and the
+    /// season selector falls back to the series poster. Mirrors Apple `TMDBClient.seasonPosters(metaID:)`.
+    suspend fun seasonPosters(metaId: String): Map<Int, String> {
+        val tvId = when {
+            metaId.startsWith("tmdb:") -> metaId.removePrefix("tmdb:").toIntOrNull()
+            metaId.startsWith("tt") -> getJson("/find/$metaId?external_source=imdb_id")
+                ?.optJSONArray("tv_results")?.optJSONObject(0)?.optInt("id", 0)?.takeIf { it > 0 }
+            else -> null
+        } ?: return emptyMap()
+        val seasons = getJson("/tv/$tvId")?.optJSONArray("seasons") ?: return emptyMap()
+        val posters = HashMap<Int, String>()
+        for (i in 0 until seasons.length()) {
+            val season = seasons.optJSONObject(i) ?: continue
+            val number = season.optInt("season_number", -1).takeIf { it >= 0 } ?: continue
+            val path = season.optStringOrNull("poster_path") ?: continue
+            posters[number] = "$IMAGE_BASE/w342$path"
+        }
+        return posters
+    }
+
+    /// People whose name matches [query], via /3/search/person through the keyless edge, most popular first,
+    /// ported from Apple `TMDBClient.searchPeople`. Only people with a photo or a known-for credit are kept
+    /// (bare name collisions are noise). Each is a [CastMember] whose `character` line carries the department
+    /// TMDB best knows them for, so the cast tiles render a result unchanged. Fail-soft: empty.
+    suspend fun searchPeople(query: String, limit: Int = 20): List<CastMember> {
+        val trimmed = query.trim()
+        if (trimmed.length < 2) return emptyList()
+        val encoded = URLEncoder.encode(trimmed, "UTF-8").replace("+", "%20")
+        val results = getJson("/search/person?query=$encoded&include_adult=false")
+            ?.optJSONArray("results") ?: return emptyList()
+        return peopleResults(results, limit)
+    }
+
+    /// The /search/person `results` array as ranked people: a real id and name, a photo or a known-for
+    /// credit, most popular first, at most [limit].
+    internal fun peopleResults(results: JSONArray, limit: Int): List<CastMember> {
+        val ranked = ArrayList<Pair<CastMember, Double>>()
+        for (i in 0 until results.length()) {
+            val entry = results.optJSONObject(i) ?: continue
+            val id = entry.optInt("id", 0).takeIf { it > 0 } ?: continue
+            val name = entry.optStringOrNull("name") ?: continue
+            val profile = entry.optStringOrNull("profile_path")?.let { "$IMAGE_BASE/w185$it" }
+            val knownFor = entry.optJSONArray("known_for")?.length() ?: 0
+            if (profile == null && knownFor == 0) continue
+            val person = CastMember(id, name, entry.optStringOrNull("known_for_department"), profile)
+            ranked += person to entry.optDouble("popularity", 0.0)
+        }
+        return ranked.sortedByDescending { it.second }.take(limit).map { it.first }
     }
 
     /// Resolve a filmography card's catalog id to an IMDb `tt` id before opening its detail, ported from

@@ -323,17 +323,6 @@ enum StreamRanking {
     }
 }
 
-enum VortxShadowRanking {
-    static func observe(
-        groups: [CoreStreamSourceGroup],
-        continuity: String?,
-        pin: ResolvedPin?,
-        cachedHashes: Set<String>,
-        prefs: SourcePreferences.Snapshot,
-        metaId: String
-    ) {}
-}
-
 enum VXProbe {
     static func log(_ channel: String, _ message: String) {}
 }

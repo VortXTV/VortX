@@ -57,6 +57,16 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
                 precondition(NativeTransportPolicy.selectsNative(required: required, preference: preference) == (required || preference))
             }
         }
+        for override in [nil, "0", "1", "true", "unexpected"] as [String?] {
+            var inherited = ["PRESERVED_FIXTURE": "unchanged", "VORTX_PROXY_ALLOW_LOOPBACK": "0"]
+            inherited["VORTX_PROXY_INSECURE_TLS"] = override
+            let secured = NativeTransportPolicy.nativeServerEnvironment(from: inherited)
+            precondition(secured["VORTX_PROXY_INSECURE_TLS"] == "0")
+            precondition(secured["PRESERVED_FIXTURE"] == "unchanged")
+            precondition(secured["VORTX_PROXY_ALLOW_LOOPBACK"] == "0")
+            precondition(inherited["VORTX_PROXY_INSECURE_TLS"] == override,
+                         "Hardening the child must not mutate the parent's environment")
+        }
         precondition(NativeTransportPolicy.boundNativePort(processRunning: true, receipt: nil) == nil)
         precondition(NativeTransportPolicy.boundNativePort(processRunning: false, receipt: "11470") == nil)
         precondition(NativeTransportPolicy.boundNativePort(processRunning: true, receipt: "11470\n") == 11470)
@@ -124,6 +134,10 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         let selection = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/VortxNativeServer.swift"), encoding: .utf8)
         precondition(selection.contains("static let isOn = NativeTransportPolicy.selectsNative("))
         let mac = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/MacNodeServer.swift"), encoding: .utf8)
+        let nativeLaunch = mac.components(separatedBy: "private static func spawnNative(binPath: String) {")[1]
+            .components(separatedBy: "proc.environment = env")[0]
+        precondition(nativeLaunch.contains("var env = NativeTransportPolicy.nativeServerEnvironment(from: ProcessInfo.processInfo.environment)"),
+                     "The real native launch must use the verified TLS environment policy")
         precondition(mac.contains("native-server-\\(UUID().uuidString).port"))
         precondition(mac.contains("env[\"VORTX_PORT_FILE\"] = nativePortReceipt"))
         precondition(mac.contains("NativeTransportPolicy.boundNativePort("))

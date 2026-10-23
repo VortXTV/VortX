@@ -135,6 +135,13 @@ enum PosterMenu { case none, continueWatching, catalog, library }
 
 // MARK: - Focused hero (the browse pages' living backdrop)
 
+/// Owns a page's `FocusedItemModel` without making the page observe it. Focus moves then re-render only
+/// the hero backdrop, which observes the model itself, instead of re-evaluating every rail and card on the
+/// page each time focus settles: on an Apple TV HD that full-page pass is what made the remote lag.
+@MainActor final class FocusedItemOwner: ObservableObject {
+    let model = FocusedItemModel()
+}
+
 /// What the browse pages show behind the rails for the title under focus.
 struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
     let id: String
@@ -195,7 +202,12 @@ extension CoreCWItem {
 /// so tvOS focus is never dropped. Heroes without a synopsis (library entries) are enriched from
 /// Cinemeta in the background, once per title per session.
 @MainActor final class FocusedItemModel: ObservableObject {
-    @Published private(set) var hero: FocusedHero?
+    @Published private(set) var hero: FocusedHero? {
+        didSet { if oldValue?.id != hero?.id { onHeroIDChange?(hero) } }
+    }
+    /// Called when focus settles on a different title (or leaves the rails), for work that follows the
+    /// hero without the page itself observing this model.
+    var onHeroIDChange: ((FocusedHero?) -> Void)?
     /// The text block shows only while focus is in the page's TOP row; deeper rows keep just the
     /// backdrop art, so the details can never collide with content that scrolled up.
     @Published private(set) var detailsVisible = true
@@ -234,10 +246,13 @@ extension CoreCWItem {
     /// ("62% watched") from the incoming library hero.
     private static func resolve(_ hero: FocusedHero) -> FocusedHero {
         loadCacheIfNeeded()
-        guard let cached = enrichmentCache[hero.id] else { return hero }
+        guard let cached = enrichmentCache[hero.id], cached.type == hero.type else { return hero }
         touchEnrichment(hero.id)
         let watchedTail = hero.metaLine.components(separatedBy: "  ·  ").first { $0.hasSuffix("% watched") }
-        let line = watchedTail.map { "\(cached.metaLine)  ·  \($0)" } ?? cached.metaLine
+        let stable = cached.metaLine.components(separatedBy: "  ·  ").filter { !$0.hasSuffix("% watched") }
+            .joined(separator: "  ·  ")
+        let rated = RatingPresentationPolicy.mergingIMDbLine(stable, freshLine: hero.metaLine)
+        let line = watchedTail.map { "\(rated)  ·  \($0)" } ?? rated
         return FocusedHero(id: hero.id, type: hero.type, title: hero.title,
                            backdrop: cached.backdrop ?? hero.backdrop,
                            metaLine: line, overview: cached.overview ?? hero.overview,
@@ -254,7 +269,9 @@ extension CoreCWItem {
         loadCacheIfNeeded()
         var parts: [String] = []
         if let releaseInfo, !releaseInfo.isEmpty { parts.append(releaseInfo) }
-        if let imdbRating, !imdbRating.isEmpty { parts.append("★ \(imdbRating)") }
+        if let imdbRating, RatingPresentationPolicy.imdb(imdbRating) != nil { parts.append("★ \(imdbRating)") }
+        else if let cached = enrichmentCache[id], cached.type == type,
+                let token = RatingPresentationPolicy.imdbToken(in: cached.metaLine) { parts.append(token) }
         if let runtime, !runtime.isEmpty { parts.append(runtime) }
         parts.append(type.capitalized)
         let genreLine = (genres?.isEmpty == false) ? genres!.prefix(3).joined(separator: " · ") : nil
@@ -288,7 +305,16 @@ extension CoreCWItem {
     /// Insert or refresh a hero and mark it most-recently-used, evicting the least-recently-used entries once
     /// the cap is exceeded so neither the in-memory map nor the persisted copy grows without bound.
     private static func storeEnrichment(_ id: String, _ hero: FocusedHero) {
-        enrichmentCache[id] = hero
+        if let cached = enrichmentCache[id], cached.type == hero.type,
+           RatingPresentationPolicy.imdbToken(in: hero.metaLine) == nil {
+            enrichmentCache[id] = FocusedHero(
+                id: hero.id, type: hero.type, title: hero.title, backdrop: hero.backdrop,
+                metaLine: RatingPresentationPolicy.mergingIMDbLine(hero.metaLine, freshLine: cached.metaLine),
+                overview: hero.overview, genreLine: hero.genreLine, logo: hero.logo,
+                allowsUltraHD: hero.allowsUltraHD)
+        } else {
+            enrichmentCache[id] = hero
+        }
         touchEnrichment(id)
         enforceEnrichmentCap()
     }
@@ -357,12 +383,13 @@ extension CoreCWItem {
                       meta.description != nil || meta.background != nil else { continue }
                 var parts: [String] = []
                 if let year = meta.releaseInfo, !year.isEmpty { parts.append(year) }
-                if let rating = meta.imdbRating, !rating.isEmpty { parts.append("★ \(rating)") }
+                if let rating = meta.imdbRating, RatingPresentationPolicy.imdb(rating) != nil { parts.append("★ \(rating)") }
+                else if let token = RatingPresentationPolicy.imdbToken(in: hero.metaLine) { parts.append(token) }
                 if let runtime = meta.runtime, !runtime.isEmpty { parts.append(runtime) }
                 // Keep the type, but drop any progress tail: it is stale by the next read, and
                 // resolve() re-attaches the live one.
                 let stableTail = hero.metaLine.components(separatedBy: "  ·  ")
-                    .filter { !$0.hasSuffix("% watched") }.joined(separator: "  ·  ")
+                    .filter { !$0.hasSuffix("% watched") && !$0.hasPrefix("★ ") }.joined(separator: "  ·  ")
                 if !stableTail.isEmpty { parts.append(stableTail) }
                 let genreLine = (meta.genres?.isEmpty == false)
                     ? meta.genres!.prefix(3).joined(separator: " · ") : nil
@@ -448,6 +475,11 @@ struct BrowseHeroBackdrop<TrailerLayer: View>: View {
     /// while the clip played.
     var trailer: () -> TrailerLayer
     @EnvironmentObject private var theme: ThemeManager
+    /// Settings > Effects and performance: animated, still or no focus art.
+    @AppStorage(VisualEffects.backdropKey) private var backdropChoice = VisualEffects.auto
+    private var backdropMode: VisualEffects.Backdrop {
+        VisualEffects.backdrop(stored: backdropChoice, reduced: PerformanceMode.reduced)
+    }
     /// The focused title's clean TMDB clearlogo (textless PNG), resolved by id like the landscape cards.
     /// nil until it resolves (or when TMDB has none / no key) - the title then falls back to styled text.
     @State private var heroLogo: UIImage?
@@ -468,9 +500,11 @@ struct BrowseHeroBackdrop<TrailerLayer: View>: View {
         ZStack(alignment: .topLeading) {
             Theme.Palette.canvas.ignoresSafeArea()
             if let hero = model.hero {
-                FullBleedBackdrop(url: hero.backdrop, allowsUltraHD: hero.allowsUltraHD ?? false)
-                    .id(hero.id)
-                    .transition(.opacity)
+                if backdropMode != .off {
+                    FullBleedBackdrop(url: hero.backdrop, allowsUltraHD: hero.allowsUltraHD ?? false)
+                        .id(hero.id)
+                        .transition(.opacity)
+                }
                 // The muted trailer clip sits OVER the still backdrop but UNDER the details, so a
                 // resolved clip becomes the moving background while the logo / meta / synopsis stay on
                 // top (the fallback still art keeps the same z-order, so the hero never blanks).
@@ -484,7 +518,7 @@ struct BrowseHeroBackdrop<TrailerLayer: View>: View {
                 }
             }
         }
-        .animation(.easeOut(duration: 0.35), value: model.hero?.id)
+        .animation(backdropMode == .animated ? .easeOut(duration: 0.35) : nil, value: model.hero?.id)
         .animation(.easeOut(duration: 0.25), value: model.detailsVisible)
         // Resolve the focused title's clearlogo by id (TMDB, same source as the landscape cards) so the
         // hero shows the logo in place of the serif title text, matching the iOS/Mac hero. Re-runs per hero.
@@ -590,10 +624,18 @@ struct LandscapeArt: View {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
                         .overlay { titleLayer }
                 } else {
-                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
-                        .blur(radius: 26).opacity(0.55)
-                        .overlay(Color.black.opacity(0.35))
-                        .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit))
+                    // A blurred copy of the poster fills the 16:9 frame; with glass and blur off the
+                    // frame is a plain dark fill instead, sparing one blur per card.
+                    Group {
+                        if VisualEffects.glassEnabled {
+                            Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                                .blur(radius: 26).opacity(0.55)
+                        } else {
+                            Theme.Palette.surface2
+                        }
+                    }
+                    .overlay(Color.black.opacity(0.35))
+                    .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit))
                 }
             } else if failed {
                 Theme.Palette.surface2.overlay(
@@ -620,7 +662,7 @@ struct LandscapeArt: View {
             let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
             CardRatingBadge(id: id, type: type,
                             active: PosterArtwork.bakesRatings && !bakedPosterShown,
-                            glyphSize: 12, textSize: 15, maxScores: 4)
+                            textSize: 15, reservedTrailing: 48)
                 .padding(Theme.Space.sm)
         }
     }
@@ -831,14 +873,15 @@ struct PosterCard: View {
                     Label("Details", systemImage: "info.circle")
                 }
             }
+            Divider()
             Button(role: .destructive) {
-                CoreBridge.shared.removeFromLibrary(id: id)
+                CoreBridge.shared.removeFromContinueWatching(id: id)
             } label: {
                 Label("Remove from Continue Watching", systemImage: "minus.circle")
             }
         case .catalog:
             Button {
-                CoreBridge.shared.addToLibrary(metaId: id, expectedType: type, fallbackPreview: catalogPreview)
+                CoreBridge.shared.addToLibraryFromMenu(catalogPreview)
             } label: {
                 Label("Add to Library", systemImage: "plus.circle")
             }
@@ -863,8 +906,9 @@ struct PosterCard: View {
             } label: {
                 Label("Mark as Unwatched", systemImage: "circle")
             }
+            Divider()
             Button(role: .destructive) {
-                CoreBridge.shared.removeFromLibrary(id: id)
+                CoreBridge.shared.removeFromLibraryFromMenu(catalogPreview)
             } label: {
                 Label("Remove from Library", systemImage: "trash")
             }

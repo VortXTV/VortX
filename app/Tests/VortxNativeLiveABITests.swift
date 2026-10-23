@@ -89,8 +89,49 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         await facade.shutdown()
         print("Live native field notifications: no-op acknowledgments quiet; progress changes playback/CW without ctx/search; equal-descriptor profile identity, addon change and explicit rebind each notify ctx; library remains live")
     }
+    /// Real shared host-field contracts in the NORMAL full ABI module. No Xperience/parser,
+    /// Keychain/UI shim, alternate Facade, conditional exclusion or extra compiler list is used.
+    static func nativeHostFieldCAS() async throws {
+        let scope = VortxAccountScope(account: "native-host-field-fixture", ownerProfileID: "native-host-field-owner")
+        let checkpoint = try VortxEncryptedCheckpointStore(
+            directory: URL(fileURLWithPath: CommandLine.arguments[3]).appendingPathComponent("native-host-field"),
+            key: SymmetricKey(size: .bits256))
+        let session = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint,
+                                            transport: VortxCResourceTransport(), allowNewAccount: true)
+        let field = "hostFieldFixture", nfc = "\u{00e9}", nfd = "e\u{0301}"
+        _ = try await session.dispatch([], now: 1000,
+            hostEdits: [.init(profileID: scope.ownerProfileID, fields: [field: .object(["label": .string(nfc)])])],
+            hostFieldCAS: .init(profileID: scope.ownerProfileID, field: field, register: nil))
+        let host = try await session.hostPreferencesDocument()
+        guard let accepted = host["profiles"]?[scope.ownerProfileID]?["fields"]?[field] else {
+            preconditionFailure("normal ABI host-field receipt missing")
+        }
+        var byteDistinct = try accepted.decode([String: VortxJSON].self)
+        byteDistinct["value"] = .object(["label": .string(nfd)])
+        let wrongRegister = VortxJSON.object(byteDistinct)
+        check(nfc == nfd && Data(nfc.utf8) != Data(nfd.utf8))
+        check(accepted == wrongRegister) // negative control: Swift equality would miss this conflict
+        check(!VortxNativeHostFieldEvidence.json(accepted, wrongRegister))
+        let durableHost = try checkpoint.readHostPreferences(scope: scope)
+        do {
+            _ = try await session.dispatch([], now: 1001,
+                hostEdits: [.init(profileID: scope.ownerProfileID, fields: [field: .object(["label": .string("must-not-write")])])],
+                hostFieldCAS: .init(profileID: scope.ownerProfileID, field: field, register: wrongRegister))
+            preconditionFailure("normal ABI accepted byte-distinct expected register")
+        } catch VortxNativeHostFieldMutationError.staleRegister {}
+        check(try checkpoint.readHostPreferences(scope: scope) == durableHost)
+        _ = try await session.dispatch([], now: 1002,
+            hostEdits: [.init(profileID: scope.ownerProfileID, fields: [field: .object(["label": .string("accepted")])])],
+            hostFieldCAS: .init(profileID: scope.ownerProfileID, field: field, register: accepted))
+        let after = try await session.hostPreferencesDocument()
+        check(after["profiles"]?[scope.ownerProfileID]?["fields"]?[field]?["value"]?["label"] == .string("accepted"))
+        await session.close()
+        print("Live native host-field: shared Foundation contracts, exact Unicode CAS rejection, unchanged failed checkpoint, subsequent valid commit")
+    }
+
     static func main() async throws {
         try shortUnwatchedEpisode()
+        try OwnerHistorySwiftLiveABICases.run(checkpointDirectory: URL(fileURLWithPath: CommandLine.arguments[3]))
         let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "fixture-owner", ownerName: "Fixture")
         let add = try runtime.dispatch(#"{"type":"add_profile","id":"fixture-kid","name":"Kid"}"#, now: 1000)
         check(add.contains("\"ok\":true"))
@@ -109,6 +150,7 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         let port = CommandLine.arguments[2]
         let addon = VortxResourceAddon(id: "source-identity", transportUrl: "http://127.0.0.1:\(port)/manifest.json", manifest: fixture["manifest"])
         try await changedFieldNotifications(addon: addon)
+        try await nativeHostFieldCAS()
         let bridge = VortxResourceBridge(transport: try VortxCResourceTransport())
         for resource in [VortxResourceRequest.Resource.catalog, .meta, .stream, .subtitles] {
             let id = resource == .catalog ? "popular" : "tt-fixture"
@@ -252,6 +294,8 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         try dispatch(["action": "Player", "args": ["action": "TimeChanged", "args": ["time": 120000, "duration": 1200001]]], field: "player")
         await facade.settled()
         check(try field("native_state")["libraries"]?["fixture-owner"]?["watchContexts"]?["tt-fixture:1:2"]?["durationMs"] == .integer(1200001))
+        // Position ticks reach disk at most every 30 s; pause, close, background and quit flush them.
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in facade.flushPendingProgress { done.resume() } }
         let durable = try JSONDecoder().decode(VortxJSON.self, from: Data(checkpoint.read(scope: scope)!.utf8))
         check(try durable == field("native_state"))
         check(!facade.dispatch(data: Data(#"{"action":"Ctx","args":{"action":"LoginWithToken","args":"not-a-real-token"}}"#.utf8), field: nil))
@@ -276,7 +320,13 @@ private final class NativeFieldNotifications: @unchecked Sendable {
                                              "metadata": .object(["type": .string("series")])])
         check(!facade.dispatchForProfile(kidProgress, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         check(facade.dispatchForProfile(kidProgress, profileID: "kid", expectedAccountGeneration: facade.accountGeneration)); await facade.settled()
-        check(try field("library")["catalog"] == .array([]))
+        // Watched or started titles are listed in the Library as previously watched, never as saved membership.
+        func watchedOnlyLibrary() throws -> Set<String> {
+            let rows = try field("library")["catalog"]?.array ?? []
+            guard rows.allSatisfy({ $0["previouslyWatched"] == .bool(true) }) else { return [] }
+            return Set(rows.compactMap { row -> String? in if case .string(let id)? = row["_id"] { return id }; return nil })
+        }
+        check(try watchedOnlyLibrary() == ["unsaved-kid"])
         check(try field("continue_watching_preview")["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-kid-episode"))
         check(facade.cachedResumeSeconds(id: "opaque-kid-episode") == 3.001)
         check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid", expectedAccountGeneration: facade.accountGeneration) == 3.001)
@@ -284,7 +334,9 @@ private final class NativeFieldNotifications: @unchecked Sendable {
                                               "metadata": .object(["type": .string("movie")])])
         check(facade.dispatchForProfile(watchedMovie, profileID: "kid", expectedAccountGeneration: facade.accountGeneration)); await facade.settled()
         check(try field("native_history")["items"]?.array?.contains { $0["_id"] == .string("unsaved-movie") && $0["state"]?["timesWatched"] == .integer(1) } == true)
-        check(try field("library")["catalog"] == .array([]))
+        // The Library view is filtered to series here (selected above), so the watched movie is not listed in it.
+        check(try watchedOnlyLibrary() == ["unsaved-kid"] && field("library")["selectable"]?["types"]?.array?
+            .contains { $0["type"] == .string("movie") } == true)
         // Ctx add-on mutations use the exact kernel actions. Invalid new descriptors are rejected before
         // old membership is considered; replacement, order and removal are committed through one FIFO.
         let replacementURL = "http://127.0.0.1:\(port)/replacement/manifest.json"
@@ -475,6 +527,23 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         let activeSlotSource = try JSONSerialization.jsonObject(with: activeSlotBaselines[0].sourceBaseline) as! [String: Any]
         check(activeSlotBaselines[0].profileID == child.id
               && ((activeSlotSource["source"] as? [String: Any])?["profileOverlaySha256"] as? String) == freshWitness)
+        // Closed slot interpretation only; this synthetic projection is NOT a valid full
+        // schema6 document, an owner-history receipt, or permission to mount a new protocol.
+        let schema6Slots: VortxJSON = .object(["schemaVersion": .integer(6),
+            "accountSlots": rebindState["nativeSync"]!["accountSlots"]!])
+        let sameSlots = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: schema6Slots)
+        check(sameSlots.count == activeSlotBaselines.count
+            && sameSlots[0].sourceBaseline == activeSlotBaselines[0].sourceBaseline)
+        for _ in 0..<8 {
+            let repeated = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSyncData: strictRebindSync)
+            check(repeated == activeSlotBaselines)
+        }
+        check(try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync:
+            .object(["schemaVersion": .integer(6)])).isEmpty)
+        do {
+            _ = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: .object(["schemaVersion": .integer(7)]))
+            fatalError("Unsupported slot schema was interpreted")
+        } catch { check(true) }
         let activeSlotDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
             roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountSlotBaselines: activeSlotBaselines)
         check(activeSlotDisposition.count == 1 && activeSlotDisposition[0].status == .matchedWitness)
@@ -484,26 +553,59 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         let activeSlotColdTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: activeSlotColdMaterial), profileID: child.id)
         check(activeSlotColdTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
               && activeSlotColdTarget.profileOverlaySHA256 == freshWitness)
-        let preOwnBaseline = Data("{\"schemaVersion\":1}".utf8)
+        // A schema-only carrier cannot prove a retained account origin, even with an active slot.
+        let partialOriginBaseline = Data("{\"schemaVersion\":1}".utf8)
+        do {
+            _ = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
+                roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountBaseline: partialOriginBaseline,
+                retainedOwnAccountSlotBaselines: activeSlotBaselines)
+            preconditionFailure("Partial origin baseline admitted by classifier")
+        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason == "Retained account origin requires a complete baseline")
+        }
+        do {
+            _ = try VortxLegacyBootstrapMaterial.encode(document: freshRootDocument, roster: [owner, ownAccount],
+                ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+                retainedOwnAccountBaseline: partialOriginBaseline, retainedOwnAccountSlotBaselines: activeSlotBaselines)
+            preconditionFailure("Partial origin baseline admitted by encoder")
+        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason == "Retained account origin requires a complete baseline")
+        }
+        // Build a complete synthetic historical shared origin through the real encoder. The
+        // later native own slot is not permission to rewrite that global legacy policy.
+        let preOwnBaseline = try VortxLegacyBootstrapMaterial.encode(
+            document: Data("{\"vortx\":{}}".utf8), roster: [owner, child], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil)
         let lateSlotDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
             roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountBaseline: preOwnBaseline,
             retainedOwnAccountSlotBaselines: activeSlotBaselines)
-        check(lateSlotDisposition.count == 1 && lateSlotDisposition[0].status == .matchedWitness)
+        check(lateSlotDisposition.isEmpty)
         let lateSlotMaterial = try VortxLegacyBootstrapMaterial.encode(document: freshRootDocument,
             roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
             retainedOwnAccountBaseline: preOwnBaseline, retainedOwnAccountSlotBaselines: activeSlotBaselines,
             deferredOwnAccountOverlays: lateSlotDisposition)
-        let lateSlotTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: lateSlotMaterial), profileID: child.id)
-        check(lateSlotTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
-              && lateSlotTarget.profileOverlaySHA256 == freshWitness)
+        let lateSlotJSON = try JSONDecoder().decode(VortxJSON.self, from: lateSlotMaterial)
+        check(lateSlotJSON["ownAccountSources"] == nil)
+        check(try VortxLegacyBootstrapMaterial.accountOrigins(lateSlotMaterial)[child.id] == .shared)
         let retainedClockCarrier = Data(("{\"source\":{\"verifiedStreamingUid\":\"verified-own-uid\",\"sourceDocumentSha256\":\""
             + String(repeating: "d", count: 64)
             + "\"},\"addons\":{\"items\":[],\"order\":[],\"intents\":[]},\"library\":{\"items\":[],\"intents\":[]},\"watches\":[{\"metaId\":\"tt-retained-clock\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583576}],\"identityLinks\":[]}").utf8)
         let retainedClockSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: child.id,
             sourceBaseline: retainedClockCarrier)
+        // Precision belongs to a complete historical own tuple, not a fabricated schema-only
+        // origin. Keep all tuple fields together, as in the material unit regression.
+        let clockCarrier = try VortxProfileOverlayWitness.decodeObject(json: retainedClockCarrier)
+        var clockBaseline = try VortxProfileOverlayWitness.decodeObject(json: freshMaterialData)
+        for (materialField, carrierField) in [("ownAccountSources", "source"), ("addons", "addons"),
+                                               ("libraries", "library"), ("watches", "watches"), ("identityLinks", "identityLinks")] {
+            var bucket = clockBaseline[materialField] as! [String: Any]
+            bucket[child.id.uuidString] = clockCarrier[carrierField]
+            clockBaseline[materialField] = bucket
+        }
         let retainedClockMaterial = try VortxLegacyBootstrapMaterial.encode(document: Data("{\"vortx\":{}}".utf8),
             roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
-            retainedOwnAccountBaseline: preOwnBaseline, retainedOwnAccountSlotBaselines: [retainedClockSlot])
+            retainedOwnAccountBaseline: JSONSerialization.data(withJSONObject: clockBaseline),
+            retainedOwnAccountSlotBaselines: [retainedClockSlot])
         let retainedClockJSON = try VortxProfileOverlayWitness.decodeObject(json: retainedClockMaterial)
         let retainedClock = (((retainedClockJSON["watches"] as? [String: Any])?[child.id.uuidString] as? [[String: Any]])?.first?["lastPlayedAtMs"] as? NSNumber)
         check(retainedClock?.doubleValue.bitPattern == 0x3fa41fb3cc50aa01)
@@ -514,16 +616,16 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         _ = try retainedClockRuntime.dispatch(String(decoding: JSONEncoder().encode(VortxJSON.object(["type": .string("import_legacy_sync"), "scope": .string(retainedClockScope.account),
             "ownerProfileId": .string(owner.id.uuidString), "material": try JSONDecoder().decode(VortxJSON.self, from: retainedClockMaterial)])), as: UTF8.self), now: 2)
         let retainedClockState = try JSONDecoder().decode(VortxJSON.self, from: Data(retainedClockRuntime.stateJSON().utf8))
-        try VortxNativeSession.validateLegacyCompatibility(scope: retainedClockScope, ownerName: owner.name, snapshot: nil,
-                                                           nativeSync: retainedClockState["nativeSync"], material: retainedClockMaterial, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: retainedClockScope, ownerName: owner.name, snapshot: nil,
+                                                           nativeSync: retainedClockState["nativeSync"], material: retainedClockMaterial, abi: VortxCABI()) == .accepted)
         let coldRebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), snapshot: rebindExport)
         defer { coldRebindRuntime.close() }
         let coldRebindExport = try coldRebindRuntime.stateJSON()
         let coldRebindState = try JSONDecoder().decode(VortxJSON.self, from: Data(coldRebindExport.utf8))
         check(coldRebindExport == rebindExport
               && activeOwnSource(coldRebindState)?["profileOverlaySha256"] == .string(freshWitness))
-        try VortxNativeSession.validateLegacyCompatibility(scope: rebindScope, ownerName: owner.name, snapshot: nil,
-                                                           nativeSync: rebindState["nativeSync"], material: freshMaterialData, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: rebindScope, ownerName: owner.name, snapshot: nil,
+                                                           nativeSync: rebindState["nativeSync"], material: freshMaterialData, abi: VortxCABI()) == .accepted)
         let switchToB = try VortxNativeProfiles.rebindAction(profileID: child.id,
             request: .init(scope: rebindScope.account, ownerProfileID: owner.id.uuidString,
                            transactionID: "schema4-own-b", expected: try VortxNativeProfiles.expectedBinding(state: rebindState, profileID: child.id),
@@ -639,14 +741,14 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         check(stateObject["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1))
         check(stateObject["libraries"]?[child.id.uuidString]?["items"] == .array([]))
         let remoteCarrier = stateObject["nativeSync"]!
-        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
-                                                          nativeSync: nil, material: material, abi: VortxCABI())
-        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
-                                                          nativeSync: remoteCarrier, material: material, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                          nativeSync: nil, material: material, abi: VortxCABI()) == .accepted)
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                                                          nativeSync: remoteCarrier, material: material, abi: VortxCABI()) == .accepted)
         let localCandidate = try VortxNativeRuntime(abi: VortxCABI(), snapshot: migrationState)
         _ = try localCandidate.dispatch(#"{"type":"mark_watched","metaId":"new-native-movie","name":"New native movie","metadata":{"type":"movie"}}"#, now: 1720000010)
-        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: localCandidate.stateJSON(),
-                                                          nativeSync: nil, material: material, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: localCandidate.stateJSON(),
+                                                          nativeSync: nil, material: material, abi: VortxCABI()) == .accepted)
         localCandidate.close()
         if case .object(var noReceipt) = remoteCarrier {
             noReceipt.removeValue(forKey: "legacyImport")
@@ -657,8 +759,8 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         var harmlessSource = source; harmlessSource["futureTheme"] = ["color": "blue", "unknown": true]
         let harmlessMaterial = try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: harmlessSource), roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000.1234)
         check(try JSONDecoder().decode(VortxJSON.self, from: harmlessMaterial) == JSONDecoder().decode(VortxJSON.self, from: material))
-        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
-                                                          nativeSync: remoteCarrier, material: harmlessMaterial, abi: VortxCABI())
+        check(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                          nativeSync: remoteCarrier, material: harmlessMaterial, abi: VortxCABI()) == .accepted)
         var pendingSource = source; pendingSource["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(remoteCarrier))
         pendingSource["profileEdits"] = ["editedAt": 1720000100000.5, "roster": [["id": owner.id.uuidString, "name": "Pending web rename"]]]
         do { _ = try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: pendingSource), roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000.1234); fatalError("native carrier bypassed pending web edits") }
@@ -678,19 +780,59 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         unsupportedProfiles[0]["name"] = "Unclocked legacy rename"
         unsupportedMaterial["roster"] = unsupportedProfiles
         let changedBytes = try JSONSerialization.data(withJSONObject: unsupportedMaterial)
-        for remote in [nil, remoteCarrier] {
-            do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
-                                                                   nativeSync: remote, material: changedBytes, abi: VortxCABI()); fatalError("changed legacy material silently mounted") }
-            catch VortxNativeError.invalidResponse {}
+        // A kernel-rejected legacy delta is held, never imported: native mount/sync continue on the
+        // unchanged native state, and the reason is a sanitized kernel code rather than material bytes.
+        func requireHeld(_ outcome: VortxNativeSession.LegacyReconciliation?, _ message: String) {
+            guard case .held(let reason, let delta) = outcome else { fatalError(message) }
+            check(reason != "unclassified" && reason.range(of: "^[a-z][a-z0-9/_-]*$", options: .regularExpression) != nil)
+            // The held outline names the bucket and field, never the renamed value or a profile id.
+            check(delta.contains("roster(~1:name)") && !delta.contains("Unclocked") && !delta.contains(owner.id.uuidString)
+                  && !delta.contains(child.id.uuidString))
         }
-        do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
-                                                               nativeSync: remoteCarrier, material: changedBytes, abi: VortxCABI()); fatalError("incompatible native peer adopted") }
-        catch VortxNativeError.invalidResponse {}
+        let summaryOwner = "00000000-0000-0000-0000-0000000000a1", summaryChild = "00000000-0000-0000-0000-0000000000b2"
+        let summaryBase: VortxJSON = .object([
+            "rosterModifiedSeconds": .number(20), "deletedProfileIds": .array([]),
+            "roster": .array([.object(["id": .string(summaryOwner), "name": .string("Owner")]), .object(["id": .string(summaryChild), "name": .string("Kid")])]),
+            "watches": .object([summaryChild: .array([.object(["metaId": .string("tt1"), "videoId": .string("tt1:1:1"), "positionMs": .integer(10)])])]),
+            "libraries": .object([summaryOwner: .object(["items": .array([]), "intents": .array([])])]),
+            "addons": .object([summaryOwner: .object(["items": .array([.object(["transportUrl": .string("https://a.example/manifest.json")])]),
+                                                      "order": .array([]), "intents": .array([])])])])
+        let summaryNext: VortxJSON = .object([
+            "rosterModifiedSeconds": .number(19), "deletedProfileIds": .array([]),
+            "roster": .array([.object(["id": .string(summaryOwner), "name": .string("Owner")]), .object(["id": .string(summaryChild), "name": .string("Kid")])]),
+            "watches": .object([summaryChild: .array([.object(["metaId": .string("tt1"), "videoId": .string("tt1:1:1"), "positionMs": .integer(90)]),
+                                                     .object(["metaId": .string("tt2"), "positionMs": .integer(5)])])]),
+            "libraries": .object([summaryOwner: .object(["items": .array([.object(["_id": .string("tt3")])]), "intents": .array([])])]),
+            "addons": .object([summaryOwner: .object(["items": .array([]), "order": .array([]), "intents": .array([])])])])
+        let outline = VortxLegacyDeltaSummary.describe(base: summaryBase, next: summaryNext, ownerProfileID: summaryOwner)
+        check(outline == "rosterClock=older,addons.items:owner(-1),libraries.items:owner(+1),watches:p1(+1/~1:positionMs)")
+        check(VortxLegacyDeltaSummary.describe(base: summaryBase, next: summaryBase, ownerProfileID: summaryOwner) == "none")
+        func shrinkItem(_ id: String) -> VortxJSON { .object(["kind": .string("standard"), "type": .string("series"), "id": .string(id)]) }
+        let shrinkBefore: VortxJSON = .object(["libraries": .object([
+            summaryOwner: .object(["items": .array([shrinkItem("tt-kept"), shrinkItem("tt-gone")])]),
+            summaryChild: .object(["items": .array([shrinkItem("tt-child")])])])])
+        let shrinkAfter: VortxJSON = .object(["libraries": .object([
+            summaryOwner: .object(["items": .array([shrinkItem("tt-kept"), shrinkItem("tt-new")])]),
+            summaryChild: .object(["items": .array([])])])])
+        let shrink = VortxNativeSession.libraryShrink(from: shrinkBefore, to: shrinkAfter, ownerProfileID: summaryOwner) ?? ""
+        // A swap still reports the removed title; a profile is named by a digest tag, never its ID or titles.
+        check(shrink.hasPrefix("owner(1),p") && shrink.hasSuffix("(1)") && !shrink.contains(summaryChild) && !shrink.contains("tt-"))
+        check(VortxNativeSession.libraryShrink(from: shrinkBefore, to: shrinkBefore, ownerProfileID: summaryOwner) == nil)
+        for remote in [nil, remoteCarrier] {
+            requireHeld(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                                          nativeSync: remote, material: changedBytes, abi: VortxCABI()),
+                        "changed legacy material silently accepted")
+        }
+        requireHeld(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                                                                      nativeSync: remoteCarrier, material: changedBytes, abi: VortxCABI()),
+                    "incompatible legacy delta accepted with a native peer")
         let merge = String(decoding: try JSONEncoder().encode(VortxJSON.object(["type": .string("merge_native_sync"), "document": remoteCarrier])), as: UTF8.self)
-        do { _ = try await migrated.dispatch([merge], now: 12, legacyMaterial: changedBytes); fatalError("warm sync committed incompatible legacy source") }
-        catch VortxNativeError.invalidResponse {}
+        _ = try await migrated.dispatch([merge], now: 12, legacyMaterial: changedBytes)
+        requireHeld(await migrated.legacyReconciliation, "warm sync accepted an incompatible legacy source")
+        check(try await migrated.stateJSON() == migrationState) // the unclocked rename was not imported
         check(try migrationStore.read(scope: legacyScope) == migrationState)
         _ = try await migrated.dispatch([merge], now: 13, legacyMaterial: material)
+        check(await migrated.legacyReconciliation == .accepted)
         check(try migrationStore.read(scope: legacyScope) == migrationState)
         var acceptedMigrationState = migrationState
         if remoteCarrier["legacyImport"]?["baseline"] != nil {
@@ -708,8 +850,8 @@ private final class NativeFieldNotifications: @unchecked Sendable {
             check(try migrationStore.readLegacyMaterial(scope: legacyScope).map { try JSONDecoder().decode(VortxJSON.self, from: $0) } == JSONDecoder().decode(VortxJSON.self, from: material))
             _ = try await migrated.dispatch([#"{"type":"get_state"}"#], now: 1720000300, legacyMaterial: material)
             check(try await migrated.stateJSON() == acceptedMigrationState) // acknowledged ancestor cannot undo rename
-            try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
-                nativeSync: acceptedState["nativeSync"], material: clockedBytes, abi: VortxCABI())
+            check(try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                nativeSync: acceptedState["nativeSync"], material: clockedBytes, abi: VortxCABI()) == .accepted)
             print("Live private legacy reconciliation: clocked peer rename, immutable original receipt/archive, ancestor no-op and cold native peer admission passed")
         }
         await migrated.close()

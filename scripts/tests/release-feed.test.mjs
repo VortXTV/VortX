@@ -33,6 +33,15 @@ const IOS_SHA = "1".repeat(64);
 const TVOS_SHA = "2".repeat(64);
 const MAC_SHA = "3".repeat(64);
 
+const NATIVE_PROJECT_TARGETS = ["VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite"];
+const projectTargetFixture = (name, build = BUILD) =>
+  '  ' + name + ':\n    settings:\n      base:\n        CURRENT_PROJECT_VERSION: "' + build + '"\n';
+function projectFixture({ historical = false, targets = NATIVE_PROJECT_TARGETS, build = BUILD } = {}) {
+  return "name: VortX\ntargets:\n" +
+    [...targets, ...(historical ? ["VortX"] : [])].map(name => projectTargetFixture(name, build)).join("") +
+    "  CinemaUISmokeRenderer:\n    type: application\nschemes:\n  VortXTV:\n    build:\n";
+}
+
 function entry({ build = BUILD, url, size, sha256, minOSVersion }) {
   return {
     version: VERSION,
@@ -133,13 +142,56 @@ test("Beta 10 build mismatch is rejected instead of advertising the wrong binary
   );
 });
 
-test("the project build is an all-target contract, not the first matching line", () => {
-  const six = Array.from({ length: 6 }, () => 'CURRENT_PROJECT_VERSION: "221"').join("\n");
-  assert.equal(projectBuildFromYmlText(six), 221);
-  assert.throws(() => projectBuildFromYmlText('CURRENT_PROJECT_VERSION: "221"'), /exactly six/);
-  assert.throws(() => projectBuildFromYmlText(six.replace('"221"', '"220"')), /disagree/);
+test("project builds require all five native targets or all six named historical targets", () => {
+  assert.equal(projectBuildFromYmlText(projectFixture()), BUILD);
+  assert.equal(projectBuildFromYmlText(projectFixture({ historical: true })), BUILD);
+  assert.equal(projectBuildFromYmlText(projectFixture().replace("  CinemaUISmokeRenderer:\n    type: application\n", "")), BUILD);
 });
 
+test("project build rejects missing named native targets in native and historical layouts", () => {
+  for (const historical of [false, true]) {
+    for (const missing of NATIVE_PROJECT_TARGETS) {
+      const text = projectFixture({ historical, targets: NATIVE_PROJECT_TARGETS.filter(name => name !== missing) });
+      assert.throws(() => projectBuildFromYmlText(text), { code: "project-build" }, missing);
+    }
+  }
+});
+
+test("project build rejects duplicate, misplaced, incomplete and counterfeit build metadata", () => {
+  const native = projectFixture(), historical = projectFixture({ historical: true });
+  const field = '        CURRENT_PROJECT_VERSION: "221"\n';
+  const incomplete = projectFixture({ targets: NATIVE_PROJECT_TARGETS.filter(name => name !== "VortXTopShelf") });
+  const cases = [
+    ["bare six-line counter", field.repeat(6)],
+    ["native mismatch", native.replace('"221"', '"220"')],
+    ["historical mismatch", historical.replace(projectTargetFixture("VortX"), projectTargetFixture("VortX", 220))],
+    ["legacy target missing its build", historical.replace(projectTargetFixture("VortX"), "  VortX:\n    settings:\n      base:\n")],
+    ["native target missing its build", native.replace(field, "")],
+    ["duplicate field", native.replace(field, field.repeat(2))],
+    ["counterfeit six fields with a missing target", incomplete.replace(field, field.repeat(3))],
+    ["duplicate named target", native.replace("schemes:\n", projectTargetFixture("VortXTV") + "schemes:\n")],
+    ["unexpected versioned target", native.replace("schemes:\n", projectTargetFixture("OtherApp") + "schemes:\n")],
+    ["versioned smoke renderer", native.replace("  CinemaUISmokeRenderer:\n    type: application\n", projectTargetFixture("CinemaUISmokeRenderer"))],
+    ["build outside targets", "settings:\n      base:\n" + field + native],
+    ["build in schemes", native + field],
+    ["misindented settings scope", native.replace("    settings:\n", "   settings:\n")],
+    ["duplicate settings scope", native.replace("  CinemaUISmokeRenderer:\n", "    settings:\n      base:\n  CinemaUISmokeRenderer:\n")],
+    ["unquoted build", native.replace('"221"', "221")],
+    ["zero build", projectFixture({ build: 0 })],
+    ["inline targets override", native + "targets: {}\n"],
+    ["quoted targets override", native + '"targets": {}\n'],
+    ["spaced targets override", native + "targets : {}\n"],
+    ["spaced quoted targets override", native + '"targets" : {}\n'],
+    ["inline settings override", native.replace("  CinemaUISmokeRenderer:\n", "    settings: {}\n  CinemaUISmokeRenderer:\n")],
+    ["spaced settings override", native.replace("  CinemaUISmokeRenderer:\n", "    settings : {}\n  CinemaUISmokeRenderer:\n")],
+    ["inline base override", native.replace("  CinemaUISmokeRenderer:\n", "      base: {}\n  CinemaUISmokeRenderer:\n")],
+    ["spaced base override", native.replace("  CinemaUISmokeRenderer:\n", "      base : {}\n  CinemaUISmokeRenderer:\n")],
+    ["duplicate targets section", native + "targets:\n"],
+  ];
+  for (const [name, text] of cases) {
+    assert.throws(() => projectBuildFromYmlText(text), { code: "project-build" }, name);
+  }
+});
 test("release and manual cut paths both require feed propagation", async () => {
   const workflow = await readFile(new URL("../../.github/workflows/release-tvos.yml", import.meta.url), "utf8");
   assert.match(workflow, /concurrency:\s*\n\s+group:\s*vortx-release-\$\{\{ inputs\.release_tag \}\}/);
@@ -408,6 +460,35 @@ test("validateReleaseFeedArtifact accepts Apple-only release (android null)", ()
   assert.equal(result.valid, true);
   assert.deepEqual(result.androidFlavors, []);
   assert.equal(result.hasApple, true);
+});
+
+test("validateReleaseFeedArtifact rejects missing or malformed Apple artifacts", () => {
+  assert.throws(() => validateReleaseFeedArtifact(validManifest({ hasApple: false })), /at least one/);
+  for (const platform of ["ios", "tvos", "mac"]) {
+    for (const value of ["garbage", [], 1]) {
+      const manifest = validManifest();
+      manifest[platform] = value;
+      assert.throws(() => validateReleaseFeedArtifact(manifest), /artifact object/);
+    }
+    for (const [field, value] of [["url", "https://example.invalid/other.ipa"], ["size", -1], ["sha256", "bad"], ["build", BUILD + 1]]) {
+      const manifest = validManifest();
+      manifest[platform][field] = value;
+      assert.throws(() => validateReleaseFeedArtifact(manifest), undefined, `${platform}.${field}`);
+    }
+  }
+});
+
+test("validateReleaseFeedArtifact accepts the generated assets container", () => {
+  const manifest = validManifest();
+  manifest.assets = {};
+  for (const platform of ["ios", "tvos", "mac"]) {
+    const { tag, version, build, ...artifact } = manifest[platform];
+    manifest.assets[platform] = artifact;
+    delete manifest[platform];
+  }
+  assert.equal(validateReleaseFeedArtifact(manifest).hasApple, true);
+  manifest.assets.ios.size = 0;
+  assert.throws(() => validateReleaseFeedArtifact(manifest), /positive integer/);
 });
 
 test("validateReleaseFeedArtifact accepts full+play Android with Apple", () => {

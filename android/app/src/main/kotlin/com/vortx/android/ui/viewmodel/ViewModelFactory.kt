@@ -1,5 +1,6 @@
 package com.vortx.android.ui.viewmodel
 
+import com.vortx.android.foryou.englishForYouTitle
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -76,6 +77,9 @@ class StremioXViewModelFactory(
             curatedCollections = appContext
                 ?.takeIf { homeSurface == HomeRailSurface.PHONE }
                 ?.let(::CuratedCollectionsModel),
+            forYouStore = appContext?.let(com.vortx.android.foryou.ForYouStore::shared),
+            forYouTitle = appContext?.let { context -> com.vortx.android.foryou.ForYouText(context)::title }
+                ?: ::englishForYouTitle,
         ) as T
         modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(
             repo,

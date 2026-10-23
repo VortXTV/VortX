@@ -17,15 +17,23 @@ The IPAs need compatible sideload signing. The Mac app is ad-hoc signed, not not
 
 An Android variant describes its **player/distribution**, not a device split. Both APKs contain phone/tablet and Android TV interfaces, including the TV launcher entry.
 
+Both variants contain the phone AND the Android TV activities; neither is a device-specific build.
+
 | Artifact pattern | Contents |
 | --- | --- |
 | `VortX-<version>-full-mpv-universal.apk` | Sideload build with native GPL libmpv and Media3 routes |
 | `VortX-<version>-play-media3-universal.apk` | Media3/ExoPlayer-only variant, without the GPL MPV payload |
 | `VortX-<version>-play-media3.aab` | Distribution App Bundle, not directly installable |
 
-Current APKs support Android 8.0/API 26+ and include `arm64-v8a`, `armeabi-v7a` and `x86_64`. A Play-oriented filename does not mean a Google Play listing is available. Use the same variant and signer when updating; do not uninstall to work around a rejected update.
+Current APKs support Android 8.0/API 26+ and include `arm64-v8a`, `armeabi-v7a`, and `x86_64`. A Play-oriented filename does not mean a Google Play listing is available. Use the same variant and signer when updating; do not uninstall to work around a rejected update.
 
 There are no current phone-only or TV-only release APKs. Old filenames using those labels were misleading. Any consumer that pins an asset name, digest or channel must be reviewed when naming changes; renaming is not automatically safe for a redirect or feed.
+
+| Historical name | Canonical equivalent |
+| --- | --- |
+| `VortX-x.y.z-phone.apk` | `VortX-x.y.z-full-mpv-universal.apk` |
+| `VortX-x.y.z-tv.apk` | `VortX-x.y.z-play-media3-universal.apk` |
+| `VortX-x.y.z-play.aab` | `VortX-x.y.z-play-media3.aab` |
 
 ## Checksums, signing and provenance
 
@@ -58,3 +66,9 @@ Explain that this is only for the official VortX app if macOS blocks it. Removin
 Normal coordinated feed publication and a direct-download beta are different workflows. A direct-download beta does not by itself authorize changing stable feeds, download routing, website deployment or backend state.
 
 Secretless pull-request packaging checks use fixture data and, for Android signing exercises, an ephemeral keystore. They cannot prove private-engine package identity, the production signer or physical-device playback. Privileged release lanes and final public readback must supply the missing evidence. Apple sideload/ad-hoc checks must not be mislabeled as Developer ID notarization or App Store acceptance.
+
+The Apple secretless lane generates the actual native-only project and checks compile/link/bundle
+mechanics for all four app targets, including both Lite simulator architectures, using marked,
+fail-closed native-engine and Mac-server stand-ins. Those stand-ins are not the private ABI or
+server and cannot be consumed by the protected release lane. Native engine/runtime behavior is
+tested separately against the reviewed private source; a stub-based build cannot certify it.

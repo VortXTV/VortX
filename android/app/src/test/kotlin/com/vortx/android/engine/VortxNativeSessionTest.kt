@@ -128,6 +128,35 @@ class VortxNativeSessionTest {
         }
     }
 
+    @Test fun `rejected legacy reconciliation is held while the native merge commits`() {
+        val runtime = Runtime(); val store = Store()
+        val merge = JSONObject().put("type", "merge_native_sync").put("document", JSONObject())
+        fun reconcile(tag: String) = JSONObject().put("type", NativeLegacyReconciliationPolicy.ACTION)
+            .put("material", JSONObject().put("fixture", tag))
+        open(runtime, store).use { session ->
+            assertEquals(null, session.heldLegacyReconciliation)
+            // The fixture kernel rejects reconcile_legacy_sync like a real unclocked legacy delta.
+            session.dispatch(listOf(merge, reconcile("rejected"), JSONObject().put("type", "switch_profile").put("id", "guest")))
+            assertEquals("guest", session.read().state.getString("activeProfileId"))
+            assertEquals("unclassified", session.heldLegacyReconciliation)
+            assertTrue("held material must not become the retained baseline",
+                JSONObject(requireNotNull(store.value)).isNull("legacyImportMaterial"))
+            val committed = store.value
+            assertTrue(runCatching { session.dispatch(listOf(reconcile("a"), reconcile("b"))) }.isFailure)
+            assertTrue(runCatching { session.dispatch(listOf(merge, JSONObject().put("type", "unsupported"))) }.isFailure)
+            assertEquals(committed, store.value)
+        }
+    }
+
+    @Test fun `legacy rejection codes keep kernel phrases and drop anything else`() {
+        assertEquals("legacy_membership_descriptor/addition_lacks_newer_install_clock", NativeLegacyReconciliationPolicy.rejectionCode(
+            JSONObject().put("ok", false).put("error", "legacy membership descriptor/addition lacks newer install clock").toString()))
+        assertEquals("unclassified", NativeLegacyReconciliationPolicy.rejectionCode(
+            JSONObject().put("ok", false).put("error", "invalid type: string \"tt1234\", expected u64").toString()))
+        assertEquals("unclassified", NativeLegacyReconciliationPolicy.rejectionCode("{\"ok\":false}"))
+        assertEquals("unclassified", NativeLegacyReconciliationPolicy.rejectionCode("not json"))
+    }
+
     @Test fun `failed durable writes dispatches and readback never publish candidate`() {
         val runtime = Runtime(); val store = Store()
         open(runtime, store).use { session ->
@@ -156,6 +185,43 @@ class VortxNativeSessionTest {
         store.value = foreign.toString()
         assertTrue(runCatching { open(runtime, store) }.isFailure); assertEquals(0, runtime.created)
         assertTrue(runCatching { VortxNativeSession.open(scope, "Owner", runtime, Store(), Transport()) }.isFailure)
+    }
+    @Test fun `original encrypted checkpoint read cannot cross stores or survive ABA`() {
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-authority-test-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        try {
+            val original = VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).use { it.read().state.toString() }
+            val target = directory.listFiles()!!.single()
+            val ciphertextA = target.readBytes()
+            val readA = store.captureCheckpoint(scope)
+            store.requireCurrentCheckpoint(scope, readA)
+            val readB = store.compareAndCommitCheckpoint(scope, readA, original)
+            assertTrue(runCatching { store.compareAndCommitCheckpoint(scope, readA, original) }.isFailure)
+            assertTrue(runCatching { VortxEncryptedCheckpointStore(directory) { key }.requireCurrentCheckpoint(scope, readB) }.isFailure)
+            // Even restoring identical encrypted bytes in this synthetic directory cannot revive
+            // a capability from before the intervening write in the same writer generation.
+            target.writeBytes(ciphertextA)
+            assertTrue(runCatching { store.requireCurrentCheckpoint(scope, readA) }.isFailure)
+            assertTrue(runCatching { store.requireCurrentCheckpoint(scope, readB) }.isFailure)
+            val forged = NativeCheckpointRead(original, store, scope, 2, ciphertextA)
+            assertTrue(runCatching { store.requireCurrentCheckpoint(scope, forged) }.isFailure)
+        } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+    @Test fun `captured absence is create only and tamper never becomes absence`() {
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-create-only-test-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        try {
+            val absent = store.captureCheckpoint(scope)
+            assertNull(absent.plaintext)
+            val original = VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).use { it.read().state.toString() }
+            assertTrue(runCatching { store.compareAndCommitCheckpoint(scope, absent, original) }.isFailure)
+            assertEquals(original, store.read(scope))
+            val target = directory.listFiles()!!.single()
+            val bytes = target.readBytes(); bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte(); target.writeBytes(bytes)
+            assertTrue(runCatching { store.captureCheckpoint(scope) }.isFailure)
+        } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
     @Test fun `AES GCM checkpoint survives cold read and rejects tamper wrong key wrong account`() {
         val directory = Files.createTempDirectory(File("build").toPath(), "native-session-test-").toFile()
@@ -311,7 +377,7 @@ class VortxNativeSessionTest {
         val transport = Transport().also { it.failedCatalog = "broken" }
         VortxNativeSession.open(scope, "Owner", bindings, store, transport).use { session ->
             val repo = NativeCatalogRepository { session }
-            val stats = WatchStatsModel(File("build/never-read-legacy"), repo, nativeEnabled = true)
+            val stats = WatchStatsModel(repo)
             stats.load(); assertNull(stats.state.value.error)
             assertEquals("Fixture Series", repo.home().getOrThrow().last().items.single().name)
             val homeRow = repo.home().getOrThrow().last()

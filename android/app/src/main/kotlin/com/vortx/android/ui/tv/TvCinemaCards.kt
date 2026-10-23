@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
@@ -63,6 +64,7 @@ internal fun TvCinemaCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     width: Dp? = null,
+    viewportWidth: Float? = null,
     onFocused: () -> Unit = {},
     focusRequester: FocusRequester? = null,
     continueWatching: Boolean = false,
@@ -71,7 +73,24 @@ internal fun TvCinemaCard(
     val colors = VortXTheme.colors
     val appContext = LocalContext.current.applicationContext
     var menuOpen by remember(item.type, item.id) { mutableStateOf(false) }
-    Box(modifier = modifier.then(if (width == null) Modifier.fillMaxWidth() else Modifier.width(width))) {
+    val continueWatchingWidth = if (continueWatching) {
+        if (viewportWidth == null) {
+            TvPosterLayoutPolicy.continueWatchingWidth()
+        } else {
+            TvPosterLayoutPolicy.continueWatchingWidth(viewportWidth)
+        }
+    } else {
+        null
+    }
+    Box(
+        modifier = modifier.then(
+            when {
+                continueWatchingWidth != null -> Modifier.width(continueWatchingWidth)
+                width == null -> Modifier.fillMaxWidth()
+                else -> Modifier.width(width)
+            },
+        ),
+    ) {
         if (continueWatching) {
             PosterQuickActionMenu(
                 item = item,
@@ -185,12 +204,24 @@ internal fun TvContinueWatchingRail(
             Text("Pick up where you left off", style = VortXTheme.type.eyebrow)
             Text("Continue Watching", style = VortXTheme.type.sectionTitle)
         }
-        LazyRow(
-            contentPadding = PaddingValues(horizontal = TvDimens.edge),
-            horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
-        ) {
-            railItems(tvHomeItems(items), key = ::tvHomeItemKey) { item ->
-                TvCinemaCard(item, onClick = { onItem(item) }, width = 300.dp, continueWatching = true, onRemoveFromContinueWatching = { onRemove(item) })
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            // Library's TV rail is measured at the point where it is rendered. The card itself retains the
+            // 390-unit Apple baseline on a normal TV, but this measured width bounds split-screen/narrow TV
+            // layouts without changing its artwork, resume, focus or remove semantics.
+            val viewportWidth = maxWidth.value
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
+            ) {
+                railItems(tvHomeItems(items), key = ::tvHomeItemKey) { item ->
+                    TvCinemaCard(
+                        item,
+                        onClick = { onItem(item) },
+                        viewportWidth = viewportWidth,
+                        continueWatching = true,
+                        onRemoveFromContinueWatching = { onRemove(item) },
+                    )
+                }
             }
         }
     }

@@ -57,7 +57,7 @@ private struct VortXButtonBody<S: InsettableShape>: View {
     let focusScale: CGFloat
     let configuration: ButtonStyleConfiguration
     @Environment(\.isFocused) private var focused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     var body: some View {
         let styled = configuration.label
@@ -109,23 +109,26 @@ extension View {
 /// - **focused**  → ember ring + lift + brightened text ON TOP of the glass, unmistakable at ten feet
 struct ChipButtonStyle: ButtonStyle {
     var selected: Bool = false
+    var profileTinted: Bool = false
     var accent: Color = Theme.Palette.accent
     var accentText: Color = Theme.Palette.accent
     private let focusMargin: CGFloat = 5
 
     func makeBody(configuration: Configuration) -> some View {
-        Chip(selected: selected, accent: accent, accentText: accentText,
+        Chip(selected: selected, profileTinted: profileTinted, accent: accent, accentText: accentText,
              focusMargin: focusMargin, configuration: configuration)
     }
 
     private struct Chip: View {
         let selected: Bool
+        let profileTinted: Bool
         let accent: Color
         let accentText: Color
         let focusMargin: CGFloat
         let configuration: ButtonStyleConfiguration
         @Environment(\.isFocused) private var focused: Bool
-        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @ReducedMotion private var reduceMotion
+        @ObservedObject private var theme = ThemeManager.shared
 
         var body: some View {
             let styled = configuration.label
@@ -136,7 +139,7 @@ struct ChipButtonStyle: ButtonStyle {
                 // The one glass chip path: neutral glass base, plus the parameterized ember overlay when
                 // selected (the style's `accent`, so a destructive / warn chip keeps its own tint). The
                 // ember focus ring + scale below still ride ON TOP of the glass.
-                .vortxGlassChip(selected: selected, tint: accent)
+                .background { chipSurface }
                 .overlay(Capsule(style: .continuous).strokeBorder(accent, lineWidth: focused ? 3 : 0))
                 .scaleEffect(configuration.isPressed ? 0.97 : (focused && !reduceMotion ? 1.06 : 1))
                 .padding(focusMargin)
@@ -155,8 +158,17 @@ struct ChipButtonStyle: ButtonStyle {
         }
 
         private var textColor: Color {
+            if profileTinted { return Theme.Palette.textPrimary }
             if selected { return accentText }
             return focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary
+        }
+
+        @ViewBuilder private var chipSurface: some View {
+            if profileTinted {
+                Color.clear.vortxGlassControl(in: Capsule(style: .continuous), active: selected)
+            } else {
+                Color.clear.vortxGlassChip(selected: selected, tint: accent)
+            }
         }
     }
 }

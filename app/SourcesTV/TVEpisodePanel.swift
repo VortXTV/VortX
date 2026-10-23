@@ -53,11 +53,11 @@ struct TVPlayerEpisodePanel: View {
                     HStack(spacing: 10) {
                         Text(label)
                             .font(.callout.weight(.semibold))
-                            .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
+                            .foregroundStyle(isCurrent ? Theme.Palette.accent : .secondary)
                         if isCurrent {
                             Image(systemName: "play.fill")
                                 .font(.caption2)
-                                .foregroundStyle(Color.accentColor)
+                                .foregroundStyle(Theme.Palette.accent)
                         }
                     }
                     Text(episode.episodeTitle)
@@ -127,11 +127,11 @@ struct TVPlayerSourcesPanel: View {
         var body: some View {
             HStack(spacing: 16) {
                 if isCurrent {
-                    Image(systemName: "play.fill").font(.caption).foregroundStyle(Color.accentColor)
+                    Image(systemName: "play.fill").font(.caption).foregroundStyle(Theme.Palette.accent)
                 }
                 Text(label)
                     .font(.title3.weight(isCurrent ? .semibold : .regular))
-                    .foregroundStyle(isCurrent ? Color.accentColor : .primary)
+                    .foregroundStyle(isCurrent ? Theme.Palette.accent : .primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 0)
@@ -197,7 +197,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let candidates = StreamRanking.rankedCandidates(
         groups, continuity: continuity, binge: binge, pin: pin,
         sticky: sticky, stickyAuthoritative: false,
-        preserveChosenRelease: true, desiredAudioLanguage: choice.audioLanguage,
+        preserveChosenRelease: true, desiredAudioLanguage: choice.audioLanguage, qualityFloor: choice.resolution,
         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
     ).filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?

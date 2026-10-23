@@ -1,6 +1,19 @@
 package com.vortx.android.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.unit.Dp
+import com.vortx.android.model.MediaType
+import com.vortx.android.person.PersonLifeLine
+import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.CinemaLandscapeArt
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -75,6 +88,8 @@ fun PersonScreen(
     onBack: () -> Unit,
     onOpenTitle: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    /** IMDb / TMDB link chips; off on TV, which has no browser. */
+    showWebLinks: Boolean = true,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -106,39 +121,47 @@ fun PersonScreen(
         }
     }
 
-    Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val landscape = posterStyle.landscape
+    var filter by remember(seed.id) { mutableStateOf(FilmographyFilter.ALL) }
+    val visible = state.credits.filter(filter::admits)
+    val offersFilter = state.credits.any { it.type == MediaType.MOVIE } && state.credits.any { it.type == MediaType.SERIES }
+
+    BoxWithConstraints(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+        val wide = maxWidth >= 600.dp
         LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 108.dp),
+            columns = GridCells.Adaptive(minSize = if (landscape) 220.dp else 116.dp),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = VortXTheme.spacing.edge,
                 end = VortXTheme.spacing.edge,
-                top = VortXTheme.spacing.xl,
+                top = VortXTheme.spacing.xl + 40.dp,
                 bottom = VortXTheme.spacing.xl,
             ),
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
             item(span = { GridItemSpan(maxLineSpan) }) {
-                PersonHeader(state = state, seed = seed)
-            }
-            state.detail?.biography?.takeIf { it.isNotBlank() }?.let { bio ->
-                item(span = { GridItemSpan(maxLineSpan) }) { BiographySection(bio) }
+                PersonHeader(state = state, seed = seed, wide = wide, showWebLinks = showWebLinks)
             }
             item(span = { GridItemSpan(maxLineSpan) }) {
-                Text(
-                    text = "Filmography",
-                    style = VortXTheme.type.sectionTitle,
-                    modifier = Modifier.padding(top = VortXTheme.spacing.sm),
+                FilmographyHeader(
+                    count = visible.size.takeIf { state.credits.isNotEmpty() },
+                    filter = filter.takeIf { offersFilter },
+                    onFilter = { filter = it },
                 )
             }
-            if (state.credits.isNotEmpty()) {
-                items(state.credits, key = { it.id }) { item ->
+            if (visible.isNotEmpty()) {
+                items(visible, key = { it.id }) { item ->
                     PosterCard(
                         title = item.name,
-                        subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
+                        subtitle = item.year,
                         onClick = { openTitle(item) },
-                        art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+                        landscape = landscape,
+                        art = {
+                            if (landscape) CinemaLandscapeArt(item)
+                            else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                        },
                     )
                 }
             } else {
@@ -151,58 +174,120 @@ fun PersonScreen(
     }
 }
 
-/// The header: circular headshot (initials disc fallback) + department eyebrow + serif name + born line,
-/// mirroring `PersonView.header`. Name + photo come from the enriched [PersonUiState.detail] once it lands,
-/// else the tapped [seed], so the header is fully painted the instant the page appears.
-@Composable
-private fun PersonHeader(state: PersonUiState, seed: PersonSeed) {
-    val detail = state.detail
-    val displayName = detail?.name ?: seed.name
-    val photoUrl = detail?.profileUrl ?: seed.profileUrl
+/// All / Movies / Shows over the filmography, the same three-way filter Apple shows.
+private enum class FilmographyFilter(val label: String) {
+    ALL("All"), MOVIES("Movies"), SHOWS("Shows");
 
+    fun admits(item: MetaItem): Boolean = when (this) {
+        ALL -> true
+        MOVIES -> item.type == MediaType.MOVIE
+        SHOWS -> item.type == MediaType.SERIES
+    }
+}
+
+/// "Filmography 59" with the All / Movies / Shows chips on the right (only when the person has both).
+@Composable
+private fun FilmographyHeader(count: Int?, filter: FilmographyFilter?, onFilter: (FilmographyFilter) -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
-        verticalAlignment = Alignment.Top,
+        modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.md),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Headshot(url = photoUrl, name = displayName)
-        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-            detail?.knownForDepartment?.let {
-                Text(text = it.uppercase(), style = VortXTheme.type.eyebrow)
-            }
-            Text(
-                text = displayName,
-                style = VortXTheme.type.screenTitle,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
-            bornLine(detail?.birthday, detail?.placeOfBirth)?.let {
-                Text(
-                    text = it,
-                    style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
-                )
+        Text(text = "Filmography", style = VortXTheme.type.sectionTitle)
+        count?.let {
+            Text(text = "$it", style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary))
+        }
+        Spacer(Modifier.weight(1f))
+        filter?.let { current ->
+            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+                FilmographyFilter.entries.forEach { option ->
+                    Chip(label = option.label, selected = option == current, onClick = { onFilter(option) })
+                }
             }
         }
     }
 }
 
-/// "Born Mar 1, 1970 · London, England", assembled from whichever parts TMDB returned (mirrors
-/// `PersonView.bornLine`); null when neither is present.
-private fun bornLine(birthday: String?, placeOfBirth: String?): String? {
-    val parts = listOfNotNull(birthday?.let { "Born $it" }, placeOfBirth)
-    return parts.takeIf { it.isNotEmpty() }?.joinToString("  ·  ")
+/// The header: a 2:3 portrait (the same shape as the posters below), the department eyebrow, the serif name,
+/// the born line with age, IMDb / TMDB links (not on TV, which has no browser), and the biography. Name and
+/// photo come from the enriched [PersonUiState.detail] once it lands, else the tapped [seed].
+@Composable
+private fun PersonHeader(state: PersonUiState, seed: PersonSeed, wide: Boolean, showWebLinks: Boolean) {
+    val detail = state.detail
+    val displayName = detail?.name ?: seed.name
+    val photoUrl = detail?.profileUrl ?: seed.profileUrl
+    val identity: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+            detail?.knownForDepartment?.let {
+                Text(text = it.uppercase(), style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.accent))
+            }
+            Text(
+                text = displayName,
+                style = if (wide) VortXTheme.type.hero else VortXTheme.type.screenTitle,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+            PersonLifeLine.describe(detail)?.let {
+                Text(text = it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary))
+            }
+            if (showWebLinks) PersonLinks(personId = seed.id, imdbId = detail?.imdbId)
+        }
+    }
+    val bio = detail?.biography?.takeIf { it.isNotBlank() }
+    if (wide) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Portrait(url = photoUrl, name = displayName, width = 200.dp)
+            Column(
+                modifier = Modifier.widthIn(max = 760.dp),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+            ) {
+                identity()
+                bio?.let { BiographySection(it) }
+            }
+        }
+    } else {
+        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md), verticalAlignment = Alignment.Top) {
+                Portrait(url = photoUrl, name = displayName, width = 112.dp)
+                identity()
+            }
+            bio?.let { BiographySection(it) }
+        }
+    }
 }
 
-/// Circular TMDB headshot with an initials-disc fallback (no photo yet, or TMDB has none), mirroring the
-/// Apple headshot's circle + subtle stroke.
+/// IMDb and TMDB pages for the person, as small chips that open the browser.
 @Composable
-private fun Headshot(url: String?, name: String) {
+private fun PersonLinks(personId: Int, imdbId: String?) {
+    val uriHandler = LocalUriHandler.current
+    Row(
+        modifier = Modifier.padding(top = VortXTheme.spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        imdbId?.takeIf { it.startsWith("nm") }?.let { id ->
+            Chip(label = "IMDb", selected = false, onClick = { runCatching { uriHandler.openUri("https://www.imdb.com/name/$id/") } })
+        }
+        if (personId > 0) {
+            Chip(label = "TMDB", selected = false, onClick = { runCatching { uriHandler.openUri("https://www.themoviedb.org/person/$personId") } })
+        }
+    }
+}
+
+/// A 2:3 rounded portrait with an initials fallback, the same shape as the filmography posters.
+@Composable
+private fun Portrait(url: String?, name: String, width: Dp) {
+    val shape = RoundedCornerShape(16.dp)
     Box(
         modifier = Modifier
-            .size(112.dp)
-            .clip(CircleShape)
+            .width(width)
+            .aspectRatio(2f / 3f)
+            .clip(shape)
             .background(VortXTheme.colors.surface2)
-            .border(1.dp, VortXTheme.colors.hairline, CircleShape),
+            .border(1.dp, VortXTheme.colors.hairline, shape),
         contentAlignment = Alignment.Center,
     ) {
         if (url.isNullOrBlank()) {
@@ -224,31 +309,24 @@ private fun Headshot(url: String?, name: String) {
 private fun initials(name: String): String =
     name.split(" ").filter { it.isNotBlank() }.take(2).mapNotNull { it.firstOrNull()?.uppercase() }.joinToString("")
 
-/// The biography paragraph, collapsible (4 lines -> full), mirroring `PersonView.biographySection`'s
-/// disclosure interaction.
+/// The biography, five lines with More / Less, matching Apple.
 @Composable
 private fun BiographySection(bio: String) {
     var expanded by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-        Row(
-            modifier = Modifier.clickable { expanded = !expanded },
-            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(text = "Biography", style = VortXTheme.type.sectionTitle)
-            Icon(
-                imageVector = VortXIcons.chevronDown,
-                contentDescription = if (expanded) "Collapse" else "Expand",
-                tint = VortXTheme.colors.textTertiary,
-                modifier = Modifier.size(18.dp),
-            )
-        }
         Text(
             text = bio,
-            style = VortXTheme.type.body,
-            maxLines = if (expanded) Int.MAX_VALUE else 4,
+            style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+            maxLines = if (expanded) Int.MAX_VALUE else 5,
             overflow = TextOverflow.Ellipsis,
         )
+        if (bio.length > 320) {
+            Text(
+                text = if (expanded) "Less" else "More",
+                style = VortXTheme.type.label.copy(color = VortXTheme.colors.accent),
+                modifier = Modifier.clickable { expanded = !expanded }.padding(vertical = 4.dp),
+            )
+        }
     }
 }
 

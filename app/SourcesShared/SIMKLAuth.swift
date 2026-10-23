@@ -177,9 +177,7 @@ enum SIMKLAuthBoundary {
 /// no secret is read or shipped. `isConfigured` gates the whole feature so an unprovisioned build stays
 /// dormant.
 actor SIMKLAuth {
-#if VORTX_NATIVE_DATA_ENGINE
     private var nativeCredentialGeneration = UUID()
-#endif
     static let shared = SIMKLAuth()
 
     // MARK: - Configuration (build-time; empty ships a dormant, invisible feature)
@@ -860,7 +858,6 @@ actor SIMKLAuth {
                 guard !Task.isCancelled,
                       CredentialScopeRegistry.shared.isCurrent(capture),
                       loginAttempts.owns(code: userCode, generation: loginGeneration) else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
                 guard let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
                     "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture) }) else { return false }
                 guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
@@ -868,18 +865,15 @@ actor SIMKLAuth {
                     _ = await MainActor.run { VortXSyncManager.shared.abortNativeProviderMutation(nativeIntent, capture: capture) }
                     return false
                 }
-#endif
                 persisted = replaceCredentialsWithNewSession(
                     access: token,
                     expiryUnix: 0,
                     ownerCapture: capture,
                     ownerNamespace: capture.namespace
                 ) == .success
-#if VORTX_NATIVE_DATA_ENGINE
                 if persisted {
                     persisted = await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
                 }
-#endif
                 if persisted { loginAttempts.invalidate() }
                 return persisted
             }
@@ -1089,9 +1083,7 @@ actor SIMKLAuth {
               let mutationLease = CredentialPublicationOutbox.beginMutation() else { return .failure }
         defer { CredentialPublicationOutbox.endMutation(mutationLease) }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
-#if VORTX_NATIVE_DATA_ENGINE
         nativeCredentialGeneration = UUID()
-#endif
         guard Self.recoverCredentialAuthority(credentials: credentials, ownerNamespace: resolvedNamespace) else {
             return .failure
         }
@@ -1206,18 +1198,14 @@ actor SIMKLAuth {
         guard await acquirePublicationBoundary() else { return false }
         defer { CredentialPublicationOutbox.endBoundary() }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
         var nativeIntent: [String: VortxNativeProviderCredentials.Register]?
         if explicitNativeDisconnect {
             nativeIntent = await MainActor.run { VortXSyncManager.shared.prepareNativeProviderMutation([
                 "simklAccess": .null, "simklExpiry": .null], capture: capture) }
             guard nativeIntent != nil, CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
         }
-#endif
         let mutate = {
-#if VORTX_NATIVE_DATA_ENGINE
             self.nativeCredentialGeneration = UUID()
-#endif
             return CredentialTupleTransaction.clear(
             baseAccounts: self.tupleAccounts(ownerNamespace: resolvedNamespace),
             activePointer: SIMKLTokenSlots.active(resolvedNamespace),
@@ -1230,14 +1218,11 @@ actor SIMKLAuth {
         }
         guard mutationGuard.map({ $0(mutate) }) ?? mutate() else { return false }
         SIMKLAuthBoundary.publish(nil)
-#if VORTX_NATIVE_DATA_ENGINE
         if let nativeIntent {
             return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
         }
-#endif
         return true
     }
-#if VORTX_NATIVE_DATA_ENGINE
     func certifiesNativePrepared(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
         guard ownerCapture() == capture else { return false }
         let keys = VortxNativeProviderCredentials.groups[1]
@@ -1262,7 +1247,6 @@ actor SIMKLAuth {
             })
         }
     }
-#endif
 
     private func acquirePublicationBoundary() async -> Bool {
         await CredentialPublicationOutbox.waitForBoundary() == .acquired

@@ -1,6 +1,6 @@
 // Forked from jarnedemeulemeester/libmpv-android v1.0.0 (MIT), file libmpv/src/main/cpp/event.cpp.
 //
-// THE ONE EVENT-PROTOCOL PATCH OF THIS FORK (VortX audit W1-B / AND-PLY-01): upstream's event loop
+// Terminal payload transport (VortX audit W1-B / AND-PLY-01): upstream's event loop
 // dispatches MPV_EVENT_END_FILE through the generic default branch, which forwards ONLY the event id
 // and drops mpv_event->data -- so the Kotlin side can never learn WHY a file ended. This fork adds an
 // explicit MPV_EVENT_END_FILE case that reads struct mpv_event_end_file and calls
@@ -14,6 +14,8 @@
 // START_FILE and every other event, which is what lets the Kotlin terminal reducer bind its
 // replacement-suppression window to START_FILE. Defensive payload guards below preserve that valid-event
 // protocol while dropping malformed/null native payloads instead of dereferencing them.
+// START_FILE additionally carries its original 64-bit entry ID for metadata-only source ownership;
+// its original generic notification still follows exactly once, preserving terminal ordering.
 #include <jni.h>
 #include <thread>
 
@@ -170,6 +172,16 @@ void *event_thread(void *arg) {
             mp_property = (mpv_event_property*)mp_event->data;
             sendPropertyUpdateToJava(env, instance, mp_property);
             break;
+        case MPV_EVENT_START_FILE: {
+            const auto *start = static_cast<const mpv_event_start_file*>(mp_event->data);
+            // A missing identity explicitly retires metadata; retain the original generic lifecycle
+            // notification exactly once so terminal classification is not changed by this addition.
+            const jlong entry_id = start ? static_cast<jlong>(start->playlist_entry_id) : -1;
+            env->CallVoidMethod(instance->javaObject, seam_MpvSeam_eventStartFile_J, entry_id);
+            containJavaCallbackException(env, "eventStartFile");
+            sendEventToJava(env, instance, mp_event->event_id);
+            break;
+        }
         case MPV_EVENT_END_FILE: {
             // The W1-B payload seam. See the file comment: forward the real end-file reason, plus the
             // native error code for ERROR terminations only.

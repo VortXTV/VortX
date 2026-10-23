@@ -35,8 +35,10 @@ struct CoreCWItem: Decodable, Identifiable {
     /// and watched-from-catalog markers are `temp`. "In the library" means neither.
     var removed: Bool? = nil
     var temp: Bool? = nil
+    /// A native Library row for a title watched or started but never saved: listed, not saved membership.
+    var previouslyWatched: Bool? = nil
 
-    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp }
+    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp, previouslyWatched }
 
     /// 0…1 watch progress (timeOffset/duration; both in ms).
     var progress: Double {
@@ -74,6 +76,12 @@ struct CoreCWItem: Decodable, Identifiable {
         let inProgress = progress > resumeFloor && progress < 0.9
         if inProgress { return false }
         return watchedToEnd || state.flaggedWatched > 0 || state.timesWatched > 0
+    }
+
+    /// A series whose latest episode is finished. The native engine keeps it in Continue Watching with no
+    /// offset and flagged watched, so a tap opens the next episode instead of replaying the finished one.
+    var isUpNext: Bool {
+        EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) && state.flaggedWatched > 0 && state.timeOffset <= 0
     }
 
     /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
@@ -266,7 +274,15 @@ enum CoreLoadable<T: Decodable>: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let tag = try container.decode(String.self, forKey: .type)
         switch tag {
-        case "Ready": self = .ready(try container.decode(T.self, forKey: .content))
+        case "Ready":
+            // These are provider resource payloads, not account/checkpoint authority.
+            // One malformed provider must settle as failed without preventing healthy
+            // peer catalogs, metadata or streams in the same snapshot from publishing.
+            do { self = .ready(try container.decode(T.self, forKey: .content)) }
+            catch is DecodingError {
+                NSLog("%@", "[core] CoreLoadable invalid Ready payload; treating as terminal (.err)")
+                self = .err
+            }
         case "Err": self = .err
         case "Loading": self = .loading
         // Any other tag (an engine "Err"-shape rename, or a genuinely errored group with an
@@ -284,7 +300,7 @@ enum CoreLoadable<T: Decodable>: Decodable {
     var isLoading: Bool { if case .loading = self { return true } else { return false } }
 }
 
-struct CoreMeta: Decodable, Identifiable {
+struct CoreMeta: Decodable, Identifiable, Sendable {
     let id: String
     let type: String
     let name: String
@@ -751,10 +767,14 @@ struct CoreMetaItem: Decodable {
         if let yt = (trailerStreams ?? []).compactMap(\.ytId).first(where: { !$0.isEmpty }) {
             return yt
         }
-        let trailerLink = (links ?? []).first {
-            $0.category.caseInsensitiveCompare("Trailer") == .orderedSame
+        let trailerLinks = (links ?? []).filter { $0.category.caseInsensitiveCompare("Trailer") == .orderedSame }
+        for link in trailerLinks {
+            if let url = link.url, let id = Self.youTubeID(from: url) { return id }
         }
-        return trailerLink.flatMap { Self.youTubeID(from: $0.name) }
+        for link in trailerLinks {
+            if let id = Self.youTubeID(from: link.name) { return id }
+        }
+        return nil
     }
 
     /// All episodes ordered (season, then episode, then id) across EVERY season, the list handed to the
@@ -840,7 +860,7 @@ struct EPGSchedule {
     }
 }
 
-struct CoreLink: Decodable, Equatable {
+struct CoreLink: Decodable, Equatable, Sendable {
     let name: String
     let category: String
     let url: String?
@@ -931,19 +951,23 @@ struct PlayerLoadToken: Hashable, Sendable {
 struct PlayerTimePositionEvent: Sendable {
     let seconds: Double
     let loadToken: PlayerLoadToken
-    /// nil preserves the existing AVPlayer/non-mpv contract. MPV supplies explicit evidence.
+    /// MPV's attributed settlement evidence takes precedence; other engines can explicitly distinguish
+    /// optimistic seek targets from completed/observed positions without fabricating an MPV receipt.
     let mpvSeekSettlement: MPVSeekSettlementEvidence?
-    var positionSettled: Bool { mpvSeekSettlement?.settled ?? true }
+    private let nonMPVPositionSettled: Bool
+    var positionSettled: Bool { mpvSeekSettlement?.settled ?? nonMPVPositionSettled }
     var transportSettled: Bool {
-        guard let evidence = mpvSeekSettlement else { return true }
+        guard let evidence = mpvSeekSettlement else { return nonMPVPositionSettled }
         return evidence.settled && evidence.attributed
     }
 
     init(seconds: Double, loadToken: PlayerLoadToken,
-         mpvSeekSettlement: MPVSeekSettlementEvidence? = nil) {
+         mpvSeekSettlement: MPVSeekSettlementEvidence? = nil,
+         positionSettled: Bool = true) {
         self.seconds = seconds
         self.loadToken = loadToken
         self.mpvSeekSettlement = mpvSeekSettlement
+        self.nonMPVPositionSettled = positionSettled
     }
 }
 
@@ -1534,6 +1558,37 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     }
 }
 
+extension CoreStream {
+    private enum CodingKeys: String, CodingKey {
+        case url, ytId, infoHash, fileIdx, sources, externalUrl, name, description, title, behaviorHints
+        case nzbUrl, nzbUrls, servers, fileMustInclude, vortxProvider
+    }
+
+    /// Many add-ons (Debridio, Torrentio-style debrid add-ons) still put the file name, size and seeders
+    /// in the older `title` field instead of `description`. Stremio reads them as one field. The native
+    /// engine passes both through unchanged, so `description` falls back to `title`; without it the
+    /// source list showed only the add-on's short name, like "Debridio 1080p".
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        url = try container.decodeIfPresent(String.self, forKey: .url)
+        ytId = try container.decodeIfPresent(String.self, forKey: .ytId)
+        infoHash = try container.decodeIfPresent(String.self, forKey: .infoHash)
+        fileIdx = try container.decodeIfPresent(Int.self, forKey: .fileIdx)
+        sources = try container.decodeIfPresent([String].self, forKey: .sources)
+        externalUrl = try container.decodeIfPresent(String.self, forKey: .externalUrl)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        let detail = try container.decodeIfPresent(String.self, forKey: .description)
+        let legacyDetail = try? container.decodeIfPresent(String.self, forKey: .title)
+        description = detail.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? legacyDetail ?? detail
+        behaviorHints = try container.decodeIfPresent(CoreStreamBehaviorHints.self, forKey: .behaviorHints)
+        nzbUrl = try container.decodeIfPresent(String.self, forKey: .nzbUrl)
+        nzbUrls = try container.decodeIfPresent([String].self, forKey: .nzbUrls)
+        servers = try container.decodeIfPresent([String].self, forKey: .servers)
+        fileMustInclude = try container.decodeIfPresent(String.self, forKey: .fileMustInclude)
+        vortxProvider = try container.decodeIfPresent(String.self, forKey: .vortxProvider)
+    }
+}
+
 struct CoreStreamBehaviorHints: Decodable, Equatable, Sendable {
     let notWebReady: Bool?
     let bingeGroup: String?
@@ -1587,6 +1642,10 @@ struct CoreStreamSourceGroup: Identifiable, Equatable, Sendable {
 struct CoreDiscover: Decodable {
     let selectable: CoreDiscoverSelectable
     let catalog: [CoreCatalogPage]          // Vec<ResourceLoadable<Vec<MetaItemPreview>>> (pages)
+    /// Native failed-page request, preserved verbatim so retry retains catalog, genre and offset.
+    /// Optional for compatibility with older projections.
+    let retryRequest: CoreRequest?
+    var hasFailedPage: Bool { catalog.contains { if case .err = $0.content { return true }; return false } }
     var items: [CoreMeta] { catalog.compactMap { $0.content?.ready }.flatMap { $0 } }
     /// True while any catalog page is still loading (e.g. a just-dispatched next-page request). Lets the
     /// bridge tell a mid-load emit (same item count, more coming) apart from a settled end-of-catalog

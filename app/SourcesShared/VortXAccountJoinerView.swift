@@ -10,7 +10,8 @@ import SwiftUI
 /// ECDH-wrapped to this device's ephemeral key. The relay never sees the key. This signs into the VortX
 /// account (the one that owns your add-ons, library, and sync), NOT a Stremio account.
 struct VortXAccountJoinerView: View {
-    /// Called on the main actor once this device is signed into VortX and its account data has been pulled.
+    /// Authentication hands off immediately. Account restore is owned by the manager, not
+    /// this disposable sheet; a slow or failed restore must not trap the success screen.
     var onSignedIn: () -> Void
 
     @State private var session: VortXSyncManager.QrJoinSession?
@@ -137,12 +138,9 @@ struct VortXAccountJoinerView: View {
                 status = .failed; return
             case .signedIn(let email):
                 status = .signedIn(email)
-                // Pull the account's add-ons/library/settings onto this fresh TV, then hydrate the engine.
-                if await VortXSyncManager.shared.reconcileAfterSignIn() == .hasAccountData {
-                    await VortXSyncManager.shared.useAccountData()
-                }
-                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
-                try? await Task.sleep(nanoseconds: 900_000_000)   // let the check mark land
+                // qrPoll has already adopted the authenticated account and scheduled its
+                // fenced, single-flight restore. Closing this sheet cannot cancel that work.
+                // The app's restore/picker surface reports loading or Retry separately.
                 onSignedIn()
                 return
             }

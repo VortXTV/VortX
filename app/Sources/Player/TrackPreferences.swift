@@ -41,9 +41,9 @@ enum PlaybackSettings {
 
     /// Power-user libmpv options, supplied as a free-form "key=value per line" snippet (an mpv.conf
     /// fragment, e.g. "profile=gpu-hq", "scale=ewa_lanczossharp", "video-sync=display-resample").
-    /// Applied verbatim during player setup after VortX's own baseline options, so an advanced viewer
-    /// can override the defaults. Default empty (no options). A malformed line is logged and skipped;
-    /// it never blocks the baseline config or crashes playback.
+    /// Rendering/audio overrides apply after VortX's baseline. TLS/config/script channels are reserved;
+    /// only the documented built-in gpu-hq/fast profiles are accepted. Default empty (no options).
+    /// Malformed or reserved lines are skipped; mandatory TLS setup still must succeed.
     static var customMpvOptions: String {
         get { UserDefaults.standard.string(forKey: Key.customMpvOptions) ?? "" }
         set { loggedSet(newValue, forKey: Key.customMpvOptions) }
@@ -318,11 +318,11 @@ struct TrackPreferences: Equatable {
 enum SettingsChangeLog {
     private static let lock = NSLock()
     private static var last: [String: String] = [:]
-    private static var primed = false
+    private static var watching = false
 
     /// Brand prefixes that identify one of the app's own preference keys. Everything else in UserDefaults
     /// (framework and system state) is ignored so the `[settings]` channel stays a clean record of deliberate
-    /// preference writes. Covers `stremiox.*`, `vortx.*`, and the dotless `vortxNativeServer` / `vortxShadowRanking`.
+    /// preference writes. Covers the `stremiox` and `vortx` namespaces, including persisted older keys.
     private static let trackedPrefixes = ["stremiox", "vortx"]
 
     private static func isTracked(_ key: String) -> Bool {
@@ -337,20 +337,21 @@ enum SettingsChangeLog {
         return out
     }
 
-    /// Re-baseline the tracked keys. Called when a settings screen appears so the first edit after opening is
-    /// logged and a change made elsewhere while settings was closed is not replayed as a stale diff.
-    static func prime() {
+    /// Start (baseline the tracked keys) or stop recording. Recording runs only while a Settings screen is on view:
+    /// Apple TV keeps its Settings tab alive for the whole session, and every preference write anywhere in the app
+    /// used to snapshot the whole preferences store here on the main thread (Apple TV log, 2026-10-16). A change
+    /// made while Settings was off screen is never replayed as a stale diff.
+    static func setWatching(_ on: Bool) {
         lock.lock(); defer { lock.unlock() }
-        last = snapshot()
-        primed = true
+        watching = on
+        last = on ? snapshot() : [:]
     }
 
-    /// Log any tracked preference key that changed since the last snapshot. If not yet primed (no appear ran),
-    /// prime silently rather than reporting the resident values as changes.
+    /// Log any tracked preference key that changed since the last snapshot, while Settings is on view.
     static func logChanges() {
         lock.lock(); defer { lock.unlock() }
+        guard watching else { return }
         let current = snapshot()
-        guard primed else { primed = true; last = current; return }
         for (key, value) in current where last[key] != value {
             DiagnosticsLog.log("settings", "key=\(key) value=\(VXProbeRedaction.scrub(value))")
         }

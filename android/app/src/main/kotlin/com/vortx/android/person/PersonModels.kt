@@ -34,6 +34,11 @@ data class PersonDetail(
     val placeOfBirth: String?,
     val profileUrl: String?, // w342 headshot, null when TMDB has none
     val knownForDepartment: String?,
+    /** IMDb person id (nm...), for the IMDb link. */
+    val imdbId: String? = null,
+    /** Raw ISO dates (yyyy-MM-dd), for the born line's age and the died line. */
+    val birthdayIso: String? = null,
+    val deathdayIso: String? = null,
 )
 
 /// The instant-paint seed the detail cast tile hands the Person page so its header (name + headshot)

@@ -1,5 +1,5 @@
 # Offline diagnostic project: deliberately contains only the fixture renderer target, so XcodeGen
-# never validates or needs the normal apps' ignored server/node release inputs.
+# never validates or needs the normal apps' ignored streaming-server release inputs.
 name: CinemaUISmokeRenderer
 options:
   bundleIdPrefix: com.stremiox
@@ -44,9 +44,9 @@ targets:
         # their macOS slices validate. Expose the same checked module maps and ordinary archives
         # directly. Do not force-load whole Rust archives: this renderer neither starts an engine
         # nor needs unreachable native code, and forcing them exceeds macOS compact-unwind limits.
-        SWIFT_INCLUDE_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/Headers $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx"
-        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64 $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64"
-        OTHER_LDFLAGS: "$(inherited) -lstremiox_core -lvortx_ffi"
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64"
+        OTHER_LDFLAGS: "$(inherited) -lvortx_ffi"
         DEAD_CODE_STRIPPING: "YES"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
         GENERATE_INFOPLIST_FILE: "YES"

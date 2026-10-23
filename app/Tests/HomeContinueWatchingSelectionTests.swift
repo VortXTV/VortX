@@ -26,6 +26,7 @@ struct HomeContinueWatchingSelectionTests {
         selectionRetiresDuringProjection()
         traktSessionRetirement()
         legacySharedProfileKeepsOverlay()
+        projectedLocalSelectionPreservesWindows()
         topShelfLateCommitDenial()
         if CommandLine.arguments.count > 1 { surfaceWiring(root: CommandLine.arguments[1]) }
 #endif
@@ -199,12 +200,33 @@ struct HomeContinueWatchingSelectionTests {
         require(!commitAllowed(), "late Top Shelf replacement Trakt session is denied")
     }
 
+    private static func projectedLocalSelectionPreservesWindows() {
+        let core = configure(native: false, eligible: false)
+        UserDefaults.standard.set("local", forKey: ContinueWatchingPreferences.sourceKey)
+        UserDefaults.standard.set("100", forKey: ContinueWatchingPreferences.windowKey)
+        let now = ISO8601DateFormatter().string(from: Date())
+        let projected = (0..<1000).map { index in
+            CoreCWItem(id: "projected-\(index)", type: "movie", name: "Projected \(index)", poster: nil,
+                state: CoreLibState(timeOffset: 10_000, duration: 100_000, videoId: nil, lastWatched: now))
+        }
+        let hundred = HomeContinueWatchingSelection.current(core: core, profiles: .shared, localItemsOverride: projected)
+        require(hundred.selection.items.count == 100, "cached local projection preserves the selected 100-item window")
+        require(hundred.selection.items.allSatisfy { $0.id.hasPrefix("projected-") },
+                "cached local projection uses its supplied source instead of rereading the overlay")
+        UserDefaults.standard.set("last90Days", forKey: ContinueWatchingPreferences.windowKey)
+        let dated = HomeContinueWatchingSelection.current(core: core, profiles: .shared, localItemsOverride: projected)
+        require(dated.selection.items.count == 1000, "cached local projection preserves all qualifying 90-day items")
+        let captured = dated.intent
+        ProfileStore.shared.activeID = profileB
+        require(!captured.isCurrent(core: core, profiles: .shared), "cached local projection retires with its original profile")
+    }
+
     private static func surfaceWiring(root: String) {
         func read(_ path: String) -> String { (try? String(contentsOfFile: root + "/" + path, encoding: .utf8)) ?? "" }
         let tv = read("app/SourcesTV/HomeView.swift")
         let ios = read("app/SourcesiOS/iOSRootView.swift")
         let shelf = read("app/SourcesTV/TopShelfSnapshotWriter.swift")
-        let call = "HomeContinueWatchingSelection.current(core: core, profiles: profiles)"
+        let call = "HomeContinueWatchingSelection.current(core: core, profiles: profiles"
         require(tv.contains(call) && ios.contains(call), "TV and iOS/macOS consume the production shared selector")
         require(shelf.contains("HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)"), "Top Shelf consumes the production shared selector")
         require(shelf.components(separatedBy: "HomeContinueWatchingSelection.permitsPrivateArtworkCommit(").count == 3,

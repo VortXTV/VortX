@@ -55,15 +55,15 @@ private enum MPVCacheFlushReceiptContractTests {
     }
 
     private static func hasNonDestructiveReanchor(_ source: String, policy: String) -> Bool {
-        guard let flush = cacheFlushSource(source), let load = loadFileSource(source),
-              let finish = section(source, from: "private func finishCacheFlushFlight", to: "    /// mpv's stock User-Agent"),
+        guard let flush = cacheFlushSource(source),
+              let finish = finishCacheFlushSource(source),
               let observe = section(source, from: "private func observeCacheReanchorSeek", to: "    private func completeCacheReanchorOnPlaybackRestart") else { return false }
         return !source.contains("no-osd drop-buffers")
             && ordered(["MPVCacheReanchorPolicy.admit(native,", "diagnosticString(\"demuxer-seekable-cache\", handle: handle)",
                         "let wasPaused = admission.paused", "cacheFlushFlight.install(",
                         "issueCacheReanchorSeek(flight, after: settlement.generation)",
                         "mpv_set_property_string(handle, \"demuxer-seekable-cache\", \"no\")"], in: flush)
-            && ordered(["finishCacheFlushFlight(cacheFlushFlight.reset())", "let issuedToken = PlayerLoadToken()"], in: load)
+            && hasLoadReplacementAdmissionContract(source)
             && finish.contains("activeLoadToken == flight.owner")
             && finish.contains("cacheFlushFlight.current == nil")
             && finish.contains("flight.originalSeekableCache")
@@ -189,9 +189,98 @@ private enum MPVCacheFlushReceiptContractTests {
     private static func loadFileSource(_ source: String) -> String? {
         section(
             source,
-            from: "func loadFile(",
-            to: "    /// Decode only the command result map"
+            from: "private func loadFile(",
+            to: "    private static func returnedPlaylistEntryID("
         )
+    }
+
+    private static func finishCacheFlushSource(_ source: String) -> String? {
+        section(source, from: "private func finishCacheFlushFlight(", to: "    private let defaultUserAgent =")
+    }
+
+    private struct ReplacementLoadSections {
+        let beforeCommand: String
+        let commandAdmission: String
+        let accepted: String
+        let rejected: String
+    }
+
+    /// Bound the real command-admission and final success/failure branches, rather than allowing a
+    /// matching reset or assignment in another branch to satisfy the ownership contract.
+    private static func replacementLoadSections(_ source: String) -> ReplacementLoadSections? {
+        guard let load = loadFileSource(source),
+              let command = load.range(of: "        loadTokenLock.lock()\n        var commandNode = mpv_node()"),
+              let admissionEnd = load.range(
+                of: "        loadTokenLock.unlock()\n        if commandResult >= 0 {",
+                range: command.upperBound..<load.endIndex
+              ), let rejection = load.range(of: "\n        } else {\n", options: .backwards),
+              let returned = load.range(of: "\n        return issuedToken", options: .backwards),
+              command.upperBound <= admissionEnd.lowerBound,
+              admissionEnd.upperBound <= rejection.lowerBound,
+              rejection.upperBound <= returned.lowerBound else { return nil }
+        return ReplacementLoadSections(
+            beforeCommand: String(load[..<command.lowerBound]),
+            commandAdmission: String(load[command.lowerBound..<admissionEnd.lowerBound]),
+            accepted: String(load[admissionEnd.upperBound..<rejection.lowerBound]),
+            rejected: String(load[rejection.upperBound..<returned.lowerBound])
+        )
+    }
+
+    private static func hasLoadReplacementAdmissionContract(_ source: String) -> Bool {
+        guard let load = replacementLoadSections(source),
+              let headerFailure = section(load.beforeCommand,
+                from: "guard headerStatus >= 0 else {",
+                to: "        setString(\"user-agent\"") else { return false }
+        let acceptedOnly = [
+            "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
+            "activeReadAheadCap = appliedCap",
+            "baselineReadAheadCap = appliedCap",
+            "pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil",
+            "pausedCacheClamped = false",
+            "memoryCacheClamped = false",
+        ]
+        return ordered([
+                "let issuedToken = PlayerLoadToken()",
+                "guard mpv != nil else {",
+                "guard let priorPlaybackProfile = MPVPlaybackProfileSnapshot(",
+                "let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)",
+                "guard headerStatus >= 0 else {",
+                "setString(\"user-agent\", userAgent.isEmpty ? defaultUserAgent : userAgent)",
+                "setString(\"referrer\", referrer)",
+                "finishCacheFlushFlight(cacheFlushFlight.reset())",
+            ], in: load.beforeCommand)
+            && load.beforeCommand.components(separatedBy: "let issuedToken = PlayerLoadToken()").count == 2
+            && load.beforeCommand.components(separatedBy: "finishCacheFlushFlight(cacheFlushFlight.reset())").count == 2
+            && headerFailure.contains("return issuedToken")
+            && !headerFailure.contains("cacheFlushFlight.reset(")
+            && ordered([
+                "loadTokenLock.lock()",
+                "let commandResult = commandReturningNode(\"loadfile\", args: args, result: &commandNode)",
+                "loadProvenance.completeReplacement(",
+                "commandSucceeded: commandResult >= 0",
+                "entryID: entryID",
+                "token: issuedToken",
+                "if commandResult >= 0 {",
+                "seekSettlement.reset(owner: issuedToken)",
+            ], in: load.commandAdmission)
+            && !load.commandAdmission.contains("cacheFlushFlight.reset(")
+            && ordered([
+                "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)",
+                "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
+                "activeReadAheadCap = appliedCap",
+                "baselineReadAheadCap = appliedCap",
+            ], in: load.accepted)
+            && load.accepted.components(separatedBy: "cacheFlushFlight.reset()").count == 2
+            && acceptedOnly.allSatisfy { statement in
+                load.accepted.contains(statement) && !load.beforeCommand.contains(statement)
+                    && !load.commandAdmission.contains(statement) && !load.rejected.contains(statement)
+            }
+            && ordered([
+                "configuredLiveMode = priorPlaybackProfile.configuredLiveMode",
+                "priorPlaybackProfile.restore { name, value in",
+                "if let mpv { checkError(value.restore(handle: mpv, name: name)) }",
+            ], in: load.rejected)
+            && !load.rejected.contains("cacheFlushFlight.reset(")
     }
 
     private static func eventLoopSource(_ source: String) -> String? {
@@ -289,11 +378,7 @@ private enum MPVCacheFlushReceiptContractTests {
             source,
             from: "private func beginCacheFlushReceipt",
             to: "    private func cacheFlushCommandErrorReceipt"
-        ), let end = section(
-            source,
-            from: "private func finishCacheFlushFlight",
-            to: "    /// mpv's stock User-Agent"
-        ), let error = section(
+        ), let end = finishCacheFlushSource(source), let error = section(
             source,
             from: "private func cacheFlushCommandErrorReceipt",
             to: "    private func cacheFlushDispositionReceipt"
@@ -381,16 +466,51 @@ private enum MPVCacheFlushReceiptContractTests {
             && policy.contains("observedPosition >= flight.target + progressEpsilon")
     }
 
+    private static func nativeFlagSetterSource(_ source: String) -> String? {
+        section(source,
+                from: "private func setFlag(_ name: String, _ flag: Bool) -> Bool {",
+                to: "    private func getInt(_ name: String) -> Int {")
+    }
+
+    private static func hasNativeFlagAdmissionContract(_ source: String) -> Bool {
+        guard let setter = nativeFlagSetterSource(source) else { return false }
+        return ordered([
+            "guard let handle = mpv else { return false }",
+            "var data: Int32 = flag ? 1 : 0",
+            "return mpv_set_property(handle, name, MPV_FORMAT_FLAG, &data) >= 0",
+        ], in: setter)
+    }
+
+    private static func terminalEOFSource(_ source: String) -> String? {
+        section(source, from: "private func emitEndFileEOF(", to: "    private func handleEndFileEOF(")
+    }
+
+    private static func hasTerminalEOFCacheResetContract(_ source: String) -> Bool {
+        guard let eof = terminalEOFSource(source) else { return false }
+        return eof.contains("seekEvidence: MPVSeekSettlementEvidence?")
+            && ordered([
+                "PlayerLoadProvenanceState.accepts(",
+                "callbackToken: loadToken, activeToken: self.activeLoadToken",
+                "self.acceptsCurrentTerminalSeekEvent(seekEvidence, owner: loadToken)",
+                "self.cacheFlushFlight.reset(owner: loadToken)",
+                "propertyName: MPVProperty.endFileEof",
+            ], in: eof)
+            && !eof.contains("consumeSyntheticEOF")
+    }
+
+    private static func hasRedirectCachePreservationContract(_ source: String) -> Bool {
+        guard let events = eventLoopSource(source),
+              let redirect = section(events,
+                from: "if ef.reason == MPV_END_FILE_REASON_REDIRECT {",
+                to: "guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id)") else { return false }
+        return ordered(["self.propagateRedirect(ef)", "break"], in: redirect)
+            && !redirect.contains("cacheFlushFlight")
+    }
+
     private static func hasLifecycleResetContract(_ source: String) -> Bool {
         guard let lifecycle = lifecycleSource(source),
               let stop = stopSource(source),
-              let load = loadFileSource(source),
-              let events = eventLoopSource(source),
-              let eof = section(
-                source,
-                from: "private func emitEndFileEOF(loadToken: PlayerLoadToken)",
-                to: "    /// mpv emits time-pos changes"
-              ) else { return false }
+              let events = eventLoopSource(source) else { return false }
         return ordered(
             [
                 "cacheFlushFlight.reset()",
@@ -399,52 +519,32 @@ private enum MPVCacheFlushReceiptContractTests {
             in: lifecycle
         )
             && ordered(["invalidateLoadToken()", "guard let handle = mpv else { return }", "mpv = nil"], in: stop)
-            && ordered(
-                [
-                    "loadTokenLock.unlock()",
-                    "if commandResult >= 0 {",
-                    "cacheFlushFlight.reset()",
-                    "} else {",
-                ],
-                in: load
-            )
-            && load.contains("Rejected replace: preserve the previous source's cache budget")
+            && hasLoadReplacementAdmissionContract(source)
             && events.contains("case MPV_EVENT_END_FILE:")
             && events.contains("cacheFlushFlight.reset(owner: loadToken)")
-            && ordered(
-                [
-                    "cacheFlushFlight.reset(owner: loadToken)",
-                    "propertyName: MPVProperty.endFileEof",
-                ],
-                in: eof
-            )
-            && !eof.contains("consumeSyntheticEOF")
+            && hasTerminalEOFCacheResetContract(source)
             && !source.contains("PausedCachePark")
-            && events.contains("MPV_END_FILE_REASON_REDIRECT")
+            && hasRedirectCachePreservationContract(source)
     }
 
     private static func hasAcceptedReplacementReceiptContract(_ source: String) -> Bool {
-        guard let load = loadFileSource(source),
-              let finish = section(
-                source,
-                from: "private func finishCacheFlushFlight",
-                to: "    /// mpv's stock User-Agent"
-              ), let falseBranch = section(
+        guard let load = replacementLoadSections(source),
+              let finish = finishCacheFlushSource(source),
+              let falseBranch = section(
                 finish,
                 from: "} else {",
                 to: "        }"
               ) else { return false }
         return ordered(
             [
-                "loadTokenLock.unlock()",
-                "if commandResult >= 0 {",
                 "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)",
                 "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
                 "activeReadAheadCap = appliedCap",
                 "baselineReadAheadCap = appliedCap",
             ],
-            in: load
+            in: load.accepted
         )
+            && hasLoadReplacementAdmissionContract(source)
             && ordered(
                 [
                     "if sampleLiveState {",
@@ -492,7 +592,7 @@ private enum MPVCacheFlushReceiptContractTests {
                         "loadTokenLock.unlock()"], in: flush)
             && ordered(["if setFlag(MPVProperty.pause, false)", "cacheFlushFlight.updateTransportIntent"], in: play)
             && ordered(["if setFlag(MPVProperty.pause, true)", "cacheFlushFlight.updateTransportIntent"], in: pause)
-            && source.contains("return mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data) >= 0")
+            && hasNativeFlagAdmissionContract(source)
     }
 
     static func main() throws {
@@ -505,7 +605,81 @@ private enum MPVCacheFlushReceiptContractTests {
         let policy = try String(contentsOf: policyURL, encoding: .utf8)
 
         check("252 maintenance requires low-level completion and exact-owner restoration", hasNonDestructiveReanchor(controller, policy: policy))
+        check("load admission mints a token before maintenance cancellation and commits cache state only on acceptance",
+              hasLoadReplacementAdmissionContract(controller))
+
+        let replacementLoad = loadFileSource(controller) ?? ""
+        func checkLoadMutation(_ name: String, _ mutatedLoad: String) {
+            let mutant = replacingFirst(replacementLoad, with: mutatedLoad, in: controller)
+            check("hostile mutation activated: \(name)", !replacementLoad.isEmpty && mutatedLoad != replacementLoad && mutant != controller)
+            check("hostile: \(name)", !hasLoadReplacementAdmissionContract(mutant))
+        }
+        checkLoadMutation("maintenance cannot reset before token issuance", replacingFirst(
+            "let issuedToken = PlayerLoadToken()",
+            with: "finishCacheFlushFlight(cacheFlushFlight.reset())\n        let issuedToken = PlayerLoadToken()",
+            in: replacementLoad))
+        checkLoadMutation("maintenance cancellation requires header admission", replacingFirst(
+            "let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)",
+            with: "finishCacheFlushFlight(cacheFlushFlight.reset())\n        let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)",
+            in: replacingFirst("        finishCacheFlushFlight(cacheFlushFlight.reset())\n", with: "", in: replacementLoad)))
+        checkLoadMutation("header rejection cannot become unconditional admission", replacingFirst(
+            "guard headerStatus >= 0 else {", with: "guard true else {", in: replacementLoad))
+        let resetBeforeCommand = replacingFirst(
+            "let commandResult = commandReturningNode(\"loadfile\", args: args, result: &commandNode)",
+            with: "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)\n        let commandResult = commandReturningNode(\"loadfile\", args: args, result: &commandNode)",
+            in: replacingFirst("            finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)\n", with: "", in: replacementLoad))
+        checkLoadMutation("new-source receipt cannot reset before synchronous command acceptance", resetBeforeCommand)
+        let capOnRejectedLoad = replacingFirst(
+            "configuredLiveMode = priorPlaybackProfile.configuredLiveMode",
+            with: "activeReadAheadCap = appliedCap\n            configuredLiveMode = priorPlaybackProfile.configuredLiveMode",
+            in: replacingFirst("            activeReadAheadCap = appliedCap\n", with: "", in: replacementLoad))
+        checkLoadMutation("rejected replacement cannot own the new cache budget", capOnRejectedLoad)
+        checkLoadMutation("rejected replacement cannot reset the outgoing flight again", replacingFirst(
+            "configuredLiveMode = priorPlaybackProfile.configuredLiveMode",
+            with: "finishCacheFlushFlight(cacheFlushFlight.reset())\n            configuredLiveMode = priorPlaybackProfile.configuredLiveMode",
+            in: replacementLoad))
+        checkLoadMutation("rejected replacement must restore the captured mode", replacingFirst(
+            "configuredLiveMode = priorPlaybackProfile.configuredLiveMode", with: "configuredLiveMode = false", in: replacementLoad))
+        checkLoadMutation("accepted provenance must use the returned command result", replacingFirst(
+            "commandSucceeded: commandResult >= 0", with: "commandSucceeded: true", in: replacementLoad))
+
         check("native cache event captures source command and pause at dequeue", hasCacheNativeOwnershipContract(controller))
+        let flagAlwaysSucceeds = replacingFirst(
+            "return mpv_set_property(handle, name, MPV_FORMAT_FLAG, &data) >= 0",
+            with: "return true", in: controller)
+        check("hostile mutation activated: pause admission always succeeds", flagAlwaysSucceeds != controller)
+        check("hostile: rejected native pause write cannot update cache-flight intent",
+              !hasCacheNativeOwnershipContract(flagAlwaysSucceeds))
+        let flagSetter = nativeFlagSetterSource(controller) ?? ""
+        let unguardedFlagSetter = replacingFirst("guard let handle = mpv else { return false }",
+            with: "let handle = mpv!", in: flagSetter)
+        let unguardedFlag = replacingFirst(flagSetter, with: unguardedFlagSetter, in: controller)
+        check("hostile mutation activated: flag setter loses teardown admission",
+              !flagSetter.isEmpty && unguardedFlagSetter != flagSetter && unguardedFlag != controller)
+        check("hostile: a pause write must reject a missing native handle",
+              !hasCacheNativeOwnershipContract(unguardedFlag))
+        let eofSource = terminalEOFSource(controller) ?? ""
+        let unfencedEOFSource = replacingFirst(
+            "guard self.acceptsCurrentTerminalSeekEvent(seekEvidence, owner: loadToken) else { return }",
+            with: "// terminal seek ownership removed", in: eofSource)
+        let unfencedEOF = replacingFirst(eofSource, with: unfencedEOFSource, in: controller)
+        check("hostile mutation activated: EOF loses seek-generation ownership",
+              !eofSource.isEmpty && unfencedEOFSource != eofSource && unfencedEOF != controller)
+        check("hostile: a stale terminal seek cannot reset the current cache flight",
+              !hasLifecycleResetContract(unfencedEOF))
+        let successorEOFSource = replacingFirst("self.cacheFlushFlight.reset(owner: loadToken)",
+            with: "self.cacheFlushFlight.reset(owner: self.activeLoadToken!)", in: eofSource)
+        let successorEOF = replacingFirst(eofSource, with: successorEOFSource, in: controller)
+        check("hostile mutation activated: EOF adopts a successor load token",
+              !eofSource.isEmpty && successorEOFSource != eofSource && successorEOF != controller)
+        check("hostile: EOF cleanup must retain its captured owner",
+              !hasLifecycleResetContract(successorEOF))
+        let destructiveRedirect = replacingFirst("if ef.reason == MPV_END_FILE_REASON_REDIRECT {",
+            with: "if ef.reason == MPV_END_FILE_REASON_REDIRECT {\n                            self.cacheFlushFlight.reset()",
+            in: controller)
+        check("hostile mutation activated: redirect resets cache maintenance", destructiveRedirect != controller)
+        check("hostile: a redirect propagates provenance without resetting cache maintenance",
+              !hasLifecycleResetContract(destructiveRedirect))
         for needle in ["generation: witness.commandGeneration", "native.lowLevelSeeks == flight.lowLevelSeeksAtIssue",
                        "let rawCacheWitness = self.cacheReanchorEventWitness", "if setFlag(MPVProperty.pause, false)"] {
             check("hostile: cache ownership contract rejects removal of \(needle)",

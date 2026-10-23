@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "repository": "VortXTV/VortX",
+  "tag": "vendor-libmpv-android-20261023-5774f40f",
+  "producerLineage": "ci-evidence",
+  "producerCommit": "5774f40f1530a8db17b6afa7d183991ab511ede9",
+  "sourceDateEpoch": 1792679103,
+  "producerRun": "39795493147",
+  "producerAttempt": "1",
+  "producerNDK": "30.0.16248370",
+  "publisherCommit": "fcf6745703dc1265bca88f12fee8fc355ddf251e",
+  "artifactId": 12435061561,
+  "artifactBytes": 128469594,
+  "artifactSHA256": "a99d4704fc03206b5a1d906925906a9b90d4fe3f583c20ac7c51cec4a378370d",
+  "aarBytes": 35811992,
+  "aarSHA256": "81312ffa6a08373d16df689fd55be733bbb10aab6efd22bc69961d699bd25b88",
+  "originalManifestSHA256": "79ff7399e03512119560b8b232a34f85e5090d664fa80a68ae77579e5b21d6eb",
+  "originalInputManifestSHA256": "34a1364639d592ad8ad139fcbb5ca11be4ea5f28061a76e9ced29c14f63322f4",
+  "dependencySourcesSHA256": "1bdc0df142932658d475cbc8f8d1a42194b6e80b12cb780f9758f654e7758d0f",
+  "publisherSourcesSHA256": "4db065b6682d8e3b09351e0a737afcd47246c7e107c84af7604f77c67d949aa1",
+  "ndkNotices": {
+    "source.properties": "e73b7dc557cea2da9212c09ee1795434957d62e63b7550eef69fd1887a355d94",
+    "NOTICE": "a3c12eee897f63991da71464b690433a15d0d74a508ce0e275436279bdcaff58",
+    "NOTICE.toolchain": "6b8633011d874b75629180e60de13ebfd546a10e56dc7d0380a35f6609f30617"
+  },
+  "sourceNotesSHA256": "84ecbcf483431f78690fb1299c1fd793632f5c75127e7f2aede515372424ebfd",
+  "releaseNotesSHA256": "db530fd98d04e15c922d7e3c3043ead041c212d8677085eb2c7837f07115a663",
+  "producerWorkflows": {
+    ".github/workflows/native-media-candidates.yml": "6c0334f5e77307d5cd8e68fbb2cdb5f2b91a1586a4c0b27282e731c6ecb55d04",
+    ".github/workflows/source-contracts.yml": "e1411dbb475ef1a22c6cff57646306bc51393d7bcd0e2f7ab85520576ddc33d7"
+  },
+  "assets": {
+    "aar": "libmpv-android-81312ffa6a08.aar",
+    "sources": "libmpv-android-81312ffa6a08-source-kit.tar.gz",
+    "provenance": "component-provenance.json",
+    "checksums": "SHA256SUMS"
+  },
+  "ndkNoticeAcquisition": {
+    "officialArchiveURL": "https://dl.google.com/android/repository/android-ndk-r30-linux.zip",
+    "archiveBytes": 738633529,
+    "actualSHA1": "5107f898313790e449e87eee2183d9a20602dee9",
+    "actualSHA256": "753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2",
+    "fullArchiveSHA1Verified": true,
+    "installed": false,
+    "upstreamCodeExecuted": false
+  }
+}

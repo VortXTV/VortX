@@ -1,38 +1,16 @@
 import Foundation
 
-/// Client for the embedded Stremio streaming server (nodejs-mobile on :11470). Direct/debrid
-/// streams play straight from their URL; torrents are created on the local server, which fetches
-/// pieces and exposes the selected file over HTTP for libmpv to play.
+/// Client for the embedded VortX streaming server (in-process on iOS/tvOS, a child process on
+/// macOS). Direct/debrid streams play straight from their URL; torrents are created on the local
+/// server, which fetches pieces and exposes the selected file over HTTP for libmpv to play.
 enum StremioServer {
-    /// The port the on-device server ACTUALLY bound. server.js targets 11470 but silently falls back to
-    /// 11471-11474 on EADDRINUSE (a fast-relaunch race), so the embedded base FOLLOWS the discovered port
-    /// instead of hardcoding 11470. A drifted port used to strand the whole session: badge Offline, every
-    /// torrent request refused. On the Lite build (no embedded server) and on macOS (MacNodeServer reclaims
-    /// and rebinds 11470 reliably via its own port handling), this stays the fixed 11470.
+    /// The port the on-device server ACTUALLY bound. Port zero is deliberately unusable while the
+    /// server starts or has failed, and on the Lite build, which ships no embedded server.
     static var embeddedPort: Int {
-        // Port zero is deliberately unusable while native starts/fails. Never route native mode
-        // to a stale Node listener merely because its conventional port is still answering.
-        if nativeTransportSelected {
-            return nativeTransportBase.flatMap { URL(string: $0)?.port } ?? 0
-        }
-        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-        // Legacy selection follows Node's discovered port, including its bounded port drift.
-        if let p = NodeServer.discoveredPort { return p }
-        #endif
-        return 11470
+        nativeTransportBase.flatMap { URL(string: $0)?.port } ?? 0
     }
     /// The on-device server base. Used unless the user points at a remote/dedicated server.
     static var embedded: String { "http://127.0.0.1:\(embeddedPort)" }
-
-    static var nativeTransportSelected: Bool {
-        #if VORTX_NO_EMBEDDED_SERVER
-        return NativeTransportPolicy.isRequired
-        #elseif os(macOS)
-        return NodeServer.nativeServerEnabled
-        #else
-        return VortxNativeServerFlag.isOn
-        #endif
-    }
 
     private static var nativeTransportBase: String? {
         #if VORTX_NO_EMBEDDED_SERVER
@@ -44,27 +22,10 @@ enum StremioServer {
         #endif
     }
 
-    /// Credential control follows the explicitly selected local runtime, never the user's LAN
-    /// server setting. Native creates additionally validate /nzb/capabilities before each POST.
+    /// Credential control follows the local runtime, never the user's LAN server setting. Creates
+    /// additionally validate /nzb/capabilities before each POST.
     static var usenetEndpoint: UsenetNodeClient.Endpoint? {
-        if nativeTransportSelected {
-            return nativeTransportBase.map { UsenetNodeClient.Endpoint(base: $0, requiresNativeCapabilities: true) }
-        }
-        return usenetNodeBase.map { UsenetNodeClient.Endpoint(base: $0, requiresNativeCapabilities: false) }
-    }
-
-    /// Legacy Node-only endpoint. A native selection never guesses the legacy port.
-    static var usenetNodeBase: String? {
-        guard !nativeTransportSelected else { return nil }
-        #if VORTX_NO_EMBEDDED_SERVER
-        return nil
-        #elseif os(macOS)
-        guard !NodeServer.isUsingNativeServer else { return nil }
-        return "http://127.0.0.1:11470"
-        #else
-        if let port = NodeServer.discoveredPort { return "http://127.0.0.1:\(port)" }
-        return "http://127.0.0.1:11470"
-        #endif
+        nativeTransportBase.map { UsenetNodeClient.Endpoint(base: $0) }
     }
     private static let urlKey = "stremiox.serverURL"
 
@@ -75,7 +36,7 @@ enum StremioServer {
     }
     static var isCustom: Bool { base != embedded }
 
-    /// Whether the embedded server can proxy (the Lite build ships no node server, so it can't).
+    /// Whether the embedded server can proxy (the Lite build ships no server, so it can't).
     static var canProxy: Bool {
         #if VORTX_NO_EMBEDDED_SERVER
         return false
@@ -90,13 +51,13 @@ enum StremioServer {
     static let remoteTrailerResolver = "https://trailer.vortx.tv"
 
     /// The base to hand a YouTube trailer id to. ALWAYS the public remote resolver (`trailer.vortx.tv`), on
-    /// every build: the embedded `server.js` `/yt` route proved unreliable (it 403s once YouTube rotates), and
+    /// every build: the embedded server's `/yt` route proved unreliable (it 403s once YouTube rotates), and
     /// the remote worker is server-fixable (a YouTube change is a worker redeploy, not an app resubmit) and
     /// works uniformly on the Lite build too. Callers append `/yt/{id}` + an optional `?lang=` hint.
     static var trailerResolverBase: String { remoteTrailerResolver }
 
     /// Route a header-gated HTTP(S) stream through the embedded server's `/proxy/` endpoint, the
-    /// same path official Stremio uses for `notWebReady` add-on streams. The server fetches each
+    /// path for `notWebReady` add-on streams. The server fetches each
     /// request (and every HLS variant / segment, which it rewrites to come back through the proxy)
     /// applying the add-on's declared headers, then serves it to libmpv over plain loopback. This
     /// is what makes picky CDNs (e.g. ok.ru behind the KhmerDub add-on) play: their playlists and
@@ -105,7 +66,7 @@ enum StremioServer {
     ///
     /// Returns nil (caller falls back to the direct URL + mpv headers) when proxying isn't possible:
     /// the Lite build, a custom remote server, a torrent/local URL, or a non-HTTP URL.
-    /// Server-side route format (from server.js): `/proxy/d={origin}&h={Name:Value}.../{path}{?query}`.
+    /// Server-side route format: `/proxy/d={origin}&h={Name:Value}.../{path}{?query}`.
     static func proxiedURL(for streamURL: URL, headers: [String: String]) -> URL? {
         let safeHeaders = StreamRequestHeaderPolicy.sanitized(headers)
         guard canProxy, !isCustom, !safeHeaders.isEmpty,
@@ -160,34 +121,20 @@ enum StremioServer {
         return await respondsAsServer("\(b)/settings")
     }
 
-    /// Is the active streaming server reachable? (Settings shows this.) Scans the embedded server's whole
-    /// fallback range (11470-11474) and LATCHES the live port, so a drifted boot self-heals instead of
-    /// reading Offline forever. Validates the /settings body shape so a foreign local listener on one of
-    /// these ports can never be latched as ours.
+    /// Is the active streaming server reachable? (Settings shows this.) The embedded server is checked
+    /// only at its published address, never at a guessed conventional port. Validates the /settings body
+    /// shape so a foreign local listener can never be mistaken for ours.
     static func isOnline() async -> Bool {
-        if !isCustom, nativeTransportSelected {
+        guard isCustom else {
             guard let nativeBase = nativeTransportBase else { return false }
             return await respondsAsServer("\(nativeBase)/settings")
         }
-        if await respondsAsServer("\(base)/settings") { return true }
-        guard !isCustom else { return false }
-        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-        // Only the in-process iOS/tvOS server drifts; macOS (MacNodeServer) reclaims and rebinds 11470,
-        // and the Lite build ships no embedded server, so neither scans (and NodeServer.latch is absent there).
-        for port in 11470...11474 where port != embeddedPort {
-            if await respondsAsServer("http://127.0.0.1:\(port)/settings") {
-                NodeServer.latch(port: port)
-                NSLog("%@", "StremioX: embedded server discovered on :\(port); latched")
-                return true
-            }
-        }
-        #endif
-        return false
+        return await respondsAsServer("\(base)/settings")
     }
 
-    /// True only when `urlString` answers /settings with HTTP 200 AND a Stremio settings body (a top-level
-    /// `values` object, per server.js's GET /settings shape). The body check keeps an unrelated local
-    /// listener on one of these ports from being mistaken for, and latched as, our embedded server.
+    /// True only when `urlString` answers /settings with HTTP 200 AND a settings body (a top-level
+    /// `values` object). The body check keeps an unrelated local listener from being mistaken for our
+    /// embedded server.
     private static func respondsAsServer(_ urlString: String) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         var req = URLRequest(url: url)
@@ -274,7 +221,7 @@ enum StremioServer {
     /// buffering pieces into it pushes the app past the limit and tvOS jetsam-kills the whole
     /// process (the "server crash" -- nav bar dead, back drops to Home, server offline on
     /// reopen). The player's own read-ahead buffer and the binge preload are independent of this.
-    /// POST /settings merges the value (server.js: saveSettings -> userSettings.extend). Custom
+    /// POST /settings merges the value into the server's settings. Custom
     /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
     @discardableResult
     static func applyServerConfig(maxAttempts: Int = 20) async -> Bool {
@@ -290,15 +237,8 @@ enum StremioServer {
         let physical = ProcessInfo.processInfo.physicalMemory
         let cap = Int(min(UInt64(192 * 1024 * 1024), max(UInt64(96 * 1024 * 1024), physical / 32)))
         #endif
-        // cacheSize bounds the ON-DISK piece cache. It does NOT bound the engine's in-memory
-        // piece map: the disk storage backend writes each completed 512KB piece into a native
-        // Buffer (off-heap, so it never shows in the JS heap, the "heap flat at 27MB, RSS to
-        // 1.5GB" signature) and only frees it once the piece's verification group is whole AND
-        // the SINGLE-worker disk writer (bagpipe(1)) has drained it. With 55 default connections
-        // feeding pieces out-of-order, partial verify-groups pile up faster than they drain and
-        // the process gets jetsam-killed on iOS. Halving the connection count keeps far fewer
-        // partial groups in flight, so pieces verify+commit+free promptly and the in-memory map
-        // stays bounded. btMaxConnections flows through enginefs.getDefaults -> engine.connections.
+        // cacheSize bounds the ON-DISK piece cache; btMaxConnections bounds how many peers feed
+        // pieces at once, which keeps the in-memory map of partially verified pieces small.
         // (Direct/debrid streams never touch this path; this only matters for torrent playback.)
         let body: [String: Any] = ["cacheSize": cap, "btMaxConnections": 24]
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return false }
@@ -311,10 +251,8 @@ enum StremioServer {
         // the entire session. A successful POST also proves the server is reachable, so it doubles as the
         // readiness gate (no separate isOnline() round-trip). Bounded loop; ~1 s between tries.
         for attempt in 0 ..< max(1, maxAttempts) {
-            // Rebuild the URL each attempt so a mid-boot port latch (server.js drifted off 11470) is
-            // picked up: `embedded` follows NodeServer.discoveredPort, so a later retry POSTs the cap to
-            // the ACTUAL bound port instead of hammering a dead one for the whole loop (which would leave
-            // the 2 GB default cache in place and jetsam the app under torrent load).
+            // Rebuild the URL each attempt: `embedded` follows the server's published port, which is
+            // only known once it has started.
             guard let url = URL(string: "\(embedded)/settings") else { return false }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"

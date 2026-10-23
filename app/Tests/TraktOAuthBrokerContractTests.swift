@@ -26,12 +26,12 @@ import Foundation
 // TraktModels normally receives these shared date formatters from CoreModels. Keep this standalone
 // contract focused on the OAuth response model instead of pulling CoreModels' unrelated graph.
 extension ISO8601DateFormatter {
-    static let epg = ISO8601DateFormatter()
-    static let epgFractional: ISO8601DateFormatter = {
+    static var epg: ISO8601DateFormatter { ISO8601DateFormatter() }
+    static var epgFractional: ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
-    }()
+    }
 }
 #endif
 
@@ -50,6 +50,13 @@ enum DiagnosticsLog {
     static func log(_ category: String, _ message: String) {}
 }
 #endif
+
+private final class RatingDateFailures: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failures = 0
+    func record() { lock.lock(); failures += 1; lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return failures }
+}
 
 @main
 private enum TraktOAuthBrokerContractTests {
@@ -145,6 +152,33 @@ private enum TraktOAuthBrokerContractTests {
               "SIMKL PIN auth remains public-client-ID-only")
         check(!logsCredentialValues(auth),
               "Trakt diagnostics never interpolate OAuth credential values")
+        let dates = RatingDateFailures()
+        DispatchQueue.concurrentPerform(iterations: 500) { index in
+            let expected = Date(timeIntervalSince1970: 1_700_000_000.375 + Double(index))
+            let encoded = TraktRatedAt.string(from: expected)
+            if let decoded = TraktRatedAt.date(from: encoded), abs(decoded.timeIntervalSince(expected)) < 0.001 {
+                // The fractional formatter and whole-second fallback keep their existing wire rules.
+            } else { dates.record() }
+        }
+        check(dates.count == 0
+                && TraktRatedAt.date(from: "2026-10-20T00:00:00Z") != nil
+                && TraktRatedAt.date(from: "2026-10-20T00:00:00.375Z") != nil
+                && TraktRatedAt.date(from: "not a date") == nil
+                && TraktRatedAt.string(from: Date(timeIntervalSince1970: 0)) == "1970-01-01T00:00:00.000Z",
+              "actual rating formatters conserve fractional/whole wire dates under concurrent calls")
+        check(auth.contains("enum TraktAuthConfigurationFailure: String, Sendable, Equatable")
+                && auth.contains("case configuration(TraktAuthConfigurationFailure)")
+                && auth.contains("case .configuration, .brokerUnavailable, .transport: return true")
+                && !auth.contains("brokerUnavailable(status: 0)"),
+              "Trakt local failures have closed reasons and retain the prior status-zero transient classification")
+        check(auth.contains("event=broker_failure stage=local reason=")
+                && auth.contains("event=broker_failure stage=http reason=")
+                && auth.contains("case 401: return \"http_unauthorized\"")
+                && auth.contains("case 403: return \"http_forbidden\"")
+                && auth.contains("case 429: return \"http_rate_limited\"")
+                && auth.contains("case 500...599: return \"http_server_error\"")
+                && auth.contains("case 300...399: return \"http_redirect\""),
+              "Trakt broker diagnostics use closed local and HTTP categories without response or credential values")
         check(brokerViolations(auth) == 0
                 && brokerViolations(auth.replacingOccurrences(
                     of: "makeBrokerRequest",

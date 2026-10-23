@@ -27,7 +27,7 @@ class NativeWatchlistUiCaptureContractTest {
 
     @Test fun `production singleton selects real native flag before its initial reload`() {
         val store = source("library/WatchlistStore.kt")
-        assertTrue(store.contains("initialNativeEnabled = { com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED }"))
+        assertTrue(store.contains("initialNativeEnabled = { true }"))
         assertTrue(store.contains("private var nativeEnabled: () -> Boolean = initialNativeEnabled"))
     }
 

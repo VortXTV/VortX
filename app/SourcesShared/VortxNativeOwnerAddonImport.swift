@@ -2,6 +2,7 @@ import Foundation
 
 /// Explicit owner import fetch only. Passive sign-in recovery never calls this helper. Descriptor
 /// validation reuses the shipping strict bootstrap parser; the native batch owns membership.
+/// Descriptors that parser holds are left out of the import.
 enum VortxNativeOwnerAddonImport {
     struct Incomplete: Error {}
     typealias Send = @Sendable (URLRequest) async throws -> AuthenticatedHTTPResponse
@@ -27,10 +28,14 @@ enum VortxNativeOwnerAddonImport {
             throw VortxNativeError.invalidResponse
         }
         let document = try JSONSerialization.data(withJSONObject: ["addons": rows])
-        let material = try VortxLegacyBootstrapMaterial.encode(document: document, roster: [owner], ownerProfileID: owner.id,
-                                                               rosterModifiedSeconds: nil)
-        let projected = try JSONDecoder().decode(VortxJSON.self, from: material)
-        guard let addons = projected["addons"]?[owner.id.uuidString]?["items"]?.array, addons.count == rows.count else {
+        let prepared = try VortxLegacyBootstrapMaterial.project(document: document, roster: [owner], ownerProfileID: owner.id,
+                                                                rosterModifiedSeconds: nil, preparePendingMembership: false)
+        let projected = try JSONDecoder().decode(VortxJSON.self, from: prepared.material)
+        // A descriptor the engine cannot represent is skipped, not fatal (issue #262): one odd add-on
+        // must not fail the whole Stremio connection. The import only adds, so nothing is removed.
+        // Every other row must still project exactly once.
+        let skipped = prepared.held.filter { $0.kind == "addon" }.count
+        guard let addons = projected["addons"]?[owner.id.uuidString]?["items"]?.array, addons.count + skipped == rows.count else {
             throw VortxNativeError.invalidResponse
         }
         try authority.withActive {}

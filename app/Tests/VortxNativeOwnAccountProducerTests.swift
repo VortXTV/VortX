@@ -80,7 +80,8 @@ private final class OwnerSelectorBackend {
         check(OwnSourceProbe.foreignHits == 0)
         let profileID = UUID(uuidString: "00000000-0000-0000-0000-00000000B22C")!
         let slot = "fixture.profile." + profileID.uuidString
-        let library = Data(" {\n \"result\":[] }\n".utf8), addons = Data(#"{"result":{"addons":[]}}"#.utf8)
+        let library = Data(" {\n \"result\":[] }\n".utf8)
+        let addons = Data(#"{"result":{"addons":[{"transportUrl":"https://addon.example/manifest.json","manifest":{"id":"fixture.community","version":"1.0.0","name":"[4K] Community catalog","description":"{Public} Films and shows"}}]}}"#.utf8)
         let requests = OwnSourceRequests()
         let send: VortxNativeOwnAccountProducer.Send = { request in
             await requests.record(request)
@@ -99,6 +100,16 @@ private final class OwnerSelectorBackend {
         let envelope = try JSONSerialization.jsonObject(with: source.sourceDocument) as! [String: Any]
         check(Data(base64Encoded: envelope["libraryResponseBase64"] as! String) == library)
         check(Data(base64Encoded: envelope["addonsResponseBase64"] as! String) == addons)
+        let sourceArchive = try VortxNativeOwnAccountProducer.archive([source])
+        try VortxNativeBootstrapArchive.validate(sourceArchive)
+        let archived = try JSONDecoder().decode(VortxJSON.self, from: sourceArchive)
+        guard case .string(let retainedSource) = archived["hostDocument"]?["ownAccountSources"]?[profileID.uuidString]?["sourceDocumentBase64"] else {
+            fatalError("Independent source was not retained")
+        }
+        check(Data(base64Encoded: retainedSource) == source.sourceDocument)
+        let nestedArchive = try VortxNativeBootstrapArchive.encode(document: Data("{}".utf8), authenticatedSourceArchive: sourceArchive)
+        try VortxNativeBootstrapArchive.validate(nestedArchive)
+        print("Issue #263 linked-account fetch/archive/nested retention preserve exact authenticated response bytes containing literal manifest labels")
         check(Data(base64Encoded: envelope["profileOverlayBase64"] as! String) == Data("{}".utf8))
         check(envelope["schemaVersion"] as? Int == 2)
         check(source.profileOverlaySHA256 == (try VortxProfileOverlayWitness.digest(json: Data("{}".utf8))))

@@ -6,6 +6,26 @@ import UIKit   // UIScreen / UIDevice for the screen-proportional hero band heig
 import AppKit  // NSApplication / NSScreen for the window-proportional macOS hero band height
 #endif
 
+/// A tint belongs to the exact displayed title/artwork, not whichever async sample finishes last.
+struct FeaturedHeroTintKey: Equatable {
+    let id: String?
+    let type: String?
+    let artwork: String?
+}
+
+struct FeaturedHeroTintSnapshot<Tint> {
+    let key: FeaturedHeroTintKey
+    let tint: Tint?
+
+    static func accepting(_ tint: Tint?, for requested: FeaturedHeroTintKey,
+                          current: FeaturedHeroTintKey, isCancelled: Bool) -> Self? {
+        guard !isCancelled, requested == current else { return nil }
+        return Self(key: requested, tint: tint)
+    }
+
+    func value(for current: FeaturedHeroTintKey) -> Tint? { key == current ? tint : nil }
+}
+
 /// The ambient featured hero shown at the top of Home, Library, and Discover, the touch/Mac twin of
 /// the tvOS browse hero. It mirrors the `iOSDetailView` hero's visual language: a full-bleed
 /// `meta.background` STILL backdrop with the same dual-gradient scrim, a logo-or-serif-title, the
@@ -29,10 +49,17 @@ struct FeaturedHeroView: View {
     /// An optional ember uppercase kicker rendered above the title, the redesign mockup's "Featured" hero
     /// eyebrow. Only Home passes it; Library / Discover / Browse leave it nil so their heroes are unchanged.
     var eyebrow: String? = nil
+    /// Home alone continues the existing cached art tint into its upper canvas. Other heroes
+    /// leave this nil; no image loading or analysis is added by the surrounding page.
+    var onTintChange: (@MainActor (FeaturedHeroTintSnapshot<Color>) -> Void)? = nil
+    /// Height added to the shared band. Mac Home passes the space it reclaims above its Customize row so the
+    /// billboard runs down to just above it; every other hero leaves it 0.
+    var extraHeight: CGFloat = 0
 
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized hero title/logo override
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
     /// The "Auto-play trailers" setting, honored by the other three hero clip call sites (tvOS home + both
     /// detail pages). The home billboard clip gates on it too so turning trailers off in Settings actually
     /// stops this ambient clip, not just reduced-motion.
@@ -58,8 +85,16 @@ struct FeaturedHeroView: View {
     /// painted as the band's BASE layer in place of flat canvas, so the load-in / fallback state and the
     /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
     /// today's fixed canvas + gradients exactly, so this is purely additive ambience.
-    @State private var heroTint: Color?
+    @State private var heroTint: FeaturedHeroTintSnapshot<Color>?
+    #if os(macOS)
+    @State private var trackpadSwipe = HeroTrackpadSwipe()
+    #endif
 
+    private var heroTintKey: FeaturedHeroTintKey {
+        .init(id: model.hero?.id, type: model.hero?.type,
+              artwork: model.hero?.backdrop ?? model.hero?.poster)
+    }
+    private var currentHeroTint: Color? { heroTint?.value(for: heroTintKey) }
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
     /// band is a fraction of the device screen height; 0.58 lands 55-60% visible even with the notch /
@@ -109,15 +144,25 @@ struct FeaturedHeroView: View {
         #endif
     }
 
-    private var heroHeight: CGFloat { Self.heroHeight }
+    private var heroHeight: CGFloat { Self.heroHeight + extraHeight }
 
     var body: some View {
+        confinedHero
+            .cinemaHeroCard()
+            .padding(.horizontal, CinemaHeroCardGeometry.inset)
+            .padding(.top, Theme.Space.xs)
+    }
+
+    private var confinedHero: some View {
         ZStack(alignment: .bottomLeading) {
             // The still backdrop image is the base art layer and the permanent fallback: the muted clip
             // (#44) only paints OVER it when a trailer id resolves, so a missing / slow / blocked embed
             // never leaves the band black; the artwork always shows through. Reduce-motion skips the
             // clip entirely.
+            // The gate line rides the always-present backdrop: on the clip itself it never ran when the gate was
+            // closed, since an empty view starts no task.
             backdrop
+                .task(id: model.hero?.id) { logHeroTrailerGate() }
             heroClip
             if let hero = model.hero {
                 content(hero)
@@ -131,14 +176,14 @@ struct FeaturedHeroView: View {
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
-        // Let just the first band bleed to the very top so the hero art runs behind the chrome (the
-        // cinematic media-app look) instead of starting below it. On macOS that's behind the hidden
-        // title-bar / traffic-light region; on iOS it's behind the frosted status-bar / nav bar. Only
-        // .top/.container, so the rails below keep normal insets. This is what removes the BLACK GAP the
-        // owner saw above the iPhone hero (H19a): the hero-height bump was double-counting the safe-area
-        // inset, leaving the status-bar strip as bare canvas above the band. The dual scrim (below) keeps
-        // the status bar / window controls legible over the art.
-        .ignoresSafeArea(.container, edges: .top)
+        .contentShape(Rectangle())
+        .simultaneousGesture(heroSwipe)
+        #if os(macOS)
+        .overlay(alignment: .bottomTrailing) { pagingArrows }
+        // Two-finger trackpad swipes page the hero while the pointer is over it.
+        .onHover { hovering in trackpadSwipe.setActive(hovering) { model.step(by: $0) } }
+        .onDisappear { trackpadSwipe.setActive(false, onSwipe: nil) }
+        #endif
         // Mac branding now lives ONLY in the persistent top bar (iOSRootView.macTopBar); the old
         // hero-corner wordmark rendered a SECOND logo on every primary screen (owner report).
         // The rare "no trailer available right now" notice (both trailer paths out). A small capsule,
@@ -166,12 +211,11 @@ struct FeaturedHeroView: View {
                    value: model.hero?.id)
         // Dynamic dominant-color backdrop: recompute the band's base tint per featured title, off-main and
         // cached (PosterImageLoader.averageColor). Cross-fades with the art; nil keeps the canvas fallback.
-        .task(id: model.hero?.id) {
-            let tint = await PosterImageLoader.averageColor(model.hero?.backdrop ?? model.hero?.poster)
-            guard !Task.isCancelled else { return }
-            withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
-                heroTint = tint
-            }
+        .task(id: heroTintKey) {
+            let requested = heroTintKey
+            await MainActor.run { publishHeroTint(nil, for: requested) }
+            let tint = await PosterImageLoader.averageColor(requested.artwork)
+            await MainActor.run { publishHeroTint(tint, for: requested) }
         }
         // FALLBACK cover (iOS/Mac, no server): the keyless WKWebView IFrame, used only when the native /yt
         // resolver is unavailable (Lite build) but a YouTube id exists. Fills the window on macOS too.
@@ -187,6 +231,16 @@ struct FeaturedHeroView: View {
                          onClose: { trailerPlay = nil })
                 .id(launch.id)
                 .ignoresSafeArea()
+        }
+    }
+
+    @MainActor
+    private func publishHeroTint(_ tint: Color?, for requested: FeaturedHeroTintKey) {
+        guard let snapshot = FeaturedHeroTintSnapshot.accepting(tint, for: requested,
+            current: heroTintKey, isCancelled: Task.isCancelled) else { return }
+        withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
+            heroTint = snapshot
+            onTintChange?(snapshot)
         }
     }
 
@@ -210,16 +264,31 @@ struct FeaturedHeroView: View {
             // yt-direct: try the DEVICE-DIRECT stream first (resolved on the user's own IP; the clip is
             // muted, so a video-only adaptive pick needs no audio sidecar). The clip mounts only after the
             // attempt lands so a late resolve never remounts it; a miss mounts the /yt worker URL.
-            Group {
+            // The clear base keeps this container non-empty before the attempt lands: SwiftUI never starts a
+            // `.task` on an empty view, so with only the conditional clip inside, the attempt never ran and no
+            // Home clip ever mounted (0.5.4 Mac log: no Home trailer lines at all).
+            ZStack {
+                Color.clear
                 if let attempt = heroClipDirect, attempt.heroID == hero.id {
                     InHeroTrailerView(url: attempt.url ?? clip, height: heroHeight, window: nil)
-                        .allowsHitTesting(false)
                         .id("hero-clip-\(hero.id)")    // reload the clip for each new featured item / rotation
                         .transition(reduceMotion ? .identity : .opacity)
                 }
             }
+            .allowsHitTesting(false)
             .task(id: hero.id) { await resolveHeroClipDirect(hero) }
         }
+    }
+
+    /// One diagnostics line per featured title: whether the ambient trailer was allowed to mount, and if not
+    /// which gate stopped it. No title identity is logged.
+    private func logHeroTrailerGate() {
+        guard let hero = model.hero else { return }
+        let reason = !autoplayTrailers ? "autoplay_off"
+            : !RemoteConfig.snapshot.isFeatureOn("trailers", default: true) ? "remote_off"
+            : reduceMotion ? "reduce_motion"
+            : hero.ambientTrailerURL == nil ? "no_trailer" : nil
+        DiagnosticsLog.log("trailer", "hero surface=home result=" + (reason.map { "skip reason=\($0)" } ?? "mount"))
     }
 
     /// yt-direct: one attempt per featured item at resolving the ambient clip on the user's own IP.
@@ -240,17 +309,16 @@ struct FeaturedHeroView: View {
 
     private var backdrop: some View {
         // GeometryReader pins BOTH art layers to the EXACT band size so `scaledToFill` always covers the
-        // whole band at any window width. Without it, the AsyncImage sat unframed inside the ZStack (the
-        // frame was on the ZStack, not the image), so it sized to the loaded image's natural width and the
-        // rest of the wide macOS band stayed bare scrim, the "backdrop only fills part of the band" report.
-        // (On the narrow iPhone the image width happened to exceed the band, so the gap never showed.)
+        // whole band at any window width. The cache-only poster fallback and the layer host both receive
+        // this exact frame, so the wide macOS band never falls back to a natural image width with a bare
+        // scrim beside it.
         GeometryReader { geo in
             ZStack {
                 // Dynamic dominant-color base: the featured art's average color under everything, so the
                 // band already carries the title's palette while the art streams in (and whenever a layer
                 // above misses). nil = today's flat canvas, the graceful fallback. STATIC on purpose: a
                 // solid tint has no visible pan, so leaving it off the render path is pixel-identical.
-                (heroTint ?? Theme.Palette.canvas)
+                (currentHeroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
                 // band (the iPhone "no backdrop" report). The poster is the catalog art the screen already
                 // loaded, so it's almost always available; the layer host paints the band-filling art over
@@ -265,15 +333,17 @@ struct FeaturedHeroView: View {
                 // on its own layer and animating THAT keeps the exact motion at ~0% main-thread cost. The
                 // host loads the 16:9 backdrop (poster fallback) through the shared PosterImageLoader.
                 KenBurnsLayerHost(backdrop: model.hero?.backdrop, poster: model.hero?.poster,
-                                  reduceMotion: reduceMotion)
+                                  reduceMotion: reduceMotion,
+                                  usesAcceptedImageFallback: navigationArtworkInset > 0)
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .clipped()
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
         // Cross-fade the artwork itself on id change so a new featured title dissolves in.
-        .id(model.hero?.id)
+        .id(model.hero?.id ?? "")
         .transition(reduceMotion ? .identity : .opacity)
         .overlay(
             // Smooth multi-stop vertical fade to canvas so the rails / grid below read cleanly and the band
@@ -291,28 +361,58 @@ struct FeaturedHeroView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+        .overlay(
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
+        )
+        .mask(CinemaHeroDissolve())
         // Purely decorative art + scrims; hide from VoiceOver so the title/meta read first.
         .accessibilityHidden(true)
     }
 
-    /// The poster painted behind the backdrop so the band is never flat black. Falls to canvas only
-    /// when there is no poster at all (rare; the catalog/CW seed almost always carries one).
+    /// The warm poster painted behind the backdrop so the band is never flat black while the bounded
+    /// backdrop request is in flight. This is deliberately CACHE-ONLY: KenBurnsLoader owns the one
+    /// progressive network/decode path, so a cold cache shows the dominant-color base instead of starting
+    /// a second full-size unbounded request for the same poster. Falls to canvas only when there is no
+    /// decoded poster at all (rare; the catalog/CW seed almost always carries one).
+    private static let posterFallbackMaxPixel = CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+
     @ViewBuilder private var posterFallback: some View {
-        if let poster = model.hero?.poster, let url = URL(string: poster) {
-            AsyncImage(url: url) { phase in
-                if case .success(let img) = phase {
-                    img.resizable().aspectRatio(contentMode: .fill)
-                } else {
-                    // Dominant-color tint while the poster streams in (falls to canvas with no tint).
-                    (heroTint ?? Theme.Palette.canvas)
-                }
-            }
-            // Decorative backdrop filler, never announced by VoiceOver.
-            .accessibilityHidden(true)
+        if let image = cachedPosterImage {
+            cachedPosterImageView(image)
         } else {
-            (heroTint ?? Theme.Palette.canvas)
+            // Dominant-color tint while the owned progressive loader fetches/decodes the art (falls to
+            // canvas with no tint). This path never starts a second request.
+            (currentHeroTint ?? Theme.Palette.canvas)
                 .accessibilityHidden(true)
         }
+    }
+
+    /// Read only the decoded cache so a poster already loaded by a rail or prior hero paints immediately.
+    /// The fallback also accepts the loader's standard card budget because Home posters commonly arrive from
+    /// a 900 px tile before the hero mounts; neither branch can fetch or decode.
+    private var cachedPosterImage: VXPosterImage? {
+        guard let poster = model.hero?.poster, let url = URL(string: poster) else { return nil }
+        return PosterImageLoader.cached(url, maxPixel: Self.posterFallbackMaxPixel)
+            ?? PosterImageLoader.cached(url)
+    }
+
+    @ViewBuilder
+    private func cachedPosterImageView(_ image: VXPosterImage) -> some View {
+        Group {
+            #if canImport(UIKit)
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+            #elseif canImport(AppKit)
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+            #endif
+        }
+        // Match the GeometryReader's band bounds so a warm poster fills wide macOS bands too.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityHidden(true)
     }
 
     // MARK: Overlay (logo-or-title · meta row · synopsis · actions)
@@ -352,16 +452,59 @@ struct FeaturedHeroView: View {
         if model.pageCount > 1 {
             HStack(spacing: 6) {
                 ForEach(0..<model.pageCount, id: \.self) { i in
-                    Capsule()
-                        .fill(i == model.page ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.28))
-                        .frame(width: i == model.page ? 18 : 6, height: 6)
-                        .animation(reduceMotion ? nil : Theme.Motion.state, value: model.page)
+                    // Each dot jumps straight to its title; the vertical padding gives the 6pt capsule a
+                    // usable hit target without changing how the row looks.
+                    Button { model.select(page: i) } label: {
+                        Capsule()
+                            .fill(i == model.page ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.28))
+                            .frame(width: i == model.page ? 18 : 6, height: 6)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                            .animation(reduceMotion ? nil : Theme.Motion.state, value: model.page)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Featured title \(i + 1) of \(model.pageCount)")
+                    .accessibilityAddTraits(i == model.page ? .isSelected : [])
                 }
             }
-            .padding(.top, Theme.Space.xs)
-            .accessibilityHidden(true)
         }
     }
+
+    /// Touch (and Mac click-drag) paging: a horizontal flick pages the billboard, a vertical one is left to
+    /// the page's scroll view. Simultaneous, so it never steals the vertical scroll that starts on the hero.
+    private var heroSwipe: some Gesture {
+        DragGesture(minimumDistance: 24)
+            .onEnded { value in
+                let dx = value.translation.width
+                let flick = value.predictedEndTranslation.width
+                guard abs(dx) > abs(value.translation.height) * 1.4,
+                      abs(dx) > Self.swipeDistance || abs(flick) > Self.swipeDistance * 2 else { return }
+                model.step(by: dx < 0 ? 1 : -1)
+            }
+    }
+
+    private static let swipeDistance: CGFloat = 56
+
+    #if os(macOS)
+    /// Previous / next for a pointer, bottom-trailing over the art (the content block is leading-aligned,
+    /// so the pair never covers the title or the actions).
+    @ViewBuilder private var pagingArrows: some View {
+        if model.pageCount > 1 {
+            HStack(spacing: Theme.Space.sm) {
+                CircleIconButton(systemName: "chevron.left", diameter: Theme.Control.circleChrome) {
+                    model.step(by: -1)
+                }
+                .accessibilityLabel("Previous featured title")
+                CircleIconButton(systemName: "chevron.right", diameter: Theme.Control.circleChrome) {
+                    model.step(by: 1)
+                }
+                .accessibilityLabel("Next featured title")
+            }
+            .padding(.trailing, Theme.Space.md)
+            .padding(.bottom, Theme.Space.lg)
+        }
+    }
+    #endif
 
     /// The add-on logo when enrichment surfaced one (the editorial signature), else the serif hero
     /// type, mirrors `iOSDetailView.titleOrLogo`.
@@ -509,7 +652,7 @@ struct FeaturedHeroView: View {
                 // The secondary hero action rides VortX's warm liquid-glass material as a floating glass
                 // capsule (redesign mockup), next to the ember-filled primary. Appearance only: the tap
                 // still opens the in-app trailer through the exact same resolve path as before.
-                Label("Trailer", systemImage: "play.rectangle.fill")
+                Label("Trailer", systemImage: "movieclapper")
                     .font(Theme.Typography.label.weight(.semibold))
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .padding(.horizontal, Theme.Space.md)
@@ -551,7 +694,7 @@ struct FeaturedHeroView: View {
 /// through Core Text (~55% of a core on an idle Home, #178). Expressed as a single layer animation the
 /// motion is byte-for-byte the same while the main thread does nothing per frame. Reduce Motion adds no
 /// animation (static art), exactly as before.
-private enum KenBurnsPan {
+enum KenBurnsPan {
     static let scaleFrom: CGFloat = 1.0
     static let scaleTo: CGFloat = 1.08
     static let offsetX: CGFloat = 12
@@ -587,7 +730,7 @@ private enum KenBurnsPan {
         transform(scale: scaleTo, offsetX: offsetX, offsetY: offsetY)
     }
 
-    static func makeAnimation() -> CABasicAnimation {
+    static func makeAnimation(epoch: CFTimeInterval = 0) -> CABasicAnimation {
         let anim = CABasicAnimation(keyPath: "transform")
         anim.fromValue = NSValue(caTransform3D: restingTransform)
         anim.toValue = NSValue(caTransform3D: activeTransform)
@@ -597,21 +740,22 @@ private enum KenBurnsPan {
         anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         anim.isRemovedOnCompletion = false
         anim.fillMode = .both
+        anim.beginTime = epoch
         return anim
     }
 
     /// Install the resting transform + (unless Reduce Motion) the pan ONCE, from make…View, so the animation
     /// is submitted a single time per host and never re-created per SwiftUI frame.
-    static func configure(_ layer: CALayer, reduceMotion: Bool) {
+    static func configure(_ layer: CALayer, reduceMotion: Bool, epoch: CFTimeInterval = 0) {
         layer.contentsGravity = .resizeAspectFill
         layer.masksToBounds = true
         layer.transform = restingTransform
-        if !reduceMotion { layer.add(makeAnimation(), forKey: animationKey) }
+        if !reduceMotion { layer.add(makeAnimation(epoch: epoch), forKey: animationKey) }
     }
 
     /// Reconcile only a Reduce-Motion toggle (rare): add or remove the pan without touching contents, so a
     /// routine SwiftUI update never restarts the animation.
-    static func reconcile(_ layer: CALayer, reduceMotion: Bool) {
+    static func reconcile(_ layer: CALayer, reduceMotion: Bool, epoch: CFTimeInterval = 0) {
         let running = layer.animation(forKey: animationKey) != nil
         if reduceMotion, running {
             layer.removeAnimation(forKey: animationKey)
@@ -620,49 +764,68 @@ private enum KenBurnsPan {
             CATransaction.commit()
         } else if !reduceMotion, !running {
             layer.transform = restingTransform
-            layer.add(makeAnimation(), forKey: animationKey)
+            layer.add(makeAnimation(epoch: epoch), forKey: animationKey)
         }
     }
 }
 
-/// Loads the hero art off-main and sets it on the pan layer's `contents`, preferring the 16:9 backdrop and
-/// falling back to the poster (the same order the old poster-behind-backdrop stack showed). Owned by the
-/// representable's coordinator so a host torn down mid-load (the per-title rotation) cancels cleanly.
-private final class KenBurnsLoader {
+// MARK: - Testable Ken Burns artwork loader
+
+/// Owns the mutable representable lifecycle on the main actor while the artwork fetch/decode runs detached
+/// from that actor. It prefers the 16:9 backdrop and falls back to the poster (the same order the old
+/// poster-behind-backdrop stack showed). A host torn down mid-load (the per-title rotation) cancels cleanly.
+@MainActor
+final class KenBurnsLoader {
     private var task: Task<Void, Never>?
     private var requestID = ""
+    private weak var targetLayer: CALayer?
+    private var onArtwork: ((CGImage) -> Void)?
 
-    func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer) {
+    func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer,
+              onArtwork: ((CGImage) -> Void)? = nil) {
+        self.onArtwork = onArtwork
         let backdropURL = HeroArtworkQualityPolicy.preferredURL(backdrop, maxPixel: maxPixel)
         let requestID = "\(backdropURL ?? poster ?? "")#\(maxPixel)"
         guard self.requestID != requestID else { return }
         self.requestID = requestID
+        targetLayer = layer
         task?.cancel()
-        task = Task { [weak layer] in
+        // A MainActor coordinator must not inherit its actor for the ImageIO work. The detached task only
+        // returns the decoded CGImage; all mutable request/layer state is checked and painted on MainActor.
+        task = Task.detached { [weak self] in
             let cg = await Self.bestArt(backdrop: backdropURL, poster: poster, maxPixel: maxPixel)
-            guard let cg, !Task.isCancelled, let layer else { return }
+            guard let cg, !Task.isCancelled else { return }
             let width = cg.width, height = cg.height
-            await MainActor.run {
-                CATransaction.begin(); CATransaction.setDisableActions(true)
-                layer.contents = cg
-                CATransaction.commit()
-            }
+            let painted = await self?.paint(cg, requestID: requestID) ?? false
             // Note that the art actually reached the layer, so a low-CPU reading is a real hero and not a
             // blank band. Logged OFF the main thread, after the contents hop returns: logging on the render
             // path would re-add the very main-thread cost #178 removes. Dimensions only, no URLs or PII.
-            Self.recordProof(width: width, height: height)
+            if painted { Self.recordProof(width: width, height: height) }
         }
     }
 
-    func cancel() { task?.cancel(); task = nil }
+    func cancel() { task?.cancel(); task = nil; onArtwork = nil }
     deinit { task?.cancel() }
 
+    /// The only layer mutation point. CALayer never crosses the detached task boundary; this MainActor method
+    /// rechecks cancellation and request identity immediately before painting the current title.
+    private func paint(_ image: CGImage, requestID: String) -> Bool {
+        // The representable coordinator is reused across SwiftUI updates. Recheck both cancellation and the
+        // request identity on the main actor so an older title cannot land after a rotation.
+        guard !Task.isCancelled, self.requestID == requestID, let layer = targetLayer else { return false }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer.contents = image
+        CATransaction.commit()
+        onArtwork?(image)
+        return true
+    }
+
     /// Note one hero paint: the backdrop art reached the layer at these pixel dimensions. Off-main, log only.
-    private static func recordProof(width: Int, height: Int) {
+    nonisolated private static func recordProof(width: Int, height: Int) {
         NSLog("[kenburns] contents set %dx%d", width, height)
     }
 
-    private static func bestArt(backdrop: String?, poster: String?, maxPixel: Int) async -> CGImage? {
+    nonisolated private static func bestArt(backdrop: String?, poster: String?, maxPixel: Int) async -> CGImage? {
         if let img = await PosterImageLoader.load(backdrop, maxPixel: CGFloat(maxPixel)),
            let cg = img.kenBurnsCGImage { return cg }
         if let img = await PosterImageLoader.load(
@@ -690,14 +853,17 @@ private extension VXPosterImage {
 // applied), and the host clips it to the band (the old outer `.clipped()`). `#if` splits ONLY the view-host
 // type; the CALayer + animation code above is shared.
 #if canImport(UIKit)
-private final class KenBurnsBackingView: UIView {
+final class KenBurnsBackingView: UIView {
+    let fallbackLayer = CALayer()
     let artLayer = CALayer()
+    let animationEpoch = CACurrentMediaTime()
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false          // decorative art; the CTA/overlay sit in a sibling layer
         backgroundColor = .clear                   // let the static tint/poster show through until art loads
         clipsToBounds = true                       // clip the scaled/panned sublayer to the band (old .clipped())
         artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.addSublayer(fallbackLayer)
         layer.addSublayer(artLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -705,8 +871,13 @@ private final class KenBurnsBackingView: UIView {
         super.layoutSubviews()
         CATransaction.begin(); CATransaction.setDisableActions(true)
         artLayer.contentsScale = layer.contentsScale   // crisp on Retina (sublayers don't inherit scale)
-        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        let height = bounds.height
+        artLayer.bounds = CGRect(x: 0, y: 0, width: bounds.width, height: height)
+        artLayer.position = CGPoint(x: bounds.midX, y: height / 2)
+        fallbackLayer.contentsScale = artLayer.contentsScale
+        fallbackLayer.bounds = artLayer.bounds
+        fallbackLayer.position = artLayer.position
+        fallbackLayer.contentsGravity = .resizeAspectFill
         CATransaction.commit()
     }
 }
@@ -715,23 +886,32 @@ private struct KenBurnsLayerHost: UIViewRepresentable {
     let backdrop: String?
     let poster: String?
     let reduceMotion: Bool
+    var usesAcceptedImageFallback = false
 
     func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
 
     func makeUIView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
-        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         return view
     }
 
     func updateUIView(_ view: KenBurnsBackingView, context: Context) {
-        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
     }
 
     static func dismantleUIView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
+    }
+
+    private func load(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer,
+                         onArtwork: { [weak view] image in
+            guard let view else { return }
+            if usesAcceptedImageFallback { view.fallbackLayer.contents = image }
+        })
     }
 
     private func heroMaxPixel(for view: UIView) -> Int {
@@ -743,14 +923,17 @@ private struct KenBurnsLayerHost: UIViewRepresentable {
     }
 }
 #elseif canImport(AppKit)
-private final class KenBurnsBackingView: NSView {
+final class KenBurnsBackingView: NSView {
+    let fallbackLayer = CALayer()
     let artLayer = CALayer()
+    let animationEpoch = CACurrentMediaTime()
     var screenChanged: (() -> Void)?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true               // clip the scaled/panned sublayer to the band (old .clipped())
         artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(fallbackLayer)
         layer?.addSublayer(artLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -766,8 +949,13 @@ private final class KenBurnsBackingView: NSView {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
         if let host = layer { artLayer.contentsScale = host.contentsScale }   // crisp on Retina
-        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        let height = bounds.height
+        artLayer.bounds = CGRect(x: 0, y: 0, width: bounds.width, height: height)
+        artLayer.position = CGPoint(x: bounds.midX, y: bounds.height - height / 2)
+        fallbackLayer.contentsScale = artLayer.contentsScale
+        fallbackLayer.bounds = artLayer.bounds
+        fallbackLayer.position = artLayer.position
+        fallbackLayer.contentsGravity = .resizeAspectFill
         CATransaction.commit()
     }
 }
@@ -776,25 +964,34 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     let backdrop: String?
     let poster: String?
     let reduceMotion: Bool
+    var usesAcceptedImageFallback = false
 
     func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
 
     func makeNSView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
-        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         installScreenChangeHandler(on: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: KenBurnsBackingView, context: Context) {
-        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         installScreenChangeHandler(on: view, coordinator: context.coordinator)
     }
 
     static func dismantleNSView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
+    }
+
+    private func load(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer,
+                         onArtwork: { [weak view] image in
+            guard let view else { return }
+            if usesAcceptedImageFallback { view.fallbackLayer.contents = image }
+        })
     }
 
     private func heroMaxPixel(for view: NSView) -> Int {
@@ -810,7 +1007,7 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     private func installScreenChangeHandler(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         view.screenChanged = { [weak view, weak coordinator] in
             guard let view, let coordinator else { return }
-            coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+            load(on: view, coordinator: coordinator)
         }
     }
 }
@@ -831,3 +1028,47 @@ private struct TrailerNativeLaunch: Identifiable {
     /// yt-direct adaptive pair: the separate audio stream mpv mounts alongside a video-only `url`.
     var audioSidecarURL: URL? = nil
 }
+
+#if os(macOS)
+/// Two-finger trackpad swipes page the home hero. The scroll-wheel monitor exists only while the pointer is
+/// over the band (installed on hover, removed on exit / disappear), and it never consumes the event, so
+/// vertical scrolling of the page is untouched. A mouse wheel carries no gesture phase and is ignored.
+@MainActor final class HeroTrackpadSwipe {
+    private var monitor: Any?
+    private var onSwipe: ((Int) -> Void)?
+    private var travel: CGFloat = 0
+    private var fired = false
+    private static let threshold: CGFloat = 60
+
+    func setActive(_ active: Bool, onSwipe: ((Int) -> Void)?) {
+        self.onSwipe = onSwipe
+        if active, monitor == nil {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                MainActor.assumeIsolated { self?.handle(event) }
+                return event
+            }
+        } else if !active, let installed = monitor {
+            NSEvent.removeMonitor(installed)
+            monitor = nil
+            travel = 0
+            fired = false
+        }
+    }
+
+    private func handle(_ event: NSEvent) {
+        if event.phase == .began { travel = 0; fired = false }
+        // Decide on the finger movement only: momentum after lift-off and phaseless mouse wheels never page.
+        guard !event.phase.isEmpty, event.momentumPhase.isEmpty else { return }
+        if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
+            // Normalise to the finger's direction whatever the natural-scrolling setting is.
+            travel += event.isDirectionInvertedFromDevice ? event.scrollingDeltaX : -event.scrollingDeltaX
+        }
+        if !fired, abs(travel) > Self.threshold {
+            fired = true
+            // Fingers moving left bring in the next title, like turning a page.
+            onSwipe?(travel < 0 ? 1 : -1)
+        }
+        if event.phase == .ended || event.phase == .cancelled { travel = 0; fired = false }
+    }
+}
+#endif

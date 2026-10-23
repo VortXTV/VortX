@@ -31,6 +31,11 @@ enum AuthenticatedHTTPTransportError: Error, Equatable, Sendable, LocalizedError
 struct AuthenticatedHTTPResponse: Sendable {
     let data: Data
     let statusCode: Int
+    let etag: String?
+
+    init(data: Data, statusCode: Int, etag: String? = nil) {
+        self.data = data; self.statusCode = statusCode; self.etag = etag
+    }
 }
 
 /// A single fail-closed transport for direct API calls that carry provider bearer tokens.
@@ -75,8 +80,22 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
         return try await LiveRequest(
             allowedHosts: Self.normalizedHosts(allowedHosts),
             maxResponseBytes: maxResponseBytes,
-            protocolClasses: protocolClasses
+            protocolClasses: protocolClasses,
+            conditionalBackupURL: Self.conditionalBackupURL(hardened)
         ).run(hardened)
+    }
+
+    /// 304 is not a redirect, but only this explicitly conditional account GET may admit it.
+    /// Keep every other 3xx and the URLSession redirect callback fail-closed.
+    private static func conditionalBackupURL(_ request: URLRequest) -> URL? {
+        guard request.httpMethod == "GET", let url = request.url,
+              url.scheme == "https", url.host == "api.vortx.tv", url.port == nil || url.port == 443,
+              url.path == "/v1/backup", url.query == nil, url.fragment == nil,
+              let tag = request.value(forHTTPHeaderField: "If-None-Match"),
+              tag.first == "\"", tag.last == "\"", tag.count >= 3,
+              let revision = UInt64(tag.dropFirst().dropLast()), revision <= 9_007_199_254_740_991,
+              tag == "\"\(revision)\"" else { return nil }
+        return url
     }
 
     static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
@@ -133,6 +152,7 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
         private let allowedHosts: Set<String>
         private let maxResponseBytes: Int
         private let protocolClasses: [AnyClass]?
+        private let conditionalBackupURL: URL?
         private let lock = NSLock()
         private var continuation: CheckedContinuation<AuthenticatedHTTPResponse, Error>?
         private var session: URLSession?
@@ -145,11 +165,13 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
         init(
             allowedHosts: Set<String>,
             maxResponseBytes: Int,
-            protocolClasses: [AnyClass]?
+            protocolClasses: [AnyClass]?,
+            conditionalBackupURL: URL?
         ) {
             self.allowedHosts = allowedHosts
             self.maxResponseBytes = maxResponseBytes
             self.protocolClasses = protocolClasses
+            self.conditionalBackupURL = conditionalBackupURL
         }
 
         func run(_ request: URLRequest) async throws -> AuthenticatedHTTPResponse {
@@ -255,7 +277,8 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
                 finish(.failure(AuthenticatedHTTPTransportError.invalidEndpoint), cancelTask: true)
                 return
             }
-            guard !(300..<400).contains(http.statusCode) else {
+            guard !(300..<400).contains(http.statusCode)
+                    || (http.statusCode == 304 && http.url == conditionalBackupURL) else {
                 completionHandler(.cancel)
                 finish(.failure(AuthenticatedHTTPTransportError.redirectRejected), cancelTask: true)
                 return
@@ -322,7 +345,8 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
                 return
             }
             finish(
-                .success(AuthenticatedHTTPResponse(data: data, statusCode: response.statusCode)),
+                .success(AuthenticatedHTTPResponse(data: data, statusCode: response.statusCode,
+                                                   etag: response.value(forHTTPHeaderField: "ETag"))),
                 cancelTask: false
             )
         }

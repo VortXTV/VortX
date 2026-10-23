@@ -4,8 +4,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -20,7 +21,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -30,6 +30,7 @@ import com.vortx.android.catalog.WatchProvider
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ratings.MdbListRatings
+import com.vortx.android.ratings.RatingsFormat
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 
@@ -46,36 +47,22 @@ import com.vortx.android.ui.theme.VortXTheme
 /// mirroring the phone `isLiveType` / Apple's `LiveTypes` guard.
 fun tvIsLiveType(type: MediaType): Boolean = type == MediaType.CHANNEL || type == MediaType.TV
 
-/// The VortX cross-provider ratings token strip: Rotten Tomatoes / Metacritic / TMDB critic scores from the
-/// keyless `VortXRatingsClient`, as compact score tokens. IMDb already shows in the hero meta line, so this
-/// surfaces the three critic providers the engine meta does not carry, mirroring the phone `RatingsRow`. The
-/// caller renders it only when [MdbListRatings.hasAny], so it never leaves an empty strip.
+/// The VortX cross-provider ratings token strip: Rotten Tomatoes / Metacritic / TMDB, then Popcorn /
+/// Letterboxd / Trakt / MyAnimeList when present, from the keyless `VortXRatingsClient`, as compact score
+/// marks. IMDb already shows in the hero meta line, so this surfaces every other provider the engine meta
+/// does not carry, each as its service's mark and score, wrapping to a second line when needed. The caller
+/// renders it only when [MdbListRatings.hasAny], so it never leaves an empty strip.
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun TvRatingsStrip(ratings: MdbListRatings, modifier: Modifier = Modifier) {
-    Row(
+    FlowRow(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
-        ratings.rottenTomatoes?.let { TvRatingToken("Rotten Tomatoes", "$it%") }
-        ratings.metacritic?.let { TvRatingToken("Metacritic", it.toString()) }
-        ratings.tmdb?.let { TvRatingToken("TMDB", "$it%") }
-    }
-}
-
-/// One provider score token: the emphasized value over its muted provider label (the phone `RatingBadge`).
-@Composable
-private fun TvRatingToken(label: String, value: String) {
-    val colors = VortXTheme.colors
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            text = value,
-            style = VortXTheme.type.sectionTitle.copy(
-                color = colors.textPrimary,
-                fontWeight = FontWeight.SemiBold,
-            ),
-        )
-        Text(text = label, style = VortXTheme.type.eyebrow.copy(color = colors.textTertiary))
+        RatingsFormat.tokens(ratings).filterNot { it.isImdb }.forEach { token ->
+            com.vortx.android.ui.components.RatingScore(token, textSize = 20)
+        }
     }
 }
 

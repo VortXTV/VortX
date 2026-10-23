@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Paths the updater's FileProvider may share (SEC-01/SEC-07). Narrowest possible surface: ONLY the
-     private cache/update/ directory UpdateChecker stages verified update APKs into. Nothing else in the
-     app is shareable through this provider, and the provider itself is not exported, so a content URI from
-     here can only ever name a fully verified staged update. -->
+<!-- Paths the app's FileProvider may share (SEC-01/SEC-07). Narrowest possible surface, two staging
+     directories in the private cache: update/ (verified update APKs UpdateChecker stages) and
+     diagnostics-export/ (the scrubbed diagnostic export DiagnosticsLog stages). Nothing else in the app is
+     shareable through this provider, and the provider itself is not exported. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path
         name="update"
         path="update/" />
+    <!-- The user-initiated diagnostic export: only the staged, already-scrubbed copy DiagnosticsLog writes
+         under cache/diagnostics-export/, never the raw logs it was built from. Shared per-Intent, read-only. -->
+    <cache-path
+        name="diagnostics-export"
+        path="diagnostics-export/" />
 </paths>

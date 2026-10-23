@@ -61,7 +61,7 @@ internal class NativeStreamingAccountLink(
         // The pending target is Own even when the captured current binding is Shared. Keep the
         // original profile/binding for CAS and retry identity; only the independent-source
         // preparation describes the intended new Own target.
-        val watched = watchedProducer.prepareOwn(owner.scope, profile.copy(usesOwnAccount = true), source, prior.optJSONArray("nativeWatchedMigrationEvidence")) {
+        val watched = watchedProducer.prepareOwn(owner.scope, profile.copy(usesOwnAccount = true), source, retainedStorage = NativeWatchedMigrationStorage.read(prior)) {
             operationJob?.isActive != false && runCatching { session.owned(owner) { source.withActive { true } } }.getOrDefault(false)
         }
         return session.owned(owner) {
@@ -75,7 +75,7 @@ internal class NativeStreamingAccountLink(
                         "Historical account overlay changed during sign-in"
                     }
                     val archived = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(currentDocument))
-                    mergeNativeWatchedArchive(owner.scope, currentDocument, archived, watched.archive(), watched.pending())
+                    mergeNativeWatchedArchive(owner.scope, currentDocument, archived, watched.storage())
                     val candidates = archived.optJSONObject("nativeOwnAccountCandidates") ?: JSONObject().also { archived.put("nativeOwnAccountCandidates", it) }
                     if (!watched.isComplete) {
                         candidates.put(profileID, JSONObject().put("verifiedStreamingUid", source.verifiedUID)

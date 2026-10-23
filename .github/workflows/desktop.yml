@@ -3,8 +3,8 @@ name: Build Desktop (Tauri)
 # Cross-platform desktop builds for Windows, Linux, and macOS on Tauri 2. Like the Android workflow,
 # this is CI-first: the Windows and Linux bundles cannot be produced on the macOS dev machine, so CI
 # is the build feedback loop. It builds installers per platform and uploads them as artifacts. The
-# shared stremio-core engine (embedded directly, since the Tauri backend is Rust) and the libmpv
-# player land on top of this verified skeleton.
+# app window runs the VortX web client; the shell embeds the VortX streaming server (from the private
+# engine, fetched with the engine token behind the engine-ci gate) and the mpv player.
 
 on:
   push:
@@ -35,7 +35,10 @@ jobs:
           - os: macos-26
             bundles: "app,dmg"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The private engine token is only reachable through this environment, whose branch policy admits
+    # beta and main, exactly like the Android workflows.
+    environment: engine-ci
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -54,9 +57,8 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # Exact Node 22 LTS patch. Node 20 is EOL (April 2026), and vite 8 requires
-          # ^20.19.0 || >=22.12.0.
-          node-version: "22.18.0"
+          # Exact Node 22 LTS patch for the Tauri CLI (Node 20 is EOL since April 2026).
+          node-version: "22.23.3"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
@@ -69,10 +71,10 @@ jobs:
         with:
           workspaces: "desktop/src-tauri -> target"
 
-      - name: Stage embedded server runtime
+      - name: Stage mpv
         working-directory: desktop
         shell: bash
-        run: scripts/fetch-server-deps.sh
+        run: scripts/fetch-mpv.sh
 
       # Stage Linux mpv as an extracted AppImage (AppDir): linuxdeploy bundles the distro mpv plus its
       # full .so closure, then we extract it so the app spawns AppRun directly at runtime - no system
@@ -127,40 +129,44 @@ jobs:
         run: |
           set -euo pipefail
           resources=src-tauri/resources
-          test -s "$resources/server.cjs"
           case "${{ matrix.os }}" in
-            ubuntu-24.04)
-              node_bin="$resources/node-linux-x64"
-              mpv_bin="$resources/mpv-linux-x64/AppRun"
-              ;;
-            windows-2025)
-              node_bin="$resources/node-win-x64.exe"
-              mpv_bin="$resources/mpv-win-x64.exe"
-              ;;
-            macos-26)
-              node_bin="$resources/node-darwin-arm64"
-              mpv_bin="$resources/mpv-darwin-arm64.app/Contents/MacOS/mpv"
-              ;;
+            ubuntu-24.04) mpv_bin="$resources/mpv-linux-x64/AppRun" ;;
+            windows-2025) mpv_bin="$resources/mpv-win-x64.exe" ;;
+            macos-26) mpv_bin="$resources/mpv-darwin-arm64.app/Contents/MacOS/mpv" ;;
             *)
               echo "::error::No runtime contract for ${{ matrix.os }}"
               exit 1
               ;;
           esac
-          test -x "$node_bin"
           test -x "$mpv_bin"
-          test "$("$node_bin" --version)" = "v20.18.1"
 
-      - name: Install frontend dependencies
+      - name: Install the Tauri CLI
         working-directory: desktop
         run: npm ci
 
-      - name: Audit frontend dependencies
+      - name: Audit desktop tooling
         working-directory: desktop
         run: npm audit --audit-level=high
 
-      - name: Build frontend
-        working-directory: desktop
-        run: npm run build
+      - name: Test the mpv fetch script
+        if: matrix.os != 'windows-2025'
+        run: node desktop/scripts/tests/fetch-mpv.test.mjs
+
+      # Cargo fetches the pinned private engine over git. The token is scoped to the engine URL only and
+      # removed again at the end of the job; values reach the shell through env, never interpolated.
+      - name: Let cargo fetch the pinned private engine
+        shell: bash
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine"
+            exit 1
+          fi
+          git config --global "url.https://x-access-token:${ENGINE_REPO_TOKEN}@github.com/VortXTV/vortx-core.insteadOf" \
+            "https://github.com/VortXTV/vortx-core"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all -- --check
@@ -260,6 +266,13 @@ jobs:
                 ;;
             esac
           done
+
+      - name: Remove the engine credential
+        if: always()
+        shell: bash
+        run: git config --global --remove-section "url.https://x-access-token:${ENGINE_REPO_TOKEN}@github.com/VortXTV/vortx-core" 2>/dev/null || true
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
 
       - name: Upload desktop bundles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

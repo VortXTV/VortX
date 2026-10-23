@@ -1,6 +1,7 @@
 package com.vortx.android.engine
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.channels.Channel
@@ -43,8 +44,9 @@ internal class NativeProviderResultBudget(private val limit: Long = NATIVE_RESOU
     })
 }
 
-/** Six independent host calls at most: four streams and two metadata. Queue time is NOT request time.
- * Settlements are serialized and receipts remain in registry order. Only admitted content is retained.
+/** Six independent host calls at most: four streams and two metadata, each queue admitted in registry order.
+ * Queue time is NOT request time. Settlements are serialized and receipts remain in registry order. Only
+ * admitted content is retained.
  */
 internal suspend fun collectNativeProviderBatch(
     legs: List<NativeProviderLeg>,
@@ -58,7 +60,11 @@ internal suspend fun collectNativeProviderBatch(
     val pages = MutableList<VortxResourceSnapshot?>(legs.size) { null }
     val budget = NativeProviderResultBudget()
     val settledByResource = mutableMapOf<VortxResourceRequest.Resource, Int>()
-    val jobs = legs.mapIndexed { index, leg -> launch {
+    // UNDISPATCHED: each leg takes its slot, or its FIFO place in its queue, on this thread before the next
+    // leg is considered, so admission follows registry order on any dispatcher instead of a race between
+    // threads (a fast later provider used to be queried ahead of the user's earlier ones). A leg starts on
+    // the caller only until its load suspends, which a native load always does.
+    val jobs = legs.mapIndexed { index, leg -> launch(start = CoroutineStart.UNDISPATCHED) {
         val permits = if (leg.request.resource == VortxResourceRequest.Resource.STREAM) streams else metadata
         val result = try { Result.success(permits.withPermit { load(leg) }) }
         catch (error: CancellationException) {

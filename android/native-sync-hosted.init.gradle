@@ -1,0 +1,87 @@
+// Protected release gate only. Real current Kotlin tests, separately built host JNI;
+// never substitute an Android .so or a stub, and never run package/native/device tasks here.
+gradle.taskGraph.whenReady { graph ->
+    def forbidden = graph.allTasks.findAll { task ->
+        task.name ==~ /(?i)(cargoNdkBuild.*|.*externalNativeBuild.*|configureCMake.*|buildCMake.*|merge.*JniLibFolders|assemble.*|bundle.*(Aar|Apk|Aab)|package.*(Apk|Bundle)|install.*)/
+    }
+    if (!forbidden.empty) throw new GradleException("Native sync host gate refuses native/package/install tasks")
+    def tests = graph.allTasks.findAll { it instanceof org.gradle.api.tasks.testing.Test }
+    if (tests*.path != [":app:testPlayDebugUnitTest"])
+        throw new GradleException("Native sync host gate requires exactly the actual Play unit Test task")
+}
+allprojects {
+    tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { task ->
+        if (task.path == ":app:testPlayDebugUnitTest") {
+            def expected = [
+                "com.vortx.android.sync.VortXSyncManagerBackupRevisionTest": 14L,
+                "com.vortx.android.sync.NativeAccountSyncTest": 8L,
+            ]
+            def observed = [:].withDefault { 0L }
+            def names = [] as Set
+            def libraryPath = System.getenv("VORTX_JNI_LIBRARY")
+            def receiptPath = System.getenv("VORTX_JNI_RECEIPT")
+            if (System.getenv("VORTX_JNI_SYNC") != "1" ||
+                    !libraryPath || !new File(libraryPath).isAbsolute() ||
+                    !receiptPath || !new File(receiptPath).isAbsolute())
+                throw new GradleException("Exact real host JNI, receipt, and native sync admission are required")
+            maxParallelForks = 1
+            forkEvery = 0
+            maxHeapSize = "768m"
+            workingDir = project.projectDir
+            jvmArgs "-XX:ActiveProcessorCount=1", "-XX:+UseSerialGC",
+                "-Djava.library.path=" + new File(libraryPath).parent,
+                "-Dkotlinx.coroutines.io.parallelism=1",
+                "-Dkotlinx.coroutines.scheduler.core.pool.size=1",
+                "-Dkotlinx.coroutines.scheduler.max.pool.size=2"
+            environment "VORTX_JNI_SYNC", "1"
+            environment "VORTX_JNI_LIBRARY", libraryPath
+            filter.failOnNoMatchingTests = true
+            ignoreFailures = false
+            outputs.upToDateWhen { false }
+            outputs.cacheIf { false }
+            def requireExactLibrary = {
+                def sha = System.getenv("VORTX_JNI_EXPECTED_SHA256")
+                if (!(sha ==~ /[0-9a-f]{64}/))
+                    throw new GradleException("Actual host JNI SHA is required")
+                def receipt = new groovy.json.JsonSlurper().parse(new File(receiptPath))
+                if (receipt.schema != 1 ||
+                    receipt.engineSource != "0c30f4782aee544a2b7e33169ad60d03630d4097" ||
+                    receipt.engineSource != System.getenv("VORTX_ENGINE_SOURCE_SHA") ||
+                    receipt.appSource != System.getenv("SOURCE_COMMIT") ||
+                    receipt.features != "jni,server,resource-host" ||
+                    receipt.toolchain != "nightly-2026-07-19" ||
+                    receipt.hostTarget != "x86_64-unknown-linux-gnu" ||
+                    receipt.libraryPath != libraryPath || receipt.librarySha256 != sha ||
+                    !(receipt.sourceInputsSha256 ==~ /[0-9a-f]{64}/))
+                    throw new GradleException("Host JNI provenance differs from the reviewed release lane")
+                def library = new File(libraryPath)
+                if (!library.isFile() || library.length() == 0L || library.canonicalPath != libraryPath)
+                    throw new GradleException("Exact host JNI artifact is absent or indirect")
+                def digest = java.security.MessageDigest.getInstance("SHA-256")
+                library.withInputStream { input ->
+                    byte[] bytes = new byte[65536]
+                    int count
+                    while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
+                }
+                def actual = digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+                if (actual != sha) throw new GradleException("Host JNI bytes changed")
+            }
+            doFirst { requireExactLibrary() }
+            afterTest { descriptor, result ->
+                def identity = [descriptor.className, descriptor.name]
+                if (!expected.containsKey(descriptor.className) || !names.add(identity))
+                    throw new GradleException("Unexpected or repeated native sync host test")
+                observed[descriptor.className] += result.testCount
+            }
+            afterSuite { descriptor, result ->
+                if (descriptor.parent == null) {
+                    requireExactLibrary()
+                    if (observed != expected || result.testCount != 22L ||
+                            result.skippedTestCount != 0L || result.failedTestCount != 0L)
+                        throw new GradleException("Require real native BackupRevision14 plus NativeAccountSync8, zero skips/failures")
+                    logger.lifecycle("Executed native BackupRevision14 and NativeAccountSync8 with unchanged real host JNI")
+                }
+            }
+        }
+    }
+}

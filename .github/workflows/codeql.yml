@@ -36,13 +36,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           build-mode: none
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -55,26 +55,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
-          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
 
-      # android/app and android/mpv-seam both pin this version. The older 27.0.12077973 CI report
-      # is not authoritative for this source tree: installing it would leave Gradle's pinned NDK absent.
-      - name: Install Android NDK 27.2.12479018
+      # Keep both Android modules and every traced/package build on the same exact NDK.
+      - name: Install Android NDK 30.0.16248370
         run: |
-          yes | sdkmanager "ndk;27.2.12479018"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          yes | sdkmanager "ndk;30.0.16248370"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: java-kotlin
           build-mode: manual
@@ -86,10 +85,24 @@ jobs:
       # CodeQL only extracts Kotlin from a compilation it traces. This task configures the Android
       # modules and compiles the Play variant without invoking the private-engine release pipeline.
       - name: Compile Android Kotlin for CodeQL
+        id: android_compile
         working-directory: android
-        run: ./gradlew :app:compilePlayDebugKotlin --no-daemon --stacktrace
+        run: ./gradlew :app:compilePlayDebugKotlin -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true --no-daemon --stacktrace
+
+      # Gradle uses current app/test dependencies from this checked-out source.
+      - name: Test Android sync and account recovery
+        working-directory: android
+        run: >-
+          ./gradlew :app:testPlayDebugUnitTest
+          -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
+          --tests com.vortx.android.sync.AndroidRealtimeSyncTest
+          --tests com.vortx.android.sync.DurableSessionStateTest
+          --tests com.vortx.android.sync.NativeAccountSyncTest
+          --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
+          --no-daemon --stacktrace
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        if: ${{ always() && !cancelled() && steps.android_compile.outcome == 'success' }}
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:java-kotlin"

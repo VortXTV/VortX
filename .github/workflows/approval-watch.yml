@@ -44,20 +44,20 @@ jobs:
           REPO: ${{ github.repository }}
           TITLE: "Action needed: a release build is waiting for approval"
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
           # jq writes the list; the shell never parses a name or a branch.
           gh api "repos/$REPO/actions/runs?status=waiting&per_page=20" \
             --jq '.workflow_runs[] | "- **\(.name)** on `\(.head_branch)`\n  \(.html_url)"' \
-            > waiting.txt 2>/dev/null || : > waiting.txt
+            > waiting.txt
 
           EXISTING="$(gh issue list --repo "$REPO" --state open --search "$TITLE in:title" \
-            --json number --jq '.[0].number' 2>/dev/null || true)"
+            --json number --jq '.[0].number')"
 
           if [ ! -s waiting.txt ]; then
             if [ -n "$EXISTING" ]; then
               gh issue close "$EXISTING" --repo "$REPO" \
-                --comment "Nothing is waiting for approval any more. Closing." >/dev/null 2>&1 || true
+                --comment "Nothing is waiting for approval any more. Closing." >/dev/null
               echo "cleared: closed issue #$EXISTING"
             else
               echo "nothing waiting"

@@ -20,13 +20,19 @@ private enum CredentialScopeRegistry {
 }
 
 @MainActor private final class UploadHarness {
-    private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
+    private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case upgradeRequired; case error }
     private let credentialAuthority = FixtureAuthority()
     let relay: BackupRelay
     var sent: [Int] = []
+    var witnesses: [Int?] = []
+    var plaintexts: [Data?] = []
     var acceptedCallbacks = 0
     var pendingApply = false
     var networkFailure = false
+    var loseAcceptedResponse = false
+    var upgradeRequired = false
+    var mountCurrent = true
+    var afterSending: (() -> Void)?
     var rejectedEcho: Int?
     var onRebuild: (() -> Void)?
 
@@ -35,32 +41,43 @@ private enum CredentialScopeRegistry {
         capture == credentialAuthority.capture()
     }
     private func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { pendingApply }
-    private func pushSyncDocAt(_ document: [String: Any], version: Int,
-                               credentialCapture capture: CredentialScopeRegistry.Capture) async -> PushOutcome {
-        guard isCurrent(capture), !pendingApply else { return .error }
+    private func pushSyncDocAt(_ document: [String: Any], version: Int, baseRevision: Int?,
+                               credentialCapture capture: CredentialScopeRegistry.Capture,
+                               plaintextData: Data? = nil,
+                               sourceIsCurrent: () -> Bool) async -> PushOutcome {
+        guard isCurrent(capture), sourceIsCurrent(), !pendingApply else { return .error }
         sent.append(version)
+        witnesses.append(baseRevision)
+        plaintexts.append(plaintextData)
+        if upgradeRequired { return .upgradeRequired }
         if networkFailure { return .error }
-        if let stored = relay.revision, version <= stored { return .rejected(storedVersion: rejectedEcho ?? stored) }
+        if relay.revision != baseRevision { return .rejected(storedVersion: rejectedEcho ?? relay.revision) }
         relay.revision = version; relay.document = document
+        afterSending?()
+        if loseAcceptedResponse || !isCurrent(capture) || !sourceIsCurrent() { return .error }
         return .accepted(version: version)
     }
     func retire() { credentialAuthority.generation += 1 }
 
     func send(_ document: [String: Any], base: Int?, edit: [String: String],
-              rebuildFails: Bool = false) async -> Bool {
+              rebuildFails: Bool = false, plaintext: Data? = nil, rebuiltPlaintext: Data? = nil) async -> Bool {
+        let capture = credentialAuthority.capture()
+        let sourceIsCurrent = { [self] in mountCurrent }
         let rebuild = { [self] () async -> DerivedSyncDoc? in
             onRebuild?()
             if rebuildFails { return nil }
             var merged = relay.document
             for (key, value) in edit { merged[key] = value }
-            return DerivedSyncDoc(document: merged, baseRevision: relay.revision)
+            return DerivedSyncDoc(document: merged, baseRevision: relay.revision, credentialCapture: capture,
+                                  sourceIsCurrent: sourceIsCurrent, plaintextData: rebuiltPlaintext)
         }
 #if BASELINE_SYNC_UPLOAD
         return await pushDerivedDoc(document, onAccepted: { [self] _ in acceptedCallbacks += 1 }) {
             await rebuild()?.document
         }
 #else
-        return await pushDerivedDoc(DerivedSyncDoc(document: document, baseRevision: base),
+        return await pushDerivedDoc(DerivedSyncDoc(document: document, baseRevision: base, credentialCapture: capture,
+                                                 sourceIsCurrent: sourceIsCurrent, plaintextData: plaintext),
                                     onAccepted: { [self] _ in acceptedCallbacks += 1 }, rebuild: rebuild)
 #endif
     }
@@ -86,6 +103,17 @@ private enum CredentialScopeRegistry {
         check(a.sent == [101] && b.sent == [101, 102] && relay.revision == 102,
               "each attempt uses the base revision of that exact merged document")
         check(a.acceptedCallbacks == 1 && b.acceptedCallbacks == 1, "only stored documents acknowledge edits")
+        check(a.witnesses == [100] && b.witnesses == [100, 101], "each PUT witnesses its candidate's own GET")
+
+        let typedRelay = BackupRelay(revision: 11, document: ["peer": "retained"])
+        let typed = UploadHarness(typedRelay)
+        let firstPlaintext = Data(#"{"nativeCounter":18446744073709551615}"#.utf8)
+        let retryPlaintext = Data(#"{"nativeCounter":18446744073709551615,"peer":"retained"}"#.utf8)
+        check(await typed.send(["ackProjection": "first"], base: 10, edit: ["local": "edit"],
+                               plaintext: firstPlaintext, rebuiltPlaintext: retryPlaintext),
+              "typed plaintext candidate retries through the actual production method")
+        check(typed.plaintexts == [firstPlaintext, retryPlaintext] && typed.witnesses == [10, 11],
+              "each attempt forwards its own exact frozen plaintext, not the ACK projection or prior bytes")
 
         let moving = BackupRelay(revision: 51, document: ["peer": "retained"])
         let client = UploadHarness(moving); client.rejectedEcho = 9_999
@@ -120,6 +148,28 @@ private enum CredentialScopeRegistry {
         check(!(await retired.send(["stale": "edit"], base: 14, edit: ["stale": "edit"])),
               "retired account cannot retry a rebuilt document")
         check(retired.sent == [15] && retired.acceptedCallbacks == 0, "retirement preserves pending intent")
+
+        let lostRelay = BackupRelay(revision: 4, document: ["peer": "preserved"])
+        let lost = UploadHarness(lostRelay); lost.loseAcceptedResponse = true
+        check(!(await lost.send(["peer": "preserved", "local": "intent"], base: 4, edit: ["local": "intent"])),
+              "lost accepted response remains unacknowledged")
+        check(lost.acceptedCallbacks == 0 && lostRelay.revision == 5, "cloud commit is not a local receipt")
+        lostRelay.document["concurrent"] = "retained"; lostRelay.revision = 6
+        lost.loseAcceptedResponse = false
+        check(await lost.send(["local": "intent"], base: 4, edit: ["local": "intent"]), "retry after lost response remerges")
+        check(lostRelay.document["concurrent"] as? String == "retained" && lost.witnesses == [4, 4, 6],
+              "ambiguous retry retains pending intent and intervening peer data")
+
+        let missingHead = UploadHarness(BackupRelay(revision: nil))
+        check(await missingHead.send(["local": "intent"], base: 8, edit: ["local": "intent"]), "existing candidate cannot pretend removed head is its base")
+        check(missingHead.witnesses == [8, nil] && missingHead.sent == [9, 0], "missing-head retry requires a fresh absent read")
+        let blocked = UploadHarness(BackupRelay(revision: 2)); blocked.upgradeRequired = true
+        check(!(await blocked.send([:], base: 2, edit: [:])) && blocked.sent == [3] && blocked.acceptedCallbacks == 0,
+              "update-needed never conflict-retries or acknowledges")
+        let remounted = UploadHarness(BackupRelay(revision: 2))
+        remounted.afterSending = { remounted.mountCurrent = false }
+        check(!(await remounted.send([:], base: 2, edit: [:])) && remounted.acceptedCallbacks == 0,
+              "mount replaced during upload cannot retire candidate intent")
 
         let exhausted = UploadHarness(BackupRelay(revision: SyncDocumentRevisionPolicy.maximumSafeRevision))
         check(!(await exhausted.send([:], base: SyncDocumentRevisionPolicy.maximumSafeRevision, edit: [:]))

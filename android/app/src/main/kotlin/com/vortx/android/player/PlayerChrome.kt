@@ -1,10 +1,13 @@
 package com.vortx.android.player
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import android.view.Display
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -133,9 +136,8 @@ private val LocalPlayerChromeIsTv = staticCompositionLocalOf { false }
 fun PlayerChrome(
     playable: Playable,
     state: PlayerState,
-    dolbyVisionAvailable: Boolean,
-    /// The honest dynamic-range line for the Playback Info sheet ("Dolby Vision" on the DV lane, "HDR10
-    /// (tone-mapped from Dolby Vision)" for a DV source on the libmpv lane). Null omits the row.
+    /// Active input/decoded dynamic range for Playback Info, not a display/output guarantee.
+    /// Null omits the row when the current engine has no unambiguous evidence.
     dynamicRange: String? = null,
     /// The relative-seek step (ms + whole seconds) for the transport +/- buttons, from the viewer's Skip
     /// step setting (Apple `stremiox.seekStep`). Defaults keep the chrome usable in isolation at 10s.
@@ -225,6 +227,7 @@ fun PlayerChrome(
     episodeOptions: List<Episode> = emptyList(),
     currentSource: StreamSource? = null,
     sourceSwitching: Boolean = false,
+    episodeSwitchPending: Boolean = false,
     sourceSwitchError: String? = null,
     failedEpisode: Episode? = null,
     onRetryEpisode: () -> Unit = {},
@@ -357,6 +360,13 @@ fun PlayerChrome(
     // chrome untouched. [trackPrefs] mirrors the persisted value so the sheets show the current pick and a
     // change round-trips to disk immediately.
     val context = LocalContext.current
+    // The other player reports where the viewer stopped; seek there so this session saves it (on the next
+    // progress tick or when the player closes) and resume picks up from it.
+    val externalPlayer = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        @Suppress("DEPRECATION")
+        PlayerHandoff.returnedPositionMs(result.resultCode == Activity.RESULT_OK, { key -> result.data?.extras?.get(key) },
+            state.durationMs)?.let(onSeek)
+    }
     val trackStore = remember(context) {
         TrackPreferencesStore(context.applicationContext, PerformanceMode.isConstrainedDevice(context))
     }
@@ -553,10 +563,9 @@ fun PlayerChrome(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
                 if (playable.viaStreamingServer) ChromeBadge("SOURCE", emberAccent)
-                // DV badge is GATED on the display actually advertising Dolby Vision. The ExoPlayer engine
-                // still does its own DV codec fallback regardless; this badge is purely about not claiming
-                // DV on a panel that cannot present it.
-                if (dolbyVisionAvailable) ChromeBadge("DOLBY VISION", emberAccent)
+                // Keep this exact badge anchor; active formats, not launch hints/panel capability, supply facts.
+                remember(state.metadata) { state.metadata.pills() }
+                    .forEach { pill -> PlaybackMetadataPillView(pill, emberAccent) }
                 if (speed != 1.0f) ChromeBadge("${trimSpeed(speed)}x", emberAccent)
             }
         }
@@ -600,7 +609,7 @@ fun PlayerChrome(
                                 1 -> "${qualityChoices.first().label} only"
                                 else -> "${qualityChoices.size} options ›"
                             },
-                            enabled = qualityChoices.any { playerReplacementChoiceEnabled(it.selected) },
+                            enabled = qualityChoices.any { playerReplacementChoiceEnabled(it.selected, episodeSwitchPending) },
                             dismissOnPick = false,
                             onPick = { openSheet = ControlSheet.QUALITY },
                         ),
@@ -617,7 +626,8 @@ fun PlayerChrome(
                     )
                     add(SheetOption(sourcesTitle, false, enabled = false, isHeader = true))
                     if (sourceSwitching) {
-                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                        add(SheetOption(if (episodeSwitchPending) "Switching episode..." else switchingSource,
+                            false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
                         add(
                             SheetOption(
@@ -634,7 +644,7 @@ fun PlayerChrome(
                                 label = choice.label,
                                 selected = choice.selected,
                                 detail = choice.detail,
-                                enabled = playerReplacementChoiceEnabled(choice.selected),
+                                enabled = playerReplacementChoiceEnabled(choice.selected, episodeSwitchPending),
                                 isChoice = true,
                                 dismissOnPick = false,
                                 onPick = { onSwitchSource(choice.source) },
@@ -684,7 +694,8 @@ fun PlayerChrome(
                 title = qualityTitle,
                 options = buildList {
                     if (sourceSwitching) {
-                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                        add(SheetOption(if (episodeSwitchPending) "Switching episode..." else switchingSource,
+                            false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
                         add(
                             SheetOption(
@@ -701,7 +712,7 @@ fun PlayerChrome(
                                 label = choice.label,
                                 selected = choice.selected,
                                 detail = choice.detail,
-                                enabled = playerReplacementChoiceEnabled(choice.selected),
+                                enabled = playerReplacementChoiceEnabled(choice.selected, episodeSwitchPending),
                                 isChoice = true,
                                 dismissOnPick = false,
                                 onPick = { onSwitchSource(choice.source) },
@@ -1238,7 +1249,10 @@ fun PlayerChrome(
                         label = "Open in another player",
                         selected = false,
                         detail = "Hand off to an installed video app",
-                        onPick = { PlayerHandoff.openInExternalPlayer(context, playable) },
+                        onPick = {
+                            if (!state.isPaused) onTogglePause()
+                            PlayerHandoff.openInExternalPlayerForResult(context, playable, state.positionMs) { externalPlayer.launch(it) }
+                        },
                     ),
                 ),
                 emberAccent = emberAccent,

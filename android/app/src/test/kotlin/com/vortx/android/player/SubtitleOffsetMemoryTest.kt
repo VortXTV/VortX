@@ -282,7 +282,7 @@ class SubtitleOffsetMemoryTest {
             subtitlePlayerIntegrationIsComplete(
                 screen,
                 chrome,
-                switching.replace(".copy(userForcedSource = true)", ".copy(userForcedSource = false)"),
+                switching.replace(".copy(userForcedSource = !pending.automatic || resolution.playable.userForcedSource)", ".copy(userForcedSource = false)"),
             ),
         )
     }
@@ -315,7 +315,7 @@ class SubtitleOffsetMemoryTest {
         )
         return screenRequirements.all(screen::contains) &&
             chromeRequirements.all(chrome::contains) &&
-            switching.contains(".copy(userForcedSource = true)")
+            switching.contains(".copy(userForcedSource = !pending.automatic || resolution.playable.userForcedSource)")
     }
 
     private fun readProjectFile(relativePath: String): String {

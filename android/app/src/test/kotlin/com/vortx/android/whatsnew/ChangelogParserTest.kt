@@ -68,7 +68,7 @@ class ChangelogParserTest {
     fun `build copies the root changelog without committing a duplicate asset`() {
         val gradle = readProjectFile("build.gradle.kts")
         assertTrue(gradle.contains("rootProject.file(\"../CHANGELOG.md\")"))
-        assertTrue(gradle.contains("assets.srcDir(generatedChangelogAssets)"))
+        assertTrue(gradle.contains("assets.directories.add(generatedChangelogAssets.get().asFile.path)"))
         assertTrue(gradle.contains("dependsOn(copyChangelogAsset)"))
         assertFalse(
             listOf(

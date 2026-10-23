@@ -1,0 +1,37 @@
+    private var scrubber: some View {
+        let focused = (selected == .scrub)
+        let shown = scrubbing ? scrubTarget : currentTime
+        return GeometryReader { geo in
+            let frac = duration > 0 ? min(1, max(0, shown / duration)) : 0
+            let w = geo.size.width
+            let barH: CGFloat = focused ? 10 : 6
+            let knob: CGFloat = focused ? 28 : 18
+            ZStack(alignment: .leading) {
+                // Track + played fill in the viewer's chosen seek-bar style (classic/wave/heartbeat/…).
+                // Only the visual swaps; the knob, chapter ticks, and scrub logic below are unchanged.
+                SeekBarTrack(style: SeekBarStyle.current, progress: frac,
+                             accent: Theme.Palette.accent,
+                             track: Theme.Palette.textPrimary.opacity(0.22),
+                             buffered: duration > 0 ? min(1, max(0, bufferedTime / duration)) : 0)
+                    .frame(width: w, height: focused ? 24 : 16)
+                // Chapter boundary ticks along the bar (decorative; the knob still reads over them).
+                ForEach(chapterFractions, id: \.self) { f in
+                    Capsule().fill(.white.opacity(0.5)).frame(width: 2, height: barH).offset(x: w * f)
+                }
+                Circle().fill(Theme.Palette.accent).frame(width: knob, height: knob)
+                    .overlay(Circle().stroke(Theme.Palette.canvas, lineWidth: focused ? 3 : 0))
+                    .shadow(color: Theme.Palette.accent.opacity(0.6), radius: focused ? 10 : 6)
+                    .offset(x: max(0, w * frac - knob / 2))
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+            .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.15), value: focused)
+            // Linear so consecutive scrub steps blend into one continuous glide instead of each easing
+            // out and stuttering against the next; slightly longer when not scrubbing so the play head
+            // drifts smoothly between the position updates.
+            .animation(
+                accessibilityReduceMotion ? nil : (scrubbing ? .linear(duration: 0.16) : .linear(duration: 0.28)),
+                value: frac
+            )
+        }
+        .frame(height: 28)
+    }

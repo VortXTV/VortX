@@ -1,0 +1,32 @@
+name: WatchStats Swift 6 package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/watchstats-swift6-package.yml"
+      - "app/SourcesShared/WatchStatsAggregation.swift"
+      - "app/Tests/WatchStatsAggregation/**"
+  push:
+    branches: [main, beta-issue263-profile-bootstrap, remove-stremio-20261023]
+    paths:
+      - ".github/workflows/watchstats-swift6-package.yml"
+      - "app/SourcesShared/WatchStatsAggregation.swift"
+      - "app/Tests/WatchStatsAggregation/Package.swift"
+      - "app/Tests/WatchStatsAggregation/Sources/WatchStatsAggregation/WatchStatsAggregation.swift"
+      - "app/Tests/WatchStatsAggregation/Tests/WatchStatsAggregationTests/WatchStatsAggregationTests.swift"
+
+permissions:
+  contents: read
+
+jobs:
+  watchstats-package:
+    if: github.repository == 'VortXTV/VortX'
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test the real Swift 6 WatchStats package
+        run: swift test --package-path app/Tests/WatchStatsAggregation --jobs 1

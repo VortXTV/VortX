@@ -184,6 +184,52 @@ class SeriesSourceStickyRankingTest {
         assertFalse(StreamRanking.resolveSettled(trailerOnly, 1, 2, 5.0, "1080p", wantedAddon = "Provider B"))
     }
 
+    @Test
+    fun bingeKeepsTheChosenQualityAfterOneFallbackEpisode() {
+        // The viewer picked 1080p. One episode had no 1080p and played the 720p release, so the hints from the
+        // stream playing now name the 720p release. The next episode has both again.
+        val full = source("full", "Provider A", "Show S01E03 1080p WEB-DL", bingeGroup = "a-1080")
+        val fallback = source("fallback", "Provider A", "Show S01E03 720p WEB-DL", bingeGroup = "a-720")
+        val groups = listOf(StreamGroup("Provider A", listOf(fallback, full)))
+        val hint = StreamRanking.signature(fallback)
+
+        val withoutFloor = SeriesSourceSticky.Preference(addon = "Provider A", bingeGroup = "a-1080")
+        assertEquals(
+            "the slide this guards against",
+            fallback,
+            StreamRanking.best(groups, continuity = hint, binge = "a-720", sticky = withoutFloor),
+        )
+
+        val chosen = withoutFloor.copy(resolution = StreamRanking.knownResolution(full))
+        assertEquals(1080, chosen.resolution)
+        assertEquals(full, StreamRanking.best(groups, continuity = hint, binge = "a-720", sticky = chosen))
+        assertEquals(full, StreamRanking.rankedCandidates(groups, continuity = hint, binge = "a-720", sticky = chosen).first())
+    }
+
+    @Test
+    fun aLowerReleaseIsStillTheFallbackWhenNothingMeetsTheFloor() {
+        val only = source("only", "Provider A", "Show S01E04 720p WEB-DL", bingeGroup = "a-720")
+        val chosen = SeriesSourceSticky.Preference(addon = "Provider A", bingeGroup = "a-1080", resolution = 1080)
+
+        assertEquals(
+            only,
+            StreamRanking.best(listOf(StreamGroup("Provider A", listOf(only))), continuity = "720p", binge = "a-720", sticky = chosen),
+        )
+    }
+
+    @Test
+    fun explicitPickRemembersItsResolutionAndOlderRecordsHaveNoFloor() {
+        val persistence = MemoryPersistence()
+        val sticky = SeriesSourceSticky(persistence, activeProfileId = { "profile-a" })
+        sticky.record("show", "Provider A", "a-1080", resolution = 1080)
+        assertEquals(1080, sticky.preference("show")?.resolution)
+
+        val legacy = SeriesSourceSticky.decode("""{"show":{"addon":"Provider A","bingeGroup":"g","ts":1.0}}""")
+        assertNull(legacy.getValue("show").resolution)
+        val roundTrip = SeriesSourceSticky.decode(SeriesSourceSticky.encode(mapOf("show" to legacy.getValue("show").copy(resolution = 2160))))
+        assertEquals(2160, roundTrip.getValue("show").resolution)
+    }
+
     private fun source(
         id: String,
         addon: String,

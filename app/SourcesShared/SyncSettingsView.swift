@@ -5,6 +5,9 @@ import SwiftUI
 /// fully signed out, this only adds cross-device sync, backup, and recovery.
 struct SyncSettingsView: View {
     @EnvironmentObject private var sync: VortXSyncManager
+    /// Embedded sign-in sheets close on confirmed authentication, independently of
+    /// network-bound account restore. Ordinary Account settings leave this nil.
+    var onSignedIn: (() -> Void)? = nil
 
     enum Mode: String, CaseIterable { case signIn = "Sign in", create = "Create", recover = "Recover" }
     @State private var mode: Mode = .signIn
@@ -32,6 +35,7 @@ struct SyncSettingsView: View {
                 } else {
                     signedOut
                 }
+                DiagnosticLogExportButton()
                 // This screen is now VortX-account-only. The external sync providers (Trakt, SIMKL) moved
                 // to the Integrations screen (IntegrationsSettingsView), alongside the Stremio connect card,
                 // since they enrich VortX rather than belonging to the VortX account itself.
@@ -46,19 +50,24 @@ struct SyncSettingsView: View {
                 .environmentObject(sync)
         }
         .alert("Sync conflict", isPresented: $showConflict) {
-            // "Merge both" is the recommended/default: it unions the rosters so NO profile is lost.
-            // The other two force one side, but even "Use account's data" still keeps local-only
-            // profiles (syncDown unions them back), so neither choice can silently delete a profile.
-            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() } }
+            // Native data uses the causal merge/restore path, never a legacy whole-document override.
+            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() ? .completed : .failed } }
             Button("Use account's data") { resolveConflict { await sync.useAccountData() } }
-            // keepThisDeviceOverridingAccount, not pushThisDevice: this prompt is only reached after the
-            // account's doc was positively READ, so the user is making an informed choice to overwrite it.
-            // That is the one push allowed past the #145 restore gate (an automatic push is not).
-            Button("Keep this device") { resolveConflict { await sync.keepThisDeviceOverridingAccount() } }
         } message: {
-            Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.")
+            Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or restore the account's data. Saved data is not overwritten by a legacy device backup.")
         }
         .task { await sync.refreshAccount() }
+        .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
+            // Async outcomes from the previous account must not repaint a replacement session.
+            syncNote = nil
+            syncing = false
+            showConflict = false
+        }
+        .onChange(of: sync.lastSyncAt) { stamp in
+            // A new durable receipt can retire a previous manual-action failure;
+            // an old successful stamp must not hide a newer failed attempt.
+            if stamp != nil, sync.synchronizationIsComplete { syncNote = nil }
+        }
     }
 
     // MARK: Signed in
@@ -85,11 +94,22 @@ struct SyncSettingsView: View {
                 .buttonStyle(ChipButtonStyle(selected: false))
         }
 
-        // The tri-state retry surface: shown when the account doc could not be reached (a network
-        // blip), so the failure is visible and retryable instead of silently swallowed.
-        if let syncNote {
+        // Keep failures visible and retryable. A completed account round-trip may still have
+        // a local change waiting, so do not show the backup claim until synchronization is complete.
+        if let failure = sync.backupUploadFailure {
+            // Observe the manager's live failure, not a copied string that survives an accepted retry.
+            Text(failure.message).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        } else if let syncNote {
             Text(syncNote).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        } else {
+            Text(MoveSeeding.backedUpLine(
+                synchronizationIsComplete: sync.synchronizationIsComplete,
+                pendingSettingsMessage: sync.pendingSettingsMessage
+            ))
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
+        Text(MoveSeeding.lastSyncLine(sync.lastSyncAt))
+            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
     }
 
     // MARK: Signed out
@@ -144,8 +164,12 @@ struct SyncSettingsView: View {
                     Button("Cancel") { showQRSignIn = false }
                         .buttonStyle(ChipButtonStyle())
                 }
-                VortXAccountJoinerView(onSignedIn: { showQRSignIn = false })
+                VortXAccountJoinerView(onSignedIn: {
+                    showQRSignIn = false
+                    onSignedIn?()
+                })
                     .frame(maxWidth: .infinity)
+                DiagnosticLogExportButton()
             }
             .padding(Theme.Space.lg)
         }
@@ -192,12 +216,17 @@ struct SyncSettingsView: View {
     /// whichever side won, the engine should hold the account's owned add-ons + owner library
     /// right away, without waiting for a background/foreground cycle to re-check. Idempotent and
     /// never-zero guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
-    private func resolveConflict(_ action: @escaping () async -> Void) {
+    private func resolveConflict(_ action: @escaping () async -> VortXSyncManager.ConflictResolutionOutcome) {
         Task { @MainActor in
             syncing = true
             syncNote = nil
-            await action()
-            await sync.hydrateEngineFromOwnedAddons()
+            let outcome = await action()
+            if outcome == .completed { await sync.hydrateEngineFromOwnedAddons() }
+            switch outcome {
+            case .completed: syncNote = nil
+            case .pending: syncNote = "Your changes are still waiting to sync. Try again shortly."
+            case .failed: syncNote = "Couldn't finish syncing. Your changes are still saved on this device. Try again."
+            }
             syncing = false
         }
     }
@@ -208,9 +237,20 @@ struct SyncSettingsView: View {
     /// so it just pushes as before. An unreachable account doc is a DISTINCT retry state: it must not
     /// be misread as "no conflict" and silently pushed over a roster that was never compared.
     private func syncNow() {
+        let session = CredentialScopeRegistry.shared.capture()
         Task { @MainActor in
+            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
             syncing = true
-            switch await sync.rosterConflictWithAccount() {
+            let restored = await sync.retryAccountRestore()
+            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+            guard restored else {
+                syncNote = "Couldn't load your account data yet. Your saved data has not been replaced. Try again."
+                syncing = false
+                return
+            }
+            let conflict = await sync.rosterConflictWithAccount()
+            guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+            switch conflict {
             case .conflict:
                 syncing = false
                 showConflict = true
@@ -218,8 +258,11 @@ struct SyncSettingsView: View {
                 syncNote = "Could not reach VortX sync. Check your connection and try again."
                 syncing = false
             case .noConflict:
-                await sync.pushThisDevice()
-                syncNote = nil
+                let pushed = await sync.pushThisDevice()
+                guard CredentialScopeRegistry.shared.isCurrent(session) else { return }
+                syncNote = pushed || sync.backupUploadFailure != nil
+                    ? nil
+                    : "Couldn't sync your latest changes. They are still saved on this device. Try again."
                 syncing = false
             }
         }
@@ -249,6 +292,10 @@ struct SyncSettingsView: View {
         switch result {
         case .ok:
             password = ""; totp = ""; needsTotp = false
+            if let onSignedIn {
+                onSignedIn()
+                return // adopt() owns the restore after this sheet disappears.
+            }
             // Decide pull vs seed vs ask: a fresh account is seeded; one with data prompts which to
             // keep; an UNREACHABLE account doc is a distinct retry state (never misread as fresh and
             // seeded over, the old nil-collapse misroute).

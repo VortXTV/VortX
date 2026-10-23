@@ -61,11 +61,13 @@ private extension View {
 struct ProfilePickerView: View {
     @EnvironmentObject private var store: ProfileStore
     @EnvironmentObject private var account: StremioAccount
-    @EnvironmentObject private var core: CoreBridge
+    /// Actions capture the current admission when tapped. Picker artwork/layout has no
+    /// engine-state dependency and must not subscribe to every engine publication.
+    private let core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     @State private var pinTarget: UserProfile?
     @State private var pinIsForEditing = false
@@ -75,16 +77,43 @@ struct ProfilePickerView: View {
     @State private var accountHelpNeeded = false
     @StateObject private var profileAction = ProfileMutationPresentation()
     @StateObject private var artwork = ProfilePickerArtwork.shared
-    #if VORTX_NATIVE_DATA_ENGINE
     @ObservedObject private var nativeSync = VortXSyncManager.shared
-    #endif
+    @State private var deferredSelection = NativeProfileActionPreparation.DeferredSelection<CredentialScopeRegistry.Capture>()
+    @State private var pinCredential: CredentialScopeRegistry.Capture?
+    @State private var signInCredential: CredentialScopeRegistry.Capture?
+    @State private var signInProfileID: UUID?
+
+    private var profilesArePreparing: Bool {
+        nativeSync.nativeCheckpointStatus == "restoring" || nativeSync.accountRestoreState == .restoring
+    }
+
+    /// The device log spans every profile's activity. With a PIN-protected profile here, export waits until
+    /// a profile is unlocked (Settings has it), unless profiles failed to load, the stuck case it exists for.
+    private var exportAllowedBeforeProfile: Bool {
+        if profileAction.errorMessage != nil { return true }
+        if nativeSync.accountRestoreState == .failed { return true }
+        return !store.profiles.contains { $0.pin != nil }
+    }
+
+    init(core: CoreBridge = .shared) { self.core = core }
+
+    private var visibleProfileError: String? {
+        if profilesArePreparing { return nil }
+        return profileAction.errorMessage
+    }
+
+    private var profileActionStatus: String {
+        if profilesArePreparing { return "Preparing your profiles—please wait…" }
+        return "Opening profile…"
+    }
 
     var body: some View {
         ZStack {
             GeometryReader { geometry in
                 let layout = ProfilePickerLayout(width: geometry.size.width,
                                                  largeText: dynamicTypeSize.isAccessibilitySize || theme.textScale > 1.20,
-                                                 isPhone: profilePickerIsPhone)
+                                                 isPhone: profilePickerIsPhone,
+                                                 isTV: profilePickerIsTV)
                 ZStack {
                     backgroundArtwork
                     ScrollView(.vertical, showsIndicators: false) {
@@ -96,66 +125,86 @@ struct ProfilePickerView: View {
                             }
                             if let movie = artwork.movie {
                                 Text(movie.name)
-                                    .modifier(ProfilePickerText(size: 26, style: .title, design: .serif))
+                                    .modifier(ProfilePickerText(size: layout.movieTextSize, style: .title, design: .serif))
                                     .multilineTextAlignment(.center)
                                     .foregroundStyle(.white.opacity(0.9))
                                     .padding(.bottom, 12)
                                     .accessibilityHidden(true)
                             }
                             Text(isEditing ? "Edit profiles" : "Who's watching?")
-                                .modifier(ProfilePickerText(size: layout.isWide ? 40 : 25, style: .title2, design: .rounded))
+                                .modifier(ProfilePickerText(size: layout.headingTextSize, style: .title2, design: .rounded))
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .accessibilityAddTraits(.isHeader)
-                            #if VORTX_NATIVE_DATA_ENGINE
                             if !nativeSync.isSignedIn {
                                 Text("Sign in to your VortX account to load your profiles.")
                                     .font(.callout).foregroundStyle(.white)
                                     .multilineTextAlignment(.center)
-                                Button("Sign in") { accountHelpNeeded = true }
+                                Button("Sign in") { deferredSelection.cancel(); accountHelpNeeded = true }
                                     .buttonStyle(.borderedProminent)
                                     .tint(theme.accent)
                             }
-                            #endif
                             if profileAction.isRunning {
-                                ProgressView("Opening profile…").tint(.white).foregroundStyle(.white)
+                                ProgressView(profileActionStatus).tint(Theme.Palette.accent).foregroundStyle(.white)
                             }
-                            if let error = profileAction.errorMessage {
+                            if !profileAction.isRunning, nativeSync.isSignedIn {
+                                if profilesArePreparing {
+                                    ProgressView("Preparing your profiles—please wait…").tint(Theme.Palette.accent).foregroundStyle(.white)
+                                    Text(deferredSelection.profileID != nil
+                                         ? "Your saved data is safe. Your selected profile will open when preparation finishes."
+                                         : "Your saved data is safe. You can choose a profile while preparation finishes.")
+                                        .font(.callout).foregroundStyle(.white)
+                                        .multilineTextAlignment(.center)
+                                } else if nativeSync.accountRestoreState == .failed, profileAction.errorMessage == nil {
+                                    Text("Couldn't finish loading your profiles. Tap a profile to try again.")
+                                        .font(.callout).foregroundStyle(.white)
+                                        .multilineTextAlignment(.center)
+                                }
+                            }
+                            if let error = visibleProfileError {
                                 Text(error).font(.callout).foregroundStyle(.white)
                                     .multilineTextAlignment(.center)
                                     .padding(12)
                                     .background(.red.opacity(0.22), in: RoundedRectangle(cornerRadius: 16))
                                     .accessibilityIdentifier("profile-picker-error")
-                                #if VORTX_NATIVE_DATA_ENGINE
-                                Button("Account settings") { accountHelpNeeded = true }
+                                Button("Account settings") { deferredSelection.cancel(); accountHelpNeeded = true }
                                     .buttonStyle(.bordered)
                                     .tint(.white)
-                                #endif
                             }
                             profileGrid(layout: layout)
-                                #if VORTX_NATIVE_DATA_ENGINE
                                 .disabled(!nativeSync.isSignedIn)
-                                #endif
                         }
                         .padding(.horizontal, layout.horizontalInset)
                         .padding(.bottom, layout.isPhone ? 32 : 0)
-                        .frame(maxWidth: 1100)
+                        .frame(maxWidth: layout.contentMaxWidth)
                         .frame(maxWidth: .infinity)
                         .frame(minHeight: geometry.size.height,
                                alignment: layout.isPhone ? .bottom : .center)
                     }
                     .disabled(pinTarget != nil || profileAction.isRunning)
                     .accessibilityHidden(pinTarget != nil)
+                    // Outside the disabled picker: a stuck profile/restore must not block its own log.
+                    .safeAreaInset(edge: .bottom) {
+                        if exportAllowedBeforeProfile {
+                            DiagnosticLogExportButton()
+                                .padding(.horizontal, 24)
+                                .padding(.vertical, 12)
+                                .disabled(pinTarget != nil)
+                                .accessibilityHidden(pinTarget != nil)
+                        }
+                    }
                 }
             }
 
             if let target = pinTarget {
                 PinGateOverlay(profile: target,
                                onUnlock: {
-                                   if pinIsForEditing { pinTarget = nil; editorProfile = target }
-                                   else { commit(target) }
+                                   finishPIN(target)
                                },
-                               onCancel: { pinTarget = nil; pinIsForEditing = false })
+                               onCancel: {
+                                   pinTarget = nil; pinIsForEditing = false
+                                   pinCredential = nil
+                               })
             }
         }
         .profileCover(item: $editorProfile) { ProfileEditorView(original: $0) }
@@ -166,11 +215,9 @@ struct ProfilePickerView: View {
             iOSSignInView()
             #endif
         }
-        #if VORTX_NATIVE_DATA_ENGINE
         .profileCover(isPresented: $accountHelpNeeded) {
             ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
         }
-        #endif
         .interactiveDismissDisabled(profileAction.isRunning)
         .task(id: artworkTaskKey) {
             guard artworkIsVisible else {
@@ -184,6 +231,23 @@ struct ProfilePickerView: View {
         .onDisappear {
             artwork.stopRotation()
             profileAction.cancel()
+            deferredSelection.cancel()
+            // A full-screen child can hide its presenter without removing its identity.
+            if !signInNeeded { signInCredential = nil; signInProfileID = nil }
+        }
+        .onChange(of: nativeSync.accountRestoreState) { state in
+            if state == .failed { deferredSelection.cancel() }
+            if state == .ready, !profileAction.isRunning { profileAction.cancel() }
+            resumeDeferredSelection()
+        }
+        .onChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
+        .onChange(of: profileAction.errorMessage) { _ in resumeDeferredSelection() }
+        .onChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
+        .onChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
+        .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
+            deferredSelection.cancel()
+            pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+            signInCredential = nil; signInProfileID = nil
         }
     }
 
@@ -201,6 +265,14 @@ struct ProfilePickerView: View {
         UIDevice.current.userInterfaceIdiom == .phone
         #else
         false
+        #endif
+    }
+
+    private var profilePickerIsTV: Bool {
+        #if os(tvOS)
+        return true
+        #else
+        return false
         #endif
     }
 
@@ -226,7 +298,7 @@ struct ProfilePickerView: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
                           alignment: .center, spacing: 24) {
                     ForEach(0..<(store.profiles.count + 2), id: \.self) { index in
-                        profileTile(at: index, side: layout.avatarSide)
+                        profileTile(at: index, side: layout.avatarSide, nameTextSize: layout.nameTextSize)
                     }
                 }
             } else {
@@ -234,7 +306,7 @@ struct ProfilePickerView: View {
                     ForEach(layout.rows(itemCount: store.profiles.count + 2), id: \.lowerBound) { row in
                         HStack(alignment: .top, spacing: layout.spacing) {
                             ForEach(Array(row), id: \.self) { index in
-                                profileTile(at: index, side: layout.avatarSide)
+                                profileTile(at: index, side: layout.avatarSide, nameTextSize: layout.nameTextSize)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -246,54 +318,115 @@ struct ProfilePickerView: View {
         .profileFocusSection()
     }
 
-    @ViewBuilder private func profileTile(at index: Int, side: CGFloat) -> some View {
+    @ViewBuilder private func profileTile(at index: Int, side: CGFloat, nameTextSize: CGFloat) -> some View {
         if index < store.profiles.count {
             let profile = store.profiles[index]
             ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
-                              isEditing: isEditing, side: side) { pick(profile) }
+                              isEditing: isEditing, side: side, nameTextSize: nameTextSize) { pick(profile) }
         } else if index == store.profiles.count {
-            ProfilePickerActionTile(title: "Add", symbol: "plus", side: side) {
+            ProfilePickerActionTile(title: "Add", symbol: "plus", side: side, nameTextSize: nameTextSize) {
+                deferredSelection.cancel()
                 editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
             }
         } else {
             ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
-                                    symbol: isEditing ? "checkmark" : "pencil", side: side) {
+                                    symbol: isEditing ? "checkmark" : "pencil", side: side, nameTextSize: nameTextSize) {
+                deferredSelection.cancel()
                 isEditing.toggle()
             }
         }
     }
 
     private func pick(_ profile: UserProfile) {
+        let capture = CredentialScopeRegistry.shared.capture()
+        if !isEditing, profilesArePreparing || !core.hasCertifiedNativeSession(capture: capture, profileID: store.activeID) {
+            profileAction.cancel()
+            deferredSelection.request(profile.id, owner: capture, preparing: true,
+                                      accountRestorePreparing: nativeSync.accountRestoreState == .restoring)
+            if !profilesArePreparing {
+                // Only preparation runs here. A failed selection/checkpoint write is never
+                // enqueued for an automatic mutation retry.
+                profileAction.start(operation: { await nativeSync.prepareNativeProfileSelection(credentialCapture: capture) },
+                    failureMessage: { core.nativeProfileRecoveryMessage }, onSuccess: { resumeDeferredSelection() })
+            }
+            return
+        }
+        deferredSelection.cancel()
         // The editor already gates an inactive profile's switch. Do not ask for its PIN twice.
         if isEditing, profile.id != store.activeID { editorProfile = profile; return }
         pinIsForEditing = isEditing
-        if profile.hasPin { pinTarget = profile }
+        if profile.hasPin {
+            pinCredential = CredentialScopeRegistry.shared.capture()
+            pinTarget = profile
+        }
         else if isEditing { editorProfile = profile }
         else { commit(profile) }
     }
 
+    private func resumeDeferredSelection() {
+        deferredSelection.observePreparation(profilesArePreparing,
+                                             accountRestorePreparing: nativeSync.accountRestoreState == .restoring)
+        // Observer delivery order is not an authority. A failed restore must cancel its
+        // waiting intent even if a checkpoint, scene or error callback arrives first.
+        if deferredSelection.waitedForAccountRestore, nativeSync.accountRestoreState == .failed {
+            deferredSelection.cancel()
+            return
+        }
+        guard scenePhase == .active, !profileAction.isRunning, !isEditing, pinTarget == nil,
+              editorProfile == nil, !signInNeeded, !accountHelpNeeded else { return }
+        let capture = CredentialScopeRegistry.shared.capture()
+        guard let id = deferredSelection.take(owner: capture, preparing: profilesArePreparing,
+            ready: core.hasCertifiedNativeSession(capture: capture, profileID: store.activeID),
+            profileExists: { id in store.profiles.contains { $0.id == id } }),
+              let profile = store.profiles.first(where: { $0.id == id }) else { return }
+        // Resolve the freshly authenticated roster and its current PIN, not the cached tile.
+        pick(profile)
+    }
+
+    private func finishPendingSignIn() {
+        defer { signInCredential = nil; signInProfileID = nil }
+        guard let capture = signInCredential, let profileID = signInProfileID,
+              CredentialScopeRegistry.shared.isCurrent(capture), store.activeID == profileID,
+              core.hasCertifiedNativeSession(capture: capture, profileID: profileID),
+              core.nativeAccountMode(profileID: profileID) == "own",
+              account.isSignedIn, account.signInError == nil else { return }
+        store.pickedThisLaunch = true
+    }
+
+    private func finishPIN(_ target: UserProfile) {
+        guard let capture = pinCredential, CredentialScopeRegistry.shared.isCurrent(capture),
+              let current = store.profiles.first(where: { $0.id == target.id }) else {
+            pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+            return
+        }
+        pinTarget = nil; pinCredential = nil
+        guard !profilesArePreparing, core.hasCertifiedNativeSession(capture: capture, profileID: store.activeID) else {
+            pick(current) // Re-prepare, then require a PIN against the newly loaded roster.
+            return
+        }
+        guard current.pin == target.pin else { pick(current); return }
+        if pinIsForEditing { editorProfile = current }
+        else { commit(current) }
+    }
+
     private func commit(_ profile: UserProfile) {
         pinTarget = nil
-        #if VORTX_NATIVE_DATA_ENGINE
         let admission = core.captureNativeProfileActionAdmission()
-        profileAction.start(operation: { await store.selectNative(profile, admission: admission) },
+        // Keep the parent picker alive until the selected profile is usable. In particular,
+        // pending-own setup is a child presentation and must not lose its presenting view.
+        profileAction.start(operation: { await store.selectNative(profile, admission: admission, finishPicker: false) },
                             failureMessage: { store.nativeProfileError ?? "Couldn't open this profile. Tap it to try again." },
                             onSuccess: {
+                                guard CredentialScopeRegistry.shared.isCurrent(admission.credential),
+                                      store.activeID == profile.id,
+                                      core.hasCertifiedNativeSession(capture: admission.credential, profileID: profile.id) else { return }
+                                deferredSelection.cancel()
                                 account.reloadForActiveProfile()
-                                if core.nativeAccountMode(profileID: profile.id) == "pending_own" { signInNeeded = true }
+                                if core.nativeAccountMode(profileID: profile.id) == "pending_own" {
+                                    signInCredential = admission.credential; signInProfileID = profile.id
+                                    signInNeeded = true
+                                } else { store.pickedThisLaunch = true }
                             })
-        #else
-        switch store.select(profile) {
-        case .sameAccount:
-            break
-        case .switchAccount(let token):
-            account.reloadForActiveProfile()
-            core.switchAccount(token: token)
-        case .needsSignIn:
-            account.reloadForActiveProfile()
-            signInNeeded = true
-        }
-        #endif
     }
 }
 
@@ -309,6 +442,11 @@ private struct ProfilePickerMovie: Identifiable, Hashable {
         ArtworkFallbackPolicy.candidates([background, poster])
     }
 
+    var firstPaintArtworkURLs: [String] {
+        // Do not put a large backdrop's timeout ahead of the public poster's first paint.
+        ArtworkFallbackPolicy.candidates([poster, background])
+    }
+
     var cacheKey: String {
         "\(id)|\(background ?? "")|\(poster ?? "")"
     }
@@ -318,7 +456,7 @@ private struct ProfilePickerMovie: Identifiable, Hashable {
 /// The identity transition then cross-fades the two layers without a blank frame on a rotation tick.
 private struct ProfilePickerBackdrop: View {
     let movie: ProfilePickerMovie?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
     @State private var image: VXPosterImage?
     @State private var imageKey = ""
 
@@ -350,8 +488,15 @@ private struct ProfilePickerBackdrop: View {
             .clipped()
             .task(id: movie?.cacheKey) {
                 guard let movie else { return }
-                let loaded = await ArtworkFallbackPolicy.firstAvailable(movie.artworkURLs) {
-                    await PosterImageLoader.load($0, maxPixel: ProfilePickerArtwork.artworkMaxPixel)
+                let loaded: VXPosterImage?
+                if let cached = synchronousCache {
+                    // Prefer a prewarmed landscape background, or an already-decoded poster,
+                    // without awaiting an uncached URL earlier in the normal quality order.
+                    loaded = cached
+                } else {
+                    loaded = await ArtworkFallbackPolicy.firstAvailable(movie.firstPaintArtworkURLs) {
+                        await PosterImageLoader.load($0, maxPixel: ProfilePickerArtwork.artworkMaxPixel)
+                    }
                 }
                 guard !Task.isCancelled, let loaded else { return }
                 let key = movie.cacheKey
@@ -384,8 +529,36 @@ private final class ProfilePickerArtwork: ObservableObject {
     static let shared = ProfilePickerArtwork()
 
     private static let candidateLimit = 12
+    private static let publicSeedByteLimit = 32_768
+    private static let publicSeedLifetime: TimeInterval = 30 * 24 * 60 * 60
+
+    // Cache only public Family-catalog metadata. This lives in purgeable Caches, not account
+    // defaults/backups, and contains no owner/profile/history/add-on configuration or signed URL.
+    private struct PublicSeed: Codable {
+        let version: Int
+        let savedAt: Date
+        let movies: [PublicMovie]
+    }
+
+    private struct PublicMovie: Codable {
+        let id: String
+        let name: String
+        let poster: String
+    }
+
+    private static var publicSeedURL: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("vortx-profile-picker-public-v1.json")
+    }
     private static let rotationIntervalNanoseconds: UInt64 = 5_000_000_000
-    fileprivate static let artworkMaxPixel: CGFloat = CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+    // Keep the rotating picker bounded to full HD on TV, without a 4K prefetch queue.
+    fileprivate static let artworkMaxPixel: CGFloat = {
+        #if os(tvOS)
+        return CGFloat(HeroArtworkQualityPolicy.fullHDLongEdge)
+        #else
+        return CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+        #endif
+    }()
 
     @Published private(set) var movie: ProfilePickerMovie?
     private var candidates: [ProfilePickerMovie] = []
@@ -398,6 +571,16 @@ private final class ProfilePickerArtwork: ObservableObject {
     private var prewarmTask: Task<Bool, Never>?
     private var rotationToken = UUID()
 
+    private init() {
+        candidates = Self.readPublicSeed()
+        // Publish public metadata synchronously. ProfilePickerBackdrop can begin its own existing
+        // cache-first load immediately; it must not wait behind a fresh catalog request.
+        if let index = candidates.firstIndex(where: { Self.hasDecodedArtwork($0) }) ?? candidates.indices.first {
+            currentIndex = index
+            movie = candidates[index]
+        }
+    }
+
     deinit {
         catalogRequest?.cancel()
         rotationTask?.cancel()
@@ -407,8 +590,12 @@ private final class ProfilePickerArtwork: ObservableObject {
     func load() async {
         if !didAttemptCatalog {
             didAttemptCatalog = true
-            catalogRequest = Task { await Self.fetchCandidates() }
+            let preferredID = movie?.id
+            catalogRequest = Task { await Self.fetchCandidates(preferredID: preferredID) }
         }
+        // A warm singleton or disk-restored public seed is already usable. Refreshing public
+        // metadata continues independently and must not postpone first paint or rotation.
+        if movie != nil { return }
         guard let catalogRequest else { return }
         let fetched = await catalogRequest.value
         guard !Task.isCancelled else { return }
@@ -472,11 +659,15 @@ private final class ProfilePickerArtwork: ObservableObject {
 
     private func showInitialCandidate() async {
         guard !candidates.isEmpty, !Task.isCancelled else { return }
-        for index in candidates.indices.shuffled() {
-            if await preload(candidates[index]) {
+        let shuffled = candidates.indices.shuffled()
+        let decoded = shuffled.filter { Self.hasDecodedArtwork(candidates[$0]) }
+        let cold = shuffled.filter { !Self.hasDecodedArtwork(candidates[$0]) }
+        for index in decoded + cold {
+            if await preload(candidates[index], firstPaint: true) {
                 guard !Task.isCancelled else { return }
                 currentIndex = index
                 movie = candidates[index]
+                Self.writePublicSeed(candidates, preferredID: candidates[index].id)
                 prewarmNext(after: index)
                 return
             }
@@ -496,7 +687,7 @@ private final class ProfilePickerArtwork: ObservableObject {
         }
     }
 
-    private func preload(_ candidate: ProfilePickerMovie) async -> Bool {
+    private func preload(_ candidate: ProfilePickerMovie, firstPaint: Bool = false) async -> Bool {
         if readyIDs.contains(candidate.id) {
             let remainsDecoded = candidate.artworkURLs.contains { raw in
                 guard let url = URL(string: raw) else { return false }
@@ -507,8 +698,14 @@ private final class ProfilePickerArtwork: ObservableObject {
             // hint; force the shared loader through its cache/URLCache path again before use.
             readyIDs.remove(candidate.id)
         }
+        // The preferred initial candidate may already be decoded without a readyIDs hint.
+        // Do not await a cold poster when its landscape background is already ready (or vice versa).
+        if Self.hasDecodedArtwork(candidate) {
+            readyIDs.insert(candidate.id)
+            return true
+        }
         if unavailableIDs.contains(candidate.id) { return false }
-        let image = await ArtworkFallbackPolicy.firstAvailable(candidate.artworkURLs) {
+        let image = await ArtworkFallbackPolicy.firstAvailable(firstPaint ? candidate.firstPaintArtworkURLs : candidate.artworkURLs) {
             await PosterImageLoader.load($0, maxPixel: Self.artworkMaxPixel)
         }
         // Cancellation is not a real art failure; do not poison this candidate for the next visible
@@ -522,7 +719,70 @@ private final class ProfilePickerArtwork: ObservableObject {
         return true
     }
 
-    private static func fetchCandidates() async -> [ProfilePickerMovie] {
+    private static func hasDecodedArtwork(_ candidate: ProfilePickerMovie) -> Bool {
+        candidate.artworkURLs.contains { raw in
+            guard let url = URL(string: raw) else { return false }
+            return PosterImageLoader.cached(url, maxPixel: Self.artworkMaxPixel) != nil
+        }
+    }
+
+    private static func publicMovieID(_ id: String) -> Bool {
+        guard id.hasPrefix("tt") else { return false }
+        let digits = id.dropFirst(2)
+        return (5...12).contains(digits.count) && digits.utf8.allSatisfy { (48...57).contains($0) }
+    }
+
+    private static func publicPoster(_ raw: String?, id: String) -> String {
+        if let raw, raw.utf8.count <= 2_048, let url = URLComponents(string: raw),
+           url.scheme?.lowercased() == "https", url.user == nil, url.password == nil,
+           url.query == nil, url.fragment == nil, url.port == nil || url.port == 443,
+           ["images.metahub.space", "live.metahub.space", "image.tmdb.org"].contains(url.host?.lowercased() ?? "") {
+            return raw
+        }
+        // Reconstruct from a validated public IMDb identifier rather than persisting unknown,
+        // token-bearing or account-specific artwork endpoints received in catalog metadata.
+        return "https://images.metahub.space/poster/medium/\(id)/img"
+    }
+
+    private static func readPublicSeed() -> [ProfilePickerMovie] {
+        guard let url = publicSeedURL,
+              let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size > 0, size <= publicSeedByteLimit,
+              let data = try? Data(contentsOf: url), data.count <= publicSeedByteLimit,
+              let seed = try? JSONDecoder().decode(PublicSeed.self, from: data), seed.version == 1,
+              seed.movies.count <= candidateLimit else { return [] }
+        let age = Date().timeIntervalSince(seed.savedAt)
+        guard age >= -60, age <= publicSeedLifetime else { return [] }
+        var seen = Set<String>()
+        return seed.movies.compactMap { entry in
+            let name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard publicMovieID(entry.id), !name.isEmpty, name.utf8.count <= 800,
+                  seen.insert(entry.id).inserted else { return nil }
+            return ProfilePickerMovie(id: entry.id, name: name,
+                                      poster: publicPoster(entry.poster, id: entry.id),
+                                      background: "https://images.metahub.space/background/big/\(entry.id)/img")
+        }
+    }
+
+    private static func writePublicSeed(_ candidates: [ProfilePickerMovie], preferredID: String?) {
+        guard let url = publicSeedURL else { return }
+        let ordered = candidates.filter { $0.id == preferredID } + candidates.filter { $0.id != preferredID }
+        var seen = Set<String>()
+        let movies = ordered.compactMap { candidate -> PublicMovie? in
+            let name = candidate.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard publicMovieID(candidate.id), !name.isEmpty, name.utf8.count <= 800,
+                  seen.insert(candidate.id).inserted else { return nil }
+            return PublicMovie(id: candidate.id, name: name, poster: publicPoster(candidate.poster, id: candidate.id))
+        }
+        let seed = PublicSeed(version: 1, savedAt: Date(), movies: Array(movies.prefix(candidateLimit)))
+        guard !seed.movies.isEmpty, let data = try? JSONEncoder().encode(seed),
+              data.count <= publicSeedByteLimit else { return }
+        // Cache failure is cosmetic only; never reset account data or block the picker.
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private static func fetchCandidates(preferredID: String?) async -> [ProfilePickerMovie] {
         let client = AddonClient()
         guard let titles = try? await client.catalog(base: AddonClient.cinemeta,
                                                      type: "movie", id: "top", genre: "Family") else {
@@ -541,16 +801,23 @@ private final class ProfilePickerArtwork: ObservableObject {
             }
             return seen.insert(title.id).inserted
         }
-        let bounded = Array(eligible.shuffled().prefix(candidateLimit))
+        let preferred = eligible.filter { $0.id == preferredID }
+        let others = eligible.filter { $0.id != preferredID }.shuffled()
+        let bounded = Array((preferred + others).prefix(candidateLimit))
         guard !bounded.isEmpty else { return [] }
 
-        return bounded.map { title in
+        let movies = bounded.map { title in
             let metahub = "https://images.metahub.space/background/big/\(title.id)/img"
             return ProfilePickerMovie(id: title.id,
                                       name: title.name,
                                       poster: title.poster,
                                       background: metahub)
         }
+        // Refresh for the next launch even when load() returned immediately for a warm seed.
+        // A previously visible seed is retained only if it is still in this public Family catalog.
+        guard !Task.isCancelled else { return [] }
+        writePublicSeed(movies, preferredID: preferredID)
+        return movies
     }
 }
 
@@ -559,6 +826,7 @@ private struct ProfileAvatarTile: View {
     let isCurrent: Bool
     let isEditing: Bool
     let side: CGFloat
+    let nameTextSize: CGFloat
     let action: () -> Void
 
     private var accent: Color {
@@ -569,11 +837,11 @@ private struct ProfileAvatarTile: View {
         Button(action: action) {
             VStack(spacing: 10) {
                 ProfileAvatarFace(profile: profile, isCurrent: isCurrent, isEditing: isEditing, side: side, accent: accent)
-                Text(profile.name).modifier(ProfilePickerText(size: 18, style: .headline))
+                Text(profile.name).modifier(ProfilePickerText(size: nameTextSize, style: .headline))
                     .multilineTextAlignment(.center).lineLimit(2)
             }
             .foregroundStyle(.white)
-            .frame(maxWidth: .infinity, alignment: .top)
+            .frame(width: side, alignment: .top)
             .contentShape(Rectangle())
         }
         .buttonStyle(ProfilePickerButtonStyle(outline: false))
@@ -626,6 +894,7 @@ private struct ProfilePickerActionTile: View {
     let title: String
     let symbol: String
     let side: CGFloat
+    let nameTextSize: CGFloat
     let action: () -> Void
 
     var body: some View {
@@ -634,10 +903,10 @@ private struct ProfilePickerActionTile: View {
                 Image(systemName: symbol).font(.system(size: side * 0.40, weight: .light))
                     .frame(width: side, height: side)
                     .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: side * 0.23, style: .continuous))
-                Text(title).modifier(ProfilePickerText(size: 18, style: .headline))
+                Text(title).modifier(ProfilePickerText(size: nameTextSize, style: .headline))
             }
             .foregroundStyle(.white)
-            .frame(maxWidth: .infinity, alignment: .top)
+            .frame(width: side, alignment: .top)
             .contentShape(Rectangle())
         }
         .buttonStyle(ProfilePickerButtonStyle())
@@ -656,7 +925,7 @@ private struct ProfilePickerButtonContent: View {
     let configuration: ButtonStyleConfiguration
     let outline: Bool
     @Environment(\.isFocused) private var focused
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     var body: some View {
         configuration.label
@@ -667,7 +936,6 @@ private struct ProfilePickerButtonContent: View {
     }
 }
 
-#if VORTX_NATIVE_DATA_ENGINE
 /// A full-screen account form needs its own way back to the picker, including before sign-in.
 private struct ProfileAccountRecoveryView: View {
     @Environment(\.dismiss) private var dismiss
@@ -679,12 +947,11 @@ private struct ProfileAccountRecoveryView: View {
                 Button("Done") { dismiss() }.buttonStyle(.bordered)
             }
             .padding()
-            SyncSettingsView()
+            SyncSettingsView(onSignedIn: { dismiss() })
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 }
-#endif
 
 /// Centered 4-digit gate over dimmed content. Owns its own input state; the caller decides
 /// what unlocking means (switch profiles in the picker, unlock the editor). The content
@@ -761,9 +1028,7 @@ struct ProfileEditorView: View {
     #if !os(tvOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
-#if VORTX_NATIVE_DATA_ENGINE
     @ObservedObject private var nativeSync = VortXSyncManager.shared
-#endif
 
     @State private var draft: UserProfile
     @State private var pinText: String
@@ -871,7 +1136,6 @@ struct ProfileEditorView: View {
                                 .buttonStyle(ChipButtonStyle(selected: draft.usesOwnAccount))
                         }
                         if draft.usesOwnAccount {
-#if VORTX_NATIVE_DATA_ENGINE
                             if !isNew && draft.usesOwnAccount == original.usesOwnAccount {
                                 let pending = core.nativeAccountMode(profileID: draft.id) == "pending_own"
                                 if nativeSync.nativeOwnAccountOverlayPending.contains(draft.id) {
@@ -899,12 +1163,6 @@ struct ProfileEditorView: View {
                                 Text("Save this account choice, then open the profile to connect. Existing account libraries remain separate.")
                                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                             }
-#else
-                            Text(draft.email.map { "Signed in as \($0)" }
-                                 ?? "You'll be asked to sign in when this profile is first opened.")
-                                .font(Theme.Typography.label)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-#endif
                         } else {
                             Text("Uses the same add-ons, but keeps its own watch history.")
                                 .font(Theme.Typography.label)
@@ -956,14 +1214,12 @@ struct ProfileEditorView: View {
                     .profileFocusSection()
                     if let error = profileAction.errorMessage {
                         Text(error).font(Theme.Typography.label).foregroundStyle(.red)
-#if VORTX_NATIVE_DATA_ENGINE
                         Button("Try again") {
                             core.refreshNativeProfileEditBinding(draft.id)
                             save()
                         }.buttonStyle(ChipButtonStyle(selected: false))
                         Button("Account settings") { accountHelpNeeded = true }
                             .buttonStyle(ChipButtonStyle(selected: false))
-#endif
                     }
                 }
                 .frame(maxWidth: usesWideEditorLayout ? 900 : .infinity, alignment: .leading)
@@ -979,25 +1235,15 @@ struct ProfileEditorView: View {
         .confirmationDialog("Delete \(original.name)? Its settings and sign-in are removed.",
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
-                #if VORTX_NATIVE_DATA_ENGINE
                 let admission = core.captureNativeProfileActionAdmission()
                 profileAction.start(operation: { await store.removeNative(original, admission: admission) },
                                     failureMessage: { store.nativeProfileError ?? "Profile could not be removed. Please retry." },
                                     onSuccess: { dismiss() })
-                #else
-                store.remove(original)
-                // `remove` authorizes against the current stored record and returns nil both for an
-                // inactive successful deletion and for a rejected deletion. Confirm disappearance before
-                // dismissing so a stale/spoofed owner editor never closes as if destructive work succeeded.
-                if !store.profiles.contains(where: { $0.id == original.id }) { dismiss() }
-                #endif
             }
         }
-        #if VORTX_NATIVE_DATA_ENGINE
         .profileCover(isPresented: $accountHelpNeeded) {
             ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
         }
-        #endif
         .profileCover(isPresented: $signInNeeded) {
             // An own-account profile with no stored token: sign in here rather than dismissing into a
             // signed-out profile. LoginView is the tvOS panel; the touch UI ships iOSSignInView.
@@ -1074,7 +1320,6 @@ struct ProfileEditorView: View {
     /// for its PIN first (switchPinPrompt). On .needsSignIn the editor presents sign-in (Option B)
     /// instead of dismissing into a signed-out profile.
     private func commitSwitch() {
-        #if VORTX_NATIVE_DATA_ENGINE
         let admission = core.captureNativeProfileActionAdmission()
         profileAction.start(operation: { await store.selectNative(original, admission: admission, finishPicker: false) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
@@ -1082,19 +1327,6 @@ struct ProfileEditorView: View {
                                 account.reloadForActiveProfile()
                                 if core.nativeAccountMode(profileID: original.id) == "pending_own" { signInNeeded = true }
                             })
-        #else
-        switch store.select(original) {
-        case .sameAccount:
-            dismiss()
-        case .switchAccount(let token):
-            account.reloadForActiveProfile()
-            core.switchAccount(token: token)
-            dismiss()
-        case .needsSignIn:
-            account.reloadForActiveProfile()
-            signInNeeded = true
-        }
-        #endif
     }
 
     private var canSave: Bool {
@@ -1108,16 +1340,11 @@ struct ProfileEditorView: View {
             draft.pin = UserProfile.pinHash(pinText, profileID: draft.id)
         }
         // empty field keeps the existing PIN; Remove PIN cleared it explicitly
-        #if VORTX_NATIVE_DATA_ENGINE
         let admission = core.captureNativeProfileActionAdmission()
-        let profile = draft, creating = isNew
-        profileAction.start(operation: { await store.saveNative(profile, creating: creating, admission: admission) },
+        let profile = draft, creating = isNew, preferenceBaseline = original
+        profileAction.start(operation: { await store.saveNative(profile, creating: creating, admission: admission, preferenceBaseline: preferenceBaseline) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be saved. Please retry." },
                             onSuccess: { dismiss() })
-        #else
-        if isNew { store.add(draft) } else { store.update(draft) }
-        dismiss()
-        #endif
     }
 
     @ViewBuilder private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {

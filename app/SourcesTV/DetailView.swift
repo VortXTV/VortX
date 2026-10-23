@@ -31,6 +31,7 @@ struct DetailView: View {
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var initialTraktNextEpisodeOffer: TraktNextEpisodeOffer? = nil
     @State private var resumeHintOpenedAt = Date()
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
@@ -46,9 +47,11 @@ struct DetailView: View {
 
     // #44 in-hero trailer gating, the SAME keys iOS uses: the "Autoplay trailers" setting + reduce-motion.
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
 
     @State private var similarItems: [MetaPreview] = []
+    /// The title's trailers, featurettes, clips and behind-the-scenes videos (Trailers & Extras).
+    @State private var titleVideos: [TMDBClient.TitleVideo] = []
     /// Franchise/collection this movie belongs to (TMDB belongs_to_collection -> parts, in release order),
     /// rendered as the "Part of the … Collection" rail JUST ABOVE More Like This. Nil for a standalone film /
     /// series / any miss, which hides the row. `collectionKey` de-dupes the fetch per imdb id.
@@ -59,6 +62,9 @@ struct DetailView: View {
     /// `collection`. Movies only; nil hides the rail. Reset with the collection on a title change.
     @State private var collectionNeighbors: (previous: MetaPreview?, next: MetaPreview?)?
     @State private var mdbRatings: MDBListRatings?
+    @State private var ratingsKey: RatingRequestKey?
+    @State private var ratingsTask: Task<Void, Never>?
+    @State private var ratingsGeneration: UUID?
     @State private var watchAvail: TMDBClient.WatchAvailability?
     @State private var financials: TMDBClient.Financials?
     @State private var releaseDates: TMDBClient.ReleaseDates?   // theatrical + digital, TMDB-fetched (movies only)
@@ -116,6 +122,7 @@ struct DetailView: View {
     /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
     /// every use because the detail page can remain mounted across sign-out or an account replacement.
     private var validInitialResumeSeconds: Double? {
+        guard initialTraktNextEpisodeOffer?.isCurrent() != false else { return nil }
         guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
@@ -123,6 +130,7 @@ struct DetailView: View {
     }
 
     private var validInitialVideoID: String? {
+        guard initialTraktNextEpisodeOffer?.isCurrent() != false else { return nil }
         guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
@@ -218,6 +226,8 @@ struct DetailView: View {
             refreshLanguageChips()
         }
         .onDisappear {
+            ratingsGeneration = nil
+            ratingsTask?.cancel(); ratingsTask = nil
             langChipsDebounce?.cancel()
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
             // user presses Back the NavigationStack pops but the bar can stay hidden at its scroll-
@@ -226,7 +236,8 @@ struct DetailView: View {
         }
         // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
         // hub's TMDB guess was wrong, meta.type corrects it and the request re-fires under the type add-ons use.
-        .onChange(of: fencedMeta?.type) { loadMovieStreamsIfNeeded() }
+        .onChange(of: fencedMeta?.type) { loadMovieStreamsIfNeeded(); loadRatings() }
+        .onChange(of: currentRatingsRequest) { loadRatings() }
         .onChange(of: fencedMeta?.id) {
             captureHero()
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
@@ -580,23 +591,37 @@ struct DetailView: View {
     /// Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft: leaves the row
     /// hidden on any miss. Skipped for live channels, which carry no ratings.
     private func loadRatings() {
-        guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
-        Task {
+        guard let requested = currentRatingsRequest else {
+            ratingsGeneration = nil
+            ratingsTask?.cancel(); ratingsTask = nil
+            ratingsKey = nil; mdbRatings = nil
+            return
+        }
+        if ratingsKey == requested && (ratingsTask != nil || mdbRatings != nil) { return }
+        ratingsTask?.cancel()
+        if ratingsKey != requested { mdbRatings = nil }
+        ratingsKey = requested
+        let generation = UUID()
+        ratingsGeneration = generation
+        ratingsTask = Task { @MainActor in
             // VortX's keyless ratings service first (IMDb / RT / Metacritic / TMDB, no user key needed), then
             // reach for the user's own MDBList key ONLY to fill what VortX did not return. Mirrors iOS so both
             // surfaces show the same ratings row for every user, keyed or not (tvOS previously showed nothing
             // unless an MDBList key was set).
-            let vx = await VortXRatingsClient.ratings(imdbID: imdb, type: type)
+            let vx = await VortXRatingsClient.ratings(imdbID: requested.id, type: requested.type)
             let needsMore = vx == nil || vx?.rottenTomatoes == nil || vx?.metacritic == nil
-            let mdb = needsMore ? await MDBListClient.ratings(imdbID: imdb, type: type) : nil
-            let merged = MDBListRatings(
-                imdb: vx?.imdb ?? mdb?.imdb,
-                rottenTomatoes: vx?.rottenTomatoes ?? mdb?.rottenTomatoes,
-                metacritic: vx?.metacritic ?? mdb?.metacritic,
-                tmdb: vx?.tmdb ?? mdb?.tmdb
-            )
-            await MainActor.run { mdbRatings = merged.hasAny ? merged : nil }
+            guard !Task.isCancelled else { return }
+            let mdb = needsMore ? await MDBListClient.ratings(imdbID: requested.id, type: requested.type) : nil
+            guard !Task.isCancelled, ratingsGeneration == generation,
+                  currentRatingsRequest == requested else { return }
+            mdbRatings = RatingPresentationPolicy.merged(vx, secondary: mdb)
+            ratingsTask = nil
         }
+    }
+
+    private var currentRatingsRequest: RatingRequestKey? {
+        guard !LiveTypes.contains(effectiveType), let imdb = ratingsImdbID else { return nil }
+        return RatingRequestKey(id: imdb, type: effectiveType)
     }
 
     /// Fetch the movie budget + box office (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
@@ -816,6 +841,52 @@ struct DetailView: View {
         }
     }
 
+    /// Trailers & Extras: every video TMDB lists for the title, played in VortX's own player like the Trailer
+    /// chip, with the YouTube app as the rescue if the in-app load fails.
+    private var extrasSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            if !titleVideos.isEmpty {
+                RailHeader(title: "Trailers & Extras")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                        ForEach(titleVideos) { video in
+                            Button { playExtra(video) } label: {
+                                TitleExtraCard(video: video, width: 520,
+                                               artwork: AnyView(EpisodeThumbImage(url: video.thumbnail?.absoluteString)),
+                                               tenFoot: true)
+                            }
+                            .buttonStyle(CardFocusStyle(scale: 1.04))
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.lg)
+                }
+            }
+        }
+        .task(id: LiveTypes.contains(type) ? nil : id) {
+            titleVideos = []
+            guard !LiveTypes.contains(type) else { return }
+            let requested = id
+            let videos = await TMDBClient.titleVideos(metaID: requested, type: effectiveType)
+            guard !Task.isCancelled, id == requested else { return }
+            titleVideos = videos
+        }
+    }
+
+    @MainActor private func playExtra(_ video: TMDBClient.TitleVideo) {
+        let label = "\(core.metaDetails?.meta?.name ?? id) · \(video.name)"
+        Task { @MainActor in
+            if let resolved = await YouTubeDirectResolver.resolve(videoID: video.key, maxHeight: 1080) {
+                presenter.request = PlaybackRequest(url: resolved.videoURL, title: label, isTrailer: true,
+                                                    trailerYouTubeID: video.key, audioSidecarURL: resolved.audioURL)
+                return
+            }
+            guard let url = TrailerRequest(title: label, youTubeID: video.key, directURL: nil)
+                .nativeFullTrailerURL(languageCode: TMDBClient.trailerLanguageBaseCode) else { return }
+            presenter.request = PlaybackRequest(url: url, title: label, isTrailer: true, trailerYouTubeID: video.key)
+        }
+    }
+
     @ViewBuilder private var moreLikeThisSection: some View {
         if !similarItems.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -1032,6 +1103,9 @@ struct DetailView: View {
                                              orderedEpisodes: ordered,
                                              watched: watched,
                                              initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season,
+                                             initialTraktSessionID: initialTraktNextEpisodeOffer == nil ? nil : initialTraktSessionID,
+                                             initialContinueWatchingIntent: initialTraktNextEpisodeOffer == nil ? nil : initialContinueWatchingIntent,
+                                             initialTraktNextEpisodeOffer: initialTraktNextEpisodeOffer,
                                              onSeasonPickerFocus: {
                                                  proxy.scrollTo(CoreSeasonedEpisodes.seasonPickerAnchor, anchor: .center)
                                              })
@@ -1045,6 +1119,8 @@ struct DetailView: View {
                         relationsSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         collectionChronologySection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        extrasSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         moreLikeThisSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
@@ -1138,6 +1214,7 @@ struct DetailView: View {
                                                initialStartAtSeconds: validInitialResumeSeconds,
                                                initialTraktSessionID: initialTraktSessionID,
                                                initialContinueWatchingIntent: initialContinueWatchingIntent,
+                                               initialTraktNextEpisodeOffer: initialTraktNextEpisodeOffer,
                                                secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil,
                                                onDetailMove: { direction, region in
                                                    handleDetailMove(direction, from: region, using: proxy)
@@ -1159,6 +1236,8 @@ struct DetailView: View {
                         relationsSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         collectionChronologySection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        extrasSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         moreLikeThisSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
@@ -1390,7 +1469,8 @@ struct DetailView: View {
                                                            episodes: orderedEpisodes,
                                                            initialStartAtSeconds: primaryResumeSeconds,
                                                            initialTraktSessionID: initialTraktSessionID,
-                                                           initialContinueWatchingIntent: initialContinueWatchingIntent)   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                           initialContinueWatchingIntent: initialContinueWatchingIntent,
+                                                           initialTraktNextEpisodeOffer: initialTraktNextEpisodeOffer)
                                     } label: {
                                         Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
                                                                   resumeSeconds: primaryResumeSeconds),
@@ -1475,11 +1555,15 @@ struct DetailView: View {
             // yt-direct: try the DEVICE-DIRECT stream first (resolved on the user's own IP; the hero is muted,
             // so a video-only adaptive pick needs no audio sidecar). The layer mounts only after the attempt
             // lands so a late resolve never remounts a clip mid-play; a miss mounts the /yt worker URL.
-            Group {
+            // The clear base keeps this container non-empty before the attempt lands: SwiftUI never starts a
+            // `.task` on an empty view, so with only the conditional clip inside, the attempt never ran.
+            ZStack {
+                Color.clear
                 if let attempt = heroDirectTrailer, attempt.metaID == m.id {
                     TVInHeroTrailerView(url: attempt.url ?? url, window: nil)
                 }
             }
+            .allowsHitTesting(false)
             .task(id: m.id) { await resolveHeroDirectTrailer(m) }
         }
     }
@@ -1560,7 +1644,7 @@ struct DetailView: View {
             Button {
                 Task { @MainActor in await playFullTrailerInApp(m) }
             } label: {
-                Label("Trailer", systemImage: "film")
+                Label("Trailer", systemImage: "movieclapper")
             }
             .buttonStyle(ChipButtonStyle())
             // #95 SECONDARY action (long-press): hand the trailer straight to the YouTube app. The
@@ -1627,16 +1711,28 @@ struct DetailView: View {
         }
     }
 
+    /// Ratings and facts share one line when they fit; with every provider's score present the ratings
+    /// move to their own wrapping line above the facts instead of pushing the facts off the hero.
     private func metaRow(_ m: CoreMetaItem) -> some View {
-        HStack(spacing: Theme.Space.md) {
-            primaryRatings(m)
-            if let r = m.releaseInfo { Text(r) }
-            if let rt = m.runtime { Text(rt) }
-            let genres = m.genres
-            if !genres.isEmpty { Text(genres.prefix(3).joined(separator: " · ")).lineLimit(1) }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: Theme.Space.md) {
+                primaryRatings(m, wrapping: false)
+                metaFacts(m)
+            }
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                primaryRatings(m, wrapping: true)
+                HStack(spacing: Theme.Space.md) { metaFacts(m) }
+            }
         }
         .font(Theme.Typography.label)
         .foregroundStyle(Theme.Palette.textSecondary)
+    }
+
+    @ViewBuilder private func metaFacts(_ m: CoreMetaItem) -> some View {
+        if let r = m.releaseInfo { Text(r) }
+        if let rt = m.runtime { Text(rt) }
+        let genres = m.genres
+        if !genres.isEmpty { Text(genres.prefix(3).joined(separator: " · ")).lineLimit(1) }
     }
 
     /// The PRIMARY rating position on the tvOS hero. VortX hosts the ratings backend, so this shows the FULL
@@ -1644,25 +1740,23 @@ struct DetailView: View {
     /// VortX ratings service resolves, and the engine metadata's IMDb rating INSTANTLY until then so the row
     /// never blanks. Both branches lead with the same accent star, so the extra scores fade in beside it with
     /// no reflow. Per-score fail-soft: a title with only IMDb keeps showing only IMDb.
-    @ViewBuilder private func primaryRatings(_ m: CoreMetaItem) -> some View {
-        if let r = mdbRatings, case let tokens = RatingsFormat.tokens(r), !tokens.isEmpty {
-            HStack(spacing: Theme.Space.md) {
-                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
-                    HStack(spacing: 5) {
-                        if token.isIMDb {
-                            Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                        } else {
-                            Text(token.label).foregroundStyle(Theme.Palette.textTertiary)
-                        }
-                        Text(token.value).foregroundStyle(Theme.Palette.textPrimary)
-                    }
-                }
+    @ViewBuilder private func primaryRatings(_ m: CoreMetaItem, wrapping: Bool) -> some View {
+        if let r = RatingPresentationPolicy.merged(ratingsKey == currentRatingsRequest ? mdbRatings : nil,
+                                                   fallbackIMDb: m.imdbRating),
+           case let tokens = RatingsFormat.tokens(r), !tokens.isEmpty {
+            if wrapping {
+                FlowLayout(spacing: Theme.Space.md) { ratingTokens(tokens) }
+            } else {
+                HStack(spacing: Theme.Space.md) { ratingTokens(tokens) }
             }
-        } else if let imdb = m.imdbRating {
-            HStack(spacing: 6) {
-                Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                Text(imdb).foregroundStyle(Theme.Palette.textPrimary)
-            }
+        }
+    }
+
+    private func ratingTokens(_ tokens: [RatingsFormat.Token]) -> some View {
+        ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+            RatingScore(token: token, textSize: 20)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(token.label) \(token.value)")
         }
     }
 
@@ -1711,6 +1805,9 @@ struct DetailView: View {
     /// `ordered` is the caller's already-sorted (season, episode, id) list, so the page sorts once instead of
     /// twice more inside this one helper.
     private func resumeSeasonHint(ordered: [CoreVideo], metaID: String) -> Int? {
+        if let offer = initialTraktNextEpisodeOffer {
+            return offer.matchingVideo(metaID: metaID, type: effectiveType, videos: ordered)?.season
+        }
         if let preferredID = newerPlaybackVideoID ?? validInitialVideoID,
            let season = ordered.first(where: { $0.id == preferredID })?.season {
             return season
@@ -1728,6 +1825,11 @@ struct DetailView: View {
     /// the account that owns the data (see the resume comment below). Twin of iOSDetailView's version.
     private func seriesPrimaryEpisode(ordered: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
+        if let offer = initialTraktNextEpisodeOffer {
+            guard let video = offer.matchingVideo(metaID: metaID, type: effectiveType, videos: ordered),
+                  !localWatched.contains(video.id) else { return nil }
+            return (video, false)
+        }
         if let preferred = DetailEpisodeTargetPolicy.preferred(
             orderedIDs: ordered.map(\.id), initialVideoID: validInitialVideoID,
             initialResumeSeconds: validInitialResumeSeconds, newerPlaybackID: newerPlaybackVideoID,
@@ -1826,6 +1928,9 @@ struct CoreSeasonedEpisodes: View {
     var orderedEpisodes: [CoreVideo] = []
     var watched: Set<String> = []
     var initialSeason: Int?
+    var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var initialTraktNextEpisodeOffer: TraktNextEpisodeOffer? = nil
     /// Scroll the season picker into the parent viewport before this view seats focus on its selected chip.
     /// Only the first episode row requests this; deeper rows keep native previous-row navigation.
     var onSeasonPickerFocus: (() -> Void)?
@@ -1839,6 +1944,9 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
+    @EnvironmentObject private var account: StremioAccount
+    @StateObject private var manualWatchedAction = ProfileMutationPresentation()
+    @State private var initialPosition = TVEpisodeInitialPositionPolicy()
 
     @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (#7 return-to-episode)
     @State private var season: Int = 1
@@ -1847,18 +1955,111 @@ struct CoreSeasonedEpisodes: View {
     @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
     @FocusState private var focusedSeason: Int?
     @State private var seasonFocusRequest = 0
+    @State private var focusInteractionGeneration: UInt64 = 0
     /// A programmatic focus request that must SCROLL before it can land. The episode list is a `LazyVStack`,
     /// so a row far down the season does not exist until it is scrolled near; assigning `focusedEpisode`
     /// straight to it would silently do nothing. Setting this instead scrolls the row into existence first
     /// (see the `ScrollViewReader` in `body`), then seats focus on the next runloop turn.
-    @State private var pendingFocusEpisode: String?
+    @State private var pendingFocusEpisode: EpisodeFocusRequest?
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
     // `videos`; episodes additionally on `season`.
     @State private var seasons: [Int] = []
     @State private var episodes: [CoreVideo] = []
+    @State private var episodeIDs: [String] = []
+    @State private var eligibleEpisodeIDs: Set<String> = []
+    /// TMDB season poster art for the season selector, keyed by season number (0 = Specials).
+    @State private var seasonPosters: [Int: String] = [:]
+    /// TMDB ratings for the season on screen (episode number to rating) and its Top rated episodes.
+    private struct EpisodeRatingsState: Equatable { var season: Int? = nil; var byEpisode: [Int: EpisodeScores] = [:]; var top: Set<Int> = [] }
+    @State private var episodeRatings = EpisodeRatingsState()
+    /// The episode grid's column count; the first row owns the Up escape to the season posters.
+    static let episodeColumns = 4
+    /// Four glass cards across the 1920pt screen inside the screen edges.
+    static let episodeCardWidth: CGFloat = (1920 - 2 * Theme.Space.screenEdge - 3 * Theme.Space.lg) / 4
+    private static let seasonPosterWidth: CGFloat = 150
     private var detailTarget: LibraryWatchedMutationPolicy.DetailTarget {
         .init(id: meta.id, type: meta.type)
+    }
+
+    private var episodeScope: String {
+        "\(profiles.activeID?.uuidString ?? "none"):\(account.credentialBoundaryGeneration):\(meta.type):\(meta.id)"
+    }
+
+    // Display ticks include the optional Trakt mirror. Initial placement, like the phone rail,
+    // uses the active profile's own accepted history so a mirror cannot suppress its resume.
+    private var localWatched: Set<String> {
+        guard profiles.activeUsesEngineHistory else { return profiles.watchedVideoIds(forMeta: meta.id) }
+        guard let details = core.metaDetails, details.meta?.id == meta.id,
+              details.meta?.type == meta.type else { return [] }
+        return core.effectiveWatchedVideoIDs(for: details)
+    }
+
+    private var episodeHistoryReady: Bool {
+        guard core.metaDetails?.meta?.id == meta.id, core.metaDetails?.meta?.type == meta.type else { return false }
+        if core.usesNativeProfileState {
+            return core.metaDetails?.watchedVideoIds != nil
+                && core.nativePlaybackTargetIsCurrent(.capture(core: core))
+        }
+        return true
+    }
+
+    private struct InitialPositionRequest: Equatable {
+        let scope: String
+        let season: Int
+        let ids: [String]
+        let eligibleIDs: Set<String>
+        let watched: Set<String>
+        let currentID: String?
+        let currentInProgress: Bool
+        let ready: Bool
+        let target: PlaybackMutationTarget
+    }
+
+    private var initialPositionRequest: InitialPositionRequest {
+        let current = resumeVideoId
+        let inProgress: Bool = {
+            guard let current, !localWatched.contains(current) else { return false }
+            if profiles.activeUsesEngineHistory {
+                return (core.metaDetails?.libraryItem?.state.timeOffset ?? 0) > 0
+            }
+            return (profiles.watch[meta.id]?.timeOffsetMs ?? 0) > 0
+        }()
+        return .init(scope: episodeScope, season: season, ids: episodeIDs, eligibleIDs: eligibleEpisodeIDs,
+                     watched: localWatched, currentID: current, currentInProgress: inProgress,
+                     ready: episodeHistoryReady, target: .capture(core: core))
+    }
+
+    private struct EpisodeFocusRequest: Equatable {
+        let generation = UUID()
+        let scope: String
+        let season: Int
+        let videoID: String
+        let target: PlaybackMutationTarget
+    }
+
+    private func focusRequestIsCurrent(_ request: EpisodeFocusRequest) -> Bool {
+        pendingFocusEpisode == request && request.scope == episodeScope && request.season == season
+            && presenter.request == nil && request.target.stillOwnsCurrentContext(core: core)
+            && episodes.contains { $0.id == request.videoID }
+    }
+
+    private func requestEpisodeFocus(_ id: String) {
+        guard episodes.contains(where: { $0.id == id }) else { return }
+        pendingFocusEpisode = .init(scope: episodeScope, season: season, videoID: id, target: .capture(core: core))
+    }
+
+    private func noteEpisodeInteraction() {
+        focusInteractionGeneration &+= 1
+        initialPosition.userInteracted(scope: episodeScope, season: season)
+        pendingFocusEpisode = nil
+        didApplyInitial = true
+    }
+
+    private func selectSeason(_ selected: Int) {
+        noteEpisodeInteraction()
+        initialPosition.userInteracted(scope: episodeScope, season: selected)
+        season = selected
     }
 
     /// The engine's CURRENT resume episode id for this series (advances as continuous-play moves through
@@ -1886,6 +2087,11 @@ struct CoreSeasonedEpisodes: View {
     private func recomputeSeasons() { seasons = Array(Set(videos.map { $0.season ?? 0 })).sorted() }
     private func recomputeEpisodes() {
         episodes = videos.filter { ($0.season ?? 0) == season }.sorted { ($0.episode ?? 0) < ($1.episode ?? 0) }
+        episodeIDs = episodes.map(\.id)
+        let now = Date()
+        eligibleEpisodeIDs = Set(episodes.filter {
+            TVEpisodeInitialPositionPolicy.isEligible(releasedDate: $0.releasedDate, released: $0.released, asOf: now)
+        }.map(\.id))
     }
 
     var body: some View {
@@ -1898,10 +2104,12 @@ struct CoreSeasonedEpisodes: View {
             if !seasons.isEmpty {
                 ScrollViewReader { chips in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: Theme.Space.sm) {
+                    HStack(alignment: .center, spacing: Theme.Space.md) {
                         ForEach(seasons, id: \.self) { s in
-                            Button { season = s } label: { Text(seasonLabel(s)) }
-                                .buttonStyle(ChipButtonStyle(selected: season == s))
+                            Button { selectSeason(s) } label: { seasonPosterTile(s, selected: season == s) }
+                                .vortxCardButton(radius: Theme.Radius.chip)
+                                .accessibilityLabel(seasonLabel(s))
+                                .accessibilityAddTraits(season == s ? .isSelected : [])
                                 .focused($focusedSeason, equals: s)
                                 .id(s)
                                 .contextMenu {
@@ -1921,7 +2129,7 @@ struct CoreSeasonedEpisodes: View {
                         }
                         // The discoverable face of the bulk menu (long-pressing a season
                         // chip is the shortcut for the same actions).
-                        Button { showBulkMenu = true } label: {
+                        Button { noteEpisodeInteraction(); showBulkMenu = true } label: {
                             Image(systemName: "ellipsis")
                         }
                         .buttonStyle(ChipButtonStyle())
@@ -1938,13 +2146,23 @@ struct CoreSeasonedEpisodes: View {
                 .id(Self.seasonPickerAnchor)
                 .onChange(of: seasonFocusRequest) {
                     let selectedSeason = season
+                    let scope = episodeScope
+                    let generation = focusInteractionGeneration
                     guard seasons.contains(selectedSeason) else { return }
                     chips.scrollTo(selectedSeason, anchor: .center)
                     DispatchQueue.main.async {
+                        guard scope == episodeScope, generation == focusInteractionGeneration,
+                              selectedSeason == season else { return }
                         focusedSeason = selectedSeason
                     }
                 }
                 }
+            }
+
+            if manualWatchedAction.isRunning {
+                ProgressView("Updating watched status…").font(Theme.Typography.label)
+            } else if let error = manualWatchedAction.errorMessage {
+                Text(error).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
 
             // LAZY, not eager (FAIL-260804-09): this was a plain `VStack`, so opening a large series' detail
@@ -1955,14 +2173,17 @@ struct CoreSeasonedEpisodes: View {
             // cap or lazily build). Spacing, padding and per-row focus binding are unchanged; the `.id` is
             // added so a programmatic focus request can scroll its row into existence first.
             ScrollViewReader { rows in
-                LazyVStack(spacing: Theme.Space.sm) {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(Self.episodeCardWidth), spacing: Theme.Space.lg, alignment: .top),
+                                         count: Self.episodeColumns),
+                          alignment: .leading, spacing: Theme.Space.lg) {
                     ForEach(Array(episodes.enumerated()), id: \.element.id) { index, v in
                         let row = episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)
-                        if TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index) {
-                            // The first row is the list's sole upward boundary. Its handler also gives Down
-                            // an explicit second-row target, so registering an Up handler cannot swallow the
-                            // first native downward list movement. Every deeper row has no move-command owner.
-                            row.modifier(DetailMoveCommandHandler(action: episodeMoveHandler()))
+                        if TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index, columns: Self.episodeColumns) {
+                            // The grid's first row is its sole upward boundary. Each first-row card routes every
+                            // direction explicitly (Up to the season posters, Down to the card below, Left/Right
+                            // along the row), so a registered handler cannot swallow a native move. Every deeper
+                            // card has no move-command owner and keeps tvOS's native grid navigation.
+                            row.modifier(DetailMoveCommandHandler(action: episodeMoveHandler(from: index)))
                         } else {
                             row
                         }
@@ -1973,9 +2194,11 @@ struct CoreSeasonedEpisodes: View {
                 // built window, then seat focus one runloop later, once it exists. tvOS keeps the row centred
                 // from there exactly as focus auto-scroll used to.
                 .onChange(of: pendingFocusEpisode) {
-                    guard let target = pendingFocusEpisode else { return }
+                    guard let request = pendingFocusEpisode, focusRequestIsCurrent(request) else { return }
+                    let target = request.videoID
                     rows.scrollTo(target, anchor: .center)
                     DispatchQueue.main.async {
+                        guard focusRequestIsCurrent(request) else { return }
                         focusedEpisode = target
                         // VERIFY, then retry ONCE. Seating focus is a REQUEST: tvOS refuses it for a row the
                         // lazy stack has not built yet (a far-off season jump can need more than one turn to
@@ -1985,11 +2208,11 @@ struct CoreSeasonedEpisodes: View {
                         // reconciles the request after this one. Bounded at a single retry, never a loop.
                         DispatchQueue.main.async {
                             // A newer request owns the seat now: leave it alone.
-                            guard pendingFocusEpisode == target else { return }
+                            guard focusRequestIsCurrent(request) else { return }
                             if focusedEpisode == target { pendingFocusEpisode = nil; return }
                             rows.scrollTo(target, anchor: .center)
                             DispatchQueue.main.async {
-                                guard pendingFocusEpisode == target else { return }
+                                guard focusRequestIsCurrent(request) else { return }
                                 focusedEpisode = target
                                 // Fail-open (MIS-260731-03): give up here whatever happens. Focus stays wherever
                                 // tvOS put it - the grid is still fully usable - rather than looping on a row
@@ -2002,6 +2225,55 @@ struct CoreSeasonedEpisodes: View {
             }
         }
         .onAppear { applyPreferredSeason() }
+        .task(id: meta.id) {
+            seasonPosters = [:]
+            let id = meta.id
+            let posters = await TMDBClient.seasonPosters(metaID: id)
+            guard !Task.isCancelled, meta.id == id else { return }
+            seasonPosters = posters
+        }
+        // Per-episode scores (IMDb, TMDB, Trakt) for the season on screen: the card's plate and Top rated.
+        .task(id: "\(meta.id)#\(season)") {
+            let id = meta.id, shown = season
+            let scores = await TMDBClient.seasonEpisodeScores(metaID: id, season: shown)
+            guard !Task.isCancelled, meta.id == id, season == shown else { return }
+            episodeRatings = EpisodeRatingsState(season: shown, byEpisode: scores,
+                                                 top: TMDBClient.topRatedEpisodes(scores.compactMapValues(\.headline)))
+        }
+        .task(id: initialPositionRequest) {
+            let request = initialPositionRequest
+            await Task.yield()
+            guard !Task.isCancelled, request.scope == episodeScope, request.season == season,
+                  presenter.request == nil, request.target.stillOwnsCurrentContext(core: core),
+                  let index = initialPosition.claim(scope: request.scope, season: request.season,
+                    ids: request.ids, eligibleIDs: request.eligibleIDs, watched: request.watched,
+                    currentID: request.currentID, currentInProgress: request.currentInProgress,
+                    ready: request.ready) else { return }
+            didApplyInitial = true
+            requestEpisodeFocus(request.ids[index])
+        }
+        .onChange(of: focusedEpisode) {
+            guard let id = focusedEpisode, id != pendingFocusEpisode?.videoID else { return }
+            noteEpisodeInteraction()
+        }
+        .onChange(of: focusedSeason) {
+            if focusedSeason != nil { noteEpisodeInteraction() }
+        }
+        .onDisappear {
+            focusInteractionGeneration &+= 1
+            manualWatchedAction.cancel()
+            pendingFocusEpisode = nil
+            initialPosition.userInteracted(scope: episodeScope, season: season)
+        }
+        .onChange(of: episodeScope) {
+            focusInteractionGeneration &+= 1
+            manualWatchedAction.cancel()
+            pendingFocusEpisode = nil
+            didApplyInitial = false
+            applyPreferredSeason()
+        }
+        .onChange(of: episodeHistoryReady) { applyPreferredSeason() }
+        .onChange(of: initialSeason) { applyPreferredSeason() }
         // #7: when the player closes, continuous-play may have advanced to a LATER episode (even a later
         // season). The detail page stays mounted behind the player, so this panel keeps the season/focus it
         // launched from. On close, jump to the episode the engine now resumes at: switch season if it moved,
@@ -2050,7 +2322,18 @@ struct CoreSeasonedEpisodes: View {
         // is lazy now, so episode 200 of a season is not built until it is scrolled to, and a focus binding
         // pointed at a row that does not exist is dropped on the floor. The async hop still lets the season
         // switch above rebuild `episodes` first.
-        DispatchQueue.main.async { pendingFocusEpisode = id }
+        let scope = episodeScope
+        let target = PlaybackMutationTarget.capture(core: core)
+        let selectedSeason = season
+        let generation = focusInteractionGeneration
+        initialPosition.userInteracted(scope: scope, season: season)
+        didApplyInitial = true
+        DispatchQueue.main.async {
+            guard scope == episodeScope, selectedSeason == season, generation == focusInteractionGeneration,
+                  presenter.request == nil,
+                  target.stillOwnsCurrentContext(core: core) else { return }
+            requestEpisodeFocus(id)
+        }
     }
 
     /// Resolve and apply the preferred season, re-applying the Continue-Watching `initialSeason` hint until it
@@ -2059,7 +2342,7 @@ struct CoreSeasonedEpisodes: View {
     /// survive the common case where a large series' episode list streams in after the panel first appears.
     private func applyPreferredSeason() {
         recomputeSeasons()
-        if !didApplyInitial {
+        if !didApplyInitial, episodeHistoryReady {
             let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
             if seasons.contains(preferred) {
                 season = preferred   // triggers onChange(season) -> didApplyInitial = true
@@ -2073,7 +2356,10 @@ struct CoreSeasonedEpisodes: View {
     }
 
     private var firstUnwatchedSeason: Int? {
-        let ordered = videos
+        let now = Date()
+        let ordered = videos.filter {
+            TVEpisodeInitialPositionPolicy.isEligible(releasedDate: $0.releasedDate, released: $0.released, asOf: now)
+        }
             .sorted {
                 let leftSeason = $0.season ?? 0
                 let rightSeason = $1.season ?? 0
@@ -2084,7 +2370,7 @@ struct CoreSeasonedEpisodes: View {
                 return $0.id < $1.id
             }
         return EpisodeDefaultSelectionPolicy.firstUnwatched(in: ordered, season: { $0.season },
-                                                             isWatched: { watched.contains($0.id) })?.season
+                                                             isWatched: { localWatched.contains($0.id) })?.season
     }
 
     /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it is
@@ -2097,12 +2383,14 @@ struct CoreSeasonedEpisodes: View {
     /// The only row-level handler belongs to row zero. Its two owned directions have explicit destinations:
     /// Up returns to the selected season chip, while Down seats focus on row one by its stable CoreVideo id. This does
     /// not rely on `onMoveCommand` propagation semantics for the first downward list movement.
-    private func episodeMoveHandler() -> ((MoveCommandDirection) -> Void)? {
+    private func episodeMoveHandler(from index: Int) -> ((MoveCommandDirection) -> Void)? {
         return { direction in
+            noteEpisodeInteraction()
             switch TVDetailEpisodeListFocusPolicy.destination(
                 for: direction,
-                fromEpisodeIndex: 0,
-                episodeCount: episodes.count
+                fromEpisodeIndex: index,
+                episodeCount: episodes.count,
+                columns: Self.episodeColumns
             ) {
             case .seasonPicker:
                 guard !seasons.isEmpty else { return }
@@ -2123,51 +2411,79 @@ struct CoreSeasonedEpisodes: View {
         return NavigationLink {
             // `orderedEpisodes` (sorted once by the page), NOT the computed `meta.orderedEpisodes`: this
             // destination is built eagerly for every row on every body evaluation. ALL seasons → cross-season auto-advance.
-            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: orderedEpisodes)
+            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: orderedEpisodes,
+                               initialTraktSessionID: initialTraktSessionID,
+                               initialContinueWatchingIntent: initialContinueWatchingIntent,
+                               initialTraktNextEpisodeOffer: initialTraktNextEpisodeOffer)
         } label: {
-            HStack(alignment: .top, spacing: Theme.Space.md) {
-                thumbnail(v, isWatched: isWatched, progress: progress)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        if isWatched {
-                            Image(systemName: "checkmark.circle.fill").font(.callout).foregroundStyle(Theme.Palette.accent)
-                        }
-                        Text("\(v.episode ?? 0). \(episodeTitle(v))")
-                            .font(Theme.Typography.cardTitle)
-                            .foregroundStyle(isWatched ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
-                            .lineLimit(2)
-                    }
-                    if let released = v.released, released.count >= 10 {
-                        Text(String(released.prefix(10))).font(.system(size: 16)).foregroundStyle(Theme.Palette.textTertiary)
-                    }
-                    if spoilerVeiled(v, isWatched: isWatched) {
-                        // Synopsis withheld until this row is focused (spoiler-safe mode). Focusing the row
-                        // reveals it (below); peripheral rows read as hidden.
-                        Label("Focus to reveal", systemImage: "eye.slash")
-                            .font(.system(size: 18)).foregroundStyle(Theme.Palette.textTertiary)
-                            .accessibilityLabel("Description hidden")
-                    } else if let overview = v.overview, !overview.isEmpty {
-                        Text(overview).font(.system(size: 18)).foregroundStyle(Theme.Palette.textSecondary)
-                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                Spacer(minLength: 0)
+            // The glass episode card (2026-10-15): the still, glass chips, the frosted panel below.
+            let hidden = spoilerVeiled(v, isWatched: isWatched)
+            let number = v.episode ?? 0
+            let rated = episodeRatings.season == (v.season ?? season)
+            GlassEpisodeCard(
+                model: .init(number: number, title: episodeTitle(v),
+                             overview: hidden ? nil : v.overview,
+                             spoilerHint: hidden ? String(localized: "Focus to reveal") : nil,
+                             runtime: meta.runtime, aired: EpisodeAirDate.short(v.released),
+                             isWatched: isWatched, isUpNext: v.id == upNextEpisodeID, progress: progress,
+                             scores: rated ? episodeRatings.byEpisode[number]?.ratings : nil,
+                             topRated: rated && episodeRatings.top.contains(number)),
+                width: Self.episodeCardWidth,
+                artwork: AnyView(thumbnail(v, isWatched: isWatched, progress: progress, cardArt: true)),
+                tenFoot: true)
+            .overlay {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .strokeBorder(Theme.Palette.accent, lineWidth: focusedEpisode == v.id ? 4 : 0)
             }
-            .padding(Theme.Space.md)
         }
-        .buttonStyle(RowFocusStyle())
+        .buttonStyle(CardFocusStyle(scale: 1.04))
+        .disabled(initialTraktNextEpisodeOffer.map {
+            $0.target.videoID != v.id || v.season != $0.target.season || v.episode != $0.target.episode
+        } ?? false)
         .contextMenu {
             Button(isWatched ? "Mark as Unwatched" : "Mark as Watched") {
-                core.markVideoWatched(v, !isWatched, expected: detailTarget)
+                markEpisodeWatched(v, isWatched: isWatched)
             }
+            .disabled(manualWatchedAction.isRunning)
         }
     }
 
-    private func thumbnail(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
+    private func markEpisodeWatched(_ video: CoreVideo, isWatched: Bool) {
+        noteEpisodeInteraction()
+        let target = PlaybackMutationTarget.capture(core: core)
+        let expected = detailTarget
+        let profileID = profiles.activeID
+        let isCurrent = { [profiles, core] in
+            profiles.activeID == profileID && target.stillOwnsCurrentContext(core: core)
+                && core.metaDetails?.meta?.id == expected.id && core.metaDetails?.meta?.type == expected.type
+        }
+        manualWatchedAction.start(operation: { [core] in
+            guard isCurrent() else { return false }
+            do {
+                try await core.markNativeVideoWatched(video, !isWatched, expected: expected, target: target)
+                return isCurrent()
+            } catch { return false }
+        }, failureMessage: {
+            isCurrent() ? "Couldn't update watched status. Long-press the episode to try again."
+                        : "Profile or title changed. Please try again."
+        })
+    }
+
+    /// The episode the page's Play target points at: the engine's current episode while unwatched, else the
+    /// next unwatched one after it (a finished episode keeps its series as up next).
+    private var upNextEpisodeID: String? {
+        let ordered = orderedEpisodes.isEmpty ? episodes : orderedEpisodes
+        guard let current = resumeVideoId else { return ordered.first { ($0.season ?? 1) > 0 && !watched.contains($0.id) }?.id }
+        if !watched.contains(current) { return current }
+        guard let index = ordered.firstIndex(where: { $0.id == current }) else { return nil }
+        return ordered[ordered.index(after: index)...].first { !watched.contains($0.id) }?.id
+    }
+
+    @ViewBuilder private func thumbnail(_ v: CoreVideo, isWatched: Bool, progress: Double, cardArt: Bool = false) -> some View {
         // Effective spoiler-blur: the user's explicit setting wins; else the RemoteConfig fleet default
         // (`features.spoilerBlur`); else baked true, identical to shipping when no remote config is present.
-        // `_ = spoilerBlur` keeps the view observing the @AppStorage so a Settings toggle triggers a redraw.
-        _ = spoilerBlur
+        // `let _ = spoilerBlur` keeps the view observing the @AppStorage so a Settings toggle triggers a redraw.
+        let _ = spoilerBlur
         // Hide future-episode imagery until watched OR revealed. On tvOS the reveal is FOCUS, and only in the
         // new spoiler-safe mode: gating focus-reveal on `spoilerSafe` keeps the legacy thumbnail-blur setting
         // behaving exactly as shipped (blurred regardless of focus) when the new mode is off.
@@ -2177,8 +2493,20 @@ struct CoreSeasonedEpisodes: View {
         // uncompressed) on the main thread and keeps it at full resolution behind a 300x170 frame. Shared
         // through PosterImageLoader instead: bounded concurrency, its own big URLCache, and an off-main
         // ImageIO downsample straight to the on-screen size, so only the pixels actually drawn are resident.
-        return EpisodeThumbImage(url: v.thumbnail, fallbackURLs: [meta.background, meta.poster])
-        .frame(width: 300, height: 170)
+        if cardArt {
+            // The glass card draws its own chips, progress bar and clip: only the art, spoiler-blurred.
+            EpisodeThumbImage(url: v.thumbnail, fallbackURLs: [meta.background, meta.poster])
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .blur(radius: blurArt ? 20 : 0)
+                .overlay {
+                    if blurArt {
+                        Image(systemName: "eye.slash.fill").font(.title2).foregroundStyle(.white.opacity(0.85)).shadow(radius: 3)
+                    }
+                }
+        } else {
+        EpisodeThumbImage(url: v.thumbnail, fallbackURLs: [meta.background, meta.poster])
+        .frame(maxWidth: .infinity)
+        .aspectRatio(16 / 9, contentMode: .fit)
         .blur(radius: blurArt ? 20 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
         .overlay {
@@ -2197,7 +2525,7 @@ struct CoreSeasonedEpisodes: View {
                 ProgressStripe(value: progress).padding(Theme.Space.xs)
             }
         }
-        .opacity(isWatched ? 0.55 : 1)
+        .opacity(isWatched ? 0.55 : 1)        }
     }
 
     private func episodeProgress(_ v: CoreVideo) -> Double {
@@ -2219,6 +2547,48 @@ struct CoreSeasonedEpisodes: View {
         return title.isEmpty ? "Episode \(v.episode ?? 0)" : title
     }
     private func seasonLabel(_ s: Int) -> String { s == 0 ? "Specials" : "Season \(s)" }
+
+    /// One season as its poster (the series poster stands in where TMDB has none, numbered so the tiles
+    /// differ), ringed in ember while selected and checked when every episode in it is watched.
+    private func seasonPosterTile(_ s: Int, selected: Bool) -> some View {
+        let width = Self.seasonPosterWidth
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous)
+        let inSeason = videos.filter { ($0.season ?? 0) == s }
+        let complete = !inSeason.isEmpty && inSeason.allSatisfy { watched.contains($0.id) }
+        return VStack(alignment: .leading, spacing: Theme.Space.xs) {
+            EpisodeThumbImage(url: seasonPosters[s], fallbackURLs: [meta.poster])
+                .frame(width: width, height: width * 1.5)
+                .overlay(alignment: .bottomLeading) {
+                    if seasonPosters[s] == nil {
+                        Text(s == 0 ? "SP" : "\(s)")
+                            .font(Theme.Typography.sectionTitle.weight(.heavy))
+                            .foregroundStyle(.white)
+                            .padding(Theme.Space.sm)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(LinearGradient(colors: [.clear, .black.opacity(0.75)],
+                                                       startPoint: .top, endPoint: .bottom))
+                    }
+                }
+                .clipShape(shape)
+                .overlay(shape.strokeBorder(selected ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.08),
+                                            lineWidth: selected ? 3 : 1))
+                .overlay(alignment: .topTrailing) {
+                    if complete {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.title3)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, Theme.Palette.accent)
+                            .padding(8)
+                    }
+                }
+                .opacity(selected ? 1 : 0.7)
+            Text(seasonLabel(s))
+                .font(Theme.Typography.label.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
+                .lineLimit(1)
+        }
+        .frame(width: width, alignment: .leading)
+    }
 }
 
 /// One episode still, decoded through the shared `PosterImageLoader` (bounded concurrency, dedicated
@@ -2285,11 +2655,12 @@ struct CoreEpisodeStreams: View {
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var initialTraktNextEpisodeOffer: TraktNextEpisodeOffer? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
     @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (binge-advance refresh)
-    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+    @ReducedMotion private var accessibilityReduceMotion
 
     // The episode this page currently SHOWS. Seeded from the pushed `video`, but re-pointed on player dismissal
     // when continuous play advanced past it: this page stays mounted behind the player (no onAppear re-fires), so
@@ -2309,7 +2680,8 @@ struct CoreEpisodeStreams: View {
         episodes: [CoreVideo] = [],
         initialStartAtSeconds: Double? = nil,
         initialTraktSessionID: TraktSessionID? = nil,
-        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil,
+        initialTraktNextEpisodeOffer: TraktNextEpisodeOffer? = nil
     ) {
         self.meta = meta
         self.video = video
@@ -2318,6 +2690,7 @@ struct CoreEpisodeStreams: View {
         self.initialStartAtSeconds = initialStartAtSeconds
         self.initialTraktSessionID = initialTraktSessionID
         self.initialContinueWatchingIntent = initialContinueWatchingIntent
+        self.initialTraktNextEpisodeOffer = initialTraktNextEpisodeOffer
         _currentVideo = State(initialValue: video)
     }
 
@@ -2344,6 +2717,16 @@ struct CoreEpisodeStreams: View {
 
     /// The season the page shows: follows `currentVideo` so a cross-season binge advance re-labels correctly.
     private var shownSeason: Int { currentVideo.season ?? season }
+
+    private var offeredVideoIsCurrent: Bool {
+        guard let offer = initialTraktNextEpisodeOffer else { return true }
+        guard offer.isCurrent(), initialTraktSessionID == offer.sessionID,
+              initialContinueWatchingIntent == offer.intent,
+              meta.id == offer.target.metaID, meta.type == offer.target.type,
+              let matched = offer.matchingVideo(details: core.metaDetails) else { return false }
+        return matched.id == currentVideo.id && matched.season == currentVideo.season
+            && matched.episode == currentVideo.episode
+    }
 
     private func moveToEpisodeTop(using proxy: ScrollViewProxy) {
         // Keep programmatic episode-top recovery deterministic without animating for users who
@@ -2420,6 +2803,7 @@ struct CoreEpisodeStreams: View {
                                    initialStartAtSeconds: initialStartAtSeconds,
                                    initialTraktSessionID: initialTraktSessionID,
                                    initialContinueWatchingIntent: initialContinueWatchingIntent,
+                                   initialTraktNextEpisodeOffer: initialTraktNextEpisodeOffer,
                                    onDetailMove: { direction, region in
                                        guard direction == .up,
                                              TVDetailActionFocusPolicy.destination(
@@ -2431,6 +2815,7 @@ struct CoreEpisodeStreams: View {
                                    },
                                    // Re-find sources: same per-episode stream args this page's loadMeta uses.
                                    performRefindLoad: {
+                                       guard offeredVideoIsCurrent else { return }
                                        core.refindSources(type: "series", id: meta.id,
                                                           streamType: "series", streamId: currentVideo.id)
                                    })
@@ -2441,7 +2826,13 @@ struct CoreEpisodeStreams: View {
         }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onAppear { core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: currentVideo.id) }
+        .onAppear {
+            guard offeredVideoIsCurrent else { return }
+            core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: currentVideo.id)
+        }
+        .onDisappear {
+            if initialTraktNextEpisodeOffer != nil { episodeTargetGeneration &+= 1 }
+        }
         // Binge-advance refresh: when the player closes, continuous play may have advanced past the episode this
         // page launched from. Follow the engine's resume episode so the page (title, backdrop, meta, and the
         // Watch-Now PlaybackMeta) shows the CURRENT episode, and re-point meta_details at it so a second Watch-Now
@@ -2467,6 +2858,7 @@ struct CoreEpisodeStreams: View {
     /// the live player's engine slot alone) and on a real move to a known episode, so a no-op close
     /// (paused, same episode) leaves the page untouched.
     private func reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
+        guard initialTraktNextEpisodeOffer == nil else { return }
         let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
         let attempted = preferPlaybackCloseReceipt ? presenter.playbackCloseAttempt : nil
         guard presenter.request == nil,
@@ -2523,7 +2915,8 @@ struct FullBleedBackdrop: View {
             for: .tvOS,
             displayLongEdge: Int(max(bounds.width, bounds.height))
         )
-        return allowsUltraHD ? requested : min(requested, HeroArtworkQualityPolicy.fullHDLongEdge)
+        // Settings > Effects and performance can cap hero art at 1080p even on a 4K display.
+        return allowsUltraHD && !VisualEffects.hdArtworkOnly ? requested : min(requested, HeroArtworkQualityPolicy.fullHDLongEdge)
     }
 
     private var artworkCandidates: [String] {
@@ -2599,6 +2992,7 @@ struct CoreStreamList: View {
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var initialTraktNextEpisodeOffer: TraktNextEpisodeOffer? = nil
     /// Optional detail action supplied by the mounting page (the movie trailer). It joins the secondary
     /// row so every action remains in one of the two semantic focus sections instead of forming a stray
     /// third row above the source controls. `AnyView` keeps this view's generic surface unchanged for the
@@ -2742,6 +3136,8 @@ struct CoreStreamList: View {
     /// state, then Unload -> Load the engine meta (via `performRefindLoad`) so expired sources are replaced. A
     /// plain re-Load would be an engine eq_update no-op; the Unload -> Load is what re-queries the add-ons.
     private func refindSources() {
+        if initialTraktNextEpisodeOffer != nil,
+           !targetIsCurrent(videoID: episodeStreamId, generation: episodeTargetGeneration) { return }
         guard refindEnabled else { return }
         torboxSearch.invalidateCachedResult(for: auxiliaryTarget)
         mediaServers.invalidateCache()
@@ -2755,6 +3151,7 @@ struct CoreStreamList: View {
     /// (via `engineResumeSeconds`), the overlay's own entry otherwise (via `ProfileStore.resumeOffset`).
     /// Suppressed for live channels (they no-op resume). Read-only; writes nothing.
     private var resumeSeconds: Double? {
+        guard initialTraktNextEpisodeOffer == nil else { return nil }
         guard let meta, !isLive else { return nil }
         let secs = core.engineResumeSeconds(for: meta) ?? ProfileStore.shared.resumeOffset(for: meta)
         return secs >= 1 ? secs : nil
@@ -2775,6 +3172,7 @@ struct CoreStreamList: View {
     /// authority. All policy lives in `TraktPlaybackShadow`, shared with iOS so the two cannot drift.
     /// Suppressed for live channels, which have no resume point to offer.
     private var traktSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? {
+        guard initialTraktNextEpisodeOffer == nil else { return nil }
         guard let meta, !isLive else { return nil }
         return TraktPlaybackShadow.shared.suggestion(for: meta,
                                                      localSeconds: resumeSeconds,
@@ -2847,6 +3245,10 @@ struct CoreStreamList: View {
         // the list + focus target restore unchanged when the player closes (presenter.request flips back to nil).
         if presenter.request != nil {
             return AnyView(Color.clear.frame(minHeight: 1))
+        }
+        if initialTraktNextEpisodeOffer != nil,
+           !targetIsCurrent(videoID: episodeStreamId, generation: episodeTargetGeneration) {
+            return AnyView(Text("This episode offer is no longer current. Return to Home to refresh."))
         }
         // Per-series quality memory: bias Watch Now toward the quality signature of
         // whatever this title played last (per profile), so a series you watch in a
@@ -3210,7 +3612,8 @@ struct CoreStreamList: View {
         // then routes through the EXISTING `playBest` auto-pick. Fires once; a manual pick (presenter.request
         // set) or backing out cancels/short-circuits it, leaving the full list.
         .task {
-            guard SourcePreferences.shared.autoPickBest,
+            guard initialTraktNextEpisodeOffer == nil,
+                  SourcePreferences.shared.autoPickBest,
                   meta?.usesSeriesLifecycle == true,
                   !didAutoPick else { return }
             var step = 0
@@ -3392,6 +3795,15 @@ struct CoreStreamList: View {
 
     private func targetIsCurrent(videoID: String?, generation: Int) -> Bool {
         guard initialContinueWatchingIntent?.isCurrent() != false else { return false }
+        if let offer = initialTraktNextEpisodeOffer {
+            guard !Task.isCancelled, offer.isCurrent(), initialTraktSessionID == offer.sessionID,
+                  initialContinueWatchingIntent == offer.intent, let meta,
+                  meta.libraryId == offer.target.metaID, meta.type == offer.target.type,
+                  meta.videoId == offer.target.videoID, videoID == offer.target.videoID,
+                  meta.season == offer.target.season, meta.episode == offer.target.episode,
+                  let matched = offer.matchingVideo(details: core.metaDetails),
+                  matched.id == meta.videoId else { return false }
+        }
         if let episodeTargetIsCurrent {
             return episodeTargetIsCurrent(videoID, generation)
         }
@@ -3784,6 +4196,9 @@ struct CoreStreamList: View {
         fromStart: Bool,
         resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
     ) -> AccountBoundResumeProposal<TraktSessionID> {
+        if initialTraktNextEpisodeOffer != nil {
+            return AccountBoundResumeProposal(seconds: nil, expectedSessionID: nil, consumesInitial: false)
+        }
         if fromStart {
             return AccountBoundResumeProposal(
                 seconds: nil,
@@ -3826,7 +4241,7 @@ struct CoreStreamList: View {
         // source, resume THAT source directly - reresolve a fresh link for the same file - instead of
         // re-running source selection across every add-on (the "Tried N sources / this source didn't load"
         // failure). Only when the stored source is genuinely gone do we drop to the auto-pick race below.
-        if let m = meta,
+        if initialTraktNextEpisodeOffer == nil, let m = meta,
            let entry = LastStreamStore.entry(for: m.libraryId, profileID: ProfileStore.shared.activeID),
            entry.debridService != nil, let hash = entry.infoHash, !hash.isEmpty,
            // Movie: always this title. Series: only when the stored episode is the one being played.
@@ -4082,7 +4497,9 @@ struct CoreStreamList: View {
            ) {
             ForEach(ExternalPlayers.detected()) { player in
                 Button("Play in \(player.name)") {
-                    ExternalPlayers.open(url, in: player, metadata: meta)
+                    if initialTraktNextEpisodeOffer != nil,
+                       !targetIsCurrent(videoID: episodeStreamId, generation: episodeTargetGeneration) { return }
+                    ExternalPlayers.open(url, in: player, metadata: meta, durationSeconds: traktDurationSeconds)
                 }
             }
         }
@@ -4309,20 +4726,45 @@ private struct TVDetailActionRow<Content: View>: View {
 /// across Continue Watching, catalog, and Library entrances.
 struct LibraryChip: View {
     @EnvironmentObject private var core: CoreBridge
+    @StateObject private var libraryAction = ProfileMutationPresentation()
 
     var body: some View {
         let saved = core.detailInLibrary
+        // The button stays the root view so the caller's focus wrapper keeps attaching to it.
         Button {
-            if saved {
-                core.removeDetailFromLibrary()   // removes from library + mirrors to external watchlists
-            } else {
-                core.addDetailToLibrary()
+            // The acknowledged native path, as on iPhone and iPad: the change is saved first, then mirrored
+            // to Trakt/SIMKL watchlists, and only while this profile and title still own the gesture.
+            let target = PlaybackMutationTarget.capture(core: core)
+            let profileID = ProfileStore.shared.activeID
+            let meta = core.metaDetails?.meta
+            let isCurrent = {
+                ProfileStore.shared.activeID == profileID && target.stillOwnsCurrentContext(core: core)
+                    && core.metaDetails?.meta?.id == meta?.id && core.metaDetails?.meta?.type == meta?.type
             }
+            libraryAction.start(operation: {
+                guard isCurrent(), let meta else { return false }
+                do {
+                    try await core.setNativeLibraryMembership(
+                        id: meta.id, type: meta.type, name: meta.name, poster: meta.poster,
+                        present: !saved, target: target)
+                    return isCurrent()
+                } catch { return false }
+            }, failureMessage: {
+                isCurrent() ? "Couldn't update Library. Please try again."
+                            : "Profile or title changed. Please try again."
+            })
         } label: {
-            Label(saved ? "In Library" : "Add to Library",
-                  systemImage: saved ? "bookmark.fill" : "bookmark")
+            if libraryAction.errorMessage != nil {
+                Label("Library: try again", systemImage: "exclamationmark.circle")
+            } else {
+                Label(saved ? "In Library" : "Add to Library",
+                      systemImage: saved ? "bookmark.fill" : "bookmark")
+            }
         }
         .buttonStyle(ChipButtonStyle(selected: saved))
+        .disabled(libraryAction.isRunning)
+        .accessibilityHint(libraryAction.errorMessage ?? "")
+        .onDisappear { libraryAction.cancel() }
     }
 }
 
@@ -4389,7 +4831,8 @@ struct WatchlistChip: View {
 /// character beneath. Wrapped in a focusable, borderless Button so the tvOS focus engine can land on the
 /// rail and travel through it (a bare non-focusable card would block downward scrolling, the same class as
 /// issue #77's non-playable source rows). Focus lifts + brightens the photo, matching the other rails.
-private struct CastMemberCard: View {
+/// One round headshot that opens the Person page: the detail cast row and the People row in Search.
+struct CastMemberCard: View {
     let member: TMDBClient.CastMember
     @FocusState private var focused: Bool
 

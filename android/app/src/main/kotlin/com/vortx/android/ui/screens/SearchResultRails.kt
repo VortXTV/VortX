@@ -1,5 +1,18 @@
 package com.vortx.android.ui.screens
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.Column
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vortx.android.person.CastMember
+import com.vortx.android.person.PersonSeed
+import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.ui.viewmodel.PersonViewModel
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -75,12 +88,35 @@ internal fun SearchResultRails(
     } }.orEmpty()
     val collectionsLoading = snapshot?.streamingLoading == true
     val sections = searchResultSections(items)
+    // A tapped person opens their page in place of the results (back returns here); a filmography title
+    // opens through [onItem] like any other result. Mirrors Apple search pushing a `PersonRoute`.
+    var personTarget by remember { mutableStateOf<PersonSeed?>(null) }
+    LaunchedEffect(query) { personTarget = null }
+    personTarget?.let { seed ->
+        val personVm: PersonViewModel = viewModel(key = "search-person-${seed.id}", factory = PersonViewModel.Factory(seed.id))
+        BackHandler { personTarget = null }
+        PersonScreen(viewModel = personVm, seed = seed, onBack = { personTarget = null }, onOpenTitle = onItem, modifier = modifier)
+        return
+    }
+    val people = rememberPeopleResults(query)
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         state = listState,
         contentPadding = PaddingValues(vertical = VortXTheme.spacing.md),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
     ) {
+        if (people.isNotEmpty()) {
+            item("search-people") {
+                Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                    Text(
+                        text = stringResource(R.string.search_people_title),
+                        style = VortXTheme.type.sectionTitle,
+                        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                    )
+                    CastRail(people) { personTarget = it }
+                }
+            }
+        }
         items(sections.filter { it.kind != SearchResultSectionKind.OTHER }, key = { "search-rail:${it.kind}" }) { section ->
             SearchPosterResultRail(section, isLoading, onItem)
         }
@@ -125,3 +161,22 @@ private fun SearchPosterResultRail(section: SearchResultSection, isLoading: Bool
         onItem = onItem,
     )
 }
+
+/// People matching [query] (Apple `CinemaPeopleResults`), debounced with the typing: a fresh query cancels
+/// the previous lookup before it lands, and the last results stay up until the new ones arrive. Empty below
+/// two characters, where the engine does not search either.
+@Composable
+internal fun rememberPeopleResults(query: String): List<CastMember> {
+    val trimmed = query.trim()
+    val people by produceState(emptyList<CastMember>(), trimmed) {
+        if (trimmed.length < 2) {
+            value = emptyList()
+            return@produceState
+        }
+        delay(PEOPLE_SEARCH_DEBOUNCE_MS)
+        value = TMDBPersonClient.searchPeople(trimmed)
+    }
+    return people
+}
+
+private const val PEOPLE_SEARCH_DEBOUNCE_MS = 350L

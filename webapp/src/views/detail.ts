@@ -18,10 +18,13 @@ import {
 import { fetchSkipSegments } from "../lib/skip";
 import { paginateSourceRows, sourceRows } from "../lib/sourcePaging";
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf, sortedVideos } from "../lib/series";
-import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
+import { actionOf, escapeHtml, httpUrl, cssImageURL } from "../lib/dom";
 import { icon } from "../lib/icons";
-import { play, setSkipSegments, currentPlayToken } from "../lib/player";
-import { cwPosition, cwProgress, cwResumeId, inLibrary, toggleLibrary } from "../lib/store";
+import { play, setSkipSegments, currentPlayToken, close as closePlayer, isPlayerOpen } from "../lib/player";
+import { isDesktop, nativePlaybackOwned } from "../lib/desktop";
+import { playNative, releaseNative } from "../lib/nativePlayer";
+import { cwPosition, cwProgress, cwResumeId, inLibrary, toggleLibrary, hasNativeAccountProjection,
+  canEditAccountWatchlist, inAccountWatchlist, setAccountWatchlist } from "../lib/store";
 import { getSettings } from "../lib/settings";
 import { fetchRatings, ratingsText, type Ratings } from "../lib/mdblist";
 import { resolveBackendTrailer, userTrailerLang } from "../lib/trailer";
@@ -259,6 +262,9 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
         render();
       }
       return true;
+    case "toggle-account-watchlist":
+      if (state.meta) { setAccountWatchlist(state.meta, !inAccountWatchlist(state.meta.id, state.meta.type ?? "")); render(); }
+      return true;
     case "share":
       return shareTitle();
     default:
@@ -355,7 +361,7 @@ function moreLikeThis(): string {
 function detailShell(bg: string, back: string, body: string): string {
   return `
     <div class="detail detail-immersive">
-      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
+      <div class="detail-bg"${bg ? ` style="background-image:${escapeHtml(cssImageURL(bg))}"` : ""}></div>
       <div class="detail-scrim"></div>
       ${back}
       <div class="detail-body">${body}</div>
@@ -728,9 +734,13 @@ function trailerButton(): string {
 /** Add to Library / In Library toggle (the app's wording), adding the title to the local Library. */
 function libraryButton(meta: MetaItem): string {
   const saved = inLibrary(meta.id);
-  return `<button class="chip lib-chip${saved ? " selected" : ""}" data-action="toggle-library" aria-pressed="${saved}">${
-    saved ? `${icon("bookmarkFill")}<span>In Library</span>` : `${icon("bookmark")}<span>Add to Library</span>`
+  const native = hasNativeAccountProjection();
+  const local = `<button class="chip lib-chip${saved ? " selected" : ""}" data-action="toggle-library" aria-pressed="${saved}">${
+    saved ? `${icon("bookmarkFill")}<span>${native ? "Saved in this browser" : "In Library"}</span>` : `${icon("bookmark")}<span>${native ? "Save in this browser" : "Add to Library"}</span>`
   }</button>`;
+  if (!native || !["movie", "series"].includes(meta.type ?? "")) return local;
+  const listed = inAccountWatchlist(meta.id, meta.type!);
+  return local + `<button class="chip${listed ? " selected" : ""}" data-action="toggle-account-watchlist" aria-pressed="${listed}"${canEditAccountWatchlist() ? "" : " disabled"}>${icon("bookmark")}<span>${listed ? "On Account Watchlist" : "Add to Account Watchlist"}</span></button>`;
 }
 
 /** Share the current title. The detail route already lives in the URL, so location.href is the link. */
@@ -788,15 +798,38 @@ function closeTrailer(): void {
 
 // ---- Playback wiring ---------------------------------------------------------------------------
 
-/** Play a stream: direct/debrid urls go straight to the player. Torrents are not playable on web. `stream`
- *  is the user's chosen source; the rest of the ranked pool becomes the ordered fallback chain the player
- *  auto-advances through on a decode / silent-audio failure (D6), with browser-decodable audio preferred. */
+/** Play a stream: direct/debrid urls go straight to the player; inside the desktop shell a torrent plays in
+ *  native mpv through the embedded VortX streaming server. `stream` is the user's chosen source; the rest of
+ *  the ranked pool becomes the ordered fallback chain the player auto-advances through on a decode /
+ *  silent-audio failure (D6), with browser-decodable audio preferred. */
 async function playStream(stream: Stream): Promise<void> {
-  if (!stream.url || !/^https?:\/\//i.test(stream.url)) return;
   const episode = state?.openEpisode ?? undefined;
   const title = episode
     ? `${state?.meta?.name ?? ""} · S${episode.season ?? 0}E${episode.episode ?? 0}`
     : state?.meta?.name ?? "VortX";
+  if (isDesktop() && isTorrent(stream)) {
+    // One player at a time: the native session takes over the host from a running in-page player.
+    if (isPlayerOpen()) closePlayer();
+    const native = episode ? nextEpisode(episode) : null;
+    const nativeMeta = state?.meta;
+    await playNative(stream, title, {
+      item: nativeMeta
+        ? {
+            id: nativeMeta.id,
+            type: nativeMeta.type,
+            name: nativeMeta.name,
+            poster: nativeMeta.poster,
+            resumeId: episode?.id ?? nativeMeta.id,
+          }
+        : undefined,
+      onNextEpisode: native ? () => void playEpisodeById(native.id) : undefined,
+    });
+    return;
+  }
+  if (!stream.url || !/^https?:\/\//i.test(stream.url)) return;
+  // One player at a time: an in-page source revokes an active or pending native request (synchronously, so play()
+  // below still starts inside the click's user-activation window).
+  if (nativePlaybackOwned()) releaseNative();
 
   // Fallback chain: the chosen url first, then the decodable-audio-preferred pool (deduped). So an
   // undecodable-audio pick still starts where the user asked but can auto-advance to a source with sound.

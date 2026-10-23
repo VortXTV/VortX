@@ -25,21 +25,38 @@ set -uo pipefail
 
 ROOT="${1:-.}"
 status=0
+[ -d "$ROOT" ] || { echo "ERROR: source root is not a directory: $ROOT" >&2; exit 2; }
+SOURCE_LIST="$(mktemp)" || exit 2
+trap 'rm -f "$SOURCE_LIST"' EXIT
+if ! find "$ROOT" \
+  \( -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.ts' -o -name '*.tsx' \
+     -o -name '*.js' -o -name '*.rs' -o -name '*.yml' -o -name '*.yaml' -o -name '*.json' \
+     -o -name '*.md' -o -name '*.sh' \) -type f -print0 > "$SOURCE_LIST"; then
+  echo "ERROR: could not enumerate every source file: $ROOT" >&2
+  exit 2
+fi
 
-while IFS= read -r f; do
+while IFS= read -r -d '' f; do
   case "$f" in
     */node_modules/*|*/build/*|*/.git/*|*/Vendor/*|*/target/*|*/dist/*) continue ;;
   esac
   # Definitive: read the bytes. No regex engine, no platform flags, no silent skip.
-  if python3 -c 'import sys; sys.exit(0 if bytes([0]) in open(sys.argv[1],"rb").read() else 1)' "$f"; then
+  python3 -c 'import sys
+try: data = open(sys.argv[1],"rb").read()
+except OSError as error:
+    print(error, file=sys.stderr)
+    sys.exit(2)
+sys.exit(0 if bytes([0]) in data else 1)' "$f"
+  result=$?
+  if [ "$result" -eq 0 ]; then
     echo "ERROR: NUL byte in source file: $f"
     echo "       This makes grep silently skip the file. Use a \\uXXXX escape instead."
     status=1
+  elif [ "$result" -ne 1 ]; then
+    echo "ERROR: could not inspect source file: $f" >&2
+    exit 2
   fi
-done < <(find "$ROOT" \
-  \( -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.ts' -o -name '*.tsx' \
-     -o -name '*.js' -o -name '*.rs' -o -name '*.yml' -o -name '*.yaml' -o -name '*.json' \
-     -o -name '*.md' -o -name '*.sh' \) -type f 2>/dev/null)
+done < "$SOURCE_LIST"
 
 if [ "$status" -eq 0 ]; then
   echo "OK: no NUL bytes in source files."

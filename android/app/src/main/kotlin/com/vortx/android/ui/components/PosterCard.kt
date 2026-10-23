@@ -19,9 +19,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.MenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,6 +61,10 @@ enum class PosterCardMenu {
     CATALOG,
     CONTINUE_WATCHING,
 }
+
+/// True while a [PosterCard] draws its art at 16:9. A portrait poster cropped to 16:9 loses the baked rating
+/// block at its foot, so [PosterArt] then shows the clean poster with the live rating badge instead.
+val LocalPosterCardLandscape = staticCompositionLocalOf { false }
 
 /// The canonical poster card (DESIGN-SYSTEM.md §3 "Poster card"): 2:3 art, card radius, `rest` shadow,
 /// title below in label style. Press/focus: lift + scale(~1.03) + glow + title brightens to
@@ -159,7 +167,7 @@ fun PosterCard(
                     ) else Modifier,
                 ),
         ) {
-            art()
+            CompositionLocalProvider(LocalPosterCardLandscape provides (landscape ?: posterStyle.landscape)) { art() }
             if (watched) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
                 Icon(
@@ -257,7 +265,7 @@ internal fun PosterQuickActionMenu(
                 }
                 DropdownMenuItem(
                     text = { Text("Add to Library") },
-                    onClick = { fire { it.addToLibrary(item) } },
+                    onClick = { fire { it.saveToLibrary(item) } },
                 )
                 DropdownMenuItem(
                     text = { Text("Mark as Watched") },
@@ -279,8 +287,12 @@ internal fun PosterQuickActionMenu(
                     )
                 }
                 onRemoveFromContinueWatching?.let { remove ->
+                    // Destructive, so it sits behind a separator in the danger colour, as on Apple. It dismisses
+                    // the title from Continue Watching only; the saved Library entry and history stay.
+                    if (onDetails != null) HorizontalDivider(color = VortXTheme.colors.hairline)
                     DropdownMenuItem(
                         text = { Text("Remove from Continue Watching") },
+                        colors = MenuDefaults.itemColors(textColor = VortXTheme.colors.danger),
                         onClick = {
                             onDismiss()
                             remove()

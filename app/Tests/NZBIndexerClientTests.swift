@@ -14,6 +14,17 @@ import Foundation
         let seriesURL = try require(NZBIndexerClient.requestURL(endpoint: endpoint, apiKey: "key", search: series))
         let sq = URLComponents(url: seriesURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
         check(sq.first(where: { $0.name == "t" })?.value == "tvsearch" && sq.first(where: { $0.name == "season" })?.value == "2" && sq.first(where: { $0.name == "ep" })?.value == "7", "series coordinates")
+        for (typed, expected) in [("drunkenslug.com", "https://drunkenslug.com/api"),
+                                  ("https://ninjacentral.co.za", "https://ninjacentral.co.za/api"),
+                                  ("https://ninjacentral.co.za/", "https://ninjacentral.co.za/api"),
+                                  ("https://api.nzbgeek.info/api", "https://api.nzbgeek.info/api"),
+                                  ("https://indexer.example/newznab/api", "https://indexer.example/newznab/api")] {
+            check((try? NZBIndexerEndpointPolicy.validate(typed).get())?.absoluteString == expected,
+                  "indexer address \(typed) resolves to its Newznab API")
+        }
+        check((try? NZBIndexerEndpointPolicy.validate("http://drunkenslug.com").get()) == nil, "cleartext indexer stays rejected")
+        let bare = try require(NZBIndexerClient.requestURL(endpoint: URL(string: "https://drunkenslug.com")!, apiKey: "key", search: series))
+        check(URLComponents(url: bare, resolvingAgainstBaseURL: false)?.path == "/api", "a saved bare site address queries /api")
         let fallback = try require(NZBIndexerClient.requestURL(endpoint: endpoint, apiKey: "key", search: series, fallback: true))
         check(URLComponents(url: fallback, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "t" })?.value == "search", "generic search fallback")
         let valid = Data("<rss><channel><item><title>Movie.2026.1080p</title><enclosure url='https://index.example/get/1' length='42'/></item><item><title>bad</title><enclosure url='file:///tmp/x'/></item></channel></rss>".utf8)
@@ -31,6 +42,23 @@ import Foundation
         check(try NZBIndexerClient.parse(data: unsafe).isEmpty, "reject enclosure userinfo")
         let cleartext = Data("<rss><channel><item><title>x</title><enclosure url='http://index.example/get?apikey=secret'/></item></channel></rss>".utf8)
         check(try NZBIndexerClient.parse(data: cleartext).isEmpty, "indexer cannot downgrade a credential-bearing enclosure to HTTP")
+        // The indexer's OWN plain-http link is upgraded, never fetched in clear; another host stays rejected.
+        let own = try NZBIndexerClient.parseCounting(data: cleartext, indexerHost: "index.example")
+        check(own.releases.first?.enclosureURL.scheme == "https" && own.releases.first?.enclosureURL.host == "index.example", "same-host http link upgraded to https")
+        let foreign = try NZBIndexerClient.parseCounting(data: cleartext, indexerHost: "other.example")
+        check(foreign.releases.isEmpty && foreign.unlinked == 1, "foreign http link rejected and counted")
+        let linkOnly = Data("<rss><channel><item><title>Show.S01E02</title><link>https://index.example/getnzb/2</link></item></channel></rss>".utf8)
+        check(try NZBIndexerClient.parse(data: linkOnly).first?.enclosureURL.absoluteString == "https://index.example/getnzb/2", "item link used when there is no enclosure")
+        var latin = Data("<?xml version='1.0' encoding='iso-8859-1'?><rss><channel><item><title>Caf".utf8)
+        latin.append(0xE9)
+        latin.append(contentsOf: Data(".2026</title><enclosure url='https://index.example/get/3'/></item></channel></rss>".utf8))
+        check(try NZBIndexerClient.parse(data: latin).first?.title == "Café.2026", "ISO-8859-1 response parsed")
+        // A UTF-16 document hides its DTD from the text check; it must still be refused, never parsed.
+        let bomb = "<?xml version='1.0' encoding='UTF-16'?><!DOCTYPE rss [<!ENTITY a 'aaaaaaaaaa'><!ENTITY b '&a;&a;&a;&a;&a;'>]><rss><channel><item><title>&b;</title><enclosure url='https://index.example/get/4'/></item></channel></rss>"
+        for encoding in [String.Encoding.utf16, .utf16LittleEndian, .utf16BigEndian] {
+            do { _ = try NZBIndexerClient.parse(data: bomb.data(using: encoding)!); check(false, "UTF-16 DTD refused (\(encoding))") }
+            catch { check(true, "UTF-16 DTD refused (\(encoding))") }
+        }
         let scope = NZBIndexerStore.captureScope()
         let config = NZBIndexerConfig(id: "one", name: "One", endpoint: endpoint.absoluteString)
         check(NZBIndexerStore.save(config, apiKey: "secret", scope: scope)?.indexers.count == 1, "secure save")

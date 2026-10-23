@@ -51,13 +51,21 @@ enum VortxNativeProfileEditHost {
     static func admit(event: VortxJSON, hostPatch: VortxJSON, preferences: VortxNativeHostPreferences,
                       scope: VortxAccountScope, baseline: Baselines, committedReplay: Bool, remoteReplay: Bool = false) throws -> Admission {
         guard case .string(let eventID) = event["eventId"], case .object(let profiles) = hostPatch else { throw VortxNativeError.invalidResponse }
+        let profileKeys = try VortxNativeHostPreferences.profileKeysByCanonicalID(profiles)
+        let baseKeys: [String: String]
+        if let rawBases = event["hostBases"] {
+            guard case .object(let bases) = rawBases else { throw VortxNativeError.invalidSnapshot }
+            baseKeys = try VortxNativeHostPreferences.profileKeysByCanonicalID(bases)
+        } else { baseKeys = [:] }
+        let currentKeys = try VortxNativeHostPreferences.profileKeysByCanonicalID(preferences.local.document.profiles)
         guard !profiles.isEmpty else { return Admission(preferences: preferences, conflict: nil) }
         guard VortxNativeHostPreferences.validActor(eventID),
               let clock = try event["observedHostClock"]?.decode(UInt64.self), clock < VortxNativeHostPreferences.maxClock,
               case .object(let bases) = event["hostBases"] else { throw VortxNativeError.invalidSnapshot }
         var pending: [String: VortxJSON] = [:]
         var conflicts: [String] = []
-        for profileID in profiles.keys.sorted() {
+        for canonicalID in profileKeys.keys.sorted() {
+            let profileID = profileKeys[canonicalID]!
             guard case .object(let patch) = profiles[profileID] else { throw VortxNativeError.invalidResponse }
             var fields: [String: [String: VortxJSON]] = [:]
             for (path, value) in patch {
@@ -70,7 +78,7 @@ enum VortxNativeProfileEditHost {
             var registers: [String: VortxJSON] = [:]
             for field in fields.keys.sorted() {
                 let path = "hostBases.\(profileID).\(field)"
-                let current = preferences.local.document.profiles[profileID]?.fields[field]
+                let current = currentKeys[canonicalID].flatMap { preferences.local.document.profiles[$0]?.fields[field] }
                 // A receipt proves an earlier atomic native+host application. Its deterministic
                 // register cannot rewind a newer local/peer register during exact event replay.
                 if committedReplay, let current,
@@ -87,13 +95,13 @@ enum VortxNativeProfileEditHost {
                     guard matches else { conflicts.append(path); continue }
                     continue
                 }
-                guard let base = bases[profileID]?[field], case .object(let evidence) = base,
+                guard let baseID = baseKeys[canonicalID], let base = bases[baseID]?[field], case .object(let evidence) = base,
                       case .string(let expectedHash) = evidence["valueHash"],
                       expectedHash.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { throw VortxNativeError.invalidSnapshot }
                 let existing: VortxJSON
                 if evidence["absent"] == .bool(true) {
                     guard Set(evidence.keys) == ["absent", "valueHash"] else { throw VortxNativeError.invalidSnapshot }
-                    guard current == nil, let authenticated = baseline[profileID]?[field] else { conflicts.append(path); continue }
+                    guard current == nil, let authenticated = baseline[canonicalID]?[field] else { conflicts.append(path); continue }
                     existing = authenticated
                 } else {
                     guard Set(evidence.keys) == ["clock", "actor", "valueHash"],
@@ -115,7 +123,7 @@ enum VortxNativeProfileEditHost {
                 }
                 registers[field] = .object(["clock": .unsigned(clock + 1), "actor": .string(eventID), "value": changed])
             }
-            if !registers.isEmpty { pending[profileID] = .object(["fields": .object(registers)]) }
+            if !registers.isEmpty { pending[canonicalID] = .object(["fields": .object(registers)]) }
         }
         guard conflicts.isEmpty else { return Admission(preferences: preferences,
             conflict: Conflict(eventId: eventID, code: "host_base_changed", paths: conflicts.sorted())) }

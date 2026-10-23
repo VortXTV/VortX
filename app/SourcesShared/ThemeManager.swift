@@ -115,6 +115,13 @@ final class ThemeManager: ObservableObject {
     var accent: Color { option.base }
     var accentBright: Color { option.bright }
 
+    /// Player-only refinement of the existing Crimson selection. Palette IDs, saved profile choices,
+    /// the default VortX gold and every non-Crimson accent retain their existing values.
+    var playerGlassUsesCrimson: Bool { accentID == "crimson" }
+    var playerGlassAccent: Color {
+        playerGlassUsesCrimson ? themeRGB(0.706, 0.075, 0.208) : accent // #B41335
+    }
+
     /// Ink that sits ON the accent fill, primary-button labels (Watch/Play/Save/Sign In), on-accent
     /// spinners, the profile "current" check. It was a hardcoded warm-brown literal, so it kept an
     /// orange cast on top of ANY accent, the "still looks orange after switching to pink" report.

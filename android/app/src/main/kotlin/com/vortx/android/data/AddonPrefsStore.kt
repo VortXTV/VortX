@@ -11,7 +11,7 @@ import org.json.JSONArray
 ///     `vortx.sync.appliedAddonOrder`): the user's PRIORITY order of installed add-on transport
 ///     URLs, written by the Add-ons screen's drag-reorder. A reorder never rewrites the engine's
 ///     `profile.addons` Vec (same on Apple); it is a display/pick-order overlay consumed by
-///     [com.vortx.android.engine.EngineStremioRepository.installedAddons] (list order) and
+///     [com.vortx.android.engine.NativeCatalogRepository.installedAddons] (list order) and
 ///     [com.vortx.android.engine.EngineState.parseMetaDetail] via [AddonOrder.pickByAddonOrder]
 ///     (the #144 localized-meta pick). It is account-scoped: a VortX account's priority must not
 ///     become the next account's display or source-selection order on the same device. Signed-out

@@ -29,7 +29,7 @@ import java.util.UUID
 
 /// Android + Android TV entry point. The five-tab Compose shell in [VortXApp] matches the iOS and
 /// Apple TV structure. It now runs on the shared stremio-core engine (over JNI, the same engine the
-/// iOS/tvOS apps use) via [com.vortx.android.engine.EngineStremioRepository]; the libmpv player
+/// iOS/tvOS apps use) via [com.vortx.android.engine.NativeCatalogRepository]; the libmpv player
 /// drops in behind the same seam. The repository itself is owned by [VortXApplication] (constructed
 /// once per process, not per Activity instance) -- see that class's doc comment for why that matters
 /// (engine double-init / event-listener orphaning safety across Activity recreation).

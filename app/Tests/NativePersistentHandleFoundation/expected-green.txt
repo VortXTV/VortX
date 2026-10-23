@@ -1,0 +1,15 @@
+START foundation legacy-generation
+PASS foundation legacy-generation
+START foundation reservation-busy
+PASS foundation reservation-busy
+START foundation throw-lifetime
+PASS foundation throw-lifetime
+START foundation reentry-gap
+PASS foundation reentry-gap
+START foundation gate-lifecycle
+PASS foundation gate-lifecycle
+START foundation gate-aba
+PASS foundation gate-aba
+START foundation exact-comparator
+PASS foundation exact-comparator
+PASS foundation groups=7 integration=UNWIRED sdk=UNPROVEN

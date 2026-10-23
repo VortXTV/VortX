@@ -79,17 +79,17 @@ class PlaybackResolveFenceTest {
     @Test
     fun `best source resolver publishes only through its own playback lease`() {
         val best = resolverBody(
-            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?)",
+            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true)",
             "/// Race the account-confirmed-cached",
         )
 
-        assertResolverUsesItsOwnLease(best, expectedPublicationCount = 6)
+        assertResolverUsesItsOwnLease(best, expectedPublicationCount = 2)
     }
 
     @Test
     fun `best source resolver rejects a publication through a different lease`() {
         val best = resolverBody(
-            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?)",
+            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true)",
             "/// Race the account-confirmed-cached",
         )
         val oneDifferentLease = best.replaceFirst(
@@ -97,7 +97,7 @@ class PlaybackResolveFenceTest {
             "publishPlaybackResolve(differentLease",
         )
 
-        assertFalse(publicationsUseExactLease(oneDifferentLease, expectedPublicationCount = 6))
+        assertFalse(publicationsUseExactLease(oneDifferentLease, expectedPublicationCount = 2))
     }
 
     private fun assertResolverUsesItsOwnLease(body: String, expectedPublicationCount: Int) {

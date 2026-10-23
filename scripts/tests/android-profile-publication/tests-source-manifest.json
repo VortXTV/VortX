@@ -1,0 +1,15 @@
+{
+  "baseHead": "f90a2c413efde22c22ca6ad732f2e56c828be21f",
+  "historicalPatchSha256": "2f5854a16b69f4c1ace9873430388c6932b9ab254881142b2ecab8f2a639c1dd",
+  "scope": "reviewed single-read boundary plus initial provider-value reuse; no test execution implied",
+  "hashes": {
+    "constructor": "bd65ef27f86e5f2cdc7e1c8443595b4d1594671330b591ea18af535871b0e2b2",
+    "read": "56fbaad3cd38f194691fe3ec2b8d53c44d29d8056f23504f7d053e7931354a82",
+    "withProjection": "367338222b306d4d74761765c9c1b3e61c1be1bb01445a934a4fcb66f2e35876",
+    "storeBoundary": "121bb8635e23bc07ddacc47a7f8b0cbeeb27f4eb6a49fdb86eab35ac06777c28",
+    "owned": "742c349b7730c8756dd06a55df06fc3a9d6b846c10407532725d0964edb49e36",
+    "currentRead": "e6e2a4603b9c5e00b98e3dc27ff8e2c7999ef40f8e6edc0d5284d5ee838e2e36",
+    "gateway": "8653b083f766f90f754435780b9088eec88e876b108f5f28eafd35092faf4abd",
+    "cwGate": "81f491a0e7af9915627818fbff3e02f2494feb56767aae89d814c2ad02fb4d11"
+  }
+}

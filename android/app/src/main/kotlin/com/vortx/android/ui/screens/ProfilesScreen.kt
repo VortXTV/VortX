@@ -26,6 +26,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,8 +45,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
+import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.profile.captureProfileSelection
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.screens.profiles.ProfileAccentSection
 import com.vortx.android.ui.screens.profiles.ProfileBackgroundSection
@@ -54,6 +58,7 @@ import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
+import kotlinx.coroutines.CancellationException
 
 /// Settings > Profiles: the "Who's watching?" switcher plus create / rename / delete, the Android port of
 /// the Apple `ProfilePickerView` + `ProfileEditorView` (`app/SourcesShared/ProfilesView.swift`).
@@ -67,8 +72,7 @@ import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 ///
 /// NEVER-POISON: switching to a non-owner profile only moves the active selection + swaps in that profile's
 /// private overlay ([ProfileStore.select] -> `overlay.activate`); it never reads or writes the account
-/// library (`EngineStremioRepository.overlayProfiles()` gates every watch path). The picker just changes who
-/// is active; the engine/library/Home refresh themselves off the switch listener + `onRebuildBoard` seam the
+/// library. The picker just changes who is active; the engine/library/Home refresh themselves off the switch listener + `onRebuildBoard` seam the
 /// store already fires.
 ///
 /// STORE OBSERVABILITY: [ProfileStore] mirrors Apple's `@Published` fields with plain main-thread fields (no
@@ -76,30 +80,37 @@ import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 /// `activeID` — the same "wrap a non-observable singleton" pattern the rest of `ui/` uses for such stores.
 ///
 /// SCOPE, honestly: a new profile is created as a SHARED profile (its own private watch history, synced
-/// through the account). Binding a profile to its OWN separate VortX/Stremio account is deferred — the
-/// per-profile token/engine-session switch is not wired on Android yet, so [ProfileStore.select] returning
-/// `SwitchAccount` / `NeedsSignIn` (only reachable for an own-account profile synced in from Apple) is
-/// surfaced as a note rather than silently half-switching the session.
+/// through the account). Binding a profile to its OWN separate VortX/Stremio account remains an account-layer
+/// concern: a successful switch is emitted as a typed [ProfileSelectionRequest] so the host can complete its
+/// exact `SwitchAccount` / `NeedsSignIn` handoff, while this settings surface never fabricates a session or
+/// silently half-switches the account.
+private data class ProfilesPinRequest(
+    val profile: UserProfile,
+    val nativeEditor: NativeStreamingAccountViewModel.Editor?,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
-    val nativeModel: NativeStreamingAccountViewModel? = if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+fun ProfilesScreen(
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+    onSelected: (ProfileSelectionRequest) -> Unit = {},
+) {
+    val nativeModel: NativeStreamingAccountViewModel? = run {
         val app = LocalContext.current.applicationContext as? VortXApplication
         val accounts = remember(app) { runCatching { app?.nativeStreamingAccounts() }.getOrNull() }
         if (accounts == null) null else viewModel(factory = NativeStreamingAccountViewModel.Creator(accounts))
-    } else null
+    }
     DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
     val nativeState = nativeModel?.state?.collectAsState()?.value
-    if (BuildConfig.NATIVE_ENGINE_ENABLED) {
-        if (nativeModel == null || nativeState == null) { ProfilesUnavailable(onBack, modifier); return }
-        nativeState.formProfile?.let { profile ->
-            NativeStreamingAccountForm(profile, nativeState, nativeModel::submit, nativeModel::close, modifier)
-            return
-        }
-        if (!nativeState.mounted) {
-            NativeStreamingSetup(nativeState, nativeModel::prepare, nativeModel::openPrepared, nativeModel::retryMigration, nativeModel::close, onBack, modifier)
-            return
-        }
+    if (nativeModel == null || nativeState == null) { ProfilesUnavailable(onBack, modifier); return }
+    nativeState.formProfile?.let { profile ->
+        NativeStreamingAccountForm(profile, nativeState, nativeModel::submit, nativeModel::close, modifier)
+        return
+    }
+    if (!nativeState.mounted) {
+        NativeStreamingSetup(nativeState, nativeModel::prepare, nativeModel::openPrepared, nativeModel::retryMigration, nativeModel::close, onBack, modifier)
+        return
     }
     val store = ProfileStore.sharedOrNull()
     if (store == null) {
@@ -111,12 +122,10 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
     // Bumped after any store mutation to force a fresh read of the plain (non-observable) store fields.
     var refresh by remember { mutableStateOf(0) }
-    // Native setup/unavailable states return above. Keep legacy reads explicitly in comparison
-    // mode; a missing native projection must never borrow the device-local legacy roster.
-    val roster = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(nativeState).profiles
-        else remember(refresh) { store.profiles }
-    val activeId = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(nativeState).activeID
-        else remember(refresh) { store.activeID }
+    // Native setup/unavailable states return above; a missing native projection must never borrow the
+    // device-local roster.
+    val roster = nativeState.profiles
+    val activeId = nativeState.activeID
 
     // The editor overlay (null = closed). Carries the profile being edited and whether it is brand-new; a new
     // draft is minted here so Save can route to add() vs update().
@@ -124,36 +133,52 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var editorIsNew by remember { mutableStateOf(false) }
     var nativeEditor by remember { mutableStateOf<NativeStreamingAccountViewModel.Editor?>(null) }
     // The PIN gate for switching INTO a locked profile (Apple `ProfilePickerView.pick` -> PinGateOverlay).
-    var pinTarget by remember { mutableStateOf<Pair<UserProfile, NativeStreamingAccountViewModel.Editor?>?>(null) }
+    var pinTarget by remember { mutableStateOf<ProfilesPinRequest?>(null) }
     // The last account-switch note, shown inline (see the SCOPE note in the header doc).
     var status by remember { mutableStateOf<String?>(null) }
 
     fun openEditor(profile: UserProfile, adding: Boolean) {
-        val capture = nativeModel?.captureEditor(profile, adding)
-        if (BuildConfig.NATIVE_ENGINE_ENABLED && capture == null) return
-        nativeEditor = capture; editorProfile = profile; editorIsNew = adding
+        val capture = nativeModel.captureEditor(profile, adding) ?: return
+        nativeEditor = capture
+        editorProfile = profile
+        editorIsNew = adding
     }
 
-    fun commitSwitch(profile: UserProfile, captured: NativeStreamingAccountViewModel.Editor?) {
+    fun commitSwitch(
+        profile: UserProfile,
+        captured: NativeStreamingAccountViewModel.Editor?,
+    ) {
         status = null
-        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
-            if (captured == null || nativeModel?.commitEditor(captured) { store.select(profile) } != true)
-                status = "The profile changed. Unlock it again before switching."
-            nativeModel?.refresh(); refresh++
+        if (captured == null) {
+            status = "The profile changed. Unlock it again before switching."
+            nativeModel.refresh(); refresh++
             return
         }
-        // select() applies the profile's theme/filters, fires the reload + rebuild seams, and swaps the watch
-        // overlay — the account library is never touched. Its outcome tells the account layer what is left.
-        when (val outcome = store.select(profile)) {
-            ProfileStore.SwitchOutcome.SameAccount -> Unit
-            is ProfileStore.SwitchOutcome.SwitchAccount ->
-                status = "Now watching as ${profile.name}. This profile has its own VortX account; " +
-                    "per-profile sign-in isn't wired on Android yet, so it keeps the current session."
-            ProfileStore.SwitchOutcome.NeedsSignIn ->
-                status = "Now watching as ${profile.name}. This profile has its own account; signing into a " +
-                    "separate account per profile isn't available on Android yet."
+        var selectedOutcome: ProfileStore.SwitchOutcome? = null
+        val committed = nativeModel.commitEditor(captured) {
+            selectedOutcome = store.select(profile)
+        } == true
+        val outcome = selectedOutcome
+        if (!committed || outcome == null) {
+            status = "The profile changed. Unlock it again before switching."
+            nativeModel.refresh(); refresh++
+            return
         }
-        refresh++
+        try {
+            val selected = checkNotNull(store.active?.takeIf { it.id == profile.id }) {
+                "Choose the profile again."
+            }
+            val after = checkNotNull(nativeModel.captureSelection(selected)) {
+                "Choose the profile again."
+            }
+            val nativeAdmission = { nativeModel.commitEditor(after) {} }
+            onSelected(captureProfileSelection(store, profile, outcome, nativeAdmission = nativeAdmission))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            status = "The profile changed. Unlock it again before switching."
+        }
+        nativeModel.refresh(); refresh++
     }
 
     val editing = editorProfile
@@ -162,8 +187,8 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             store = store,
             original = editing,
             isNew = editorIsNew,
-            nativeCommit = nativeEditor?.let { editor -> { action -> nativeModel?.commitEditor(editor, action) == true } },
-            onDone = { editorProfile = null; refresh++; nativeModel?.refresh() },
+            nativeCommit = nativeEditor?.let { editor -> { action -> nativeModel.commitEditor(editor, action) } },
+            onDone = { editorProfile = null; refresh++; nativeModel.refresh() },
             onCancel = { editorProfile = null },
             modifier = modifier,
         )
@@ -204,10 +229,13 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                                     // isLocked guardrail); the active row therefore opens its own editor.
                                     openEditor(profile, false)
                                 } else {
-                                    val captured = nativeModel?.captureSelection(profile)
-                                    if (!BuildConfig.NATIVE_ENGINE_ENABLED || captured != null) {
-                                        if (profile.hasPin) pinTarget = profile to captured
-                                        else commitSwitch(profile, captured)
+                                    val captured = nativeModel.captureSelection(profile)
+                                    if (captured != null) {
+                                        if (profile.hasPin) {
+                                            pinTarget = ProfilesPinRequest(profile, captured)
+                                        } else {
+                                            commitSwitch(profile, captured)
+                                        }
                                     }
                                 }
                             },
@@ -223,25 +251,25 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     })
                 }
 
-                nativeState?.migration?.let {
+                nativeState.migration?.let {
                     SettingsSection(title = "Preserved account data", footer = if (it.watchlistPending > 0)
                         "Some Watchlist data has an unknown profile or invalid format and remains preserved without being assigned to Main. Correct the original backup before retrying. Your current native library remains usable."
                         else "Original history is preserved while exact episode inventories are unavailable. Your current native library remains usable.") {
                         EditorButton(if (nativeState.busy) "Retrying original sources…" else "Retry preserved data", !nativeState.busy, false,
-                            onClick = { nativeModel?.retryMigration() })
-                        if (nativeState.busy) EditorButton("Cancel retry", true, false, onClick = { nativeModel?.close() })
+                            onClick = { nativeModel.retryMigration() })
+                        if (nativeState.busy) EditorButton("Cancel retry", true, false, onClick = { nativeModel.close() })
                     }
                 }
-                nativeState?.streaming?.filter { it.profile.id == activeId }?.forEach { entry ->
+                nativeState.streaming?.filter { it.profile.id == activeId }?.forEach { entry ->
                     SettingsSection(title = "This profile's streaming account", footer =
                         "Sign-in verifies this profile's Stremio identity and imports its independent library and add-ons. The VortX owner account is unchanged.") {
-                        EditorButton("Sign in or change streaming account", true, false, onClick = { nativeModel?.open(entry.profile.id) })
+                        EditorButton("Sign in or change streaming account", true, false, onClick = { nativeModel.open(entry.profile.id) })
                         if (entry.pendingOverlay) Text(
                             "Historical profile data is preserved but still needs source attribution. Linking another account does not assign that history to it.",
                             style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary), modifier = Modifier.padding(VortXTheme.spacing.sm))
                     }
                 }
-                nativeState?.message?.let { Text(it, style = VortXTheme.type.label) }
+                nativeState.message?.let { Text(it, style = VortXTheme.type.label) }
 
                 status?.let { message ->
                     Text(
@@ -255,12 +283,79 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
         pinTarget?.let { target ->
             PinGateOverlay(
-                profile = target.first,
-                onUnlock = { pinTarget = null; commitSwitch(target.first, target.second) },
+                profile = target.profile,
+                onUnlock = {
+                    pinTarget = null
+                    commitSwitch(target.profile, target.nativeEditor)
+                },
                 onCancel = { pinTarget = null },
             )
         }
     }
+}
+
+/**
+ * Reuses the Settings profile editor and its native admission boundary from the launch picker. The picker
+ * supplies the exact profile snapshot and owns the return/roster refresh; this route owns only the temporary
+ * native editor capture needed by [ProfileEditor].
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ProfilePickerEditorRoute(
+    store: ProfileStore,
+    original: UserProfile,
+    isNew: Boolean,
+    onDone: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val nativeModel: NativeStreamingAccountViewModel? = run {
+        val app = LocalContext.current.applicationContext as? VortXApplication
+        val accounts = remember(app) { runCatching { app?.nativeStreamingAccounts() }.getOrNull() }
+        if (accounts == null) null else viewModel(
+            key = "profile-picker-editor",
+            factory = NativeStreamingAccountViewModel.Creator(accounts),
+        )
+    }
+    DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
+    val nativeState = nativeModel?.state?.collectAsState()?.value
+    if (nativeModel == null || nativeState == null || !nativeState.mounted) {
+        ProfilesUnavailable(onCancel, modifier)
+        return
+    }
+
+    var captureAttempted by remember(nativeModel, original.id, isNew) {
+        mutableStateOf(false)
+    }
+    var nativeEditor by remember(nativeModel, original.id, isNew) {
+        mutableStateOf<NativeStreamingAccountViewModel.Editor?>(null)
+    }
+    LaunchedEffect(nativeModel, original.id, isNew) {
+        nativeEditor = nativeModel.captureEditor(original, isNew)
+        captureAttempted = true
+    }
+    if (!captureAttempted) {
+        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Opening profile editor…", style = VortXTheme.type.body)
+        }
+        return
+    }
+    if (nativeEditor == null) {
+        ProfilesUnavailable(onCancel, modifier)
+        return
+    }
+
+    ProfileEditor(
+        store = store,
+        original = original,
+        isNew = isNew,
+        nativeCommit = nativeEditor?.let { editor ->
+            { action -> nativeModel.commitEditor(editor, action) }
+        },
+        onDone = { nativeModel.refresh(); onDone() },
+        onCancel = onCancel,
+        modifier = modifier,
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -486,19 +581,17 @@ private fun ProfileEditor(
             // The owner is the account's main profile; it can never be a Kids profile (guarded here as well
             // as by hiding the row below).
             isKids = if (original.isOwner) false else isKids,
-            usesOwnAccount = if (BuildConfig.NATIVE_ENGINE_ENABLED && !original.isOwner) usesOwnAccount else original.usesOwnAccount,
+            usesOwnAccount = if (!original.isOwner) usesOwnAccount else original.usesOwnAccount,
         )
         draft = when {
             removePin -> draft.copy(pin = null)
             pinText.isNotEmpty() -> draft.copy(pin = UserProfile.pinHash(pinText, draft.id))
             else -> draft
         }
-        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
-            if (nativeCommit?.invoke { if (isNew) store.add(draft) else store.update(draft) } != true) {
-                saveError = "Profile changes could not be confirmed. Reopen the account before trying again."
-                return
-            }
-        } else if (isNew) store.add(draft) else store.update(draft)
+        if (nativeCommit?.invoke { if (isNew) store.add(draft) else store.update(draft) } != true) {
+            saveError = "Profile changes could not be confirmed. Reopen the account before trying again."
+            return
+        }
         onDone()
     }
 
@@ -619,7 +712,7 @@ private fun ProfileEditor(
                 }
             }
 
-            if (BuildConfig.NATIVE_ENGINE_ENABLED && !original.isOwner) {
+            if (!original.isOwner) {
                 SettingsSection(title = "Streaming library", footer = "Own account creates a separate, pending sign-in. Shared keeps this profile's separate watch history with the owner's add-ons. Existing account slots are retained when switching.") {
                     Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm), modifier = Modifier.padding(VortXTheme.spacing.sm)) {
                         Chip(label = "Shared", selected = !usesOwnAccount, onClick = { usesOwnAccount = false })
@@ -652,10 +745,8 @@ private fun ProfileEditor(
                             destructive = true,
                             modifier = Modifier.weight(1f),
                             onClick = {
-                                if (BuildConfig.NATIVE_ENGINE_ENABLED) {
-                                    if (nativeCommit?.invoke { store.remove(original) } == true) onDone()
-                                    else saveError = "The profile changed. Reopen its editor before deleting."
-                                } else { store.remove(original); onDone() }
+                                if (nativeCommit?.invoke { store.remove(original) } == true) onDone()
+                                else saveError = "The profile changed. Reopen its editor before deleting."
                             },
                         )
                         EditorButton(

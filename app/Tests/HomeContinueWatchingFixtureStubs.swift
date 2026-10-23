@@ -64,15 +64,28 @@ final class ProfileStore {
     var cwItems: [CoreCWItem] = []
     var active: UserProfile?
 }
-struct UserProfile {
+struct UserProfile: Equatable {   // Equatable like the real profile (applyNativeProfiles compares rosters)
     struct PlaybackPrefs: Equatable {}
     let id: UUID
     var usesEngineHistory: Bool = true
     var discovery: ProfileDiscoveryPreferences? = nil
     var playback: PlaybackPrefs? = nil
+    var addonPreferences: ProfileAddonPreferences? = nil
+    var accentID = "ember"
+    var oled = false
+    var textScale = 1.0
 }
+struct ProfileAddonPreferences: Equatable {}
 
 struct CoreLibrary { let catalog: [CoreCWItem] }
+// The legacy selector fixture has no new native eligibility capability. The separate
+// TraktNextEpisodeConsumerTests links the real consumer with continuation-controlled evidence.
+struct TraktNextEpisodeOffer {}
+final class TraktHomeNextEpisodeProducer {
+    static let shared = TraktHomeNextEpisodeProducer()
+    func requestRefresh(intent: HomeContinueWatchingSelection.Intent, core: CoreBridge) {}
+    func offers(intent: HomeContinueWatchingSelection.Intent, paused: [CoreCWItem], now: Date) -> [TraktNextEpisodeOffer] { [] }
+}
 struct CoreCWItem {
     let id: String
     let type: String
@@ -82,13 +95,14 @@ struct CoreCWItem {
     var resumeSeconds: Double { state.timeOffset / 1000 }
     var progress: Double { state.duration > 0 ? state.timeOffset / state.duration : 0 }
     var isFinished: Bool { progress >= 0.95 }
+    var isUpNext: Bool { false }   // fixtures carry no watched flag
     var removed: Bool? { nil }
     var temp: Bool? { nil }
 }
 enum EpisodePlaybackIdentity { static func usesSeriesLifecycle(type: String) -> Bool { type == "series" } }
 enum TopShelfSnapshot {
     static let maxItems = 8
-    struct Item { let id: String; let type: String; let title: String; let poster: String?; let progress: Double }
+    struct Item: Equatable { let id: String; let type: String; let title: String; let poster: String?; let progress: Double }
 }
 struct CoreLibState {
     let timeOffset: Double

@@ -26,13 +26,21 @@ import java.util.concurrent.locks.LockSupport
 
 internal class AddonManifestFetcher(
     private val timeoutMs: Int,
-    private val hostValidator: (String) -> Unit = { PublicAddressPolicy.requireLiteralPublicOrHostname(it) },
+    private val hostValidator: (String) -> Unit = PublicAddressPolicy::requireAddonLiteralOrHostname,
     private val transport: ManifestTransport = OkHttpManifestTransport(timeoutMs),
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
     fun fetch(url: String): JSONObject? {
         val startedAt = nanoTime()
-        var current = url.toHttpUrlOrNull()?.takeIf(::isAllowedUrl) ?: return null
+        val origin = url.toHttpUrlOrNull() ?: return null
+        // Validate literal syntax before OkHttp canonicalizes shorthand/encoded IP hosts.
+        if (origin.host.contains(':') || origin.host.all { it.isDigit() || it == '.' }) {
+            val rawHost = runCatching { java.net.URI(url).host?.removeSurrounding("[", "]") }.getOrNull()
+                ?: return null
+            if (!origin.host.contains(':') && rawHost != origin.host) return null
+            if (runCatching { PublicAddressPolicy.requireAddonLiteralOrHostname(rawHost) }.isFailure) return null
+        }
+        var current = origin.takeIf { isAllowedUrl(it, origin) } ?: return null
         var redirects = 0
         val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs.toLong())
 
@@ -40,11 +48,11 @@ internal class AddonManifestFetcher(
             val remainingNanos = timeoutNanos - (nanoTime() - startedAt)
             if (remainingNanos <= 0) return null
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1)
-            val response = runCatching { transport.execute(current, remainingMs) }.getOrNull() ?: return null
+            val response = runCatching { transport.executeAddon(current, remainingMs, origin) }.getOrNull() ?: return null
             if (response.statusCode in REDIRECT_STATUS_CODES) {
                 if (redirects >= MAX_REDIRECTS) return null
                 val location = response.location ?: return null
-                current = current.resolve(location)?.takeIf(::isAllowedUrl) ?: return null
+                current = current.resolve(location)?.takeIf { isAllowedUrl(it, origin) } ?: return null
                 redirects += 1
                 continue
             }
@@ -57,10 +65,13 @@ internal class AddonManifestFetcher(
         }
     }
 
-    private fun isAllowedUrl(url: HttpUrl): Boolean {
+    private fun isAllowedUrl(url: HttpUrl, origin: HttpUrl): Boolean {
         if (url.scheme != "http" && url.scheme != "https") return false
         if (url.username.isNotEmpty() || url.password.isNotEmpty()) return false
-        return runCatching { hostValidator(url.host) }.isSuccess
+        return runCatching {
+            hostValidator(url.host)
+            if (!sameAddonOrigin(url, origin)) PublicAddressPolicy.requireLiteralPublicOrHostname(url.host)
+        }.isSuccess
     }
 
     private companion object {
@@ -71,7 +82,12 @@ internal class AddonManifestFetcher(
 
 internal fun interface ManifestTransport {
     fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse
+    fun executeAddon(url: HttpUrl, timeoutMs: Long, origin: HttpUrl): ManifestTransportResponse =
+        execute(url, timeoutMs)
 }
+
+internal fun sameAddonOrigin(url: HttpUrl, origin: HttpUrl): Boolean =
+    url.scheme == origin.scheme && url.host == origin.host && url.port == origin.port
 
 internal data class ManifestTransportResponse(
     val statusCode: Int,
@@ -82,9 +98,21 @@ internal data class ManifestTransportResponse(
 private class OkHttpManifestTransport(timeoutMs: Int) : ManifestTransport {
     private val client = buildAddonManifestClient(timeoutMs)
 
-    override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
+    override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse =
+        executeScoped(url, timeoutMs, origin = null)
+
+    override fun executeAddon(url: HttpUrl, timeoutMs: Long, origin: HttpUrl): ManifestTransportResponse =
+        executeScoped(url, timeoutMs, origin)
+
+    private fun executeScoped(url: HttpUrl, timeoutMs: Long, origin: HttpUrl?): ManifestTransportResponse {
         val requestClient = client.newBuilder()
-            .dns(DeadlinePublicDns(timeoutMs))
+            .dns(DeadlinePublicDns(timeoutMs) { hostname ->
+                if (origin != null && sameAddonOrigin(url, origin) && hostname == url.host) {
+                    PublicAddressPolicy.requireAddon(hostname)
+                } else {
+                    PublicAddressPolicy.requirePublic(hostname)
+                }
+            })
             .build()
         val request = Request.Builder()
             .url(url)
@@ -247,6 +275,58 @@ internal class DnsAdmissionLease(private val releasePermit: () -> Unit) {
 }
 
 internal object PublicAddressPolicy {
+    // Public-only helpers below remain unchanged for import/health and other callers.
+    fun requireAddonLiteralOrHostname(hostname: String) {
+        val address = when {
+            hostname.contains(':') -> parseIpv6Literal(hostname)
+            hostname.isNotEmpty() && hostname.all { it.isDigit() || it == '.' } -> parseIpv4Literal(hostname)
+            else -> return
+        } ?: throw UnknownHostException("Invalid add-on address")
+        if (isBlocked(address) && !isSelfHosted(address)) {
+            throw UnknownHostException("Add-on URL contains an unsupported address")
+        }
+    }
+
+    fun requireAddon(hostname: String): List<InetAddress> {
+        val addresses = try {
+            InetAddress.getAllByName(hostname).toList()
+        } catch (error: Exception) {
+            throw UnknownHostException("Unable to resolve add-on host").apply { initCause(error) }
+        }
+        if (addresses.isEmpty() || addresses.any { isBlocked(it) && !isSelfHosted(it) }) {
+            throw UnknownHostException("Add-on host resolved to an unsupported address")
+        }
+        return addresses
+    }
+
+    internal fun isSelfHosted(address: InetAddress): Boolean {
+        val bytes = address.address
+        if (bytes.size == 4) return isSelfHostedIpv4(bytes)
+        if (bytes.size != 16) return false
+        if (bytes.copyOfRange(0, 10).all { it == 0.toByte() } &&
+            bytes[10] == 0xff.toByte() && bytes[11] == 0xff.toByte()) {
+            return isSelfHostedIpv4(bytes.copyOfRange(12, 16))
+        }
+        if (bytes.copyOfRange(0, 4).contentEquals(byteArrayOf(0x00, 0x64, 0xff.toByte(), 0x9b.toByte())) &&
+            bytes.copyOfRange(4, 12).all { it == 0.toByte() }) {
+            return isSelfHostedIpv4(bytes.copyOfRange(12, 16))
+        }
+        // AWS metadata is ULA, so exclude it before allowing ordinary private IPv6 services.
+        if (bytes.contentEquals(byteArrayOf(0xfd.toByte(), 0, 0x0e, 0xc2.toByte(),
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0x54))) return false
+        return (bytes[0].toInt() and 0xfe) == 0xfc || address.isLoopbackAddress
+    }
+
+    private fun isSelfHostedIpv4(bytes: ByteArray): Boolean {
+        val a = bytes[0].toInt() and 0xff
+        val b = bytes[1].toInt() and 0xff
+        val c = bytes[2].toInt() and 0xff
+        val d = bytes[3].toInt() and 0xff
+        if (a == 100 && b == 100 && c == 100 && d == 200) return false // Alibaba metadata
+        return a == 10 || a == 127 || (a == 100 && b in 64..127) ||
+            (a == 172 && b in 16..31) || (a == 192 && b == 168)
+    }
+
     fun requireLiteralPublicOrHostname(hostname: String) {
         val address = when {
             hostname.contains(':') -> parseIpv6Literal(hostname)

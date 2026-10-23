@@ -48,4 +48,12 @@ class PhoneHeroPolicyTest {
 
     private fun item(id: String, type: MediaType = MediaType.MOVIE, name: String = id) =
         MetaItem(id = id, type = type, name = name)
+
+    @Test
+    fun `a swipe pages only once it travels the swipe distance`() {
+        assertEquals(1, PhoneHeroPolicy.swipeStep(travelPx = -200f, thresholdPx = 150f))
+        assertEquals(-1, PhoneHeroPolicy.swipeStep(travelPx = 151f, thresholdPx = 150f))
+        assertEquals(0, PhoneHeroPolicy.swipeStep(travelPx = -149f, thresholdPx = 150f))
+        assertEquals(0, PhoneHeroPolicy.swipeStep(travelPx = 0f, thresholdPx = 150f))
+    }
 }

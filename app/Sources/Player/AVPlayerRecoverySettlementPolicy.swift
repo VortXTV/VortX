@@ -124,6 +124,11 @@ enum AVPlayerRecoverySettlementPolicy {
         private(set) var ticket: RecoverySeekTicket?
         private(set) var issuedRequestID: UInt64?
 
+        func target(ownership: Ownership) -> Double? {
+            guard let ticket, ticket.ownership == ownership else { return nil }
+            return ticket.sourceSeconds
+        }
+
         mutating func issue(
             sourceSeconds: Double,
             playbackRequested: Bool,

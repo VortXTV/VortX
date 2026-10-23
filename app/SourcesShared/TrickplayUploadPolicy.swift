@@ -186,6 +186,22 @@ enum TrickplayCaptureSessionPolicy {
     }
 }
 
+/// One cancellation lease per scrub owner. The frame cache is shared, so cancellation
+/// must stay local to the requesting store rather than retiring independent consumers.
+final class TrickplayLocalReadLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 /// Data-only disk seam for local trickplay frames. LocalTrickplayFrameCache owns
 /// scheduling and decoded-image memory; this keeps its existing on-disk address
 /// stable and lets a fresh cache instance read a prior session's bytes.
@@ -208,7 +224,9 @@ struct TrickplayFrameDiskStore {
     /// what has been captured, or into a gap wider than that window), the nearest captured frame still gives an
     /// approximate preview instead of "unavailable". Enumerates this media's files once; nil when it has none.
     /// Runs off the main thread (called only from the cache's ioQueue).
-    func nearest(mediaKey: String, targetBucket: Int) -> (bucket: Int, data: Data)? {
+    func nearest(mediaKey: String, targetBucket: Int,
+                 shouldContinue: () -> Bool = { true }) -> (bucket: Int, data: Data)? {
+        guard shouldContinue() else { return nil }
         let prefix = filePrefix(mediaKey) + "-"
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
@@ -216,6 +234,7 @@ struct TrickplayFrameDiskStore {
         var bestBucket: Int?
         var bestDistance = Int.max
         for file in files {
+            guard shouldContinue() else { return nil }
             let name = file.lastPathComponent
             guard name.hasPrefix(prefix), name.hasSuffix(".jpg") else { continue }
             let middle = name.dropFirst(prefix.count).dropLast(4)   // strip "<prefix>-" and ".jpg" -> bucket digits
@@ -223,7 +242,8 @@ struct TrickplayFrameDiskStore {
             let distance = abs(bucket - targetBucket)
             if distance < bestDistance { bestDistance = distance; bestBucket = bucket }
         }
-        guard let bestBucket, let data = data(mediaKey: mediaKey, bucket: bestBucket) else { return nil }
+        guard shouldContinue(), let bestBucket,
+              let data = data(mediaKey: mediaKey, bucket: bestBucket) else { return nil }
         return (bestBucket, data)
     }
 

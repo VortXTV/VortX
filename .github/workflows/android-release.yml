@@ -55,15 +55,17 @@ jobs:
           echo "::error::Android artifacts may only be attached to the draft. The Apple release coordinator validates the complete cross-platform set and publishes last."
           exit 1
 
-      # Private source pins stay in lockstep with android.yml. Native variants package only
-      # libvortx_ffi.so; the Stremio checkout pin remains for the explicit non-native comparison path.
+      - name: Acquire reviewed Android mpv component from the checked-out release source
+        run: /usr/bin/python3 -I scripts/acquire-android-mpv-component.py
+
+      # The private engine pin stays in lockstep with android.yml. Artifacts package only libvortx_ffi.so.
       - name: Preflight the engine token (fail closed)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
-            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repo (VortXTV/vortx-core)"
             exit 1
           fi
 
@@ -75,42 +77,28 @@ jobs:
           VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
         run: scripts/verify-android-release-signing.sh preflight
 
-      - name: Fetch stremiox-core (private, pinned)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: VortXTV/stremiox-core
-          ref: 31c66611822043e089f5819ad232a5df93975873
-          token: ${{ secrets.ENGINE_REPO_TOKEN }}
-          path: core
-          persist-credentials: false
-
       - name: Fetch vortx-core (private monorepo, pinned)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3
+          ref: 0c30f4782aee544a2b7e33169ad60d03630d4097
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
 
-      - name: Promote the vortx-core workspace + record exact private source pins
+      - name: Promote the vortx-core workspace + record the exact private source pin
         run: |
           set -euo pipefail
           vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "0c201563c6aa54eeb0545b55ad01582c0c3bcae3" \
+          test "$vortx_sha" = "0c30f4782aee544a2b7e33169ad60d03630d4097" \
             || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
-          stremio_sha="$(git -C core rev-parse HEAD^{commit})"
-          test "$stremio_sha" = "31c66611822043e089f5819ad232a5df93975873" \
-            || { echo "::error::stremiox-core checkout does not match its immutable pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
-          echo "STREMIOX_CORE_SOURCE_SHA=$stremio_sha" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
           rm -rf _vortx_core_src
-          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "pinned private sources: stremiox-core@$stremio_sha vortx-core@$vortx_sha (promoted monorepo subdir)"
+          echo "pinned private source: vortx-core@$vortx_sha (promoted monorepo subdir)"
 
       - name: Set up JDK 21
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
@@ -121,7 +109,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
-          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0 cmake;4.1.2"
 
       # The committed wrapper remains the Gradle version authority. This action supplies caching only.
       - name: Set up Gradle
@@ -129,8 +117,11 @@ jobs:
 
       - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
         run: |
-          yes | sdkmanager "ndk;27.2.12479018"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          yes | sdkmanager "ndk;30.0.16248370"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          # The runner image also exports an older NDK as ANDROID_NDK_ROOT; point it at the same pin
+          # so no tool can pick the other one.
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
       - name: Install Rust nightly + Android targets
         uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
@@ -142,14 +133,72 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # `key` remains in the action's restore prefix; private source changes cannot fall
-          # back to an older same-ref native target cache. Both checkouts exist before hashing.
-          key: ${{ github.ref_name }}-native-${{ hashFiles('core/Cargo.*', 'core/rust-toolchain.toml', 'core/.cargo/**', 'core/src/**', 'core/include/**', 'vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
+          # back to an older same-ref native target cache. The checkout exists before hashing.
+          key: ${{ github.ref_name }}-native-${{ env.VORTX_ENGINE_SOURCE_SHA }}-${{ hashFiles('vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
           workspaces: |
-            core -> target
             vortx-core -> target-andx
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "=3.5.4" --locked
+
+      # Same protected job, same authenticated private pin, no extra credentials. Host JNI is
+      # disposable and separate from target-andx/jniLibs; it must never enter an APK or handoff.
+      - name: Build exact host JNI for native sync release tests
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          test "$VORTX_ENGINE_SOURCE_SHA" = 0c30f4782aee544a2b7e33169ad60d03630d4097
+          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
+          target="$(mktemp -d "$RUNNER_TEMP/native-sync-host.XXXXXXXX")"
+          proof="$GITHUB_WORKSPACE/android/app/build/reports/native-sync-host"
+          mkdir -p "$proof"
+          source_manifest="$target/source-inputs.sha256"
+          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
+            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$source_manifest"
+          test -s "$source_manifest"
+          nice -n 15 cargo +nightly-2026-07-19 build --locked \
+            --manifest-path vortx-core/Cargo.toml -p vortx-ffi --no-default-features \
+            --features jni,server,resource-host --release --target x86_64-unknown-linux-gnu \
+            --target-dir "$target" --jobs 1
+          find vortx-core \( -path vortx-core/target -o -path vortx-core/target-andx \) -prune -o \
+            -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$target/source-inputs.after.sha256"
+          cmp --silent "$source_manifest" "$target/source-inputs.after.sha256"
+          library="$target/x86_64-unknown-linux-gnu/release/libvortx_ffi.so"
+          test -s "$library" && test ! -L "$library"
+          # Host architecture + the production JNI call surface, without printing private inputs.
+          readelf -h "$library" | grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64'
+          READELF=readelf bash scripts/verify-native-engine-abi.sh android "$library" owner-history
+          library_sha="$(sha256sum "$library" | cut -d' ' -f1)"
+          source_sha="$(sha256sum "$source_manifest" | cut -d' ' -f1)"
+          jq -n --arg app "$SOURCE_COMMIT" --arg source "$VORTX_ENGINE_SOURCE_SHA" \
+            --arg path "$library" --arg sha "$library_sha" --arg inputs "$source_sha" \
+            '{schema:1,appSource:$app,engineSource:$source,features:"jni,server,resource-host",
+              toolchain:"nightly-2026-07-19",hostTarget:"x86_64-unknown-linux-gnu",
+              libraryPath:$path,librarySha256:$sha,sourceInputsSha256:$inputs}' > "$proof/host-jni.json"
+          echo "VORTX_JNI_LIBRARY=$library" >> "$GITHUB_ENV"
+          echo "VORTX_JNI_EXPECTED_SHA256=$library_sha" >> "$GITHUB_ENV"
+          echo "VORTX_JNI_RECEIPT=$proof/host-jni.json" >> "$GITHUB_ENV"
+          echo "VORTX_JNI_SOURCE_MANIFEST=$source_manifest" >> "$GITHUB_ENV"
+
+      - name: Require real native sync revision and account tests before packaging
+        timeout-minutes: 30
+        working-directory: android
+        env:
+          JAVA_TOOL_OPTIONS: "-XX:ActiveProcessorCount=1"
+          VORTX_JNI_SYNC: "1"
+        run: bash ../scripts/test-android-native-sync-host.sh
+
+      - name: Retain native sync release JUnit and bounded provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Android-native-sync-host-tests
+          path: |
+            android/app/build/test-results/testPlayDebugUnitTest/*.xml
+            android/app/build/reports/native-sync-host/host-jni.json
+            android/app/build/reports/native-sync-host/host-jni-accepted.json
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Build release APKs and Play bundle
         working-directory: android
@@ -158,20 +207,15 @@ jobs:
           TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
           SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
           SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
-          STREMIOX_CORE_DIR: ${{ github.workspace }}/core
           VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
           VORTX_REQUIRE_ENGINE: "1"
-          VORTX_NATIVE_RESOURCE_HOST: "1"
-          VORTX_NATIVE_ENGINE: "1"
           VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
           VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
           VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
           VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
-        # Native mode and its resource-host feature are selected together. The Gradle contract
-        # derives BuildConfig.NATIVE_ENGINE_ENABLED and the Cargo feature from these same values.
-        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true --no-daemon --stacktrace
+        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
 
-      - name: Verify native BuildConfig and native-only engine in every Android artifact
+      - name: Verify native-only engine in every Android artifact
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -181,13 +225,10 @@ jobs:
             echo "::error::expected exactly two release APKs and one AAB"
             exit 1
           fi
-          READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          STRIP="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"
+          READELF="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          STRIP="$ANDROID_HOME/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
           test -x "$STRIP" || { echo "::error::pinned NDK llvm-strip unavailable"; exit 1; }
-          test -x "$DEXDUMP" || { echo "::error::pinned Android build-tools dexdump unavailable"; exit 1; }
-          DEXDUMP="$DEXDUMP" bash scripts/verify-android-native-build-config.sh "${apks[@]}" "${bundles[@]}"
           READELF="$READELF" STRIP="$STRIP" bash scripts/verify-native-android-artifacts.sh \
             --native-only --staged-dir android/app/src/main/jniLibs \
             --source-sha "$VORTX_ENGINE_SOURCE_SHA" "${apks[@]}" "${bundles[@]}" \
@@ -267,7 +308,6 @@ jobs:
             echo "source commit: $SOURCE_COMMIT"
             echo "native engine source commit: $VORTX_ENGINE_SOURCE_SHA"
             echo "native engine Cargo features: jni,server,resource-host"
-            echo "legacy Stremio source commit (not packaged): $STREMIOX_CORE_SOURCE_SHA"
             echo "workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "workflow run attempt: $GITHUB_RUN_ATTEMPT"
           } >> dist/SIGNING_PROVENANCE.txt
@@ -278,6 +318,18 @@ jobs:
             "dist/VortX-${version}-play-media3.aab" \
             | sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the immutable Android handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Android-release
+          path: |
+            dist/*.apk
+            dist/*.aab
+            dist/SHA256SUMS-android.txt
+            dist/SIGNING_PROVENANCE.txt
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Create or append to the draft release
         env:

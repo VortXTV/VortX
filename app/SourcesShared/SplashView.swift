@@ -92,7 +92,7 @@ struct VortXWordmark: View {
 struct SplashView: View {
     var onFinished: () -> Void
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ReducedMotion private var reduceMotion
     @State private var glowIn = false
     @State private var ribbonTrim: CGFloat = 0
     @State private var dotIn = false

@@ -1,6 +1,7 @@
 package com.vortx.android.data
 
 import com.vortx.android.model.AuthState
+import com.vortx.android.profile.ProfileSelectionRequest
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,6 +29,12 @@ interface AuthRepository {
     /// network, ...), never a generic string.
     suspend fun signIn(email: String, password: String): Result<Unit>
     suspend fun signInForRevision(email: String, password: String, revision: String?): Result<Unit> = signIn(email, password)
+
+    /** Legacy account handoff only; native profile authority never calls this optional auth seam. */
+    suspend fun completeProfileSelection(request: ProfileSelectionRequest): Result<Boolean> =
+        Result.failure(IllegalStateException("This account connection is unavailable. Choose the profile again."))
+    suspend fun signInForProfileSelection(request: ProfileSelectionRequest, email: String, password: String): Result<Unit> =
+        Result.failure(IllegalStateException("This account connection is unavailable. Choose the profile again."))
 
     /// Sign out. Always succeeds locally (clears the account state) even if the network round-trip to
     /// invalidate the server-side session fails -- the user's device should never get "stuck" signed

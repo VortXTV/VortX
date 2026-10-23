@@ -24,6 +24,51 @@ struct AVPlayerRemuxStartupSignal: Equatable {
     }
 }
 
+/// Owns a cold listener until its issuing load adopts it. No remux producer is started here.
+/// Cancellation may race the blocking listener factory, so a late result is retired on its worker queue.
+final class AVPlayerColdRemuxPreparation: @unchecked Sendable {
+    typealias Mount = (server: VortXRemuxHLSServer, playlistURL: URL)
+    private let lock = NSLock()
+    private var retired = false
+    private var mount: Mount?
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return retired
+    }
+
+    func publish(_ result: Mount?) {
+        lock.lock()
+        if retired {
+            lock.unlock()
+            result?.server.invalidate()
+            return
+        }
+        mount = result
+        lock.unlock()
+    }
+
+    /// Only the main actor's current load can take ownership, immediately before starting the producer.
+    func take() -> Mount? {
+        lock.lock(); defer { lock.unlock() }
+        guard !retired else { return nil }
+        retired = true
+        defer { mount = nil }
+        return mount
+    }
+
+    func cancel() {
+        lock.lock()
+        retired = true
+        let abandoned = mount
+        mount = nil
+        lock.unlock()
+        abandoned?.server.invalidate()
+    }
+
+    deinit { cancel() }
+}
+
 // MARK: - PiP state machine (dependency-free)
 
 enum AVPlayerPictureInPictureCommand: Equatable, Sendable {
@@ -331,6 +376,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let claimsPublishedTailRetry: Bool
     }
     private var deferredEventOwnedRecovery: DeferredEventOwnedRecovery?
+    /// A growing playlist left static by a lead-parked producer while paused; AVFoundation expires it
+    /// (CoreMedia -12888) even though the mount is healthy. Shared by the deferral and the Play resume.
+    private static let pausedExpiryRecoveryReason = "paused failed-to-end on healthy published tail"
     /// A CoreMedia consumer failure or a growing-playlist item-end owns one short event-local corroboration
     /// task. Its item/token/generation/mount fences make cancellation and a later source switch harmless.
     private var eventOwnedRecoveryTask: Task<Void, Never>?
@@ -357,6 +405,19 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// selection then moves into `pendingMediaSelectionIntent` so an unavailable AVAsset group cannot hold
     /// transport or a remux-seek transaction hostage.
     private var pendingPlaybackIntent: PlaybackIntentPolicy.Intent?
+    private var replacementReadyDeadlineTask: Task<Void, Never>?
+
+    /// Only the currently bound replacement may pin the old source clock or reuse a mount's ready edge.
+    private var pendingReplacementSourceSeconds: Double? {
+        guard let intent = pendingPlaybackIntent, !intent.consumed,
+              intent.ownerGeneration == itemGeneration,
+              intent.mountIdentity == playbackMountIdentity else { return nil }
+        return intent.sourceSeconds
+    }
+
+    private var recoveryPinnedSourceSeconds: Double? {
+        pendingReplacementSourceSeconds ?? recoverySeekSettlement.target(ownership: seekDestinationOwnership)
+    }
     /// Selection-only continuation of a consumed playback intent.  It is deliberately writable while the
     /// asset's media-selection groups are loading, but it never owns a seek or defers play/pause.
     private var pendingMediaSelectionIntent: PlaybackIntentPolicy.Intent?
@@ -395,6 +456,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     var hasProducedPlayableVideoFrame: Bool {
         let seconds = item?.currentTime().seconds ?? 0
         return latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
+    }
+
+    private var nativeStartupClock = ApplePlaybackStartPolicy.NativeClockProgress()
+    var playbackStartEvidence: ApplePlaybackStartPolicy.AVPlayerEvidence {
+        .init(requiresVideoFrame: contentIsDolbyVision || isRemuxMounted,
+              renderedVideoFrame: hasProducedPlayableVideoFrame,
+              settledNativeClockAdvanced: nativeStartupClock.hasAdvanced(generation: itemGeneration),
+              positionSettled: recoveryPinnedSourceSeconds == nil && !seekEndBoundary.isPending
+                  && !nativeStartupClock.isSeekPending(generation: itemGeneration))
     }
 
     /// Diag-6 coupling ownership state, keyed by `itemGeneration` (branch review finding 2). The first frame
@@ -556,6 +626,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var audioGroup: AVMediaSelectionGroup?
     private var subGroup: AVMediaSelectionGroup?
     private var audioTracks: [MPVTrack] = []
+    private weak var badgeMetadataItem: AVPlayerItem?
+    private var badgeMetadataSelection: AVMediaSelectionOption?
+    private var badgeMetadataTask: Task<Void, Never>?
+    private var badgeMetadataAttempted = false
+    private var badgeMetadataRevision: UInt64 = 0
+    private var badgeVideoRange: PlaybackMetadataFacts.DynamicRange = .unknown
+    private var badgeNativeAudioChannels = 0
     private var subTracks: [MPVTrack] = []
     /// Source-container audio identities published by the active remux. Unlike AVMediaSelection options these
     /// IDs survive replacement mounts and include every deliverable track without spawning parallel muxers.
@@ -624,6 +701,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // delivery AVFoundation supports for a growing fMP4 (the progressive loader path above never framed on
     // device). Held for the whole session; torn down in stop()/loadFile().
     private var remuxHLSServer: VortXRemuxHLSServer?
+    private var coldLocalRemuxPreparation: AVPlayerColdRemuxPreparation?
+    private var coldLocalRemuxMountTask: Task<Void, Never>?
     private struct ConfiguredPreparedRemux {
         let handle: VortXPreparedRemuxHandle
         let ownerIdentity: VortXPreparedRemuxOwnerIdentity
@@ -888,6 +967,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // MARK: Loading + transport
 
     func invalidateLoadToken() {
+        replacementReadyDeadlineTask?.cancel()
+        replacementReadyDeadlineTask = nil
+        cancelColdLocalRemuxPreparation()
         nativePreflightState.retire()
         #if os(tvOS)
         nativePreAttachTask?.cancel()
@@ -903,6 +985,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
     @discardableResult
     private func supersedeSeekRequest() -> UInt64 {
+        // A complete seek can fit between observer ticks. Its landing must seed a new native baseline,
+        // never turn the old position -> target jump into first-start proof.
+        nativeStartupClock.reset(generation: itemGeneration)
         seekDestination.clear()
         seekEndBoundary.reset()
         seekCompletionTimeoutTask?.cancel()
@@ -1333,25 +1418,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             VXProbe.log(
                 "dv",
                 "\(lane) adopted (prepared local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(adopted.server.port)")
-        } else if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
-           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
-                                                  mode: wantsPlainRemux ? .plain : .dolbyVision,
-                                                  startAtSeconds: requestedRemuxOrigin,
-                                                  selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
-                                                  preferredAudioLanguages: remuxPreferredAudioLanguages,
-                                                  audioRejectTerms: remuxAudioRejectTerms,
-                                                  onStartupTimeout: startupTimeout) {
-            remuxHLSServer = mounted.server
-            localRemuxPlaylistURL = mounted.playlistURL
-            mounted.server.start()
-            newAsset = AVURLAsset(url: mounted.playlistURL)
-            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
-            DiagnosticsLog.log("avplayer", "\(lane) mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
-            // [dv] the remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
-            // fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties the reason
-            // to the observed engine flip, giving one greppable [dv] trail (the plain lane logs on the same
-            // channel so one grep still shows route -> mount -> classify -> demote in order).
-            VXProbe.log("dv", "\(lane) mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+        } else if wantsRemux, VortXRemuxHLSServer.deliveryEnabled {
+            beginColdLocalRemuxMount(
+                url: url, headers: headers,
+                wantsPlainRemux: wantsPlainRemux, wantsDVRemux: wantsDVRemux,
+                startAtSeconds: requestedRemuxOrigin,
+                selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
+                preferredAudioLanguages: remuxPreferredAudioLanguages,
+                audioRejectTerms: remuxAudioRejectTerms,
+                live: live, loadToken: issuedToken, generation: issuedGeneration,
+                onStartupTimeout: startupTimeout)
+            return issuedToken
         } else if wantsDVRemux, !VortXRemuxHLSServer.deliveryEnabled,
                   let built = VortXRemuxResourceLoader.make(
                     input: url,
@@ -1367,30 +1444,116 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             DiagnosticsLog.log("avplayer", "dv-remux mount host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
             VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
         } else if wantsRemux {
-            // The remux lane (DV or plain) was demanded but the mount could not be built (the local HLS
-            // server failed to bind, or the legacy loader could not be assembled). AVFoundation has no
-            // Matroska demuxer, so loading the raw MKV here would mount an item AVPlayer can never produce a
-            // frame from. Fail-soft immediately so the chrome demotes to libmpv instead of stalling on
-            // an un-demuxable asset. This ties into the [dv] demotion trail below.
-            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
-            if recoverAudioReplacementIfNeeded(
-                generation: issuedGeneration,
-                reason: "\(lane) mount build failed") {
-                return issuedToken
-            }
-            DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
-            VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
-            guard terminalLatch.claim(generation: issuedGeneration) else { return issuedToken }
-            fatalErrorEmitted = true
-            emit(MPVProperty.endFileError,
-                 wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable",
-                 loadToken: issuedToken)
+            failRemuxMount(url: url, wantsPlainRemux: wantsPlainRemux,
+                           loadToken: issuedToken, generation: issuedGeneration)
             return issuedToken
         } else {
             let safeHeaders = StreamRequestHeaderPolicy.sanitized(headers)
             let options = safeHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": safeHeaders]
             newAsset = AVURLAsset(url: url, options: options)
         }
+        finishLoadAsset(newAsset, url: url, headers: headers, live: live,
+                        wantsDVRemux: wantsDVRemux,
+                        loadToken: issuedToken, generation: issuedGeneration)
+        return issuedToken
+    }
+
+    private func cancelColdLocalRemuxPreparation() {
+        coldLocalRemuxPreparation?.cancel()
+        coldLocalRemuxPreparation = nil
+        coldLocalRemuxMountTask?.cancel()
+        coldLocalRemuxMountTask = nil
+    }
+
+    private func beginColdLocalRemuxMount(
+        url: URL, headers: [String: String]?,
+        wantsPlainRemux: Bool, wantsDVRemux: Bool,
+        startAtSeconds: Double,
+        selectedAudioStreamIndex: Int?,
+        preferredAudioLanguages: [String]?, audioRejectTerms: [String]?,
+        live: Bool, loadToken: PlayerLoadToken, generation: UInt64,
+        onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void
+    ) {
+        cancelColdLocalRemuxPreparation()
+        let preparation = AVPlayerColdRemuxPreparation()
+        coldLocalRemuxPreparation = preparation
+        // make() waits for NWListener binding for up to two seconds. Only immutable request inputs
+        // cross to this worker; AVPlayerItem, display criteria and UI publication stay on the main actor.
+        let work = Task.detached(priority: .utility) {
+            guard !preparation.isCancelled else { return }
+            let mounted = VortXRemuxHLSServer.make(
+                input: url, headers: headers,
+                mode: wantsPlainRemux ? .plain : .dolbyVision,
+                startAtSeconds: startAtSeconds,
+                selectedAudioStreamIndex: selectedAudioStreamIndex,
+                preferredAudioLanguages: preferredAudioLanguages,
+                audioRejectTerms: audioRejectTerms,
+                onStartupTimeout: onStartupTimeout)
+            preparation.publish(mounted)
+        }
+        coldLocalRemuxMountTask = Task { @MainActor [weak self] in
+            await withTaskCancellationHandler {
+                await work.value
+            } onCancel: {
+                preparation.cancel()
+                work.cancel()
+            }
+            guard let self else { preparation.cancel(); return }
+            defer {
+                if self.coldLocalRemuxPreparation === preparation {
+                    self.coldLocalRemuxPreparation = nil
+                    self.coldLocalRemuxMountTask = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+                  !self.fatalErrorEmitted, !self.terminalLatch.hasEmitted else {
+                preparation.cancel()
+                return
+            }
+            guard let mounted = preparation.take() else {
+                self.failRemuxMount(url: url, wantsPlainRemux: wantsPlainRemux,
+                                    loadToken: loadToken, generation: generation)
+                return
+            }
+            // Before this exact ownership transfer there is only a listener, no producer or input
+            // connection. A cancelled mount therefore cannot overlap a later AV-to-MPV handoff.
+            self.remuxHLSServer = mounted.server
+            self.localRemuxPlaylistURL = mounted.playlistURL
+            mounted.server.start()
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log("avplayer", "\(lane) mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+            VXProbe.log("dv", "\(lane) mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+            self.finishLoadAsset(AVURLAsset(url: mounted.playlistURL),
+                                 url: url, headers: headers, live: live,
+                                 wantsDVRemux: wantsDVRemux,
+                                 loadToken: loadToken, generation: generation)
+        }
+    }
+
+    private func failRemuxMount(url: URL, wantsPlainRemux: Bool,
+                               loadToken: PlayerLoadToken, generation: UInt64) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
+        let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+        if recoverAudioReplacementIfNeeded(generation: generation, reason: "\(lane) mount build failed") {
+            return
+        }
+        DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
+        VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
+        guard terminalLatch.claim(generation: generation) else { return }
+        fatalErrorEmitted = true
+        emit(MPVProperty.endFileError,
+             wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable",
+             loadToken: loadToken)
+    }
+
+    /// Common attachment tail for direct, prepared, legacy and newly constructed local assets.
+    private func finishLoadAsset(_ newAsset: AVURLAsset,
+                                 url: URL, headers: [String: String]?, live: Bool,
+                                 wantsDVRemux: Bool,
+                                 loadToken: PlayerLoadToken, generation: UInt64) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+              !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
         let newItem = AVPlayerItem(asset: newAsset)
         // A10-ii: name the AVPlayer lane on the probe at the mount, so the first heartbeat after routing shows
         // engine=avplayer + the source host instead of a stale or blank lane. The KVO observers refine the
@@ -1457,17 +1620,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 asset: newAsset,
                 item: newItem,
                 output: output,
-                loadToken: issuedToken,
-                generation: issuedGeneration)
-            return issuedToken
+                loadToken: loadToken,
+                generation: generation)
+            return
         }
         #endif
         attachPreparedItem(
             newItem,
             output: output,
-            loadToken: issuedToken,
-            generation: issuedGeneration)
-        return issuedToken
+            loadToken: loadToken,
+            generation: generation)
     }
 
     private func pendingLoadIsCurrent(loadToken: PlayerLoadToken, generation: UInt64) -> Bool {
@@ -2017,6 +2179,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         #endif
 
         player.replaceCurrentItem(with: freshItem)
+        armReplacementReadyDeadline(for: freshItem, loadToken: loadToken)
         observe(freshItem, loadToken: loadToken)
         if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
         return true
@@ -2052,6 +2215,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               let playlistURL = (currentItem.asset as? AVURLAsset)?.url,
               let loadToken = activeLoadToken else { return false }
 
+        if remountPendingSeekIfOutsideWindow() { return true }
         pendingPlaybackIntent = beginPlaybackRemountIntent(from: currentItem)
         if claimsPublishedTailRetry { publishedTailRecoveryBudget.claim() }
         DiagnosticsLog.log(
@@ -2103,6 +2267,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         freshItem.add(output)
         videoOutput = output
         player.replaceCurrentItem(with: freshItem)
+        armReplacementReadyDeadline(for: freshItem, loadToken: loadToken)
         observe(freshItem, loadToken: loadToken)
         if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
         return true
@@ -2179,6 +2344,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Wait through more than one segment-publication cadence. A new segment admits a same-mount item
     /// immediately; otherwise a byte-budget-parked producer may still use a rich existing HLS window at the
     /// bounded deadline. A genuinely starved or input-opening mount never spends a destructive replacement.
+    private func pausedExpiryAdmitsImmediateReplacement(_ item: AVPlayerItem) -> Bool {
+        guard let progress = remuxMountProgress, progress.initPublished, !progress.failed else { return false }
+        let bounds = mountedPlayerWindowBounds
+        let playerSeconds = item.currentTime().seconds
+        return AVPlayerEventRecoveryPolicy.admitsFreshItem(
+            producerAdvanced: false,
+            inputOpenInFlight: progress.inputOpenInFlight,
+            publishedAheadSeconds: playerSeconds.isFinite ? max(0, bounds.producedEdge - playerSeconds) : 0,
+            publishedWindowSeconds: bounds.servedStart.map { max(0, bounds.producedEdge - $0) } ?? 0)
+    }
+
     private func scheduleEventOwnedRecovery(
         receipt: EventOwnedRecoveryReceipt,
         eventItem: AVPlayerItem,
@@ -2383,7 +2559,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// completes, a target outside that mount's produced window must start a replacement remux rather than be
     /// clamped onto the old edge by the fresh HDR-only item.
     private func remountPendingSeekIfOutsideWindow() -> Bool {
-        guard let target = pendingSeek, isRemuxMounted else { return false }
+        guard isRemuxMounted else { return false }
+        let target = pendingSeek ?? pendingRequestedSourcePositionSeconds ?? playbackPositionSeconds
         let sourceDuration = remuxHLSServer?.sourceDurationSeconds
             ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
         let mountedWindow = mountedPlayerWindowBounds
@@ -2455,9 +2632,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 deliverTerminal(.error(reason), loadToken: loadToken, generation: itemGeneration)
                 logTransport("play -> deferred event became producer failure")
             case .recoverablePublishedTail:
-                if deferred.receipt.loadToken == loadToken,
-                   deferred.receipt.generation == itemGeneration,
-                   deferred.receipt.mountIdentity == playbackMountIdentity,
+                let ownsDeferred = deferred.receipt.loadToken == loadToken
+                    && deferred.receipt.generation == itemGeneration
+                    && deferred.receipt.mountIdentity == playbackMountIdentity
+                // The expired playlist only advances once the playhead does, so the observation window
+                // below can never see progress here; it would only delay a resume the window can serve.
+                if ownsDeferred, deferred.reason == Self.pausedExpiryRecoveryReason,
+                   pausedExpiryAdmitsImmediateReplacement(currentItem),
+                   retryFreshItemOnHealthyMount(reason: deferred.reason,
+                                                claimsPublishedTailRetry: deferred.claimsPublishedTailRetry) {
+                    logTransport("play -> replaced paused-expired item without observation wait")
+                    emit(MPVProperty.pause, false)
+                    return
+                }
+                if ownsDeferred,
                    scheduleEventOwnedRecovery(
                     receipt: deferred.receipt,
                     eventItem: currentItem,
@@ -2731,6 +2919,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         preparedServer: VortXRemuxHLSServer? = nil
     ) {
         seekEndBoundary.begin(requestID: requestID)
+        nativeStartupClock.beginSeek(generation: itemGeneration, requestID: requestID)
         let seekItem = item
         let seekGeneration = itemGeneration
         let seekLoadToken = activeLoadToken
@@ -2770,6 +2959,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     return
                 }
                 self.seekEndBoundary.finish(requestID: requestID)
+                self.nativeStartupClock.finishSeek(generation: seekGeneration, requestID: requestID)
                 self.seekDestination.finish(ownership: self.seekDestinationOwnership)
                 _ = self.recoverySeekSettlement.finish(requestID: requestID)
                 if let preparedServer {
@@ -2781,13 +2971,30 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
                 // A paused clock may not tick again. Keep the chrome and cue on the actual landing,
                 // exactly like the producer lead ledger, not the optimistic requested position.
-                self.publishSeekPosition(playerSeconds: landing)
+                self.publishSeekPosition(playerSeconds: landing, positionSettled: true)
             }
         }
-        publishSeekPosition(playerSeconds: clamped)
+        publishSeekPosition(playerSeconds: clamped, positionSettled: false)
     }
 
-    private func publishSeekPosition(playerSeconds: Double) {
+    /// Preserve the existing pre-ready raw-seek behavior and recovery deadlines, but keep its in-flight
+    /// target out of native startup evidence. Logical load tokens can survive item replacement.
+    private func seekBeforeStart(playerSeconds: Double, item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        let generation = itemGeneration
+        let requestID = seekRequestGeneration
+        nativeStartupClock.beginSeek(generation: generation, requestID: requestID)
+        player.seek(to: CMTime(seconds: max(playerSeconds, 0), preferredTimescale: 600)) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, finished,
+                      self.itemGeneration == generation,
+                      self.seekRequestGeneration == requestID,
+                      self.owns(item, loadToken: loadToken) else { return }
+                self.nativeStartupClock.finishSeek(generation: generation, requestID: requestID)
+            }
+        }
+    }
+
+    private func publishSeekPosition(playerSeconds: Double, positionSettled: Bool) {
         let reported = RemuxResumePolicy.presented(
             playerSeconds: playerSeconds,
             origin: remuxTimelineOrigin)
@@ -2795,8 +3002,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
            owns(item, loadToken: loadToken) {
             emit(
                 MPVProperty.timePos,
-                PlayerTimePositionEvent(seconds: reported, loadToken: loadToken),
-                loadToken: loadToken
+                PlayerTimePositionEvent(seconds: reported, loadToken: loadToken,
+                                        positionSettled: positionSettled),
+                loadToken: loadToken, seekRequestID: seekRequestGeneration
             )
         }
         updateSubtitleOverlay(atClock: reported)   // re-check the cue now; the observer is only ~4 Hz
@@ -2813,9 +3021,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Live playback position in SOURCE seconds. A resumed remux adds its achieved timeline origin; an
     /// unreadable pre-first-sample clock reports that origin instead of zero, protecting stored progress.
     var playbackPositionSeconds: Double {
-        if remuxSeekRemountTarget != nil, let pendingPlaybackIntent {
-            return pendingPlaybackIntent.sourceSeconds
-        }
+        if let source = recoveryPinnedSourceSeconds { return source }
         return RemuxResumePolicy.presented(
             playerSeconds: player.currentTime().seconds,
             origin: remuxTimelineOrigin)
@@ -3565,17 +3771,26 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             completion?(false)
             return
         }
-        let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
+        let finish: @MainActor @Sendable (Bool) -> Void = { ok in completion?(ok) }
         SubtitleFileFetcher.fetch(remote, timeout: timeout) { [weak self] data in
-            guard let data else { finish(false); return }
+            guard let data else {
+                Task { @MainActor in finish(false) }
+                return
+            }
             Task { @MainActor in
-                // SubtitleCueRenderer is main-actor isolated (the engine owns it), so parse on the
-                // main actor. The parser is budget-bounded (max 2 MiB input, capped cue count), so
-                // this stays off the hot playback path.
-                let cues = SubtitleCueRenderer.parse(data: data)
-                guard !cues.isEmpty else { finish(false); return }
+                // A superseded fetch must not start parser work. Parsing is pure value work; keep it
+                // off the main actor, then recheck the same item and selection revision before commit.
                 guard let self,
                       self.owns(requestItem, loadToken: requestToken),
+                      self.externalSubtitleRequestRevision == requestRevision else {
+                    finish(false)
+                    return
+                }
+                let cues = await Task.detached(priority: .utility) {
+                    SubtitleCueRenderer.parse(data: data)
+                }.value
+                guard !cues.isEmpty else { finish(false); return }
+                guard self.owns(requestItem, loadToken: requestToken),
                       self.externalSubtitleRequestRevision == requestRevision else {
                     finish(false)
                     return
@@ -3689,6 +3904,143 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             height: Int(size.height),
             audioCodec: selectedAudioCodec(),
             audioChannels: selectedAudioChannels())
+    }
+
+    /// Source/decoded format facts, not a launch filename or the display's supported modes.
+    func playbackMetadataFacts() -> PlaybackMetadataFacts {
+        guard let currentItem = player.currentItem, item === currentItem,
+              activeLoadToken != nil else { return PlaybackMetadataFacts() }
+        let selected = tracks(ofType: "audio").first { $0.selected && $0.isSelectable }
+        let currentSelection = audioGroup.flatMap {
+            currentItem.currentMediaSelection.selectedMediaOption(in: $0)
+        }
+        let sourceBacked = !remuxSourceAudioTracks.isEmpty
+        let audioIDBefore = sourceBacked ? selectedRemuxAudioSourceIndex : currentSelection.flatMap { option in
+            audioGroup?.options.firstIndex(of: option)
+        }
+        let summary = mediaSummary()
+        let finalSelection = audioGroup.flatMap {
+            currentItem.currentMediaSelection.selectedMediaOption(in: $0)
+        }
+        let audioIDAfter = sourceBacked ? selectedRemuxAudioSourceIndex : finalSelection.flatMap { option in
+            audioGroup?.options.firstIndex(of: option)
+        }
+        let audioCurrent = PlaybackMetadataFacts.audioSelectionMatches(
+            selectedRowID: selected?.id, beforeID: audioIDBefore, afterID: audioIDAfter)
+        let owned = badgeMetadataItem === currentItem && badgeMetadataSelection === currentSelection
+        let audioCacheOwned = owned && currentSelection === finalSelection
+        return PlaybackMetadataFacts(
+            width: summary.width, height: summary.height,
+            dynamicRange: owned ? badgeVideoRange : .unknown,
+            audioSelected: audioCurrent, audioLanguage: audioCurrent ? (selected?.lang ?? "") : "",
+            audioCodec: audioCurrent ? summary.audioCodec : "",
+            audioChannels: !audioCurrent ? 0 : (summary.audioChannels > 0
+                ? summary.audioChannels : (audioCacheOwned ? badgeNativeAudioChannels : 0)))
+    }
+
+    private func retireBadgeMetadata() {
+        badgeMetadataTask?.cancel(); badgeMetadataTask = nil
+        if badgeMetadataRevision < UInt64.max { badgeMetadataRevision += 1 }
+        badgeMetadataAttempted = false; badgeMetadataItem = nil; badgeMetadataSelection = nil
+        badgeVideoRange = .unknown; badgeNativeAudioChannels = 0
+    }
+
+    /// Owned KVO events invalidate both successful and unavailable samples. No self-published retry loop.
+    private func badgeMetadataDidChange(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        guard owns(item, loadToken: loadToken) else { return }
+        retireBadgeMetadata()
+        publishTrackListIfTopologyReady()
+    }
+
+    /// One metadata attempt per actual item/selection/revision. No timer or transport-clock polling.
+    private func refreshBadgeMetadataIfNeeded(_ item: AVPlayerItem) {
+        guard player.currentItem === item, let loadToken = activeLoadToken,
+              badgeMetadataRevision < UInt64.max else { return }
+        let selection = audioGroup.flatMap { item.currentMediaSelection.selectedMediaOption(in: $0) }
+        if badgeMetadataItem === item, badgeMetadataSelection === selection,
+           badgeMetadataAttempted || badgeMetadataTask != nil { return }
+        retireBadgeMetadata()
+        guard badgeMetadataRevision < UInt64.max else { return }
+        let revision = badgeMetadataRevision
+        let sourceAudioIndex = selectedRemuxAudioSourceIndex
+        badgeMetadataItem = item; badgeMetadataSelection = selection
+        badgeMetadataAttempted = true
+        // These remux fields come from the admitted parsed stream/signaling, not contentIsDolbyVision.
+        if isRemuxMounted {
+            let range = DVPlaybackPolicy.remuxDisplayRange(
+                dolbyVision: remuxHLSServer?.signaling?.dolbyVision
+                    ?? remuxRemoteMount?.carriesDolbyVision ?? false,
+                hdrFallback: usingHDRFallbackItem,
+                videoRange: remuxHLSServer?.signaling?.videoRange ?? remuxRemoteMount?.videoRange)
+            switch range {
+            case .dolbyVision: badgeVideoRange = .dolbyVision
+            case .hdr10: badgeVideoRange = .pq
+            case .hlg: badgeVideoRange = .hlg
+            case .sdr: badgeVideoRange = .sdr
+            }
+        }
+        badgeMetadataTask = Task { @MainActor [weak self, weak item] in
+            guard let self, let item else { return }
+            @MainActor func current() -> Bool {
+                !Task.isCancelled && self.player.currentItem === item
+                    && self.activeLoadToken == loadToken
+                    && self.badgeMetadataRevision == revision
+                    && self.badgeMetadataItem === item
+                    && self.badgeMetadataSelection === selection
+                    && self.audioGroup.flatMap({ item.currentMediaSelection.selectedMediaOption(in: $0) }) === selection
+                    && self.selectedRemuxAudioSourceIndex == sourceAudioIndex
+            }
+            var range = self.badgeVideoRange
+            let enabledVideo = item.tracks.filter {
+                $0.isEnabled && $0.assetTrack?.mediaType == .video
+            }.compactMap { $0.assetTrack }
+            // Multiple enabled alternate video tracks are ambiguous; never badge the first asset track.
+            let video = enabledVideo.count == 1 ? enabledVideo : []
+            guard current() else { return }
+            for track in video {
+                let formats = (try? await track.load(.formatDescriptions)) ?? []
+                guard current() else { return }
+                let ranges = Set(formats.map { format -> String in
+                    let codec = CMFormatDescriptionGetMediaSubType(format)
+                    if codec == 0x64766831 || codec == 0x64766865 {
+                        return PlaybackMetadataFacts.DynamicRange.dolbyVision.rawValue
+                    }
+                    let transfer = CMFormatDescriptionGetExtension(
+                        format, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+                    if transfer == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String) {
+                        return PlaybackMetadataFacts.DynamicRange.pq.rawValue
+                    }
+                    if transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) {
+                        return PlaybackMetadataFacts.DynamicRange.hlg.rawValue
+                    }
+                    return PlaybackMetadataFacts.DynamicRange.unknown.rawValue
+                })
+                if ranges.count == 1, let observed = ranges.first {
+                    range = PlaybackMetadataFacts.DynamicRange(rawValue: observed) ?? .unknown
+                } else if !formats.isEmpty {
+                    range = .unknown // Mixed format descriptions are not proof of a currently selected range.
+                }
+                break // Do not turn an unselected alternate video track into the active badge.
+            }
+            // An enabled, single audio item track is an actual selection. Ambiguity stays unknown.
+            let audio = item.tracks.filter { $0.isEnabled && $0.assetTrack?.mediaType == .audio }
+            var channels = 0
+            if audio.count == 1, let track = audio.first?.assetTrack {
+                let formats = (try? await track.load(.formatDescriptions)) ?? []
+                guard current() else { return }
+                let counts = Set(formats.map {
+                    CMAudioFormatDescriptionGetStreamBasicDescription($0).map { Int($0.pointee.mChannelsPerFrame) } ?? 0
+                })
+                if counts.count == 1, let count = counts.first, (1...64).contains(count) { channels = count }
+            }
+            guard current() else { return }
+            self.badgeVideoRange = range; self.badgeNativeAudioChannels = channels
+            self.badgeMetadataTask = nil
+            // Through the topology gate: readyToPlay starts this load before the audio and subtitle groups
+            // exist, and no track list may publish until both have loaded. A load that finishes first is
+            // carried by the gate's own publication once the groups are in (its refresh returns early).
+            self.publishTrackListIfTopologyReady()
+        }
     }
 
     /// Video frame rate for the community-subtitle release fingerprint (Gap 8). The libmpv engine reads the
@@ -4003,8 +4355,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func observe(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        let observedGeneration = itemGeneration
+        nativeStartupClock.reset(generation: observedGeneration)
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             Task { @MainActor in self?.handleStatus(observedItem, loadToken: loadToken) }
+        })
+        observations.append(item.observe(\.tracks, options: [.new]) { [weak self] observedItem, _ in
+            Task { @MainActor [weak self] in self?.badgeMetadataDidChange(observedItem, loadToken: loadToken) }
+        })
+        observations.append(item.observe(\.presentationSize, options: [.new]) { [weak self] observedItem, _ in
+            Task { @MainActor [weak self] in self?.badgeMetadataDidChange(observedItem, loadToken: loadToken) }
         })
         observations.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] observedItem, _ in
             Task { @MainActor in
@@ -4105,15 +4465,26 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                       self.owns(item, loadToken: loadToken) else { return }
                 // Cheap, every tick: the play head (scrubber smoothness) and the subtitle overlay clock. These
                 // must stay at the full 0.25s cadence or the progress bar and external subs visibly lag.
-                let position = RemuxResumePolicy.presented(
+                let pinnedPosition = self.recoveryPinnedSourceSeconds
+                let position = pinnedPosition ?? RemuxResumePolicy.presented(
                     playerSeconds: time.seconds,
                     origin: self.remuxTimelineOrigin)
+                let positionSettled = pinnedPosition == nil && !self.seekEndBoundary.isPending
+                    && !self.nativeStartupClock.isSeekPending(generation: observedGeneration)
+                self.nativeStartupClock.observe(
+                    generation: observedGeneration, playerSeconds: time.seconds,
+                    transportRunning: self.playbackRequested && self.player.timeControlStatus == .playing,
+                    positionSettled: positionSettled)
                 self.emit(
                     MPVProperty.timePos,
-                    PlayerTimePositionEvent(seconds: position, loadToken: loadToken),
-                    loadToken: loadToken
+                    PlayerTimePositionEvent(seconds: position, loadToken: loadToken,
+                                            positionSettled: positionSettled),
+                    loadToken: loadToken, seekRequestID: self.seekRequestGeneration
                 )
                 self.updateSubtitleOverlay(atClock: position)   // sync external-sub overlay to source time
+                // The new item's temporary clock is not watched/startup/recovery progress. Do not feed it
+                // into budget rearming, stall evidence or the producer's retained-window accounting.
+                guard pinnedPosition == nil else { return }
                 let clock = ProcessInfo.processInfo.systemUptime
                 // Proven-progress stall-episode end (root-cause report section 2): the raw AVPlayer clock, in
                 // the SAME seconds space the KVO handler above baselined the episode against. `.paused`/
@@ -4257,7 +4628,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func handleStatus(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
-        guard owns(item, loadToken: loadToken) else { return }
+        guard owns(item, loadToken: loadToken), !fatalErrorEmitted else { return }
         switch item.status {
         case .readyToPlay:
             let readyContinuation = AVPlayerRecoverySettlementPolicy.ReadyContinuationOwnership(
@@ -4271,10 +4642,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 if !DVPlaybackPolicy.acceptsRemuxReady(
                     transitionAccepted: accepted,
                     mountAlreadyReady: server.hasMarkedEngineReady,
-                    recoveryItem: usingHDRFallbackItem) {
+                    recoveryItem: usingHDRFallbackItem || pendingReplacementSourceSeconds != nil) {
                     return
                 }
             }
+            replacementReadyDeadlineTask?.cancel()
+            replacementReadyDeadlineTask = nil
             isReady = true
             // Clear the seek-remount spinner (see remountForSeek). The replacement is playable, so whatever
             // wait it advertised is over; an item that is still genuinely starved re-raises this from its own
@@ -4326,7 +4699,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             emit(MPVProperty.seekable, seekable, loadToken: loadToken)
             refreshRemuxSourceAudioTracks()
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
-            emitDynamicRange(item)             // Gap 7: light the chrome's HDR chip for DV / HDR10 / HLG content
+            emitDynamicRange(item)             // Existing playback/capture behavior remains unchanged.
+            refreshBadgeMetadataIfNeeded(item)
             loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
@@ -4344,11 +4718,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                             "dv",
                             "pre-start seek to \(Int(target))s already satisfied by remux origin \(Int(remuxTimelineOrigin))s")
                     case .hidePreroll(let playerSeconds):
-                        // `playerSeconds` is already the exact local-clock destination (see the policy's own
-                        // header): the SAME CMTime construction the non-remux branch below uses, so a mutant
-                        // that reused `target` (the SOURCE second) here instead would seek to the wrong clock
-                        // on every resumed remux mount, not just fail to hide the preroll.
-                        player.seek(to: CMTime(seconds: max(playerSeconds, 0), preferredTimescale: 600))
+                        // `playerSeconds` is already the local-clock destination. The helper keeps the SAME
+                        // CMTime construction for direct and preroll seeks; reusing the source `target` here
+                        // would seek to the wrong clock on every resumed remux mount.
+                        seekBeforeStart(playerSeconds: playerSeconds, item: item, loadToken: loadToken)
                         DiagnosticsLog.log(
                             "dv",
                             "pre-start seek to \(Int(target))s: hiding \(String(format: "%.3f", playerSeconds))s of keyframe preroll from remux origin \(Int(remuxTimelineOrigin))s")
@@ -4358,7 +4731,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                             "dropped pre-start seek to \(Int(target))s: \(Int(ahead))s past remux origin \(Int(remuxTimelineOrigin))s")
                     }
                 } else {
-                    player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
+                    seekBeforeStart(playerSeconds: target, item: item, loadToken: loadToken)
                 }
             }
             // Consume and clear the remount transaction before kicking off unbounded group discovery.  This
@@ -4901,7 +5274,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 if let receipt = makeEventOwnedRecoveryReceipt(for: failedItem, loadToken: loadToken) {
                     deferredEventOwnedRecovery = DeferredEventOwnedRecovery(
                         receipt: receipt, terminal: .error(message),
-                        reason: "paused failed-to-end on healthy published tail",
+                        reason: Self.pausedExpiryRecoveryReason,
                         claimsPublishedTailRetry: true)
                     let ns = err as NSError?
                     let underlying = ns?.userInfo[NSUnderlyingErrorKey] as? NSError
@@ -5251,6 +5624,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     private func publishTrackListIfTopologyReady() {
         guard selectionTopologyGeneration == itemGeneration else { return }
+        if let item = player.currentItem { refreshBadgeMetadataIfNeeded(item) }
         emit(MPVProperty.trackList, nil)
     }
 
@@ -5280,7 +5654,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     @objc private func mediaSelectionDidChange(_ note: Notification) {
         guard let changedItem = note.object as? AVPlayerItem,
               changedItem === player.currentItem,
-              selectionTopologyGeneration == itemGeneration else { return }
+              selectionTopologyGeneration == itemGeneration,
+              let loadToken = activeLoadToken,
+              owns(changedItem, loadToken: loadToken) else { return }
+        retireBadgeMetadata()
+        defer {
+            if owns(changedItem, loadToken: loadToken) { publishTrackListIfTopologyReady() }
+        }
         if let group = subGroup,
            externalSubtitleSettlement.consumeIfNativeDeselected(
                 generation: itemGeneration,
@@ -5305,7 +5685,32 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         refreshSelectionTracks(for: changedItem)
     }
 
+    /// A replacement cannot wait forever on a mount whose one-time startup deadline already completed.
+    /// Preserve its source intent for outer fallback; timeout is an error, never EOF/episode completion.
+    private func armReplacementReadyDeadline(for replacement: AVPlayerItem, loadToken: PlayerLoadToken) {
+        replacementReadyDeadlineTask?.cancel()
+        let generation = itemGeneration
+        let mountIdentity = playbackMountIdentity
+        replacementReadyDeadlineTask = Task { @MainActor [weak self, weak replacement] in
+            do { try await Task.sleep(nanoseconds: 30_000_000_000) }
+            catch { return }
+            guard let self, let replacement, !Task.isCancelled,
+                  self.itemGeneration == generation,
+                  self.playbackMountIdentity == mountIdentity,
+                  self.owns(replacement, loadToken: loadToken),
+                  !self.isReady, !self.fatalErrorEmitted,
+                  self.pendingReplacementSourceSeconds != nil else { return }
+            self.replacementReadyDeadlineTask = nil
+            self.deliverTerminal(.error("Playback could not resume. Please retry this source."),
+                                 loadToken: loadToken, generation: generation)
+        }
+    }
+
     private func teardownObservers() {
+        replacementReadyDeadlineTask?.cancel()
+        replacementReadyDeadlineTask = nil
+        retireBadgeMetadata()
+        nativeStartupClock.reset(generation: nil)
         externalSubtitleSettlement.clear()
         invalidateNativeSubtitleOverlay()
         remuxSubtitleInventoryRefreshTask?.cancel()
@@ -5324,7 +5729,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func installPlayheadReceiptObserver() {
         if let playheadObserver { player.removeTimeObserver(playheadObserver) }
         playheadObserver = nil
-        guard timeObserver != nil, let server = remuxHLSServer else { return }
+        guard timeObserver != nil, recoveryPinnedSourceSeconds == nil,
+              let server = remuxHLSServer else { return }
         let epoch = server.playbackReceiptEpoch
         playheadObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
@@ -5335,6 +5741,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     deinit {
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
+        replacementReadyDeadlineTask?.cancel()
+        coldLocalRemuxPreparation?.cancel()
+        coldLocalRemuxMountTask?.cancel()
         remuxSubtitleInventoryRefreshTask?.cancel()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         if let playheadObserver { player.removeTimeObserver(playheadObserver) }

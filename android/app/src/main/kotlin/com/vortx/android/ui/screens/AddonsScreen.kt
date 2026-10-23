@@ -333,7 +333,8 @@ private fun AddonRow(
                 }
             }
             // Actions wrap (Apple `addonActionChips`): Configure shows for any configurable add-on; the
-            // Change-URL / eye / Remove trio is gated on !isProtected (protected defaults are not editable).
+            // Change-URL / eye / Remove trio is gated on !isProtected (protected defaults are not editable),
+            // except that a protected add-on switched off elsewhere always keeps its eye to come back on.
             FlowRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                 if (addon.isConfigurable) {
                     Chip(
@@ -350,9 +351,10 @@ private fun AddonRow(
                         leadingIcon = VortXIcons.link,
                         onClick = onChangeUrl,
                     )
-                    // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls
-                    // account-wide -- the same eye / eye-slash pair as Apple `AddonsView.swift:424-428`,
-                    // gated the same way (protected defaults have no toggle).
+                }
+                // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide;
+                // the same eye / eye-slash pair as Apple `AddonsView.visibilityToggle`.
+                if (!addon.isProtected || addon.isDisabled) {
                     IconButton(onClick = onToggle) {
                         Icon(
                             imageVector = if (addon.isDisabled) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
@@ -360,6 +362,8 @@ private fun AddonRow(
                             tint = if (addon.isDisabled) colors.textTertiary else colors.accent,
                         )
                     }
+                }
+                if (!addon.isProtected) {
                     IconButton(onClick = onRemove) {
                         Icon(VortXIcons.delete, contentDescription = "Remove ${addon.name}", tint = colors.danger)
                     }

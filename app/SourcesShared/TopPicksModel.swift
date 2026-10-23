@@ -18,18 +18,37 @@ final class TopPicksModel: ObservableObject {
     /// At most this many cards in the rail.
     private static let maxItems = 20
 
-    /// The signature of the last successful build (profile id + ordered seed ids), so a routine engine
-    /// re-emit with the same recent titles doesn't refetch.
-    private var lastSignature: String?
+    /// Exact private request inputs. Identical refreshes share an in-flight request, while a
+    /// profile/account/key boundary retires the old personalized result immediately.
+    private struct SeedIdentity: Equatable {
+        let id: String
+        let type: String
+    }
+    private struct RequestSignature: Equatable {
+        let profileID: UUID?
+        let ownerKey: String
+        let owner: CredentialScopeRegistry.Capture
+        let key: String
+        let seeds: [SeedIdentity]
+        let owned: Set<String>
+    }
+    private var lastSignature: RequestSignature?
+    private var inFlightSignature: RequestSignature?
+    private var requestGeneration: UInt64 = 0
     private var loadTask: Task<Void, Never>?
+
+    deinit { loadTask?.cancel() }
 
     /// Recompute from the active profile's recent watch/library titles. `cw` is the profile-aware
     /// Continue Watching, `library` the profile-aware library; both are passed in by the caller so this
     /// model never reaches into engine/profile state directly (it stays a pure transform + cache).
     /// No-ops when the seed signature is unchanged.
-    func refresh(profileID: UUID?, cw: [CoreCWItem], library: [CoreCWItem]) {
+    func refresh(profileID: UUID?, cw: [CoreCWItem], library: [CoreCWItem], ownerKey: String = "") {
         // TMDB recommendations are the recommender; with no key there is nothing to surface.
-        guard ApiKeys.tmdbKey() != nil else { items = []; lastSignature = nil; return }
+        let owner = CredentialScopeRegistry.shared.capture()
+        guard let key = ApiKeys.tmdbKey(), CredentialScopeRegistry.shared.isCurrent(owner) else {
+            clear(); return
+        }
 
         // Seed from Continue Watching first (most recent intent), then fill from the library, keeping
         // only IMDb ids (the recommender resolves IMDb ids) and de-duplicating.
@@ -40,39 +59,66 @@ final class TopPicksModel: ObservableObject {
             .prefix(Self.maxSeeds)
             .map { (id: $0.id, type: $0.type) }
 
-        guard !seeds.isEmpty else { items = []; lastSignature = nil; return }
+        guard !seeds.isEmpty else { clear(); return }
 
         // Exclude anything the profile already has (CW + library) so we never recommend owned titles.
         let owned = Set((cw + library).map(\.id))
-        let signature = (profileID?.uuidString ?? "main") + "|" + seeds.map(\.id).joined(separator: ",")
-        if signature == lastSignature, !items.isEmpty { return }
+        let signature = RequestSignature(profileID: profileID, ownerKey: ownerKey, owner: owner, key: key,
+                                         seeds: seeds.map { SeedIdentity(id: $0.id, type: $0.type) },
+                                         owned: owned)
+        if let previous = inFlightSignature ?? lastSignature,
+           previous.profileID != profileID || previous.ownerKey != ownerKey || previous.owner != owner || previous.key != key {
+            items = []
+            lastSignature = nil
+        }
+        if signature == lastSignature, !items.isEmpty {
+            // Returning to a cached request must retire a different pending fetch; otherwise
+            // its late completion could replace the cached row with now-obsolete inputs.
+            if inFlightSignature != nil {
+                requestGeneration &+= 1
+                loadTask?.cancel()
+                loadTask = nil
+                inFlightSignature = nil
+            }
+            return
+        }
+        if signature == inFlightSignature { return }
 
+        requestGeneration &+= 1
+        let generation = requestGeneration
         loadTask?.cancel()
-        loadTask = Task {
+        inFlightSignature = signature
+        loadTask = Task { [weak self] in
             let recommendations = await Self.fetch(seeds: Array(seeds), owned: owned)
-            if Task.isCancelled { return }
+            guard let self, !Task.isCancelled, self.requestGeneration == generation,
+                  CredentialScopeRegistry.shared.isCurrent(owner), ApiKeys.tmdbKey() == key else { return }
+            self.inFlightSignature = nil
+            self.loadTask = nil
             // Keep the rail when results arrive; on an empty fetch (flaky network) leave whatever we
             // already had rather than blanking a populated rail, but clear the signature so the next
             // refresh retries.
             if recommendations.isEmpty {
-                lastSignature = nil
+                self.lastSignature = nil
             } else {
-                items = recommendations
-                lastSignature = signature
+                self.items = recommendations
+                self.lastSignature = signature
             }
         }
     }
 
     /// Clear when the profile signs out or switches to one with no eligible history.
     func clear() {
+        requestGeneration &+= 1
         loadTask?.cancel()
+        loadTask = nil
+        inFlightSignature = nil
         items = []
         lastSignature = nil
     }
 
     /// Fetch "more like this" for every seed in parallel, then merge preserving seed order (a recommend
     /// from the most-recent title outranks one from an older title), de-duplicate, drop owned titles, and
-    /// cap. Runs off the main actor.
+    /// cap. Network child tasks run concurrently; the bounded merge remains on this model's main actor.
     private static func fetch(seeds: [(id: String, type: String)], owned: Set<String>) async -> [MetaPreview] {
         let perSeed: [[MetaPreview]] = await withTaskGroup(of: (Int, [MetaPreview]).self) { group in
             for (index, seed) in seeds.enumerated() {

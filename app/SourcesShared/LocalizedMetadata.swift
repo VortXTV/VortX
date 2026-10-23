@@ -117,6 +117,8 @@ final class LocalizedMetadataStore: ObservableObject {
 
     /// Ids currently in flight (per lang-scoped key), so overlapping card batches don't double-fetch.
     private var inFlight = Set<String>()
+    /// Retryable failures stay memory-only; genuine misses also expire so later pool contributions appear.
+    private var retryAfter: [String: Date] = [:]
     private var flushTask: Task<Void, Never>?
     /// Ids queued for the next batched flush (deduped), pending a short debounce so a burst of cards coalesces.
     private var pending = Set<String>()
@@ -167,7 +169,8 @@ final class LocalizedMetadataStore: ObservableObject {
     /// a burst of cards (a whole grid appearing) coalesces into one or two worker calls.
     private func request(_ id: String) {
         let key = scopedKey(id)
-        guard entries[key] == nil, !inFlight.contains(key) else { return }
+        guard entries[key]?.isEmpty != false, !inFlight.contains(key),
+              retryAfter[key].map({ $0 <= Date() }) ?? true else { return }
         pending.insert(id)
         guard flushTask == nil else { return }
         flushTask = Task { [weak self] in
@@ -187,18 +190,23 @@ final class LocalizedMetadataStore: ObservableObject {
         for id in batch { inFlight.insert(scopedKey(id, lang: lang)) }
 
         let fetched = await fetchPool(ids: batch, lang: lang)
+        let retryTime = Date().addingTimeInterval(fetched == nil ? Self.failureRetryDelay : Self.missRetryDelay)
         var updates: [String: LocalizedMeta] = [:]
         var misses: [String] = []
         for id in batch {
             let key = scopedKey(id, lang: lang)
             inFlight.remove(key)
-            if let hit = fetched[id], !hit.isEmpty {
+            if let hit = fetched?[id], !hit.isEmpty {
                 updates[key] = hit
+                retryAfter[key] = nil
             } else {
                 misses.append(id)
-                // Record a negative so we do not hammer the pool on every layout; a later user-key backfill
-                // can still overwrite it (see backfillFromUserKey).
-                updates[key] = LocalizedMeta(title: "", posterPath: "", logoPath: "")
+                retryAfter[key] = retryTime
+                // Only an accepted pool response proves a miss. Offline/HTTP/parse failures
+                // never become persistent negative metadata, and retries are throttled.
+                if fetched != nil {
+                    updates[key] = LocalizedMeta(title: "", posterPath: "", logoPath: "")
+                }
             }
         }
         if !updates.isEmpty {
@@ -221,22 +229,22 @@ final class LocalizedMetadataStore: ObservableObject {
     // MARK: pool read
 
     /// GET /meta/l10n?ids=<csv>&lang=<code> against the catalogs edge, signed via VortXEdgeAuth. Fail-soft to
-    /// an empty map (the caller then records negatives + optionally backfills).
-    private func fetchPool(ids: [String], lang: String) async -> [String: LocalizedMeta] {
-        guard let base = poolBase() else { return [:] }
+    /// nil on transport/HTTP/parse failure; an empty map is an accepted response with real misses.
+    private func fetchPool(ids: [String], lang: String) async -> [String: LocalizedMeta]? {
+        guard let base = poolBase() else { return nil }
         var comps = URLComponents(string: base + "/meta/l10n")
         comps?.queryItems = [
             URLQueryItem(name: "ids", value: ids.joined(separator: ",")),
             URLQueryItem(name: "lang", value: lang),
         ]
-        guard let url = comps?.url else { return [:] }
+        guard let url = comps?.url else { return nil }
         var req = URLRequest(url: url)
         VortXEdgeAuth.sign(&req)
         do {
             let (data, resp) = try await session.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let items = obj["items"] as? [String: Any] else { return [:] }
+                  let items = obj["items"] as? [String: Any] else { return nil }
             var out: [String: LocalizedMeta] = [:]
             for (id, raw) in items {
                 guard let row = raw as? [String: Any] else { continue }   // null = miss; skip
@@ -246,7 +254,7 @@ final class LocalizedMetadataStore: ObservableObject {
                     logoPath: (row["logoPath"] as? String) ?? "")
             }
             return out
-        } catch { return [:] }
+        } catch { return nil }
     }
 
     // MARK: user-key backfill + contribute (self-seed the pool)
@@ -267,6 +275,7 @@ final class LocalizedMetadataStore: ObservableObject {
             for await (id, meta) in group {
                 guard let meta, !meta.isEmpty else { continue }
                 backfilled[scopedKey(id, lang: lang)] = meta   // collect, then merge once (single re-render)
+                retryAfter[scopedKey(id, lang: lang)] = nil
                 contributions.append([
                     "id": id, "title": meta.title,
                     "posterPath": meta.posterPath, "logoPath": meta.logoPath,
@@ -285,7 +294,7 @@ final class LocalizedMetadataStore: ObservableObject {
     /// for art, base-language image match then textless, path-only. nil when TMDB has nothing / no id match.
     private func tmdbLocalized(id: String, lang: String) async -> LocalizedMeta? {
         guard let key = ApiKeys.tmdbKey() else { return nil }
-        let base = LocalizedMetadataLanguage.baseCode
+        let base = lang.split(separator: "-").first.map(String.init)?.lowercased() ?? lang.lowercased()
         // Resolve the TMDB kind + numeric id (imdb via /find, or a direct tmdb ref).
         let ref = await tmdbRef(for: id, key: key)
         guard let ref else { return nil }
@@ -370,6 +379,8 @@ final class LocalizedMetadataStore: ObservableObject {
 
     private static let maxIDsPerRead = 60          // matches the worker's MAX_IDS_PER_READ
     private static let maxBackfillPerFlush = 8     // cap user-key TMDB fan-out per flush
+    private static let failureRetryDelay: TimeInterval = 30
+    private static let missRetryDelay: TimeInterval = 60 * 60
 
     /// Map an app language code to TMDB's `language=` form, mirroring the worker's `tmdbLang`: script subtags
     /// map to a region form, region subtags are kept, everything else falls to the base language.
@@ -424,17 +435,33 @@ final class LocalizedMetadataStore: ObservableObject {
     private func loadDiskCache() {
         guard let url = cacheURL, let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode([String: LocalizedMeta].self, from: data) else { return }
-        entries = decoded
+        // Discard old all-empty records: older clients persisted network failures as
+        // permanent misses, and that format has no timestamp from which to recover an age.
+        entries = decoded.filter { !$0.value.isEmpty }
     }
 
+    /// Persist the entries, coalesced and off the main actor. While a grid streams in, a flush lands every
+    /// ~120 ms, and each one used to JSON-encode up to 4,000 entries and rewrite the file on the main thread,
+    /// right where focus moves and scrolling are handled. A lost write only means a later re-fetch.
     private func saveDiskCache() {
-        // Cap the persisted set so the cache never grows without bound across sessions.
-        let capped = entries.count > Self.diskCacheCap
-            ? Dictionary(uniqueKeysWithValues: entries.prefix(Self.diskCacheCap).map { ($0.key, $0.value) })
-            : entries
-        guard let url = cacheURL, let data = try? JSONEncoder().encode(capped) else { return }
-        try? data.write(to: url, options: .atomic)
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.saveDelayNanoseconds)
+            guard !Task.isCancelled, let self, let url = self.cacheURL else { return }
+            // Cap the persisted set so the cache never grows without bound across sessions.
+            let entries = self.entries.filter { !$0.value.isEmpty }
+            let capped = entries.count > Self.diskCacheCap
+                ? Dictionary(uniqueKeysWithValues: entries.prefix(Self.diskCacheCap).map { ($0.key, $0.value) })
+                : entries
+            await Task.detached(priority: .utility) {
+                guard let data = try? JSONEncoder().encode(capped) else { return }
+                try? data.write(to: url, options: .atomic)
+            }.value
+        }
     }
+
+    private var saveTask: Task<Void, Never>?
+    private static let saveDelayNanoseconds: UInt64 = 1_500_000_000
 
     private static let diskCacheCap = 4000
 }

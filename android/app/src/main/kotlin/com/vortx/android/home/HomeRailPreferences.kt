@@ -7,6 +7,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 
 enum class HomeRail(val key: String, val title: String) {
+    FOR_YOU("forYou", "For You"),
+    SMART_COLLECTIONS("smartCollections", "Smart Collections"),
     COLLECTIONS_HUB("collectionsHub", "Collections"),
     TOP_PICKS("topPicks", "Top Picks for you"),
     BECAUSE_YOU_WATCHED("becauseYouWatched", "Because You Watched"),
@@ -27,6 +29,8 @@ enum class HomeRail(val key: String, val title: String) {
         private const val SECTION_CATALOG_PREFIX = "vortx.home."
 
         val phoneDefaultOrder = listOf(
+            FOR_YOU,
+            SMART_COLLECTIONS,
             COLLECTIONS_HUB,
             TOP_PICKS,
             BECAUSE_YOU_WATCHED,
@@ -41,6 +45,8 @@ enum class HomeRail(val key: String, val title: String) {
         )
 
         val tvDefaultOrder = listOf(
+            FOR_YOU,
+            SMART_COLLECTIONS,
             COLLECTIONS_HUB,
             TOP_PICKS,
             BECAUSE_YOU_WATCHED,
@@ -54,6 +60,8 @@ enum class HomeRail(val key: String, val title: String) {
         )
 
         fun forCatalog(catalog: Catalog): HomeRail = when {
+            catalog.id.startsWith("${FOR_YOU.catalogId}:") -> FOR_YOU
+            catalog.id.startsWith("${SMART_COLLECTIONS.catalogId}:") -> SMART_COLLECTIONS
             catalog.id.startsWith("${MEDIA_SERVERS.catalogId}:") -> MEDIA_SERVERS
             catalog.id.startsWith("${IMPORTED_LISTS.catalogId}:") -> IMPORTED_LISTS
             catalog.id.startsWith("${EDITORIAL_COLLECTIONS.catalogId}:") -> EDITORIAL_COLLECTIONS
@@ -98,11 +106,21 @@ data class HomeRailLayout(
 )
 
 internal object HomeRailPolicy {
+    /**
+     * Saved positions win; a default section missing from the saved order (a newly shipped one such as
+     * For You) slots in right after its nearest default predecessor, at the top when it has none, rather
+     * than below every add-on catalog. Mirrors Apple `HomeRailPreferences.arrange(saved:defaults:)`.
+     */
     fun normalizedOrder(savedKeys: List<String>, defaults: List<HomeRail>): List<HomeRail> {
         if (savedKeys.isEmpty()) return defaults
         val allowed = defaults.toSet()
-        val saved = savedKeys.mapNotNull(HomeRail::fromKey).filter { it in allowed }.distinct()
-        return saved + defaults.filterNot(saved::contains)
+        val result = savedKeys.mapNotNull(HomeRail::fromKey).filter { it in allowed }.distinct().toMutableList()
+        defaults.forEachIndexed { index, rail ->
+            if (rail in result) return@forEachIndexed
+            val anchor = defaults.subList(0, index).lastOrNull { it in result }
+            result.add(anchor?.let { result.indexOf(it) + 1 } ?: 0, rail)
+        }
+        return result
     }
 
     fun arrangeCatalogs(

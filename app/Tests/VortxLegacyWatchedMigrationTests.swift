@@ -83,11 +83,16 @@ enum VortxLegacyWatchedMigrationTests {
                   "watched evidence does not invent viewing clocks or progress")
         }
 
-        await expectFailure("unresolved opaque bitmap is still rejected by strict material adapter") {
-            _ = try VortxLegacyBootstrapMaterial.encode(document: document,
-                roster: [ownerProfile], ownerProfileID: ownerID, rosterModifiedSeconds: nil,
-                accountID: "account-a")
-        }
+        // Without evidence the opaque bitmap is held (issue #262), never decoded into guessed episodes.
+        let unresolved = try VortxLegacyBootstrapMaterial.project(document: document,
+            roster: [ownerProfile], ownerProfileID: ownerID, rosterModifiedSeconds: nil,
+            accountID: "account-a", preparePendingMembership: false)
+        check(unresolved.held.contains { $0.reason.contains("Opaque watched bitfield") },
+              "unresolved opaque bitmap is still refused by the strict material adapter")
+        let unresolvedMaterial = try JSONSerialization.jsonObject(with: unresolved.material) as! Object
+        let unresolvedWatches = (unresolvedMaterial["watches"] as! [String: [Object]])[ownerID.uuidString] ?? []
+        check(!unresolvedWatches.contains { episodeIDs.contains($0["videoId"] as? String ?? "") },
+              "no bitmap episode becomes a watched fact without evidence")
         let changedDocument = Data(document + Data([0x20]))
         try await expectStale("changed source bytes") {
             _ = try row.videoIDs(accountID: "account-a", profileID: ownerID, sourceSHA256: digest(changedDocument),
@@ -270,11 +275,7 @@ enum VortxLegacyWatchedMigrationTests {
             try VortxLegacyWatchedMigration.validateArchivedPending(pendingArchive,
                 accountID: "account-a", ownerProfileID: sharedID)
         }
-        await expectFailure("incomplete inventory strict adapter") {
-            _ = try VortxLegacyBootstrapMaterial.encode(document: document,
-                roster: [ownerProfile], ownerProfileID: ownerID, rosterModifiedSeconds: nil,
-                accountID: "account-a", watchedEvidence: unavailable.rows)
-        }
+        try expectHeldBitmap("incomplete inventory strict adapter", document: document, evidence: unavailable.rows)
 
         let twoAddons = try ownerDocument(addons: [addon(url: catalogURL, manifest: manifest),
                                                     addon(url: alternateURL, manifest: alternateManifest)])
@@ -287,11 +288,7 @@ enum VortxLegacyWatchedMigrationTests {
         check(ambiguous.unresolved[0].sourceDocument == twoAddons
               && ambiguous.unresolved[0].sourceDocumentSHA256 == digest(twoAddons),
               "ambiguous inventory preserves exact source bytes and digest")
-        await expectFailure("ambiguous inventory strict adapter") {
-            _ = try VortxLegacyBootstrapMaterial.encode(document: twoAddons,
-                roster: [ownerProfile], ownerProfileID: ownerID, rosterModifiedSeconds: nil,
-                accountID: "account-a", watchedEvidence: ambiguous.rows)
-        }
+        try expectHeldBitmap("ambiguous inventory strict adapter", document: twoAddons, evidence: ambiguous.rows)
     }
 
     private static func retriesHistoricalPendingWithoutReplacingSource() async throws {
@@ -759,6 +756,19 @@ enum VortxLegacyWatchedMigrationTests {
 
     private static func check(_ condition: @autoclosure () -> Bool, _ message: String) {
         precondition(condition(), message)
+    }
+
+    /// Issue #262: a bitmap without exactly one evidence row is held by the strict adapter, never
+    /// decoded into guessed episodes, while the rest of the account still projects.
+    private static func expectHeldBitmap(_ description: String, document: Data,
+                                         evidence: [VortxLegacyWatchedMigration.ValidatedRow]) throws {
+        let projected = try VortxLegacyBootstrapMaterial.project(document: document,
+            roster: [ownerProfile], ownerProfileID: ownerID, rosterModifiedSeconds: nil,
+            accountID: "account-a", watchedEvidence: evidence, preparePendingMembership: false)
+        check(projected.held.contains { $0.reason.contains("Opaque watched bitfield") }, "Expected hold: \(description)")
+        let material = try JSONSerialization.jsonObject(with: projected.material) as! Object
+        let watches = (material["watches"] as! [String: [Object]])[ownerID.uuidString] ?? []
+        check(!watches.contains { episodeIDs.contains($0["videoId"] as? String ?? "") }, "No guessed episode: \(description)")
     }
 
     private static func expectFailure(_ description: String, _ action: () async throws -> Void) async {

@@ -13,12 +13,6 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   app/SourcesShared/EpisodeEngineBindingRequest.swift app/SourcesShared/EpisodeSourceCollection.swift app/Tests/EpisodeSourceCollectionTests.swift \
   -o "$episode_test_dir/collection"
 "$episode_test_dir/collection"
-xcrun swiftc -D VORTX_NATIVE_DATA_ENGINE -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-  app/SourcesShared/SourceSettlementPolicy.swift app/SourcesShared/NextEpisodePreparationWork.swift \
-  app/SourcesShared/SourceIndexContract.swift app/SourcesShared/SourceIndexIdentity.swift \
-  app/SourcesShared/EpisodeEngineBindingRequest.swift app/SourcesShared/EpisodeSourceCollection.swift app/Tests/EpisodeSourceCollectionTests.swift \
-  -o "$episode_test_dir/native-collection"
-"$episode_test_dir/native-collection"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/NextEpisodePreparationWork.swift app/SourcesTV/NextEpisodePreloadPolicy.swift \
   app/Tests/NextEpisodePreloadPolicyTests.swift -o "$episode_test_dir/preload"

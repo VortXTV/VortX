@@ -335,19 +335,27 @@ class NativeWatchedMigrationProducerTest {
 
         val foreignArchive = JSONArray(batch.archive().toString())
         foreignArchive.getJSONObject(0).put("accountId", "account.foreign")
-        val unresolved = NativeWatchedMigrationProducer { error("foreign archive must not be accepted") }
-            .prepare(scope, source, roster, retainedArchive = foreignArchive, isCurrent = { true })
-        assertFalse(unresolved.isComplete)
-        assertEquals("episode_inventory_unavailable", unresolved.pending().getJSONObject(0).getString("reason"))
+        // Foreign journal ownership is rejected before metadata work; it is not a retryable inventory gap.
+        assertFailure {
+            NativeWatchedMigrationProducer { error("foreign archive must not be accepted") }
+                .prepare(scope, source, roster, retainedArchive = foreignArchive, isCurrent = { true })
+        }
 
         // The UID field is only accepted for an independent authenticated source.  A shared source
         // archive carrying one is structurally invalid and must never be replayed as owner evidence.
         val uidArchive = JSONArray(batch.archive().toString())
         uidArchive.getJSONObject(0).put("verifiedStreamingUid", "foreign-streaming-uid")
-        assertFailure {
-            NativeWatchedMigrationProducer { error("foreign UID archive must be rejected before fetch") }
-                .prepare(scope, source, roster, retainedArchive = uidArchive, isCurrent = { true })
+        var uidFetchAttempted = false
+        try {
+            NativeWatchedMigrationProducer {
+                uidFetchAttempted = true
+                error("foreign UID archive must be rejected before fetch")
+            }.prepare(scope, source, roster, retainedArchive = uidArchive, isCurrent = { true })
+            fail("Expected shared source with a forged streaming UID to be rejected")
+        } catch (error: IllegalArgumentException) {
+            assertEquals("Malformed own-account watched source envelope", error.message)
         }
+        assertFalse("A forged streaming UID must be rejected before metadata fetch", uidFetchAttempted)
     }
 
     @Test

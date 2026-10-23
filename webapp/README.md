@@ -25,18 +25,21 @@ and explains the empty state when the only sources found are torrents.
 
 ## How it maps to the rest of the repo
 
-| Concern | Native apps / desktop | This web client |
+| Concern | Native apps | This web client (also the desktop app's UI) |
 | --- | --- | --- |
-| Add-on protocol | native engine integration, platform-specific hosts | `src/lib/addon.ts` - direct `fetch()` |
-| Catalogs / meta | engine `board` / `meta_details` models | Cinemeta + installed add-ons over HTTPS |
-| Stream ranking | `StreamRanking.swift` / `desktop/src/streamRanking.ts` | `src/lib/streamRanking.ts` (ported) |
-| Series / episodes | `desktop/src/engine.ts` helpers | `src/lib/series.ts` (ported) |
-| Player | libmpv (Apple) / libmpv via Tauri (desktop) | HTML5 `<video>` + `hls.js` (`src/lib/player.ts`) |
-| Torrents | in-process streaming server | not supported (no server) |
+| Add-on protocol | the VortX engine (vortx-core) | `src/lib/addon.ts` - direct `fetch()` |
+| Catalogs / meta | the VortX engine's resource host | Cinemeta + installed add-ons over HTTPS |
+| Stream ranking | `StreamRanking.swift` / Android ranking | `src/lib/streamRanking.ts` (ported) |
+| Series / episodes | native series views | `src/lib/series.ts` (ported) |
+| Player | libmpv | HTML5 `<video>` + `hls.js` (`src/lib/player.ts`); native mpv for torrents in the desktop app |
+| Torrents | in-process VortX streaming server | browser: not supported; desktop app: the shell's in-process VortX streaming server |
 
-The ranking, series handling and detail UX share concepts with the other frontends, but browser
-behavior is not a full native-app parity claim. The browser does not embed the native engine or a
-media streaming server. Account sync still uses the VortX API.
+## The desktop app
+
+The VortX desktop app (`desktop/`, Tauri) loads this web client and adds what a browser cannot have: the
+VortX streaming server running in the app process, so torrent sources play, and the native mpv player.
+`src/lib/desktop.ts` is the whole bridge; in a browser it is inert. The shell exposes only its server
+and player commands, and only to the `https://web.vortx.tv` origin.
 
 ## Add-ons
 
@@ -66,7 +69,7 @@ corepack npm run build      # tsc && vite build -> dist/
 corepack npm run preview    # serve the production build locally
 ```
 
-Requirements: Node 22.18+ with Corepack. `package.json` pins npm 11.17.0, and the project
+Requirements: Node 22.23.3+ with Corepack. `package.json` pins npm 12.2.0, and the project
 rejects installs and scripts run with a different Node or npm version.
 
 ## Deploy (Cloudflare Pages -> web.vortx.tv)

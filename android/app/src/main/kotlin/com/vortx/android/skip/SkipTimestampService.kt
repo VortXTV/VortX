@@ -71,7 +71,7 @@ object SkipTimestampService {
         return "vortx:$imdbId:${season ?: 0}:${episode ?: 0}:$durationBucket"
     }
 
-    fun supports(metaId: String): Boolean = queryPair(metaId) != null || AniSkipService.supports(metaId)
+    fun supports(metaId: String): Boolean = TheIntroDBV4.supports(metaId) || AniSkipService.supports(metaId)
 
     // MARK: - Providers
 
@@ -104,31 +104,38 @@ object SkipTimestampService {
 
     /// Layer 2a: TheIntroDB crowd spans (any media, keyed by imdb/tmdb/tvdb id). Mirrors Apple `theIntroDB`.
     private suspend fun theIntroDB(metaId: String, season: Int?, episode: Int?, durationSeconds: Double): List<SegmentCandidate> {
-        val idParam = queryPair(metaId) ?: return emptyList()
-        val durationBucket = (durationSeconds / 10).toInt() * 10
-        val key = "$metaId:${season ?: 0}:${episode ?: 0}:$durationBucket"
+        val lookup = TheIntroDBV4.lookup(metaId, season, episode, durationSeconds) ?: return emptyList()
+        val key = lookup.cacheKey
         store?.entry(key)?.let { cached ->
             Log.i(TAG, "cache hit $key: ${cached.spans.size} spans")
             return candidatesFrom(cached.spans, durationSeconds)
         }
 
-        val sb = StringBuilder("https://api.theintrodb.org/v3/media?${idParam.first}=${idParam.second}")
-        if (season != null && episode != null) sb.append("&season=$season&episode=$episode")
-        if (durationSeconds > 0) sb.append("&duration_ms=${(durationSeconds * 1000).toInt()}")
-        val res = SkipHttp.request("GET", sb.toString())
-        if (res.status == 404) { // known-missing: cache so we retry daily, not per play
-            Log.i(TAG, "$key: not in the database")
-            store?.store(SkipTimestampStore.Entry.miss(), key)
-            return emptyList()
+        val res = SkipHttp.request("GET", lookup.url)
+        return when (val result = TheIntroDBV4.read(res.status, res.body)) {
+            TheIntroDBV4.ReadResult.NotFound -> {
+                store?.store(SkipTimestampStore.Entry.miss(), key)
+                emptyList()
+            }
+            is TheIntroDBV4.ReadResult.Media -> {
+                val spans = result.spans.map { StoredSpan(it.kind, it.startMs, it.endMs) }
+                store?.store(SkipTimestampStore.Entry(System.currentTimeMillis(), spans, null), key)
+                candidatesFrom(spans, durationSeconds)
+            }
+            TheIntroDBV4.ReadResult.EpisodeList, TheIntroDBV4.ReadResult.Versions -> {
+                Log.i(TAG, "TheIntroDB v4 returned a non-timestamp response")
+                emptyList()
+            }
+            TheIntroDBV4.ReadResult.InvalidResponse -> {
+                Log.i(TAG, "TheIntroDB v4 invalid response")
+                emptyList()
+            }
+            is TheIntroDBV4.ReadResult.HttpFailure -> {
+                // Invalid requests, throttling and outages are not missing media. Never retry on v3.
+                Log.i(TAG, "TheIntroDB v4 HTTP ${result.status}")
+                emptyList()
+            }
         }
-        if (res.status != 200) { // rate-limit / server error: retry next play
-            Log.i(TAG, "$key: HTTP ${res.status}")
-            return emptyList()
-        }
-        val spans = parseTheIntroDB(res.body) ?: return emptyList()
-        Log.i(TAG, "$key: ${spans.size} spans fetched")
-        store?.store(SkipTimestampStore.Entry(System.currentTimeMillis(), spans, null), key)
-        return candidatesFrom(spans, durationSeconds)
     }
 
     /// Layer 2b: SkipDB crowd spans (any media, keyed by IMDB id only). Mirrors Apple `skipDB`.
@@ -188,17 +195,6 @@ object SkipTimestampService {
         return candidatesFrom(parsed.first, durationSeconds)
     }
 
-    // MARK: - Id mapping
-
-    /// Maps a Stremio meta id to the API's id parameter `(name, value)`. IMDB ("tt123…"), or namespaced
-    /// "tmdb:123" / "tvdb:123". Mirrors Apple `queryItem(for:)`.
-    private fun queryPair(metaId: String): Pair<String, String>? {
-        if (IMDB_REGEX.matches(metaId)) return "imdb_id" to metaId
-        if (metaId.startsWith("tmdb:")) metaId.removePrefix("tmdb:").toIntOrNull()?.let { return "tmdb_id" to it.toString() }
-        if (metaId.startsWith("tvdb:")) metaId.removePrefix("tvdb:").toIntOrNull()?.let { return "tvdb_id" to it.toString() }
-        return null
-    }
-
     /// null intro start = from 0; null credits end = to end of file. Mirrors Apple `candidates(from:...)`.
     private fun candidatesFrom(spans: List<StoredSpan>, duration: Double, confidence: Double = 0.9): List<SegmentCandidate> =
         spans.mapNotNull { span ->
@@ -209,20 +205,6 @@ object SkipTimestampService {
         }
 
     // MARK: - Response parsing (org.json equivalents of the Apple Decodable structs)
-
-    /// TheIntroDB `/v3/media`: up to four arrays of `{start_ms, end_ms}`, either side nullable.
-    private fun parseTheIntroDB(body: String): List<StoredSpan>? {
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val out = mutableListOf<StoredSpan>()
-        for (kind in listOf("intro", "recap", "credits", "preview")) {
-            val arr = root.optJSONArray(kind) ?: continue
-            for (i in 0 until arr.length()) {
-                val s = arr.optJSONObject(i) ?: continue
-                out.add(StoredSpan(kind, s.optIntOrNull("start_ms"), s.optIntOrNull("end_ms")))
-            }
-        }
-        return out
-    }
 
     /// SkipDB `/api/segments`: one object per type (or null / excluded). `outro` maps to "credits". Returns
     /// (spans, intro_length_estimate_ms). Include a span only when start_ms is present (Apple's guard).

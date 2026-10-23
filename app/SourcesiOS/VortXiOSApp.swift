@@ -127,6 +127,8 @@ struct VortXiOSApp: App {
                 // ScenePhase's initial value does not necessarily emit a change on cold launch. Starting here
                 // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
                 .onAppear { UpdateChecker.shared.startMonitoring() }
+                // Infuse reporting where the viewer stopped (its x-success callback to vortx://).
+                .onOpenURL { _ = InfuseReturnCoordinator.handle($0) }
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     // Termination evidence: keep the receipt's last-known phase current so the next
                     // launch can distinguish a backgrounded jetsam kill from a foreground kill.
@@ -138,6 +140,7 @@ struct VortXiOSApp: App {
                     }
                     if phase == .active {
                         UpdateChecker.shared.startMonitoring()
+                        InfuseReturnCoordinator.applyReturned()   // a position Infuse reported before VortX was ready
                         // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero
                         // call sites anywhere in the repo, so the only refreshes were the cold-launch fetch
                         // and the 6-hourly periodic Task, whose sleep does not advance while the process is
@@ -147,15 +150,8 @@ struct VortXiOSApp: App {
                         // fail-soft by construction (refresh never throws and keeps last-good on any error).
                         Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
                         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-                        // #130: after a long suspension iOS can tear down the server's bound listener while
-                        // node keeps ticking, so the server reads Offline until a manual restart.
-                        // recoverIfSuspended subsumes the old drift-latch probe (isOnline) and, on a
-                        // CONNECTION-REFUSED result while the process is alive, signals the in-node rebind; a
-                        // timeout is left alone (busy-but-alive). macOS is excluded: MacNodeServer rebinds 11470.
-                        Task.detached(priority: .utility) { await NodeServer.recoverIfSuspended() }
-                        // Phase 8: the flag-gated in-process engine server stops on background (below),
-                        // so foreground restarts it on a fresh ephemeral port; the player follows via
-                        // StremioServer.embeddedPort. No-op while `vortxNativeServer` is off.
+                        // The in-process engine server stops on background (below), so foreground restarts
+                        // it on a fresh ephemeral port; the player follows via StremioServer.embeddedPort.
                         VortxNativeServer.startIfNeeded()
                         #endif
                         Task {
@@ -491,11 +487,11 @@ private struct MacWindowChrome: NSViewRepresentable {
         }
 
         @MainActor private func apply(to window: NSWindow) {
-            // The player hides the buttons' ancestor chain for its full-bleed cover. Keep that behavior
-            // and AppKit's native fullscreen hover chrome; windowed browsing uses the independent host.
-            guard !inFullScreenTransition, !window.styleMask.contains(.fullScreen),
-                  MacPlayerHost.shared.content == nil else { return }
-            MacWindowControls.restore(in: window)
+            // Keep AppKit's native fullscreen chrome. Windowed, the independent host keeps the buttons; while
+            // the player is up they follow its controls (shown with them, faded out when they hide).
+            guard !inFullScreenTransition, !window.styleMask.contains(.fullScreen) else { return }
+            let player = MacPlayerHost.shared
+            MacWindowControls.restore(in: window, visible: player.content == nil || player.chromeVisible)
         }
     }
 }
@@ -504,12 +500,12 @@ private struct MacWindowChrome: NSViewRepresentable {
 #if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
 import AppKit
 
-/// macOS app delegate whose sole job is to kill the embedded node streaming server when the app
-/// actually quits. `applicationWillTerminate(_:)` is the reliable "app is exiting" signal on macOS
-/// (Cmd-Q, menu Quit, logout/shutdown), unlike scenePhase `.background`/`.inactive`, which fire on
-/// routine window/focus changes and must NOT tear the server down. Without this the `node` child is
-/// reparented to launchd and keeps holding port 11470 (the orphaned-process leak this fixes).
+/// Ordinary quit is deferred until the owned streaming child exits. If shutdown cannot be
+/// confirmed, cancel quit and keep the app as owner. Force Quit/crash bypasses this contract.
+@MainActor
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
+    private var quitRequestPending = false
+    private var quitFailureAlert: NSAlert?
     // Install the macOS 26 (Tahoe) NSToolbar-insert crash guard before any window
     // stands up its (hidden) toolbar. SwiftUI's ToolbarBridge otherwise throws an
     // NSException inserting into the shared window toolbar when an off-main model
@@ -520,14 +516,37 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
         VortXInstallToolbarCrashGuard()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        NodeServer.stop()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !quitRequestPending else { return .terminateLater }
+        quitRequestPending = true
+        NodeServer.stop { stopped in
+            self.quitRequestPending = false
+            sender.reply(toApplicationShouldTerminate: stopped)
+            guard !stopped, self.quitFailureAlert == nil else { return }
+            let alert = NSAlert()
+            alert.messageText = "VortX could not finish shutting down the streaming server"
+            alert.informativeText = "Quit was canceled so the app can keep ownership of its server. You can retry Quit or use Restart streaming server in Settings. A forced exit may leave the server running."
+            alert.addButton(withTitle: "Keep VortX Open")
+            self.quitFailureAlert = alert
+            if let window = sender.windows.first(where: { $0.isVisible && $0 !== alert.window }) {
+                alert.beginSheetModal(for: window) { _ in
+                    Task { @MainActor in self.quitFailureAlert = nil }
+                }
+            } else {
+                // Last-window-close can request quit with no remaining document window.
+                // This AppKit modal loop presents the failure; it never joins the server queue.
+                sender.activate()
+                _ = alert.runModal()
+                self.quitFailureAlert = nil
+            }
+        }
+        return .terminateLater
     }
 
     /// Closing the only window must QUIT the app (a single-window media app, not a document app).
     /// Without this, the red close button / Cmd-W left the app running headless with the node server
-    /// still holding port 11470 and no way to get the window back, and applicationWillTerminate above
-    /// never fired, so the server was only reaped on an explicit Quit.
+    /// still holding port 11470 and no way to get the window back. This requests the same deferred
+    /// quit path; an incomplete shutdown keeps the owner alive and displays the failure.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 #endif

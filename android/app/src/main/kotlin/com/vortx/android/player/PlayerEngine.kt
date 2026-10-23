@@ -251,6 +251,7 @@ data class PlayerState(
     val engineFallbackReason: EngineFallbackReason? = null,
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),
+    val metadata: PlaybackMetadata = PlaybackMetadata(),
 )
 
 enum class EngineFallbackReason {

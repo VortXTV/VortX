@@ -158,6 +158,8 @@ data class PreferredEpisode(
     val episode: Int,
     /** Optional engine video identity; when supplied it must agree with the episode coordinates. */
     val videoIdentity: String? = null,
+    /** The Continue Watching row is up next: this episode is finished, so Detail targets the next unwatched one. */
+    val upNext: Boolean = false,
 )
 
 /** Only an actual engine video identity supplies episode coordinates; sparse titles get no default. */

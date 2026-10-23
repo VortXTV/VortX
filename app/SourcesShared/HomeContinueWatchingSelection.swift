@@ -38,6 +38,7 @@ enum HomeContinueWatchingSelection {
     struct Snapshot {
         let selection: TraktPlaybackShadow.ContinueWatchingSelection
         let context: Context
+        var nextEpisodes: [TraktNextEpisodeOffer] = []
         var intent: Intent { Intent(context: context, source: selection.source,
                                     traktSessionID: selection.sessionID, simklSessionID: selection.simklSessionID) }
     }
@@ -61,16 +62,53 @@ enum HomeContinueWatchingSelection {
             }
         }
     }
+    /// A captured native intent that went stale only because its account/session generation moved on (each sync
+    /// merge republishes the binding) while the same account, profile, settings and service session remain. The
+    /// next history publication re-captures it; a presenter may keep this profile's last row until then.
+    static func awaitsRecapture(_ intent: Intent, core: CoreBridge = .shared, profiles: ProfileStore = .shared) -> Bool {
+        let context = intent.context
+        guard context.usesNativeProfileState, core.usesNativeProfileState,
+              let profileID = context.profileID, profiles.activeID == profileID,
+              profiles.activeUsesEngineHistory == context.usesEngineHistory,
+              context.preferences == ContinueWatchingPreferences.current(),
+              context.preferenceEpoch == ContinueWatchingPreferences.selectionEpoch,
+              case .native(let binding?) = context.nativeTarget, binding.profileID == profileID,
+              CredentialScopeRegistry.shared.isCurrent(binding.credential) else { return false }
+        switch intent.source {
+        case .local: return intent.traktSessionID == nil && intent.simklSessionID == nil
+        case .trakt: return intent.traktSessionID != nil && TraktAuth.storedSessionID == intent.traktSessionID
+        case .simkl: return intent.simklSessionID != nil && SIMKLAuth.storedSessionID == intent.simklSessionID
+        }
+    }
     static func refreshCurrent(core: CoreBridge = .shared, profiles: ProfileStore = .shared) {
         let snapshot = current(core: core, profiles: profiles)
         if snapshot.context.preferences.source == .simkl { SIMKLContinueWatchingShadow.shared.refresh(context: snapshot.context) }
         else if snapshot.context.preferences.source == .trakt { TraktPlaybackShadow.shared.refreshIfStale() }
     }
 
+    /// Only the visible Home task invokes this lane; ordinary source/settings refreshes do not.
+    static func refreshVisibleTraktNextEpisodes(core: CoreBridge = .shared, profiles: ProfileStore = .shared) {
+        let snapshot = current(core: core, profiles: profiles)
+        guard snapshot.intent.source == .trakt, snapshot.intent.isCurrent(core: core, profiles: profiles) else { return }
+        TraktHomeNextEpisodeProducer.shared.requestRefresh(intent: snapshot.intent, core: core)
+    }
+
+    /// A newly mounted presentation has no accepted producer yet. Keep its body empty
+    /// without selecting/sorting history; the source refresh installs a captured intent.
+    static func waitingForPresentation(core: CoreBridge, profiles: ProfileStore) -> Snapshot {
+        let context = Context(profileID: profiles.activeID,
+            usesNativeProfileState: core.usesNativeProfileState,
+            usesEngineHistory: profiles.activeUsesEngineHistory, nativeTarget: nil)
+        var selection = TraktPlaybackShadow.ContinueWatchingSelection(items: [], source: .local, sessionID: nil)
+        selection.status = "Waiting for this profile's acknowledged account and Continue Watching settings…"
+        return Snapshot(selection: selection, context: context)
+    }
+
     static func current(
         core: CoreBridge,
         profiles: ProfileStore,
-        shadow: TraktPlaybackShadow? = nil
+        shadow: TraktPlaybackShadow? = nil,
+        localItemsOverride: [CoreCWItem]? = nil
     ) -> Snapshot {
         var context = Context(
             profileID: profiles.activeID,
@@ -91,8 +129,8 @@ enum HomeContinueWatchingSelection {
 
         // A native shared profile has its own core bucket too. Never fall back to its
         // retired legacy overlay, including while a native session is unavailable.
-        let localItems = context.usesNativeProfileState || context.usesEngineHistory
-            ? core.continueWatching : profiles.cwItems
+        let localItems = localItemsOverride ?? (context.usesNativeProfileState || context.usesEngineHistory
+            ? core.continueWatching : profiles.cwItems)
         var selection: TraktPlaybackShadow.ContinueWatchingSelection
         let requested = context.preferences.source
         if !context.usesEngineHistory || requested == .local {
@@ -142,7 +180,28 @@ enum HomeContinueWatchingSelection {
                 return Snapshot(selection: unavailable, context: context)
             }
         }
-        return Snapshot(selection: selection, context: context)
+        var result = Snapshot(selection: selection, context: context)
+        result.nextEpisodes = TraktHomeNextEpisodeProducer.shared.offers(
+            intent: result.intent, paused: selection.items, now: Date())
+        guard result.intent.isCurrent(core: core, profiles: profiles) else {
+            // A deliberately unavailable/disconnected service has no action capability, but its
+            // empty diagnostic is still useful presentation. Never grant this exception to rows,
+            // captured service sessions, next-episode offers, or a retired original owner context.
+            let serviceUnavailable: Bool
+            switch selection.source {
+            case .local: serviceUnavailable = false
+            case .trakt: serviceUnavailable = !TraktAuth.isConfigured || TraktAuth.storedSessionID == nil
+            case .simkl: serviceUnavailable = !SIMKLAuth.isConfigured || SIMKLAuth.storedSessionID == nil
+            }
+            if serviceUnavailable, selection.items.isEmpty, selection.status != nil,
+               selection.sessionID == nil, selection.simklSessionID == nil,
+               context.isCurrent(core: core, profiles: profiles) {
+                // Construct only the inert presentation: no actionable offers survive this path.
+                return Snapshot(selection: selection, context: context)
+            }
+            return Snapshot(selection: unavailable, context: context)
+        }
+        return result
     }
 
     /// Used at both private-art storage and final publication. A still-connected Trakt

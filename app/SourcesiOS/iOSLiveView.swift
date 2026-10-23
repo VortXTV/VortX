@@ -5,7 +5,7 @@ import SwiftUI
 /// art is a logo on a neutral card, not box-art, so a dedicated `ChannelTile` (not a forked poster
 /// card) carries the right shape. Tapping a channel pushes the standard `iOSDetailView`, which now has
 /// a Live branch (backdrop + name + source list + LIVE badge, no VOD chrome) and plays through the
-/// player's live-tuned path. The screen reuses the engine + player wholesale: no EPG, no M3U import.
+/// player's live-tuned path. The TV guide (`iOSLiveGuideView`) shows the same channels against time.
 ///
 /// Empty state: when no installed add-on exposes a live catalog there are no live rows, so the screen
 /// nudges the user to the Add-ons tab rather than showing a blank surface.
@@ -22,6 +22,14 @@ struct iOSLiveView: View {
                     emptyState
                 } else {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        // The schedule view: every channel down the side, programmes across time.
+                        NavigationLink {
+                            iOSLiveGuideView(channels: LiveGuideChannel.channels(from: core.liveBoardRows), onOpen: openChannel)
+                        } label: {
+                            Label("TV guide", systemImage: "calendar")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                        .padding(.horizontal, Theme.Space.md)
                         ForEach(core.liveBoardRows) { row in
                             if !row.items.isEmpty {
                                 ChannelRail(title: row.title, items: row.items, onTap: handleTap)
@@ -62,6 +70,12 @@ struct iOSLiveView: View {
     /// poster surfaces there is no featured hero to pin to, so a tap always pushes detail.
     private func handleTap(_ meta: CoreMeta) {
         path.append(FeaturedHeroItem.from(meta: meta))
+    }
+
+    /// A guide programme opens its channel's live page, found in the same live rows the guide was built from.
+    private func openChannel(_ channel: LiveGuideChannel) {
+        guard let meta = core.liveBoardRows.lazy.flatMap(\.items).first(where: { $0.id == channel.id && $0.type == channel.type }) else { return }
+        handleTap(meta)
     }
 
     // Route through the shared compat empty state for one consistent layout (#44). No CTA: switching

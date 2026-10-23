@@ -177,8 +177,8 @@ struct WatchEntry: Codable, Equatable {
 /// overlay watch history. This transport is used for two things only: the one-time IMPORT read that
 /// migrates a user's existing Stremio-datastore data into the VortX account, and, when the user opts into
 /// the "also sync to Stremio" mirror (`alsoSyncToStremio`, default OFF), the legacy two-way Stremio sync.
-/// The automatic Stremio WRITE is dormant by default. `repairPoisonedLibrary` still runs on every launch
-/// as a permanent safety scan (an old build on the same account can still poison official library sync).
+/// The automatic Stremio mirror WRITE is dormant by default. Legacy inspection preserves original
+/// library records and reports a recovery need; it does not scrub them or certify UUID-only ownership.
 ///
 /// Transport: our OWN datastore collection. Official clients only ever pull the collections they
 /// know ("libraryItem", ...), so documents in a different collection are invisible to them and
@@ -189,7 +189,7 @@ struct WatchEntry: Codable, Equatable {
 /// into the schema string field `state.watched` PARSED in official apps' stremio-core as a
 /// watched-bitfield and FAILED, which broke the library pull for the entire account in every
 /// official Stremio app ("Serialization error: state.watched: invalid digit found in string").
-/// `repairPoisonedLibrary` scrubs those documents and runs on every launch until clean.
+/// `inspectLegacyLibrary` retains those originals for explicitly authorized safe recovery/export.
 enum ProfileSync {
     private static let api = "https://api.strem.io/api"
     private static let collection = "stremioxProfiles"     // our own, invisible to official clients
@@ -242,52 +242,42 @@ enum ProfileSync {
 
     private static func watchID(_ profileID: UUID) -> String { "stremiox:watch:\(profileID.uuidString)" }
 
-    // MARK: Launch preparation: repair the old poison, then probe our collection
+    // MARK: Launch preparation: inspect retained legacy data, then probe our collection
 
-    /// Idempotent and cheap once clean. Returns watch payloads salvaged from the old transport
-    /// (keyed by document id) so they can be migrated.
-    static func prepare(authKey: String) async -> [String: String] {
-        let salvaged = await repairPoisonedLibrary(authKey: authKey)
+    /// Inspect legacy records without rewriting them, then probe the separate custom collection.
+    /// The existing availability probe may write its probe document; inspection never scrubs history.
+    /// A UUID-only payload cannot grant current-account ownership or automatic migration authority.
+    static func prepare(authKey: String) async -> LegacyProfileRecoveryPolicy.Recovery {
+        let inspection = await inspectLegacyLibrary(authKey: authKey)
         if cloudAvailable == nil {
             await probeCollection(authKey: authKey)
         }
-        return salvaged
+        return inspection
     }
 
-    /// Scrub every `stremiox:*` document the old transports left in the account's libraryItem
-    /// collection: their `state.watched` JSON breaks the official apps' library deserialization.
-    /// Overwrites each with a valid empty watched string (the documents stay invisible: type
-    /// "other" + removed). Returns the payloads found, so watch history can be salvaged.
-    private static func repairPoisonedLibrary(authKey: String) async -> [String: String] {
+    /// Inspect historical `stremiox:*` library documents while preserving every original remote record.
+    /// Ambiguous or unreadable history remains a visible recovery need, not an empty successful import.
+    private static func inspectLegacyLibrary(authKey: String) async -> LegacyProfileRecoveryPolicy.Recovery {
         // Once a launch scans the whole library and finds nothing poisoned, remember that per account
         // so we stop pulling the entire libraryItem collection (and rebuilding an unbounded salvage map)
         // on every subsequent launch. Cleared implicitly if the flag is ever reset.
-        if UserDefaults.standard.bool(forKey: repairDoneKey(authKey)) { return [:] }
+        if UserDefaults.standard.bool(forKey: repairDoneKey(authKey)) { return .unavailable } // skipped is not a new clean observation
         let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "all": true]
-        guard let data = try? await post("datastoreGet", body: body),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = object["result"] as? [[String: Any]] else {
+        let recovery = LegacyProfileRecoveryPolicy.inspection(try? await post("datastoreGet", body: body))
+        guard recovery.inspectionSucceeded else {
             log.error("repair: could not list the library")
-            return [:]
+            return recovery
         }
-        var salvaged: [String: String] = [:]
-        var repaired = 0
-        for item in items {
-            guard let id = item["_id"] as? String, id.hasPrefix("stremiox:") else { continue }
-            let watched = (item["state"] as? [String: Any])?["watched"] as? String ?? ""
-            if !watched.isEmpty { salvaged[id] = watched }
-            guard !watched.isEmpty else { continue }   // already clean
-            await putLibraryItem(sanitizedDoc(id: id, name: item["name"] as? String ?? "StremioX"),
-                                 authKey: authKey)
-            repaired += 1
-        }
-        if repaired > 0 {
-            log.info("repair: scrubbed \(repaired) poisoned documents; official apps can sync again")
+        if recovery.requiresSafeRepair {
+            // No remote scrub before durable exact-source retention AND acknowledged local
+            // adoption. This API also lacks a conditional write, so a later peer edit cannot
+            // safely be erased based on this observation. Preserve the original remote source.
+            log.error("repair: original legacy payloads preserved; safe export/recovery required")
         } else {
             // Nothing to fix this launch: mark the account clean so we skip the full-library scan next time.
             UserDefaults.standard.set(true, forKey: repairDoneKey(authKey))
         }
-        return salvaged
+        return recovery
     }
 
     /// Per-account "library already scanned clean" flag key. Derived from a SHA-256 of the authKey so
@@ -295,24 +285,6 @@ enum ProfileSync {
     private static func repairDoneKey(_ authKey: String) -> String {
         let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
         return "stremiox.libraryRepairComplete.\(digest)"
-    }
-
-    /// A valid, schema-clean, invisible libraryItem (empty watched string parses fine everywhere).
-    private static func sanitizedDoc(id: String, name: String) -> [String: Any] {
-        let now = isoNow()
-        return [
-            "_id": id,
-            "name": name,
-            "type": "other",
-            "posterShape": "poster",
-            "removed": true,
-            "temp": false,
-            "_ctime": now,
-            "_mtime": now,
-            "state": ["lastWatched": now, "timeWatched": 0, "timeOffset": 0, "overallTimeWatched": 0,
-                      "timesWatched": 0, "flaggedWatched": 0, "duration": 0, "video_id": "",
-                      "watched": "", "noNotif": true] as [String: Any],
-        ]
     }
 
     /// One write + read against our own collection decides whether cloud sync is on.
@@ -357,17 +329,22 @@ enum ProfileSync {
         return watch
     }
 
-    static func pushWatch(_ watch: [String: WatchEntry], profileID: UUID, authKey: String) async {
-        guard cloudAvailable == true else { return }
-        // Keep the document a sane size: the rail only ever shows recent titles anyway.
-        let trimmed = watch.count <= 120 ? watch
-            : Dictionary(uniqueKeysWithValues: watch.sorted { $0.value.lastWatched > $1.value.lastWatched }
-                .prefix(120).map { ($0.key, $0.value) })
-        guard let data = try? JSONEncoder().encode(trimmed),
-              let string = String(data: data, encoding: .utf8) else { return }
-        await putDocument(["_id": watchID(profileID), "_mtime": isoNow(), "payload": string],
-                          authKey: authKey)
-        log.info("watch overlay pushed: \(trimmed.count) entries")
+    static func pushWatch(_ watch: [String: WatchEntry], profileID: UUID, authKey: String,
+                          isCurrent: @escaping @MainActor () -> Bool) async -> LegacyProfileRecoveryPolicy.MirrorResult {
+        guard !Task.isCancelled, await isCurrent(), cloudAvailable == true else { return .unavailable }
+        let data: Data
+        do { data = try LegacyProfileRecoveryPolicy.completeMirrorPayload(watch) }
+        catch LegacyProfileRecoveryPolicy.Failure.mirrorCapacity {
+            log.error("watch mirror: complete snapshot exceeds policy; no remote write")
+            return .capacity
+        } catch { return .unavailable }
+        guard let string = String(data: data, encoding: .utf8) else { return .unavailable }
+        let response = await putDocument(["_id": watchID(profileID), "_mtime": isoNow(), "payload": string],
+                                         authKey: authKey, isCurrent: isCurrent)
+        guard !Task.isCancelled, await isCurrent(), let response,
+              LegacyProfileRecoveryPolicy.mirrorOfferCompleted(response) else { return .unavailable }
+        log.info("watch overlay offered: \(watch.count) complete entries")
+        return .offered
     }
 
     /// Decode a watch payload salvaged from the old transport (for one-time migration).
@@ -388,29 +365,42 @@ enum ProfileSync {
         return result.first
     }
 
-    private static func putDocument(_ document: [String: Any], authKey: String) async {
+    @discardableResult
+    private static func putDocument(_ document: [String: Any], authKey: String,
+                                    isCurrent: (@MainActor () -> Bool)? = nil) async -> Data? {
         let body: [String: Any] = ["authKey": authKey, "collection": collection, "changes": [document]]
-        guard let data = try? await post("datastorePut", body: body) else {
-            log.error("datastorePut \(document["_id"] as? String ?? "?", privacy: .public): request failed")
-            return
+        guard let data = try? await post("datastorePut", body: body, isCurrent: isCurrent) else {
+            log.error("datastorePut result=request_failed")
+            return nil
         }
-        let raw = String(data: data, encoding: .utf8)?.prefix(200) ?? "?"
-        log.info("datastorePut \(document["_id"] as? String ?? "?", privacy: .public): \(String(raw), privacy: .public)")
+        // A server response can contain reflected/private fields. Only closed local events
+        // cross the logging boundary; no body, document ID, token, or server error is echoed.
+        if LegacyProfileRecoveryPolicy.mirrorOfferCompleted(data) {
+            log.info("datastorePut result=success")
+        } else {
+            log.error("datastorePut result=invalid_or_failed_response")
+        }
+        return data
     }
 
-    private static func putLibraryItem(_ item: [String: Any], authKey: String) async {
-        let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "changes": [item]]
-        _ = try? await post("datastorePut", body: body)
-    }
-
-    private static func post(_ path: String, body: [String: Any]) async throws -> Data {
+    private static func post(_ path: String, body: [String: Any],
+                             isCurrent: (@MainActor () -> Bool)? = nil) async throws -> Data {
         guard let url = URL(string: "\(api)/\(path)") else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = 20
-        let (data, _) = try await URLSession.shared.data(for: request)
+        if let isCurrent {
+            let capturedRequest = request
+            return try await LegacyWatchOwnership.perform(isCurrent: isCurrent) {
+                let (data, response) = try await URLSession.shared.data(for: capturedRequest)
+                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw URLError(.badServerResponse) }
+                return data
+            }
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw URLError(.badServerResponse) }
         return data
     }
 

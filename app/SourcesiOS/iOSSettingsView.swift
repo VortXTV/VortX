@@ -6,6 +6,22 @@ import CoreTransferable
 import UIKit
 #endif
 
+#if os(macOS)
+/// Minimum readable typography for the dense desktop Settings form. Semantic child styles such as
+/// footnote and caption inherit the same Dynamic Type floor, while larger accessibility sizes pass
+/// through unchanged. This modifier is applied only to the macOS Settings form.
+private struct MacSettingsTypography: ViewModifier {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .body) private var bodyPointSize: CGFloat = 16
+
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: bodyPointSize))
+            .dynamicTypeSize(max(dynamicTypeSize, .xxxLarge))
+    }
+}
+#endif
+
 /// A lazy share-sheet payload for the rolling diagnostic log. `ShareLink` asks this representation for
 /// the file only after the owner taps it, so rebuilding Settings never rereads and rewrites the entire log.
 /// The produced file is still a sanitised copy rather than the live cache file.
@@ -56,8 +72,10 @@ struct iOSSettingsView: View {
     @State private var diagExport: (url: String, qr: Image)?
     @State private var diagMacPath: String?
     #if os(macOS)
+    @State private var macRestartFailure: String?
+    @State private var macRestartRecheck: Task<Void, Never>?
     /// Drives the "Share streaming server on this network" toggle (macOS only). Backed by
-    /// NodeServer.sharedOnLAN, which persists + restarts the node process when it flips.
+    /// NodeServer.sharedOnLAN, which persists and restarts the streaming-server child when it flips.
     @State private var shareOnLAN = NodeServer.sharedOnLAN
     @State private var didCopyLAN = false
     // EXTERNAL ENGINE MODE, host side (macOS only). VortXEngineHost is a headless service with no SwiftUI
@@ -78,13 +96,6 @@ struct iOSSettingsView: View {
     @State private var didCopyEngineAddress = false
     @State private var showEngineRevokeAllConfirm = false
     #endif
-    #if !os(macOS)
-    /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
-    /// Same key on every app (settings parity); the toggle renders only in builds whose VortxEngine
-    /// slice carries the server (VortxNativeServerFlag.isSupported), so it can never dangle.
-    @AppStorage(VortxNativeServerFlag.key) private var engineServerOn = false
-    #endif
-
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     // Match Frame Rate is an Apple TV display-mode preference (HDRDisplayMode owns the behavior), but it is
     // bound here on the SAME key so the setting reads and writes identically on every app and the account
@@ -222,36 +233,8 @@ struct iOSSettingsView: View {
         #endif
     }
 
-    private var settingsCardRadius: CGFloat {
-        usesWideSettingsLayout ? 24 : 18
-    }
-
     private var settingsRowInsets: EdgeInsets {
-        usesWideSettingsLayout
-            ? EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20)
-            : EdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
-    }
-
-    /// Padding keeps text readable; this is the actual space between row cards. The old form only inset
-    /// the background shape, so neighbouring rounded boxes still touched even with generous row padding.
-    private var settingsRowSpacing: CGFloat {
-        usesWideSettingsLayout ? Theme.Space.sm : Theme.Space.xs
-    }
-
-    /// Wide surfaces can carry a little more of the active profile hue; the phone stays restrained so the
-    /// compact form remains dark and scannable instead of becoming a column of coloured slabs.
-    private var settingsTintAlpha: Double {
-        usesWideSettingsLayout ? 0.10 : 0.08
-    }
-
-    /// macOS Form does not expose `listRowSpacing`; keep its wide-column card breathing room with the
-    /// clipped background inset while iPhone/iPad use the real iOS row-spacing API above.
-    private var settingsCardVerticalInset: CGFloat {
-        #if os(macOS)
-        return Theme.Space.xs / 2
-        #else
-        return 0
-        #endif
+        VortXInlineGlassPolicy.rowInsets(wide: usesWideSettingsLayout)
     }
 
     var body: some View {
@@ -303,9 +286,10 @@ struct iOSSettingsView: View {
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
             #if os(iOS)
-            .listRowSpacing(settingsRowSpacing)
+            // The row's layout insets and background share one gutter owner on every platform.
+            .listRowSpacing(0)
             #endif
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent).ignoresSafeArea())
             .frame(maxWidth: usesWideSettingsLayout ? 1120 : .infinity, alignment: .center)
             .padding(.horizontal, usesWideSettingsLayout ? Theme.Space.sm : 0)
             #endif
@@ -445,18 +429,31 @@ struct iOSSettingsView: View {
             .onChange(of: theme.textScale) { _ in ProfileStore.shared.captureTheme() }
             // Device-scoped settings (audioOutput, forceSDRTonemap, perfMode, directLinksOnly) are
             // deliberately NOT folded back: they describe THIS device, not the viewer.
-            .task {
+            #if os(macOS)
+            .onDisappear {
+                macRestartRecheck?.cancel()
+                macRestartRecheck = nil
+            }
+            #endif
+            .task { @MainActor in
                 // Live server monitor that never gives up: the embedded server cold-starts well
                 // after launch, so a fixed window could expire and show "Offline" until a relaunch.
                 // Retries fast while offline, keeps the badge fresh once up; restarts on each visit.
                 while !Task.isCancelled {
+                    #if os(macOS)
+                    refreshMacRestartFailure()
+                    #endif
                     if effectiveDirectLinksOnly {
                         serverOnline = nil
                         try? await Task.sleep(for: .seconds(12))
                         continue
                     }
                     let online = await StremioServer.isOnline()
-                    serverOnline = online
+                    guard !Task.isCancelled else { return }
+                    #if os(macOS)
+                    refreshMacRestartFailure()
+                    #endif
+                    serverOnline = effectiveDirectLinksOnly ? nil : online
                     try? await Task.sleep(for: .seconds(online ? 12 : 3))
                 }
             }
@@ -469,12 +466,10 @@ struct iOSSettingsView: View {
                     updates.presentAvailableIfNeeded(force: true)
                 }
             }
-            .onAppear { SettingsChangeLog.prime() }   // I-settings: baseline the [settings] change log for this visit
             // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
-            // SettingsChangeLog), covering all the @AppStorage controls without a scattered .onChange per control.
-            .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
-                SettingsChangeLog.logChanges()
-            }
+            // SettingsChangeLog) while this screen is on view, covering all the @AppStorage controls without a
+            // scattered .onChange per control.
+            .modifier(SettingsChangeRecorder())
     }
 
     // MARK: Settings search
@@ -484,13 +479,7 @@ struct iOSSettingsView: View {
     /// grouped-list platter when a new section is added.
     private func styledSettingsSection<Content: View>(_ content: Content) -> some View {
         content
-            .listRowBackground(Color.clear.vortxGlassTintedSurface(
-                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous),
-                fillAlpha: VortXGlass.cardFillAlpha,
-                tint: Theme.Palette.accent,
-                tintAlpha: settingsTintAlpha,
-                shadow: .flat)
-                .padding(.vertical, settingsCardVerticalInset))
+            .listRowBackground(VortXSettingsRowBackground(wide: usesWideSettingsLayout, tint: Theme.Palette.accent))
             .listRowInsets(settingsRowInsets)
             .listRowSeparator(.hidden)
     }
@@ -578,8 +567,9 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
+            .modifier(MacSettingsTypography())
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent).ignoresSafeArea())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas.ignoresSafeArea())
@@ -720,7 +710,7 @@ struct iOSSettingsView: View {
                 }
                 .padding(.vertical, 2)
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+            .listRowInsets(settingsRowInsets)
         } header: {
             Text("Profiles")
         } footer: {
@@ -765,7 +755,10 @@ struct iOSSettingsView: View {
             if vortxSync.hasCompletedFirstSync {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(MoveSeeding.backedUpLine).font(.subheadline.weight(.semibold))
+                        Text(MoveSeeding.backedUpLine(
+                            synchronizationIsComplete: vortxSync.synchronizationIsComplete,
+                            pendingSettingsMessage: vortxSync.pendingSettingsMessage
+                        )).font(.subheadline.weight(.semibold))
                         Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
                             .font(.footnote).foregroundStyle(.secondary)
                     }
@@ -787,7 +780,7 @@ struct iOSSettingsView: View {
                         Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
                     }
                 } else {
-                    NavigationLink("Sign in / Create account") { SyncSettingsView() }
+                    PushLink("Sign in / Create account") { SyncSettingsView() }
                         .font(.subheadline.weight(.semibold))
                 }
                 Button {
@@ -825,17 +818,17 @@ struct iOSSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            NavigationLink("VortX account & sync") { SyncSettingsView() }
+            PushLink("VortX account & sync") { SyncSettingsView() }
             // Optional imports and services that enrich VortX (Stremio, Trakt, SIMKL, Nuvio).
-            NavigationLink("Integrations") { IntegrationsSettingsView() }
-            NavigationLink("Import from Stremio") { StremioImportView() }
-            NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
-            NavigationLink("Debrid services") { DebridKeysView() }
-            NavigationLink("Usenet provider") { UsenetProviderView() }
-            NavigationLink("NZB indexers") { NZBIndexerSettingsView() }
-            NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
-            NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
-            NavigationLink("Media servers (Plex, Jellyfin, Emby)") { MediaServersSettingsView() }
+            PushLink("Integrations") { IntegrationsSettingsView() }
+            PushLink("Import from Stremio") { StremioImportView() }
+            PushLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
+            PushLink("Debrid services") { DebridKeysView() }
+            PushLink("Usenet provider") { UsenetProviderView() }
+            PushLink("NZB indexers") { NZBIndexerSettingsView() }
+            PushLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
+            PushLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
+            PushLink("Media servers (Plex, Jellyfin, Emby)") { MediaServersSettingsView() }
         }
     }
 
@@ -945,8 +938,8 @@ struct iOSSettingsView: View {
                 Text("SkipDB").tag("skipdb")
                 Text("Both").tag("both")
             }
-            NavigationLink("Skip database key") { SkipKeysView() }
-            NavigationLink("Seek bar style") { SeekBarStylePicker() }
+            PushLink("Skip database key") { SkipKeysView() }
+            PushLink("Seek bar style") { SeekBarStylePicker() }
             Toggle("Community scrub previews", isOn: $communityTrickplay)
                 .tint(Theme.Palette.accent)
             Text("Share and reuse scrub-preview thumbnails across the community, so previews appear instantly without each device regenerating them. Only the generated thumbnails are shared, never any account data.")
@@ -1264,8 +1257,7 @@ struct iOSSettingsView: View {
             // Auto-pick + live preview) binds directly to the SourcePreferences singleton, the same
             // direct-singleton pattern the rest of this section uses.
             SourceFilterChipsView(prefs: sourcePrefs)
-                .listRowInsets(EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md,
-                                          bottom: Theme.Space.sm, trailing: Theme.Space.md))
+                .listRowInsets(settingsRowInsets)
             Toggle("Use add-on ranking order", isOn: $sourcePrefs.useAddonOrder)
                 .tint(Theme.Palette.accent)
 
@@ -1426,62 +1418,54 @@ struct iOSSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            #if os(macOS)
+            if let message = visibleMacRestartFailure {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            #endif
+
             if !effectiveDirectLinksOnly {
                 Text(StremioServer.base)
                     .font(.system(.footnote, design: .monospaced))
                     .foregroundStyle(.secondary)
-                NavigationLink {
+                PushLink {
                     ServerConfigView { Task { serverOnline = await StremioServer.isOnline() } }
                 } label: {
                     Label("Configure server", systemImage: "server.rack")
                 }
 
                 #if !os(macOS)
-                // The embedded server tees its console + uncaught errors + a per-second heartbeat to a log
-                // file. Surfacing it lets a user whose server dies on-device read/share the exact cause
-                // (the sim can't reproduce it). iOS/iPad only: this is the in-process NodeServer.
+                // Show the current in-process server state. Its events are included in the app diagnostics.
                 if !StremioServer.isCustom {
-                    NavigationLink {
+                    PushLink {
                         ServerLogView()
                     } label: {
                         Label("Server log", systemImage: "doc.text.magnifyingglass")
                     }
-                    // The in-process Node server CANNOT re-init once it exits (a nodejs-mobile limit), so a
-                    // "restart" on iOS is necessarily a fresh app launch. Always offered now (the user asked
-                    // for a one-tap restart to reclaim memory before/after the server is killed under
-                    // pressure), not only once it has already exited. role:.destructive + the label make the
-                    // quit explicit, and the status line below says whether the server is currently running.
+                    // This action restarts the whole app to reclaim process memory. The destructive role
+                    // and label make the quit explicit; the native server also restarts on the next launch.
                     Button(role: .destructive) { exit(0) } label: {
                         Label("Restart server (quits VortX, then reopen it)", systemImage: "arrow.clockwise")
-                    }
-                    // Mobile runtimes cannot be swapped in-process: persist the next-launch choice.
-                    if VortxNativeServerFlag.isSupported && !NativeTransportPolicy.isRequired {
-                        Toggle(isOn: $engineServerOn) {
-                            Label("Engine streaming server (experimental)", systemImage: "gearshape.2")
-                        }
-                        Text("Restart VortX after changing the streaming engine.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
                     }
                 }
                 #endif
 
                 #if os(macOS)
                 if !StremioServer.isCustom {
-                    // macOS: the server is a CHILD process, so restart it IN PLACE without quitting the app
-                    // (unlike iOS' one-shot in-process nodejs-mobile). Reaps the child, frees its accumulated
-                    // memory, and rebinds 11470. Same restart() the LAN-sharing toggle already uses.
+                    // macOS requests an in-place restart. If the old child does not exit during
+                    // TERM grace, the failure stays visible and this same button is the explicit retry.
                     Button {
                         NodeServer.restart()
-                        Task {   // re-check status once the child has respawned
-                            try? await Task.sleep(nanoseconds: 1_500_000_000)
-                            serverOnline = await StremioServer.isOnline()
-                        }
+                        scheduleMacRestartRecheck()
                     } label: {
                         Label("Restart streaming server", systemImage: "arrow.clockwise")
                     }
-                    // macOS only: let this Mac act as a Stremio streaming server for the rest of the
-                    // LAN (like the desktop app), so the Apple TV / phone can use it as their server.
+                    // macOS only: let this Mac act as the streaming server for the rest of the LAN,
+                    // so the Apple TV / phone can use it as their server.
                     lanSharingControls
                 }
                 #endif
@@ -1490,7 +1474,7 @@ struct iOSSettingsView: View {
             #if os(iOS) || os(macOS)
             // EXTERNAL ENGINE MODE, client side. Keep this beside the server rows because people
             // looking for a Mac that serves this device will look under Streaming Server first.
-            NavigationLink("Use a Mac as the engine") { ExternalEngineSettingsView() }
+            PushLink("Use a Mac as the engine") { ExternalEngineSettingsView() }
             Text("Let a Mac on your network unpack and prepare the stream for this device. Off until you pair one.")
                 .font(.caption).foregroundStyle(.secondary)
             #endif
@@ -1502,7 +1486,7 @@ struct iOSSettingsView: View {
             // Deliberately OUTSIDE the two gates that wrap the rows above. `!effectiveDirectLinksOnly` gates
             // the TORRENT server, and an engine host never touches it: it fetches a debrid or direct URL and
             // remuxes it, which is exactly what a Direct Links Only build does all day. `!StremioServer.isCustom`
-            // gates rows that configure the embedded node child, and this Mac can host an engine while pointing
+            // gates rows that configure the streaming-server child, and this Mac can host an engine while pointing
             // its own playback at somebody else's server. Nesting inside either would hide a feature that works
             // fine in that state, which is worse than an extra row.
             engineHostControls
@@ -1520,18 +1504,15 @@ struct iOSSettingsView: View {
 
     #if os(macOS)
     /// The "Share on this network" toggle + LAN URL + transcoding status (macOS only). Shown when
-    /// the embedded server is in use. Flipping the toggle restarts node so the new bind takes hold.
+    /// the embedded server is in use. Flipping the toggle restarts the server so the new bind takes hold.
     @ViewBuilder private var lanSharingControls: some View {
         Toggle(isOn: Binding(
             get: { shareOnLAN },
             set: { newValue in
                 shareOnLAN = newValue
-                NodeServer.sharedOnLAN = newValue            // persists + restarts node
+                NodeServer.sharedOnLAN = newValue            // persists and restarts the server
                 didCopyLAN = false
-                Task {                                        // re-check status after the restart
-                    try? await Task.sleep(nanoseconds: 1_200_000_000)
-                    serverOnline = await StremioServer.isOnline()
-                }
+                scheduleMacRestartRecheck()
             }
         )) {
             Label("Share streaming server on this network", systemImage: "wifi")
@@ -1854,8 +1835,46 @@ struct iOSSettingsView: View {
     }
     #endif
 
+    #if os(macOS)
+    /// The cached embedded failure never labels a custom endpoint or an inactive server.
+    private var visibleMacRestartFailure: String? {
+        guard !effectiveDirectLinksOnly, !StremioServer.isCustom else { return nil }
+        return macRestartFailure
+    }
+
+    @MainActor private func refreshMacRestartFailure() {
+        let message = !effectiveDirectLinksOnly && !StremioServer.isCustom
+            ? NodeServer.restartFailureDescription : nil
+        if macRestartFailure != message { macRestartFailure = message }
+    }
+
+    /// Reuses the existing action-triggered health recheck, after the two-second TERM grace.
+    /// The ordinary monitor still refreshes state if queued lifecycle work finishes later.
+    @MainActor private func scheduleMacRestartRecheck() {
+        macRestartRecheck?.cancel()
+        macRestartRecheck = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(2.25))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            refreshMacRestartFailure()
+            guard !effectiveDirectLinksOnly, !StremioServer.isCustom else { return }
+            let online = await StremioServer.isOnline()
+            guard !Task.isCancelled else { return }
+            refreshMacRestartFailure()
+            guard !effectiveDirectLinksOnly, !StremioServer.isCustom else { return }
+            serverOnline = online
+        }
+    }
+    #endif
+
     private var serverColor: Color {
         if effectiveDirectLinksOnly { return Theme.Palette.textTertiary }
+        #if os(macOS)
+        if visibleMacRestartFailure != nil { return Theme.Palette.danger }
+        #endif
         switch serverOnline {
         case .some(true): return Color(.sRGB, red: 0.45, green: 0.72, blue: 0.42, opacity: 1)
         case .some(false): return Theme.Palette.danger
@@ -1864,6 +1883,9 @@ struct iOSSettingsView: View {
     }
     private var serverText: String {
         if effectiveDirectLinksOnly { return String(localized: "Disabled by Direct Links Only") }
+        #if os(macOS)
+        if visibleMacRestartFailure != nil { return String(localized: "Restart incomplete") }
+        #endif
         switch serverOnline {
         case .some(true): return String(localized: "Online")
         case .some(false): return String(localized: "Offline")
@@ -1923,10 +1945,10 @@ struct iOSSettingsView: View {
                 Text("Twice daily").tag("twiceDaily")
                 Text("4x daily").tag("fourTimesDaily")
             }
-            NavigationLink("Streaming services") { iOSReorderServicesView() }
-            NavigationLink("Discover & region") { iOSDiscoverSettingsView() }
+            PushLink("Streaming services") { iOSReorderServicesView() }
+            PushLink("Discover & region") { iOSDiscoverSettingsView() }
             // The full "Upcoming" calendar (next air / release dates of library + watchlisted titles).
-            NavigationLink("Upcoming") { iOSUpcomingScreen() }
+            PushLink("Upcoming") { iOSUpcomingScreen() }
             // Fold Search into Discover (one combined surface with a search field above the browse) so the
             // tab bar is less cluttered on mobile. Default OFF, fully reversible; Search returns as its own tab.
             Toggle("Combine Discover & Search", isOn: $mergeDiscoverSearch)
@@ -1938,7 +1960,7 @@ struct iOSSettingsView: View {
                                                       set: { spoilerSafe = $0; spoilerBlur = $0 }))
             // Poster appearance (width / corner radius / landscape art / labels) lives on its own screen
             // with a live preview. The old inline "Cinematic landscape cards" toggle moved there.
-            NavigationLink("Poster style") { iOSPosterStyleView() }
+            PushLink("Poster style") { iOSPosterStyleView() }
             // Surface the hide-labels toggle here too so it is discoverable without opening Poster style.
             // It applies across every poster rail (Discover, Home, Continue Watching, More Like This) since
             // they all render through the shared PosterCardiOS which reads this same preference.
@@ -1951,11 +1973,11 @@ struct iOSSettingsView: View {
                     Text(accent.label).tag(accent.id)
                 }
             }
-            Picker("Background", selection: $theme.oled) {
-                Text("Warm").tag(false)
-                Text("OLED Black").tag(true)
+            // Chips instead of the system segmented control, whose grey selection ignores the accent.
+            LabeledContent("Background") {
+                VortXSegmented(options: [.init(value: false, title: "Warm"), .init(value: true, title: "OLED Black")],
+                               selection: $theme.oled)
             }
-            .pickerStyle(.segmented)
 
             Picker("Dolby Vision / HDR", selection: $hdrToneMapMode) {
                 Text("Auto").tag("auto")
@@ -1971,12 +1993,11 @@ struct iOSSettingsView: View {
                 Text("App text size  ·  \(Int((theme.textScale * 100).rounded()))%")
             }
 
-            Picker("Performance", selection: $perfMode) {
-                Text("Auto").tag("auto")
-                Text("Full").tag("full")
-                Text("Reduced").tag("reduced")
+            LabeledContent("Performance") {
+                VortXSegmented(options: [.init(value: "auto", title: "Auto"), .init(value: "full", title: "Full"),
+                                         .init(value: "reduced", title: "Reduced")],
+                               selection: $perfMode)
             }
-            .pickerStyle(.segmented)
         } header: {
             Text("Appearance")
         } footer: {
@@ -2031,7 +2052,11 @@ struct iOSSettingsView: View {
             Toggle("Prefer add-on subtitles", isOn: $preferAddonSubtitles)
                 .tint(Theme.Palette.accent)
             Text("Use a matching add-on subtitle when available. Keep the built-in track if loading fails.")
+                #if os(macOS)
+                .font(.footnote).foregroundStyle(Theme.Palette.textSecondary)
+                #else
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                #endif
             Toggle("Recognize image subtitles", isOn: $recogniseImageSubtitles)
                 .tint(Theme.Palette.accent)
         } header: {
@@ -2240,12 +2265,12 @@ struct iOSSettingsView: View {
             manualUpdateResult
             LabeledContent("Version", value: appVersion)
             LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
-            NavigationLink {
+            PushLink {
                 WhatsNewView()
             } label: {
                 Label("What's New", systemImage: "sparkles")
             }
-            NavigationLink {
+            PushLink {
                 WatchStatsView()
             } label: {
                 Label("Watch Stats", systemImage: "chart.bar.xaxis")
@@ -2290,9 +2315,15 @@ struct iOSSettingsView: View {
 
     // MARK: Engine diagnostics (the FFI smoke check kept off the Home page)
 
+    /// The bundled VortX core build, from the provenance the release generator stamps into Info.plist.
+    private var nativeEngineLabel: String {
+        let revision = Bundle.main.object(forInfoDictionaryKey: "VortXEngineSourceRevision") as? String ?? ""
+        return revision.isEmpty ? "VortX core" : "VortX core (\(revision.prefix(8)))"
+    }
+
     @ViewBuilder private var engineSection: some View {
         Section("Engine") {
-            LabeledContent("stremio-core schema", value: "\(core.schemaVersion)")
+            LabeledContent("Data engine", value: nativeEngineLabel)
             LabeledContent("Home rows", value: "\(core.boardRows.count)")
         }
     }
@@ -2337,7 +2368,8 @@ private enum SettingsSearchSection: CaseIterable {
         case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
                                "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
                                "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
-                               "media server", "plex", "jellyfin", "emby", "api key"]
+                               "media server", "plex", "jellyfin", "emby", "api key",
+                               "xperience", "nuvio", "collections.json", "import collections"]
         case .stremioMirror: return ["mirror", "two-way sync", "add-ons", "library", "continue watching"]
         case .playback: return ["direct links only", "audio output", "video upscaling", "streaming cache",
                                 "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
@@ -2370,7 +2402,7 @@ private enum SettingsSearchSection: CaseIterable {
         case .advanced: return ["mpv", "custom options", "diagnostic logging", "diagnostic log", "export log"]
         case .backup: return ["backup", "restore", "export library", "import library"]
         case .about: return ["version", "player", "what's new", "update", "libmpv", "mpvkit"]
-        case .engine: return ["stremio-core", "schema", "home rows", "diagnostics", "ffi"]
+        case .engine: return ["data engine", "vortx core", "engine", "home rows", "diagnostics"]
         }
     }
 }

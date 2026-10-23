@@ -154,7 +154,33 @@ jobs:
               END { exit(found ? 0 : 1) }
             ' "$RUNNER_TEMP/SIGNING_PROVENANCE.txt"
           done
-          grep -Fx "release tag: $TAG" "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" >/dev/null
+          # BEGIN PINNED 0.5.5 RC HANDOFF: preserve the original signing record, never rewrite it.
+          if [ "$TAG" = v0.5.5 ]; then
+            [ "$GH_REPO" = VortXTV/VortX ] && [ "$RELEASE_ID" = 415681390 ]
+            [ "$(sha256sum "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" | awk '{print $1}')" = e42939673bec0dff481c5b885d228f3c285978bf033497525e31b6c60d3dafc7 ]
+            [ "$FULL_SHA" = b61a02a8da6dfd2aa24cb56e0f17c8b73a24605fac8583538437f873f5e73a69 ]
+            [ "$PLAY_SHA" = e630a09fe3d91fcb2e5c280a7813aebf085df9ef4cb556fe049dabb34d77b7cb ]
+            SOURCE_055=35761135a71867d23a9c4ee83cbdb31fe65747bd
+            for LINE in 'release tag: v0.5.5-rc.1' "release tag commit: $SOURCE_055" "source commit: $SOURCE_055" 'Android versionCode: 274' 'Android versionName: 0.5.5'; do
+              grep -Fx "$LINE" "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" >/dev/null
+            done
+            jq -e '.prerelease == false' <<<"$RELEASE_JSON" >/dev/null
+            gh api -- "repos/$GH_REPO/releases/latest" | jq -e '.id == 415681390 and .tag_name == "v0.5.5" and .draft == false and .prerelease == false' >/dev/null
+            gh api -- "repos/$GH_REPO/git/ref/tags/v0.5.5" | jq -e '.object.type == "tag" and .object.sha == "c89a4a24326a8683910afc28b569ca783cfcad7a"' >/dev/null
+            gh api -- "repos/$GH_REPO/git/tags/c89a4a24326a8683910afc28b569ca783cfcad7a" | jq -e --arg source "$SOURCE_055" '.tag == "v0.5.5" and .object.type == "commit" and .object.sha == $source' >/dev/null
+            gh api -- "repos/$GH_REPO/git/ref/tags/v0.5.5-rc.1" | jq -e --arg source "$SOURCE_055" '.object.type == "commit" and .object.sha == $source' >/dev/null
+            for RUN_PATH in actions/runs/38966783085 actions/runs/38966783085/attempts/1; do
+              gh api -- "repos/$GH_REPO/$RUN_PATH" | jq -e --arg source "$SOURCE_055" '
+                .id == 38966783085 and .run_attempt == 1 and .repository.full_name == "VortXTV/VortX" and .head_repository.full_name == "VortXTV/VortX" and
+                .path == ".github/workflows/android-release.yml" and .event == "workflow_dispatch" and
+                .status == "completed" and .conclusion == "success" and
+                .head_branch == "v0.5.5-rc.1" and .head_sha == $source
+              ' >/dev/null
+            done
+          else
+            grep -Fx "release tag: $TAG" "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" >/dev/null
+          fi
+          # END PINNED 0.5.5 RC HANDOFF
 
           ACTIVE_RECEIPT_BODY="$(jq -cn --arg action read-active-receipt '{action:$action}')"
           ACTIVE_RECEIPT="$(signed_post "$ACTIVE_RECEIPT_BODY")"

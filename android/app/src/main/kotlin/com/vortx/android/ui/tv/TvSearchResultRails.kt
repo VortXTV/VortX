@@ -1,5 +1,12 @@
 package com.vortx.android.ui.tv
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import com.vortx.android.person.PersonSeed
+import com.vortx.android.ui.screens.rememberPeopleResults
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -72,6 +79,15 @@ internal fun TvSearchResultRails(
     } }.orEmpty()
     val collectionsLoading = snapshot?.streamingLoading == true
     val sections = searchResultSections(items)
+    // A selected person takes over the results with their page (back returns here), like the phone search.
+    var personTarget by remember { mutableStateOf<PersonSeed?>(null) }
+    LaunchedEffect(query) { personTarget = null }
+    personTarget?.let { seed ->
+        BackHandler { personTarget = null }
+        TvPersonOverlay(seed = seed, onOpenTitle = onItem, onBack = { personTarget = null })
+        return
+    }
+    val people = rememberPeopleResults(query)
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(vertical = VortXTheme.spacing.md),
@@ -93,6 +109,27 @@ internal fun TvSearchResultRails(
         }
         items(sections.filter { it.kind == SearchResultSectionKind.OTHER }, key = { "tv-search-rail:${it.kind}" }) { section ->
             TvSearchPosterResultRail(section, isLoading, onItem)
+        }
+        // People after the titles, as on Apple TV, so the remote reaches the title rails first.
+        if (people.isNotEmpty()) {
+            item("tv-search-people") {
+                Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                    Text(
+                        text = stringResource(R.string.search_people_title),
+                        style = VortXTheme.type.sectionTitle,
+                        modifier = Modifier.padding(horizontal = TvDimens.edge),
+                    )
+                    LazyRow(
+                        modifier = Modifier.focusGroup(),
+                        contentPadding = PaddingValues(horizontal = TvDimens.edge),
+                        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+                    ) {
+                        items(people) { person ->
+                            TvCastTile(person) { personTarget = PersonSeed(person.id, person.name, person.profileUrl) }
+                        }
+                    }
+                }
+            }
         }
         if (errorMessage != null) {
             item("tv-search-addon-error") {

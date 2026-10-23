@@ -50,7 +50,10 @@ struct ContinueWatchingServiceTests {
         pickerBindingEpochsAndWiring()
         traktPublicationEpochs()
         await nativeMigration()
+        unchangedRosterProjection()
         legacySourceMethodWindow()
+        topShelfPublicationChanges()
+        inertServiceDiagnostics()
         #endif
         if !failures.isEmpty { failures.forEach { print("FAIL: \($0)") }; exit(1) }
         print("PASS: \(checks) inert production CW service/window/fold/reader/migration checks")
@@ -411,6 +414,135 @@ struct ContinueWatchingServiceTests {
         unauthenticated.applyNativeProfiles([profile], activeID: profileA); await unauthenticated.drain()
         require(unauthenticated.saveCount == 0, "unacknowledged original account cannot qualify startup legacy witness")
         CredentialScopeRegistry.shared.eligible = true
+    }
+    /// A sync that republishes the same roster to the same installation is not projected again (no roster
+    /// write, no preference re-apply, no store republish). A changed roster or another installation still is.
+    static func unchangedRosterProjection() {
+        configure(source: "local"); UserDefaults.standard.reset()
+        CoreBridge.shared.nativeBinding = .init(profileID: profileA, credential: CredentialScopeRegistry.shared.capture(),
+            sessionGeneration: UUID(), accountGeneration: UUID())
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        let profile = UserProfile(id: profileA)
+        let store = MigrationFixtureProfileStore(profiles: [], activeID: nil)
+        store.applyNativeProfiles([profile], activeID: profileA, projectionTarget: target)
+        require(store.persistCount == 1, "first projection writes the roster")
+        store.applyNativeProfiles([profile], activeID: profileA, projectionTarget: target)
+        require(store.persistCount == 1, "identical roster to the same installation is not projected again")
+        var edited = profile; edited.accentID = "ocean"
+        store.applyNativeProfiles([edited], activeID: profileA, projectionTarget: target)
+        require(store.persistCount == 2 && store.active?.accentID == "ocean", "a changed roster is projected")
+        CoreBridge.shared.nativeBinding = .init(profileID: profileA, credential: CredentialScopeRegistry.shared.capture(),
+            sessionGeneration: UUID(), accountGeneration: UUID())
+        store.applyNativeProfiles([edited], activeID: profileA, projectionTarget: CoreBridge.shared.captureNativePlaybackTarget())
+        require(store.persistCount == 3, "the same roster on a new installation is projected")
+    }
+    static func topShelfPublicationChanges() {
+        configure(source: "local")
+        func row(_ id: String, progress: Double = 0.2, name: String = "Title", poster: String? = nil) -> CoreCWItem {
+            .init(id: id, type: "movie", name: name, poster: poster,
+                  state: .init(timeOffset: progress * 100_000, duration: 100_000, videoId: nil))
+        }
+        func key(_ rows: [CoreCWItem]) -> FixtureTopShelfMapper.PublicationKey {
+            CoreBridge.shared.continueWatching = rows
+            return FixtureTopShelfMapper.publicationKey(for:
+                HomeContinueWatchingSelection.current(core: .shared, profiles: .shared))
+        }
+        let initial = key([row("a"), row("b")])
+        require(initial.items.map(\.id) == ["a", "b"], "shelf key carries actual selected rows")
+        require(key([row("a"), row("b")]) == initial, "unchanged content and epoch deduplicate")
+        require(key([row("a", progress: 0.4), row("b")]) != initial, "same-head native progress invalidates shelf")
+        require(key([row("a", name: "New title"), row("b")]) != initial, "same-head title invalidates shelf")
+        require(key([row("a", poster: "https://images.invalid/new.jpg"), row("b")]) != initial, "same-head local artwork invalidates shelf")
+        require(key([row("a"), row("c")]) != initial, "interior membership invalidates shelf")
+        require(key([row("a")]) != initial, "interior removal invalidates shelf")
+        require(key([]) != initial, "explicit empty queue invalidates shelf")
+        let nine = (0..<9).map { row(String($0)) }
+        let capped = key(nine)
+        require(capped.items.count == 8, "shelf observation retains only eight mapped rows")
+        require(key(Array(nine.prefix(8)) + [row("8", progress: 0.6)]) == capped,
+                "unpublished ninth-row progress does not cause a shelf write")
+        let original = CoreBridge.shared.nativeBinding!
+        CoreBridge.shared.nativeBinding = nil
+        let unavailable = key([row("a"), row("b")])
+        require(unavailable.items.isEmpty && unavailable != initial, "unsettled native source retires the visible key")
+        CoreBridge.shared.nativeBinding = .init(profileID: profileA, credential: original.credential,
+            sessionGeneration: UUID(), accountGeneration: UUID())
+        let restored = key([row("a"), row("b")])
+        require(restored.items == initial.items && restored != initial && restored != unavailable,
+                "same rows after native reopen trigger publication under a new epoch")
+        require(!initial.intent.isCurrent() && restored.intent.isCurrent(), "old key never gains authority through owner ABA")
+        ContinueWatchingPreferences.retireSelection()
+        let preferenceEpoch = key([row("a"), row("b")])
+        require(preferenceEpoch.items == restored.items && preferenceEpoch != restored,
+                "same source choice after preference ABA has a distinct key")
+        require(!restored.intent.isCurrent(), "retired preference key cannot authorize publication")
+        let current = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        let privateSelection = HomeContinueWatchingSelection.Snapshot(
+            selection: .init(items: [row("a", poster: "https://private.invalid/poster")],
+                             source: .trakt, sessionID: TraktSessionID(rawValue: "inert-shelf")), context: current.context)
+        require(FixtureTopShelfMapper.publicationKey(for: privateSelection).items.first?.poster == nil,
+                "observation key does not expose a private remote poster to the system")
+    }
+    static func inertServiceDiagnostics() {
+        configure()
+        SIMKLAuth.storedSessionID = nil
+        let disconnected = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        require(disconnected.selection.source == .simkl && disconnected.selection.items.isEmpty
+            && disconnected.selection.status?.contains("Connect SIMKL") == true,
+            "inert disconnected diagnostic retains requested source without local fallback")
+        require(!disconnected.intent.isCurrent()
+            && !disconnected.intent.permitsDetails(id: "tt100", type: "movie", videoID: nil)
+            && disconnected.nextEpisodes.isEmpty,
+            "empty disconnected diagnostic grants neither tap nor offer/publication capability")
+        SIMKLAuth.isConfigured = false
+        SIMKLAuth.storedSessionID = session
+        let unavailable = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        require(unavailable.selection.items.isEmpty
+            && unavailable.selection.status?.contains("unavailable") == true
+            && unavailable.selection.simklSessionID == nil && !unavailable.intent.isCurrent(),
+            "unconfigured service with retained credential remains inert unavailable presentation")
+        SIMKLAuth.isConfigured = true
+        require(!disconnected.intent.isCurrent() && !unavailable.intent.isCurrent(),
+            "later service connection cannot revive nil-session diagnostic intents")
+        configure(source: "trakt")
+        TraktAuth.storedSessionID = nil
+        let trakt = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        require(trakt.selection.source == .trakt && trakt.selection.items.isEmpty
+            && trakt.selection.status?.contains("unavailable") == true && !trakt.intent.isCurrent(),
+            "unprovisioned Trakt diagnostic stays visible but has no service authority")
+        configure()
+        SIMKLAuth.storedSessionID = nil
+        var contextChecks = 0
+        CoreBridge.shared.beforeNativeCurrentCheck = {
+            contextChecks += 1
+            if contextChecks == 3 { CoreBridge.shared.nativeBinding = nil }
+        }
+        let retiredOwner = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        CoreBridge.shared.beforeNativeCurrentCheck = nil
+        require(retiredOwner.selection.items.isEmpty
+            && retiredOwner.selection.status?.contains("Waiting") == true,
+            "owner retirement during final check cannot retain a disconnected-service diagnostic")
+        configure()
+        let originalServiceIntent = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared).intent
+        var sessionChecks = 0
+        CoreBridge.shared.beforeNativeCurrentCheck = {
+            sessionChecks += 1
+            if sessionChecks == 3 {
+                SIMKLAuth.storedSessionID = SIMKLSessionID(rawValue: "inert-diagnostic-replacement")
+            }
+        }
+        let retiredSession = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
+        CoreBridge.shared.beforeNativeCurrentCheck = nil
+        require(sessionChecks >= 3 && originalServiceIntent.source == .simkl
+            && originalServiceIntent.simklSessionID == session
+            && !originalServiceIntent.isCurrent()
+            && !originalServiceIntent.permitsDetails(id: "tt100", type: "movie", videoID: nil)
+            && retiredSession.selection.source == .local && retiredSession.selection.items.isEmpty
+            && retiredSession.selection.status?.contains("Waiting") == true
+            && retiredSession.selection.sessionID == nil && retiredSession.selection.simklSessionID == nil
+            && retiredSession.nextEpisodes.isEmpty,
+            "captured connected session retirement denies old service intent and returns only empty waiting fallback")
+        configure(source: "local")
     }
     static func legacySourceMethodWindow() {
         configure(source: "local", window: "100", eligible: false)

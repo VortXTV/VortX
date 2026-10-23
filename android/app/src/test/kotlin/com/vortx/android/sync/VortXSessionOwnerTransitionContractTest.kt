@@ -9,7 +9,7 @@ import org.junit.Test
 class VortXSessionOwnerTransitionContractTest {
 
     @Test
-    fun everyPersistentOwnerMutationUsesTheDebridTransitionOutsideTheSessionMonitor() {
+    fun everyPersistentOwnerMutationUsesDurableSessionAdmissionAndRetainsRecoveryWork() {
         val source = readSource()
         val setup = source
             .substringAfter("private val sessionState = DurableSessionState(")
@@ -25,10 +25,9 @@ class VortXSessionOwnerTransitionContractTest {
             .substringBefore("// MARK: - HTTP")
 
         assertTrue(setup.contains("initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial()"))
-        // The transition is now COMPOSED (metadata migration first, then debrid); the load-bearing
-        // property is that persistent owner mutations still pass through the debrid owner guard.
-        assertTrue(setup.contains("ownerTransition = { mutation ->"))
-        assertTrue(setup.contains("metadataKeys.runOwnerTransition { debridKeys.runOwnerTransition(mutation) }"))
+        // Native provider credentials own their account admission; durable session mutation remains
+        // inside DurableSessionState rather than the retired comparison stores' owner locks.
+        assertTrue(setup.contains("ownerTransition = { mutation -> mutation() }"))
         assertTrue(signOut.contains("operations.invalidate {"))
         assertFalse(signOut.contains("hadPendingPush"))
         assertTrue(signOut.contains("hadActiveRealtime = realtime.isActive()"))
@@ -180,9 +179,10 @@ class VortXSessionOwnerTransitionContractTest {
         val openConnection = transport.indexOf("URL(BASE + path).openConnection()")
         val attach = transport.indexOf("callPermit.attachCancellation(opened::disconnect)")
         val outputStream = transport.indexOf("outputStream.use")
-        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent())", openConnection) >= 0)
+        // The permit check may also require the witnessed backup candidate (`|| !candidateCurrent()`).
+        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent()", openConnection) >= 0)
         assertTrue(attach > openConnection)
-        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent())", outputStream) > attach)
+        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent()", outputStream) > attach)
         assertTrue(transport.contains("callPermit.close()"))
         assertTrue(transport.contains("Once the request body is accepted"))
     }
@@ -220,7 +220,7 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("fun requestSyncSoon()")
             .substringBefore("/** Catch-up PULL entry point")
 
-        val mark = requestSync.indexOf("pendingState.recordEdit(owner, proposedAttempt)")
+        val mark = requestSync.indexOf("pendingState.recordEdit(owner, proposedAttempt, progressOnly, uploadClockMs())")
         val createJob = requestSync.indexOf("scope.launch(start = CoroutineStart.LAZY)")
         val retry = requestSync.indexOf("runPendingSyncRetryLoop(")
         val push = requestSync.indexOf("val synced = syncUp(lease)")
@@ -234,37 +234,10 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(push < complete)
         assertTrue(requestSync.contains("pendingState.owns(attempt, runningJob)"))
         assertTrue(requestSync.contains("maxDelayMs = SYNC_RETRY_MAX_MS"))
-    }
-
-    @Test
-    fun `direct engine remove then reinstall sync descriptors even when tombstone already matches`() {
-        val engine = readEngineSource()
-        val install = engine
-            .substringAfter("override suspend fun installAddon(url: String): Result<Unit> = runCatching {")
-            .substringBefore("override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {")
-        val remove = engine
-            .substringAfter("override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {")
-            .substringBefore("/** A successful local add-on remove/reinstall is account data")
-        val requester = engine
-            .substringAfter("private fun requestAddonTombstoneSync()")
-            .substringBefore("override suspend fun changeAddonUrl")
-        val sync = readSource()
-        val requestSync = sync
-            .substringAfter("fun requestSyncSoon()")
-            .substringBefore("/** Catch-up PULL entry point")
-        val armPendingSync = sync
-            .substringAfter("private fun armPendingSync(")
-            .substringBefore("/** Catch-up PULL entry point")
-
-        assertTrue(install.indexOf("addonTombstones.forget(normalized)") >= 0)
-        assertTrue(install.indexOf("requestAddonTombstoneSync()") > install.indexOf("addonTombstones.forget(normalized)"))
-        assertFalse(install.contains("if (addonTombstones.forget"))
-        assertTrue(remove.contains("if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)"))
-        assertTrue(remove.indexOf("requestAddonTombstoneSync()") > remove.indexOf("addonTombstones.tombstone(addon.transportUrl)"))
-        assertTrue(requester.contains("(appContext as? VortXApplication)?.syncManager?.requestSyncSoon()"))
-        assertTrue(requestSync.contains("val lease = captureSyncLease() ?: return"))
-        assertTrue(requestSync.contains("armPendingSync(lease, recordEdit = true)"))
-        assertTrue(armPendingSync.contains("initialDelayMs = SYNC_DEBOUNCE_MS"))
+        // Waits go through the upload window, and an accepted upload acknowledges it before completion.
+        assertTrue(requestSync.contains("waitForUploadWindow(attempt, runningJob, retryDelayMs.takeIf { it > SYNC_DEBOUNCE_MS })"))
+        val acknowledge = requestSync.indexOf("if (synced) pendingState.acknowledgeUpload(attempt, runningJob, editGeneration)")
+        assertTrue(push < acknowledge && acknowledge < complete)
     }
 
     @Test
@@ -279,9 +252,9 @@ class VortXSessionOwnerTransitionContractTest {
         val startRealtime = source
             .substringAfter("fun startRealtime()")
             .substringBefore("/** Close the real-time channel")
-        val syncDown = source
-            .substringAfter("private suspend fun syncDown(")
-            .substringBefore("/**\n     * Auto-sync")
+        val nativeReceive = source
+            .substringAfter("private suspend fun nativeSyncDown(")
+            .substringBefore("private fun mergeNativeProviders(")
 
         assertTrue(pendingState.contains("writeMarker(nextOwner.accountId, true)"))
         assertTrue(pendingState.contains("attempt !== expectedAttempt"))
@@ -295,7 +268,7 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(stateStore.contains("return edit.commit()"))
         assertTrue(source.contains("const val KEY_PENDING_PUSH = \"pendingPush.\""))
         assertTrue(startRealtime.indexOf("retryPendingPushBeforePull") < startRealtime.indexOf("realtime.start()"))
-        assertTrue(syncDown.contains("if (retryPendingPushBeforePull(lease)) return false"))
+        assertTrue(nativeReceive.contains("if (retryPendingPushBeforePull(lease)) return false"))
     }
 
     @Test
@@ -316,12 +289,15 @@ class VortXSessionOwnerTransitionContractTest {
         val matching = source
             .substringAfter("private fun sessionMatchesLease(lease: SyncSessionLease)")
             .substringBefore("// MARK: - Flows")
-        val mergeLocal = source
-            .substringAfter("private suspend fun mergeLocalIntoDoc(lease: SyncSessionLease)")
-            .substringBefore("/**\n     * Pull the account doc")
-        val syncDown = source
-            .substringAfter("private suspend fun syncDown(")
-            .substringBefore("/**\n     * Auto-sync")
+        val nativeReceive = source
+            .substringAfter("private suspend fun nativeSyncDown(")
+            .substringBefore("private fun mergeNativeProviders(")
+        val providerMerge = source
+            .substringAfter("private fun mergeNativeProviders(")
+            .substringBefore("private suspend fun applyNativeHostSettings(")
+        val hostSettings = source
+            .substringAfter("private suspend fun applyNativeHostSettings(")
+            .substringBefore("private suspend fun nativeSyncUp(")
 
         assertFalse(source.contains("internal data class SyncSessionLease"))
         assertTrue(leaseType.contains("private val immutableDataKey = dataKey.copyOf()"))
@@ -342,10 +318,11 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(matching.contains("sessionState.ownerEpoch == lease.ownerEpoch"))
         assertTrue(matching.contains("current.account.id == lease.accountId"))
         assertTrue(matching.contains("current.token == lease.token"))
-        assertFalse(matching.contains("dataKey"))
-        assertTrue(mergeLocal.contains("publishIfSyncLeaseCurrent(lease)"))
-        assertTrue(syncDown.contains("publishIfSyncLeaseCurrent(lease)"))
-        assertTrue(syncDown.contains("advanceVersion(lease, version)"))
+        assertTrue(matching.contains("lease.matchesDataKey(current.dataKey)"))
+        assertTrue(hostSettings.contains("publishIfSyncLeaseCurrent(lease)"))
+        assertTrue(nativeReceive.contains("mergeNativeProviders(lease, account, pull.doc)"))
+        assertTrue(providerMerge.contains("publishIfSyncLeaseCurrent(lease)"))
+        assertTrue(nativeReceive.contains("advanceVersion(lease, pull.version)"))
     }
 
     @Test
@@ -382,16 +359,6 @@ class VortXSessionOwnerTransitionContractTest {
             assertTrue(postOk || preOk)
             request = nextRequest
         }
-    }
-
-    private fun readEngineSource(): String {
-        val candidates = listOf(
-            File("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
-            File("app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
-            File("android/app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
-        )
-        return candidates.firstOrNull(File::isFile)?.readText()
-            ?: error("Could not locate EngineStremioRepository.kt from ${File(".").absolutePath}")
     }
 
     private fun assertMutatingAuthFence(

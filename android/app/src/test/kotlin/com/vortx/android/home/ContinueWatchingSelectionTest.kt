@@ -89,6 +89,12 @@ class ContinueWatchingSelectionTest {
             .put("durationMs", 0), emptyList())
         assertNull(unknown.preferredEpisode); assertNull(unknown.continueWatchingActivityAtMillis)
         assertTrue(boundContinueWatching(listOf(unknown), ContinueWatchingWindow.LAST_90_DAYS, now).isEmpty())
+        // A finished latest episode: the engine keeps the series with no offset, flagged watched. Up next.
+        val upNext = nativeContinueWatchingItem(JSONObject().put("metaId", "tt1000001").put("type", "series")
+            .put("name", "Up next").put("videoId", "tt1000001:3:8").put("offsetMs", 0).put("watched", true)
+            .put("durationMs", 2700000).put("updatedAt", now), emptyList())
+        assertEquals(PreferredEpisode(3, 8, "tt1000001:3:8", upNext = true), upNext.preferredEpisode)
+        assertEquals(listOf(upNext), boundContinueWatching(listOf(upNext), ContinueWatchingWindow.LAST_90_DAYS, now))
     }
 
     @Test fun `ninety days includes exact boundary excludes unknown old and future timestamps`() {

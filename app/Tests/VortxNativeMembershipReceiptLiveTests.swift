@@ -136,6 +136,24 @@ private final class MembershipCheckpointGate: VortxCheckpointStore, @unchecked S
         for file in sealedFiles { check(try Data(contentsOf: file).range(of: Data(orphan.utf8)) == nil, "ciphertext excludes raw orphan URL") }
         try store.rememberAuthenticatedScope(scope)
         check(try store.recovery(account: scope.account)?.bootstrap == bootstrap, "original source bootstrap retained exactly")
+        // Existing indexed proofs must remain valid across the Mac key-storage migration.
+        // Both account and installation keys are fixture-only; no production loader is invoked.
+        let legacyInstallationBytes = Data(repeating: 0x51, count: 32)
+        let indexedDirectory = directory.appendingPathComponent("indexed-key-migration", isDirectory: true)
+        let indexedStore = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key,
+            installationKey: SymmetricKey(data: legacyInstallationBytes), bootstrap: bootstrap, bootstrapScope: scope)
+        try indexedStore.commit(await session.stateJSON(), scope: scope, hostPreferences: store.readHostPreferences(scope: scope)!)
+        try indexedStore.rememberAuthenticatedScope(scope)
+        let keyDirectory = directory.appendingPathComponent("immutable-fixture-key", isDirectory: true)
+        let migratedBytes = try VortxNativeInstallationKeyFileStore(directory: keyDirectory,
+            legacyRead: { legacyInstallationBytes }, randomBytes: { fatalError("legacy migration generated random key") }).loadOrCreateBytes()
+        let migratedStore = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key, installationKey: SymmetricKey(data: migratedBytes))
+        check(try migratedStore.authenticatedCheckpoint(scope: scope) == store.read(scope: scope), "migrated key authenticates old checkpoint inventory")
+        check(try migratedStore.recovery(account: scope.account)?.bootstrap == bootstrap, "migrated key retains indexed bootstrap")
+        let absentScope = VortxAccountScope(account: "account.fixture-new-inventory-scope", ownerProfileID: scope.ownerProfileID)
+        check(try migratedStore.authenticatedCheckpoint(scope: absentScope) == nil, "migrated key proves unrelated files are covered by exact indexed proofs")
+        let rotatedStore = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key, installationKey: SymmetricKey(data: Data(repeating: 0x52, count: 32)))
+        do { _ = try rotatedStore.authenticatedCheckpoint(scope: absentScope); fatalError("rotated installation key authenticated old proofs") } catch {}
         _ = try await session.dispatch([#"{"type":"get_state"}"#], now: 1800000000, legacyMaterial: preparation.material, authenticatedSourceArchive: sourceArchive)
         check(try await ledger(session) == firstLedger, "same-source warm replay is idempotent")
         var unrelated = original; unrelated["futureHostPreference"] = "changed document only"

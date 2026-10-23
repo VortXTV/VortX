@@ -1,4 +1,3 @@
-#if VORTX_NATIVE_DATA_ENGINE
 import SwiftUI
 
 /// A pending legacy-history import must be visible even when there is only one profile and the
@@ -62,4 +61,3 @@ struct NativeWatchedMigrationNotice: View {
         retryTask = nil
     }
 }
-#endif

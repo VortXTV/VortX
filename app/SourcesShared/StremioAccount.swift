@@ -135,62 +135,15 @@ typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
 extension PlaybackMutationTarget {
 
     static func capture(core: CoreBridge) -> PlaybackMutationTarget {
-#if VORTX_NATIVE_DATA_ENGINE
         return core.captureNativePlaybackTarget()
-#else
-        let profiles = ProfileStore.shared
-        if profiles.activeUsesEngineHistory {
-            // History is an owner-account carrier, never a generic native-engine carrier. A
-            // secondary profile may use its own Stremio account, but its callbacks must not
-            // manufacture rows in the fixed owner bucket.
-            let ownerHistoryCapture: CredentialScopeRegistry.Capture? =
-                profiles.activeID == UserProfile.ownerID && profiles.active?.isOwner == true
-                ? CredentialScopeRegistry.shared.capture()
-                : nil
-            return .engine(profileID: profiles.activeID,
-                           keychainAccount: profiles.activeKeychainAccount,
-                           uid: core.currentUID(), historyCapture: ownerHistoryCapture)
-        }
-        guard let profileID = profiles.activeID else {
-            // A missing active id means no profile can own a local write. The engine route is
-            // deliberately fail-closed below when the active context no longer matches.
-            return .engine(profileID: nil, keychainAccount: profiles.activeKeychainAccount,
-                           uid: core.currentUID(), historyCapture: nil)
-        }
-        return .overlay(profileID: profileID)
-#endif
     }
 
     func stillOwnsCurrentContext(core: CoreBridge) -> Bool {
-#if VORTX_NATIVE_DATA_ENGINE
         return core.nativePlaybackTargetIsCurrent(self)
-#else
-        let profiles = ProfileStore.shared
-        let context = PlaybackMutationOwnershipPolicy.Context(
-            activeProfileID: profiles.activeID,
-            activeUsesEngineHistory: profiles.activeUsesEngineHistory,
-            activeKeychainAccount: profiles.activeKeychainAccount,
-            activeUID: core.currentUID(),
-            extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
-        )
-        return PlaybackMutationOwnershipPolicy.allows(self, in: context)
-#endif
     }
 
     func stillOwnsAccountContext(core: CoreBridge) -> Bool {
-#if VORTX_NATIVE_DATA_ENGINE
         return stillOwnsCurrentContext(core: core)
-#else
-        let profiles = ProfileStore.shared
-        let context = PlaybackMutationOwnershipPolicy.Context(
-            activeProfileID: profiles.activeID,
-            activeUsesEngineHistory: profiles.activeUsesEngineHistory,
-            activeKeychainAccount: profiles.activeKeychainAccount,
-            activeUID: core.currentUID(),
-            extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
-        )
-        return PlaybackMutationOwnershipPolicy.allowsAccountMutation(self, in: context)
-#endif
     }
 
     /// A player progress event may enter the owner-history carrier only if its immutable launch
@@ -198,17 +151,7 @@ extension PlaybackMutationTarget {
     /// `usesEngineHistory` alone is deliberately insufficient: secondary profiles can have their
     /// own native account but must never write the owner's membership-neutral history.
     func stillOwnsOwnerHistoryContext(core: CoreBridge) -> Bool {
-#if VORTX_NATIVE_DATA_ENGINE
         return false // nativeSync is the account carrier; never duplicate native writes into legacy caches
-#else
-        guard case let .engine(profileID, _, _, historyCapture?) = self,
-              profileID == UserProfile.ownerID,
-              ProfileStore.shared.activeID == UserProfile.ownerID,
-              ProfileStore.shared.active?.isOwner == true,
-              CredentialScopeRegistry.shared.isCurrent(historyCapture),
-              stillOwnsCurrentContext(core: core) else { return false }
-        return true
-#endif
     }
 
     var ownerHistoryCapture: CredentialScopeRegistry.Capture? {
@@ -266,11 +209,8 @@ final class StremioAccount: ObservableObject {
         set { Self.storeAuthKey(newValue, account: tokenKey) }
     }
     private static func storeAuthKey(_ value: String?, account: String) {
-#if VORTX_NATIVE_DATA_ENGINE
+        LegacyWatchOwnership.invalidateSession()
         VortxNativeOwnAccountProducer.withCredentialMutation(slot: account) { _ = Keychain.set(value, for: account) }
-#else
-        Keychain.set(value, for: account)
-#endif
     }
 
     private func captureAuthOperationContext() -> AuthOperationContext {
@@ -281,9 +221,8 @@ final class StremioAccount: ObservableObject {
     }
 
     private func beginAuthOperation() -> AuthOperationContext {
-#if VORTX_NATIVE_DATA_ENGINE
+        LegacyWatchOwnership.invalidateSession()
         VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)
-#endif
         authOperationGeneration &+= 1
         return captureAuthOperationContext()
     }
@@ -294,14 +233,22 @@ final class StremioAccount: ObservableObject {
             && ProfileStore.shared.activeKeychainAccount == context.keychainAccount
     }
 
+    /// A QR code belongs to the viewer/account that requested it, including A → B → A switches.
+    /// Check this before handing a validated link token to the credential mutation boundary.
+    func captureLinkLoginAdmission() -> @MainActor () -> Bool {
+        let context = captureAuthOperationContext()
+        let credential = CredentialScopeRegistry.shared.capture()
+        return { [weak self] in
+            CredentialScopeRegistry.shared.isCurrent(credential)
+                && self?.authOperationStillCurrent(context) == true
+        }
+    }
+
     init() {
-#if VORTX_NATIVE_DATA_ENGINE
         VortxNativeCredentialSelectionRelay.shared.observe(self) { account in
             account.reloadForActiveProfile()
         }
-#endif
         email = Self.displayEmail()
-        migrateTokenToKeychain()
         let context = captureAuthOperationContext()
         if Keychain.string(context.keychainAccount) != nil {
             isSignedIn = true
@@ -310,12 +257,13 @@ final class StremioAccount: ObservableObject {
     }
 
     /// Re-read the session for the newly active profile (called after a profile switch).
-    func reloadForActiveProfile() {
-#if VORTX_NATIVE_DATA_ENGINE
+    func reloadForActiveProfile(preservingSignInError message: String? = nil) {
+        LegacyWatchOwnership.invalidateSession()
         VortxNativeOwnAccountProducer.invalidateContext()
-#endif
         authOperationGeneration &+= 1
-        signInError = nil
+        // Partial credential persistence is not a completed import. Publish its warning BEFORE
+        // isSignedIn, so login-sheet observers cannot dismiss and hide the retry outcome.
+        signInError = message
         streamSources = []
         addons = []
         email = Self.displayEmail()
@@ -335,16 +283,6 @@ final class StremioAccount: ObservableObject {
         return UserDefaults.standard.string(forKey: "stremiox.email")
     }
 
-    /// Move a token saved by an older build (UserDefaults) into the Keychain, once.
-    private func migrateTokenToKeychain() {
-#if !VORTX_NATIVE_DATA_ENGINE
-        guard authKey == nil,
-              let legacy = UserDefaults.standard.string(forKey: tokenKey), !legacy.isEmpty else { return }
-        Self.storeAuthKey(legacy, account: tokenKey)
-        UserDefaults.standard.removeObject(forKey: tokenKey)
-#endif
-    }
-
     func signIn(email rawEmail: String, password: String) async {
         signInError = nil
         // tvOS text fields tend to auto-capitalize / add stray whitespace; normalize the email so
@@ -359,11 +297,9 @@ final class StremioAccount: ObservableObject {
         struct ErrObj: Decodable { let message: String? }
         guard !email.isEmpty, !password.isEmpty else { signInError = "Enter your email and password."; return }
         var context = beginAuthOperation()
-#if VORTX_NATIVE_DATA_ENGINE
         let nativeTarget: CoreBridge.NativeAccountLoginTarget?
         do { nativeTarget = try CoreBridge.shared.captureNativeAccountLogin(importOwnerAddons: true) }
         catch { signInError = "Open this profile before connecting its account."; return }
-#endif
         do {
             let res: Res = try await post("login", body: Req(email: email, password: password))
             guard authOperationStillCurrent(context) else { return }
@@ -378,15 +314,11 @@ final class StremioAccount: ObservableObject {
             // destination dynamically from the profile selected after the response returned.
             // Never use a dynamically selected credential destination after this await: the selected
             // profile may have changed. Write only to the slot captured before the request started.
-#if VORTX_NATIVE_DATA_ENGINE
             if let nativeTarget {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)
                 guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
                 context = captureAuthOperationContext()
             } else { throw VortxNativeError.closed }
-#else
-            Self.storeAuthKey(key, account: context.keychainAccount)
-#endif
             guard authOperationStillCurrent(context) else { return }
             publishCredentialBoundary(wasSignedIn: wasSignedIn)
             // Publish the credential boundary before the email publisher so CoreBridge can rotate its
@@ -396,83 +328,113 @@ final class StremioAccount: ObservableObject {
             log.info("signed in ok")
             await loadAddons(for: context)
         } catch {
-#if VORTX_NATIVE_DATA_ENGINE
+            // This typed outcome is emitted only after secure credential selection and
+            // our accepted add-on import. It is not a new authentication failure.
+            if let incomplete = error as? OwnerHistoryLoginPreparation.Incomplete,
+               let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
+               authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
+                let message: String
+                switch incomplete.reason {
+                case .pendingMetadata:
+                    message = "The connection and add-ons were saved. Library and history import is waiting for episode metadata. Refresh and retry the import."
+                case .importUnavailable:
+                    message = "The connection and add-ons were saved, but the library and history import could not be confirmed. Refresh and retry the import."
+                }
+                reloadForActiveProfile(preservingSignInError: message)
+                return
+            }
             if error is VortxNativeOwnerAddonImport.Incomplete,
                let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
                authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
-                reloadForActiveProfile()
-                signInError = "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import."
+                reloadForActiveProfile(preservingSignInError: "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import.")
                 return
             }
             if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
                let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
                authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
-                reloadForActiveProfile()
-                signInError = "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged."
+                reloadForActiveProfile(preservingSignInError: "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged.")
                 return
             }
-#endif
             guard authOperationStillCurrent(context) else { return }
-#if VORTX_NATIVE_DATA_ENGINE
             if nativeTarget != nil {
                 signInError = "Account could not be connected. Existing library and history are unchanged. Refresh the profile and retry."
                 return
             }
-#endif
             signInError = "Couldn't reach Stremio. Check your connection."
             log.error("signIn network error: \(error.localizedDescription, privacy: .public)")
         }
     }
 
-    func signInWithAuthKey(_ token: String) async {
+    enum LinkSignInOutcome: Equatable { case signedIn, failed(String), superseded }
+
+    @discardableResult
+    func signInWithAuthKey(_ token: String) async -> LinkSignInOutcome {
+        guard !Task.isCancelled else { return .superseded }
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { signInError = "Sign-in failed."; return }
+        guard !token.isEmpty else { signInError = "Sign-in failed."; return .failed("Sign-in failed.") }
         signInError = nil
         var context = beginAuthOperation()
         let wasSignedIn = isSignedIn
-#if VORTX_NATIVE_DATA_ENGINE
         let nativeCapture = CredentialScopeRegistry.shared.capture()
         do {
             if let target = try CoreBridge.shared.captureNativeAccountLogin(importOwnerAddons: true) {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)
-                guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
+                guard CredentialScopeRegistry.shared.isCurrent(nativeCapture),
+                      authOperationGeneration == context.generation,
+                      ProfileStore.shared.active?.id == context.profileID else { return .superseded }
                 context = captureAuthOperationContext()
             } else { throw VortxNativeError.closed }
         } catch {
+            if let incomplete = error as? OwnerHistoryLoginPreparation.Incomplete,
+               CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
+               ProfileStore.shared.active?.id == context.profileID {
+                let message: String
+                switch incomplete.reason {
+                case .pendingMetadata:
+                    message = "The connection and add-ons were saved. Library and history import is waiting for episode metadata. Refresh and retry the import."
+                case .importUnavailable:
+                    message = "The connection and add-ons were saved, but the library and history import could not be confirmed. Refresh and retry the import."
+                }
+                reloadForActiveProfile(preservingSignInError: message)
+                return .failed(message)
+            }
             if error is VortxNativeOwnerAddonImport.Incomplete,
                CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
                ProfileStore.shared.active?.id == context.profileID {
-                reloadForActiveProfile()
-                signInError = "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import."
-                return
+                let message = "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import."
+                reloadForActiveProfile(preservingSignInError: message)
+                return .failed(message)
             }
             if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
                CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
                ProfileStore.shared.active?.id == context.profileID {
-                reloadForActiveProfile()
-                signInError = "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged."
-                return
+                let message = "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged."
+                reloadForActiveProfile(preservingSignInError: message)
+                return .failed(message)
             }
-            guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
-            signInError = "Account could not be connected. Your existing profile data is unchanged. Refresh the profile and retry."
-            return
+            guard CredentialScopeRegistry.shared.isCurrent(nativeCapture),
+                  authOperationGeneration == context.generation,
+                  ProfileStore.shared.active?.id == context.profileID else { return .superseded }
+            let message = "Account could not be connected. Your existing profile data is unchanged. Refresh the profile and retry."
+            signInError = message
+            return .failed(message)
         }
-#else
-        Self.storeAuthKey(token, account: context.keychainAccount)
-#endif
-        guard authOperationStillCurrent(context) else { return }
+        // The credential is committed by now. A dismissed QR screen (task cancellation) must not leave a
+        // saved account showing as signed out; only a newer auth operation or profile supersedes it.
+        guard authOperationStillCurrent(context) else { return .superseded }
         publishCredentialBoundary(wasSignedIn: wasSignedIn)
         await backfillEmail(for: context)
-        guard authOperationStillCurrent(context) else { return }
+        guard authOperationStillCurrent(context) else { return .superseded }
         if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
         log.info("signed in with link ok")
         await loadAddons(for: context)
+        guard authOperationStillCurrent(context), !Task.isCancelled else { return .superseded }
+        return .signedIn
     }
 
     func signOut() {
-#if VORTX_NATIVE_DATA_ENGINE
+        LegacyWatchOwnership.invalidateSession()
         VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)
-#endif
         authOperationGeneration &+= 1
         authKey = nil; isSignedIn = false; streamSources = []; addons = []
         setEmail(nil)
@@ -557,12 +519,10 @@ final class StremioAccount: ObservableObject {
     /// when the stored progress is for the same episode the user is opening. Overlay profiles
     /// (a non-owner shared profile) resume from their own private history instead.
     func resumeOffset(for meta: PlaybackMeta) async -> Double {
-#if VORTX_NATIVE_DATA_ENGINE
         if CoreBridge.shared.usesNativeProfileState {
             let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
             return await CoreBridge.shared.nativeResumeSeconds(for: meta, target: target)
         }
-#endif
         if !ProfileStore.shared.activeUsesEngineHistory {
             return ProfileStore.shared.resumeOffset(for: meta)
         }
@@ -594,12 +554,10 @@ final class StremioAccount: ObservableObject {
                       target: PlaybackMutationTarget? = nil) async {
         let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)
         guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
-#if VORTX_NATIVE_DATA_ENGINE
         if CoreBridge.shared.usesNativeProfileState {
             CoreBridge.shared.reportNativeProgress(for: meta, positionSeconds: positionSeconds, durationSeconds: durationSeconds, target: target)
             return
         }
-#endif
         if let profileID = target.overlayProfileID {
             ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
                                                durationSeconds: durationSeconds, profileID: profileID)

@@ -70,51 +70,44 @@ final class AddonHealthStore: ObservableObject {
 
     nonisolated private static func check(_ transportUrl: String) async -> AddonHealth {
         guard let url = URL(string: transportUrl) else { return .down }
-        // SSRF guard, same policy as installAddon/previewAddonManifest (AddonURLGuard). A transportUrl can
-        // arrive from a synced account doc or the web dashboard, not just a user paste, so never let this
-        // auto-firing reachability probe hit an arbitrary private / LAN / link-local / metadata target and
-        // turn the app into a network scanner. The ONE legitimate private target is the app's own loopback
-        // streaming server (the default 127.0.0.1 local add-on); a discard-response GET to loopback has no
-        // attacker feedback channel, so it is exempt while everything else private is refused.
-        if !isLoopbackHost(url.host), await AddonURLGuard.validate(url) != nil { return .down }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        // Some add-on CDNs reject non-browser User-Agents (same lesson as AddonClient + the libmpv fetches).
-        req.setValue("Mozilla/5.0 (Apple TV; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/604.1",
-                     forHTTPHeaderField: "User-Agent")
+        // Installed private add-ons must not be marked down merely because they use LAN/Tailscale.
+        // Reuse bounded manifest transport and its per-hop origin checks, not automatic URLSession redirects.
         let start = Date()
         do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
+            _ = try await AddonURLGuard.fetch(url, context: .manifest, access: .addon(origin: url), timeout: timeout)
             let ms = Int(Date().timeIntervalSince(start) * 1000)
-            guard let http = resp as? HTTPURLResponse, (200..<400).contains(http.statusCode) else { return .down }
             return ms <= okThresholdMs ? .ok(ms: ms) : .slow(ms: ms)
         } catch {
             return .down
         }
     }
 
-    /// True when `host` is on-device loopback (localhost / 127.0.0.0/8 / ::1). Exempt from the probe's SSRF
-    /// guard so the default 127.0.0.1 local-add-on still reports its real status (see check(_:)).
-    nonisolated private static func isLoopbackHost(_ host: String?) -> Bool {
-        guard var h = host, !h.isEmpty else { return false }
-        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }  // unbracket IPv6 literals
-        let lower = h.lowercased()
-        return lower == "localhost" || lower == "::1" || lower.hasPrefix("127.")
-    }
 }
 
 /// Add-ons use the compact settings-card treatment on a phone and the wider Cinema Glass card preset on
 /// iPad/Mac. Keeping this switch in one modifier changes only presentation; all action rows remain live.
 private struct AddonSurfaceModifier: ViewModifier {
     let wide: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if wide {
-            content.vortxCinemaCard()
-        } else {
-            content.vortxSettingsCard()
-        }
+        #if os(tvOS)
+        // Keep the existing opaque, remote-focus surface on Apple TV.
+        content.vortxSettingsCard()
+        #else
+        let radius = wide ? Theme.Radius.card + 4 : Theme.Radius.card
+        content.vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: radius, style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: Theme.Palette.accent,
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: contrast == .increased),
+            shadow: .card,
+            contained: true,
+            forceOpaque: reduceTransparency || contrast == .increased)
+        #endif
     }
 }
 
@@ -124,13 +117,35 @@ private extension View {
     }
 }
 
+/// Gives a vertical panel an explicit viewport width and centers a capped content column within it.
+/// Keeping both frame owners together makes this behavior testable without constructing AddonsView's
+/// account, engine, and profile stores.
+private struct AddonPanelScrollContainer<Content: View>: View {
+    let maxContentWidth: CGFloat
+    let content: Content
+
+    init(maxContentWidth: CGFloat, @ViewBuilder content: () -> Content) {
+        self.maxContentWidth = maxContentWidth
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView {
+            content
+                .frame(maxWidth: maxContentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 /// Add-ons installed on your account, read live from the engine. Install one by its manifest URL,
 /// or remove a non-default add-on here. Changes sync to your account and to the official apps when mirroring
 /// is enabled; a Change URL is an atomic engine replacement that retains its priority slot.
 struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks add-on management even with no Stremio account connected
-    @EnvironmentObject private var core: CoreBridge
+    @VisibleCore private var core   // observed only while this tab is on screen (EngineObservation.swift)
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
     #if !os(tvOS)
@@ -169,7 +184,7 @@ struct AddonsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
+            AddonPanelScrollContainer(maxContentWidth: usesWideAddonLayout ? 1120 : .infinity) {
                 VStack(alignment: .leading, spacing: usesCompactAddonLayout ? Theme.Space.md : Theme.Space.lg) {
                     // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
                     // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
@@ -188,7 +203,12 @@ struct AddonsView: View {
                         if core.addons.isEmpty {
                             hint("No add-ons yet. Paste an add-on's manifest URL above to install one.")
                         } else {
-                            NavigationLink { CatalogManagerView() } label: {
+                            NavigationLink {
+                                CatalogManagerView()
+                                #if os(macOS)
+                                .macBackAffordance()
+                                #endif
+                            } label: {
                                 HStack(spacing: Theme.Space.md) {
                                     Label("Customize catalogs", systemImage: "slider.horizontal.3")
                                         .font(Theme.Typography.cardTitle)
@@ -267,8 +287,6 @@ struct AddonsView: View {
                 }
                 .padding(.horizontal, usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.screenInset)
                 .padding(.vertical, usesCompactAddonLayout ? Theme.Space.md : Theme.Space.xl)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(maxWidth: usesWideAddonLayout ? 1120 : .infinity, alignment: .center)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
@@ -291,6 +309,7 @@ struct AddonsView: View {
                 Text("This add-on is already installed. Update it to its latest manifest?")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var installSection: some View {
@@ -326,7 +345,12 @@ struct AddonsView: View {
     }
 
     private var discoverLink: some View {
-        NavigationLink { AddonStoreView() } label: {
+        NavigationLink {
+            AddonStoreView()
+            #if os(macOS)
+            .macBackAffordance()
+            #endif
+        } label: {
             HStack(spacing: Theme.Space.md) {
                 Label("Discover add-ons", systemImage: "sparkles.rectangle.stack")
                     .font(Theme.Typography.cardTitle)
@@ -509,19 +533,27 @@ struct AddonsView: View {
                     .buttonStyle(ChipButtonStyle(selected: false))
                     .fixedSize()
             }
-            // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
-            Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
-                Image(systemName: isOff ? "eye.slash" : "eye")
-            }
-            .buttonStyle(ChipButtonStyle(selected: !isOff))
-            .fixedSize()
-            .accessibilityLabel(isOff ? "Show \(addon.manifest.name) for this profile" : "Hide \(addon.manifest.name) for this profile")
+            visibilityToggle(addon, isOff: isOff)
             if !profiles.activeSharesMainAddons {
                 Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
                     .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
                     .fixedSize()
             }
+        } else if isOff {
+            // A built-in add-on switched off elsewhere (another device, the web dashboard, an older version)
+            // always keeps a way back on, even though built-ins cannot be switched off here.
+            visibilityToggle(addon, isOff: isOff)
         }
+    }
+
+    /// Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
+    private func visibilityToggle(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
+            Image(systemName: isOff ? "eye.slash" : "eye")
+        }
+        .buttonStyle(ChipButtonStyle(selected: !isOff))
+        .fixedSize()
+        .accessibilityLabel(isOff ? "Show \(addon.manifest.name) for this profile" : "Hide \(addon.manifest.name) for this profile")
     }
 
     private func hint(_ text: String) -> some View {

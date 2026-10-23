@@ -147,8 +147,9 @@ let rules: [Rule] = [
     // already in Caches from earlier builds, and Caches survives app updates, so the sanitiser has to sit at
     // export time on ALL THREE surfaces or the weakest one defines the exposure.
     Rule(
-        name: "G3 all three export paths emit the sanitised export body, never the live file",
-        files: ["app/SourcesShared/VXDiagExport.swift", "app/SourcesiOS/iOSSettingsView.swift"],
+        name: "G3 every export surface emits the sanitised export body, never the live file",
+        files: ["app/SourcesShared/VXDiagExport.swift", "app/SourcesiOS/iOSSettingsView.swift",
+                "app/SourcesShared/DiagnosticLogExportButton.swift"],
         check: { files in
             var found: [String] = []
             if let export = files["app/SourcesShared/VXDiagExport.swift"] {
@@ -173,6 +174,20 @@ let rules: [Rule] = [
                 found += forbidding(settings, "private var diagLogExportURL: URL?",
                                     why: "a computed share URL rewrites the whole diagnostic log on every SwiftUI body pass")
             }
+            if let entry = files["app/SourcesShared/DiagnosticLogExportButton.swift"] {
+                found += requiring(entry, "VXDiagExport.exportBody()",
+                                   why: "pre-profile sharing must export a sanitised copy")
+                found += requiring(entry, "FileRepresentation(exportedContentType: .plainText)",
+                                   why: "pre-profile sharing must prepare the file lazily")
+                found += requiring(entry, "ShareLink(item: PreProfileDiagnosticLogTransfer()",
+                                   why: "pre-profile sharing must use the sanitised transfer")
+                found += requiring(entry, "preview: SharePreview(\"VortX diagnostic log\")",
+                                   why: "pre-profile sharing must supply a SwiftUI preview")
+                found += forbidding(entry, "VXProbe.logFileURL",
+                                    why: "pre-profile sharing must never expose the live cache")
+                found += forbidding(entry, "Data(contentsOf:",
+                                    why: "pre-profile sharing must not bypass the export payload")
+            }
             return found
         },
         revertedFixture: [
@@ -190,6 +205,11 @@ let rules: [Rule] = [
                     let url = VXProbe.logFileURL
                     return url
                 }
+            }
+            """,
+            "app/SourcesShared/DiagnosticLogExportButton.swift": """
+            struct DiagnosticLogExportButton: View {
+                var body: some View { ShareLink(item: VXProbe.logFileURL) }
             }
             """
         ]

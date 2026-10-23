@@ -500,23 +500,16 @@ private let rules: [Rule] = [
         ]
     ),
     Rule(
-        name: "R13 shadow ranking receives only the redacted meta token",
+        name: "R13 source diagnostics retain redacted identity and no retired comparison sink",
         files: ["app/SourcesShared/SourceListModel.swift"],
         check: { files in
             guard let model = files["app/SourcesShared/SourceListModel.swift"] else {
                 return ["SourceListModel source missing"]
             }
-            var found = requiring(model, "let metaToken = VXProbeRedaction.identityToken(",
-                                  why: "shadow ranking must receive a bounded redacted identity token")
-                + requiring(model, "metaId: metaToken",
-                            why: "the shadow-ranking producer must pass the redacted token")
-            if let start = model.lines(containing: "VortxShadowRanking.observe").first {
-                let end = min(start + 8, model.lines.count)
-                found += violations(model, forbidding: "metaId: ctx.metaId",
-                                    why: "raw catalog identity reaches the exportable shadow sink",
-                                    in: start...end)
-            }
-            return found
+            return requiring(model, "let metaToken = VXProbeRedaction.identityToken(",
+                             why: "source diagnostics must retain a bounded redacted identity token")
+                + violations(model, forbidding: "VortxShadowRanking.observe",
+                             why: "the retired comparison runtime must not receive source lists")
         },
         revertedFixture: [
             "app/SourcesShared/SourceListModel.swift":

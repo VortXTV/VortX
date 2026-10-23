@@ -240,3 +240,69 @@ func yearScopingParsesTimestamps() {
     let dayOnly = try! #require(WatchStats.parseISODate("2024-12-31"))
     #expect(WatchStats.calendar.component(.year, from: dayOnly) == 2024)
 }
+
+
+// MARK: - Swift 6 formatter ownership and legacy date acceptance
+
+private let watchStatsDateCompatibilityInputs: [String?] = [
+    nil, "", "x", "not-a-date", "2026-05-13",
+    "2026-05-13T05:50:02Z", "2026-05-13T05:50:02.7Z",
+    "2026-05-13T05:50:02.786Z", "2026-05-13T05:50:02.786798Z",
+    "2026-05-13T05:50:02.786798226Z", "2026-05-13T05:50:02.786798226123Z",
+    "2026-05-13T05:50:02+05:30", "2026-05-13T05:50:02.786+05:30",
+    "2026-05-13T05:50:02-07:00", "2026-05-13T05:50:02.786-07:00",
+    "2026-05-13T05:50:02+0530", "2026-05-13T05:50:02-0700",
+    "2025-12-31T23:30:00-02:00", "2026-01-01T00:30:00+02:00",
+    "2024-02-29T12:34:56Z", "2025-02-29T12:34:56Z",
+    "2026-13-01T12:34:56Z", "2026-05-32T12:34:56Z",
+    "2026-05-13T24:00:00Z", "2026-05-13T23:59:60Z",
+    "2026-05-13T05:50:02", "2026-05-13 05:50:02Z",
+    "2026-05-13t05:50:02z", "2026-05-13T05:50:02Zjunk",
+    " 2026-05-13T05:50:02Z", "2026-05-13T05:50:02Z ",
+    "2026-05-13anything", "2026-05-13Tinvalid", "2026-05", "0000-00-00",
+]
+
+/// Exact old parse order/options/fallback, with formatter references local to this test call.
+/// Do not replace this oracle with the production parser or a different date-formatting API.
+private func legacyWatchStatsDate(_ raw: String?) -> Date? {
+    guard let raw, !raw.isEmpty else { return nil }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: raw) { return date }
+    if let date = ISO8601DateFormatter().date(from: raw) { return date }
+    guard raw.count >= 10 else { return nil }
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .iso8601)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.date(from: String(raw.prefix(10)))
+}
+
+@Test("Swift 6 parser preserves exact legacy fractional, timezone and malformed-input acceptance")
+func swift6DateAcceptanceMatchesLegacy() {
+    for raw in watchStatsDateCompatibilityInputs {
+        #expect(WatchStats.parseISODate(raw) == legacyWatchStatsDate(raw))
+    }
+}
+
+@Test("Concurrent date parsing retains exact legacy results without sharing formatter references")
+func swift6ConcurrentDateAcceptanceMatchesLegacy() async {
+    let failures = await withTaskGroup(of: [Int].self, returning: [Int].self) { group in
+        for _ in 0..<8 {
+            group.addTask {
+                var mismatches: [Int] = []
+                for (index, raw) in watchStatsDateCompatibilityInputs.enumerated() {
+                    if WatchStats.parseISODate(raw) != legacyWatchStatsDate(raw) {
+                        mismatches.append(index)
+                    }
+                }
+                return mismatches
+            }
+        }
+        var allMismatches: [Int] = []
+        for await mismatches in group { allMismatches += mismatches }
+        return allMismatches
+    }
+    #expect(failures.isEmpty)
+}

@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Stremio addon protocol models (the subset the tvOS client needs)
 
 /// A catalog item / meta preview (grid card).
-struct MetaPreview: Identifiable, Decodable, Hashable {
+struct MetaPreview: Identifiable, Decodable, Hashable, Sendable {
     let id: String
     let type: String
     let name: String

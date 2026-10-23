@@ -3,7 +3,7 @@
 # Fail closed if the Apple engine artifacts would reintroduce either of the two dsymutil/link
 # warning families the artifact repair (REQ-260811-04) eliminated. Inspects BOTH the final
 # XCFramework slices AND the retained pre-localization archives under app/Vendor/engine-prelocalize/,
-# across StremioXCore (the core) and VortxEngine (the five FFI slices).
+# of VortxEngine (the five FFI slices).
 #
 #   * newer-minOS: ld warns "object file was built for newer <platform> version than being linked"
 #     for every object whose LC_BUILD_VERSION.minos (or an LC_VERSION_MIN_*.version) exceeds the
@@ -13,7 +13,7 @@
 #     per-object invariant. A prebuilt-std object with a LOWER floor never warns, so <= (not ==) is
 #     the exact zero-warning condition.
 #
-#   * missing-OSO: the localized objects (core_localized.o / vortx_ffi_localized.o, produced by
+#   * missing-OSO: the localized objects (vortx_ffi_localized.o, produced by
 #     ld -r) carry a debug map whose N_OSO stabs name their pre-localization INPUT archive. When
 #     that input was deleted (the pre-repair `rm -f`), dsymutil could not open it and warned for
 #     every symbol. The build now RETAINS each input under app/Vendor/engine-prelocalize/; this
@@ -24,21 +24,18 @@
 # stripped; no -oso_prefix is used - the repair fixed the objects, this only reads them back.
 #
 #   scripts/verify-apple-engine-artifacts.sh [--native-only] [REPO_ROOT]
-# Native-only builds inspect all five native slices and their retained input archives; the
-# default remains the complete legacy+native check used by the combined CI SDK build.
+# Inspects all five native slices and their retained input archives. `--native-only` is accepted
+# for existing callers; it is the only mode.
 #
 # EXIT  0 all inspected archives clean   1 any newer-minOS or missing-OSO source   2 setup error
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-NATIVE_ONLY=0
 if [ "${1:-}" = "--native-only" ]; then
-  NATIVE_ONLY=1
   shift
 fi
 REPO_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 VENDOR="$REPO_ROOT/app/Vendor"
-CORE_XC="$VENDOR/StremioXCore.xcframework"
 FFI_XC="$VENDOR/VortxEngine.xcframework"
 PRELOC="$VENDOR/engine-prelocalize"
 
@@ -57,9 +54,6 @@ if [ -z "$LLVM_NM" ]; then
   [ -n "${_sr:-}" ] && [ -n "${_host:-}" ] && [ -x "$_sr/lib/rustlib/$_host/bin/llvm-nm" ] && LLVM_NM="$_sr/lib/rustlib/$_host/bin/llvm-nm"
 fi
 
-if [ "$NATIVE_ONLY" -eq 0 ]; then
-  [ -d "$CORE_XC" ] || die "missing $CORE_XC (build-core-xcframework.sh did not run / its cache did not restore)"
-fi
 [ -d "$FFI_XC" ]  || die "missing $FFI_XC (build-ffi-xcframework.sh did not run / its cache did not restore)"
 [ -d "$PRELOC" ]  || die "missing $PRELOC (retained pre-localization archives absent; the OSO map cannot resolve)"
 
@@ -198,11 +192,7 @@ tvos-arm64 aarch64-apple-tvos
 tvos-arm64-simulator aarch64-apple-tvos-sim
 macos-arm64 aarch64-apple-darwin
 NATIVE_SLICES
-  if [ "$NATIVE_ONLY" -eq 1 ]; then
-    find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'
-  else
-    find "$CORE_XC" "$FFI_XC" "$PRELOC" -type f -name '*.a'
-  fi
+  find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'
   } | LC_ALL=C sort -u
 )
 

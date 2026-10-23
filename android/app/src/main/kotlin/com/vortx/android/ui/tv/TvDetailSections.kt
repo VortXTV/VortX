@@ -1,6 +1,17 @@
 package com.vortx.android.ui.tv
 
+import com.vortx.android.ratings.VortXRatingsClient
+import com.vortx.android.ratings.MdbListRatings
+import com.vortx.android.ratings.EpisodeScores
 import androidx.compose.foundation.BorderStroke
+import com.vortx.android.person.TMDBPersonClient
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -9,21 +20,17 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,9 +59,8 @@ import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.components.episodeRailTargetIndex
-import com.vortx.android.ui.components.episodeRailPageIndex
+import com.vortx.android.ui.components.episodeGridPageStart
 import kotlinx.coroutines.yield
-import kotlinx.coroutines.launch
 
 /// The 10-foot season picker + episode browser for the TV Detail page, the couch analogue of the phone
 /// `DetailScreen`'s `SeasonSelector` + `EpisodeRow` list and the mirror of Apple `app/SourcesTV/DetailView`.
@@ -67,7 +73,7 @@ import kotlinx.coroutines.launch
 /// PER-PROFILE HISTORY: the per-episode and per-season watched toggles route straight into
 /// [onToggleWatched]/[onMarkSeasonWatched] ([DetailViewModel.setVideoWatched]/[setSeasonWatched]), which write
 /// through the SAME `CatalogRepository` seam the phone uses. That seam is where the main-profile-via-engine /
-/// overlay-profile-via-local-overlay split is enforced (`EngineStremioRepository.overlayProfiles()`); this UI
+/// overlay-profile-via-local-overlay split is enforced by the engine repository; this UI
 /// never touches history directly, so an overlay profile can never mutate the account library from the couch.
 @Composable
 fun TvSeasonEpisodeSection(
@@ -89,18 +95,23 @@ fun TvSeasonEpisodeSection(
         detail.videos.filter { it.season == activeSeason }.sortedBy { it.episode }
     }
     val seasonFocus = remember(activeSeason) { FocusRequester() }
-    val episodeRowState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
     val episodeFocusRequesters = remember(episodes.map { it.id }) {
         episodes.map { FocusRequester() }
     }
+    val seasonPosters by produceState(emptyMap<Int, String>(), detail.id) {
+        value = runCatching { TMDBPersonClient.seasonPosters(detail.id) }.getOrDefault(emptyMap())
+    }
+    // The season as a grid, one page of rows at a time: the page holding the current episode first, and
+    // Previous / Next step a page. Only one page of cards is ever built, so a long season stays light.
+    var pageStart by remember(activeSeason) { mutableIntStateOf(0) }
     LaunchedEffect(focusRestoreEpisodeId, focusRestoreRevision, selectedEpisodeId, episodes) {
         val index = episodeRailTargetIndex(episodes.map { it.id }, focusRestoreEpisodeId ?: selectedEpisodeId)
             ?: episodeRailTargetIndex(episodes.map { it.id }, selectedEpisodeId) ?: return@LaunchedEffect
-        episodeRowState.scrollToItem(index)
+        pageStart = episodeGridPageStart(index, TV_EPISODE_PAGE)
         yield()
         runCatching { episodeFocusRequesters[index].requestFocus() }
     }
+    val page = episodes.drop(pageStart).take(TV_EPISODE_PAGE)
     val seasonAllWatched = episodes.isNotEmpty() && episodes.all { it.id in detail.watchedVideoIds }
 
     Column(
@@ -117,13 +128,17 @@ fun TvSeasonEpisodeSection(
 
         if (seasons.size > 1) {
             LazyRow(
-                contentPadding = PaddingValues(horizontal = TvDimens.edge),
-                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                contentPadding = PaddingValues(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.xs),
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
             ) {
                 items(seasons, key = { it }) { season ->
-                    TvFilterChip(
-                        label = if (season > 0) "Season $season" else "Specials",
+                    val inSeason = detail.videos.filter { it.season == season }
+                    TvSeasonPosterTile(
+                        season = season,
+                        poster = seasonPosters[season],
+                        fallback = detail.poster,
                         selected = season == activeSeason,
+                        complete = inSeason.isNotEmpty() && inSeason.all { it.id in detail.watchedVideoIds },
                         onClick = { onSelectSeason(season) },
                         modifier = if (season == activeSeason) Modifier.focusRequester(seasonFocus) else Modifier,
                     )
@@ -143,34 +158,144 @@ fun TvSeasonEpisodeSection(
             }
         }
 
-        Row(modifier = Modifier.padding(horizontal = TvDimens.edge), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-            TvFilterChip("Previous episodes", false, enabled = episodeRowState.canScrollBackward, onClick = { scope.launch {
-                episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
-                    episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, false))
-            } })
-            TvFilterChip("Next episodes", false, enabled = episodeRowState.canScrollForward, onClick = { scope.launch {
-                episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
-                    episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, true))
-            } })
-        }
-        LazyRow(
-            state = episodeRowState,
-            contentPadding = PaddingValues(horizontal = TvDimens.edge),
-            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
-        ) {
-            itemsIndexed(episodes, key = { _, ep -> ep.id }) { index, episode ->
-                val watched = episode.id in detail.watchedVideoIds
-                TvEpisodeCard(
-                    episode = episode,
-                    watched = watched,
-                    isCurrent = episode.id == selectedEpisodeId,
-                    onSelect = { onSelectEpisode(episode.id) },
-                    onToggleWatched = { onToggleWatched(episode, !watched) },
-                    focusRequester = episodeFocusRequesters[index],
-                    upFocusRequester = if (index == 0) seasonFocus else episodeFocusRequesters[index - 1],
+        if (episodes.size > TV_EPISODE_PAGE) {
+            Row(
+                modifier = Modifier.padding(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TvFilterChip("Previous episodes", false, enabled = pageStart > 0, onClick = {
+                    pageStart = (pageStart - TV_EPISODE_PAGE).coerceAtLeast(0)
+                })
+                TvFilterChip("Next episodes", false, enabled = pageStart + TV_EPISODE_PAGE < episodes.size, onClick = {
+                    pageStart += TV_EPISODE_PAGE
+                })
+                Text(
+                    text = "Episodes ${pageStart + 1}–${pageStart + page.size} of ${episodes.size}",
+                    style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
                 )
             }
         }
+        // Per-episode scores (IMDb, TMDB, Trakt) for the season on screen, from the VortX ratings service.
+        val episodeScores by produceState<Map<Int, EpisodeScores>>(emptyMap(), detail.id, activeSeason) {
+            value = emptyMap()
+            value = VortXRatingsClient.episodes(detail.id, activeSeason) ?: emptyMap()
+        }
+        Column(
+            modifier = Modifier.padding(horizontal = TvDimens.edge),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
+        ) {
+            page.chunked(TV_EPISODE_COLUMNS).forEachIndexed { rowIndex, row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+                    row.forEach { episode ->
+                        val index = pageStart + page.indexOf(episode)
+                        val watched = episode.id in detail.watchedVideoIds
+                        TvEpisodeCard(
+                            episode = episode,
+                            watched = watched,
+                            isCurrent = episode.id == selectedEpisodeId,
+                            onSelect = { onSelectEpisode(episode.id) },
+                            onToggleWatched = { onToggleWatched(episode, !watched) },
+                            focusRequester = episodeFocusRequesters[index],
+                            // The grid's first row hands Up to the season posters, as on Apple TV; deeper rows
+                            // keep native grid navigation.
+                            upFocusRequester = if (rowIndex == 0) seasonFocus else FocusRequester.Default,
+                            modifier = Modifier.weight(1f),
+                            scores = episodeScores[episode.episode]?.ratings,
+                        )
+                    }
+                    repeat(TV_EPISODE_COLUMNS - row.size) { Spacer(Modifier.weight(1f)) }
+                }
+            }
+        }
+    }
+}
+
+private const val TV_EPISODE_COLUMNS = 4
+private const val TV_EPISODE_PAGE = TV_EPISODE_COLUMNS * 3
+private val TV_SEASON_POSTER_WIDTH = 104.dp
+
+/// One season as its own focusable poster (the series poster stands in, numbered, where TMDB has none),
+/// ringed in the accent when it is the season shown and checked when fully watched. Mirrors Apple TV
+/// `seasonPosterTile`.
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun TvSeasonPosterTile(
+    season: Int,
+    poster: String?,
+    fallback: String?,
+    selected: Boolean,
+    complete: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = VortXTheme.colors
+    Column(
+        modifier = Modifier.width(TV_SEASON_POSTER_WIDTH),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        Surface(
+            onClick = onClick,
+            modifier = modifier.fillMaxWidth().aspectRatio(2f / 3f),
+            shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.chip),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = colors.surface2,
+                focusedContainerColor = colors.surface3,
+            ),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.06f),
+            border = ClickableSurfaceDefaults.border(
+                border = Border(
+                    border = BorderStroke(if (selected) 3.dp else 1.dp, if (selected) colors.accent else colors.textPrimary.copy(alpha = 0.08f)),
+                    shape = VortXShapes.chip,
+                ),
+                focusedBorder = Border(
+                    border = BorderStroke(TvDimens.focusBorder, colors.accentBright),
+                    shape = VortXShapes.chip,
+                ),
+            ),
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                AsyncImage(
+                    model = poster ?: fallback,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    alpha = if (selected) 1f else 0.7f,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                if (poster == null) {
+                    Text(
+                        text = if (season == 0) "SP" else "$season",
+                        style = VortXTheme.type.sectionTitle.copy(color = Color.White, fontWeight = FontWeight.Black),
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .fillMaxWidth()
+                            .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f))))
+                            .padding(VortXTheme.spacing.sm),
+                    )
+                }
+                if (complete) {
+                    Icon(
+                        imageVector = VortXIcons.checkmarkCircle,
+                        contentDescription = null,
+                        tint = colors.accent,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .size(22.dp)
+                            .background(Color.White, CircleShape),
+                    )
+                }
+            }
+        }
+        Text(
+            text = if (season > 0) "Season $season" else "Specials",
+            style = VortXTheme.type.label.copy(
+                color = if (selected) colors.textPrimary else colors.textSecondary,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            ),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -188,10 +313,12 @@ private fun TvEpisodeCard(
     onToggleWatched: () -> Unit,
     focusRequester: FocusRequester,
     upFocusRequester: FocusRequester,
+    modifier: Modifier = Modifier.width(288.dp),
+    scores: MdbListRatings? = null,
 ) {
     val colors = VortXTheme.colors
     Column(
-        modifier = Modifier.width(288.dp),
+        modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
         Surface(
@@ -219,7 +346,7 @@ private fun TvEpisodeCard(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(162.dp)
+                        .aspectRatio(16f / 9f)
                         .clip(VortXShapes.card)
                         .background(colors.surface2),
                 ) {
@@ -238,6 +365,13 @@ private fun TvEpisodeCard(
                             contentDescription = "Watched",
                             tint = colors.accentBright,
                             modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).size(24.dp),
+                        )
+                    }
+                    scores?.let {
+                        com.vortx.android.ui.components.RatingScoresPlate(
+                            it,
+                            textSize = 13,
+                            modifier = Modifier.align(Alignment.TopStart).padding(8.dp).padding(end = 36.dp),
                         )
                     }
                     if (isCurrent) {
@@ -354,7 +488,7 @@ fun TvCastCreditsSection(
 /// id); a name-only entry is a plain, non-focusable tile with nothing to look up.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvCastTile(member: CastMember, onTap: (() -> Unit)?) {
+internal fun TvCastTile(member: CastMember, onTap: (() -> Unit)?) {
     val colors = VortXTheme.colors
     val body: @Composable () -> Unit = {
         Column(
@@ -458,6 +592,7 @@ fun TvPersonOverlay(seed: PersonSeed, onOpenTitle: (MetaItem) -> Unit, onBack: (
             seed = seed,
             onBack = onBack,
             onOpenTitle = onOpenTitle,
+            showWebLinks = false, // TV has no browser
         )
     }
 }

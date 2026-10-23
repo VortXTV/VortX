@@ -113,7 +113,7 @@ async function loadSelectedCatalog(): Promise<void> {
   const state: CatState = { ref, skip: 0, done: false, loading: false, seen: new Set<string>(), token };
   cat = state;
   const metas = await fetchCatalog(ref, 0);
-  if (token !== reqToken || !grid) return; // a newer type/catalog selection superseded this load
+  if (token !== reqToken || !grid || document.getElementById("discover-grid") !== grid) return; // the owned surface may have been replaced
   const fresh = dedupe(metas, state);
   state.skip = metas.length;
   state.lastFirstId = metas[0]?.id;

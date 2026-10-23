@@ -46,6 +46,7 @@ import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
@@ -107,6 +108,7 @@ fun TvShell(
     // the shell usable in a @Preview / test.
     onPlayLocal: (Playable) -> Unit = {},
     syncManager: VortXSyncManager? = null,
+    onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -119,7 +121,9 @@ fun TvShell(
     var libraryReturnRoute by remember { mutableStateOf(TvLibraryRoute.DOWNLOADS) }
     var libraryRestoreFocusSignal by remember { mutableStateOf(0) }
     val libraryEntryFocus = remember {
-        listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY).associateWith { FocusRequester() }
+        listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY, TvLibraryRoute.SMART_COLLECTIONS,
+            TvLibraryRoute.NETWORK_SHARES)
+            .associateWith { FocusRequester() }
     }
     var homeBrowseSelected by remember { mutableStateOf(false) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
@@ -261,6 +265,10 @@ fun TvShell(
                             onWatchlist = { openLibraryRoute(TvLibraryRoute.WATCHLIST) },
                             onPreviouslyWatched = { openLibraryRoute(TvLibraryRoute.HISTORY) },
                             entryFocusRequesters = libraryEntryFocus,
+                            onSmartCollections = ({ openLibraryRoute(TvLibraryRoute.SMART_COLLECTIONS) })
+                                .takeIf { com.vortx.android.profile.ProfileStore.sharedOrNull()?.active?.isKids != true },
+                            onNetworkShares = ({ openLibraryRoute(TvLibraryRoute.NETWORK_SHARES) })
+                                .takeIf { com.vortx.android.profile.ProfileStore.sharedOrNull()?.active?.isKids != true },
                             modifier = Modifier.focusProperties { canFocus = libraryRoute == TvLibraryRoute.LANDING },
                         )
                     when (libraryRoute) {
@@ -279,6 +287,8 @@ fun TvShell(
                             onBack = ::closeLibraryRoute,
                             onItem = onItem,
                         )
+                        TvLibraryRoute.SMART_COLLECTIONS -> TvSmartCollectionsScreen(onBack = ::closeLibraryRoute, onItem = onItem)
+                        TvLibraryRoute.NETWORK_SHARES -> TvNetworkSharesScreen(onBack = ::closeLibraryRoute, onPlay = onPlayLocal)
                     }
                     }
                 }
@@ -302,7 +312,7 @@ fun TvShell(
                         onExit = { onDestinationChange(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem)
+                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected)
             }
 
             // Quiet "You're offline" chip pinned to the bottom of the active surface while the device has no

@@ -4,6 +4,25 @@ import AppKit
 #endif
 #if os(iOS)
 import AVKit   // AVRoutePickerView (in-player AirPlay button)
+import UIKit
+#endif
+
+#if os(iOS)
+/// `UIApplication.isIdleTimerDisabled` is process-wide. A late SwiftUI disappearance from an older
+/// presentation may release only its own owner, never a newer player's keep-awake lease.
+@MainActor private enum IOSPlaybackIdleTimer {
+    static var lease = PlaybackIdleTimerLease<UUID>()
+
+    static func claim(_ owner: UUID) { lease.claim(owner) }
+    static func update(_ owner: UUID, preventIdle: Bool) {
+        guard lease.owns(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = preventIdle
+    }
+    static func release(_ owner: UUID) {
+        guard lease.release(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+}
 #endif
 
 /// Full-screen native libmpv player for iOS / Mac, brought to parity with the tvOS `TVPlayerView`:
@@ -60,6 +79,7 @@ private struct PlayerTimeLabel: View {
         Text(formattedTime(clock.position))
             .font(.caption.monospacedDigit())
             .foregroundStyle(.white.opacity(opacity))
+            .vortxPlayerTimeLabelProtection()
             .opacity(!showWhenPositive || clock.position > 0 ? 1 : 0)
     }
 
@@ -249,21 +269,12 @@ private struct PlayerSeekSliderSurface: View {
     private var trackWidth: CGFloat { max(1, size.width - sliderInset * 2) }
 
     var body: some View {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         PlayerStyledSeekSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
                                duration: duration, bufferedTime: bufferedTime, width: size.width,
                                accent: accent, animated: animated,
                                onScrubChanged: onScrubChanged, onEditingChanged: onEditingChanged)
-            .overlay {
-                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
-                                     sliderInset: sliderInset, height: size.height)
-            }
-        #else
-        PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
-                          duration: duration, onScrubChanged: onScrubChanged,
-                          onEditingChanged: onEditingChanged)
-            .tint(accent)
-            #if os(macOS)
+#if os(macOS)
             .onContinuousHover { phase in
                 guard !scrubbing else { return }
                 switch phase {
@@ -274,7 +285,16 @@ private struct PlayerSeekSliderSurface: View {
                     onHoverPreviewChanged(nil)
                 }
             }
-            #endif
+#endif
+            .overlay {
+                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
+                                     sliderInset: sliderInset, height: size.height)
+            }
+        #else
+        PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
+                          duration: duration, onScrubChanged: onScrubChanged,
+                          onEditingChanged: onEditingChanged)
+            .tint(accent)
             .overlay {
                 if !scrubbing {
                     PlayerBufferedBand(clock: clock, duration: duration, bufferedTime: bufferedTime,
@@ -444,6 +464,7 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.playerControlContrastOverride) private var contrastOverride
     @Environment(\.isEnabled) private var isEnabled
+    @AppStorage(VisualEffects.glassKey) private var glassChoice = VisualEffects.auto
 
     private var reduceTransparency: Bool {
         reduceTransparencyOverride ?? systemReduceTransparency
@@ -461,25 +482,40 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
             .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
     }
 
-    /// Keep the material inside the exact disc/pill silhouette. A fixed neutral veil protects white
-    /// glyphs over bright video; only a selected setting adds a small accent cue over that glass.
+    /// Profile-tinted glass inside the exact disc/pill silhouette. The accent sits UNDER a dark veil:
+    /// a tint on top lifts light accents (Mono, Gold) over a white frame below 4.5:1 for white glyphs,
+    /// while tint-then-veil keeps every accent readable and reads as a deep shade of the profile colour.
+    /// Accessibility keeps a dark, fully opaque readable face.
     @ViewBuilder private var surface: some View {
         ZStack {
-            if reduceTransparency || contrast == .increased || !isEnabled {
+            if reduceTransparency
+                || !VisualEffects.glass(stored: glassChoice, reduced: VisualEffects.reducedForAuto)
+                || contrast == .increased || !isEnabled {
                 shape.fill(neutral)
+                if isEnabled { shape.fill(Theme.Palette.accent.opacity(active ? 0.22 : 0.12)) }
             } else {
-                shape.fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
-                shape.fill(neutral.opacity(prominent ? 0.62 : 0.66))
-            }
-            if active && isEnabled {
-                shape.fill(Theme.Palette.accent.opacity(0.16))
+                if #available(iOS 26.0, macOS 26.0, *) {
+                    // Clear Liquid Glass tinted with the profile accent, so the edges and refraction carry it.
+                    shape.fill(.clear)
+                        .glassEffect(.clear.tint(Theme.Palette.playerGlassAccent.opacity(active ? 0.45 : 0.30)).interactive(), in: shape)
+                        .environment(\.colorScheme, .dark)
+                } else {
+                    shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, .dark)
+                }
+                shape.fill(Theme.Palette.playerGlassAccent.opacity(VortXPlayerChromePolicy.controlTintAlpha(
+                    active: active, crimson: Theme.Palette.playerGlassUsesCrimson)))
+                shape.fill(neutral.opacity(VortXPlayerChromePolicy.controlVeilAlpha(
+                    crimson: Theme.Palette.playerGlassUsesCrimson)))
+                // Specular top light: the lit-glass sheen, kept off the lower half where the label sits.
+                shape.fill(LinearGradient(colors: [.white.opacity(0.13), .white.opacity(0)],
+                                          startPoint: .top, endPoint: .center))
             }
         }
         .clipShape(shape)
     }
 
-    // Player chrome floats over arbitrary video, so it must not inherit profile-tinted app surfaces.
+    // The accessibility face remains opaque. The shared policy thins only Crimson's normal veil.
     private var neutral: Color { Color(.sRGB, white: 0.08, opacity: 1) }
 
     private var foreground: Color {
@@ -487,20 +523,21 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
     }
 
     private var border: LinearGradient {
-        let top = contrast == .increased ? 0.48 : prominent ? 0.26 : 0.18
-        let tint: Color = active && isEnabled ? Theme.Palette.accent : .white
-        return LinearGradient(colors: [tint.opacity(active && isEnabled ? 0.72 : top),
-                                       tint.opacity(active && isEnabled ? 0.32 : top * 0.28)],
+        // A bright white rim at the top fading into the accent: the lit edge of Liquid Glass.
+        let top = contrast == .increased ? 0.48 : active && isEnabled ? 0.62 : prominent ? 0.46 : 0.40
+        let tint: Color = contrast == .increased ? .white : Theme.Palette.playerGlassAccent
+        return LinearGradient(colors: [Color.white.opacity(top),
+                                       tint.opacity(active && isEnabled ? 0.40 : top * 0.45)],
                               startPoint: .top, endPoint: .bottom)
     }
 
-    private var shadowOpacity: Double { isEnabled ? 0.20 : 0.10 }
-    private var shadowRadius: CGFloat { prominent ? 5 : 3 }
-    private var shadowY: CGFloat { 2 }
+    private var shadowOpacity: Double { isEnabled ? 0.16 : 0.08 }
+    private var shadowRadius: CGFloat { prominent ? 4 : 2 }
+    private var shadowY: CGFloat { 1 }
 }
 
 private extension View {
-    /// Player-only neutral glass. Callers still decide the visual size/tap target before the modifier.
+    /// Player-only profile glass. Callers still decide the visual size/tap target before the modifier.
     func playerControlSurface<S: InsettableShape>(in shape: S,
                                                    prominent: Bool = false,
                                                    active: Bool = false) -> some View {
@@ -517,19 +554,31 @@ private struct PlayerControlButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
+                #if os(macOS)
+                Image(systemName: icon).font(.system(size: 17, weight: .semibold))
+                #else
                 Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+                #endif
                 // #135: force a single line + allow the font to shrink instead of wrapping mid-word
                 // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
                 // fit at full size so minimumScaleFactor is a no-op there.
-                Text(title).font(.subheadline.weight(.medium))
+                #if os(macOS)
+                Text(title)
+                    .font(.system(size: 16, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                #else
+                Text(title)
+                    .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                     #if !os(iOS)
                     .minimumScaleFactor(0.75)
                     #endif
+                #endif
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
-            #if os(iOS)
             .frame(minHeight: 44)
+            #if os(iOS)
             .fixedSize(horizontal: true, vertical: false)
             #endif
             .playerControlSurface(in: RoundedRectangle(cornerRadius: 11, style: .continuous), active: active)
@@ -538,6 +587,26 @@ private struct PlayerControlButton: View {
         // label. Its own Capsule/RoundedRectangle is the complete visual and hit surface.
         .buttonStyle(.plain)
     }
+}
+
+private enum PlayerSourceAvailability {
+    static func hasAlternates(_ groups: [CoreStreamSourceGroup], playable: (CoreStream) -> Bool) -> Bool {
+        var foundOne = false
+        for group in groups {
+            for stream in group.streams where playable(stream) {
+                if foundOne { return true }
+                foundOne = true
+            }
+        }
+        return false
+    }
+}
+
+private struct PlayerChapterInventoryOwner: Equatable {
+    let engine: ObjectIdentifier
+    let loadToken: PlayerLoadToken
+    let itemGeneration: UInt64?
+    let sourceGeneration: Int
 }
 
 private struct PlayerTransportToolbar: View {
@@ -603,7 +672,7 @@ private struct PlayerLiveIndicator: View {
         // Liquid Glass on OS 26. Background only; the red dot stays a plain fill and playback state is unchanged.
         .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
         Spacer()
-        PlayerTimeLabel(clock: clock, opacity: 0.85, showWhenPositive: true)
+        PlayerTimeLabel(clock: clock, showWhenPositive: true)
     }
     }
 }
@@ -624,10 +693,12 @@ private struct PlayerBottomTimeline: View {
                 PlayerTimeLabel(clock: clock)
                 Spacer(minLength: 8)
                 if let endsAtText {
-                    Text(endsAtText).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.6))
+                    Text(endsAtText).font(.caption2.monospacedDigit()).foregroundStyle(.white)
+                        .vortxPlayerTimeLabelProtection()
                 }
                 Spacer(minLength: 8)
-                Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.8))
+                Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    .vortxPlayerTimeLabelProtection()
             }
             .padding(.horizontal, 10)
         }
@@ -635,12 +706,18 @@ private struct PlayerBottomTimeline: View {
         HStack(spacing: 12) {
             PlayerTimeLabel(clock: clock)
             GeometryReader { geo in track(geo.size) }
+                #if os(macOS)
+                .frame(height: 44)
+                #else
                 .frame(height: 24)
+                #endif
                 .animation(.easeOut(duration: 0.12), value: hasThumbnail)
             VStack(alignment: .trailing, spacing: 1) {
                 Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    .vortxPlayerTimeLabelProtection()
                 if let ends = endsAtText {
-                    Text(ends).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.55))
+                    Text(ends).font(.caption2.monospacedDigit()).foregroundStyle(.white)
+                        .vortxPlayerTimeLabelProtection()
                 }
             }
         }
@@ -695,6 +772,25 @@ private struct PlayerSkipEditorLayout: View {
     }
 }
 
+/// The chrome stays mounted when faded, so its measured height is available before the pointer reveals it.
+private struct PlayerBottomBarHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private enum PlayerSkipChromePolicy {
+    static func showsPrompt(controlsVisible: Bool, sharesChrome: Bool) -> Bool {
+        sharesChrome || !controlsVisible
+    }
+
+    static func bottomPadding(controlsVisible: Bool, sharesChrome: Bool, chromeHeight: Double) -> Double {
+        guard sharesChrome, controlsVisible, chromeHeight.isFinite else { return 40 }
+        return max(40, chromeHeight + 12)
+    }
+}
+
 private struct PlayerBottomBarLayout: View {
     let isLive: Bool
     let live: PlayerLiveIndicator
@@ -717,8 +813,7 @@ private struct PlayerBottomBarLayout: View {
             toolbar
         }
         .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 12)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
-                    fillAlpha: VortXGlass.barFillAlpha, shadow: .bar)
+        .vortxPlayerBottomBackplate()
         .padding(.horizontal, 16).padding(.bottom, 16)
         #endif
     }
@@ -738,27 +833,187 @@ private enum PlayerVideoSizeGesturePolicy {
 
 /// An exclusive recognizer prevents a completed pinch from also toggling controls. It lives below
 /// the chrome, so slider drags and control taps retain their own independent targets.
-private struct PlayerVideoInteractionSurface: View {
+private struct PlayerVideoTouchPolicy<TouchID: Hashable> {
+    private(set) var cycle: UInt64 = 0
+    private var activeTouches: Set<TouchID> = []
+    private var multiTouchOwned = false
+    private var tapDelivered = false
+    private var pinchDelivered = false
+
+    mutating func began(_ touches: Set<TouchID>) -> UInt64 {
+        guard !touches.isEmpty else { return cycle }
+        if activeTouches.isEmpty {
+            cycle &+= 1
+            multiTouchOwned = false
+            tapDelivered = false
+            pinchDelivered = false
+        }
+        activeTouches.formUnion(touches)
+        if activeTouches.count > 1 { multiTouchOwned = true }
+        return cycle
+    }
+
+    mutating func finished(_ touches: Set<TouchID>) {
+        activeTouches.subtract(touches)
+        // Keep ownership through the ended/cancelled delivery order. Only a NEW touch
+        // cycle may reset it; a failed pinch must not strand the next ordinary tap.
+    }
+
+    mutating func claimPinch() -> UInt64? {
+        guard cycle != 0 else { return nil }
+        multiTouchOwned = true
+        return cycle
+    }
+
+    mutating func consumePinch(_ expectedCycle: UInt64) -> Bool {
+        guard expectedCycle == cycle, multiTouchOwned, !pinchDelivered else { return false }
+        pinchDelivered = true
+        return true
+    }
+
+    mutating func consumeTap(_ expectedCycle: UInt64) -> Bool {
+        guard cycle != 0, expectedCycle == cycle, !multiTouchOwned, !tapDelivered else { return false }
+        tapDelivered = true
+        return true
+    }
+
+    mutating func invalidate() {
+        cycle &+= 1
+        activeTouches.removeAll()
+        multiTouchOwned = true
+        tapDelivered = true
+        pinchDelivered = true
+    }
+}
+
+#if os(iOS)
+@MainActor private struct PlayerVideoInteractionSurface: UIViewRepresentable {
     let locked: Bool
     let pinchEnabled: Bool
     let onTap: () -> Void
     let onPinch: (CGFloat) -> Void
 
-    var body: some View {
-        Color.clear.contentShape(Rectangle())
-            .gesture(MagnificationGesture(minimumScaleDelta: 0.02)
-                .exclusively(before: TapGesture())
-                .onEnded { result in
-                    switch result {
-                    case .first(let scale): if pinchEnabled && !locked { onPinch(scale) }
-                    case .second: onTap()
-                    }
-                })
-            .ignoresSafeArea()
-            .accessibilityLabel(locked ? "Unlock player controls" : "Show player controls")
-            .accessibilityAction { onTap() }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> TouchView {
+        let view = TouchView()
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.isMultipleTouchEnabled = true
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
+        tap.numberOfTapsRequired = 1
+        tap.numberOfTouchesRequired = 1
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinched(_:)))
+        for recognizer in [tap as UIGestureRecognizer, pinch] {
+            recognizer.delegate = context.coordinator
+            recognizer.cancelsTouchesInView = false
+            recognizer.delaysTouchesBegan = false
+            recognizer.delaysTouchesEnded = false
+            view.addGestureRecognizer(recognizer)
+        }
+        context.coordinator.tap = tap
+        context.coordinator.pinch = pinch
+        view.began = { [weak coordinator = context.coordinator] touches in
+            guard let coordinator else { return }
+            coordinator.tapCycle = coordinator.ownership.began(touches)
+        }
+        view.finished = { [weak coordinator = context.coordinator] touches in
+            coordinator?.ownership.finished(touches)
+        }
+        view.activate = { [weak coordinator = context.coordinator] in
+            guard let coordinator, coordinator.attached else { return false }
+            coordinator.onTap()
+            return true
+        }
+        updateUIView(view, context: context)
+        return view
+    }
+
+    func updateUIView(_ view: TouchView, context: Context) {
+        // Refresh callbacks BEFORE toggling recognition, since disabling a live pinch cancels it.
+        let coordinator = context.coordinator
+        coordinator.onTap = onTap
+        coordinator.onPinch = onPinch
+        coordinator.locked = locked
+        coordinator.pinchEnabled = pinchEnabled
+        coordinator.attached = true
+        coordinator.pinch?.isEnabled = pinchEnabled && !locked
+        view.isAccessibilityElement = true
+        view.accessibilityTraits = .button
+        view.accessibilityLabel = locked ? "Unlock player controls" : "Show player controls"
+    }
+
+    static func dismantleUIView(_ view: TouchView, coordinator: Coordinator) {
+        coordinator.attached = false
+        coordinator.ownership.invalidate()
+        coordinator.pinchCycle = nil
+        coordinator.onTap = {}
+        coordinator.onPinch = { _ in }
+        view.began = nil
+        view.finished = nil
+        view.activate = nil
+    }
+
+    @MainActor final class TouchView: UIView {
+        var began: ((Set<ObjectIdentifier>) -> Void)?
+        var finished: ((Set<ObjectIdentifier>) -> Void)?
+        var activate: (() -> Bool)?
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            began?(Set(touches.map(ObjectIdentifier.init)))
+        }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            finished?(Set(touches.map(ObjectIdentifier.init)))
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            finished?(Set(touches.map(ObjectIdentifier.init)))
+        }
+        override func accessibilityActivate() -> Bool { activate?() ?? false }
+    }
+
+    @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var ownership = PlayerVideoTouchPolicy<ObjectIdentifier>()
+        var tapCycle: UInt64 = 0
+        var pinchCycle: UInt64?
+        weak var tap: UITapGestureRecognizer?
+        weak var pinch: UIPinchGestureRecognizer?
+        var attached = false
+        var locked = false
+        var pinchEnabled = false
+        var onTap: () -> Void = {}
+        var onPinch: (CGFloat) -> Void = { _ in }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            (gestureRecognizer === tap && other === pinch) || (gestureRecognizer === pinch && other === tap)
+        }
+
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            guard attached, recognizer.state == .ended, ownership.consumeTap(tapCycle) else { return }
+            onTap() // The current caller chooses toggle versus locked unlock-chip behavior.
+        }
+
+        @objc func pinched(_ recognizer: UIPinchGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                pinchCycle = ownership.claimPinch()
+            case .changed:
+                break // Ownership remains with this cycle, without repeated engine actions.
+            case .ended:
+                defer { pinchCycle = nil }
+                guard attached, pinchEnabled, !locked, let pinchCycle,
+                      ownership.consumePinch(pinchCycle) else { return }
+                onPinch(recognizer.scale) // Existing size policy still validates scale/current mode.
+            case .cancelled, .failed:
+                pinchCycle = nil // Do not reset touch-cycle ownership here.
+            default:
+                break
+            }
+        }
     }
 }
+
+#endif
 
 private struct PlayerSizeModeFeedback: View {
     let title: String
@@ -777,6 +1032,7 @@ private struct PlayerSizeModeFeedback: View {
             }
     }
 }
+
 
 private struct PlayerTouchIconButton: View {
     let icon: String
@@ -892,7 +1148,7 @@ private struct PlayerTouchOptionsButton: View {
 
 private struct PlayerTouchHeader: View {
     let title: String
-    let metadata: String
+    let metadataPills: [PlaybackMetadataPill]
     let close: PlayerTouchIconButton
     let pictureInPicture: () -> AnyView
     let aspect: PlayerTouchAspectButton
@@ -912,8 +1168,9 @@ private struct PlayerTouchHeader: View {
             if !title.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.headline.weight(.semibold)).lineLimit(1)
-                    if !metadata.isEmpty {
-                        Text(metadata).font(.caption).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
+                    if !metadataPills.isEmpty {
+                        PlaybackMetadataPills(pills: metadataPills)
+                            .font(.caption).foregroundStyle(.white.opacity(0.65))
                     }
                 }
                 .foregroundStyle(.white)
@@ -1124,10 +1381,12 @@ struct PlayerScreen: View {
     var onPlaybackIdentityCommitted: (PlaybackMeta) -> Void = { _ in }
     let onClose: () -> Void
 
-    // CoreBridge / account are injected at the iOS app root; the player reads them for in-player source
-    // switching (alternate loaded streams) and add-on subtitles - exactly as tvOS does. They are
-    // EnvironmentObjects, so no presenter (iOSDetailView / iOSRootView) needs to change to feed them.
-    @EnvironmentObject private var core: CoreBridge
+    // CoreBridge / account are read for in-player source switching (alternate loaded streams) and add-on
+    // subtitles, exactly as tvOS does. The account is injected at the iOS app root. The bridge is read freely
+    // but observed narrowly (`PlayerEngineChanges`): observing all of it rebuilt this screen on every engine
+    // event during playback.
+    private var core: CoreBridge { CoreBridge.shared }
+    @StateObject private var engineChanges = PlayerEngineChanges()
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager      // observe accent + textScale so the chrome repaints live
     // Compact width (iPhone portrait/landscape) shrinks the inline volume slider so the top-bar icon cluster
@@ -1306,6 +1565,7 @@ struct PlayerScreen: View {
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
     @State private var markedWatched = false           // ~90%/EOF watched marker fires once per title (mirrors tvOS)
+    @State private var watchedDwell = WatchedPlaybackDwell<PlayerLoadToken>()
     @State private var autoAddedThisPlayback = false    // D8/D9: the ~60s auto-add + watch-ping fires once per playback
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true   // "Auto-add watched to Library" (default ON)
     @State private var buffering = true
@@ -1318,6 +1578,8 @@ struct PlayerScreen: View {
     @State private var duration = 0.0
     @State private var completionEvidence = PlaybackCompletionEvidence<PlayerLoadToken>()
     @State private var bufferedTime = 0.0   // buffered-ahead edge (seconds) for the YouTube-style grey scrubber band
+    /// This screen's identity in FullscreenPlaybackGate, so a repeated onAppear counts it once.
+    @State private var playbackGateToken = UUID()
     @State private var lastReported = -1.0     // last whole-second progress pushed to stremio-core
     @State private var isPaused = false
     @State private var speed = 1.0
@@ -1329,8 +1591,9 @@ struct PlayerScreen: View {
     @State private var audioCodec = ""
     @State private var audioChannels = 0
     @State private var isHDR = false
-    @State private var metadataLine = ""        // "4K · HDR · EAC3"-style line shown under the title
+    @State private var metadataPills: [PlaybackMetadataPill] = [] // Rebuilt only on media metadata events.
     @State private var controlsVisible = true
+    @State private var bottomChromeHeight: CGFloat = 0
     /// Player Lock: while true the chrome is hidden and non-interactive and a tap on the video only
     /// reveals the small unlock chip, so a pocketed phone / a handed-over device can't seek or pause by
     /// accident. Engaged from the top bar's lock button; per-playback state (never persisted).
@@ -1341,6 +1604,7 @@ struct PlayerScreen: View {
     @State private var unlockChipVisible = false
     @State private var unlockChipHideTask: Task<Void, Never>?
     @State private var scrubbing = false
+    @State private var editingVolume = false
     @State private var scrubTarget: Double = 0   // committed scrub position while dragging; avoids timePos fighting the thumb (#32)
     @State private var refreshTask: Task<Void, Never>?   // debounced panel/track refresh; cancellable so it can't outlive the player (#20)
     /// Session audio-language filter, matching the tvOS/iOS source-picker chip (#204). On Mac the
@@ -1370,6 +1634,12 @@ struct PlayerScreen: View {
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
     @State private var forcedLandscape = false
     @State private var hideTask: Task<Void, Never>?
+    // Plain reference state: pointer deadlines must not invalidate this entire player on every move.
+    private final class ControlsHideClock {
+        var deadline = Double.infinity
+        var lastPointerPresence = -Double.infinity
+    }
+    @State private var controlsHideClock = ControlsHideClock()
     // Sleep timer (#5): pause playback after a set time, or stop at the end of the current episode.
     @State private var sleepMinutes: Int? = nil        // nil = off (unless sleepAtEpisodeEnd)
     @State private var sleepAtEpisodeEnd = false        // stop at episode end instead of auto-advancing
@@ -1731,6 +2001,9 @@ struct PlayerScreen: View {
     /// (source hop / demote / retry) keeps it unchanged, so the scrobble coordinator's once-latches survive
     /// and a completion recorded before the reload is never re-sent.
     @State private var playbackSessionID = UUID().uuidString
+#if os(iOS)
+    @State private var playbackIdleTimerOwner = UUID()
+#endif
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
     @State private var isSeekable = true
@@ -1856,12 +2129,15 @@ struct PlayerScreen: View {
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
     @State private var chapterFractions: [Double] = []   // chapter boundary positions (0...1) for scrubber ticks
+    @State private var chapterInventoryOwner: PlayerChapterInventoryOwner?
+    @State private var chapterInventoryCount = 0
     @State private var upNextSuppressed = false           // user tapped Watch Credits: hide the band + don't auto-advance this episode
     @State private var apiSkipCandidates: [SegmentCandidate] = []
     @State private var currentSkip: SkipSegment?
     @State private var autoSkipCountdown = AutoSkipCountdownState()
     @State private var autoSkipDelaySeconds = AutoSkipSettings.delaySeconds()
-    @State private var skipFetchKey = ""
+    @State private var skipFetchOwner: SkipLookupRequestOwner<PlayerLoadToken>?
+    @State private var skipFetchAttempt: UUID?
     @State private var skipFetchTask: Task<Void, Never>?
 
     // Playback-info overlay rows, refreshed while the Info panel is open.
@@ -1879,11 +2155,19 @@ struct PlayerScreen: View {
             // tvOS routes HLS in TVPlayerView, both unchanged.
             mpvBody
         }
+        // Every control in the player (panels, toggles, spinners) carries the chosen accent, however the
+        // player was presented (a cover on iPhone, a window-root overlay on Mac).
+        .tint(Theme.Palette.accent)
         // Ambient-hero gate: the browse UI (and any mounted in-hero trailer clip) stays alive UNDER this
         // fullscreen player, so signal "a player is up" for as long as this screen is mounted - the hero
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
-        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(); LoopbackPlaybackAssertion.begin(for: url) }
+        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(playbackGateToken); LoopbackPlaybackAssertion.begin(for: url) }
+        // Panels and the failure screen list sources, so they follow every engine change.
+        .onChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
+        // A first frame, remote resume or dismissed dialog re-arms a visible bar. The original
+        // one-shot timer could expire during loading/pausing and never run again until another tap.
+        .onChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }
         .onChange(of: core.streamsEpoch) { _ in
             establishSubtitleTimingScopeIfAvailable()
             if appliedAutoTracks {
@@ -1895,12 +2179,13 @@ struct PlayerScreen: View {
             consumePendingManualEpisodeNavigationIfReady()
         }
         .onChange(of: sourceSwitchGeneration) { _ in
+            fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
             episodeInventoryUnavailable = false
             hydrateDirectResumeSeriesInventory()
         }
-        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
+        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(playbackGateToken); LoopbackPlaybackAssertion.end() }
     }
 
     #if os(iOS) || os(macOS)
@@ -2090,14 +2375,13 @@ struct PlayerScreen: View {
 
             playerSurface
 
-            // Reliable tap-to-toggle: a transparent hit-test layer over the video. The UIKit
-            // recognizer on the Metal view frequently missed taps (you had to tap many times);
-            // a SwiftUI contentShape layer catches every tap. The controls sit above it, so their
-            // buttons still work and a tap on empty space falls through here to toggle.
+            // A dedicated transparent surface owns one-finger taps independently of pinch. Actual
+            // buttons/panels remain above it; decorative buffering must not steal its hit tests.
             #if os(iOS)
             PlayerVideoInteractionSurface(locked: isLocked, pinchEnabled: touchPinchEnabled,
                 onTap: { if isLocked { revealUnlockChip() } else { toggleControls() } },
                 onPinch: handleVideoPinch)
+                .ignoresSafeArea()
             #else
             Color.clear.contentShape(Rectangle())
                 .onTapGesture { if isLocked { revealUnlockChip() } else { toggleControls() } }
@@ -2116,14 +2400,19 @@ struct PlayerScreen: View {
 
             if (buffering || reconnecting) && !loadFailed { bufferingOverlay }
 
-            // Skip pill shows only while watching (controls hidden); suppressed once the Up Next band is up
-            // so the two end-of-episode prompts never stack.
+            // On Mac, pointer movement reveals chrome: keep manual Skip available and lift it above the
+            // measured bar. Automatic countdown eligibility remains separate while the viewer uses controls.
+            // Up Next still replaces this prompt so the two end-of-episode actions never stack.
             // Suppressed while locked: the pill is a tap-to-seek affordance, and the whole point of the
             // lock is that no stray tap can move playback.
             if hasStartedPlaying, let seg = currentSkip,
                !autoSkipCountdown.isSuppressed(for: seg),
-               !controlsVisible, !isLocked, panel == nil, !loadFailed, upNextRemaining == nil {
+               PlayerSkipChromePolicy.showsPrompt(controlsVisible: controlsVisible,
+                                                 sharesChrome: skipSharesChrome),
+               !isLocked, panel == nil, !loadFailed, !stillWatchingPrompt,
+               (!skipSharesChrome || !skipEditActive), upNextRemaining == nil {
                 skipPill(seg)
+                    .zIndex(1)
             }
 
             // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
@@ -2234,6 +2523,13 @@ struct PlayerScreen: View {
         .persistentSystemOverlays(.hidden)
         #endif
         .tint(Theme.Palette.accent)
+        // Mac: the window buttons show and auto-hide with these controls.
+        .macPlayerChromeVisible(controlsVisible && !isLocked)
+        #if os(macOS)
+        .onContinuousHover { phase in
+            if case .active = phase { macPointerMoved() }
+        }
+        #endif
         .onAppear {
             refreshAutoSkipSettings()
             playbackExited = false
@@ -2257,7 +2553,8 @@ struct PlayerScreen: View {
                     episodeGeneration: episodeSwitchGeneration,
                     loadToken: externalHandoffLoadToken
                 )
-                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta) { launched in
+                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta, startSeconds: resumeSeconds,
+                                                   durationSeconds: assetSanityExpectedRuntimeSeconds()) { launched in
                     guard !playbackExited,
                           externalHandoff.matches(
                               url: curURL ?? url,
@@ -2312,7 +2609,8 @@ struct PlayerScreen: View {
             hydrateDirectResumeMetadataForPlayerUI()
             hydrateDirectResumeSeriesInventory()
             #if os(iOS)
-            UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
+            IOSPlaybackIdleTimer.claim(playbackIdleTimerOwner)
+            IOSPlaybackIdleTimer.update(playbackIdleTimerOwner, preventIdle: true) // hold the screen awake while the player is open (parity with tvOS)
             if !isTrailer { PlayerOrientation.forceLandscape() }   // rotate to landscape as the stream opens, even under rotation lock
             #elseif os(macOS)
             // macOS has no idle-timer API; hold a display-sleep assertion so the Mac doesn't dim/sleep
@@ -2337,7 +2635,7 @@ struct PlayerScreen: View {
             invalidateLocalTrickplayCapture()
             cancelAssetSanityObservationDeadline()
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
-            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
+            hideTask?.cancel(); hideTask = nil; loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
             cancelPostFrameResumeSeekWatchdog()
             refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
@@ -2359,7 +2657,7 @@ struct PlayerScreen: View {
             }
             NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
-            UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
+            IOSPlaybackIdleTimer.release(playbackIdleTimerOwner)
             PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
@@ -2432,7 +2730,8 @@ struct PlayerScreen: View {
                               ) else { return }
                         guard probeSucceeded else { externalLinkDead = true; return }
                         // Handed off, stop local playback so the stream isn't decoded twice.
-                        ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta) { launched in
+                        ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta, startSeconds: currentTime,
+                                           durationSeconds: duration > 0 ? duration : assetSanityExpectedRuntimeSeconds()) { launched in
                             guard !playbackExited,
                                   externalHandoff.matches(
                                       url: curURL ?? url,
@@ -2471,7 +2770,7 @@ struct PlayerScreen: View {
             // Every playable source loaded for this title, newline-joined - handy for sending the whole
             // ranked list at once. Only shown when more than one source is actually loaded (a single
             // source is already covered by "Copy stream link").
-            if allSourceLinks.count > 1 {
+            if hasMultipleSourceLinks {
                 Button("Copy all source links") {
                     Haptics.tap()
                     let joined = allSourceLinks.joined(separator: "\n")
@@ -2624,6 +2923,7 @@ struct PlayerScreen: View {
         }
         refreshSubFingerprint(force: true)
         fetchPooledSubtitles()
+        fetchSkipTimestamps()
     }
 
     private func cancelAssetSanityObservationDeadline() {
@@ -2889,9 +3189,14 @@ struct PlayerScreen: View {
         switch name {
         case MPVProperty.pausedForCache:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
-            if let b = data as? Bool { buffering = b }
+            if let b = data as? Bool {
+                if b { watchedDwell.reset() }
+                buffering = b
+            }
         case MPVProperty.videoParamsSigPeak:
-            if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
+            if let p = data as? Double { isHDR = p > 1.0 }
+        case MPVProperty.videoParamsGamma:
+            refreshMetadataFacts(loadToken: loadToken)
         case MPVProperty.timePos:
             if let event = data as? PlayerTimePositionEvent,
                PlayerLoadProvenanceState.accepts(
@@ -2899,6 +3204,7 @@ struct PlayerScreen: View {
                 activeToken: coordinator.player?.activeLoadToken
                ) {
                 let d = event.seconds
+                updateWatchedDwell(with: event)
                 guard d.isFinite, d >= 0 else { return }
                 // Recovery retains the last settled position; the UI can still show raw seek targets.
                 if event.positionSettled {
@@ -2912,12 +3218,12 @@ struct PlayerScreen: View {
                 let supersededTick = supersededAdvance?.pending.issued == true
                     && event.loadToken == supersededAdvance?.pending.loadToken
                 if supersededTick { return }
-                let renderedAVFrame = (coordinator.player as? AVPlayerEngineController)?
-                    .hasProducedPlayableVideoFrame == true
+                let avStartEvidence = (coordinator.player as? AVPlayerEngineController)?.playbackStartEvidence
                 if pendingAdvance?.issued == true,
                    event.loadToken == pendingAdvance?.loadToken,
                    ApplePlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
-                       positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame) { return }
+                       positionSeconds: d, positionSettled: event.transportSettled,
+                       avPlayerEvidence: avStartEvidence) { return }
                 if let target = postFrameResumeSeekWatchdogTarget,
                    postFrameResumeSeekWatchdogOwner == event.loadToken,
                    event.transportSettled,
@@ -2927,7 +3233,8 @@ struct PlayerScreen: View {
                     cancelPostFrameResumeSeekWatchdog()
                 }
                 if ApplePlaybackStartPolicy.hasStarted(
-                    positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame),
+                    positionSeconds: d, positionSettled: event.transportSettled,
+                    avPlayerEvidence: avStartEvidence),
                    !hasStartedPlaying {
                     if let pending = pendingAdvance {
                         guard pending.issued,
@@ -3122,7 +3429,9 @@ struct PlayerScreen: View {
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
                     // bogus offset (or drop a fake Continue-Watching entry).
                     if assetSanityAccepted, !effectivelyLive,
-                       duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
+                       duration > 0, d - lastReported >= 20 {   // push progress ~every 20s, the tvOS cadence
+                        // Each report is a full native-engine transaction (state hydrate + validation), so a
+                        // 5 s cadence kept a core busy during playback. Pause, seek and exit still report at once.
                         lastReported = d
                         reportProgress(d)
                     }
@@ -3151,15 +3460,6 @@ struct PlayerScreen: View {
                        ((duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120)) {
                         warmNextIfNeeded()
                     }
-                    // ~90% in → flip the engine's watched marker live, so the title leaves Continue
-                    // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if assetSanityAccepted, !markedWatched,
-                       !effectivelyLive, duration > 0, d / duration >= 0.9,
-                       let m = curMeta {
-                        markedWatched = true
-                        core.markPlaybackWatched(m, target: playbackMutationTarget,
-                                                 allowEngineWrite: engineWritesOpen)
-                    }
                 }
                 if hasStartedPlaying, observedAudioLanguage == nil, incomingEpisodeChoice == nil,
                    assetSanityAttempt.isAccepted(owner: event.loadToken) {
@@ -3168,7 +3468,9 @@ struct PlayerScreen: View {
             }
         case MPVProperty.duration:
             if let d = data as? Double {
+                if d != duration || !d.isFinite || d <= 0 { watchedDwell.reset() }
                 duration = d
+                retireUnusableSkipLookupDuration(loadToken: loadToken, durationSeconds: d)
                 if !appliedSize, d > 0 {                 // re-apply the size mode on every (re)load
                     appliedSize = true
                     coordinator.player?.setVideoSize(videoSize)
@@ -3251,6 +3553,7 @@ struct PlayerScreen: View {
             if let d = data as? Double, d.isFinite, d >= currentTime { bufferedTime = d }
         case MPVProperty.pause:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
+            if let paused = data as? Bool, paused { watchedDwell.reset() }
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume must fire once per
             // press, not twice (this also collapses the pre-existing KVO double-fire). The now-playing write is
@@ -3258,6 +3561,8 @@ struct PlayerScreen: View {
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
                 if b { localNNTPStallRecovery.suspend() }
+                // The engine writes position ticks at most every 30 s; make the latest one durable on pause.
+                if b { core.flushNativeProgress() }
                 #if os(iOS) || os(macOS)
                 if b {
                     suspendAVReplacementFirstFrameDeadline()
@@ -3293,7 +3598,7 @@ struct PlayerScreen: View {
             let summary = coordinator.player?.mediaSummary()
             videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
             audioChannels = summary?.audioChannels ?? 0
-            metadataLine = computeMetadataLine()
+            refreshMetadataFacts(loadToken: loadToken)
             // Gap A (#76): on AVPlayer, chapters() is [] at readyToPlay (loadChapters is async) and the engine
             // re-emits trackList precisely once they resolve, so re-pull skip candidates + chapter marks here.
             // On libmpv chapters() is already synchronous at duration, so this is a cheap no-op re-run there.
@@ -3327,6 +3632,8 @@ struct PlayerScreen: View {
             case .persistOutgoingCompletionOnly:
                 return
             }
+            if let exhaustion = data as? SeekEOFRecoveryExhaustion,
+               handleExhaustedSeekEOFRecovery(exhaustion, loadToken: loadToken) { return }
             #if os(iOS) || os(macOS)
             // ANY AVPlayer failure, pre-start (a Profile 7 / TrueHD-only DV remux, a container AVPlayer
             // can't open) or MID-PLAY, demotes to libmpv IN PLACE: flipping avEngineFailed swaps
@@ -3405,7 +3712,8 @@ struct PlayerScreen: View {
                 srcProbe("endFileError IGNORED (live stream owns its own reconnect) reason=\((data as? String) ?? "-")")
             }
         case MPVProperty.endFileEof:
-            if let loadToken, rejectPrematureEOFIfNeeded(loadToken: loadToken) { return }
+            if let loadToken, rejectPrematureEOFIfNeeded(loadToken: loadToken,
+                seekEOF: data as? SeekEOFRecoveryExhaustion) { return }
             let completionOnly: Bool
             switch terminalAction(for: loadToken, kind: .eof) {
             case .handleCommitted:
@@ -3750,10 +4058,8 @@ struct PlayerScreen: View {
             // ZERO rows from libmpv plays even though the LOCAL disk cache (its own ioQueue) still worked. Hop to
             // the main actor here so BOTH engines feed record+upload identically. `data` (Data) is Sendable.
             //
-            // The heavy JPEG decode + macOS near-black rasterization/sampling runs HERE, off the main actor (this
-            // libmpv completion is on a background capture queue; the AVPlayer engine already hops to main before
-            // calling back, so its decode is on main, which is unavoidable and cheap for that path). Only the small
-            // main-actor tail (in-flight reset + record/upload of the already-decoded frame) hops to the main actor.
+            // Engine callbacks can arrive on either queue. Explicitly schedule JPEG decode and black-frame
+            // inspection on a utility queue, then publish only for the capture generation that owns the result.
             guard let data else {
                 Task { @MainActor in
                     watchdog.cancel()
@@ -3767,14 +4073,16 @@ struct PlayerScreen: View {
                 return
             }
             VXProbe.log("tp", "\(engine) captured \(data.count) bytes at \(Int(time))s")
-            let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)   // heavy decode + black-check OFF main
-            Task { @MainActor in
-                watchdog.cancel()
-                guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
-                self.localTrickplayCaptureInFlight = false
-                _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
-                guard let decoded else { return }   // decode failed / near-black: already logged off-actor
-                self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
+            DispatchQueue.global(qos: .utility).async {
+                let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)
+                Task { @MainActor in
+                    watchdog.cancel()
+                    guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
+                    self.localTrickplayCaptureInFlight = false
+                    _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
+                    guard let decoded else { return }   // decode failed / near-black: already logged off-actor
+                    self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
+                }
             }
         }
     }
@@ -4151,7 +4459,34 @@ struct PlayerScreen: View {
                      isLive: isLive, engine: engine)
     }
 
+    private func updateWatchedDwell(with event: PlayerTimePositionEvent) {
+        guard !markedWatched, let m = curMeta,
+              event.loadToken == coordinator.player?.activeLoadToken,
+              committedLoadToken == event.loadToken,
+              pendingAdvance == nil, supersededAdvance == nil else {
+            watchedDwell.reset()
+            return
+        }
+        let watched = watchedDwell.observe(
+            context: .init(owner: event.loadToken, libraryID: m.libraryId, videoID: m.videoId,
+                           episodeGeneration: episodeSwitchGeneration,
+                           sourceGeneration: sourceSwitchGeneration,
+                           seekGeneration: event.mpvSeekSettlement?.generation),
+            time: ProcessInfo.processInfo.systemUptime, position: event.seconds,
+            duration: duration, rate: speed,
+            eligible: assetSanityAttempt.isAccepted(owner: event.loadToken)
+                && hasStartedPlaying && event.positionSettled
+                && !effectivelyLive && !scrubbing && !isPaused && !buffering
+        )
+        if watched {
+            markedWatched = true
+            core.markPlaybackWatched(m, target: playbackMutationTarget,
+                                     allowEngineWrite: engineWritesOpen)
+        }
+    }
+
     private func resetRawPosition(owner: PlayerLoadToken) {
+        watchedDwell.reset()
         lastRawTimePos = -1
         lastRawTimePosOwner = owner
         lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
@@ -4413,14 +4748,19 @@ struct PlayerScreen: View {
 
     /// A known early EOF is a source failure, not permission to mark watched or advance. Live/trailer and
     /// unknown-duration semantics are left intact. Mirrors TVPlayerView's ownership-fenced path.
-    private func rejectPrematureEOFIfNeeded(loadToken: PlayerLoadToken) -> Bool {
+    private func rejectPrematureEOFIfNeeded(loadToken: PlayerLoadToken,
+                                            seekEOF: SeekEOFRecoveryExhaustion? = nil) -> Bool {
         guard loadToken == coordinator.player?.activeLoadToken else { return true }
-        switch completionEvidence.consumeEOF(owner: loadToken, isLive: effectivelyLive, isTrailer: isTrailer) {
+        switch completionEvidence.consumeEOF(owner: loadToken, isLive: effectivelyLive, isTrailer: isTrailer,
+                                             knownDurationFallback: seekEOF?.duration) {
         case .allowCompletion:
             return false
         case .ignore:
             return true
         case let .premature(position, duration):
+            if let seekEOF,
+               handleExhaustedSeekEOFRecovery(seekEOF, loadToken: loadToken,
+                                             resumeOverride: position) { return true }
             DiagnosticsLog.log("player", "premature EOF rejected position=\(position) duration=\(duration); retaining episode")
             switch terminalAction(for: loadToken, kind: .error) {
             case .handleCommitted:
@@ -4443,6 +4783,36 @@ struct PlayerScreen: View {
             }
             return true
         }
+    }
+
+    /// The engine has already reopened this exact seek once. Retain this episode and resume intent;
+    /// do not send the same failed region through the independent startup/mid-play retry ladder again.
+    private func handleExhaustedSeekEOFRecovery(_ exhaustion: SeekEOFRecoveryExhaustion,
+                                               loadToken: PlayerLoadToken?,
+                                               resumeOverride: Double? = nil) -> Bool {
+        guard let loadToken, loadToken == coordinator.player?.activeLoadToken else { return false }
+        guard case .handleCommitted = terminalAction(for: loadToken, kind: .error) else { return false }
+        let action = SeekEOFRecoveryContinuationPolicy.action(exhaustion: exhaustion,
+            live: effectivelyLive, trailer: isTrailer,
+            explicitPick: currentPickWasExplicit, resumedPlayback: currentPlaybackIsResume)
+        guard action != .ordinaryRecovery else { return false }
+        // A timeout retains requested transport intent, not a fabricated confirmed-position receipt.
+        let resume = resumeOverride.map { retryResumeTarget(confirmedPositionOverride: $0) }
+            ?? exhaustion.target
+        midPlayFailureOwner = loadToken
+        midPlayFailureResume = resume
+        hasStartedPlaying = false
+        autoRetryTask?.cancel(); autoRetryTask = nil
+        loadTimeout?.cancel(); loadTimeout = nil
+        recoveryDeadline?.cancel(); recoveryDeadline = nil
+        reconnecting = false
+        loadErrorMsg = "This source stopped near the seek position. Choose another source or retry."
+        DiagnosticsLog.log("player", "seek recovery exhausted; retaining episode and resume intent")
+        if action == .tryAlternateSource,
+           hopToNextSource(reason: "seek recovery exhausted", resumeOverride: resume) { return true }
+        (coordinator.player as? MPVMetalViewController)?.parkAfterExhaustedSeekEOF(exhaustion)
+        presentTerminalLoadFailure()
+        return true
     }
 
     /// Preserve the actual play head, reopen the existing bounded recovery ladder, and spend its separate
@@ -4671,6 +5041,7 @@ struct PlayerScreen: View {
     }
 
     private func viewerPause() {
+        watchedDwell.reset()
         // A surface handoff may temporarily have no controller. The next mount still owes this input.
         localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
@@ -5336,6 +5707,7 @@ struct PlayerScreen: View {
     }
 
     private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
+        watchedDwell.reset()
         let initialTarget = InitialResumeUserIntentPolicy.target(
             applied: appliedInitialResume,
             ownsRequest: assetSanityAttempt.owner.map { $0 == coordinator.player?.activeLoadToken } == true,
@@ -5769,9 +6141,22 @@ struct PlayerScreen: View {
             }
             let mounted = await awaitReplacementMPVMount(for: handoff)
             guard !Task.isCancelled,
-                  let mpv = mounted?.controller,
-                  mpv.activeLoadToken == mounted?.token else { return }
-            if let token = mounted?.token { adoptResumeSurfaceIfCurrent(loadToken: token) }
+                  !playbackExited,
+                  avToMPVHandoff == nil,
+                  !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url),
+                  let mounted,
+                  coordinator.player === mounted.controller,
+                  mounted.controller.activeLoadToken == mounted.token else { return }
+            let mpv = mounted.controller
+            let token = mounted.token
+            adoptResumeSurfaceIfCurrent(loadToken: token)
+            // The selected rate is live SwiftUI state. Apply it only after this exact handoff has admitted
+            // its mounted controller and token, before any watchdog or resume work can advance the new mount.
+            mpv.setSpeed(speed)
             if let recovery = directAVNoFrameRecovery,
                recovery.url == handoff.url,
                recovery.episodeGeneration == handoff.episodeGeneration,
@@ -5783,7 +6168,7 @@ struct PlayerScreen: View {
                     sourceGeneration: recovery.sourceGeneration,
                     resumeGeneration: recovery.resumeGeneration,
                     attemptID: recovery.attemptID,
-                    mpvLoadToken: mounted?.token)
+                    mpvLoadToken: token)
             }
             DiagnosticsLog.log(
                 "playback",
@@ -6290,7 +6675,8 @@ struct PlayerScreen: View {
     private func rememberAcceptedSeriesChoice() {
         guard let key = seriesStickyKey else { return }
         if let choice = manualSourceToRemember, currentPickWasExplicit {
-            SeriesSourceSticky.record(seriesKey: key, addon: choice.addon, bingeGroup: choice.bingeGroup)
+            SeriesSourceSticky.record(seriesKey: key, addon: choice.addon, bingeGroup: choice.bingeGroup,
+                                      resolution: (curHint ?? recordQualityText).flatMap(StreamRanking.knownResolution))
             manualSourceToRemember = nil
             invalidatePreparedEpisode(reason: "accepted manual source")
         }
@@ -6299,6 +6685,9 @@ struct PlayerScreen: View {
             appliedAutoTracks = true
             autoSelectTracks()
         }
+        // Language codes only: which audio the loaded file offers and which one playback selected.
+        let loadedAudio = coordinator.player?.tracks(ofType: "audio") ?? []
+        DiagnosticsLog.log("binge", "audio inventory=\(loadedAudio.map { $0.lang.isEmpty ? "?" : $0.lang }) selected=\(loadedAudio.first(where: { $0.selected })?.lang ?? "-") desired=\(seriesStickyKey.flatMap { SeriesSourceSticky.currentSnapshot(for: $0).audioLanguage } ?? "-")")
         // Re-read the selected audio after automatic selection; subtitle rows never enter this path.
         if let selected = coordinator.player?.tracks(ofType: "audio").first(where: { $0.selected && $0.isSelectable }),
            pendingAutomaticAudioLanguage == nil || TrackSelector.matches(selected.lang, pendingAutomaticAudioLanguage ?? "") {
@@ -6506,6 +6895,7 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        watchedDwell.reset()
         engineSurfaceTransfer = nil
         #if !os(tvOS)
         skipDBPreviewing = false
@@ -6557,6 +6947,7 @@ struct PlayerScreen: View {
     /// earlier would let a rejected replacement duplicate its watched/auto-add/progress side effects or undo
     /// the viewer's Watch Credits choice.
     private func resetRuntimeForIssuedEpisode() {
+        watchedDwell.reset()
         #if !os(tvOS)
         skipDBPreviewing = false
         skipDBPreviewReturnPosition = nil
@@ -7384,6 +7775,9 @@ struct PlayerScreen: View {
             preparedEpisodeSourceOwner = sourceOwner
             preparedEpisodeChoice = choice
             DiagnosticsLog.log("binge", "next prepare ready target=\(VXProbeRedaction.identityToken(nextID)) host=\(result.url.host ?? "-") generation=\(generation)")
+            DiagnosticsLog.log("binge", "next prepare pick " + BingePickDiagnostics.describe(
+                result.stream, resolvedURL: result.url, season: result.meta.season, episode: result.meta.episode,
+                desiredAudio: choice?.audioLanguage, chosenBingeGroup: choice?.bingeGroup))
         }
     }
 
@@ -7974,7 +8368,7 @@ struct PlayerScreen: View {
 
     private var bufferingOverlay: some View {
         VStack(spacing: 14) {
-            ProgressView().controlSize(.large).tint(.white)
+            ProgressView().controlSize(.large).tint(Theme.Palette.accent)
             if let status = torrentStatus {   // live peer/byte progress during torrent warm-up
                 Text(status).font(.callout.weight(.medium)).foregroundStyle(.white.opacity(0.9))
             } else if reconnecting {
@@ -7982,6 +8376,7 @@ struct PlayerScreen: View {
             }
         }
         .transition(.opacity)
+        .allowsHitTesting(false)
     }
 
     private var loadErrorOverlay: some View {
@@ -8019,9 +8414,13 @@ struct PlayerScreen: View {
 
     private var controls: some View {
         ZStack {
-            LinearGradient(colors: [.black.opacity(0.55), .clear, .black.opacity(0.75)],
-                           startPoint: .top, endPoint: .bottom)
+            #if os(macOS)
+            VortXPlayerBackdrop(platform: .desktop)
                 .ignoresSafeArea().allowsHitTesting(false)
+            #else
+            VortXPlayerBackdrop(platform: .touch)
+                .ignoresSafeArea().allowsHitTesting(false)
+            #endif
 
             VStack(spacing: 0) {
                 topBar
@@ -8029,54 +8428,33 @@ struct PlayerScreen: View {
                 centerTransport
                 Spacer()
                 bottomBar
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear.preference(key: PlayerBottomBarHeightKey.self,
+                                                   value: geometry.size.height)
+                        }
+                    }
             }
         }
+        .onPreferenceChange(PlayerBottomBarHeightKey.self) { bottomChromeHeight = $0 }
     }
 
-    /// "4K · HDR · EAC3"-style line from the current video height + HDR + audio codec (tvOS parity #20),
-    /// shown under the title so the user can tell what they actually got. Recomputed on track/HDR change.
-    private func computeMetadataLine() -> String {
-        var parts: [String] = []
-        // Resolution is defined by WIDTH (4K is ~3840 wide at ANY aspect), so a 2.40:1 4K film (3840x1600)
-        // is NOT mislabeled "1440p" off its 1600 height. Width when known, else a 16:9 height estimate.
-        let res = videoWidth > 0 ? videoWidth : Int(Double(videoHeight) * 16.0 / 9.0)
-        switch res {
-        case 3000...:     parts.append("4K")
-        case 2200..<3000: parts.append("1440p")
-        case 1500..<2200: parts.append("1080p")
-        case 1000..<1500: parts.append("720p")
-        case 1..<1000:    if videoHeight > 0 { parts.append("\(videoHeight)p") }
-        default:          break
-        }
-        if isHDR { parts.append("HDR") }
-        if !audioCodec.isEmpty {
-            let channelSuffix = audioChannels > 0 ? " \(audioChannels)ch" : ""
-            parts.append("\(audioLabel(audioCodec))\(channelSuffix)")
-        }
-        return parts.joined(separator: "  ·  ")
+    /// Cache selected-media labels at the metadata boundary, never in the transport/body clock.
+    private func refreshMetadataFacts(loadToken: PlayerLoadToken?) {
+        guard let loadToken, loadToken == coordinator.player?.activeLoadToken,
+              callbackBelongsToCommittedMedia(loadToken) else { return }
+        metadataPills = (coordinator.player?.playbackMetadataFacts() ?? PlaybackMetadataFacts()).pills
     }
 
     /// Clear produced AVPlayer audio facts at every physical-load boundary. A following track-list event
     /// republishes truth from the newly mounted engine; until then the chrome must show no prior engine's
     /// codec or channel count, especially during an AVPlayer-to-libmpv demotion.
     private func clearCachedAudioOutputTruth() {
+        chapterInventoryOwner = nil
+        chapterInventoryCount = 0
         audioCodec = ""
         audioChannels = 0
-        metadataLine = computeMetadataLine()
-    }
-
-    private func audioLabel(_ c: String) -> String {
-        switch c.lowercased() {
-        case "eac3":                 return "EAC3"
-        case "ac3":                  return "AC3"
-        case "truehd":               return "TrueHD"
-        case "dts", "dts-hd", "dca": return "DTS"
-        case "aac":                  return "AAC"
-        case "flac":                 return "FLAC"
-        case "opus":                 return "Opus"
-        case "mp3":                  return "MP3"
-        default:                     return c.uppercased()
-        }
+        metadataPills = []
     }
 
     private var topBar: some View {
@@ -8090,7 +8468,7 @@ struct PlayerScreen: View {
     #if os(iOS)
     private var touchHeader: PlayerTouchHeader {
         PlayerTouchHeader(
-            title: curTitle, metadata: metadataLine,
+            title: curTitle, metadataPills: metadataPills,
             close: PlayerTouchIconButton(icon: "chevron.down", label: "Close player") { leavePlayback() },
             pictureInPicture: {
                 if let controller = coordinator.player as? AVPlayerEngineController {
@@ -8111,7 +8489,7 @@ struct PlayerScreen: View {
             options: PlayerTouchOptionsButton(presented: $touchOptionsVisible,
                 content: { touchOptionsPanel },
                 onVisibilityChanged: { visible in
-                    if visible { hideTask?.cancel() } else { scheduleHide() }
+                    if visible { hideTask?.cancel(); hideTask = nil } else { scheduleHide() }
                 })
         )
     }
@@ -8154,7 +8532,7 @@ struct PlayerScreen: View {
             icon: "gearshape") { openPanel(.playerSettings) })
         actions.append(PlayerTouchOptionAction(id: "external", title: "Play in another app",
             icon: "arrow.up.forward.app") {
-                hideTask?.cancel()
+                hideTask?.cancel(); hideTask = nil
                 showExternalChooser = true
             })
         return actions
@@ -8220,9 +8598,9 @@ struct PlayerScreen: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(curTitle).font(.headline.weight(.semibold)).foregroundStyle(.white)
                         .lineLimit(1).shadow(radius: 3)
-                    if !metadataLine.isEmpty {
-                        Text(metadataLine).font(.caption.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.75)).lineLimit(1).shadow(radius: 2)
+                    if !metadataPills.isEmpty {
+                        PlaybackMetadataPills(pills: metadataPills).font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.75)).shadow(radius: 2)
                     }
                 }
             }
@@ -8306,7 +8684,7 @@ struct PlayerScreen: View {
             volumeControl   // D5: in-player volume slider + mute (libmpv `volume` / AVPlayer.volume), persisted
             iconButton("gearshape", label: "Player settings") { openPanel(.playerSettings) }   // decoder toggle + playback info (tvOS parity #22)
             iconButton("arrow.up.forward.app", label: "Play in another app") {       // hand off to Infuse / VLC / Share
-                hideTask?.cancel()
+                hideTask?.cancel(); hideTask = nil
                 showExternalChooser = true
             }
         }
@@ -8338,9 +8716,17 @@ struct PlayerScreen: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(playerMuted ? "Unmute" : "Mute")
+            #if os(macOS)
+            // The macOS system slider ignores the app's tint and drew this in white; ours carries the accent.
+            VortXSlider(value: Binding(get: { playerMuted ? 0 : playerVolume },
+                                       set: { setPlayerVolume($0) }),
+                        range: 0...100, onEditingChanged: setVolumeEditing)
+                .frame(width: 92)
+                .accessibilityLabel("Volume")
+            #else
             Slider(value: Binding(get: { playerMuted ? 0 : playerVolume },
                                   set: { setPlayerVolume($0) }),
-                   in: 0...100) { editing in if editing { hideTask?.cancel() } else { scheduleHide() } }
+                   in: 0...100, onEditingChanged: setVolumeEditing)
                 .tint(Theme.Palette.accent)
                 #if os(iOS)
                 .frame(width: 204)   // the dedicated options popover keeps a usable continuous volume slider
@@ -8348,6 +8734,7 @@ struct PlayerScreen: View {
                 .frame(width: 92)
                 #endif
                 .accessibilityLabel("Volume")
+            #endif
         }
     }
 
@@ -8468,9 +8855,10 @@ struct PlayerScreen: View {
                 hoverPreviewTime: hoverPreviewTime,
                 onScrubChanged: { scrubThumbnails.show(time: $0) },
                 onEditingChanged: { editing in
+                    if editing { watchedDwell.reset() }
                     scrubbing = editing
                     if editing {
-                        scrubTarget = currentTime; hideTask?.cancel()
+                        scrubTarget = currentTime; hideTask?.cancel(); hideTask = nil
                         hoverPreviewTime = nil; hoverPreviewRatio = nil
                     } else {
                         let target = scrubTarget
@@ -8510,13 +8898,14 @@ struct PlayerScreen: View {
     }
 
     private var bottomTransportToolbar: PlayerTransportToolbar {
-        PlayerTransportToolbar(
+        let sourceGroups = currentSourceGroups
+        return PlayerTransportToolbar(
             speed: controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed), active: speed != 1.0) { openPanel(.speed) },
             subtitles: controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) },
             audio: audioTracks.isEmpty ? nil : controlButton("waveform", "Audio") { openPanel(.audio) },
             aspect: controlButton("aspectratio", "Aspect") { openPanel(.video) },
-            quality: hasMultipleQualities ? controlButton("4k.tv", "Quality") { openPanel(.quality) } : nil,
-            sources: hasAlternateSources ? controlButton("rectangle.stack", "Sources") { openPanel(.sources) } : nil,
+            quality: StreamRanking.hasMultipleResolutions(sourceGroups) ? controlButton("4k.tv", "Quality") { openPanel(.quality) } : nil,
+            sources: PlayerSourceAvailability.hasAlternates(sourceGroups, playable: { playableURL(for: $0) != nil }) ? controlButton("rectangle.stack", "Sources") { openPanel(.sources) } : nil,
             episodes: isEpisodePlaybackContext ? controlButton("list.bullet", "Episodes") { openPanel(.episodes) } : nil,
             chapters: hasChapters ? controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) } : nil,
             grab: controlButton("camera.viewfinder", "Grab") { grabFrame() },
@@ -8746,7 +9135,7 @@ struct PlayerScreen: View {
                 .skipDBTooltip("Preview: plays 2s before start, jumps to end")
 
                 if skipDBSubmitting {
-                    ProgressView().controlSize(.small).tint(.white).padding(.horizontal, 4)
+                    ProgressView().controlSize(.small).tint(Theme.Palette.accent).padding(.horizontal, 4)
                 } else if skipDBSubmitResult == true {
                     Label("Submitted!", systemImage: "checkmark.circle.fill")
                         .font(.caption.weight(.semibold))
@@ -8894,7 +9283,7 @@ struct PlayerScreen: View {
             let key = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
             skipDBSubmittedKeys.insert(key)
             skipDBSubmitResult = true
-            skipFetchKey = ""
+            invalidateSkipLookup()
             fetchSkipTimestamps()
         } catch {
             skipDBSubmitResult = false
@@ -9025,6 +9414,14 @@ struct PlayerScreen: View {
         upNextSuppressed = true
     }
 
+    private var skipSharesChrome: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
     private func skipPill(_ segment: SkipSegment) -> some View {
         let interactionMediaID = autoSkipMediaIdentity
         let interactionEpoch = autoSkipCountdown.epoch
@@ -9083,9 +9480,14 @@ struct PlayerScreen: View {
                         .accessibilityHint("Hides this prompt and will not auto-skip this segment again")
                     }
                 }
-                .padding(.trailing, 28).padding(.bottom, 40)
+                .padding(.trailing, 28)
+                .padding(.bottom, CGFloat(PlayerSkipChromePolicy.bottomPadding(
+                    controlsVisible: controlsVisible, sharesChrome: skipSharesChrome,
+                    chromeHeight: Double(bottomChromeHeight))))
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: controlsVisible)
+        .animation(.easeInOut(duration: 0.2), value: bottomChromeHeight)
         .transition(.opacity)
     }
 
@@ -9126,35 +9528,76 @@ struct PlayerScreen: View {
     }
     private func refreshSkipSegments() {
         let chapters = coordinator.player?.chapters() ?? []
+        chapterInventoryOwner = currentChapterInventoryOwner
+        chapterInventoryCount = chapters.count
         let chapterCandidates = SkipSegments.chapterCandidates(chapters: chapters, duration: duration)
         skipSegments = SegmentResolver.resolve(chapterCandidates + apiSkipCandidates, duration: duration)
         chapterFractions = ChapterMarks.fractions(chapters: chapters, duration: duration)
         updateCurrentSkip(at: currentTime)
     }
-    private func fetchSkipTimestamps() {
-        guard let m = curMeta, SkipTimestampService.supports(metaId: m.libraryId) else {
-            skipFetchTask?.cancel(); apiSkipCandidates = []; skipFetchKey = ""
-            AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
-            refreshSkipSegments(); return
-        }
-        let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
-        guard key != skipFetchKey else { return }
-        if key != skipFetchKey { apiSkipCandidates = [] }
-        skipFetchKey = key
-        AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
-        let dur = duration
+    private var currentSkipLookupOwner: SkipLookupRequestOwner<PlayerLoadToken>? {
+        guard let m = curMeta, pendingAdvance == nil,
+              SkipTimestampService.supports(metaId: m.libraryId),
+              let loadToken = coordinator.player?.activeLoadToken,
+              assetSanityAttempt.isAccepted(owner: loadToken) else { return nil }
+        return SkipLookupRequestOwner(metaId: m.libraryId, season: m.season, episode: m.episode,
+                                      durationSeconds: duration, sourceGeneration: sourceSwitchGeneration,
+                                      loadToken: loadToken)
+    }
+
+    private func invalidateSkipLookup() {
         skipFetchTask?.cancel()
+        skipFetchTask = nil
+        skipFetchOwner = nil
+        skipFetchAttempt = nil
+        apiSkipCandidates = []
+        #if !os(tvOS)
+        skipDBIntroEstimateMs = nil
+        #endif
+        refreshSkipSegments()
+    }
+
+    /// Called by the current duration event before its positive-duration side-effect guard.
+    private func retireUnusableSkipLookupDuration(loadToken: PlayerLoadToken?, durationSeconds: Double) {
+        guard let loadToken, loadToken == coordinator.player?.activeLoadToken,
+              pendingAdvance == nil, assetSanityAttempt.isAccepted(owner: loadToken),
+              SkipLookupRequestOwner<PlayerLoadToken>.usableMilliseconds(durationSeconds) == nil else { return }
+        invalidateSkipLookup()
+    }
+
+    private func fetchSkipTimestamps() {
+        AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
+        guard let owner = currentSkipLookupOwner else {
+            invalidateSkipLookup()
+            return
+        }
+        guard owner.shouldStart(replacing: skipFetchOwner,
+                                previousTaskIsCancelled: skipFetchTask?.isCancelled ?? true) else { return }
+        invalidateSkipLookup()
+        let attempt = UUID()
+        skipFetchOwner = owner
+        skipFetchAttempt = attempt
         skipFetchTask = Task { @MainActor in
-            let found = await SkipTimestampService.candidates(imdbId: m.libraryId, season: m.season,
-                                                              episode: m.episode, durationSeconds: dur)
-            guard !Task.isCancelled, skipFetchKey == key else { return }
+            var completed = false
+            defer {
+                // A rejected finished task is not a successful cached/coalesced request. Do not retire a successor.
+                if !completed, skipFetchAttempt == attempt { invalidateSkipLookup() }
+            }
+            let found = await SkipTimestampService.candidates(
+                imdbId: owner.metaId, season: owner.season, episode: owner.episode,
+                durationSeconds: owner.durationSeconds
+            )
+            guard skipFetchAttempt == attempt, skipFetchOwner == owner,
+                  owner.canPublish(current: currentSkipLookupOwner, isCancelled: Task.isCancelled) else { return }
             apiSkipCandidates = found
             refreshSkipSegments()
             #if !os(tvOS)
-            // Typical-intro-length hint (from the optional skipdb.tv read), surfaced as the editor's
-            // "magic" suggested end. Keyed like the skipDB cache entry.
-            skipDBIntroEstimateMs = await SkipTimestampStore.shared.introEstimate(for: "skipdb:\(key):\(Int(dur / 10) * 10)")
+            let estimate = await SkipTimestampStore.shared.introEstimate(for: owner.skipDBHintCacheKey)
+            guard skipFetchAttempt == attempt, skipFetchOwner == owner,
+                  owner.canPublish(current: currentSkipLookupOwner, isCancelled: Task.isCancelled) else { return }
+            skipDBIntroEstimateMs = estimate
             #endif
+            completed = true
         }
     }
 
@@ -10298,7 +10741,7 @@ struct PlayerScreen: View {
 
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
-        currentSourceGroups.reduce(0) { $0 + $1.streams.filter { playableURL(for: $0) != nil }.count } > 1
+        PlayerSourceAvailability.hasAlternates(currentSourceGroups, playable: { playableURL(for: $0) != nil })
     }
 
     /// The stream currently on screen: the loaded source whose playable URL matches what mpv is playing.
@@ -10339,16 +10782,40 @@ struct PlayerScreen: View {
         return out
     }
 
+    /// Whether "Copy all source links" is worth offering: stops at the second distinct link instead of
+    /// building the whole de-duplicated list, which the dialog only needs once the action is tapped.
+    private var hasMultipleSourceLinks: Bool {
+        var first: String?
+        for group in currentSourceGroups {
+            for stream in group.streams {
+                guard let link = playableURL(for: stream)?.absoluteString else { continue }
+                if let first, first != link { return true }
+                if first == nil { first = link }
+            }
+        }
+        return false
+    }
+
     /// More than one distinct resolution is available for the current title, so the Quality picker is worth
     /// showing (one tap to drop 4K -> 1080p -> 720p, or climb back up, at the current position).
     private var hasMultipleQualities: Bool {
-        StreamRanking.resolutionOptions(currentSourceGroups).count > 1
+        StreamRanking.hasMultipleResolutions(currentSourceGroups)
     }
 
     /// The file carries embedded chapter markers (more than the implicit single whole-file chapter), so the
-    /// Chapters navigator is worth offering. Reads mpv's chapter-list, the same data the skip-intro detector
-    /// already uses.
-    private var hasChapters: Bool { (coordinator.player?.chapters().count ?? 0) > 1 }
+    /// Chapters navigator is worth offering. The inventory is captured by the existing track/duration
+    /// refresh, never synchronously re-read from libmpv for each chrome/body evaluation.
+    private var hasChapters: Bool {
+        guard let owner = currentChapterInventoryOwner else { return false }
+        return chapterInventoryOwner == owner && chapterInventoryCount > 1
+    }
+
+    private var currentChapterInventoryOwner: PlayerChapterInventoryOwner? {
+        guard let player = coordinator.player, let loadToken = player.activeLoadToken else { return nil }
+        return PlayerChapterInventoryOwner(engine: ObjectIdentifier(player), loadToken: loadToken,
+            itemGeneration: (player as? AVPlayerEngineController)?.currentItemGeneration,
+            sourceGeneration: sourceSwitchGeneration)
+    }
 
     /// Up to a capped number of loaded sources, grouped by add-on in their existing priority order, so
     /// switching is quick. The full (sometimes thousands-long) list stays on the detail page; capping
@@ -10472,7 +10939,7 @@ struct PlayerScreen: View {
     }
 
     private func openPanel(_ p: Panel) {
-        hideTask?.cancel()
+        hideTask?.cancel(); hideTask = nil
         refreshTracks()
         if p == .info { infoRows = coordinator.player?.playbackStats() ?? [] }
         // Late add-on subtitle recovery: if the start-of-playback fetch raced an empty add-on collection (or
@@ -10505,7 +10972,10 @@ struct PlayerScreen: View {
         cancelDirectResumeInventoryRefresh()
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer leaving immediately
         invalidateEpisodeWorkForExit()
-        if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive, duration > 0,
+        // Dismissing/rewinding Continue Watching requires proven completion, not
+        // a provisional duration or a scrub target that happens to exceed 90%.
+        if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive,
+           markedWatched, duration.isFinite, duration > 0, currentTime.isFinite,
            currentTime / duration >= 0.9, let m = curMeta {
             if !m.usesSeriesLifecycle, terminalRewindGate.issueTerminalRewind() {
                 core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)
@@ -10513,7 +10983,7 @@ struct PlayerScreen: View {
         }
         invalidateLocalTrickplayCapture()
         cancelAssetSanityObservationDeadline()
-        hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
+        hideTask?.cancel(); hideTask = nil; loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         cancelPostFrameResumeSeekWatchdog()
         #if os(iOS) || os(macOS)
@@ -10934,7 +11404,7 @@ struct PlayerScreen: View {
         noteInteraction()            // a tap is presence: re-arm the "Still watching?" idle guard
         if panel != nil { return }   // a tap behind an open panel shouldn't flip the bar; the scrim handles dismissal
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
-        if controlsVisible { scheduleHide() } else { hideTask?.cancel() }
+        if controlsVisible { scheduleHide() } else { hideTask?.cancel(); hideTask = nil }
     }
 
     // MARK: - Player Lock (touch-lock)
@@ -10942,7 +11412,7 @@ struct PlayerScreen: View {
     /// Engage the lock from the top bar: chrome drops immediately, the auto-hide timer stands down, and
     /// a brief unlock-chip flash teaches where the exit is.
     private func engageLock() {
-        hideTask?.cancel()
+        hideTask?.cancel(); hideTask = nil
         withAnimation(.easeInOut(duration: 0.2)) {
             isLocked = true
             controlsVisible = false
@@ -10971,17 +11441,68 @@ struct PlayerScreen: View {
         }
         scheduleHide()
     }
+    /// Engine lifecycle changes do not count as viewer presence. They only resume a visible bar's
+    /// deadline once its first frame arrives or the last interaction/paused/dialog hold ends.
+    private var controlsAutoHideEligible: Bool {
+        hasStartedPlaying && !isPaused && !scrubbing && !editingVolume && panel == nil &&
+        !touchOptionsVisible && !skipEditActive && !isLocked && !loadFailed && !playbackExited &&
+        !showExternalChooser && !showShare && grabbedFrame == nil &&
+        !externalLinkDead && !subtitleLoadFailed && !stillWatchingPrompt
+    }
+
+    private func refreshControlsAutoHide() {
+        hideTask?.cancel(); hideTask = nil
+        guard controlsVisible, controlsAutoHideEligible else { return }
+        controlsHideClock.deadline = ProcessInfo.processInfo.systemUptime + 4
+        startControlsHideIfNeeded()
+    }
+
+    private func setVolumeEditing(_ editing: Bool) {
+        editingVolume = editing
+        if editing {
+            hideTask?.cancel(); hideTask = nil
+        } else {
+            scheduleHide()
+        }
+    }
+
     private func scheduleHide() {
-        noteInteraction()            // every control interaction routes through here: re-arm the idle guard
-        hideTask?.cancel()
+        noteInteraction()            // actual input re-arms the idle guard; engine changes do not
+        guard !isLocked, !playbackExited else { return }
         controlsVisible = true
+        controlsHideClock.deadline = ProcessInfo.processInfo.systemUptime + 4
+        startControlsHideIfNeeded()
+    }
+
+    private func macPointerMoved() {
+        guard !isLocked, !playbackExited else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        controlsHideClock.deadline = now + 4
+        if !controlsVisible { controlsVisible = true }
+        // Presence affects the parent's idle guard; sample it at most once a second, while every
+        // pointer event extends the non-observed hide deadline without causing a body refresh.
+        if now - controlsHideClock.lastPointerPresence >= 1 {
+            controlsHideClock.lastPointerPresence = now
+            noteInteraction()
+        }
+        startControlsHideIfNeeded()
+    }
+
+    /// Mouse movement only extends a deadline: one sleeper owns a visible bar instead of creating
+    /// a task for every pointer event. Cancellation is checked before an old sleeper can touch state.
+    private func startControlsHideIfNeeded() {
+        guard hideTask == nil, controlsVisible, controlsAutoHideEligible else { return }
         hideTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(4))
-            // Never auto-hide before the first frame arrives: a stuck pre-start load must KEEP its
-            // controls (and their close button) on screen so the player is never a trap. Also hold
-            // while scrubbing, a panel is open, or paused.
-            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !touchOptionsVisible, !isPaused, !skipEditActive else { return }
-            withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
+            while !Task.isCancelled {
+                let remaining = max(0, controlsHideClock.deadline - ProcessInfo.processInfo.systemUptime)
+                if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+                guard !Task.isCancelled else { return }
+                guard controlsAutoHideEligible else { hideTask = nil; return }
+                if ProcessInfo.processInfo.systemUptime < controlsHideClock.deadline { continue }
+                withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
+                hideTask = nil
+                return
+            }
         }
     }
 
@@ -11027,7 +11548,7 @@ struct PlayerScreen: View {
         // Always pause whatever is on screen so the prompt never plays over a running video (a boundary whose
         // file already ended pauses a no-op; a next episode that already began is stopped). Continue resumes.
         if !isPaused { viewerPause() }
-        hideTask?.cancel()
+        hideTask?.cancel(); hideTask = nil
         withAnimation(.easeInOut(duration: 0.2)) { stillWatchingPrompt = true }
     }
 
@@ -11097,3 +11618,15 @@ private struct AirPlayPickerRepresentable: UIViewRepresentable {
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
 #endif
+
+private extension View {
+    /// Mac: the window buttons show and hide with the player's controls (MacPlayerHost.chromeVisible).
+    @ViewBuilder func macPlayerChromeVisible(_ visible: Bool) -> some View {
+        #if os(macOS)
+        self.onAppear { MacPlayerHost.shared.chromeVisible = visible }
+            .onChange(of: visible) { _, now in MacPlayerHost.shared.chromeVisible = now }
+        #else
+        self
+        #endif
+    }
+}

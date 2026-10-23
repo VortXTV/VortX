@@ -1,122 +1,42 @@
-# Gradle version catalog (S01 gradle hygiene). Single source of truth for every dependency +
-# plugin coordinate the android/ build uses; module build.gradle.kts files reference `libs.*`
-# instead of hardcoded strings so a version lives in exactly one place.
-#
-# Version choices (documented here, not just in code review history, per the house rule that
-# comments carry contracts):
-#   - agp: 8.10.0 is the FLOOR that officially supports compileSdk/targetSdk 36 (Android 16) --
-#     AGP's own release notes list API 35 as the max for 8.9.x and API 36 as the max starting
-#     8.10.0. The prior pin (8.5.2) only worked at compileSdk 36 via the
-#     android.suppressUnsupportedCompileSdk escape hatch in gradle.properties (removed in this same
-#     commit). AGP 8.10.0 requires Gradle >= 8.11.1 (its documented minimum/default), hence the
-#     wrapper pin below.
-#   - kotlin: left at 2.2.10, UNCHANGED. Nothing about the targetSdk 36 / AGP bump requires a newer
-#     Kotlin, and 2.2.10 is already the floor dev.jdtech.mpv:libmpv needs to read its 2.2.0-versioned
-#     .kotlin_module metadata (see app/build.gradle.kts). The Compose BOM below was picked to stay
-#     inside Kotlin 2.2.x's compiler window (see composeBom note) specifically so this pin could stay
-#     put -- bumping Kotlin further is left to a session that actually needs it (Kotlin's metadata
-#     reader is forward-only: an older compiler cannot read a library built by a newer one, the same
-#     failure class the libmpv comment describes).
-#   - composeBom: 2025.09.01. Compose 1.9 went stable with the August 2025 BOM; September's BOM is
-#     the first full-month release after that line settled, and both predate Kotlin 2.3.0 (released
-#     2025-12-16), so a 2.2.10 compiler can consume it without a metadata-version mismatch. This is a
-#     deliberate margin choice over chasing the newest BOM on the day of this commit -- the newest BOM
-#     as of authoring is already several Kotlin minors ahead of the pinned 2.2.10 compiler, while
-#     2025.09.01 built + linted clean in the verified S01 build (SDK provisioned in-sandbox; see the
-#     S01 report). Bump alongside a coordinated Kotlin bump later, don't bump one without the other.
-#   - Everything else pinned here (activity-compose, core-ktx, core-splashscreen, lifecycle,
-#     security-crypto) is chosen the same way: a genuinely current stable release that predates
-#     Kotlin 2.3.0, not the latest-as-of-today release, for the same forward-metadata-compat reason.
-#   - media3 and kotlinx-coroutines-android are carried over UNCHANGED from the pre-S01 pins; nothing
-#     in this session's scope required moving them.
-#   - coil: 3.3.0 (S03 engine bring-up, image loading for the real catalog posters). Picked for the
-#     SAME forward-metadata-compat reason as composeBom above: Coil's changelog records 3.3.0 as
-#     "Update Kotlin to 2.2.0" (released 2025-07-22), the last Coil3 line built against the 2.2.x
-#     compiler family before 3.4.0 jumped to Kotlin 2.3.10 -- a 2.2.10 compiler cannot read that
-#     newer metadata (the same failure class documented for composeBom/kotlin above), so 3.3.0 is the
-#     newest Coil that stays inside our pinned window. `coil-compose` + `coil-network-okhttp` (Coil3
-#     split HTTP fetching out of core; okhttp is the documented default engine) are both this version.
+# One Android version catalog for both app flavors and :mpv-seam.
+# Coordinated stable candidate: AGP built-in Kotlin + matching Compose compiler plugin.
+# Gradle 9.7.0 is within KGP 2.4.21's tested Gradle range; AGP 9.4.1 is newer than
+# KGP's published fully-tested AGP maximum (9.3.1), so the hosted composition gate is required.
+# compileSdk 37 satisfies current Core/Lifecycle AAR metadata; targetSdk 36 / minSdk 26 stay fixed.
+# Media3 1.11.1 is already selected independently; this wave does not change it.
+# The libmpv AAR is still full-only. Updating the source-built seam's NDK does not rebuild its
+# precompiled FFmpeg/mbedTLS payload. Security Crypto 1.1.0 is deprecated but remains the latest
+# stable compatibility reader; replacing encrypted preferences requires a separate data migration.
+# Tink remains the explicit X25519 dependency used for byte-compatible device pairing. Its raw
+# subtle.X25519 API is upstream @Alpha; the 1.24.0 candidate must pass existing pairing vectors
+# and encrypted-preference compatibility/readback before shipping, not just dependency resolution.
+# Cast/TV/Coil/Work/OkHttp remain plain dependencies in both flavors, never a GPL boundary change.
 
 [versions]
-agp = "8.10.0"
-kotlin = "2.2.10"
-composeBom = "2025.09.01"
-activityCompose = "1.12.0"
-coreKtx = "1.17.0"
-coreSplashscreen = "1.0.1"
-lifecycle = "2.9.4"
-coroutines = "1.8.1"
-media3 = "1.9.4"
+agp = "9.4.1"
+kotlin = "2.4.21"
+composeBom = "2026.09.00"
+activityCompose = "1.13.0"
+coreKtx = "1.19.1"
+coreSplashscreen = "1.2.0"
+lifecycle = "2.11.0"
+coroutines = "1.11.0"
+media3 = "1.11.1"
 securityCrypto = "1.1.0"
-# Tink: pinned to the exact version security-crypto 1.1.0 already resolves transitively, so adding it as
-# an EXPLICIT dependency introduces no new artifact/version (offline-safe) and no resolution conflict. Used
-# ONLY for `com.google.crypto.tink.subtle.X25519` (raw RFC 7748 scalar mult) in the E2E-account device
-# pairing crypto (com.vortx.android.sync.VortXPairingCrypto) -- it produces the identical 32-byte shared
-# secret as the Apple app's CryptoKit Curve25519 and the webapp's WebCrypto X25519, which is the byte-match
-# the pairing handoff depends on. Everything else in the sync crypto (PBKDF2, AES-GCM, HKDF) is hand-rolled
-# over the JDK's javax.crypto, so this is the only crypto library the account crypto pulls.
-tink = "1.8.0"
+tink = "1.24.0"
 mpvLibmpv = "1.0.0"
-# androidx.tv Compose-for-TV (S13 Android TV 10-foot slice). 1.0.0 is the FIRST stable release of the
-# Compose-for-TV library and is pinned deliberately on the SAME forward-metadata-compat rule the whole
-# catalog follows (see composeBom/coil/work notes above): its POM declares kotlin-stdlib 1.8.22, so its
-# .kotlin_module metadata is Kotlin 1.8 -- read with a huge margin by the pinned 2.2.10 compiler (the
-# forward-only reader rule this file keeps flagging), where the newer 1.1.0 line would be chasing the
-# tip for no gain here. Its transitive Compose deps are declared at 1.6.8 but resolve UP to the
-# compose-bom 2025.09.01 (Compose 1.9) versions the app already pulls -- the BOM constrains every
-# androidx.compose.* coordinate, and tv-material's 1.6-compiled bytecode runs against 1.9 unchanged
-# (Compose is backward-compatible within its stable API). tv-material is NOT a licensing-boundary
-# dependency (it carries no GPL native code), so it is a plain `implementation` in BOTH flavors.
-tvMaterial = "1.0.0"
-# androidx.tvprovider (TV-2 Android TV "Play Next" / Watch Next row). 1.0.0 is the stable release of the
-# TvProvider support library; it is a plain Java/AndroidX artifact with no Kotlin metadata, so the
-# forward-metadata-compat rule the rest of this file follows does not even apply. It supplies
-# TvContractCompat + WatchNextProgram, the system-TvProvider bridge that publishes Continue Watching onto
-# the Android TV home "Play Next" row. Carries no GPL native code, so it is a plain `implementation` in
-# BOTH flavors (the row is available on the sideloaded `full` build and any future Play build alike).
-tvProvider = "1.0.0"
-coil = "3.3.0"
-# WorkManager: the offline-downloads transport (com.vortx.android.downloads.DownloadWorker). It is the Android
-# mechanism with the contract Apple gets from a `.background` URLSession -- work persisted in its own database and
-# re-run in a fresh process after the app dies -- which is why the port uses it rather than android.app.DownloadManager
-# (no pause/resume, no per-record control) or a Media3 DownloadService (an opaque cache, incompatible with this
-# subsystem's <id>.<ext> flat file + index.json record schema).
-#
-# 2.10.0 (Dec 2024) is picked on the SAME forward-metadata-compat rule as composeBom/coil above, NOT because it is the
-# newest: the line has since moved to 2.11.x, but 2.10.0 predates Kotlin 2.3.0 (2025-12-16) by a full year, so the
-# pinned 2.2.10 compiler can read its .kotlin_module metadata with a wide margin. It carries everything this port
-# needs (CoroutineWorker, setForeground/ForegroundInfo, unique work). Bump alongside a coordinated Kotlin bump.
-work = "2.10.0"
-# OkHttp: the account realtime-sync WebSocket transport (com.vortx.android.sync.VortXSyncRealtime).
-# HttpURLConnection (which the sync manager's plain HTTP helper uses) has no WebSocket support, and
-# OkHttp is ALREADY on the runtime classpath -- coil-network-okhttp 3.3.0 resolves okhttp 4.12.0
-# transitively as Coil3's documented default engine -- so this explicit pin is the tink pattern above:
-# it introduces no new artifact/version (offline-safe) and no resolution conflict, it only makes the
-# dependency first-party instead of leaning on a transitive. 4.12.0 also predates Kotlin 2.3.0 (it is
-# built on Kotlin 1.8/1.9-era metadata), so the pinned 2.2.10 compiler reads it with wide margin.
-okhttp = "4.12.0"
-# Google Cast (the CAST lane: send the current stream to a Cast receiver -- Android's AirPlay equivalent).
-# play-services-cast-framework is a plain Google/AndroidX AAR with NO GPL native code (unlike libmpv), so
-# it is a licensing-boundary-SAFE plain `implementation` carried in BOTH the `full` and `play` flavors and
-# introduces no libmpv into the Play build. It is a Java library with no Kotlin metadata, so the
-# forward-metadata-compat rule the rest of this catalog follows (composeBom/coil/work) does not apply -- any
-# version is compiler-safe against the pinned Kotlin 2.2.10 (same as tvProvider/zxing). 21.5.0 is a stable,
-# widely-deployed release chosen over the newest 22.x to keep its transitive AndroidX floor (appcompat,
-# mediarouter, fragment) conservative; targetSdk 36 / minSdk 26 are well within its support window.
-playServicesCast = "21.5.0"
-# androidx.mediarouter: the Cast device-discovery + route-selection API the custom Compose device chooser
-# uses (this app is AppCompat-free and Compose-only, so it drives MediaRouter directly instead of the SDK's
-# View-based MediaRouteButton/chooser dialog, which need an AppCompat/MediaRouter theme this app does not
-# carry). play-services-cast-framework 21.5.0 already resolves mediarouter transitively (1.6.0-beta01 floor);
-# it is declared EXPLICITLY here because cast code imports androidx.mediarouter.media.* directly (the
-# first-party-declares-its-direct-deps rule the okhttp/tink pins follow), pinned to the stable 1.7.0 (>= the
-# transitive floor, so Gradle selects it with no downgrade). A plain Java/AndroidX artifact, no Kotlin
-# metadata, so it is compiler-safe like the cast framework above.
-mediarouter = "1.7.0"
+tvMaterial = "1.1.0"
+tvProvider = "1.1.0"
+coil = "3.6.3"
+work = "2.12.0"
+okhttp = "5.5.0"
+smbj = "0.15.0"
+playServicesCast = "23.0.0"
+mediarouter = "1.8.1"
 junit = "4.13.2"
-androidxTestRunner = "1.6.2"
-androidxTestExtJunit = "1.2.1"
-jsonJvm = "20240303"
+androidxTestRunner = "1.7.0"
+androidxTestExtJunit = "1.3.0"
+jsonJvm = "20260814"
 zxing = "3.5.4"
 
 [libraries]
@@ -152,6 +72,7 @@ coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref 
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
 
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+smbj = { group = "com.hierynomus", name = "smbj", version.ref = "smbj" }
 
 # Google Cast lane (see the playServicesCast / mediarouter version notes above). Both are plain
 # `implementation` in BOTH flavors -- no GPL native code, so the `play` build stays GPL-clean.
@@ -170,5 +91,4 @@ android-application = { id = "com.android.application", version.ref = "agp" }
 # The :mpv-seam library module (W1-B source-built libmpv JNI seam) rides the SAME AGP pin as the
 # app; no separate version, one Gradle/AGP per build.
 android-library = { id = "com.android.library", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

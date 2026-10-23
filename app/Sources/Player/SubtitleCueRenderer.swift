@@ -8,8 +8,14 @@ import UIKit
 import AppKit
 #endif
 
+/// One ceiling for downloaded bytes, bounded local reads, and decoded subtitle parser input.
+enum SubtitleFileBudget {
+    nonisolated static let maximumBytes = 8 * 1024 * 1024
+    nonisolated static let maximumScalars = maximumBytes
+}
+
 /// One timed subtitle cue: the [start, end] window (media seconds) plus the already-cleaned display text.
-struct SubtitleCue {
+struct SubtitleCue: Sendable {
     let start: TimeInterval
     let end: TimeInterval
     let text: String
@@ -27,13 +33,13 @@ struct SubtitleCue {
 final class SubtitleCueRenderer {
     /// These are parser and renderer budgets, not format preferences.  They keep a malicious or accidentally
     /// enormous community subtitle from turning one foreground playback tick into unbounded allocation/work.
-    static let maximumInputBytes = 2 * 1024 * 1024
-    static let maximumInputScalars = 2 * 1024 * 1024
-    static let maximumCueCount = 12_000
-    static let maximumCueTextScalars = 4_096
-    static let maximumTimelineSeconds: TimeInterval = 7 * 24 * 60 * 60
-    static let maximumCueDuration: TimeInterval = 120
-    static let maximumSimultaneousCues = 3
+    nonisolated static let maximumInputBytes = SubtitleFileBudget.maximumBytes
+    nonisolated static let maximumInputScalars = SubtitleFileBudget.maximumScalars
+    nonisolated static let maximumCueCount = 12_000
+    nonisolated static let maximumCueTextScalars = 4_096
+    nonisolated static let maximumTimelineSeconds: TimeInterval = 7 * 24 * 60 * 60
+    nonisolated static let maximumCueDuration: TimeInterval = 120
+    nonisolated static let maximumSimultaneousCues = 3
     static let maximumManualOffset: TimeInterval = 120
     /// Active cues, sorted by start. Empty when no external sub is loaded (the overlay then shows nothing).
     private(set) var cues: [SubtitleCue] = []
@@ -97,14 +103,14 @@ final class SubtitleCueRenderer {
 
     /// Parse SRT or WebVTT bytes into cues. Format is detected from content (a leading `WEBVTT` header ⇒ VTT),
     /// but the timestamp grammar is unified so a mislabeled file still parses. Returns [] on undecodable data.
-    static func parse(data: Data) -> [SubtitleCue] {
+    nonisolated static func parse(data: Data) -> [SubtitleCue] {
         guard !data.isEmpty, data.count <= maximumInputBytes, let text = decodeText(data) else { return [] }
         return parse(text: text)
     }
 
     /// Parse subtitle TEXT (already decoded) into cues. Robust to CRLF/CR, BOM, WEBVTT headers, NOTE/STYLE/REGION
     /// blocks, numeric SRT indices, and cue identifiers; malformed blocks are skipped, never fatal.
-    static func parse(text raw: String) -> [SubtitleCue] {
+    nonisolated static func parse(text raw: String) -> [SubtitleCue] {
         guard raw.unicodeScalars.count <= maximumInputScalars else { return [] }
         // Normalize newlines and strip a leading BOM so line splitting is predictable across providers.
         var text = raw
@@ -156,7 +162,7 @@ final class SubtitleCueRenderer {
     /// `Dialogue:` line is one cue. Styling (`{\...}` override tags, `\N` line breaks) is FLATTENED to plain
     /// text, since the overlay is not libass. No `[Events]` / no valid Dialogue rows yields [] (the caller then
     /// falls through to the SRT/VTT parser). Robust to a missing Format line via the standard v4+ defaults.
-    private static func parseASS(text: String) -> [SubtitleCue] {
+    nonisolated private static func parseASS(text: String) -> [SubtitleCue] {
         var startIdx = 1, endIdx = 2, textIdx = 9, fieldCount = 10   // ASS v4+ Dialogue defaults
         var inEvents = false
         var cues: [SubtitleCue] = []
@@ -198,7 +204,7 @@ final class SubtitleCueRenderer {
     /// one bottom-centre surface; retaining more does not improve rendering and makes later clock lookups
     /// attacker-amplifiable.  Sorting is the one O(n log n) step; the sweep itself is O(n), unlike repeatedly
     /// scanning all overlapping prior cues.
-    private static func boundedCues(_ raw: [SubtitleCue]) -> [SubtitleCue] {
+    nonisolated private static func boundedCues(_ raw: [SubtitleCue]) -> [SubtitleCue] {
         let ordered = raw.filter {
             $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end > $0.start
                 && $0.end - $0.start <= maximumCueDuration && $0.end <= maximumTimelineSeconds
@@ -222,7 +228,7 @@ final class SubtitleCueRenderer {
     /// Flatten one ASS Dialogue Text field to plain display text: convert `\N` / `\n` hard breaks to newlines
     /// and `\h` to a space, then reuse `cleanText` to strip `{\...}` override blocks, any inline tags, and HTML
     /// entities. (`parseTimestamp` already accepts the `H:MM:SS.cc` ASS time form.)
-    private static func cleanASSText(_ input: String) -> String {
+    nonisolated private static func cleanASSText(_ input: String) -> String {
         var out = input
         out = out.replacingOccurrences(of: "\\N", with: "\n")
         out = out.replacingOccurrences(of: "\\n", with: "\n")
@@ -244,7 +250,7 @@ final class SubtitleCueRenderer {
     /// Ordered most-specific first so the longest metadata run is consumed. The tail shapes are
     /// individually loose, which is why matching is NEVER per-line alone: the per-file vote below has to
     /// pass before anything is stripped.
-    private static let leakedASSPrefixPatterns = [
+    nonisolated private static let leakedASSPrefixPatterns = [
         // Full script Dialogue row (Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,): the two
         // H:MM:SS.cc timestamps make it unmistakable.
         #"^(?:Dialogue:\s*)?\d+,\d+:\d{2}:\d{2}[.:]\d{1,3},\d+:\d{2}:\d{2}[.:]\d{1,3},[^,\n]*,[^,\n]*,\d+,\d+,\d+,[^,\n]*,"#,
@@ -264,7 +270,7 @@ final class SubtitleCueRenderer {
     ]
 
     /// The range of a leaked ASS metadata prefix at the start of `line`, or nil.
-    private static func leakedASSPrefixRange(in line: String) -> Range<String.Index>? {
+    nonisolated private static func leakedASSPrefixRange(in line: String) -> Range<String.Index>? {
         for pattern in leakedASSPrefixPatterns {
             if let r = line.range(of: pattern, options: .regularExpression), r.lowerBound == line.startIndex {
                 return r
@@ -284,7 +290,7 @@ final class SubtitleCueRenderer {
     /// `parse`, the single parser behind `addExternalSubtitle`, so the auto-selected and manually
     /// re-selected paths render identically. Fail-soft: only prefixes are removed; a cue left with no
     /// text is dropped (it carried nothing but metadata).
-    private static func stripLeakedASSMetadata(from cues: [SubtitleCue]) -> [SubtitleCue] {
+    nonisolated private static func stripLeakedASSMetadata(from cues: [SubtitleCue]) -> [SubtitleCue] {
         guard !cues.isEmpty else { return cues }
         var totalLines = 0
         var leakedLines = 0
@@ -309,7 +315,7 @@ final class SubtitleCueRenderer {
 
     /// Parse a timing line "HH:MM:SS,mmm --> HH:MM:SS,mmm" (SRT) or "HH:MM:SS.mmm --> HH:MM:SS.mmm ..." (VTT,
     /// possibly with trailing cue settings like `line:90% align:middle` which are ignored). Hours are optional.
-    private static func parseTiming(_ line: String) -> (TimeInterval, TimeInterval)? {
+    nonisolated private static func parseTiming(_ line: String) -> (TimeInterval, TimeInterval)? {
         guard let arrowRange = line.range(of: "-->") else { return nil }
         let lhs = String(line[..<arrowRange.lowerBound])
         // The end side may carry cue settings after a space; take the first token only.
@@ -321,7 +327,7 @@ final class SubtitleCueRenderer {
 
     /// Parse one timestamp: `[HH:]MM:SS[,.]mmm`. Accepts both `,` (SRT) and `.` (VTT) as the millisecond
     /// separator, and 2- or 3-digit fractional parts. Returns nil on garbage.
-    private static func parseTimestamp(_ raw: String) -> TimeInterval? {
+    nonisolated private static func parseTimestamp(_ raw: String) -> TimeInterval? {
         let s = raw.trimmingCharacters(in: .whitespaces)
         guard !s.isEmpty else { return nil }
         // Separate the fractional part on the last ',' or '.'.
@@ -348,7 +354,7 @@ final class SubtitleCueRenderer {
     /// Strip inline markup so the drawn text is clean: SRT/VTT tags (`<i>`, `<b>`, `<font ...>`, `<c.foo>`),
     /// ASS override blocks (`{\an8}`), and HTML entities. libmpv/libass would style these; our overlay renders
     /// plain text, so we remove the tags rather than half-render them. Leaves the line breaks intact.
-    private static func cleanText(_ input: String) -> String {
+    nonisolated private static func cleanText(_ input: String) -> String {
         var out = input
         // Remove ASS/SSA override blocks: {\an8}, {\i1}, etc.
         out = out.replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
@@ -366,7 +372,7 @@ final class SubtitleCueRenderer {
 
     /// Decode subtitle bytes to a String. Tries UTF-8, then UTF-16, then Latin-1 (common for older SRT files),
     /// so a non-UTF-8 provider file still renders instead of failing silently.
-    private static func decodeText(_ data: Data) -> String? {
+    nonisolated private static func decodeText(_ data: Data) -> String? {
         if let s = String(data: data, encoding: .utf8) { return s }
         if let s = String(data: data, encoding: .utf16) { return s }
         if let s = String(data: data, encoding: .isoLatin1) { return s }
@@ -387,7 +393,7 @@ enum SubtitleFileFetcher {
     /// Raised from 2 MiB: long films ship SDH-heavy SRT / styled ASS well past 2 MiB, and the old cap made
     /// those subtitle downloads fail exactly on big files. Still bounded so a hostile add-on cannot make the
     /// player parse unbounded input.
-    private static let maximumBytes = 8 * 1024 * 1024
+    private static let maximumBytes = SubtitleFileBudget.maximumBytes
     private static let maximumHeaderBytes = 32 * 1024
 
     /// Fetch the subtitle bytes for `url`, calling `done` on a background thread with the data (or nil on
@@ -395,12 +401,28 @@ enum SubtitleFileFetcher {
     /// timeout + one retry.
     static func fetch(_ url: URL, timeout: TimeInterval, done: @escaping @Sendable (Data?) -> Void) {
         if url.isFileURL {
-            guard let data = try? Data(contentsOf: url), data.count <= maximumBytes else { done(nil); return }
-            done(data)
+            // Community subtitles are already local, but reading them can still block the UI actor.
+            // Read at most the shared ceiling plus one sentinel byte before accepting the file.
+            Task.detached(priority: .utility) { done(readLocalFile(url)) }
             return
         }
         guard SubtitleRemoteURLPolicy.accepts(url) else { done(nil); return }
         download(url, timeout: timeout, retriesLeft: 1, done: done)
+    }
+
+    private static func readLocalFile(_ url: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var data = Data()
+        do {
+            while data.count <= maximumBytes {
+                let count = min(64 * 1024, maximumBytes + 1 - data.count)
+                guard let chunk = try handle.read(upToCount: count), !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+        } catch { return nil }
+        guard !data.isEmpty, data.count <= maximumBytes else { return nil }
+        return data
     }
 
     private static func download(_ url: URL, timeout: TimeInterval, retriesLeft: Int, done: @escaping @Sendable (Data?) -> Void) {

@@ -55,7 +55,14 @@ struct MoveSeedingNagTV: View {
             NavigationLink {
                 // onSignedIn: the pairing landed and the account's data pulled; close the whole nag (the
                 // Settings banner now shows the backed-up confirmation with the last-sync time).
-                VortXAccountJoinerView(onSignedIn: { dismiss() })
+                ScrollView {
+                    VStack(spacing: Theme.Space.lg) {
+                        VortXAccountJoinerView(onSignedIn: { dismiss() })
+                        DiagnosticLogExportButton()
+                    }
+                    .padding(Theme.Space.lg)
+                    .frame(maxWidth: .infinity)
+                }
             } label: {
                 Label("Sign in with QR code", systemImage: "qrcode").frame(width: 560)
             }
@@ -97,7 +104,10 @@ struct MoveSeedingNagTV: View {
     // MARK: Seeded (reached mid-flow when the pairing lands and the first sync completes)
 
     @ViewBuilder private var confirmation: some View {
-        Text(MoveSeeding.backedUpLine)
+        Text(MoveSeeding.backedUpLine(
+            synchronizationIsComplete: sync.synchronizationIsComplete,
+            pendingSettingsMessage: sync.pendingSettingsMessage
+        ))
             .font(Theme.Typography.screenTitle)
             .foregroundStyle(Theme.Palette.textPrimary)
             .multilineTextAlignment(.center)

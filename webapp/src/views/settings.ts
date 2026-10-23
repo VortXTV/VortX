@@ -1,5 +1,6 @@
 import { actionOf, escapeHtml } from "../lib/dom";
-import { currentSession, signOut } from "../lib/account";
+import { currentSession, signOut, accountSyncStatus } from "../lib/account";
+import { sessionOwner } from "../lib/vault";
 import { exportBackup, importBackup } from "../lib/store";
 import {
   profiles,
@@ -10,6 +11,7 @@ import {
   addProfile,
   updateProfileMeta,
   deleteProfile,
+  hasNativeProfiles,
   PROFILE_AVATARS,
 } from "../lib/profiles";
 import {
@@ -86,7 +88,12 @@ const SOURCE_LABELS: Record<SourceType, { name: string; sub: string }> = {
   direct: { name: "Direct", sub: "Plain HTTP/HTTPS streams from add-ons" },
 };
 
+function isKnownSourceType(value: unknown): value is SourceType {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(SOURCE_LABELS, value);
+}
+
 let host: HTMLElement | null = null;
+let logoutNotice = "";
 
 export function renderSettings(target: HTMLElement): void {
   host = target;
@@ -135,13 +142,13 @@ function profilesSection(): string {
   const chips = list
     .map(
       (p) =>
-        `<button class="profile-chip${p.id === activeId ? " selected" : ""}" data-action="switch-profile" data-id="${escapeHtml(p.id)}">
+        `<button class="profile-chip${p.id === activeId ? " selected" : ""}" data-action="switch-profile" data-id="${escapeHtml(p.id)}"${p.restricted ? ' disabled aria-disabled="true"' : ""}>
           <span class="profile-avatar" aria-hidden="true">${escapeHtml(p.avatar)}</span>
           <span class="profile-name">${escapeHtml(p.name)}</span>
         </button>`,
     )
     .join("");
-  const add = `<button class="profile-chip profile-add" data-action="add-profile" aria-label="Add a profile"><span class="profile-avatar" aria-hidden="true">+</span><span class="profile-name">Add</span></button>`;
+  const add = hasNativeProfiles() ? "" : `<button class="profile-chip profile-add" data-action="add-profile" aria-label="Add a profile"><span class="profile-avatar" aria-hidden="true">+</span><span class="profile-name">Add</span></button>`;
 
   const active = activeProfile();
   const avatars = PROFILE_AVATARS.map(
@@ -160,8 +167,9 @@ function profilesSection(): string {
 
   return group(
     "Profiles",
-    `<div class="profile-row">${chips}${add}</div>${editor}`,
-    "Each profile keeps its own look, languages, library, and Continue Watching; switching applies them instantly. A PIN lock is coming next.",
+    `<div class="profile-row">${chips}${add}</div>${hasNativeProfiles() ? "" : editor}`,
+    hasNativeProfiles() ? "Account profiles update automatically from VortX. Manage their names, avatars and membership in VortX. PIN, kids and pending-account profiles cannot be opened here."
+      : "Each profile keeps its own look, languages, library, and Continue Watching; switching applies them instantly. A PIN lock is coming next.",
   );
 }
 
@@ -170,16 +178,30 @@ function accountSection(): string {
   if (acct) {
     const who = escapeHtml(acct.username || acct.email || "Signed in");
     const sub = acct.email && acct.username ? escapeHtml(acct.email) : undefined;
-    const body = row(who, `<button class="chip" data-action="account-signout">Sign out</button>`, sub);
-    return group("Account", body, "Your library, add-ons, and settings sync across every VortX device, end to end encrypted.");
+    const body = row(who, `<button class="chip" data-action="account-signout">Sign out</button>`, sub) +
+      `<p class="settings-footer" data-account-sync-status aria-live="polite">${accountSyncMessage()}</p>`;
+    return group("Account", body, "Your account data is end to end encrypted.");
   }
-  const body = `<a class="btn-primary settings-signin" href="#/login">Sign in to VortX</a>`;
+  const body = `<a class="btn-primary settings-signin" href="#/login">Sign in to VortX</a><p data-logout-status role="status">${escapeHtml(logoutNotice)}</p>`;
   return group(
     "Account",
     body,
     "Sign in to sync your library, add-ons, and settings across every VortX device (end to end encrypted). You can keep using the web app signed out, stored only on this device.",
   );
 }
+
+function accountSyncMessage(): string {
+  const status = accountSyncStatus();
+  if (status.upgradeRequired) return "Update VortX to continue syncing. Your unsaved changes are retained on this browser.";
+  if (status.projectionPending) return "Account update received. Supported browser data updates automatically; some native data or profile protections still require VortX.";
+  if (hasNativeProfiles()) return "Account updates apply automatically. Account Watchlist, trailer autoplay, direct-only links and performance settings sync with durable offline retries. Browser Save is local; other native profile-setting and playback edits stay queued pending compatible sync support. Metadata API keys sync independently.";
+  return status.appliedVersion === undefined ? "Checking for account updates…" : "Account updates apply automatically while this page is active.";
+}
+
+if (typeof window !== "undefined") window.addEventListener("vortx:account-sync-changed", () => {
+  const label = host?.querySelector<HTMLElement>("[data-account-sync-status]");
+  if (label) label.textContent = accountSyncMessage();
+});
 
 function metadataSection(mdblistKey: string, tmdbKey: string): string {
   const body =
@@ -403,14 +425,14 @@ function segmented(opts: { value: string; label: string; on: boolean }[], action
   const items = opts
     .map(
       (o) =>
-        `<button class="seg${o.on ? " selected" : ""}" data-action="${action}" data-${dataKey}="${o.value}">${o.label}</button>`,
+        `<button class="seg${o.on ? " selected" : ""}" data-action="${escapeHtml(action)}" data-${dataKey}="${escapeHtml(o.value)}">${escapeHtml(o.label)}</button>`,
     )
     .join("");
   return `<div class="segmented" role="group">${items}</div>`;
 }
 
 function toggle(action: string, on: boolean): string {
-  return `<button class="switch${on ? " on" : ""}" role="switch" aria-checked="${on}" data-action="${action}"><span class="switch-knob"></span></button>`;
+  return `<button class="switch${on ? " on" : ""}" role="switch" aria-checked="${on ? "true" : "false"}" data-action="${action}"><span class="switch-knob"></span></button>`;
 }
 
 /** A -/+ stepper showing a percentage. `dir` is carried on data-dir; `kind` distinguishes which value. */
@@ -448,11 +470,14 @@ function langSelect(id: string, value: string, defaultLabel: string): string {
 
 /** The source-type priority list (highest first), each row with up/down controls. */
 function reorderList(order: SourceType[]): string {
-  return order
+  // A saved backup can contain a newer client's type or malformed data. Ignore unsupported rows in
+  // this presentation only; do not rewrite the saved order or discard future-client preferences.
+  const knownOrder = Array.isArray(order) ? order.filter(isKnownSourceType) : [];
+  return knownOrder
     .map((type, i) => {
       const info = SOURCE_LABELS[type];
-      const up = `<button class="stepper-btn" data-action="source-move" data-type="${type}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="Move ${info.name} up">↑</button>`;
-      const down = `<button class="stepper-btn" data-action="source-move" data-type="${type}" data-dir="1" ${i === order.length - 1 ? "disabled" : ""} aria-label="Move ${info.name} down">↓</button>`;
+      const up = `<button class="stepper-btn" data-action="source-move" data-type="${escapeHtml(type)}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="Move ${info.name} up">↑</button>`;
+      const down = `<button class="stepper-btn" data-action="source-move" data-type="${escapeHtml(type)}" data-dir="1" ${i === knownOrder.length - 1 ? "disabled" : ""} aria-label="Move ${info.name} down">↓</button>`;
       return row(info.name, `<div class="reorder-ctl">${up}${down}</div>`, info.sub);
     })
     .join("");
@@ -518,15 +543,24 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return commit({ subtitleScale: clampSub(Number(d.size) || 1) });
     case "sub-size":
       return commit({ subtitleScale: clampSub(getSettings().subtitleScale + (Number(d.dir) || 0) * SUB_STEP) });
-    case "account-signout":
-      signOut();
+    case "account-signout": {
+      logoutNotice = "Signed out in this tab; checking saved session…";
+      const completion = signOut(), revision = sessionOwner().revision;
       rerender();
+      const target = host?.querySelector<HTMLElement>("[data-logout-status]");
+      void completion.then((result) => {
+        if (sessionOwner().revision !== revision) return;
+        logoutNotice = result.status === "not-persisted" ? "Saved session cleared." : "Saved sign-out could not be confirmed. The residual session has not been re-adopted.";
+        if (target?.isConnected && target === host?.querySelector("[data-logout-status]")) target.textContent = logoutNotice;
+      });
       return true;
+    }
     case "switch-profile":
       setActiveProfile(d.id ?? ""); // applies the profile's look via updateSettings
       rerender();
       return true;
     case "add-profile":
+      if (hasNativeProfiles()) return true;
       addProfile("New profile", PROFILE_AVATARS[profiles().length % PROFILE_AVATARS.length]);
       rerender();
       return true;
@@ -575,13 +609,17 @@ function toggleAlerts(): boolean {
 
 /** Reorder a source type within the priority list (immutably). */
 function moveSource(type: SourceType, dir: number): boolean {
-  const order = [...getSettings().sourceOrder];
-  const i = order.indexOf(type);
+  const saved = getSettings().sourceOrder;
+  if (!Array.isArray(saved) || !isKnownSourceType(type) || (dir !== -1 && dir !== 1)) return true;
+  const order = [...saved];
+  // Move between the displayed types, preserving unsupported entries in their original slots.
+  const indices = order.flatMap((candidate, index) => isKnownSourceType(candidate) ? [index] : []);
+  const i = indices.findIndex((index) => order[index] === type);
   const j = i + dir;
-  if (i < 0 || j < 0 || j >= order.length) return true;
-  const swapped = order[j];
-  order[j] = order[i];
-  order[i] = swapped;
+  if (i < 0 || j < 0 || j >= indices.length) return true;
+  const swapped = order[indices[j]];
+  order[indices[j]] = order[indices[i]];
+  order[indices[i]] = swapped;
   updateSettings({ sourceOrder: order });
   rerender();
   return true;

@@ -326,13 +326,13 @@ object VortXSyncDoc {
     /** Parse one safely-installable descriptor without rejecting compatible shallow records elsewhere in a doc. */
     internal fun addonDescriptor(raw: JSONObject): AddonDescriptor? {
         // Do not coerce arbitrary JSON values to strings: this object is dispatched directly to the native
-        // engine during account hydration, so it has the same public-network admission as a pasted install.
+        // engine during account hydration, so use the same endpoint admission as a pasted install.
         val url = (raw.opt("transportUrl") as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         val uri = runCatching { URI(url) }.getOrNull() ?: return null
         if (
             uri.scheme?.lowercase() !in setOf("http", "https") ||
-            uri.host.isNullOrBlank() || uri.rawUserInfo != null ||
-            runCatching { PublicAddressPolicy.requireLiteralPublicOrHostname(uri.host) }.isFailure
+            uri.host.isNullOrBlank() || uri.rawUserInfo != null || uri.rawFragment != null ||
+            runCatching { PublicAddressPolicy.requireAddonLiteralOrHostname(uri.host.removeSurrounding("[", "]")) }.isFailure
         ) return null
         val manifest = raw.optJSONObject("manifest") ?: return null
         // Native's manifest serde needs real string values; `optString` would turn numbers/objects into
@@ -546,7 +546,15 @@ object VortXSyncDoc {
         val profilesArr = JSONArray()
         for (p in roster) {
             if (deleted.contains(p.id) && !p.isOwner) continue
-            profilesArr.put(summaryFor(p))
+            val previous = profileRow(existingVortx?.optJSONArray("profiles"), p.id)
+            val fresh = summaryFor(p)
+            profilesArr.put(preserveOwnedObject(previous, fresh, SUMMARY_KEYS,
+                mapOf("settings" to SUMMARY_SETTINGS_KEYS)).also { summary ->
+                val settings = summary.getJSONObject("settings")
+                val freshPlayback = fresh.getJSONObject("settings").optJSONObject("playback")
+                if (freshPlayback != null) settings.put("playback", preserveOwnedObject(
+                    previous?.optJSONObject("settings")?.optJSONObject("playback"), freshPlayback, SUMMARY_PLAYBACK_KEYS))
+            })
         }
         v.put("profiles", profilesArr)
 
@@ -554,7 +562,7 @@ object VortXSyncDoc {
         val fullRoster = JSONArray()
         for (p in roster) {
             if (deleted.contains(p.id) && !p.isOwner) continue
-            fullRoster.put(UserProfile.encodeProfile(p))
+            fullRoster.put(preserveProfile(p, profileRow(existingVortx?.optJSONArray("roster"), p.id)))
         }
         v.put("roster", fullRoster)
 
@@ -566,9 +574,13 @@ object VortXSyncDoc {
             if (p.isOwner) continue
             val entries = store.watchEntries(p.id)
             if (entries.isEmpty()) continue
+            val bucket = byProfile.optJSONObject(p.id)?.let { JSONObject(it.toString()) } ?: JSONObject()
+            val previousRows = bucket.optJSONArray("library")
             val library = JSONArray()
-            for ((metaId, e) in entries) library.put(overlayItem(metaId, e))
-            byProfile.put(p.id, JSONObject().put("library", library))
+            for ((metaId, e) in entries) library.put(preserveOwnedObject(
+                profileRow(previousRows, metaId, normalize = false), overlayItem(metaId, e), OVERLAY_KEYS))
+            bucket.put("library", library)
+            byProfile.put(p.id, bucket)
         }
         if (byProfile.length() > 0) v.put("byProfile", byProfile) else v.remove("byProfile")
 
@@ -601,6 +613,58 @@ object VortXSyncDoc {
         writeRosterModified(v, store.rosterModified)
         return v
     }
+
+    /** Preserve extensions at rewritten boundaries while removing omitted fields this codec owns. */
+    private fun preserveOwnedObject(previous: JSONObject?, fresh: JSONObject, owned: Set<String>,
+        children: Map<String, Set<String>> = emptyMap()): JSONObject {
+        val result = previous?.let { JSONObject(it.toString()) } ?: JSONObject()
+        owned.forEach { result.remove(it) }
+        fresh.keys().forEach { key ->
+            val child = fresh.optJSONObject(key)
+            result.put(key, if (child != null && key in children)
+                preserveOwnedObject(previous?.optJSONObject(key), child, children.getValue(key)) else fresh.get(key))
+        }
+        return result
+    }
+
+    private fun profileRow(rows: JSONArray?, id: String, normalize: Boolean = true): JSONObject? {
+        fun identity(value: String) = if (normalize) UserProfile.normalizeId(value) else value
+        return rows?.orEmptyObjects()?.firstOrNull { (it.opt("id") as? String)?.let(::identity) == identity(id) }
+    }
+
+    private fun preserveProfile(profile: UserProfile, previous: JSONObject?): JSONObject =
+        preserveOwnedObject(previous, profile.encode(), PROFILE_KEYS,
+            mapOf("playback" to PLAYBACK_KEYS, "discovery" to DISCOVERY_KEYS))
+
+    private fun mergePriorObjects(left: JSONObject?, right: JSONObject): JSONObject =
+        (left?.let { JSONObject(it.toString()) } ?: JSONObject()).also { merged -> right.keys().forEach { key ->
+            val child = right.optJSONObject(key)
+            merged.put(key, if (child != null) mergePriorObjects(merged.optJSONObject(key), child) else right.get(key))
+        } }
+
+    internal fun preservedRoster(roster: List<UserProfile>, vararg previous: JSONArray?): JSONArray =
+        JSONArray().also { result -> roster.forEach { profile ->
+            var prior: JSONObject? = null
+            previous.forEach { rows -> profileRow(rows, profile.id)?.let { row ->
+                prior = mergePriorObjects(prior, row)
+            } }
+            result.put(preserveProfile(profile, prior))
+        } }
+
+    private val PROFILE_KEYS = setOf("id", "name", "avatar", "accentID", "oled", "textScale", "pin", "usesOwnAccount",
+        "email", "isOwner", "familyEdit", "playback", "discovery", "disabledAddons", "isKids")
+    private val SUMMARY_KEYS = setOf("id", "name", "locked", "main", "familyEdit", "pinHash", "settings", "disabledAddons")
+    private val SUMMARY_SETTINGS_KEYS = setOf("avatar", "accent", "oled", "textScale", "isKids", "playback")
+    private val PLAYBACK_KEYS = setOf("audioLang", "subtitleLang", "forcedPolicy", "subFont", "subSize", "subColor",
+        "subBackground", "subSizeScale", "subBrightness", "sourceTypeOrder", "useAddonOrder", "safetyMode", "instantOnly",
+        "hideDeadTorrents", "hdrOnly", "excludeAV1", "excludeKeywords", "includeKeywords", "keywordsAreRegex", "maxResolution",
+        "maxFileSizeGB", "minResolution", "hideUnknownResolution", "preferredAudioOnly", "preferKeywords", "avoidBehavior", "autoPickBest")
+    private val SUMMARY_PLAYBACK_KEYS = PLAYBACK_KEYS - setOf("forcedPolicy", "preferKeywords", "avoidBehavior", "autoPickBest") + "forced"
+    private val DISCOVERY_KEYS = setOf("hiddenCatalogs", "catalogOrder", "hiddenHubCategories", "regionOverrideCaptured",
+        "regionOverride", "filtersCaptured", "filtersData", "selectedProviders", "providerOrder", "tabVisibilityCaptured",
+        "hideLiveTab", "hideDiscoverTab", "hideLibraryTab", "hideSearchTab", "showCollectionsHome", "showCollectionsDiscover",
+        "continueWatchingSource", "continueWatchingWindow")
+    private val OVERLAY_KEYS = setOf("id", "name", "type", "poster", "t", "d", "lastWatched", "v", "w")
 
     /** The dashboard summary entry for one profile, byte-parity with Apple `vortxSummary`'s profiles map. */
     private fun summaryFor(p: UserProfile): JSONObject {

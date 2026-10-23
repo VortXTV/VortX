@@ -18,6 +18,16 @@ class NativeLegacyMaterialTest {
     private fun watchRows(material: JSONObject, profile: String = owner.id): List<JSONObject> = material.getJSONObject("watches").getJSONArray(profile).let { a ->
         (0 until a.length()).map(a::getJSONObject)
     }
+    /** Issue #262: a unit the projection cannot represent is held, never fatal, and deterministically so. */
+    private fun held(document: JSONObject, phrase: String, roster: List<UserProfile> = listOf(owner, child)): JSONObject {
+        val holds = mutableListOf<NativeLegacyHeld>(); val again = mutableListOf<NativeLegacyHeld>()
+        val first = nativeLegacyMaterial(document, roster, 1720000000.1234, watchedMigration = null, held = holds)
+        val second = nativeLegacyMaterial(document, roster, 1720000000.1234, watchedMigration = null, held = again)
+        assertTrue("Expected a hold for '$phrase', got $holds", holds.any { it.reason.contains(phrase) })
+        assertEquals("Holding '$phrase' keeps the material deterministic", first.toString(), second.toString())
+        assertTrue(nativeLegacyHeldSummary(holds).isNotEmpty())
+        return first
+    }
     private fun failure(document: JSONObject, phrase: String) {
         val error = runCatching { material(document) }.exceptionOrNull()
         assertTrue("Expected '$phrase', got $error", error is IllegalArgumentException && error.message.orEmpty().contains(phrase))
@@ -25,6 +35,54 @@ class NativeLegacyMaterialTest {
 
     private fun addonV3(counter: String = "2", state: String = "removed") = JSONObject().put("version", 3).put("counter", counter)
         .put("eventId", "e9" + "0".repeat(30)).put("state", state).put("wallTime", 1000.125).put("legacyRemovedSeen", 300).put("legacyAddedSeen", 200)
+
+    /** Issue #262: a 0.4 account carrying rows the native engine cannot represent still loads. */
+    @Test fun `one unrepresentable unit never stops the account and a held unit leaves no trace`() {
+        fun descriptor(url: String, id: String) = JSONObject().put("transportUrl", url).put("manifest", JSONObject().put("id", id).put("name", id))
+        val urlOnly = JSONObject().put("transportUrl", "https://old.example.com/manifest.json").put("name", "Old")
+        val stray = "30000000-0000-0000-0000-000000000003"
+        val doc = document(JSONObject()
+            .put("library", JSONArray().put(movie("tt-kept", 12.0)).put(movie("yt-channel").put("type", "channel"))
+                .put(movie("iptv-one").put("type", "tv")).put(movie("tt-series", 42.0).put("type", "series").put("v", ""))
+                .put(movie("tt-noclock", 30.0).put("lastWatched", "")))
+            .put("addons", JSONArray().put(descriptor("https://example.com/manifest.json", "fixture")).put(urlOnly)
+                .put(descriptor("https://frag.example.com/manifest.json#cfg", "frag"))
+                .put(descriptor("http://192.168.1.20:7000/manifest.json", "lan")))
+            .put("deletedProfiles", JSONArray().put("not-a-uuid"))
+            .put("byProfile", JSONObject()
+                .put(stray, JSONObject().put("watched", JSONObject().put("tt-stray", JSONObject().put("w", JSONArray().put("tt-stray:1:1")))))
+                .put(child.id, JSONObject().put("watched", JSONObject().put("tt-child", JSONObject().put("ma", JSONObject().put("tt-child:1:1", 1500.5)))))))
+        val holds = mutableListOf<NativeLegacyHeld>()
+        val result = nativeLegacyMaterial(doc, listOf(owner, child), 1720000000.1234, watchedMigration = null, held = holds)
+        val items = result.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("items")
+        assertEquals("Representable titles stay saved, including ones whose progress is held",
+            setOf("tt-kept", "tt-series", "tt-noclock"), (0 until items.length()).map { items.getJSONObject(it).getString("id") }.toSet())
+        val ownerWatches = watchRows(result)
+        assertTrue(ownerWatches.any { it.getString("metaId") == "tt-kept" && it.getLong("positionMs") == 12_000L })
+        assertTrue(ownerWatches.none { it.getString("metaId") in setOf("tt-series", "tt-noclock", "yt-channel", "iptv-one") })
+        val addons = result.getJSONObject("addons").getJSONObject(owner.id).getJSONArray("items")
+        assertEquals(listOf("https://example.com/manifest.json", "http://192.168.1.20:7000/manifest.json"),
+            (0 until addons.length()).map { addons.getJSONObject(it).getString("transportUrl") })
+        assertTrue(watchRows(result, child.id).any { it.optString("videoId") == "tt-child:1:1" })
+        val reasons = holds.map { "${it.kind}:${it.reason}" }
+        for (expected in listOf("library_row:Unsupported catalog content type", "library_progress:Series progress requires an exact video identity",
+                "library_progress:Progress lacks a genuine viewing clock", "addon:URL-only add-on requires manifest reconciliation",
+                "addon:Unsupported add-on transport URL", "deleted_profile:Invalid deleted profile identity",
+                "profile_overlay:Watch carrier references an unknown profile"))
+            assertTrue("Expected hold $expected; got $reasons", reasons.any { it.startsWith(expected) })
+        assertEquals(2, reasons.count { it.startsWith("library_row:Unsupported catalog content type") })
+        assertEquals("Only the fragment URL holds; the private add-on is retained", 1,
+            reasons.count { it.startsWith("addon:Unsupported add-on transport URL") })
+        val summary = nativeLegacyHeldSummary(holds)
+        assertFalse(summary, summary.contains("tt-") || summary.contains(stray) || summary.contains("example.com"))
+        assertEquals("malformed_clock_x", scrubbedLegacyReason("Malformed clock tt123:1:2"))
+        assertEquals("malformed_object_carrier_x", scrubbedLegacyReason("Malformed object carrier $stray"))
+        // A unit is atomic: progress that fails after appending a mark leaves nothing behind.
+        val partial = movie("tt-partial", 5.0).put("type", "series").put("v", "").put("w", JSONArray().put("tt-partial:1:1"))
+        val rolledBack = held(document(JSONObject().put("library", JSONArray().put(partial))), "Series progress requires an exact video identity")
+        assertTrue(watchRows(rolledBack).none { it.getString("metaId") == "tt-partial" })
+        assertEquals(1, rolledBack.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("items").length())
+    }
 
     @Test fun `known addon V3 is forwarded intact despite scalar intent disagreement`() {
         val url = "https://fixture.invalid/manifest.json"
@@ -51,13 +109,13 @@ class NativeLegacyMaterialTest {
         assertEquals(500, v3.getInt("legacyRemovedSeen")); assertEquals(600, v3.getInt("legacyAddedSeen"))
     }
 
-    @Test fun `unknown malformed or future addon intents fail rather than dropping causal metadata`() {
+    @Test fun `unknown malformed or future addon intents are held rather than dropping causal metadata`() {
         val url = "https://fixture.invalid/manifest.json"
         fun intent(value: JSONObject) = document(JSONObject().put("deletedAddonsTs", JSONObject().put(url, value)))
-        failure(intent(JSONObject().put("future", true)), "Unsupported add-on intent fields")
-        failure(intent(JSONObject().put("intentV3", addonV3().put("future", true))), "Unsupported V3")
-        assertTrue(runCatching { material(intent(JSONObject().put("intentV3", addonV3("01")))) }.isFailure)
-        failure(intent(JSONObject().put("intentV3", addonV3().put("wallTime", System.currentTimeMillis() + 49L * 60 * 60 * 1000))), "future")
+        held(intent(JSONObject().put("future", true)), "Unsupported add-on intent fields")
+        held(intent(JSONObject().put("intentV3", addonV3().put("future", true))), "Unsupported V3")
+        held(intent(JSONObject().put("intentV3", addonV3("01"))), "counter")
+        held(intent(JSONObject().put("intentV3", addonV3().put("wallTime", System.currentTimeMillis() + 49L * 60 * 60 * 1000))), "future")
     }
 
     @Test fun `pending or malformed website profile edits never bypass complete material validation`() {
@@ -128,7 +186,7 @@ class NativeLegacyMaterialTest {
         val v = JSONObject().put("library", JSONArray().put(movie())).put("deletedLibraryTs", JSONObject().put("tt123", JSONObject().put("removedAt", 900.99).put("addedAt", 900.01)))
         val intent = material(document(v)).getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0)
         assertEquals("movie:tt123", intent.getString("key")); assertEquals(900.99, intent.getDouble("removedAtMs"), 0.0)
-        failure(document(JSONObject().put("deletedLibrary", JSONArray().put("tt999"))), "title-type reconciliation")
+        held(document(JSONObject().put("deletedLibrary", JSONArray().put("tt999"))), "title-type reconciliation")
     }
 
     @Test fun `owner actor tie is resolved before timestamp-only kernel import`() {
@@ -169,7 +227,7 @@ class NativeLegacyMaterialTest {
         assertEquals(0L, row.getLong("positionMs")); assertTrue(row.has("lastPlayedAtMs"))
         assertEquals(1767225600999.875, row.getDouble("lastPlayedAtMs"), 0.0)
         history.remove("eventEpochMs")
-        failure(document(v), "Malformed genuine owner history")
+        held(document(v), "Malformed genuine owner history")
     }
 
     @Test fun `durable unclocked duplicate cannot resurrect omission from authoritative rail snapshot`() {
@@ -180,9 +238,9 @@ class NativeLegacyMaterialTest {
     }
 
     @Test fun `unsupported evidence is explicit instead of a partial success`() {
-        failure(document(JSONObject().put("library", JSONArray().put(movie(time = 1.0).put("watched", "opaque-bitfield")))), "bitfield")
-        failure(document(JSONObject().put("byProfile", JSONObject().put(child.id, JSONObject().put("library", JSONArray().put(movie()))))), "Saved-only overlay")
-        failure(document(JSONObject().put("addons", JSONArray().put(JSONObject().put("transportUrl", "https://example.com/manifest.json")))), "manifest reconciliation")
+        held(document(JSONObject().put("library", JSONArray().put(movie(time = 1.0).put("watched", "opaque-bitfield")))), "bitfield")
+        held(document(JSONObject().put("byProfile", JSONObject().put(child.id, JSONObject().put("library", JSONArray().put(movie()))))), "Saved-only overlay")
+        held(document(JSONObject().put("addons", JSONArray().put(JSONObject().put("transportUrl", "https://example.com/manifest.json")))), "manifest reconciliation")
         assertTrue(runCatching { material(document(), listOf(owner, child.copy(usesOwnAccount = true))) }.exceptionOrNull()?.message.orEmpty().contains("authenticated streaming-account"))
     }
 
@@ -203,9 +261,9 @@ class NativeLegacyMaterialTest {
         val tiny = document(JSONObject().put("byProfile", JSONObject().put(child.id,
             JSONObject().put("library", JSONArray().put(movie(time = 0.0001))))))
         assertEquals(0L, watchRows(material(tiny), child.id).single().getLong("positionMs"))
-        failure(document(JSONObject().put("library", JSONArray().put(movie(time = -0.0001)))), "Invalid clock")
-        failure(document(JSONObject().put("library", JSONArray().put(movie().put("t", java.math.BigDecimal("9007199254740.9901"))))), "Excessive progress")
-        failure(document(JSONObject().put("library", JSONArray().put(movie().put("t", "1.01")))), "Malformed clock")
+        held(document(JSONObject().put("library", JSONArray().put(movie(time = -0.0001)))), "Invalid clock")
+        held(document(JSONObject().put("library", JSONArray().put(movie().put("t", java.math.BigDecimal("9007199254740.9901"))))), "Excessive progress")
+        held(document(JSONObject().put("library", JSONArray().put(movie().put("t", "1.01")))), "Malformed clock")
     }
 
     @Test fun `explicit preparation retains orphan historical installs and web removals without native membership`() {
@@ -221,7 +279,7 @@ class NativeLegacyMaterialTest {
             .put("library", JSONArray().put(movie(time = 1.00001))))
             .put("addonOrder", JSONArray().put(live)).put("webAddonRemovals", removals)
         val original = nativeWatchedDocumentSnapshot(doc)
-        failure(doc, "installed descriptor")
+        held(doc, "installed descriptor")
         val prepared = prepare(doc)
         val bucket = prepared.material.getJSONObject("addons").getJSONObject(owner.id)
         assertEquals(1, bucket.getJSONArray("items").length()); assertEquals(live, bucket.getJSONArray("order").getString(0))
@@ -235,30 +293,40 @@ class NativeLegacyMaterialTest {
         assertEquals(owner.id, retained.getString("profileId"))
         val digest = java.security.MessageDigest.getInstance("SHA-256").digest(original).joinToString("") { "%02x".format(it) }
         assertEquals(digest, retained.getString("sourceDocumentSha256"))
-        val orderedOrphan = JSONObject(doc.toString()).put("addonOrder", JSONArray().put(stamps.keys().next()))
-        assertTrue(runCatching { prepare(orderedOrphan) }.isFailure)
-        val v3 = document(JSONObject().put("deletedAddonsTs", JSONObject().put(live, JSONObject().put("intentV3", addonV3(state = "present")))))
-        assertTrue(runCatching { prepare(v3) }.isFailure)
+        // An orphan cannot be ordered and a present V3 cannot be deferred: each is held, never imported.
+        val orphanURL = stamps.keys().next()
+        val orderedOrphan = prepare(JSONObject(doc.toString()).put("addonOrder", JSONArray().put(orphanURL)))
+        assertTrue(orderedOrphan.held.any { it.kind == "addon_order" && it.reason.contains("Ordered add-on requires descriptor reconciliation") })
+        assertEquals(0, orderedOrphan.material.getJSONObject("addons").getJSONObject(owner.id).getJSONArray("order").length())
+        val v3 = prepare(document(JSONObject().put("deletedAddonsTs", JSONObject().put(live, JSONObject().put("intentV3", addonV3(state = "present"))))))
+        assertTrue(v3.held.any { it.reason.contains("installed descriptor") })
+        assertEquals(0, v3.material.getJSONObject("addons").getJSONObject(owner.id).getJSONArray("intents").length())
+        assertEquals(0, v3.pendingMembershipReceipts.length())
     }
 
-    @Test fun `untyped library removal remains exact pending evidence and malformed evidence still fails`() {
+    @Test fun `untyped library removal remains exact pending evidence and malformed evidence is held`() {
         val unknown = JSONObject().put("removedAt", 900.99).put("addedAt", 900.01)
         val doc = document(JSONObject().put("library", JSONArray().put(movie(time = 2.0)))
             .put("deletedLibraryTs", JSONObject().put("tt999", unknown)).put("deletedLibrary", JSONArray().put("tt999")))
-        failure(doc, "title-type reconciliation")
+        held(doc, "title-type reconciliation")
         val prepared = prepare(doc)
         assertEquals(2, prepared.pendingMembershipReceipts.length())
         assertEquals(0, prepared.material.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("intents").length())
         assertTrue(NativeHostPreferences.equal(unknown, prepared.pendingMembershipReceipts.getJSONObject(0).getJSONObject("receipt")))
-        assertTrue(runCatching { prepare(document(JSONObject().put("deletedLibraryTs", JSONObject().put("tt999", JSONObject().put("removedAt", "900"))))) }.isFailure)
-        assertTrue(runCatching { prepare(document(JSONObject().put("deletedLibraryTs", JSONObject().put("tt999", JSONObject().put("future", true))))) }.isFailure)
-        assertTrue(runCatching { prepare(document(JSONObject().put("library", JSONArray().put(movie("tt123")).put(movie("tt123").put("type", "series"))))) }.isFailure)
+        // Pending is not a malformed-input escape hatch: malformed evidence is held, never deferred.
+        for (malformed in listOf(
+            document(JSONObject().put("deletedLibraryTs", JSONObject().put("tt999", JSONObject().put("removedAt", "900")))),
+            document(JSONObject().put("deletedLibraryTs", JSONObject().put("tt999", JSONObject().put("future", true)))),
+            document(JSONObject().put("library", JSONArray().put(movie("tt123")).put(movie("tt123").put("type", "series")))))) {
+            val outcome = prepare(malformed)
+            assertTrue(outcome.held.isNotEmpty() && outcome.pendingMembershipReceipts.length() == 0)
+        }
     }
 
     @Test fun `saved-only shared overlay retains exact row and locator without invented viewing or owner membership`() {
         val saved = movie(time = 0.0).put("futurePreference", "kept")
         val doc = document(JSONObject().put("byProfile", JSONObject().put(child.id, JSONObject().put("library", JSONArray().put(saved)))))
-        failure(doc, "Saved-only overlay")
+        held(doc, "Saved-only overlay")
         val prepared = prepare(doc)
         assertTrue(watchRows(prepared.material, child.id).isEmpty())
         assertEquals(0, prepared.material.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("items").length())
@@ -278,7 +346,8 @@ class NativeLegacyMaterialTest {
                 NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(pending)).put("sourceField", invalidLocator)), setOf(owner.id, child.id)) }.isFailure)
         }
         saved.put("poster", 123)
-        assertTrue(runCatching { prepare(doc) }.isFailure)
+        val malformed = prepare(doc)
+        assertTrue(malformed.held.any { it.reason.contains("Malformed string poster") } && malformed.pendingMembershipReceipts.length() == 0)
     }
 
     @Test fun `independent own source unresolved evidence never enters shared root pending ledger`() {
@@ -301,14 +370,19 @@ class NativeLegacyMaterialTest {
         val root = document(JSONObject().put("byProfile", JSONObject().put(ownProfile.id,
             JSONObject().put("library", JSONArray().put(movie("own-orphan", 0.0))))))
         val own = source(root, JSONArray())
-        val failure = runCatching { prepareOwn(root, own) }.exceptionOrNull()
-        assertTrue(failure?.message.orEmpty().contains("Saved-only overlay"))
-        assertTrue(runCatching { nativeOwnAccountCarrier(own, ownProfile, root) }.isFailure)
+        val savedOnly = prepareOwn(root, own)
+        assertTrue(savedOnly.held.any { it.kind == "own_profile_overlay_row" && it.reason.contains("Saved-only overlay") })
+        assertEquals(0, savedOnly.pendingMembershipReceipts.length())
+        val carrier = nativeOwnAccountCarrier(own, ownProfile, root)
+        assertFalse(carrier.getJSONArray("watches").toString().contains("own-orphan"))
         val conflictRoot = document()
         val rows = JSONArray()
         for ((id, offset) in listOf("tt111" to 20_001, "tmdb:222" to 30_001)) rows.put(JSONObject().put("_id", id).put("type", "movie")
             .put("state", JSONObject().put("timeOffset", offset).put("duration", 100_000).put("lastWatched", "2026-01-01T00:00:00.123456Z").put("video_id", "tt111")))
-        assertTrue(runCatching { prepareOwn(conflictRoot, source(conflictRoot, rows)) }.exceptionOrNull()?.message.orEmpty().contains("conflicting title identities"))
+        val ownConflict = prepareOwn(conflictRoot, source(conflictRoot, rows))
+        assertTrue(ownConflict.held.any { it.kind == "own_watch" && it.reason.contains("conflicting title identities") })
+        assertEquals(0, ownConflict.pendingMembershipReceipts.length())
+        assertFalse(ownConflict.material.getJSONObject("watches").getJSONArray(ownProfile.id).toString().contains("tt111"))
         val valid = prepareOwn(conflictRoot, source(conflictRoot, JSONArray()))
         assertEquals(0, valid.pendingMembershipReceipts.length())
     }
@@ -370,7 +444,7 @@ class NativeLegacyMaterialTest {
         val doc = document(JSONObject().put("library", JSONArray().put(first).put(second).put(unaffected))
             .put("ownerWatched", JSONObject().put("original-intent", intent)))
         val original = nativeWatchedDocumentSnapshot(doc)
-        failure(doc, "conflicting title identities")
+        held(doc, "conflicting title identities")
         val prepared = prepare(doc)
         assertEquals("tt789", watchRows(prepared.material).single().getString("metaId"))
         assertEquals(3, prepared.material.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("items").length())
@@ -389,7 +463,8 @@ class NativeLegacyMaterialTest {
         assertEquals(1, nativeLegacyMembershipJournal(scope, nativeLegacyMembershipJournal(scope, null, prepared.pendingMembershipReceipts),
             prepare(JSONObject(doc.toString()).put("unrelated", 99)).pendingMembershipReceipts).getJSONArray("receipts").length())
         second.put("t", "malformed")
-        assertTrue(runCatching { prepare(doc) }.isFailure)
+        val malformed = prepare(doc)
+        assertTrue(malformed.held.any { it.kind == "library_progress" && it.reason.contains("Malformed clock") })
     }
 
     @Test fun `prepared full roster imports through real JNI and preserves pending receipts in sealed cold checkpoint`() = kotlinx.coroutines.runBlocking {
@@ -487,9 +562,9 @@ class NativeLegacyMaterialTest {
     @Test fun `credential-bearing addon material and malformed carriers fail closed`() {
         val addon = JSONObject().put("transportUrl", "https://example.com/manifest.json")
             .put("manifest", JSONObject().put("id", "test").put("name", "Test").put("accessToken", "secret"))
-        failure(document(JSONObject().put("addons", JSONArray().put(addon))), "Credential-bearing")
+        held(document(JSONObject().put("addons", JSONArray().put(addon))), "Credential-bearing")
         failure(document(JSONObject().put("library", "not-an-array")), "Malformed array")
-        failure(document(JSONObject().put("byProfile", JSONObject().put("unknown", JSONObject().put("watched", JSONObject())))), "unknown profile")
+        held(document(JSONObject().put("byProfile", JSONObject().put("unknown", JSONObject().put("watched", JSONObject())))), "unknown profile")
     }
 
     @Test fun `empty intent cannot suppress shipping legacy deletion epoch or reconcile web removal`() {
@@ -500,25 +575,25 @@ class NativeLegacyMaterialTest {
         val result = material(document(v))
         assertEquals(1.0, result.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0).getDouble("removedAtMs"), 0.0)
         assertEquals(1.0, result.getJSONObject("addons").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0).getDouble("removedAtMs"), 0.0)
-        failure(document(JSONObject().put("deletedAddonsTs", JSONObject().put(url, JSONObject()))).put("webAddonRemovals", JSONArray().put(url)), "Unclocked web")
+        held(document(JSONObject().put("deletedAddonsTs", JSONObject().put(url, JSONObject()))).put("webAddonRemovals", JSONArray().put(url)), "Unclocked web")
     }
 
     @Test fun `legacy lowercase add-on identifier fails despite exact lowercased descriptor match`() {
         fun addon(path: String) = JSONObject().put("transportUrl", "https://example.com/$path/manifest.json")
             .put("manifest", JSONObject().put("id", path).put("name", path).put("version", "1.0.0"))
-        failure(document(JSONObject().put("addons", JSONArray().put(addon("Config")).put(addon("config")))
+        held(document(JSONObject().put("addons", JSONArray().put(addon("Config")).put(addon("config")))
             .put("deletedAddons", JSONArray().put("https://example.com/config/manifest.json"))), "Ambiguous legacy add-on")
     }
 
     @Test fun `removal group does not establish alias equivalence between distinct titles`() {
         val bucket = JSONObject().put("library", JSONArray().put(movie("tt123", 1.0)).put(movie("tt456", 1.0)))
             .put("removed", JSONArray().put(JSONObject().put("keys", JSONArray().put("movie\u001fimdb:tt123").put("movie\u001fimdb:tt456")).put("removedAt", 1000)))
-        failure(document(JSONObject().put("byProfile", JSONObject().put(child.id, bucket))), "verified title reconciliation")
+        held(document(JSONObject().put("byProfile", JSONObject().put(child.id, bucket))), "verified title reconciliation")
     }
 
     @Test fun `owner removed flag never converts viewing timestamp into deletion intent`() {
         val row = movie(time = 1.0).put("removed", true).put("eventEpochMs", 1767225600123)
-        failure(document(JSONObject().put("library", JSONArray().put(row))), "explicit library removal intent")
+        held(document(JSONObject().put("library", JSONArray().put(row))), "explicit library removal intent")
         val result = material(document(JSONObject().put("library", JSONArray().put(row)).put("deletedLibrary", JSONArray().put("tt123"))))
         val intent = result.getJSONObject("libraries").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0)
         assertEquals(1.0, intent.getDouble("removedAtMs"), 0.0)
@@ -540,12 +615,12 @@ class NativeLegacyMaterialTest {
         assertEquals(2000L, row.getLong("positionMs")); assertEquals(100000L, row.getLong("durationMs"))
         newer.put("lastWatched", prior.getString("lastWatched"))
         newer.put("eventEpochMs", 1767225600123.456)
-        failure(document(v), "equal-clock progress")
+        held(document(v), "equal-clock progress")
     }
 
     @Test fun `contradictory owner watched operation at same clock and actor fails closed`() {
         fun intent(watched: Boolean) = JSONObject().put("t", "tt123").put("v", "tt123").put("w", watched).put("u", 100.25).put("a", "same")
-        failure(document(JSONObject().put("library", JSONArray().put(movie())).put("ownerWatched", JSONObject().put("a", intent(true)).put("b", intent(false)))), "equal-clock owner intent")
+        held(document(JSONObject().put("library", JSONArray().put(movie())).put("ownerWatched", JSONObject().put("a", intent(true)).put("b", intent(false)))), "equal-clock owner intent")
     }
 
     @Test fun `zero overlay mark clocks are ingress absence and cannot suppress legacy watched ids`() {
@@ -560,7 +635,7 @@ class NativeLegacyMaterialTest {
         for (field in listOf("w", "ma", "ua")) {
             val series = JSONObject().put("id", "ttSeries").put("type", "series").put("name", "Series")
             series.put(field, if (field == "w") JSONArray().put("ttSeries") else JSONObject().put("ttSeries", 100.5))
-            failure(document(JSONObject().put("library", JSONArray().put(series))), "Whole-title mark")
+            held(document(JSONObject().put("library", JSONArray().put(series))), "Whole-title mark")
         }
         val marked = watchRows(material(document(JSONObject().put("library", JSONArray().put(movie().put("w", JSONArray().put("tt123")))))))
         assertTrue(marked.single().getBoolean("watched"))

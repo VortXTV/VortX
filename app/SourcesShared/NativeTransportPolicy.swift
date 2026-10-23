@@ -1,17 +1,14 @@
 import Foundation
 
-/// Selecting the native data engine also selects native transport. An unavailable native build
-/// must fail closed; a preference can never downgrade it to the legacy runtime.
+/// Transport rules for the VortX streaming server. An unavailable server fails closed.
 enum NativeTransportPolicy {
-    static var isRequired: Bool {
-        #if VORTX_NATIVE_DATA_ENGINE
-        return true
-        #else
-        return false
-        #endif
+    /// App launches must verify upstream TLS even when the parent shell carries a daemon-only
+    /// development override. Preserve the rest of the environment and the server's normal policy.
+    static func nativeServerEnvironment(from inherited: [String: String]) -> [String: String] {
+        var environment = inherited
+        environment["VORTX_PROXY_INSECURE_TLS"] = "0"
+        return environment
     }
-
-    static func selectsNative(required: Bool, preference: Bool) -> Bool { required || preference }
 
     /// A running process alone does not prove it owns its listening port. The caller supplies
     /// only this launch's unique port-file receipt, emitted by the native daemon after bind.

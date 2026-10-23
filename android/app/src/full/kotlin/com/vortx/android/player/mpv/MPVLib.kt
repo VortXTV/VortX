@@ -77,6 +77,8 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
     /// uses `change-list append`).
     fun command(cmd: Array<String>) = delegate.command(cmd)
 
+    fun loadFileWithEntryID(url: String): Long? = delegate.loadFileWithEntryID(url)
+
     /// Set an mpv OPTION before [init] (the pre-`mpv_initialize` window). Returns mpv's status code
     /// (< 0 on error). This is how [MpvConfig.baseOptions] is applied. After [init], prefer
     /// [setPropertyString] for options that are also runtime-settable properties (matching the Apple
@@ -116,6 +118,7 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
         fun eventProperty(name: String, value: Boolean)
         fun eventProperty(name: String, value: String)
         fun eventTerminal(event: MpvTerminalEvent)
+        fun eventStartFile(entryID: Long) {}
         fun event(id: Int)
     }
 
@@ -141,6 +144,7 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
         const val VIDEO_RECONFIG = MpvSeam.MpvEvent.MPV_EVENT_VIDEO_RECONFIG
         const val AUDIO_RECONFIG = MpvSeam.MpvEvent.MPV_EVENT_AUDIO_RECONFIG
         const val SHUTDOWN = MpvSeam.MpvEvent.MPV_EVENT_SHUTDOWN
+        const val QUEUE_OVERFLOW = MpvSeam.MpvEvent.MPV_EVENT_QUEUE_OVERFLOW
     }
 
     companion object {

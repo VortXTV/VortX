@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 import PackageDescription
 
 // Standalone test package for the PURE Watch Stats aggregation. It compiles the REAL
@@ -8,6 +8,7 @@ import PackageDescription
 // per the repository guide); run it with `swift test` from this directory.
 let package = Package(
     name: "WatchStatsAggregation",
+    platforms: [.macOS(.v13), .iOS(.v16), .tvOS(.v18)],
     targets: [
         .target(name: "WatchStatsAggregation", path: "Sources/WatchStatsAggregation"),
         .testTarget(
@@ -15,5 +16,6 @@ let package = Package(
             dependencies: ["WatchStatsAggregation"],
             path: "Tests/WatchStatsAggregationTests"
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

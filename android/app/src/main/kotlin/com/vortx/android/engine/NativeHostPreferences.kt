@@ -5,12 +5,30 @@ import com.vortx.android.library.NativeWatchlistCodec
 import com.vortx.android.library.WatchlistEntry
 import java.math.BigDecimal
 import java.util.UUID
+import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** Shared Apple/Android schema 1. Kernel authority and credential storage are deliberately separate. */
 internal object NativeHostPreferences {
     const val MAX_CLOCK = 9_007_199_254_740_991L
+    private val profileUUID = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    /** UUID case is spelling, not authority. Shortened UUID/legacy identities stay byte-exact. */
+    internal fun canonicalProfileID(id: String): String = if (profileUUID.matches(id)) id.uppercase(Locale.ROOT) else id
+
+    /** Immutable event maps use this unique index without changing source/fingerprint material. */
+    internal fun profileKeyIndex(groups: JSONObject): Map<String, String> = linkedMapOf<String, String>().also { index ->
+        for (raw in groups.keys()) {
+            require(raw.isNotBlank() && '\u0000' !in raw)
+            require(index.put(canonicalProfileID(raw), raw) == null) { "Duplicate canonical host profile identity" }
+        }
+    }
+
+    private fun canonicalGroups(groups: JSONObject): JSONObject {
+        val index = profileKeyIndex(groups)
+        val copied = JSONObject(groups.toString())
+        return JSONObject().also { normalized -> index.forEach { (id, raw) -> normalized.put(id, copied.get(raw)) } }
+    }
     private val nativeFields = setOf("id", "name", "isOwner", "pin", "isKids", "familyEdit", "accentID", "oled", "textScale",
         "disabledAddons", "usesOwnAccount", "account", "addons", "settings", "parental", "rev", "updatedAt", "deleted")
     private val forbiddenGlobals = setOf("activeprofileid", "activeid", "profiles", "roster", "nativesync", "nativehostpreferences",
@@ -28,6 +46,8 @@ internal object NativeHostPreferences {
             .put("counter", 0).put("document", empty(scope)).put("pending", false)
         actor(value.getString("actor")); clock(value.get("counter")); require(value.get("pending") is Boolean)
         validate(scope, value.getJSONObject("document"))
+        val document = value.getJSONObject("document")
+        document.put("profiles", canonicalGroups(document.getJSONObject("profiles")))
         require(value.getLong("counter") >= maximum(value.getJSONObject("document"))) { "Host preference clock regressed" }
         return value
     }
@@ -38,6 +58,7 @@ internal object NativeHostPreferences {
         require(document.getString("scope") == scope.accountID && document.getString("ownerProfileId") == scope.ownerProfileID)
         NativeHostDocument.requireCredentialFree(document)
         val profiles = document.getJSONObject("profiles")
+        profileKeyIndex(profiles) // Equal-valued aliases are still ambiguous and must fail closed.
         for (id in profiles.keys()) {
             require(id.isNotBlank() && '\u0000' !in id)
             val bucket = profiles.getJSONObject(id)
@@ -59,6 +80,10 @@ internal object NativeHostPreferences {
             clock(entry.get("clock")); actor(entry.getString("actor"))
             val value = entry.get("value")
             if (watchlist) NativeWatchlistCodec.validate(field, value)
+            if (field.startsWith(com.vortx.android.foryou.ForYouSync.PREFIX)) {
+                require(profile) { "For You is profile-scoped" }
+                com.vortx.android.foryou.ForYouSync.validate(field, value)
+            }
             if (value == JSONObject.NULL) continue
             if (profile) when (field) {
                 "avatar", "email" -> require(value is String) { "Invalid host string preference" }
@@ -119,6 +144,7 @@ internal object NativeHostPreferences {
         }
     }
     fun validateProjectedProfiles(profiles: JSONObject) {
+        profileKeyIndex(profiles)
         for (id in profiles.keys()) {
             if (id == "modifiedSeconds") continue
             val profile = profiles.getJSONObject(id)
@@ -152,7 +178,7 @@ internal object NativeHostPreferences {
         }
         mergeFields(destination.getJSONObject("globals").getJSONObject("fields"), incoming.getJSONObject("globals").getJSONObject("fields"))
         val profiles = destination.getJSONObject("profiles")
-        val remoteProfiles = incoming.getJSONObject("profiles")
+        val remoteProfiles = canonicalGroups(incoming.getJSONObject("profiles"))
         for (id in remoteProfiles.keys()) {
             val target = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
             mergeFields(target.getJSONObject("fields"), remoteProfiles.getJSONObject(id).getJSONObject("fields"))
@@ -164,8 +190,10 @@ internal object NativeHostPreferences {
     fun recordProfiles(scope: VortxAccountScope, local: JSONObject, before: JSONObject, after: JSONObject): JSONObject {
         val result = local(scope, local)
         val profiles = result.getJSONObject("document").getJSONObject("profiles")
-        for (id in after.keys().asSequence().filter { it != "modifiedSeconds" }.sorted()) {
-            val old = before.optJSONObject(id) ?: JSONObject(); val next = after.getJSONObject(id)
+        val oldProfiles = canonicalGroups(before)
+        val nextProfiles = canonicalGroups(after)
+        for (id in nextProfiles.keys().asSequence().filter { it != "modifiedSeconds" }.sorted()) {
+            val old = oldProfiles.optJSONObject(id) ?: JSONObject(); val next = nextProfiles.getJSONObject(id)
             for (field in (old.keys().asSequence().toSet() + next.keys().asSequence().toSet()).sorted()) {
                 if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) || equal(old.opt(field), next.opt(field))) continue
                 val bucket = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
@@ -188,7 +216,8 @@ internal object NativeHostPreferences {
     fun recordProfileFields(scope: VortxAccountScope, local: JSONObject, profileID: String, changes: JSONObject): JSONObject {
         val result = local(scope, local)
         val profiles = result.getJSONObject("document").getJSONObject("profiles")
-        val bucket = profiles.optJSONObject(profileID) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(profileID, it) }
+        val id = canonicalProfileID(profileID)
+        val bucket = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
         val fields = bucket.getJSONObject("fields")
         for (field in changes.keys().asSequence().sorted()) {
             if (fields.has(field) && equal(fields.getJSONObject(field).get("value"), changes.get(field))) continue
@@ -200,7 +229,10 @@ internal object NativeHostPreferences {
     fun seedWatchlists(scope: VortxAccountScope, local: JSONObject, baseline: Map<String, List<WatchlistEntry>>): JSONObject {
         val result = local(scope, local)
         val profiles = result.getJSONObject("document").getJSONObject("profiles")
-        for ((id, items) in baseline) {
+        val ids = mutableSetOf<String>()
+        baseline.keys.forEach { require(ids.add(canonicalProfileID(it))) { "Duplicate canonical Watchlist profile identity" } }
+        for ((raw, items) in baseline) {
+            val id = canonicalProfileID(raw)
             val fields = (profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }).getJSONObject("fields")
             for (item in items) {
                 val field = NativeWatchlistCodec.field(item.id, item.type)
@@ -220,12 +252,13 @@ internal object NativeHostPreferences {
         fields.put(field, JSONObject().put("clock", clock + 1).put("actor", local.getString("actor")).put("value", value ?: JSONObject.NULL))
     }
     fun projectProfiles(local: JSONObject, base: JSONObject, roster: JSONObject): JSONObject {
-        val result = JSONObject(base.toString())
-        val profiles = local.getJSONObject("document").getJSONObject("profiles")
+        val result = canonicalGroups(base)
+        val profiles = canonicalGroups(local.getJSONObject("document").getJSONObject("profiles"))
+        val nativeRoster = canonicalGroups(roster)
         for (id in profiles.keys()) {
-            require(roster.has(id)) { "Host preference profile is not in native roster" }
-            if (roster.getJSONObject(id).getBoolean("deleted")) continue
-            val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", roster.getJSONObject(id).getString("name"))
+            require(nativeRoster.has(id)) { "Host preference profile is not in native roster" }
+            if (nativeRoster.getJSONObject(id).getBoolean("deleted")) continue
+            val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", nativeRoster.getJSONObject(id).getString("name"))
             val fields = profiles.getJSONObject(id).getJSONObject("fields")
             for (field in fields.keys()) {
                 if (field.startsWith(NativeWatchlistCodec.PREFIX)) continue // Separate per-item ledger, not profile DTO attributes.

@@ -1,0 +1,424 @@
+import Foundation
+
+// Deterministic scheduler/native doubles. No real native context or threads are used.
+// Real relay, registration, dispatch head, NONE/SHUTDOWN exits and teardown bodies
+// below are extracted verbatim. Only the unchanged event-processing payload is omitted.
+// Queue doubles deliberately do not claim Dispatch @Sendable or platform actor proof.
+
+private let MPV_EVENT_NONE = 0
+private let MPV_EVENT_SHUTDOWN = 1
+private let MPV_EVENT_TEST_PAYLOAD = 2
+private struct NativeEvent {
+    struct Payload { let event_id: Int }
+    let pointee: Payload
+}
+private final class Hooks: @unchecked Sendable {
+    static let shared = Hooks()
+    var afterUnlock: ((NSLock) -> Void)?
+    var trace: [String] = []
+}
+private final class NSLock: @unchecked Sendable {
+    private(set) var held = false
+    func lock() { precondition(!held, "recursive test lock"); held = true }
+    func unlock() {
+        precondition(held)
+        held = false
+        Hooks.shared.afterUnlock?(self)
+    }
+}
+private final class DispatchQueue: @unchecked Sendable {
+    static let main = DispatchQueue()
+    var pending: [() -> Void] = []
+    var beforeEnqueue: (() -> Void)?
+    private(set) var running = false
+    private(set) var enqueues = 0
+    func async(execute: @escaping () -> Void) {
+        beforeEnqueue?()
+        enqueues += 1
+        pending.append(execute)
+    }
+    func tick() {
+        precondition(!running, "serial consumer overlap")
+        guard !pending.isEmpty else { return }
+        let work = pending.removeFirst()
+        running = true
+        work()
+        running = false
+    }
+    func drain() {
+        var count = 0
+        while !pending.isEmpty {
+            count += 1
+            precondition(count < 100, "unbounded continuation")
+            tick()
+        }
+    }
+}
+private final class Native: @unchecked Sendable {
+    let handle: OpaquePointer
+    var callback: ((UnsafeMutableRawPointer?) -> Void)?
+    var context: UnsafeMutableRawPointer?
+    var events: [Int] = []
+    var onWait: (() -> Void)?
+    var onUnregister: (() -> Void)?
+    var destroyed = false
+    var waitCalls = 0
+    var destroyCalls = 0
+    var commands: [String] = []
+    init(_ value: Int) { handle = OpaquePointer(bitPattern: value)! }
+    func wake() { callback?(context) }
+}
+private final class NativeRegistry: @unchecked Sendable {
+    static let shared = NativeRegistry()
+    var contexts: [OpaquePointer: Native] = [:]
+    func native(_ handle: OpaquePointer?) -> Native {
+        contexts[handle!]!
+    }
+}
+private func mpv_set_wakeup_callback(_ handle: OpaquePointer?,
+    _ callback: ((UnsafeMutableRawPointer?) -> Void)?, _ context: UnsafeMutableRawPointer?) {
+    let native = NativeRegistry.shared.native(handle)
+    precondition(!native.destroyed)
+    native.callback = callback
+    native.context = context
+    Hooks.shared.trace.append(callback == nil ? "unregister" : "register")
+    if callback == nil { native.onUnregister?() }
+}
+@discardableResult
+private func mpv_command_string(_ handle: OpaquePointer?, _ command: String) -> Int32 {
+    let native = NativeRegistry.shared.native(handle)
+    precondition(!native.destroyed, "command after destroy")
+    native.commands.append(command)
+    Hooks.shared.trace.append(command)
+    return 0
+}
+private func mpv_terminate_destroy(_ handle: OpaquePointer?) {
+    let native = NativeRegistry.shared.native(handle)
+    precondition(!native.destroyed, "double destroy")
+    native.destroyed = true
+    native.destroyCalls += 1
+    Hooks.shared.trace.append("destroy")
+}
+private func mpv_wait_event(_ handle: OpaquePointer, _ timeout: Double) -> NativeEvent? {
+    let native = NativeRegistry.shared.native(handle)
+    precondition(!native.destroyed, "native poll after destroy")
+    native.waitCalls += 1
+    let event = native.events.isEmpty ? MPV_EVENT_NONE : native.events.removeFirst()
+    native.onWait?()
+    return .init(pointee: .init(event_id: event))
+}
+private enum DiagnosticsLog {
+    static func log(_ category: String, _ message: String) {}
+}
+private enum MPVProperty { static let timePos = "time-pos" }
+private struct Evidence { let generation: Int }
+private struct PlayerTimePositionEvent {
+    init(seconds: Double, loadToken: Int, mpvSeekSettlement: Evidence) {}
+}
+private struct Recovery {
+    mutating func observeSeek(owner: Int) -> Bool { true }
+}
+
+// PRODUCTION_RELAY
+
+private final class MPVMetalViewController: @unchecked Sendable {
+    var mpv: OpaquePointer!
+    var wakeupRelay: Unmanaged<WakeupRelay>?
+    let queue: DispatchQueue
+    let loadTokenLock = NSLock()
+    var startMuted = true
+    var loopPlayback = true
+    var appliedDynamicRange: Int?
+    var isFullPlayerPresentation = false
+    var probeChannel = "trailer"
+    var activeLoadToken = 1
+    var seekEOFRecovery = Recovery()
+    var payloadOwners: [Int] = []
+    init(native: Native, queue: DispatchQueue = DispatchQueue()) {
+        mpv = native.handle
+        self.queue = queue
+        NativeRegistry.shared.contexts[native.handle] = native
+    }
+    func register() {
+        // PRODUCTION_REGISTER
+    }
+    func stopTail() {
+        // PRODUCTION_STOP
+    // PRODUCTION_DEINIT
+    func emit(_ name: String, _ data: Any?, loadToken: Int) {}
+    func acceptsSettledPosition(_ evidence: Evidence, owner: Int) -> Bool { true }
+    func completeSeekEOFRecovery(loadToken: Int, position: Double, settlement: Evidence) {}
+
+    // PRODUCTION_DRAIN_HEAD
+                // Explicit extraction boundary: native event parsing/settlement is not mirrored.
+                // The unchanged production load lock is released before real exit adapters below.
+                self.loadTokenLock.unlock()
+                let drainedRestart: (Int, Double, Evidence)? = nil
+                // PRODUCTION_NONE
+                switch event!.pointee.event_id {
+                // PRODUCTION_SHUTDOWN
+                default:
+                    self.payloadOwners.append(self.activeLoadToken)
+                }
+            }
+        }
+    }
+}
+
+private final class WeakRelayProbe {
+    weak var value: WakeupRelay?
+    init(_ value: WakeupRelay) { self.value = value }
+}
+
+@main
+private enum MPVWakeupAdapterTests {
+    static func main() {
+        var checks = 0
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            checks += 1
+            guard condition() else {
+                print("WAKEUP_ASSERTION_FAILED: \(message)")
+                exit(1)
+            }
+        }
+        func fixture(_ body: (MPVMetalViewController, Native) -> Void) {
+            Hooks.shared.afterUnlock = nil
+            Hooks.shared.trace = []
+            let native = Native(0x100)
+            let controller = MPVMetalViewController(native: native)
+            controller.register()
+            body(controller, native)
+            Hooks.shared.afterUnlock = nil
+            controller.queue.beforeEnqueue = nil
+            native.onWait = nil
+            native.onUnregister = nil
+            controller.stopTail()
+            controller.queue.drain()
+            DispatchQueue.main.drain()
+            check(native.destroyCalls == 1, "fixture retires/destroys exactly once")
+        }
+
+        fixture { c, n in
+            for _ in 0..<10_000 { n.wake() }
+            check(c.queue.pending.count == 1, "native callback burst queues one preview consumer")
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1,
+                  "preceding wakes collapse into one native NONE poll")
+        }
+        fixture { c, n in
+            c.queue.beforeEnqueue = {
+                c.queue.beforeEnqueue = nil
+                n.wake()
+            }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1,
+                  "wake during first enqueue is represented by that scheduled consumer")
+        }
+        fixture { c, n in
+            n.events = [MPV_EVENT_TEST_PAYLOAD, MPV_EVENT_NONE]
+            var once = false
+            n.onWait = {
+                if !once { once = true; n.wake() }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2 && n.waitCalls == 3,
+                  "reentrant wake while dequeue lock is held produces one continuation")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                    n.wake() // after fake native selected NONE, before real NONE exit/finish
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "last wake after NONE selection survives finish handoff")
+        }
+        fixture { c, n in
+            var installed = false
+            n.onWait = {
+                if !installed {
+                    installed = true
+                    Hooks.shared.afterUnlock = { lock in
+                        guard lock !== c.loadTokenLock else { return }
+                        Hooks.shared.afterUnlock = nil
+                        n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                        n.wake() // finish already made the gate idle; it must enqueue itself
+                    }
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "wake immediately after finish-idle transition enqueues itself")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    n.wake()
+                    c.queue.beforeEnqueue = {
+                        c.queue.beforeEnqueue = nil
+                        n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                        n.wake()
+                    }
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [1] && c.queue.enqueues == 2,
+                  "wake in scheduled-to-enqueue gap is consumed by the one continuation")
+        }
+        fixture { c, n in
+            n.wake()
+            let relay = c.wakeupRelay!.takeUnretainedValue()
+            var retiredBeforeUnregister = false
+            n.onUnregister = { retiredBeforeUnregister = !relay.beginDrain() }
+            c.stopTail()
+            check(retiredBeforeUnregister, "stop retires relay before native unregister")
+            relay.signal() // models a callback already admitted before native unregister
+            c.queue.drain()
+            check(n.waitCalls == 0 && n.destroyCalls == 1,
+                  "stop before start makes queued/late preview consumers inert")
+            check(Hooks.shared.trace.suffix(3).elementsEqual(["unregister", "quit", "destroy"]),
+                  "stop preserves unregister, immediate quit, then serialized destroy")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    n.wake()
+                    c.queue.beforeEnqueue = {
+                        c.queue.beforeEnqueue = nil
+                        c.stopTail() // enqueue destroy before the already-promised continuation
+                    }
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && n.destroyCalls == 1,
+                  "continuation queued behind destroy never polls freed context")
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    c.stopTail()
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && n.destroyCalls == 1,
+                  "stop after poll admission leaves destruction behind the current consumer")
+        }
+        fixture { c, n in
+            n.wake()
+            c.mpv = nil // adversarially exercise the actual nil-handle retirement path
+            c.queue.drain()
+            check(n.waitCalls == 0, "queued preview drain never polls after losing its handle")
+            c.mpv = n.handle // restore ownership only for fixture destruction
+        }
+        fixture { c, n in
+            n.events = [MPV_EVENT_SHUTDOWN]
+            n.onWait = { n.wake() }
+            n.wake()
+            c.queue.drain()
+            check(n.waitCalls == 1 && c.queue.enqueues == 1,
+                  "actual shutdown return retires pending continuation")
+        }
+        fixture { c, n in
+            let successor = Native(0x200)
+            NativeRegistry.shared.contexts[successor.handle] = successor
+            n.wake()
+            c.mpv = successor.handle // adversarial mismatch without a normal stop
+            c.queue.drain()
+            check(n.waitCalls == 0 && successor.waitCalls == 0,
+                  "old relay's expected-context guard cannot poll a different context")
+            c.mpv = n.handle // restore fixture teardown ownership only
+        }
+        fixture { c, n in
+            var once = false
+            n.onWait = {
+                if !once {
+                    once = true
+                    c.activeLoadToken = 2
+                    n.events.append(MPV_EVENT_TEST_PAYLOAD)
+                    n.wake()
+                }
+            }
+            n.wake()
+            c.queue.drain()
+            check(c.payloadOwners == [2] && c.queue.enqueues == 2,
+                  "logical source replacement does not retire native-context wake authority")
+        }
+        weak var releasedOldRelay: WakeupRelay?
+        do {
+            Hooks.shared.afterUnlock = nil
+            let queue = DispatchQueue()
+            let oldNative = Native(0x300)
+            var controller: MPVMetalViewController? = MPVMetalViewController(native: oldNative, queue: queue)
+            controller!.register()
+            let oldRelay = controller!.wakeupRelay!.takeUnretainedValue()
+            releasedOldRelay = oldRelay
+            oldNative.wake()
+            controller!.stopTail()
+            queue.drain()
+            check(oldNative.destroyCalls == 1, "old context fully destroyed before address reuse")
+            let newNative = Native(0x300) // allocator address reuse, but a distinct native lifetime
+            controller!.mpv = newNative.handle
+            NativeRegistry.shared.contexts[newNative.handle] = newNative
+            controller!.register()
+            oldRelay.signal()
+            newNative.wake()
+            queue.drain()
+            check(newNative.waitCalls == 1, "retired relay cannot consume same-address successor events")
+            controller!.stopTail()
+            queue.drain()
+            controller = nil
+            withExtendedLifetime(oldRelay) {
+                check(releasedOldRelay != nil, "explicit old-relay test reference is still valid")
+            }
+        }
+        check(releasedOldRelay == nil, "old relay has no retained scheduling/native ownership after scope ends")
+        do {
+            let queue = DispatchQueue()
+            let native = Native(0x400)
+            var controller: MPVMetalViewController? = MPVMetalViewController(native: native, queue: queue)
+            controller!.register()
+            let relay = WeakRelayProbe(controller!.wakeupRelay!.takeUnretainedValue())
+            var retiredBeforeUnregister = false
+            native.onUnregister = { retiredBeforeUnregister = relay.value.map { !$0.beginDrain() } ?? false }
+            native.wake()
+            controller = nil // actual extracted deinit, no stopTail()
+            check(retiredBeforeUnregister, "deinit retires relay before native unregister")
+            queue.drain()
+            check(native.waitCalls == 0 && native.destroyCalls == 1,
+                  "deinit invalidates queued weak-controller drain and serializes destruction")
+            check(relay.value == nil, "native +1 and queued strong relay retains are both released")
+        }
+        for (muted, looping) in [(false, true), (true, false), (false, false)] {
+            let native = Native(0x500)
+            let controller = MPVMetalViewController(native: native)
+            controller.startMuted = muted
+            controller.loopPlayback = looping
+            controller.register()
+            for _ in 0..<10 { native.wake() }
+            check(controller.queue.pending.count == 10,
+                  "non-full-muted native callback scheduling is unchanged")
+            controller.queue.drain()
+            check(native.waitCalls == 10, "main/windowed preview keeps one drain per callback")
+            controller.stopTail()
+            controller.queue.drain()
+        }
+        print("PASS: \(checks) project-Swift5 actual lifecycle adapter assertions; NOT full strict-Swift6/native/thread/device proof")
+    }
+}

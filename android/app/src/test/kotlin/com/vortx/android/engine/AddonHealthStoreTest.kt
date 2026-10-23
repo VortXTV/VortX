@@ -241,7 +241,7 @@ class AddonHealthStoreTest {
     }
 
     @Test
-    fun `public policy blocks private targets while strict loopback remains probeable`() = runTest {
+    fun `installed private and loopback add-ons remain probeable while metadata stays blocked`() = runTest {
         val requested = mutableListOf<String>()
         val store = store(
             probe = AddonHealthProbe { url ->
@@ -265,8 +265,8 @@ class AddonHealthStoreTest {
             ),
         )
 
-        assertEquals(setOf("example.com", "127.0.0.1", "localhost", "::1"), requested.toSet())
-        assertEquals(AddonHealth.Unreachable, store.status.value[key(privateLan)])
+        assertEquals(setOf("example.com", "127.0.0.1", "localhost", "::1", "192.168.1.20"), requested.toSet())
+        assertEquals(AddonHealth.Online(5), store.status.value[key(privateLan)])
         assertEquals(AddonHealth.Unreachable, store.status.value[key(metadata)])
         assertEquals(AddonHealth.Unreachable, store.status.value[key(shorthandLoopback)])
     }

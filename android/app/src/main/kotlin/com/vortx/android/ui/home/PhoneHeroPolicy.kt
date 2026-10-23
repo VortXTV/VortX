@@ -44,6 +44,19 @@ internal object PhoneHeroPolicy {
         requestIdentity == visibleIdentity && requestGeneration == visibleGeneration
 
     fun identity(item: MetaItem): String = "${item.type.id}:${item.id}"
+
+    /** How far a horizontal drag must travel to page the billboard (Apple `FeaturedHeroView.swipeDistance`). */
+    const val SWIPE_DISTANCE_DP = 56
+
+    /**
+     * The page step for a finished horizontal drag of [travelPx]: dragging left (negative) shows the next
+     * title, right the previous, and anything shorter than [thresholdPx] stays put.
+     */
+    fun swipeStep(travelPx: Float, thresholdPx: Float): Int = when {
+        travelPx <= -thresholdPx -> 1
+        travelPx >= thresholdPx -> -1
+        else -> 0
+    }
 }
 
 /** Immutable request token used to reject a late repository result after the hero has moved on. */

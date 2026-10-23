@@ -7,12 +7,11 @@ import Foundation
 /// It also owns an offline RETRY QUEUE for pushes (watchlist / watched) that failed while offline, drained
 /// on the next refresh.
 ///
-/// EPISODE GRAIN: the same `/sync/watched/shows` response Trakt already answers carries a per-season /
-/// per-episode breakdown (it is omitted only when a caller asks for `extended=noseasons`, which this one
-/// never has). The pull therefore harvests BOTH grains from ONE response: the title-level id set, and a
-/// per-episode key set keyed `<showIdentity>|<season>|<episode>`. That gives episode watched-badges and a
-/// locally computed next-unwatched episode with NO extra request and NO per-show fan-out. See
-/// `TraktEpisodeShadow` for the read side that maps those keys back into the app's opaque video-id space.
+/// EPISODE GRAIN: explicitly paginated `/sync/watched/shows?extended=progress` pages carry the
+/// per-season / per-episode breakdown. The default response no longer includes that progress.
+/// Both complete title legs and all episode keys commit together; incomplete or oversized pulls keep
+/// the previous cache. Presence is positive watched-badge evidence, not absence-as-unwatched or
+/// authoritative next-episode evidence. No per-show fan-out is needed for this badge import.
 ///
 /// HARD INVARIANT (libraryItem POISON): this NEVER writes an engine `libraryItem`. Nothing here dispatches
 /// an engine watched-mark. The shadow set lives only in this cache and is unioned into a read-only badge
@@ -30,12 +29,8 @@ final class TraktSyncEngine {
     private static let refreshInterval: TimeInterval = 5 * 60
     /// Bound the retry queue so a long offline stretch can't grow it without limit.
     private static let queueCap = 200
-    /// Bound the episode key set. A heavy account (hundreds of shows x hundreds of episodes, x3 identity
-    /// forms) is the only realistic way this cache grows without limit, and it is held in memory for the
-    /// process lifetime. At the cap the pull keeps the keys it already folded and stops adding, so a huge
-    /// account degrades to PARTIAL episode badges rather than unbounded memory. 300k keys is roughly a
-    /// 100k-episode account at three identity forms each, far beyond any real library.
-    private static let episodeKeyCap = 300_000
+    /// The reader fails closed at this key cap; it never commits a truncated episode history.
+    private static let episodeKeyCap = TraktWatchedSnapshotReader.Limits().episodeKeys
 
     private let lock = NSLock()
     /// The watched id set pulled from Trakt (movies + shows), unioned into `WatchedIndex`. Holds BOTH
@@ -52,8 +47,18 @@ final class TraktSyncEngine {
     /// Persisted retry queue of pushes that failed (offline). Drained on refresh.
     private var pendingPushes: [PendingPush]
     /// `<movies.watched_at>|<episodes.watched_at>` from the last SUCCESSFUL pull, per `/sync/last_activities`.
-    /// Present iff a pull succeeded, so it doubles as the "we have pulled before" flag (see `pullWatched`).
+    /// It can skip a read only when paired with the current complete-pagination read version.
     private var lastActivityFingerprint: String?
+    private var watchedReadVersion: Int?
+    private var watchedShowInventory: [TraktWatchedShowInventoryEntry]?
+    private var watchedInventoryRevision: UUID?
+    /// Never carries raw state across an account boundary; guarded by the same lock as the cache.
+    private var snapshotRetention: TraktSyncSnapshotEnvelope?
+    private var snapshotPersistenceBlocked = false
+    /// One watched read across badge and selected-CW callers. A reset invalidates its owner token;
+    /// the retired flight's defer cannot release a successor flight.
+    private var watchedReadFlight: UUID?
+    private var lastWatchedRead: Date?
     private var lastRefresh: Date?
     private var refreshing = false
     /// Set by `refreshNow()` when a force arrives while a refresh is already in flight. The single-flight
@@ -74,6 +79,11 @@ final class TraktSyncEngine {
         let watchedEpisodeKeys: [String]
         let pendingPushes: [PendingPush]
         let lastActivityFingerprint: String?
+        /// Optional for backward-compatible decoding. A missing/old version invalidates only the
+        /// skip cursor, preserving old badge sets and same-session pending pushes until a good read.
+        let watchedReadVersion: Int?
+        let watchedShowInventory: [TraktWatchedShowInventoryEntry]?
+        let watchedInventoryRevision: UUID?
     }
 
     private static let storage = try? PrivateExternalSyncStorage.live(
@@ -90,11 +100,17 @@ final class TraktSyncEngine {
     private init() {
         let initialSession = TraktAuth.storedSessionID
         stateSessionID = initialSession
-        let snapshot = initialSession.flatMap(Self.load(for:))
+        let loaded = initialSession.map(Self.load(for:))
+        let snapshot = loaded?.snapshot
         watchedIDs = Set(snapshot?.watchedIDs ?? [])
         watchedEpisodeKeys = Set((snapshot?.watchedEpisodeKeys ?? []).prefix(Self.episodeKeyCap))
         pendingPushes = (snapshot?.pendingPushes ?? []).filter { $0.sessionID == initialSession }
         lastActivityFingerprint = snapshot?.lastActivityFingerprint
+        watchedReadVersion = snapshot?.watchedReadVersion
+        watchedShowInventory = snapshot?.watchedShowInventory
+        watchedInventoryRevision = snapshot?.watchedInventoryRevision
+        snapshotRetention = loaded?.retention
+        snapshotPersistenceBlocked = loaded?.blocked ?? false
         TraktAuthBoundary.observe(key: "trakt-sync-engine") { [weak self] sessionID in
             self?.reset(to: sessionID)
         }
@@ -103,6 +119,41 @@ final class TraktSyncEngine {
     }
 
     // MARK: - Read side (WatchedIndex consumes this)
+
+    /// nil is unavailable/not yet complete; a returned empty entries array is a proven empty
+    /// account inventory. Consumers must recheck session, revision and membership after awaits.
+    func currentWatchedShowInventory(
+        expectedSession: TraktSessionID, purpose: TraktWatchedReadPurpose = .badgeImport
+    ) -> TraktWatchedShowInventory? {
+        guard Self.watchedPurposeIsCurrent(purpose) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        guard !snapshotPersistenceBlocked, stateSessionID == expectedSession,
+              TraktAuth.storedSessionID == expectedSession,
+              watchedReadVersion == TraktWatchedSnapshotReader.readVersion,
+              let entries = watchedShowInventory, let revision = watchedInventoryRevision else { return nil }
+        return .init(sessionID: expectedSession, revision: revision,
+                     readVersion: TraktWatchedSnapshotReader.readVersion,
+                     activityFingerprint: lastActivityFingerprint, entries: entries)
+    }
+
+    /// Read-only refresh for a captured caller purpose. Never drains provider writes, pulls ratings,
+    /// or changes the badge-import toggle. An existing flight is not joined by an unrelated intent:
+    /// return the current complete cache (or nil), and let a later visible-lane read retry.
+    func refreshWatchedShowInventory(
+        expectedSession: TraktSessionID, purpose: TraktWatchedReadPurpose
+    ) async -> TraktWatchedShowInventory? {
+        guard TraktAuth.isConfigured, Self.watchedPurposeIsCurrent(purpose),
+              TraktAuth.storedSessionID == expectedSession else { return nil }
+        let context: (generation: Int, recent: Bool)? = lock.withLock {
+            guard stateSessionID == expectedSession else { return nil }
+            let recent = lastWatchedRead.map { Date().timeIntervalSince($0) < Self.refreshInterval } ?? false
+            return (generation, recent)
+        }
+        guard let context else { return nil }
+        if !context.recent { await pullWatched(expectedSession: expectedSession, gen: context.generation, purpose: purpose) }
+        guard watchedPullIsCurrent(expectedSession: expectedSession, gen: context.generation, purpose: purpose) else { return nil }
+        return currentWatchedShowInventory(expectedSession: expectedSession, purpose: purpose)
+    }
 
     /// The shadow watched id set (imdb + tmdb forms), or empty when the import toggle is off. Synchronous
     /// + lock-guarded so `WatchedIndex.rebuild` can union it inline. Gated on the toggle here so a single
@@ -160,6 +211,13 @@ final class TraktSyncEngine {
         watchedEpisodeKeys = []
         pendingPushes = []
         lastActivityFingerprint = nil
+        watchedReadVersion = nil
+        watchedShowInventory = nil
+        watchedInventoryRevision = nil
+        snapshotRetention = nil
+        snapshotPersistenceBlocked = false
+        watchedReadFlight = nil
+        lastWatchedRead = nil
         lastRefresh = nil
         stateSessionID = sessionID
         generation &+= 1   // invalidate any in-flight refresh so it cannot write its pre-reset result back
@@ -187,24 +245,25 @@ final class TraktSyncEngine {
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
-                self.lock.lock()
-                self.refreshing = false
-                // Only stamp lastRefresh when no disconnect/reset happened mid-refresh. A reset bumps
-                // generation and nulls lastRefresh; re-stamping it here would make refreshIfStale early-
-                // return for up to refreshInterval, silently delaying the reconnected account's first
-                // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
-                // pull immediately.
-                if self.generation == gen,
-                   self.stateSessionID == sessionID,
-                   TraktAuth.storedSessionID == sessionID {
-                    self.lastRefresh = Date()
+                let force = self.lock.withLock {
+                    self.refreshing = false
+                    // Only stamp lastRefresh when no disconnect/reset happened mid-refresh. A reset bumps
+                    // generation and nulls lastRefresh; re-stamping it here would make refreshIfStale early-
+                    // return for up to refreshInterval, silently delaying the reconnected account's first
+                    // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
+                    // pull immediately.
+                    if self.generation == gen,
+                       self.stateSessionID == sessionID,
+                       TraktAuth.storedSessionID == sessionID {
+                        self.lastRefresh = Date()
+                    }
+                    // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard;
+                    // its throttle clear was then re-armed by the stamp above. Honor it now with one more pass
+                    // so a just-enabled import is never deferred to the next unrelated engine event.
+                    let force = self.refreshAgain
+                    self.refreshAgain = false
+                    return force
                 }
-                // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard;
-                // its throttle clear was then re-armed by the stamp above. Honor it now with one more pass
-                // so a just-enabled import is never deferred to the next unrelated engine event.
-                let force = self.refreshAgain
-                self.refreshAgain = false
-                self.lock.unlock()
                 if force { self.refreshNow() }
             }
             guard TraktAuth.storedSessionID == sessionID else { return }
@@ -267,173 +326,161 @@ final class TraktSyncEngine {
         if changed { await MainActor.run { NotificationCenter.default.post(name: TraktRatingsStore.changedNote, object: nil) } }
     }
 
-    /// Pull GET /sync/watched/{movies,shows} and fold each title's ids (imdb + tmdb forms) into the shadow
-    /// cache, plus every watched episode of every show into the episode key set. Reuses `TraktAuth` for a
-    /// live bearer so `TraktService` stays untouched. Fail-soft: a failed leg contributes nothing.
-    ///
-    /// Skipped entirely when `/sync/last_activities` says neither movies nor episodes have been watched
-    /// since our last successful pull, so the steady state costs one small request every 5 minutes instead
-    /// of re-downloading (and re-parsing) a whole library that did not change.
-    private func pullWatched(expectedSession: TraktSessionID, gen: Int) async {
-        // Import is opt-in: when the toggle is off, `shadowWatchedIDs()` returns empty anyway, so pulling
-        // (and hitting the Trakt read endpoints + refreshing a token) would be pure waste. Skip the network
-        // entirely until the user turns import on. The push/drain side is gated by its own toggles upstream.
-        guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return }
-        lock.lock()
-        guard generation == gen,
-              stateSessionID == expectedSession,
-              TraktAuth.storedSessionID == expectedSession else { lock.unlock(); return }
-        let seenFingerprint = lastActivityFingerprint
-        lock.unlock()
-        // CHEAP GATE. `fingerprint` is nil when the call failed or Trakt sent neither timestamp: fail OPEN
-        // (fall through and pull), because a gate that guesses "nothing changed" from a failure would pin
-        // the shadow to a stale set indefinitely. Skip ONLY on a positive match against a fingerprint we
-        // stamped after a real success, which is why a nil `seenFingerprint` (fresh install, or a
-        // disconnect wipe) always pulls.
-        let fingerprint = await watchedActivityFingerprint(expectedSession: expectedSession)
-        if let fingerprint, let seenFingerprint, fingerprint == seenFingerprint { return }
-        var next = Set<String>()
-        var nextEpisodes = Set<String>()
-        var moviesOK = false
-        var showsOK = false
-        for type in ["movies", "shows"] {
-            let isSeries = (type == "shows")
-            guard let rows = await getWatched(type: type, expectedSession: expectedSession) else { continue }
-            if isSeries { showsOK = true } else { moviesOK = true }
-            for row in rows {
-                let container = (row[isSeries ? "show" : "movie"]) as? [String: Any]
-                guard let ids = container?["ids"] as? [String: Any] else { continue }
-                // Fold EVERY identity Trakt gives us for this title into the shadow set, not just imdb.
-                // The badge read is a plain `ids.contains(item.id)`, and catalog covers are keyed by
-                // whatever identity their source uses: Cinemeta covers are `tt…`, but our TMDB-backed
-                // hub / Discover covers (and library items added from them) are `tmdb:<id>` (see
-                // TMDBClient's `"tmdb:\(id)"`). Capturing ONLY imdb dropped every tmdb-keyed cover AND
-                // any Trakt record that lacks an imdb id, so a title watched on Trakt showed as
-                // unwatched (issue #143). Same id-mismatch class the trickplay tmdb-identity fix killed.
-                //
-                // `titleIdentities` is the ONE place that shape is spelled (see `TraktWatchedFold`), reused
-                // for the episode keys below so a show's episodes are indexed under exactly the identities
-                // its title is, and the two grains can never disagree about how this show is named.
-                let identities = TraktWatchedFold.titleIdentities(ids, isSeries: isSeries)
-                for identity in identities { next.insert(identity) }
-                // A title Trakt returns with NEITHER imdb nor tmdb cannot be matched to any cover, so it
-                // is simply absent from the set (no badge). We never guess an identity it did not give us.
-                // The same holds for its episodes: no identity means no episode key either, which is why
-                // a non-empty episode set always implies a non-empty title set.
-                if isSeries, !identities.isEmpty, nextEpisodes.count < Self.episodeKeyCap {
-                    Self.foldEpisodes(row["seasons"], identities: identities, into: &nextEpisodes)
+    /// Fetch a complete paginated badge snapshot, then publish its sets, cursor, and read version
+    /// in one lock-protected persistence transaction. Nothing commits on a failed page/leg/boundary.
+    private func pullWatched(
+        expectedSession: TraktSessionID, gen: Int, purpose: TraktWatchedReadPurpose = .badgeImport
+    ) async {
+        guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else { return }
+        let context: (flight: UUID, fingerprint: String?, version: Int?)? = lock.withLock {
+            guard !snapshotPersistenceBlocked, generation == gen, stateSessionID == expectedSession,
+                  watchedReadFlight == nil else { return nil }
+            let flight = UUID()
+            watchedReadFlight = flight
+            let seenVersion = watchedShowInventory != nil && watchedInventoryRevision != nil ? watchedReadVersion : nil
+            return (flight, lastActivityFingerprint, seenVersion)
+        }
+        guard let context else { return }
+        let flight = context.flight
+        defer { finishWatchedRead(flight: flight) }
+        let snapshot: TraktWatchedSnapshotReader.Snapshot
+        do {
+            let complete = try await TraktWatchedSnapshotReader.read(
+                previousFingerprint: context.fingerprint,
+                previousReadVersion: context.version,
+                isCurrent: { self.watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) },
+                parsingIsCurrent: { self.watchedParsingIsCurrent(expectedSession: expectedSession, gen: gen) },
+                request: { path in
+                    try await self.watchedData(path: path, expectedSession: expectedSession, gen: gen, purpose: purpose)
                 }
+            )
+            guard let complete else {
+                guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else { return }
+                lock.withLock {
+                    if generation == gen, stateSessionID == expectedSession, watchedReadFlight == flight {
+                        lastWatchedRead = Date()
+                    }
+                }
+                return
             }
+            snapshot = complete
+        } catch {
+            // Provider failures, oversized/incomplete traversals, stale sessions and cancellation
+            // leave the prior complete cache, cursor and pending queue exactly as they were.
+            return
         }
-        // Stamp the fingerprint once BOTH legs actually answered, even if the account has nothing watched
-        // (an empty but truthful result), so the gate can skip the next poll instead of re-pulling forever.
-        if moviesOK, showsOK, let fingerprint {
-            lock.lock()
-            if generation == gen,
-               stateSessionID == expectedSession,
-               TraktAuth.storedSessionID == expectedSession {
-                lastActivityFingerprint = fingerprint
-                persistLocked()
+        // Evaluate external intent outside the engine lock: a caller predicate is never invoked
+        // under our lock. The consumer independently fences its own publication after this await.
+        guard Self.watchedPurposeIsCurrent(purpose) else { return }
+        let prepared: (candidate: PersistedSnapshot, data: Data, changed: Bool)? = lock.withLock {
+            guard !Task.isCancelled,
+                  generation == gen,
+                  watchedReadFlight == flight,
+                  stateSessionID == expectedSession,
+                  TraktAuth.storedSessionID == expectedSession else { return nil }
+            let changed = snapshot.watchedIDs != watchedIDs || snapshot.episodeKeys != watchedEpisodeKeys
+            let revision = UUID()
+            // Preflight the complete retained envelope before publishing any part of the transaction.
+            // Raw inventory rows can be large; overflow must not become a partial or memory-only cursor.
+            let candidate = PersistedSnapshot(sessionID: expectedSession,
+                watchedIDs: Array(snapshot.watchedIDs), watchedEpisodeKeys: Array(snapshot.episodeKeys),
+                pendingPushes: pendingPushes.filter { $0.sessionID == expectedSession },
+                lastActivityFingerprint: snapshot.activityFingerprint,
+                watchedReadVersion: TraktWatchedSnapshotReader.readVersion,
+                watchedShowInventory: snapshot.shows, watchedInventoryRevision: revision)
+            guard let data = persistedDataLocked(candidate) else { return nil }
+            return (candidate, data, changed)
+        }
+        guard let prepared else { return }
+        // Recheck Home intent after potentially expensive envelope encoding. If a queue edit or
+        // reset wins while unlocked, discard this candidate instead of overwriting the newer state.
+        guard Self.watchedPurposeIsCurrent(purpose) else { return }
+        let committed = lock.withLock {
+            guard !Task.isCancelled, generation == gen, stateSessionID == expectedSession,
+                  watchedReadFlight == flight, pendingPushes == prepared.candidate.pendingPushes,
+                  TraktAuth.storedSessionID == expectedSession else { return false }
+            guard let storage = Self.storage else { return false }
+            do {
+                try storage.save(prepared.data)
+            } catch {
+                // A bounded candidate is not a durable replace acknowledgement. Keep all old memory
+                // state/cursors when protected persistence is unavailable; a later pull can retry.
+                return false
             }
-            lock.unlock()
+            watchedIDs = snapshot.watchedIDs
+            watchedEpisodeKeys = snapshot.episodeKeys
+            lastActivityFingerprint = snapshot.activityFingerprint
+            watchedReadVersion = TraktWatchedSnapshotReader.readVersion
+            watchedShowInventory = snapshot.shows
+            watchedInventoryRevision = prepared.candidate.watchedInventoryRevision
+            lastWatchedRead = Date()
+            // The one saved envelope includes both sets and cursor, even if only its version changed.
+            return true
         }
-        // COMMIT GATE. Both legs must have answered before the caches are replaced. The pull is a REPLACE,
-        // not a merge, so committing a half-result (movies 200, shows offline) would silently drop every
-        // show badge until the next good pull, contradicting this type's "a failed leg contributes nothing"
-        // contract. Requiring both legs keeps the last good cache whole on a partial failure. `next` empty
-        // with both legs OK is a truthful empty account result and replaces stale state.
-        guard moviesOK, showsOK else { return }
-        lock.lock()
-        // A disconnect while this pull was in flight wiped watchedIDs and bumped generation; do NOT write
-        // the pre-reset set back, or the imported badges would resurrect after the user disconnected.
-        guard generation == gen,
-              stateSessionID == expectedSession,
-              TraktAuth.storedSessionID == expectedSession else { lock.unlock(); return }
-        let changed = next != watchedIDs || nextEpisodes != watchedEpisodeKeys
-        watchedIDs = next
-        watchedEpisodeKeys = nextEpisodes
-        if changed { persistLocked() }
-        lock.unlock()
-        if changed {
+        guard committed else { return }
+        if prepared.changed && ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) {
             await MainActor.run { WatchedIndex.shared.externalShadowChanged() }
         }
     }
 
-    /// Fold one show row's `seasons` array into `keys`, one key per (identity, season, episode). Trakt only
-    /// lists an episode here once it has been watched, so mere PRESENCE is the watched signal; `plays` is
-    /// not consulted (a row with 0 plays does not occur, and treating it as unwatched would drop badges).
-    /// Tolerant of every shape it does not recognize: a missing / malformed season or episode number is
-    /// skipped rather than guessed.
-    private static func foldEpisodes(_ seasons: Any?, identities: [String], into keys: inout Set<String>) {
-        guard let seasons = seasons as? [[String: Any]] else { return }
-        for season in seasons {
-            guard let seasonNumber = TraktWatchedFold.nonNegativeInt(season["number"]),
-                  let episodes = season["episodes"] as? [[String: Any]] else { continue }
-            for episode in episodes {
-                guard let episodeNumber = TraktWatchedFold.nonNegativeInt(episode["number"]) else { continue }
-                guard keys.count < episodeKeyCap else { return }
-                for identity in identities { keys.insert(TraktWatchedFold.episodeKey(identity, seasonNumber, episodeNumber)) }
-            }
+    /// Synchronous fence usable before/after every network/token suspension and immediately at commit.
+    private static func watchedPurposeIsCurrent(_ purpose: TraktWatchedReadPurpose) -> Bool {
+        guard !Task.isCancelled else { return false }
+        switch purpose {
+        case .badgeImport: return ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false)
+        case .selectedContinueWatching(let isCurrent): return isCurrent()
         }
     }
 
-    /// `<movies.watched_at>|<episodes.watched_at>` from GET /sync/last_activities, or nil on any failure.
-    ///
-    /// Deliberately NOT the response's `all` timestamp: `all` moves on ANY account activity (a rating, a
-    /// comment, a list edit), so gating on it would re-pull the whole library for changes that cannot
-    /// affect a watched badge. These two timestamps are exactly the ones that can.
-    private func watchedActivityFingerprint(expectedSession: TraktSessionID) async -> String? {
-        guard let json = await getJSONObject(
-            path: "/sync/last_activities",
-            expectedSession: expectedSession
-        ) else { return nil }
-        let movies = (json["movies"] as? [String: Any])?["watched_at"] as? String
-        let episodes = (json["episodes"] as? [String: Any])?["watched_at"] as? String
-        guard movies != nil || episodes != nil else { return nil }
-        return "\(movies ?? "-")|\(episodes ?? "-")"
+    private func finishWatchedRead(flight: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        if watchedReadFlight == flight { watchedReadFlight = nil }
     }
 
-    /// Authenticated GET returning the raw JSON array, or nil on any failure.
-    ///
-    /// NOTE: no `extended` parameter, deliberately. Trakt's default for `/sync/watched/shows` INCLUDES the
-    /// per-season / per-episode breakdown that `foldEpisodes` reads; adding `extended=noseasons` here would
-    /// silently strip it and reduce the episode shadow to nothing. If a future caller wants a lighter
-    /// response, it must not do it by narrowing this request.
-    private func getWatched(
-        type: String,
-        expectedSession: TraktSessionID
-    ) async -> [[String: Any]]? {
-        await getJSON(
-            path: "/sync/watched/\(type)",
-            expectedSession: expectedSession
-        ) as? [[String: Any]]
+    /// Cheap loop fence: no Keychain, defaults, or caller callbacks. The generation preserves ABA
+    /// protection even if a reset rebinds to an equal session identifier during parsing.
+    private func watchedParsingIsCurrent(expectedSession: TraktSessionID, gen: Int) -> Bool {
+        guard !Task.isCancelled else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return generation == gen && stateSessionID == expectedSession
     }
 
-    /// Authenticated GET returning a raw JSON object, or nil on any failure.
-    private func getJSONObject(path: String, expectedSession: TraktSessionID) async -> [String: Any]? {
-        await getJSON(path: path, expectedSession: expectedSession) as? [String: Any]
+    private func watchedPullIsCurrent(
+        expectedSession: TraktSessionID, gen: Int, purpose: TraktWatchedReadPurpose
+    ) -> Bool {
+        guard Self.watchedPurposeIsCurrent(purpose) else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return generation == gen && stateSessionID == expectedSession
+            && TraktAuth.storedSessionID == expectedSession
     }
 
-    /// Authenticated GET returning whatever JSON the endpoint sent, or nil on any failure (no token, bad
-    /// URL, transport error, non-200, unparseable body). Every read here is fail-soft by contract, so the
-    /// callers only ever distinguish "got it" from "did not".
-    private func getJSON(path: String, expectedSession: TraktSessionID) async -> Any? {
-        guard let token = try? await TraktAuth.shared.validToken(for: expectedSession),
-              let url = URL(string: TraktAuth.apiBase + path) else { return nil }
+    /// Keep the existing guarded bearer transport, endpoint, timeout, redirect policy and 8 MiB
+    /// streamed response cap. Only constant reader-owned paths/queries are passed to this method.
+    private func watchedData(
+        path: String, expectedSession: TraktSessionID, gen: Int, purpose: TraktWatchedReadPurpose
+    ) async throws -> Data {
+        guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else {
+            throw CancellationError()
+        }
+        let token = try await TraktAuth.shared.validToken(for: expectedSession)
+        guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose),
+              let url = URL(string: TraktAuth.apiBase + path) else { throw CancellationError() }
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
         request.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let response = try? await AuthenticatedHTTPTransport.shared.send(
-                  request,
-                  allowedHosts: ["api.trakt.tv"],
-                  maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
-              ),
-              response.statusCode == 200,
-              await TraktAuth.shared.sessionID == expectedSession,
-              let json = try? AuthenticatedHTTPTransport.jsonObject(from: response.data) else { return nil }
-        return json
+        let response = try await AuthenticatedHTTPTransport.shared.send(
+            request,
+            allowedHosts: ["api.trakt.tv"],
+            maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+        )
+        guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else {
+            throw CancellationError()
+        }
+        guard response.statusCode == 200 else { throw AuthenticatedHTTPTransportError.invalidResponse }
+        return response.data
     }
 
     // MARK: - Retry queue (offline pushes)
@@ -442,8 +489,9 @@ final class TraktSyncEngine {
     /// set/clear. Only the title-level identity is stored, so a replay is idempotent enough for Trakt.
     ///
     /// `rating` / `ratedAtEpoch` are Optionals and carry the ratings payload only. Optionals decode as nil
-    /// when the key is absent, so a queue file written before ratings existed still decodes (the whole
-    /// array is decoded with one `try?`, so a single un-decodable row would drop every queued push).
+    /// when the key is absent, so a queue file written before ratings existed still decodes. Envelope
+    /// admission isolates unknown rows before decoding this executable projection; those rows remain
+    /// raw in same-session storage rather than being discarded or interpreted as new actions.
     struct PendingPush: Codable, Sendable, Equatable {
         enum Kind: String, Codable, Sendable {
             case watchlistAdd, watchlistRemove, watched
@@ -530,36 +578,36 @@ final class TraktSyncEngine {
 
     /// Re-attempt every queued push; keep the ones that still fail. Runs inside `refreshIfStale`.
     private func drainQueue(expectedSession: TraktSessionID, gen: Int) async {
-        lock.lock()
-        guard generation == gen,
-              stateSessionID == expectedSession,
-              TraktAuth.storedSessionID == expectedSession else { lock.unlock(); return }
-        let queue = pendingPushes
-        lock.unlock()
-        guard !queue.isEmpty else { return }
+        let capturedQueue: [PendingPush]? = lock.withLock {
+            guard generation == gen,
+                  stateSessionID == expectedSession,
+                  TraktAuth.storedSessionID == expectedSession else { return nil }
+            return pendingPushes
+        }
+        guard let queue = capturedQueue, !queue.isEmpty else { return }
         var stillFailing: [PendingPush] = []
         for push in queue {
             if await send(push, expectedSession: expectedSession) == false { stillFailing.append(push) }
         }
-        lock.lock()
-        // A disconnect/reset while we were sending bumps generation and wipes the queue. Writing our
-        // pre-reset survivors back here would resurrect the wiped queue and let a push drain into the
-        // NEXT account that signs in on this device (the cross-account contamination reset() prevents).
-        // Drop the stale result; the live (empty) queue stands.
-        guard generation == gen,
-              stateSessionID == expectedSession,
-              TraktAuth.storedSessionID == expectedSession else { lock.unlock(); return }
-        // Merge, do not overwrite: enqueue() may have appended pushes while our sends were awaiting
-        // (a watched-mark made mid-drain). Overwriting pendingPushes with stillFailing alone would
-        // silently drop those for a still-connected provider. Keep the survivors, then append anything
-        // added since the drained snapshot, deduped and capped as enqueue() does.
-        let appendedDuringDrain = pendingPushes.filter { !queue.contains($0) }
-        var merged = stillFailing
-        for push in appendedDuringDrain where !merged.contains(push) { merged.append(push) }
-        if merged.count > Self.queueCap { merged.removeFirst(merged.count - Self.queueCap) }
-        pendingPushes = merged
-        persistLocked()
-        lock.unlock()
+        lock.withLock {
+            // A disconnect/reset while we were sending bumps generation and wipes the queue. Writing our
+            // pre-reset survivors back here would resurrect the wiped queue and let a push drain into the
+            // NEXT account that signs in on this device (the cross-account contamination reset() prevents).
+            // Drop the stale result; the live (empty) queue stands.
+            guard generation == gen,
+                  stateSessionID == expectedSession,
+                  TraktAuth.storedSessionID == expectedSession else { return }
+            // Merge, do not overwrite: enqueue() may have appended pushes while our sends were awaiting
+            // (a watched-mark made mid-drain). Overwriting pendingPushes with stillFailing alone would
+            // silently drop those for a still-connected provider. Keep the survivors, then append anything
+            // added since the drained snapshot, deduped and capped as enqueue() does.
+            let appendedDuringDrain = pendingPushes.filter { !queue.contains($0) }
+            var merged = stillFailing
+            for push in appendedDuringDrain where !merged.contains(push) { merged.append(push) }
+            if merged.count > Self.queueCap { merged.removeFirst(merged.count - Self.queueCap) }
+            pendingPushes = merged
+            persistLocked()
+        }
     }
 
     /// Send one queued push through `TraktService`. Returns true on success (or when the push carries no
@@ -570,6 +618,9 @@ final class TraktSyncEngine {
         guard let sessionID = push.sessionID,
               sessionID == expectedSession,
               TraktAuth.storedSessionID == sessionID else { return true }
+        // Disk admission already quarantines these. This extra fence also prevents an unusable
+        // in-memory caller value from becoming a different action or a successful no-send deletion.
+        guard Self.usablePendingAction(push) else { return false }
         let ids = TraktIDs(imdb: (push.imdb?.isEmpty == false) ? push.imdb : nil, tmdb: push.tmdb)
         guard ids.imdb != nil || ids.tmdb != nil else { return true }
         let items: TraktSyncItems = push.isSeries
@@ -602,9 +653,7 @@ final class TraktSyncEngine {
                     )
                 }
             case .ratingSet:
-                // A queued rating with no value is malformed and can never succeed; drop it (return true)
-                // rather than retry it forever.
-                guard let rating = push.rating else { return true }
+                guard let rating = push.rating else { return false }
                 // Send the ORIGINAL rated_at, not "now": the local shadow's newer-wins merge compares
                 // against this stamp, and a drain-time stamp would make Trakt look newer than the local
                 // entry it came from.
@@ -644,26 +693,88 @@ final class TraktSyncEngine {
 
     // MARK: - Protected persistence
 
-    private static func load(for sessionID: TraktSessionID) -> PersistedSnapshot? {
-        guard let storage else { return nil }
+    private struct LoadedSnapshot {
+        let snapshot: PersistedSnapshot?
+        let retention: TraktSyncSnapshotEnvelope?
+        let blocked: Bool
+    }
+    private static func load(for sessionID: TraktSessionID) -> LoadedSnapshot {
+        let empty = LoadedSnapshot(snapshot: nil, retention: nil, blocked: false)
+        let blocked = LoadedSnapshot(snapshot: nil, retention: nil, blocked: true)
+        guard let storage else { return empty }
         let data: Data
         do {
-            guard let stored = try storage.load() else { return nil }
+            guard let stored = try storage.load() else { return empty }
             data = stored
         } catch {
-            try? storage.reset()
-            return nil
+            return blocked
         }
-        guard let snapshot = try? JSONDecoder().decode(PersistedSnapshot.self, from: data),
-              snapshot.sessionID == sessionID else {
+        do {
+            let prepared = try TraktSyncSnapshotEnvelope.prepare(data, expectedSession: sessionID) { row in
+                Self.pendingRowKey(row, expectedSession: sessionID)
+            }
+            let snapshot = try JSONDecoder().decode(PersistedSnapshot.self, from: prepared.owned)
+            guard snapshot.sessionID == sessionID,
+                  snapshot.watchedEpisodeKeys.count <= episodeKeyCap,
+                  snapshot.watchedIDs.count <= TraktWatchedSnapshotReader.Limits().rows * 3 else { return blocked }
+            if let entries = snapshot.watchedShowInventory {
+                guard entries.count <= TraktWatchedSnapshotReader.Limits().rows,
+                      Set(entries.map(\.traktID)).count == entries.count else { return blocked }
+            }
+            return LoadedSnapshot(snapshot: snapshot, retention: prepared.retention, blocked: false)
+        } catch TraktSyncSnapshotEnvelope.Failure.wrongSession {
+            // Established foreign owner: keep the existing account-boundary reset behavior.
             try? storage.reset()
-            return nil
+            return empty
+        } catch {
+            // Unknown/malformed/over-budget same-file state cannot be retained safely. Do not turn
+            // that into permission to erase it or overwrite it with a lossy projection.
+            return blocked
         }
-        return snapshot
+    }
+
+    private static func pendingRowKey(_ row: Data, expectedSession: TraktSessionID) -> Data? {
+        guard let push = try? JSONDecoder().decode(PendingPush.self, from: row),
+              push.sessionID == expectedSession, usablePendingAction(push) else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(push)
+    }
+
+    /// Codable is only a shape check, not permission to execute a queued action. Unusable source
+    /// rows are kept byte-for-byte by the envelope's opaque lane; they never enter pendingPushes.
+    private static func usablePendingAction(_ push: PendingPush) -> Bool {
+        let imdb = push.imdb ?? ""
+        if !imdb.isEmpty {
+            guard imdb.utf8.count <= 32, imdb.hasPrefix("tt"), imdb.utf8.count > 2,
+                  imdb.dropFirst(2).utf8.allSatisfy({ (48...57).contains($0) }) else { return false }
+        }
+        if let tmdb = push.tmdb, tmdb <= 0 { return false }
+        guard !imdb.isEmpty || push.tmdb != nil else { return false }
+        if let stamp = push.ratedAtEpoch, !stamp.isFinite { return false }
+        switch push.kind {
+        case .watched:
+            // Actual recordWatched/scrobbleItem callers require episode coordinates for a show.
+            // A whole-show watched row must never fall through to a movie with the same numeric id.
+            if push.isSeries {
+                guard let season = push.season, let episode = push.episode,
+                      season >= 0, episode >= 0 else { return false }
+            }
+            return push.rating == nil && push.ratedAtEpoch == nil
+        case .watchlistAdd, .watchlistRemove:
+            // Actual watchlist callers queue title-level intent but may copy episode coordinates.
+            return push.rating == nil && push.ratedAtEpoch == nil
+        case .ratingSet:
+            guard let rating = push.rating, (1...10).contains(rating) else { return false }
+            return push.season == nil && push.episode == nil
+        case .ratingRemove:
+            return push.rating == nil && push.season == nil && push.episode == nil
+        }
     }
 
     /// Called only with `lock` held, so no stale save can overtake a boundary reset.
     private func persistLocked() {
+        guard !snapshotPersistenceBlocked else { return }
         guard let storage = Self.storage, let stateSessionID else {
             try? Self.storage?.reset()
             return
@@ -673,9 +784,30 @@ final class TraktSyncEngine {
             watchedIDs: Array(watchedIDs),
             watchedEpisodeKeys: Array(watchedEpisodeKeys),
             pendingPushes: pendingPushes.filter { $0.sessionID == stateSessionID },
-            lastActivityFingerprint: lastActivityFingerprint
+            lastActivityFingerprint: lastActivityFingerprint,
+            watchedReadVersion: watchedReadVersion,
+            watchedShowInventory: watchedShowInventory,
+            watchedInventoryRevision: watchedInventoryRevision
         )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        guard let data = persistedDataLocked(snapshot) else { return }
         try? storage.save(data)
+    }
+
+    private func persistedDataLocked(_ snapshot: PersistedSnapshot) -> Data? {
+        guard !snapshotPersistenceBlocked, let stateSessionID,
+              snapshot.sessionID == stateSessionID,
+              TraktAuth.storedSessionID == stateSessionID else { return nil }
+        guard let owned = try? JSONEncoder().encode(snapshot),
+              owned.count <= TraktSyncSnapshotEnvelope.maximumBytes else { return nil }
+        let data: Data
+        if let snapshotRetention {
+            guard let retained = try? snapshotRetention.merging(owned, expectedSession: stateSessionID, knownRowKey: {
+                Self.pendingRowKey($0, expectedSession: stateSessionID)
+            }) else { return nil }
+            data = retained
+        } else {
+            data = owned
+        }
+        return data
     }
 }

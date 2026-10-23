@@ -57,6 +57,25 @@ class NativeProviderBatchTest {
         assertEquals((0 until 22).filter { it != 2 }.map { "p$it" }, last.pages.map { it.groups.single().addonId })
     }
 
+    @Test fun `admission follows registry order on a multi threaded dispatcher`() = runBlocking {
+        // Before ordered admission, every provider raced for a slot, so a fast later provider could be
+        // queried ahead of the user's earlier ones. Repeat to make that race show up reliably.
+        repeat(25) {
+            val release = CompletableDeferred<Unit>()
+            val admitted = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val slowEntered = Channel<Unit>(Channel.UNLIMITED)
+            val batch = async(Dispatchers.Default) { collectNativeProviderBatch(legs(22), load = { leg ->
+                admitted += leg.addon.id
+                if (leg.addon.id in setOf("p0", "p1", "p2", "p3")) { slowEntered.send(Unit); release.await() }
+                page(leg)
+            }) {} }
+            repeat(4) { withTimeout(2000) { slowEntered.receive() } }
+            assertEquals(listOf("p0", "p1", "p2", "p3"), admitted.toList())
+            release.complete(Unit); batch.await()
+            assertEquals(22, admitted.size)
+        }
+    }
+
     @Test fun `metadata two and streams four are independent admission queues`() = runBlocking {
         val currentMeta = AtomicInteger(); val currentStream = AtomicInteger()
         val peakMeta = AtomicInteger(); val peakStream = AtomicInteger()

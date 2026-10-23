@@ -247,6 +247,12 @@ object PosterArtwork {
         return if (ERDB.isActive) ERDB.imageURL("poster", id, fallback) else XRDB.imageURL("poster", id, fallback)
     }
 
+    /**
+     * Whether a card showing a clean wide backdrop should draw its OWN rating badge: the ratings feature is
+     * on and the backdrop is not itself baked (only ERDB bakes backdrops). Apple landscape `active` rule.
+     */
+    val badgesBackdrops: Boolean get() = bakesRatings && !ERDB.isActive
+
     /** Backdrop image URL. ERDB when active (it bakes ratings/quality on backdrops too), else the original. */
     fun backdrop(id: String, fallback: String?): String? =
         if (ERDB.isActive) ERDB.imageURL("backdrop", id, fallback) else fallback

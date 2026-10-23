@@ -4,6 +4,7 @@ import AppKit
 @MainActor final class MacPlayerHost {
     static let shared = MacPlayerHost()
     var content: Bool?
+    var chromeVisible = true
 }
 
 @main enum MacWindowChromeLifecycleTests {
@@ -41,10 +42,18 @@ import AppKit
         precondition(restoredHost !== firstNativeParent, "failed fullscreen entry must not suspend controls forever")
 
         MacPlayerHost.shared.content = true
-        restoredHost.isHidden = true
         NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: first)
-        precondition(restoredHost.isHidden, "playback must remain chrome-free")
+        precondition(!restoredHost.isHidden && restoredHost.alphaValue == 1, "playback shows the buttons with its controls")
+        MacPlayerHost.shared.chromeVisible = false
+        NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: first)
+        precondition(restoredHost.isHidden, "the buttons hide with the player's controls")
+        MacPlayerHost.shared.chromeVisible = true
+        NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: first)
+        precondition(!restoredHost.isHidden && restoredHost.alphaValue == 1, "moving the pointer brings them back")
+        MacPlayerHost.shared.chromeVisible = false
+        NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: first)
         MacPlayerHost.shared.content = nil
+        MacPlayerHost.shared.chromeVisible = true
         NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: first)
         precondition(!restoredHost.isHidden, "dismissal restores normal controls")
 
@@ -64,6 +73,6 @@ import AppKit
         NotificationCenter.default.post(name: NSWindow.didUpdateNotification, object: second)
         precondition(secondHost.isHidden, "dismantle must remove observers and pending repairs")
         precondition(!first.isVisible && !second.isVisible && first.toolbar == nil && second.toolbar == nil)
-        print("PASS offscreen MacWindowChrome lifecycle: real view attachment, fullscreen handoff/cancellation, player suppression/dismissal, detach/reattach, dismantle, no toolbar or playback")
+        print("PASS offscreen MacWindowChrome lifecycle: real view attachment, fullscreen handoff/cancellation, buttons following player controls, dismissal, detach/reattach, dismantle, no toolbar or playback")
     }
 }

@@ -9,7 +9,9 @@ import {
   resetComplete,
   checkUsername,
   TotpRequiredError,
-  type Session,
+  createAuthSurface, retireAuthSurface, beginAuthAttempt, authAttemptCurrent, authEffectCurrent,
+  completeMemoryOnly, pendingAuthOperation, resumeAuthOperation, recoveryCodeFor, acknowledgeRecoveryCode,
+  onSessionAuthority, sessionOwner, authTransitionFrom, pendingAuthPersistence, resolveAuthPersistence, type AuthSurface, type AuthAttempt, type AuthEffect, type AuthResult,
 } from "../lib/vault";
 
 // The VortX account screen for the webapp, ported from the website's login controller (the same state
@@ -36,10 +38,43 @@ let needTotp = false; // sign-in revealed the 2FA field after a TotpRequiredErro
 let pendingRecoveryCode = ""; // the just-minted code shown on the "created" step
 let usernameTimer = 0; // debounce handle for the availability check
 let hostEl: HTMLElement | null = null;
+let surface: AuthSurface | undefined, attempt: AuthAttempt | undefined, effect: AuthEffect | undefined;
+let viewGeneration = 0, unsubscribeOwner: (() => void) | undefined;
+let statusText = "", allowMemory = false;
+function scrub(): void {
+  hostEl?.querySelectorAll<HTMLInputElement>("input").forEach((node) => { node.value = ""; node.removeAttribute("value"); });
+  const code = field("reccode"); if (code) code.textContent = "";
+  pendingRecoveryCode = "";
+}
+export function disposeLogin(): void {
+  if (surface) retireAuthSurface(surface);
+  window.clearTimeout(usernameTimer); unsubscribeOwner?.(); unsubscribeOwner = undefined;
+  window.removeEventListener("pagehide", disposeLogin);
+  scrub(); allowMemory = false; hostEl = null; surface = undefined; attempt = undefined; effect = undefined; viewGeneration++;
+}
+function currentView(generation: number, lease: AuthSurface | undefined): boolean {
+  return !!hostEl && generation === viewGeneration && lease === surface;
+}
+function actionError(x: unknown): string {
+  const pending = pendingAuthOperation();
+  if (pending?.outcome === "unknown") return "The server outcome is unknown. Keep this tab open; do not repeat this account operation.";
+  if (pending?.outcome === "accepted") return "The server accepted the operation. Its setup material remains in this tab; use Resume setup, not another request.";
+  return message(x);
+}
 
 /** Paint the account screen into `host`. The signed-in state shows the dash step; otherwise sign-in. */
 export function renderLogin(host: HTMLElement): void {
-  hostEl = host;
+  disposeLogin();
+  hostEl = host; surface = createAuthSurface();
+  statusText = sessionOwner().mode === "blocked" ? "This account is retained, but storage ownership is blocked. No guest fallback was used." : "";
+  const unsubscribe = onSessionAuthority((origin) => {
+    if (unsubscribeOwner !== unsubscribe || hostEl !== host) return; // a retired batch listener cannot affect its replacement
+    if (origin && surface && authTransitionFrom(origin, surface)) return; // exact self-transition, never suppress a rival
+    const target = hostEl;
+    if (target) renderLogin(target);
+  });
+  unsubscribeOwner = unsubscribe;
+  window.addEventListener("pagehide", disposeLogin);
   needTotp = false;
   pendingRecoveryCode = "";
   step = currentSession() ? "dash" : "in";
@@ -49,15 +84,32 @@ export function renderLogin(host: HTMLElement): void {
 /** Re-render the current step into the host (idempotent; called after every state change). */
 function render(): void {
   if (!hostEl) return;
+  viewGeneration++;
   hostEl.innerHTML = `
     <div class="auth-screen">
       <p class="t-eyebrow">VortX account</p>
       <h1 class="t-screen auth-title">Your sync, end to end encrypted.</h1>
       <p class="t-body auth-lead">Your profiles, settings, library, and history on every device. Your password is the key, so no VortX server can ever read your data.</p>
+      <p class="auth-error" id="auth-status" role="status">${escapeHtml(statusText)}</p>
+      <div id="auth-pending" role="status" aria-live="polite">${pendingMarkup()}</div>
       ${stepMarkup()}
       <p class="t-label auth-footnote muted">End to end encrypted. Your password and keys never leave this tab.</p>
     </div>`;
   wireForms();
+}
+
+function pendingMarkup(): string {
+  const pending = pendingAuthOperation(), unresolved = pendingAuthPersistence();
+  const warning = pending ? '<p class="auth-hint">An account operation is retained in this tab. Keep this tab open until setup is resolved; closing it can lose its private recovery material.</p>' : "";
+  const unknown = pending?.outcome === "unknown" ? '<p class="auth-hint">The server outcome is unknown. Do not repeat this operation.</p>' : "";
+  const resume = pending?.resumable && !unresolved ? '<button class="chip" data-action="resume-setup">Resume accepted setup</button>' : "";
+  const resolve = unresolved ? '<button class="chip" data-action="resolve-save">Check unresolved local save</button>' : "";
+  const memory = allowMemory && !unresolved ? '<button class="chip" data-action="auth-memory">Continue in this tab only</button>' : "";
+  return warning + unknown + resume + resolve + memory;
+}
+function updatePending(): void {
+  const node = field("auth-pending");
+  if (node) node.innerHTML = pendingMarkup(); // preserve the current form/attempt and its entered intent
 }
 
 /** The markup for the active step. */
@@ -226,7 +278,7 @@ function wireForms(): void {
  *  detail.ts's handleDetailClick shape so main.ts wires it the same way. */
 export function handleLoginClick(target: EventTarget | null): boolean {
   const hit = actionOf(target);
-  if (!hit) return false;
+  if (!hit || !hostEl?.contains(hit.node)) return false;
   switch (hit.action) {
     case "auth-tab-in":
       needTotp = false;
@@ -246,7 +298,16 @@ export function handleLoginClick(target: EventTarget | null): boolean {
       goto("in");
       return true;
     case "reccode-done":
-      goto("dash");
+      if (effect && acknowledgeRecoveryCode(effect)) { pendingRecoveryCode = ""; goto("dash"); }
+      return true;
+    case "resolve-save":
+      void resolveSave();
+      return true;
+    case "resume-setup":
+      void resumeSetup();
+      return true;
+    case "auth-memory":
+      if (attempt) { try { const result = completeMemoryOnly(attempt); void finishLocal(result); } catch (x) { status(actionError(x)); } }
       return true;
     case "copy-reccode":
       void copyRecoveryCode(hit.node);
@@ -255,8 +316,7 @@ export function handleLoginClick(target: EventTarget | null): boolean {
       void onResetSend(hit.node);
       return true;
     case "sign-out":
-      signOut();
-      goto("in");
+      void signOutHere();
       return true;
     default:
       return false;
@@ -273,165 +333,171 @@ export function wireLogin(host: HTMLElement): void {
 }
 
 function goto(next: Step): void {
-  step = next;
-  render();
+  if (surface) retireAuthSurface(surface);
+  scrub(); allowMemory = false; surface = createAuthSurface(); attempt = undefined; effect = undefined;
+  window.clearTimeout(usernameTimer); step = next; render();
 }
-
-// --- Form handlers ------------------------------------------------------------------------------
-
-async function onSignIn(ev: SubmitEvent): Promise<void> {
-  ev.preventDefault();
-  clearError("in-err");
-  const loginId = inputValue("in-login").trim();
-  const password = inputValue("in-pw");
-  const totp = needTotp ? inputValue("in-totp").trim() : undefined;
-  const btn = submitButton(ev);
-  setBusy(btn, needTotp ? "Verifying…" : "Signing in…");
-  try {
-    const session = await login(loginId, password, totp);
-    await succeed(session);
-  } catch (x: unknown) {
-    if (x instanceof TotpRequiredError) {
-      // 2FA account: reveal the code field IN PLACE and let the user resubmit with it. Do NOT re-render
-      // the form (that rebuilds the inputs and wipes the email/password the user already typed); just
-      // un-hide the existing TOTP row and relabel the button.
-      needTotp = true;
-      const wrap = field<HTMLElement>("in-totp-wrap");
-      if (wrap) wrap.hidden = false;
-      restoreButton(btn, "Verify and sign in");
-      focusField("in-totp");
-    } else {
-      showError("in-err", message(x));
-      restoreButton(btn, needTotp ? "Verify and sign in" : "Sign in");
-    }
-  }
+function status(text: string): void {
+  statusText = text; const node = field("auth-status"); if (node) node.textContent = text;
 }
-
-async function onCreate(ev: SubmitEvent): Promise<void> {
-  ev.preventDefault();
-  clearError("up-err");
-  const email = inputValue("up-email").trim();
-  const username = inputValue("up-username").trim();
-  const password = inputValue("up-pw");
-  const btn = submitButton(ev);
-  setBusy(btn, "Creating…");
-  try {
-    const { session, recoveryCode } = await register(email, username, password);
-    // Persist the session now, but gate the user on saving the one-time recovery code first.
-    adoptSession(session);
-    pendingRecoveryCode = recoveryCode;
-    goto("created");
-  } catch (x: unknown) {
-    showError("up-err", message(x));
-    restoreButton(btn, "Create account");
-  }
+async function signOutHere(): Promise<void> {
+  const target = hostEl;
+  const promise = signOut(); // retires immediately; observer may replace this surface
+  if (!target) return;
+  renderLogin(target);
+  const generation = viewGeneration, lease = surface;
+  status("Signing out of this tab; checking saved session…");
+  const result = await promise;
+  if (currentView(generation, lease)) status(result.status === "not-persisted" ? "Signed out; saved session cleared." : "Signed out in this tab, but the saved session could not be confirmed cleared.");
 }
-
-async function onRecover(ev: SubmitEvent): Promise<void> {
-  ev.preventDefault();
-  clearError("rec-err");
-  const email = inputValue("rec-email").trim();
-  const code = inputValue("rec-code").trim();
-  const password = inputValue("rec-pw");
-  const btn = submitButton(ev);
-  setBusy(btn, "Resetting…");
-  try {
-    const session = await recover(email, code, password);
-    await succeed(session);
-  } catch (x: unknown) {
-    showError("rec-err", message(x));
-    restoreButton(btn, "Reset password");
-  }
-}
-
-async function onResetSend(node: HTMLElement): Promise<void> {
-  const email = inputValue("rs-email").trim();
-  if (!email) {
-    showError("rs-err", "Enter your email first.");
+async function finishLocal(result: AuthResult): Promise<void> {
+  if (!result.effect || !authEffectCurrent(result.effect)) {
+    if (hostEl) { status("The session was not adopted here (" + result.status + "). Saved account material has been preserved."); updatePending(); }
     return;
   }
-  clearError("rs-err");
-  const btn = node as HTMLButtonElement;
-  setBusy(btn, "Sending…");
+  allowMemory = false;
+  const receipt = result.effect;
+  effect = receipt;
+  status(result.status === "memory-only" ? "This tab only — not saved for reload." : "Session saved.");
+  const code = recoveryCodeFor(effect);
+  if (code) { scrub(); pendingRecoveryCode = code; step = "created"; render(); return; }
+  const session = currentSession();
+  scrub();
+  if (session) await hydrateFromAccount(session);
+  if (effect === receipt && authEffectCurrent(receipt)) navigate({ name: "home" });
+}
+async function resolveSave(): Promise<void> {
+  const lease = surface, generation = viewGeneration; if (!lease) return;
+  const result = await resolveAuthPersistence(lease);
+  if (currentView(generation, lease)) await finishLocal(result);
+}
+async function resumeSetup(): Promise<void> {
+  const lease = surface, generation = viewGeneration;
+  if (!lease) return;
   try {
-    await resetStart(email);
-    const sent = field<HTMLElement>("rs-sent");
-    if (sent) sent.hidden = false;
-  } catch {
-    showError("rs-err", "Could not send the code. Try again in a minute.");
-  } finally {
-    restoreButton(btn, "Email me a code");
-  }
+    const result = await resumeAuthOperation(lease);
+    if (currentView(generation, lease)) await finishLocal(result);
+  } catch (x) { if (currentView(generation, lease)) { status(actionError(x)); updatePending(); } }
 }
 
-async function onResetComplete(ev: SubmitEvent): Promise<void> {
+// --- Form handlers: each callback owns the exact form generation and attempt ----------------------
+function beginForm(ev: SubmitEvent, kind: "login" | "register" | "recover" | "reset"): AuthAttempt | null {
   ev.preventDefault();
-  clearError("rs-err");
-  const email = inputValue("rs-email").trim();
-  const code = inputValue("rs-code").trim();
-  const password = inputValue("rs-pw");
-  const btn = submitButton(ev);
-  setBusy(btn, "Resetting…");
+  if (!hostEl || !surface || !hostEl.contains(ev.currentTarget as Node)) return null;
+  try { attempt = beginAuthAttempt(kind, surface); allowMemory = false; updatePending(); return attempt; }
+  catch (x) { status(actionError(x)); return null; }
+}
+async function settleForm(handle: AuthAttempt): Promise<void> {
+  const result = await adoptSession(handle);
+  // A historical persisted result may lack a current effect; never paint it into a newer surface.
+  if (attempt !== handle || !hostEl) return;
+  if (result.effect) { await finishLocal(result); return; }
+  status("Local session save: " + result.status + ". No newer account was replaced.");
+  const mode = sessionOwner().mode;
+  allowMemory = result.status === "not-persisted" && (mode === "guest" || mode === "memory");
+  updatePending();
+}
+async function onSignIn(ev: SubmitEvent): Promise<void> {
+  const handle = beginForm(ev, "login"); if (!handle) return;
+  const generation = viewGeneration, lease = surface;
+  const loginId = inputValue("in-login").trim(), password = inputValue("in-pw");
+  const totp = needTotp ? inputValue("in-totp").trim() : undefined, btn = submitButton(ev);
+  clearError("in-err"); setBusy(btn, needTotp ? "Verifying…" : "Signing in…");
   try {
-    const { session, recoveryCode } = await resetComplete(email, code, password);
-    adoptSession(session);
-    pendingRecoveryCode = recoveryCode;
-    goto("created");
-  } catch (x: unknown) {
-    showError("rs-err", message(x));
-    restoreButton(btn, "Reset and start fresh");
+    await login(loginId, password, totp, handle);
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) await settleForm(handle);
+  } catch (x) {
+    if (!currentView(generation, lease) || !authAttemptCurrent(handle)) return;
+    if (x instanceof TotpRequiredError) {
+      needTotp = true; const wrap = field("in-totp-wrap"); if (wrap) wrap.hidden = false;
+      restoreButton(btn, "Verify and sign in"); focusField("in-totp");
+    } else { showError("in-err", actionError(x)); restoreButton(btn, "Sign in"); }
+  } finally {
+    if (currentView(generation, lease)) updatePending();
   }
 }
-
+async function onCreate(ev: SubmitEvent): Promise<void> {
+  const handle = beginForm(ev, "register"); if (!handle) return;
+  const generation = viewGeneration, lease = surface, btn = submitButton(ev);
+  const email = inputValue("up-email").trim(), username = inputValue("up-username").trim(), password = inputValue("up-pw");
+  clearError("up-err"); setBusy(btn, "Creating…");
+  try {
+    await register(email, username, password, handle);
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) await settleForm(handle);
+  } catch (x) {
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) { showError("up-err", actionError(x)); restoreButton(btn, "Create account"); }
+  } finally {
+    if (currentView(generation, lease)) updatePending();
+  }
+}
+async function onRecover(ev: SubmitEvent): Promise<void> {
+  const handle = beginForm(ev, "recover"); if (!handle) return;
+  const generation = viewGeneration, lease = surface, btn = submitButton(ev);
+  const email = inputValue("rec-email").trim(), code = inputValue("rec-code").trim(), password = inputValue("rec-pw");
+  clearError("rec-err"); setBusy(btn, "Resetting…");
+  try {
+    await recover(email, code, password, handle);
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) await settleForm(handle);
+  } catch (x) {
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) { showError("rec-err", actionError(x)); restoreButton(btn, "Reset password"); }
+  } finally {
+    if (currentView(generation, lease)) updatePending();
+  }
+}
+async function onResetSend(node: HTMLElement): Promise<void> {
+  const generation = viewGeneration, lease = surface;
+  if (!lease || !hostEl?.contains(node)) return;
+  const email = inputValue("rs-email").trim();
+  if (!email) { showError("rs-err", "Enter your email first."); return; }
+  let handle: AuthAttempt;
+  try { handle = attempt = beginAuthAttempt("reset-send", lease); updatePending(); } catch (x) { status(actionError(x)); return; }
+  const btn = node as HTMLButtonElement; setBusy(btn, "Sending…");
+  try {
+    await resetStart(email, handle);
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) { const sent = field("rs-sent"); if (sent) sent.hidden = false; }
+  } catch (x) {
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) showError("rs-err", actionError(x));
+  } finally {
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) { restoreButton(btn, "Email me a code"); updatePending(); }
+  }
+}
+async function onResetComplete(ev: SubmitEvent): Promise<void> {
+  const handle = beginForm(ev, "reset"); if (!handle) return;
+  const generation = viewGeneration, lease = surface, btn = submitButton(ev);
+  const email = inputValue("rs-email").trim(), code = inputValue("rs-code").trim(), password = inputValue("rs-pw");
+  clearError("rs-err"); setBusy(btn, "Resetting…");
+  try {
+    await resetComplete(email, code, password, handle);
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) await settleForm(handle);
+  } catch (x) {
+    if (currentView(generation, lease) && authAttemptCurrent(handle)) { showError("rs-err", actionError(x)); restoreButton(btn, "Reset and start fresh"); }
+  } finally {
+    if (currentView(generation, lease)) updatePending();
+  }
+}
 function onUsernameInput(): void {
   window.clearTimeout(usernameTimer);
-  const value = inputValue("up-username").trim();
-  const hint = field<HTMLElement>("up-uhint");
+  const generation = viewGeneration, lease = surface, input = field<HTMLInputElement>("up-username"), hint = field("up-uhint");
+  const value = input?.value.trim() ?? "";
   if (!hint) return;
-  if (!/^[a-zA-Z0-9_]{3,20}$/.test(value)) {
-    hint.textContent = value ? "3-20 letters, numbers, underscore" : "";
-    hint.className = "auth-hint";
-    return;
-  }
+  if (!/^[a-zA-Z0-9_]{3,20}$/.test(value)) { hint.textContent = value ? "3-20 letters, numbers, underscore" : ""; hint.className = "auth-hint"; return; }
   hint.textContent = "checking…";
-  hint.className = "auth-hint";
+  const valid = () => currentView(generation, lease) && field("up-username") === input && input?.value.trim() === value && field("up-uhint") === hint;
   usernameTimer = window.setTimeout(async () => {
     try {
       const ok = await checkUsername(value);
-      // The user may have moved on (re-render); only write if the hint is still on screen.
-      const live = field<HTMLElement>("up-uhint");
-      if (!live) return;
-      live.textContent = ok ? "available" : "taken";
-      live.className = ok ? "auth-hint ok" : "auth-hint bad";
-    } catch {
-      const live = field<HTMLElement>("up-uhint");
-      if (live) {
-        live.textContent = "";
-        live.className = "auth-hint";
-      }
-    }
+      if (valid()) { hint.textContent = ok ? "available" : "taken"; hint.className = ok ? "auth-hint ok" : "auth-hint bad"; }
+    } catch { if (valid()) { hint.textContent = ""; hint.className = "auth-hint"; } }
   }, 350);
 }
-
-// --- On success ---------------------------------------------------------------------------------
-
-/** vault already saved the session; cache + notify, then go home. (register/reset go via the
- *  recovery-code gate first, then "I saved it, continue" calls goto("dash"); they do not call this.) */
-async function succeed(session: Session): Promise<void> {
-  adoptSession(session);
-  // Pull the account's add-ons / library / metadata keys before showing Home, so a returning user lands
-  // on their populated app instead of a blank slate. Fail-soft (never blocks sign-in).
-  await hydrateFromAccount(session);
-  navigate({ name: "home" });
-}
-
 async function copyRecoveryCode(node: HTMLElement): Promise<void> {
+  const receipt = effect, generation = viewGeneration, lease = surface;
+  if (!receipt || !authEffectCurrent(receipt) || !hostEl?.contains(node)) return;
+  const code = recoveryCodeFor(receipt); if (!code) return;
   try {
-    await navigator.clipboard.writeText(pendingRecoveryCode);
-    node.textContent = "Copied";
-  } catch {
-    // Clipboard blocked (permissions / insecure context): the code is still visible to copy by hand.
-  }
+    await navigator.clipboard.writeText(code);
+    if (currentView(generation, lease) && authEffectCurrent(receipt)) node.textContent = "Copied";
+  } catch { /* requested clipboard write cannot be rolled back; do not paint a retired surface */ }
 }
 
 // --- Small DOM helpers (scoped to the login host) -----------------------------------------------

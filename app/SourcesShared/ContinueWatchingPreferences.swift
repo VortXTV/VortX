@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum ContinueWatchingService: String, Codable, CaseIterable, Sendable {
     case local, trakt, simkl
@@ -17,10 +18,9 @@ enum ContinueWatchingPreferences {
     static let sourceKey = "vortx.home.continueWatching.source"
     static let windowKey = "vortx.home.continueWatching.window"
     static let changedNote = Notification.Name("vortx.home.continueWatching.preferenceChanged")
-    private static let epochLock = NSLock()
-    nonisolated(unsafe) private static var epoch: UInt64 = 0
-    static var selectionEpoch: UInt64 { epochLock.lock(); defer { epochLock.unlock() }; return epoch }
-    static func retireSelection() { epochLock.lock(); epoch &+= 1; epochLock.unlock() }
+    private static let epoch = OSAllocatedUnfairLock(initialState: UInt64(0))
+    static var selectionEpoch: UInt64 { epoch.withLock { $0 } }
+    static func retireSelection() { epoch.withLock { $0 &+= 1 } }
     /// The Picker setter retires old work before its one projection write, even if SwiftUI
     /// coalesces A → B → A into no onChange callback. A same-value setter is a no-op.
     @discardableResult
@@ -53,16 +53,21 @@ enum ContinueWatchingPreferences {
         return parser.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
     /// Unknown activity sorts last for a cap and is excluded from a dated window. Never stamp "now".
+    /// Key closures must be stable and side-effect-free for this call; each row is decorated once.
     static func bounded<T>(_ items: [T], window: ContinueWatchingWindow, now: Date,
                            activity: (T) -> String?, identity: (T) -> String) -> [T] {
-        let ordered = items.enumerated().sorted { a, b in
-            let lhs = Self.activity(activity(a.element)), rhs = Self.activity(activity(b.element))
+        let decorated = items.enumerated().map { entry in
+            (offset: entry.offset, element: entry.element,
+             date: Self.activity(activity(entry.element)), key: identity(entry.element))
+        }
+        let ordered = decorated.sorted { a, b in
+            let lhs = a.date, rhs = b.date
             if lhs != rhs { return (lhs ?? .distantPast) > (rhs ?? .distantPast) }
-            let left = identity(a.element), right = identity(b.element)
+            let left = a.key, right = b.key
             return left == right ? a.offset < b.offset : left < right
-        }.map(\.element)
-        if let cap = window.cap { return Array(ordered.prefix(cap)) }
+        }
+        if let cap = window.cap { return ordered.prefix(cap).map(\.element) }
         let cutoff = now.addingTimeInterval(-90 * 24 * 60 * 60)
-        return ordered.filter { activity($0).flatMap(Self.activity).map { $0 >= cutoff && $0 <= now } ?? false }
+        return ordered.filter { $0.date.map { $0 >= cutoff && $0 <= now } ?? false }.map(\.element)
     }
 }

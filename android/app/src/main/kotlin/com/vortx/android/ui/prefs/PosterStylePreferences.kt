@@ -7,6 +7,7 @@ import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
 
 /**
  * Poster-card presentation preferences (width / corner-radius / landscape / hide-labels), the Kotlin port of
@@ -32,8 +33,9 @@ object PosterStylePreferences {
 
     /**
      * Poster-card WIDTH presets. [compactWidth] is the phone (compact width class) point width, matching
-     * Apple `PosterWidthPreset.compactWidth`; [balanced][BALANCED] is the shipping default. The wire name is
-     * the Apple rawValue so a synced value maps across platforms.
+     * Apple `PosterWidthPreset.compactWidth`; [regularWidth] is the iPad/Mac/Android-tablet width and
+     * [tvWidth] keeps the same relative ladder on a 10-foot poster wall. [balanced][BALANCED] is the
+     * shipping default. The wire name is the Apple rawValue so a synced value maps across platforms.
      */
     enum class WidthPreset(val wire: String, val label: String, val compactWidth: Dp) {
         COMPACT("compact", "Compact", 110.dp),
@@ -42,6 +44,21 @@ object PosterStylePreferences {
         BALANCED("balanced", "Balanced", 168.dp),
         COMFORT("comfort", "Comfort", 186.dp),
         LARGE("large", "Large", 200.dp);
+
+        /** Regular-width baseline from Apple's `PosterWidthPreset.regularWidth` ladder. */
+        val regularWidth: Dp
+            get() = when (this) {
+                COMPACT -> 150.dp
+                DENSE -> 180.dp
+                STANDARD -> 204.dp
+                BALANCED -> 224.dp
+                COMFORT -> 260.dp
+                LARGE -> 320.dp
+            }
+
+        /** TV poster baseline: Apple's regular ladder scaled from 224 to its 200-unit poster baseline. */
+        val tvWidth: Dp
+            get() = (regularWidth.value * 200f / 224f).roundToInt().dp
 
         companion object {
             val DEFAULT = BALANCED

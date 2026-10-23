@@ -226,7 +226,7 @@ object DownloadManager {
      * [requestHeaders] is an explicit parameter rather than being read off [stream], mirroring how the caller
      * already holds the RESOLVED [com.vortx.android.model.Playable] whose `headers` carry the stream's declared
      * `behaviorHints.proxyHeaders.request` (decoded by EngineState.parseStream into [StreamSource.requestHeaders]
-     * and attached at resolve time by EngineStremioRepository.resolve). DetailViewModel.download forwards
+     * and attached at resolve time by NativeCatalogRepository.resolve). DetailViewModel.download forwards
      * `playable.headers` here, so a header-gated CDN (Referer / User-Agent requirement) serves the download the
      * same way it serves playback.
      */

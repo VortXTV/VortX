@@ -86,18 +86,96 @@ def release_detail(tag: str) -> dict:
     return record
 
 
+def project_build_from_yml_text(content: str) -> str:
+    # Accept the tracked block-YAML structure, not arbitrary counts of build-like text.
+    required = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
+    allowed = {*required, "VortX", "CinemaUISmokeRenderer"}
+    targets = {}
+    path = []
+    sections = 0
+
+    def invalid(reason):
+        raise MetadataError(f"app/project.yml {reason}")
+
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        while path and path[-1][0] >= indent:
+            path.pop()
+        keys = [key for _, key in path]
+        header = re.fullmatch(r"( *)([A-Za-z_][A-Za-z0-9_]*):[ \t]*(?:#.*)?", line)
+        mapping = re.match(r"""^( *)(?:"([^"]+)"|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))[ \t]*:""", line)
+        mapping_key = next((value for value in mapping.groups()[1:] if value is not None), None) if mapping else None
+        structural = ((indent == 0 and mapping_key == "targets")
+                      or (len(keys) == 2 and keys[0] == "targets" and indent == 4 and mapping_key == "settings")
+                      or (len(keys) == 3 and keys[0] == "targets" and keys[2] == "settings" and indent == 6 and mapping_key == "base"))
+        if structural and not header:
+            invalid("uses unsupported inline or quoted structural metadata")
+        if re.search(r"\bCURRENT_PROJECT_VERSION\b", line):
+            value = re.fullmatch(r'        CURRENT_PROJECT_VERSION:[ \t]+"([0-9]+)"[ \t]*(?:#.*)?', line)
+            if (not value or len(keys) != 4 or keys[0] != "targets"
+                    or keys[2:] != ["settings", "base"] or [level for level, _ in path] != [0, 2, 4, 6]
+                    or keys[1] not in allowed
+                    or keys[1] == "CinemaUISmokeRenderer"):
+                invalid("has an unexpected or misplaced CURRENT_PROJECT_VERSION")
+            target = targets[keys[1]]
+            if target["build"] is not None:
+                invalid(f"has duplicate build values for {keys[1]}")
+            build = value[1]
+            if not 0 < int(build) <= 9007199254740991:
+                invalid(f"build must be a positive safe integer for {keys[1]}")
+            target["build"] = build
+        if keys == ["targets"] and indent == 2:
+            if not header or header[2] not in allowed:
+                invalid("has an unexpected target declaration")
+            if header[2] in targets:
+                invalid(f"has duplicate target {header[2]}")
+            targets[header[2]] = {"build": None, "settings": False, "base": False}
+        if not header:
+            continue
+        key = header[2]
+        if indent == 0 and key == "targets":
+            sections += 1
+            if sections != 1:
+                invalid("has duplicate targets sections")
+        if keys and keys[0] == "targets" and len(keys) >= 2 and keys[1] in targets:
+            target = targets[keys[1]]
+            if len(keys) == 2 and indent == 4 and key == "settings":
+                if target["settings"]:
+                    invalid(f"has duplicate settings for {keys[1]}")
+                target["settings"] = True
+            if len(keys) == 3 and keys[2] == "settings" and indent == 6 and key == "base":
+                if target["base"]:
+                    invalid(f"has duplicate settings.base for {keys[1]}")
+                target["base"] = True
+        path.append((indent, key))
+    if sections != 1:
+        invalid("must contain one targets section")
+    for name in required:
+        if name not in targets:
+            invalid(f"is missing required target {name}")
+    expected = (*required, *(("VortX",) if "VortX" in targets else ()))
+    builds = []
+    for name in expected:
+        if targets[name]["build"] is None:
+            invalid(f"is missing CURRENT_PROJECT_VERSION for {name}")
+        builds.append(targets[name]["build"])
+    if len(set(builds)) != 1:
+        invalid(f"build values disagree: {builds}")
+    return builds[0]
+
+
 def tag_build(tag: str) -> str:
     result = gh_json("api", f"repos/{REPO}/contents/app/project.yml?ref={tag}")
     try:
         content = base64.b64decode(result["content"]).decode("utf-8")
     except (KeyError, ValueError, UnicodeDecodeError, TypeError) as error:
         raise MetadataError(f"project metadata for {tag} could not be decoded") from error
-    matches = re.findall(r'CURRENT_PROJECT_VERSION:\s*"([0-9]+)"', content)
-    if len(matches) != 6:
-        raise MetadataError(f"project metadata for {tag} has {len(matches)} build values (need six)")
-    if len(set(matches)) != 1:
-        raise MetadataError(f"project metadata for {tag} has inconsistent build values: {matches}")
-    return matches[0]
+    try:
+        return project_build_from_yml_text(content)
+    except MetadataError as error:
+        raise MetadataError(f"project metadata for {tag}: {error}") from error
 
 
 def asset_by_name(assets: list[dict], name: str) -> dict:

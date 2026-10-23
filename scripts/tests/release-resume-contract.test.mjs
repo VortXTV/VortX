@@ -95,7 +95,9 @@ test('actual protected coordinator condition admits only native successful tag b
   assert(!allowed('skipped', 'refs/heads/main', '{}', {}, 'push'));
   assert(!allowed('skipped', 'refs/heads/main', '{}', {}, 'workflow_dispatch', true));
   assert.match(workflow, /if: github.event_name != 'release' && inputs.resume_handoff == ''/);
-  const coordinator = workflow.split('  attach-release:\n')[1].split('  verify-published:\n')[0];
+  // Stop at the next actual job, not a named verifier: a read-only direct-test verifier
+  // was inserted between these jobs and its checkout is not a privileged coordinator checkout.
+  const coordinator = workflow.split('  attach-release:\n')[1].split(/\n  [A-Za-z][A-Za-z0-9_-]*:\n/)[0];
   assert.match(coordinator, /environment: release-approval/);
   assert.doesNotMatch(coordinator, /actions\/checkout|\b(?:bash|node|python3?) scripts\//);
   assert.doesNotMatch(coordinator, /(?:^|\n)\s*(?:export )?GITHUB_SHA=/);

@@ -27,6 +27,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -55,6 +56,7 @@ fun CinemaEpisodeCard(
     onToggleWatched: () -> Unit,
     focusRequester: FocusRequester,
     modifier: Modifier = Modifier,
+    scores: MdbListRatings? = null,
     thumb: @Composable () -> Unit,
 ) {
     val status = cinemaEpisodeStatus(watched, progress)
@@ -71,6 +73,10 @@ fun CinemaEpisodeCard(
             if (watched) {
                 Icon(VortXIcons.checkmarkCircle, "Watched", tint = VortXTheme.colors.accent,
                     modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).size(24.dp))
+            }
+            // The episode's own scores (IMDb, TMDB, Trakt), on the same glass plate the title cards use.
+            scores?.let {
+                RatingScoresPlate(it, modifier = Modifier.align(Alignment.TopStart).padding(8.dp).padding(end = 32.dp))
             }
             progress?.takeIf { it.isFinite() && it > 0f }?.let { fraction ->
                 Box(Modifier.align(Alignment.BottomStart).fillMaxWidth().height(4.dp).background(VortXTheme.colors.surface3)) {

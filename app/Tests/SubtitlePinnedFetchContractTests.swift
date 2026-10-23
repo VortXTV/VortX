@@ -3,6 +3,7 @@
 // Extract the fetcher + policy block, then compile it with the pinned transport and this harness:
 //
 //   { echo 'import Foundation'; echo ''; \
+//     awk '/^enum SubtitleFileBudget/{b=1} b {print} b && /^}/{b=0}' app/Sources/Player/SubtitleCueRenderer.swift; \
 //     awk '/^enum SubtitleFileFetcher \{/{f=1} /^#if canImport\(UIKit\)/{f=0} f' \
 //       app/Sources/Player/SubtitleCueRenderer.swift; } \
 //     > /tmp/subtitle-fetch-policy.swift && \
@@ -57,10 +58,10 @@ struct SubtitlePinnedFetchContractTests {
         try? smallBytes.write(to: small)
         check("file:// subtitle returns exact bytes", awaitFetch(small) == smallBytes)
 
-        // 2. Local file above the 2 MiB ceiling fails closed.
+        // 2. Local file above the shared 8 MiB ceiling fails closed.
         let big = URL(fileURLWithPath: "/tmp/subtitle-contract-big.bin")
-        try? Data(count: 2 * 1024 * 1024 + 1).write(to: big)
-        check("file:// subtitle above 2 MiB fails closed", awaitFetch(big) == nil)
+        try? Data(count: SubtitleFileBudget.maximumBytes + 1).write(to: big)
+        check("file:// subtitle above 8 MiB fails closed", awaitFetch(big) == nil)
 
         // 3. Plain HTTP fails closed: the pinned transport is HTTPS-only and there is no fallback path
         //    that lets URLSession re-resolve the hostname at connect time.

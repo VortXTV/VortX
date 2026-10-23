@@ -141,7 +141,7 @@ final class iOSNextEpisodePreparer: ObservableObject {
         let displayGroups = iOSDisplayGroups(groups)
         let candidates = StreamRanking.rankedCandidates(displayGroups, continuity: context.continuity,
             binge: context.binge, pin: context.pin, sticky: sticky, stickyAuthoritative: false,
-            preserveChosenRelease: true, desiredAudioLanguage: choice.audioLanguage,
+            preserveChosenRelease: true, desiredAudioLanguage: choice.audioLanguage, qualityFloor: choice.resolution,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }, debridCachedHashes: context.cachedHashes)
             .filter { !StreamRanking.continuityLanguageMismatch($0, desired: choice.audioLanguage) }
         guard !candidates.isEmpty, admitted() else { return nil }

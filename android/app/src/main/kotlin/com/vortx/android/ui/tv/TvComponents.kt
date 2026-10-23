@@ -1,5 +1,6 @@
 package com.vortx.android.ui.tv
 
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -325,8 +326,12 @@ fun TvBackdrop(url: String?, seed: String, modifier: Modifier = Modifier, fallba
         urls = listOf(url) + fallbackUrls,
         contentDescription = null,
         modifier = modifier.background(backdropBrush(seed, VortXTheme.colors)),
+        // Settings > Effects and performance > Artwork HD: decode at most 1080p even on a 4K TV.
+        maxDecodePx = if (com.vortx.android.ui.prefs.currentVisualEffects().hdArtworkOnly) HD_LONG_EDGE_PX else null,
     )
 }
+
+private const val HD_LONG_EDGE_PX = 1_920
 
 /// A deterministic two-stop gradient hued around the live accent, seeded by a string so an art-less hero
 /// stays in the current theme family. Mirrors the placeholder idea in
@@ -393,6 +398,8 @@ fun TvFilterChip(
     modifier: Modifier = Modifier,
     stateDescription: String? = null,
     enabled: Boolean = true,
+    /** Optional leading glyph (the Trailer chip's clapperboard, as on Apple TV). */
+    leadingIcon: ImageVector? = null,
 ) {
     val colors = VortXTheme.colors
     val accessibilityStateDescription = stateDescription
@@ -418,13 +425,19 @@ fun TvFilterChip(
             ),
         ),
     ) {
-        Text(
-            text = label,
-            style = VortXTheme.type.label,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        Row(
             modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
-        )
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            leadingIcon?.let { Icon(it, contentDescription = null, modifier = Modifier.size(20.dp)) }
+            Text(
+                text = label,
+                style = VortXTheme.type.label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -515,6 +528,15 @@ internal fun androidx.compose.foundation.layout.BoxScope.TvPosterArt(item: MetaI
             onError = { backdropFailed = true },
             modifier = Modifier.fillMaxSize(),
         )
+        if (item.id.startsWith("tt")) {
+            com.vortx.android.ui.components.CardRatingBadge(
+                id = item.id,
+                type = item.type.id,
+                active = PosterArtwork.badgesBackdrops,
+                textSize = 15,
+                modifier = Modifier.align(Alignment.TopStart).padding(10.dp).padding(end = 48.dp),
+            )
+        }
     }
 }
 

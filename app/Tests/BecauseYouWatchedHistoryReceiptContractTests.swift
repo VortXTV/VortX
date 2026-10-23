@@ -200,8 +200,9 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
         }
         check(account.contains("struct AuthOperationContext") &&
                 account.contains("authOperationStillCurrent(context)") &&
-                account.contains("Self.storeAuthKey(key, account: context.keychainAccount)") &&
-                account.contains("withCredentialMutation(slot: account)") &&
+                account.contains("captureNativeAccountLogin(importOwnerAddons: true)") &&
+                account.contains("try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)") &&
+                account.contains("try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)") &&
                 account.contains("await loadAddons(for: context)") &&
                 account.contains("await backfillEmail(for: context)"),
               "Stremio auth validates the initiating profile across awaited writes")
@@ -216,10 +217,28 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 !boundarySource.contains("authKey") &&
                 !boundarySource.contains("email"),
               "credential boundary carries only non-secret owner identity")
-        check(bridge.contains("let eventProfileID = note.userInfo?[\"profileID\"] as? String") &&
-                bridge.contains("eventProfileID == ProfileStore.shared.active?.id.uuidString") &&
-                bridge.contains("eventKeychainAccount == ProfileStore.shared.activeKeychainAccount"),
-              "CoreBridge rejects a delayed credential event for another selected owner")
+        func boundedBody(_ text: String, after marker: String, until next: String) -> String {
+            guard let start = text.range(of: marker),
+                  let end = text.range(of: next, range: start.upperBound..<text.endIndex) else {
+                preconditionFailure("Missing bounded production method: " + marker)
+            }
+            return String(text[start.lowerBound..<end.lowerBound])
+        }
+        let ownLogin = boundedBody(bridge, after: "@MainActor func authenticateNativeOwnAccount(",
+            until: "    @MainActor private func authenticateNativeOwnerAccount(")
+        let ownerLogin = boundedBody(bridge, after: "@MainActor private func authenticateNativeOwnerAccount(",
+            until: "    private static func readNativeCredential")
+        check(ownLogin.contains("nativePlaybackBinding(.native(target.binding))?.0 === facade") &&
+                ownLogin.contains("CredentialScopeRegistry.shared.isCurrent(capture), nativeFacade === facade,") &&
+                ownLogin.contains("ProfileStore.shared.activeID == target.profile.id") &&
+                ownLogin.contains("try refreshNativeProfiles(reloadCredentials: false)"),
+              "own-profile completion independently rejects retired credential, installation and selected profile")
+        check(ownerLogin.contains("nativePlaybackBinding(.native(target.binding))?.0 === facade") &&
+                ownerLogin.contains("CredentialScopeRegistry.shared.isCurrent(capture) && facade.isAvailable && facade.accountGeneration == epoch") &&
+                ownerLogin.contains("facade.profileSnapshot()?.state[\"activeProfileId\"] == .string(selectedProfileID)") &&
+                ownerLogin.contains("expectedSelection: target.expectedOwnerSelection, authority: authority, read: Self.readNativeCredential") &&
+                ownerLogin.contains("try refreshNativeProfiles(reloadCredentials: false)"),
+              "owner completion independently retains captured account, profile, native facade and secure selection")
         check(bridge.contains("VortXSyncManager.credentialScopeDidChangeNote") &&
                 bridge.contains("capturedCredentialCapture: credentialCapture") &&
                 bridge.contains("CredentialScopeRegistry.shared.isCurrent(credentialCapture)") &&
@@ -227,12 +246,17 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 !bridge.contains("resetSignedOutEngineForLocalHydration") &&
                 bridge.contains("await self.loadLibraryAndAwait()"),
               "history source reads retain the exact VortX credential capture")
+        let nativeRestore = boundedBody(sync, after: "func restoreNativeCheckpoint(",
+            until: "    /// Shared account-owner epoch.")
+        let nativeHydration = boundedBody(sync, after: "func hydrateEngineFromOwnedAddons(",
+            until: "    /// Compute the account-owned add-on descriptors")
         check(sync.contains("credentialScopeDidChangeNote") &&
-                sync.contains("BecauseYouWatchedDocumentHistory.snapshot") &&
-                sync.contains("library: source.library") &&
-                sync.contains("continueWatching: source.continueWatching") &&
+                nativeHydration.contains("_ = await ensureNativeCheckpoint(credentialCapture: suppliedCapture)") &&
+                nativeRestore.contains("guard isSignedIn, isCurrent(capture), case .account = capture.scope else") &&
+                nativeRestore.contains("pullDocVersionedResult(credentialCapture: capture)") &&
+                nativeRestore.contains("ProfileStore.shared.activeID == selectedProfile") &&
                 !sync.contains("awaitLocalHistoryHydrationReset"),
-              "VortX owner transitions publish a boundary and hydration receipt")
+              "VortX owner transitions hydrate only an authenticated native checkpoint for the captured account and profile")
         check(bridge.contains("&& (!tokenPresent || (importedAwayFromStremio && importedAwayReady))"),
               "ordinary retained Stremio tokens cannot masquerade as local-history authority")
         check(bridge.contains("private func credentialScopeDidChange(") &&

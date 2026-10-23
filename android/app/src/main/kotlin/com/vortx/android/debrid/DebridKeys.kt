@@ -317,7 +317,7 @@ class DebridKeys private constructor(
     constructor(context: Context) : this(
         store = AndroidDebridKeyValueStore(context.applicationContext),
         activeOwner = PROCESS_OWNER_BINDING::currentOwner,
-        nativeMode = BuildConfig.NATIVE_ENGINE_ENABLED,
+        nativeMode = true,
     )
 
     /// The stored key for [service], or an empty string when none is set.
@@ -958,7 +958,7 @@ class DebridKeys private constructor(
         private var didObserveCredentialOwner = false
 
         /** Visible key changes, successful mutations, and observed owner transitions publish one revision. */
-        internal val credentialRevision: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _credentialRevision.asStateFlow()
+        internal val credentialRevision: StateFlow<Long> get() = NativeProviderAccess.revision
 
         private fun advanceCredentialRevisionLocked() {
             val next = credentialRevisionCounter.incrementAndGet()

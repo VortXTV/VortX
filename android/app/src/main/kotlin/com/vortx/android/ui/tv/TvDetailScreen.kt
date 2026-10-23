@@ -65,6 +65,7 @@ import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.components.TraktManualCheckInAction
+import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DetailNavigationFence
@@ -387,6 +388,19 @@ private fun TvDetailContent(
                         focusRequester = playFocus,
                     )
                     Spacer(Modifier.width(VortXTheme.spacing.sm))
+                    // Trailer sits beside Watch with its clapperboard, as on Apple TV: free 1080p from the user's
+                    // own IP via the client resolver (worker fallback on a miss), through the shared player latch.
+                    // Still the first focus fallback while Watch waits for sources.
+                    if (hasTrailer) {
+                        TvFilterChip(
+                            label = "Trailer",
+                            selected = false,
+                            onClick = { beginPlayback { viewModel.playTrailer() } },
+                            modifier = trailerModifier,
+                            leadingIcon = VortXIcons.clapperboard,
+                        )
+                        Spacer(Modifier.width(VortXTheme.spacing.sm))
+                    }
                     // Sources is an explicit peer of Watch, not a distant right-pane discovery task.
                     // It parks the remote on the source pane's stable Re-find control, from which the
                     // ranked Watch Now row and filters are one deterministic D-pad step away.
@@ -420,19 +434,6 @@ private fun TvDetailContent(
                             resolving = playback is Playback.Resolving,
                             tv = true,
                         )
-                    }
-                    // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
-                    // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
-                    // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).
-                    if (hasTrailer) {
-                        item {
-                            TvFilterChip(
-                                label = "Trailer",
-                                selected = false,
-                                onClick = { beginPlayback { viewModel.playTrailer() } },
-                                modifier = trailerModifier,
-                            )
-                        }
                     }
                     item {
                         TvFilterChip(

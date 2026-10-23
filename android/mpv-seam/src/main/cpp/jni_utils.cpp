@@ -50,6 +50,7 @@ void init_methods_cache(JNIEnv *env) {
         // verbatim (MPV_END_FILE_REASON_*); error is .error when reason==MPV_END_FILE_REASON_ERROR,
         // else 0 (client.h documents .error as present only for the ERROR reason).
         seam_MpvSeam_eventEndFile_II = env->GetMethodID(seam_MpvSeam, "eventEndFile", "(II)V"); // eventEndFile(int, int)
+        seam_MpvSeam_eventStartFile_J = env->GetMethodID(seam_MpvSeam, "eventStartFile", "(J)V");
         seam_MpvSeam_event = env->GetMethodID(seam_MpvSeam, "event", "(I)V"); // event(int)
         seam_MpvSeam_logMessage_SiS = env->GetMethodID(seam_MpvSeam, "logMessage", "(Ljava/lang/String;ILjava/lang/String;)V"); // logMessage(String, int, String)
     });

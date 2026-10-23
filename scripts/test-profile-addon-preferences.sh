@@ -10,7 +10,7 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 } > "$profile_test_dir/Discovery.swift"
 {
   printf '%s\n' 'import Foundation' 'extension ProfileStore {'
-  for method in 'toggleAddon' 'isAddonDisabledForActive' 'addonPreferences' 'effectiveDisabledAddons' 'effectiveAddonRanking' 'applyAddonPreferences' 'customizeAddonVisibility' 'resetAddonVisibilityToMain' 'customizeAddonRanking' 'resetAddonRankingToMain' 'setAddonOrder' 'capturePlayback'; do
+  for method in 'toggleAddon' 'isAddonDisabledForActive' 'addonPreferences' 'effectiveDisabledAddons' 'effectiveAddonRanking' 'applyAddonPreferences' 'customizeAddonVisibility' 'resetAddonVisibilityToMain' 'customizeAddonRanking' 'resetAddonRankingToMain' 'setAddonOrder' 'capturePlayback' 'profileCapturingPlayback'; do
     sed -n "/^    .*func ${method}(/,/^    }/p" app/SourcesShared/Profiles.swift | sed 's/private func /func /'
   done
   sed -n '/^    var activeSharesMainAddons:/p' app/SourcesShared/Profiles.swift

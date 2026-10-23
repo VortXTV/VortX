@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -97,6 +98,13 @@ fun TvHomeScreen(
     val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
     val hubOrder by viewModel.collectionsHubOrder.collectAsStateWithLifecycle()
     val hubHidden by viewModel.collectionsHubHidden.collectAsStateWithLifecycle()
+    val forYouUi by viewModel.forYouUi.collectAsStateWithLifecycle()
+    // null: no picker; true: the once-per-profile first-run offer; false: Tune (edit).
+    var interestsPicker by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(forYouUi) { if (interestsPicker == null && viewModel.claimFirstRunOffer()) interestsPicker = true }
+    interestsPicker?.let { firstRun ->
+        com.vortx.android.ui.foryou.ForYouPickerDialog(forYouUi.interests, firstRun, tvForYouChip, TvDimens.edge) { interestsPicker = null }
+    }
     if (collectionBrowse.target != null) {
         TvCollectionsBrowseScreen(
             state = collectionBrowse,
@@ -138,6 +146,8 @@ fun TvHomeScreen(
                     onLoadMoreRows = viewModel::loadMoreRows,
                     reselectSignal = reselectSignal,
                     modifier = modifier,
+                    forYouShowInvite = forYouUi.showInvite,
+                    onTuneForYou = { interestsPicker = false },
                 )
             }
     }
@@ -160,6 +170,8 @@ private fun TvHomeContent(
     onLoadMoreRows: () -> Unit,
     reselectSignal: Int = 0,
     modifier: Modifier,
+    forYouShowInvite: Boolean = false,
+    onTuneForYou: () -> Unit = {},
 ) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
@@ -195,8 +207,12 @@ private fun TvHomeContent(
     var hasReceivedFocus by remember(contentOwnerGeneration, catalogLayout) { mutableStateOf(false) }
     // Remote CW is already privately enriched behind its immutable source receipt; never send it into
     // the generic identity-only hero cache (including same-title source/account replacements).
-    val heroItems = com.vortx.android.home.continueWatchingHeroCatalogs(visibleCatalogs).flatMap { it.items }
-    val focusedItem = focusState.focusedItem()
+    val heroItems = remember(visibleCatalogs) {
+        com.vortx.android.home.continueWatchingHeroCatalogs(visibleCatalogs).flatMap { it.items }
+    }
+    // The hero follows focus once it settles (Apple's 150 ms), so holding the D-pad across a rail no longer
+    // starts a backdrop crossfade and a full-screen artwork load for every card it passes.
+    val focusedItem = rememberSettledHeroFocus(focusState.focusedItem(), contentOwnerGeneration, catalogLayout)
     val heroItem = heroItems.firstOrNull { focusedItem != null && it.type == focusedItem.type && it.id == focusedItem.id &&
         it.continueWatchingPermit == focusedItem.continueWatchingPermit } ?: heroItems.firstOrNull()
 
@@ -256,10 +272,13 @@ private fun TvHomeContent(
             // The hub is not a catalog, so [visibleCatalogs] (which drives focus + hero above) stays pure; the
             // hub rides Customize-Home order/hide only for THIS list via [homeRowsWithHub].
             val hubShown = collections.isVisible && !collectionsHubHidden
-            val rows = remember(visibleCatalogs, hubShown, collectionsHubOrder) {
-                homeRowsWithHub(
-                    visibleCatalogs,
-                    if (hubShown) collectionsHubSlot(visibleCatalogs, collectionsHubOrder) else null,
+            val rows = remember(visibleCatalogs, hubShown, collectionsHubOrder, forYouShowInvite) {
+                com.vortx.android.ui.homeRowsWithForYou(
+                    homeRowsWithHub(
+                        visibleCatalogs,
+                        if (hubShown) collectionsHubSlot(visibleCatalogs, collectionsHubOrder) else null,
+                    ),
+                    collectionsHubOrder, forYouShowInvite,
                 )
             }
             val lastCatalogId = visibleCatalogs.lastOrNull()?.id
@@ -277,6 +296,8 @@ private fun TvHomeContent(
                             onRetryCollections,
                             if (index == 0) firstCardFocus else null,
                         )
+                        HomeRowItem.ForYouHeader -> TvForYouHeader(onTuneForYou, if (index == 0) firstCardFocus else null)
+                        HomeRowItem.ForYouInvite -> TvForYouInvite(onTuneForYou, if (index == 0) firstCardFocus else null)
                         is HomeRowItem.CatalogRow -> {
                             val catalog = row.catalog
                             if (catalog.id == lastCatalogId) {
@@ -406,50 +427,54 @@ private fun TvCatalogRow(
                 Text("Continue catalog")
             }
         }
-        LazyRow(
-            state = rowState,
-            contentPadding = PaddingValues(horizontal = TvDimens.edge),
-            horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
-        ) {
-            itemsIndexed(visibleItems, key = { _, it -> tvHomeItemKey(it) }) { i, item ->
-                if (onEndReached != null && i == visibleItems.lastIndex) {
-                    LaunchedEffect(catalog.engineIndex, visibleItems.size, tvHomeItemKey(item)) {
-                        onEndReached()
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val viewportWidth = maxWidth.value
+            LazyRow(
+                state = rowState,
+                contentPadding = PaddingValues(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
+            ) {
+                itemsIndexed(visibleItems, key = { _, it -> tvHomeItemKey(it) }) { i, item ->
+                    if (onEndReached != null && i == visibleItems.lastIndex) {
+                        LaunchedEffect(catalog.engineIndex, visibleItems.size, tvHomeItemKey(item)) {
+                            onEndReached()
+                        }
                     }
-                }
-                val menu = posterMenuFor(catalog)
-                val focusKey = TvHomeFocusKey(catalog.id, item.type, item.id)
-                val cardFocus = when {
-                    recovery?.key == focusKey -> recoveryFocus
-                    firstCardFocus != null && i == 0 -> firstCardFocus
-                    else -> null
-                }
-                if (usesContinueWatchingCard) {
-                    TvCinemaCard(
+                    val menu = posterMenuFor(catalog)
+                    val focusKey = TvHomeFocusKey(catalog.id, item.type, item.id)
+                    val cardFocus = when {
+                        recovery?.key == focusKey -> recoveryFocus
+                        firstCardFocus != null && i == 0 -> firstCardFocus
+                        else -> null
+                    }
+                    if (usesContinueWatchingCard) {
+                        TvCinemaCard(
+                            item = item,
+                            onClick = { onItem(item) },
+                            onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
+                            focusRequester = cardFocus,
+                            width = TvPosterLayoutPolicy.continueWatchingWidth(viewportWidth),
+                            viewportWidth = viewportWidth,
+                            continueWatching = true,
+                            onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onRemoveFromContinueWatching(item) }) else null,
+                        )
+                    } else TvPosterCard(
                         item = item,
                         onClick = { onItem(item) },
-                        onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
+                        onFocused = {
+                            onFocused(item)
+                            if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
+                        },
                         focusRequester = cardFocus,
-                        width = 300.dp,
-                        continueWatching = true,
-                        onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onRemoveFromContinueWatching(item) }) else null,
+                        menu = menu,
+                        onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
+                        onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) {
+                            { onRemoveFromContinueWatching(item) }
+                        } else {
+                            null
+                        },
                     )
-                } else TvPosterCard(
-                    item = item,
-                    onClick = { onItem(item) },
-                    onFocused = {
-                        onFocused(item)
-                        if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
-                    },
-                    focusRequester = cardFocus,
-                    menu = menu,
-                    onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
-                    onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) {
-                        { onRemoveFromContinueWatching(item) }
-                    } else {
-                        null
-                    },
-                )
+                }
             }
         }
     }
@@ -576,6 +601,8 @@ private fun TvCatalogHeader(
         HomeRail.TRAKT_WATCHLIST -> "From Trakt"
         HomeRail.TRAKT_CONTINUE_WATCHING -> "From Trakt"
         HomeRail.SIMKL_WATCHLIST -> "From SIMKL"
+        HomeRail.FOR_YOU, HomeRail.SMART_COLLECTIONS -> com.vortx.android.foryou.forYouReason(catalog)
+            ?.let(com.vortx.android.foryou.ForYouText(androidx.compose.ui.platform.LocalContext.current)::reason)
         else -> null
     }
     Row(
@@ -704,6 +731,20 @@ internal fun tvHomeHeroSelection(
         item = selected,
     )
 }
+
+/// [item] once focus has rested on it for [HERO_SETTLE_MS]; the first focus lands at once. Keyed on the
+/// content owner and layout like the focus state itself, so a replaced owner never sees the old hero.
+@Composable
+private fun rememberSettledHeroFocus(item: MetaItem?, ownerGeneration: Any?, layout: Any?): MetaItem? {
+    val settled = remember(ownerGeneration, layout) { mutableStateOf(item) }
+    LaunchedEffect(item, ownerGeneration, layout) {
+        if (settled.value != null) delay(HERO_SETTLE_MS)
+        settled.value = item
+    }
+    return settled.value
+}
+
+private const val HERO_SETTLE_MS = 150L
 
 internal fun TvHomeFocusState.focusedItem(): MetaItem? {
     val key = focused ?: return null

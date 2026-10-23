@@ -11,6 +11,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import coil3.compose.AsyncImage
+import coil3.compose.LocalPlatformContext
+import coil3.request.ImageRequest
 
 internal fun artworkCandidates(urls: List<String?>): List<String> =
     urls.mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }.distinct()
@@ -25,6 +27,10 @@ internal fun FallbackArtwork(
     contentDescription: String?,
     modifier: Modifier = Modifier,
     placeholder: @Composable () -> Unit = {},
+    /** Caps the decoded size (longest edge, px) below the on-screen size; null decodes at the view size. */
+    maxDecodePx: Int? = null,
+    /** Keep existing Crop/FILL requests by default; scoped callers can bound the decode with FIT. */
+    decodeScale: coil3.size.Scale = coil3.size.Scale.FILL,
 ) {
     val candidates = artworkCandidates(urls)
     key(candidates) {
@@ -33,8 +39,12 @@ internal fun FallbackArtwork(
         Box(modifier = modifier) {
             placeholder()
             candidates.getOrNull(requestIndex)?.let { url ->
+                val context = LocalPlatformContext.current
                 AsyncImage(
-                    model = url,
+                    model = maxDecodePx?.let {
+                        ImageRequest.Builder(context).data(url).size(it)
+                            .scale(decodeScale).precision(coil3.size.Precision.INEXACT).build()
+                    } ?: url,
                     contentDescription = contentDescription,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),

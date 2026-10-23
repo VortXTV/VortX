@@ -323,24 +323,35 @@ enum TraktDate {
 /// would fall back to `.distantPast` at the merge and could never win a newer-wins comparison, so both
 /// forms are tried before giving up.
 enum TraktRatedAt {
-    private static let fractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
-    private static let whole: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
+    // NSISO8601DateFormatter is mutable and not Sendable. The pair never escapes this
+    // owner, and every access is serialized, retaining cached formatters and wire behavior.
+    private final class LockedFormatters: @unchecked Sendable {
+        private let lock = NSLock()
+        private let fractional: ISO8601DateFormatter
+        private let whole: ISO8601DateFormatter
+        init() {
+            fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            whole = ISO8601DateFormatter()
+            whole.formatOptions = [.withInternetDateTime]
+        }
+        func string(from date: Date) -> String {
+            lock.lock(); defer { lock.unlock() }
+            return fractional.string(from: date)
+        }
+        func date(from string: String) -> Date? {
+            lock.lock(); defer { lock.unlock() }
+            return fractional.date(from: string) ?? whole.date(from: string)
+        }
+    }
+    private static let formatters = LockedFormatters()
 
     /// Format a date the way Trakt expects on a ratings write.
-    static func string(from date: Date) -> String { fractional.string(from: date) }
+    static func string(from date: Date) -> String { formatters.string(from: date) }
 
     /// Parse a Trakt `rated_at`, tolerating the whole-second form. nil when neither form matches.
     static func date(from string: String) -> Date? {
-        fractional.date(from: string) ?? whole.date(from: string)
+        formatters.date(from: string)
     }
 }
 

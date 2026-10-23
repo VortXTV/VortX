@@ -157,9 +157,7 @@ struct TraktLoginAttemptAuthority {
 /// only an opaque broker session and never receives Trakt's device credential. Trakt data-plane calls
 /// remain direct and continue to use the public client ID.
 actor TraktAuth {
-#if VORTX_NATIVE_DATA_ENGINE
     private var nativeCredentialGeneration = UUID()
-#endif
     static let shared = TraktAuth()
 
     // MARK: - Configuration (public client ID; empty ships a dormant, invisible feature)
@@ -929,7 +927,6 @@ actor TraktAuth {
                 guard !Task.isCancelled,
                       CredentialScopeRegistry.shared.isCurrent(capture),
                       loginAttempts.owns(code: session, generation: loginGeneration) else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
                 guard let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
                     "traktAccess": .string(token.accessToken), "traktRefresh": .string(token.refreshToken),
                     "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture) }) else { return false }
@@ -938,7 +935,6 @@ actor TraktAuth {
                     _ = await MainActor.run { VortXSyncManager.shared.abortNativeProviderMutation(nativeIntent, capture: capture) }
                     return false
                 }
-#endif
                 mutationAttempted = true
                 persisted = replaceCredentialsWithNewSession(
                     access: token.accessToken,
@@ -947,11 +943,9 @@ actor TraktAuth {
                     ownerCapture: capture,
                     ownerNamespace: capture.namespace
                 ) == .success
-#if VORTX_NATIVE_DATA_ENGINE
                 if persisted {
                     persisted = await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
                 }
-#endif
                 if persisted { loginAttempts.invalidate() }
                 return persisted
             }
@@ -976,7 +970,7 @@ actor TraktAuth {
             throw TraktAuthError.denied
         default:
             DiagnosticsLog.log("trakt-auth", "broker device/poll -> unknown status")
-            throw TraktAuthError.brokerUnavailable(status: 200)
+            throw Self.brokerFault(status: 200)
         }
     }
 
@@ -1206,7 +1200,7 @@ actor TraktAuth {
         try Task.checkCancellation()
         guard CredentialScopeRegistry.shared.isCurrent(capture),
               currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
-        guard status == 200 else { throw TraktAuthError.brokerUnavailable(status: status) }
+        guard status == 200 else { throw Self.brokerFault(status: status) }
         let response = try decode(BrokerRefreshResponse.self, from: data)
         if response.status == "ok" {
             guard let token = response.token,
@@ -1214,7 +1208,6 @@ actor TraktAuth {
                   token.expiresIn > 0 else { throw TraktAuthError.decoding }
             // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
             // session identity here: queued work and snapshots captured before refresh remain valid.
-#if VORTX_NATIVE_DATA_ENGINE
             let persisted = await performCredentialBoundary {
                 guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
                       currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
@@ -1231,21 +1224,11 @@ actor TraktAuth {
                 return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
             }
             guard persisted else { throw TraktAuthError.persistenceFailure }
-#else
-            guard CredentialScopeRegistry.shared.isCurrent(capture),
-                  currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
-                throw TraktAuthError.sessionChanged
-            }
-            try Task.checkCancellation()
-            guard storeRefreshedToken(token, ownerCapture: capture) else {
-                throw TraktAuthError.persistenceFailure
-            }
-#endif
             return token
         }
         guard response.status == "invalid_grant" else {
             DiagnosticsLog.log("trakt-auth", "broker refresh -> unknown status")
-            throw TraktAuthError.brokerUnavailable(status: 200)
+            throw Self.brokerFault(status: 200)
         }
         // Only the broker's explicit invalid_grant verdict may end the session. Before clearing it, look for
         // a concurrent local or cross-device refresh winner exactly as the pre-broker durable flow did.
@@ -1366,9 +1349,7 @@ actor TraktAuth {
         guard let mutationLease = CredentialPublicationOutbox.beginMutation() else { return false }
         defer { CredentialPublicationOutbox.endMutation(mutationLease) }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
         nativeCredentialGeneration = UUID()
-#endif
         let resolvedNamespace = capture.namespace
         guard case let .authority(active) = readCredentialTupleForMutation(ownerNamespace: resolvedNamespace),
               active.values.count == 4,
@@ -1417,9 +1398,7 @@ actor TraktAuth {
               let mutationLease = CredentialPublicationOutbox.beginMutation() else { return .failure }
         defer { CredentialPublicationOutbox.endMutation(mutationLease) }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
-#if VORTX_NATIVE_DATA_ENGINE
         nativeCredentialGeneration = UUID()
-#endif
         guard Self.recoverCredentialAuthority(credentials: credentials, ownerNamespace: resolvedNamespace) else {
             return .failure
         }
@@ -1693,18 +1672,14 @@ actor TraktAuth {
         guard await acquirePublicationBoundary() else { return false }
         defer { CredentialPublicationOutbox.endBoundary() }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-#if VORTX_NATIVE_DATA_ENGINE
         var nativeIntent: [String: VortxNativeProviderCredentials.Register]?
         if explicitNativeDisconnect {
             nativeIntent = await MainActor.run { VortXSyncManager.shared.prepareNativeProviderMutation([
                 "traktAccess": .null, "traktRefresh": .null, "traktExpiry": .null], capture: capture) }
             guard nativeIntent != nil, CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
         }
-#endif
         let mutate = {
-#if VORTX_NATIVE_DATA_ENGINE
             self.nativeCredentialGeneration = UUID()
-#endif
             return CredentialTupleTransaction.clear(
             baseAccounts: self.tupleAccounts(ownerNamespace: resolvedNamespace),
             activePointer: TraktTokenSlots.active(resolvedNamespace),
@@ -1720,14 +1695,11 @@ actor TraktAuth {
         }
         guard mutationGuard.map({ $0(mutate) }) ?? mutate() else { return false }
         TraktAuthBoundary.publish(nil)
-#if VORTX_NATIVE_DATA_ENGINE
         if let nativeIntent {
             return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
         }
-#endif
         return true
     }
-#if VORTX_NATIVE_DATA_ENGINE
     func certifiesNativePrepared(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
         guard ownerCapture() == capture else { return false }
         let keys = VortxNativeProviderCredentials.groups[0]
@@ -1752,7 +1724,6 @@ actor TraktAuth {
             })
         }
     }
-#endif
 
     private func acquirePublicationBoundary() async -> Bool {
         await CredentialPublicationOutbox.waitForBoundary() == .acquired
@@ -1822,10 +1793,10 @@ actor TraktAuth {
     private func ensureConfigured() throws {
         guard !configuration.clientID.isEmpty else { throw TraktAuthError.notConfigured }
         guard Self.validateBrokerBase(configuration.brokerBase) != nil else {
-            throw TraktAuthError.brokerUnavailable(status: 0)
+            throw Self.configurationFault(.invalidBrokerConfiguration)
         }
         guard oauthRequestSigner != nil || VortXEdgeAuth.canSignOAuthV2 else {
-            throw TraktAuthError.brokerUnavailable(status: 0)
+            throw Self.configurationFault(.signingUnavailable)
         }
     }
 
@@ -1872,10 +1843,12 @@ actor TraktAuth {
             "/v1/oauth/trakt/refresh",
             "/v1/oauth/trakt/revoke",
         ])
-        guard allowedPaths.contains(path),
-              let base = Self.validateBrokerBase(configuration.brokerBase),
+        guard allowedPaths.contains(path) else {
+            throw Self.configurationFault(.requestRejected)
+        }
+        guard let base = Self.validateBrokerBase(configuration.brokerBase),
               let url = URL(string: path, relativeTo: base)?.absoluteURL else {
-            throw TraktAuthError.brokerUnavailable(status: 0)
+            throw Self.configurationFault(.invalidBrokerConfiguration)
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1884,33 +1857,40 @@ actor TraktAuth {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let bodyData = try JSONEncoder().encode(body)
         guard bodyData.count <= 16 * 1024 else {
-            throw TraktAuthError.brokerUnavailable(status: 0)
+            throw Self.configurationFault(.requestTooLarge)
         }
         request.httpShouldHandleCookies = false
         request.setValue(nil, forHTTPHeaderField: "Cookie")
         request.httpBody = bodyData
         if let oauthRequestSigner {
             guard let signed = oauthRequestSigner(request, bodyData) else {
-                throw TraktAuthError.brokerUnavailable(status: 0)
+                throw Self.configurationFault(.signingFailed)
             }
             request = signed
         } else {
             guard VortXEdgeAuth.signOAuthV2(&request, body: bodyData) else {
-                throw TraktAuthError.brokerUnavailable(status: 0)
+                throw Self.configurationFault(.signingFailed)
             }
         }
         guard request.url == url,
               request.httpMethod == "POST",
               request.httpBody == bodyData else {
-            throw TraktAuthError.brokerUnavailable(status: 0)
+            throw Self.configurationFault(.requestRejected)
         }
         request.httpShouldHandleCookies = false
         request.setValue(nil, forHTTPHeaderField: "Cookie")
         return request
     }
 
+    private static func configurationFault(_ reason: TraktAuthConfigurationFailure) -> TraktAuthError {
+        DiagnosticsLog.log("trakt-auth", "event=broker_failure stage=local reason=\(reason.rawValue)")
+        return .configuration(reason)
+    }
+
     private static func brokerFault(status: Int) -> TraktAuthError {
-        .brokerUnavailable(status: status)
+        let error = TraktAuthError.brokerUnavailable(status: status)
+        DiagnosticsLog.log("trakt-auth", "event=broker_failure stage=http reason=\(error.brokerDiagnosticReason) status=\(status)")
+        return error
     }
 
     private func send(_ request: URLRequest) async throws -> (Data, Int) {
@@ -1982,6 +1962,30 @@ final class TraktOAuthNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unc
     }
 }
 
+/// Local request preparation failures contain only closed reasons, never configuration or signing values.
+enum TraktAuthConfigurationFailure: String, Sendable, Equatable {
+    case invalidBrokerConfiguration = "invalid_broker_configuration"
+    case signingUnavailable = "signing_unavailable"
+    case signingFailed = "signing_failed"
+    case requestRejected = "request_rejected"
+    case requestTooLarge = "request_too_large"
+
+    var userMessage: String {
+        switch self {
+        case .invalidBrokerConfiguration:
+            return "This build has an invalid Trakt connection service configuration. Please update VortX."
+        case .signingUnavailable:
+            return "This build cannot authenticate Trakt connection requests. Please update VortX."
+        case .signingFailed:
+            return "VortX could not authenticate the Trakt connection request. Please try again."
+        case .requestRejected:
+            return "VortX could not prepare a secure Trakt connection request. Please try again."
+        case .requestTooLarge:
+            return "The Trakt connection request was too large to send safely. Please try again."
+        }
+    }
+}
+
 /// Typed errors for the Trakt auth flow. Broker faults are transient and never mean that the account
 /// ended. Only an explicit broker `invalid_grant` response reaches the refresh sign-out branch.
 enum TraktAuthError: LocalizedError, Sendable, Equatable {
@@ -1993,6 +1997,7 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
     case codeAlreadyUsed
     case expired
     case denied
+    case configuration(TraktAuthConfigurationFailure)
     case brokerUnavailable(status: Int)
     case persistenceFailure
     case server(status: Int)
@@ -2001,9 +2006,30 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
 
     var isTransient: Bool {
         switch self {
-        case .brokerUnavailable, .transport: return true
+        // Configuration replaces the old status-0 broker fault without changing polling backoff
+        // or the existing unexpired-token refresh fallback. It is never an auth-loss verdict.
+        case .configuration, .brokerUnavailable, .transport: return true
         case .server(let status): return status >= 500
         default: return false
+        }
+    }
+
+    /// Closed diagnostic categories; no associated transport text or response/configuration values.
+    var brokerDiagnosticReason: String {
+        switch self {
+        case .configuration(let reason): return reason.rawValue
+        case .brokerUnavailable(let status):
+            switch status {
+            case 200: return "unexpected_response"
+            case 300...399: return "http_redirect"
+            case 401: return "http_unauthorized"
+            case 403: return "http_forbidden"
+            case 429: return "http_rate_limited"
+            case 400...499: return "http_client_error"
+            case 500...599: return "http_server_error"
+            default: return "unclassified_broker_failure"
+            }
+        default: return "not_broker_fault"
         }
     }
 
@@ -2017,7 +2043,26 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
         case .codeAlreadyUsed: return "This Trakt sign-in code was already used."
         case .expired: return "The Trakt sign-in code expired. Please try again."
         case .denied: return "Trakt access was denied."
-        case .brokerUnavailable: return "Could not reach the VortX Trakt service. Please try again in a moment."
+        case .configuration(let reason): return reason.userMessage
+        case .brokerUnavailable(let status):
+            switch status {
+            case 200:
+                return "The VortX Trakt service returned an unexpected response. Please try again."
+            case 300...399:
+                return "The VortX Trakt service returned an unexpected redirect. Please try again later."
+            case 401:
+                return "The VortX Trakt service could not authenticate this request (HTTP 401). Please try again later."
+            case 403:
+                return "The VortX Trakt service refused this request (HTTP 403). Please try again later."
+            case 429:
+                return "The VortX Trakt service is receiving too many requests (HTTP 429). Please wait and try again."
+            case 500...599:
+                return "The VortX Trakt service is temporarily unavailable (HTTP \(status)). Please try again later."
+            case 400...499:
+                return "The VortX Trakt service rejected this request (HTTP \(status)). Please try again later."
+            default:
+                return "Could not reach the VortX Trakt service. Please try again in a moment."
+            }
         case .persistenceFailure: return "Trakt could not durably save the new credentials."
         case .server(let status): return "Trakt returned an error (HTTP \(status))."
         case .transport(let message): return message

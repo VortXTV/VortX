@@ -1,0 +1,7 @@
+{
+  "uid": "fixture-disk-owner",
+  "items": {
+    "tt-disk-2023": {"type":"movie","name":"Disk 2023","state":{"overallTimeWatched":60000,"timesWatched":1,"lastWatched":"2023-06-01T00:00:00Z"}},
+    "tt-disk-2024": {"type":"movie","name":"Disk 2024","state":{"overallTimeWatched":120000,"timesWatched":1,"lastWatched":"2024-06-01T00:00:00Z"}}
+  }
+}

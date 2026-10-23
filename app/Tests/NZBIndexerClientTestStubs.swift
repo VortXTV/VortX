@@ -29,3 +29,6 @@ struct CredentialScope: Equatable, Sendable { var storageNamespace = "test" }
 }
 @MainActor final class ProfileStore { static let shared = ProfileStore(); var activeID: UUID? = nil }
 enum UserProfile { static let ownerID = UUID() }
+
+/// The client logs one line per search; the checks only need it to accept the call.
+enum DiagnosticsLog { static func log(_ tag: String, _ message: String) {} }

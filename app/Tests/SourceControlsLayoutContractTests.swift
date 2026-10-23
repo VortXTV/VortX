@@ -21,15 +21,14 @@ enum SourceControlsLayoutContractTests {
         precondition(chip.contains("hugsTightly: true"))
         precondition(chip.contains("activeFill: selected ? tint.opacity(VortXGlass.chipSelectedAlpha) : nil"))
         precondition(chip.contains("opaqueTVFill: Theme.Palette.surface2"))
-        let filter = source.components(separatedBy: "private struct AddonFilterChip: View {")[1]
-            .components(separatedBy: "// MARK: Sort control")[0]
-        precondition(filter.contains("Capsule().fill(selected ? Theme.Palette.accent : Theme.Palette.surface2)"))
-        precondition(filter.contains("if selected { Image(systemName: \"checkmark\") }"))
-        precondition(filter.contains(".accessibilityAddTraits(selected ? [.isSelected] : [])"))
-        precondition(filter.contains("selected: sourceFilter == nil") && filter.contains("selectSourceAddon(nil)"))
-        precondition(filter.contains("selected: sourceFilter == group.addon") && filter.contains("selectSourceAddon(group.addon)"))
+        let tabs = source.components(separatedBy: "private var sourceAddonTabs: some View {")[1]
+            .components(separatedBy: "private func selectSourceAddon(_ addon: String?) {")[0]
+        precondition(tabs.contains(".foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)"))
+        precondition(tabs.contains(".accessibilityAddTraits(selected ? [.isSelected] : [])"))
+        precondition(tabs.contains("selected: selectedSourceAddon == nil") && tabs.contains("selectSourceAddon(nil)"))
+        precondition(tabs.contains("selected: selectedSourceAddon == group.addon") && tabs.contains("selectSourceAddon(group.addon)"))
         let selection = source.components(separatedBy: "private func selectSourceAddon(_ addon: String?) {")[1]
-            .components(separatedBy: "private var filterBar")[0]
+            .components(separatedBy: "// MARK: Sort control")[0]
         precondition(selection.contains("selectedSourceAddon = addon") && selection.contains("sourceFilter = addon"))
         // All must reveal the list too, before the optional per-addon expansion branch is evaluated.
         precondition(selection.components(separatedBy: "if let addon {")[0].contains("showAllSources = true"))

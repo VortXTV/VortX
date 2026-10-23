@@ -6,7 +6,17 @@ import java.math.BigDecimal
 
 /** Only compare accepted, account-joined wire carriers, never UI projections or local actor clocks. */
 internal object NativeSyncPublicationPolicy {
-    fun needsRepublish(remote: JSONObject, joined: NativeAccountExport): Boolean {
+    fun needsRepublish(remote: JSONObject, joined: NativeAccountExport, remoteRaw: ByteArray? = null): Boolean {
+        joined.rawAccount?.let { accepted ->
+            // Full admitted wire carriers, not the small native UI projection. Otherwise every
+            // schema6 receive looks different and needlessly rearms a full account upload.
+            val original = com.vortx.android.engine.NativeOwnerHistoryAccount(requireNotNull(remoteRaw))
+            val next = com.vortx.android.engine.NativeOwnerHistoryAccount(accepted)
+            return listOf("nativeSync", "nativeHostPreferences", "profileEditResults", "nativeOwnerHistorySources").any { key ->
+                val a = original.raw(key); val b = next.raw(key)
+                if (a == null || b == null) a != null || b != null else !com.vortx.android.engine.OHJson.equal(a, b)
+            }
+        }
         val incoming = remote.optJSONObject("nativeSync")
         if (incoming == null) return !remote.has("nativeSync") &&
             joined.nativeSync.optString("scope").isNotBlank() && joined.nativeSync.optJSONObject("legacyImport") != null
@@ -15,6 +25,15 @@ internal object NativeSyncPublicationPolicy {
         if (incoming.optString("scope").isBlank() || incoming.optString("scope") != joined.nativeSync.optString("scope")) return false
         return !same(incoming, joined.nativeSync) ||
             (joined.hostPreferences != null && !same(remote.optJSONObject("nativeHostPreferences"), joined.hostPreferences))
+    }
+
+    /** A securely joined provider register can retain an ACKed fact without new local intent. */
+    fun needsProviderRepublish(remote: JSONObject, joined: JSONObject): Boolean {
+        val carrier = joined.optJSONObject("nativeProviderCredentials") ?: return false
+        // Empty initialized vaults contribute no causal facts and must not arm an idle echo.
+        if (carrier.optJSONObject("fields")?.length() == 0) return false
+        return !same(remote.optJSONObject("nativeProviderCredentials"), carrier) ||
+            !same(remote.opt("apiKeys"), joined.opt("apiKeys"))
     }
 
     internal fun same(left: Any?, right: Any?): Boolean = when {

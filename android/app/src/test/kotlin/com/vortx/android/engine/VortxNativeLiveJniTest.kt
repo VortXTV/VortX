@@ -179,6 +179,11 @@ class VortxNativeLiveJniTest {
         } finally { mounted?.close(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
+    /** Native facts and the retained legacy baseline. The host archive mirrors whichever authenticated
+     * document last arrived, including one whose legacy delta the kernel held. */
+    private fun nativeFacts(snapshot: String?): String =
+        JSONObject(requireNotNull(snapshot)).apply { remove("hostDocument"); remove("excludedCredentialPaths") }.toString()
+
     @Test fun `authenticated legacy bootstrap native profile lifecycle and same-account reopen use real JNI`() = runBlocking {
         assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
         load()
@@ -243,8 +248,10 @@ class VortxNativeLiveJniTest {
             val before = runtime.session().read().state.toString()
             val changedLegacy = JSONObject(doc.toString())
             changedLegacy.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client edit")
-            assertTrue(runCatching { runtime.applyDocument(account, changedLegacy) { true } }.isFailure)
-            assertEquals(before, runtime.session().read().state.toString())
+            // An old client's unclocked legacy edit is held, never fatal and never adopted.
+            assertTrue(runtime.applyDocument(account, changedLegacy) { true })
+            assertEquals("legacy_profile_edit/deletion_lacks_newer_representable_roster_clock", runtime.session().heldLegacyReconciliation)
+            assertEquals(nativeFacts(before), nativeFacts(runtime.session().read().state.toString()))
             current = account.copy(generation = 5)
             assertTrue(runCatching { runtime.session() }.isFailure)
             assertNull(runtime.exportDocument(account))
@@ -315,24 +322,35 @@ class VortxNativeLiveJniTest {
                     assertEquals(first.session().read().state.toString(), firstStore.committed)
                 } finally { first.retire() }
             }
-            val rejected = listOf(
-                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client name") },
-                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("library").put(JSONObject().put("id", "legacy-only").put("type", "movie").put("name", "Old client film")) },
-                JSONObject(carrier.toString()).also { it.getJSONObject("nativeSync").remove("legacyImport") },
+            // Old-client legacy deltas are held by the kernel (never fatal, never adopted); a carrier
+            // without its verified legacy baseline receipt is still rejected outright.
+            val held = listOf(
+                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client name") } to "legacy_profile_edit/deletion_lacks_newer_representable_roster_clock",
+                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("library").put(JSONObject().put("id", "legacy-only").put("type", "movie").put("name", "Old client film")) } to "legacy_membership_descriptor/addition_lacks_newer_install_clock",
             )
+            val unreceipted = JSONObject(carrier.toString()).also { it.getJSONObject("nativeSync").remove("legacyImport") }
             val before = runtime.session().read().state.toString()
-            for (bad in rejected) {
-                assertTrue(runCatching { runtime.applyDocument(account, bad) { true } }.isFailure)
-                assertEquals(before, runtime.session().read().state.toString())
-                assertEquals(before, checkpoints.read(scope))
+            for ((bad, reason) in held) {
+                assertTrue(runtime.applyDocument(account, bad) { true })
+                assertEquals(reason, runtime.session().heldLegacyReconciliation)
+                assertEquals(nativeFacts(before), nativeFacts(runtime.session().read().state.toString()))
+                assertEquals(nativeFacts(before), nativeFacts(checkpoints.read(scope)))
             }
+            assertTrue(runCatching { runtime.applyDocument(account, unreceipted) { true } }.isFailure)
+            assertEquals(nativeFacts(before), nativeFacts(runtime.session().read().state.toString()))
+            assertEquals(nativeFacts(before), nativeFacts(checkpoints.read(scope)))
             runtime.retire()
-            for (bad in rejected) {
+            for ((bad, reason) in held) {
                 runtime = coordinator()
-                assertTrue(runCatching { runtime.applyDocument(account, bad) { true } }.isFailure)
-                assertTrue(runCatching { runtime.session() }.isFailure)
-                assertEquals(before, checkpoints.read(scope))
+                assertTrue(runtime.applyDocument(account, bad) { true })
+                assertEquals(reason, runtime.session().heldLegacyReconciliation)
+                assertEquals(nativeFacts(before), nativeFacts(checkpoints.read(scope)))
+                runtime.retire()
             }
+            runtime = coordinator()
+            assertTrue(runCatching { runtime.applyDocument(account, unreceipted) { true } }.isFailure)
+            assertTrue(runCatching { runtime.session() }.isFailure)
+            assertEquals(nativeFacts(before), nativeFacts(checkpoints.read(scope)))
             // A valid native-native update with unchanged old material remains usable on cold reopen.
             assertTrue(runtime.applyDocument(account, carrier) { true })
             assertEquals("Native name", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
@@ -343,10 +361,24 @@ class VortxNativeLiveJniTest {
             }
             val fresh = NativeAccountCoordinator(bindings(), absent, { noNetwork() }, { true }, { it() }, {})
             try {
-                for (bad in rejected) {
-                    assertTrue(runCatching { fresh.applyDocument(account, bad) { true } }.isFailure)
-                    assertNull(absent.committed)
+                for ((bad, reason) in held) {
+                    val adoptedStore = object : VortxCheckpointStore {
+                        var committed: String? = null
+                        override fun read(scope: VortxAccountScope) = committed
+                        override fun commit(scope: VortxAccountScope, snapshot: String) { committed = snapshot }
+                    }
+                    val adopting = NativeAccountCoordinator(bindings(), adoptedStore, { noNetwork() }, { true }, { it() }, {})
+                    try {
+                        assertTrue(adopting.applyDocument(account, bad) { true })
+                        assertEquals(reason, adopting.session().heldLegacyReconciliation)
+                        assertEquals("Native name", NativeProfileAccess { adopting.session() }.read().profiles.single().name)
+                        assertEquals("native-only", NativeCatalogRepository { adopting.session() }.library().getOrThrow().items.single().id)
+                        // The held delta was the only legacy action: nothing becomes this device's retained baseline.
+                        assertFalse(adopting.session().read().state.has("legacyImportMaterial"))
+                    } finally { adopting.retire() }
                 }
+                assertTrue(runCatching { fresh.applyDocument(account, unreceipted) { true } }.isFailure)
+                assertNull(absent.committed)
                 val unsafeImport = JSONObject(doc.toString())
                 unsafeImport.getJSONObject("vortx").getJSONArray("addons").put(JSONObject()
                     .put("transportUrl", "https://fixture.invalid/manifest.json").put("manifest", JSONObject()
@@ -392,8 +424,10 @@ class VortxNativeLiveJniTest {
             assertEquals("Legacy edit", profile.name); assertEquals(pin, profile.pin)
             val before = runtime.session().read().state.toString()
             val unclocked = JSONObject(changed.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Unclocked") }
-            assertTrue(runCatching { runtime.applyDocument(account, unclocked) { true } }.isFailure)
-            assertEquals(before, runtime.session().read().state.toString()); assertEquals(before, checkpoints.read(runtime.session().scope))
+            assertTrue(runtime.applyDocument(account, unclocked) { true })
+            assertEquals("legacy_profile_edit/deletion_lacks_newer_representable_roster_clock", runtime.session().heldLegacyReconciliation)
+            assertEquals(nativeFacts(before), nativeFacts(runtime.session().read().state.toString()))
+            assertEquals(nativeFacts(before), nativeFacts(checkpoints.read(runtime.session().scope)))
         } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
@@ -474,7 +508,7 @@ class VortxNativeLiveJniTest {
             repo.loadHomeRowNextPage(blocked).getOrThrow()
             assertEquals("2", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
             val policy = NativeCatalogRepository::class.java.getDeclaredMethod("policyPage", VortxResourceSnapshot::class.java,
-                VortxNativeRead::class.java, String::class.java, List::class.java).also { it.isAccessible = true }
+                VortxNativeRead::class.java, String::class.java, List::class.java, java.util.UUID::class.java).also { it.isAccessible = true }
             for (blockedOutcome in listOf("R", "null")) {
                 recertified = false; missingMeta = false
                 repo.meta(MediaType.MOVIE, "g").getOrThrow()
@@ -486,7 +520,7 @@ class VortxNativeLiveJniTest {
                 recertified = blockedOutcome == "R"; missingMeta = blockedOutcome == "null"
                 assertTrue(repo.meta(MediaType.MOVIE, "g").isFailure)
                 assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
-                val stale = runCatching { policy.invoke(repo, old.single(), read, "meta", old) }.exceptionOrNull()
+                val stale = runCatching { policy.invoke(repo, old.single(), read, "meta", old, null) }.exceptionOrNull()
                 assertTrue(stale is java.lang.reflect.InvocationTargetException && stale.cause is IllegalStateException)
                 assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
                 assertNull(repo.peekMeta(MediaType.MOVIE, "g"))

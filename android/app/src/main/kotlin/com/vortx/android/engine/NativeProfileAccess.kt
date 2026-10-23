@@ -5,7 +5,10 @@ import com.vortx.android.profile.UserProfile
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal class NativeProfileAccess(private val session: () -> VortxNativeSession) : NativeProfileGateway {
+internal class NativeProfileAccess(
+    private val publicationAdmission: ((VortxNativeSession, () -> Boolean) -> Boolean)? = null,
+    private val session: () -> VortxNativeSession,
+) : NativeProfileGateway {
     internal class EditTarget internal constructor(internal val runtime: VortxNativeSession, internal val owner: VortxNativeOwner,
         internal val profileID: String, internal val original: UserProfile?, internal val binding: NativeAccountBinding?)
     fun captureEdit(profile: UserProfile, adding: Boolean): EditTarget = captureTarget(profile, adding, requireActive = true)
@@ -28,6 +31,20 @@ internal class NativeProfileAccess(private val session: () -> VortxNativeSession
         }
     }
     override fun read(): NativeProfileGateway.Projection = projection(session().read())
+    override fun <T> withProjection(expected: NativeProfileGateway.Projection, action: () -> T): T {
+        val runtime = session()
+        // Session must precede provider/account admission; nested native reads then reenter this monitor.
+        return runtime.withCurrentRead { current ->
+            val admit = checkNotNull(publicationAdmission) { "Native profile publication admission unavailable" }
+            var result: Result<T>? = null
+            check(admit(runtime) {
+                check(session() === runtime && projection(current) == expected) { "Native profile projection changed" }
+                result = runCatching(action)
+                true
+            }) { "Native profile account changed" }
+            checkNotNull(result).getOrThrow()
+        }
+    }
     override fun select(id: String): NativeProfileGateway.Projection {
         val runtime = session(); val read = runtime.read()
         // The existing UI verifies the exact projected salted PIN before calling ProfileStore.select.

@@ -136,7 +136,7 @@ final class PlayerPresenter: ObservableObject {
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
-    @EnvironmentObject private var core: CoreBridge   // tear down the engine Player on a genuine player exit
+    private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
     @State private var splashDone = false
 
@@ -267,6 +267,7 @@ struct RootTabView: View {
     let launchReady: Bool
 
     @Environment(\.scenePhase) private var scenePhase
+    @GlassEligibility private var glassEnabled
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
@@ -351,15 +352,20 @@ struct RootTabView: View {
         )
     }
 
+    /// Only the selected tab, and none while the player covers the shell, follows engine events live.
+    private func engineVisible(_ tag: Int) -> Bool { selection == tag && presenter.request == nil }
+
     var body: some View {
         TabView(selection: selectionBinding) {
             HomeView(isActive: selection == 0).id(resetTokens[0])
+                .environment(\.engineObservationActive, engineVisible(0))
                 .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
             // Discover / Live / Library / Search are the hideable tabs (#117): each drops out of the
             // TabView entirely when its Settings > Tab bar toggle hides it, and the matching .onChange
             // below heals the selection to Home so the TabView never points at a missing tag.
             if !hideDiscoverTab {
                 DiscoverView().id(resetTokens[1])
+                    .environment(\.engineObservationActive, engineVisible(1))
                     .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
             }
             // Live TV sits after Discover. Tags 0-5 were already taken (Search uses 4, Add-ons 3),
@@ -367,29 +373,32 @@ struct RootTabView: View {
             // below stays in bounds against the resized 7-slot array.
             if !hideLiveTab {
                 LiveView().id(resetTokens[6])
+                    .environment(\.engineObservationActive, engineVisible(6))
                     .tabItem { Label("Live", systemImage: "dot.radiowaves.left.and.right") }.tag(6)
             }
             if !hideLibraryTab {
                 LibraryView().id(resetTokens[2])
+                    .environment(\.engineObservationActive, engineVisible(2))
                     .tabItem { Label("Library", systemImage: "books.vertical.fill") }.tag(2)
             }
             if !hideSearchTab {
                 NavigationStack { SearchView() }.id(resetTokens[4])
+                    .environment(\.engineObservationActive, engineVisible(4))
                     .tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(4)
             }
             AddonsView().id(resetTokens[3])
+                .environment(\.engineObservationActive, engineVisible(3))
                 .tabItem { Label("Add-ons", systemImage: "puzzlepiece.extension.fill") }.tag(3)
             SettingsView().id(resetTokens[5])
+                .environment(\.engineObservationActive, engineVisible(5))
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
-        #if VORTX_NATIVE_DATA_ENGINE
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if launchReady, presenter.request == nil {
                 NativeWatchedMigrationNotice()
             }
         }
-        #endif
         // Offline chip (#120): a quiet bottom capsule while the device has no network path. Pure
         // signal (never focusable, never navigates); it clears on its own when connectivity returns,
         // and online tabs stay reachable for cached browsing.
@@ -494,6 +503,10 @@ struct RootTabView: View {
         .onChange(of: hideSearchTab) { _, hidden in
             if hidden, selection == 4 { selection = 0 }
         }
+        // The mounted native bar does not rebuild with SwiftUI material changes. Refresh only its
+        // appearance when glass, Performance Auto or system transparency changes effective eligibility.
+        // This does not change selection/reset tokens or capture account/profile/theme preferences.
+        .onChange(of: glassEnabled) { _, _ in applyTabBarAccent() }
         // The active profile owns the theme: mirror Settings changes into it so they survive a switch.
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.oled) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
@@ -580,6 +593,8 @@ struct RootTabView: View {
     }
 
     private func applyTabBarAccent() {
+        // One observation drives both the background and every live bar's shadow in this pass.
+        let useGlass = glassEnabled
         let item = UITabBarItemAppearance()
         item.normal.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.textSecondary)]
         item.normal.iconColor = UIColor(Theme.Palette.textSecondary)
@@ -590,7 +605,7 @@ struct RootTabView: View {
         let appearance = UITabBarAppearance()
         // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and give it the REAL
         // VortX glass treatment, so the tvOS top nav reads as VortX glass and matches the Mac / iOS chrome.
-        // Under Reduce Transparency, stand down to an opaque warm surface for legibility. RE-SKIN ONLY: this
+        // When glass is ineligible, stand down to an opaque warm surface for legibility. RE-SKIN ONLY: this
         // changes the bar's BACKGROUND appearance; the native TabView, its focus engine, tab tags/order, and
         // the ember selection indicator below are all untouched.
         //
@@ -604,7 +619,7 @@ struct RootTabView: View {
         // a SwiftUI material), over the system blur that `configureWithDefaultBackground` supplies, so content
         // scrolling behind the bar is still sampled. The drop shadow is applied per-bar in `retintTabBars`,
         // where the real `UITabBar` layer is in hand.
-        if UIAccessibility.isReduceTransparencyEnabled {
+        if !useGlass {
             appearance.configureWithOpaqueBackground()
             appearance.backgroundColor = UIColor(Theme.Palette.surface1)
         } else {
@@ -618,20 +633,23 @@ struct RootTabView: View {
         UITabBar.appearance().standardAppearance = appearance
         UITabBar.appearance().scrollEdgeAppearance = appearance
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            for window in scene.windows { retintTabBars(under: window.rootViewController, with: appearance) }
+            for window in scene.windows {
+                retintTabBars(under: window.rootViewController, with: appearance, glassEnabled: useGlass)
+            }
         }
     }
 
-    private func retintTabBars(under controller: UIViewController?, with appearance: UITabBarAppearance) {
+    private func retintTabBars(under controller: UIViewController?, with appearance: UITabBarAppearance,
+                               glassEnabled: Bool) {
         guard let controller else { return }
         if let tabs = controller as? UITabBarController {
             tabs.tabBar.standardAppearance = appearance
             tabs.tabBar.scrollEdgeAppearance = appearance
-            applyTabBarShadow(to: tabs.tabBar)
+            applyTabBarShadow(to: tabs.tabBar, glassEnabled: glassEnabled)
             tabs.tabBar.setNeedsLayout()
         }
-        controller.children.forEach { retintTabBars(under: $0, with: appearance) }
-        retintTabBars(under: controller.presentedViewController, with: appearance)
+        controller.children.forEach { retintTabBars(under: $0, with: appearance, glassEnabled: glassEnabled) }
+        retintTabBars(under: controller.presentedViewController, with: appearance, glassEnabled: glassEnabled)
     }
 
     /// Float the tvOS tab bar on the SAME drop shadow every other VortX glass surface casts.
@@ -645,10 +663,10 @@ struct RootTabView: View {
     /// `shadowPath` is deliberately left nil: Core Animation then derives the shadow from the layer's
     /// composited alpha, which means it follows the bar's actual ROUNDED floating platter instead of the
     /// square bounds a hand-built path would give. One bar, once per appearance pass, so the cost of the
-    /// alpha-derived shadow is irrelevant here. Skipped under Reduce Transparency, where the bar stands down
+    /// alpha-derived shadow is irrelevant here. Skipped whenever glass is ineligible, where the bar stands down
     /// to a flat opaque surface and a float shadow would be off-message.
-    private func applyTabBarShadow(to tabBar: UITabBar) {
-        guard !UIAccessibility.isReduceTransparencyEnabled else {
+    private func applyTabBarShadow(to tabBar: UITabBar, glassEnabled: Bool) {
+        guard glassEnabled else {
             tabBar.layer.shadowOpacity = 0
             return
         }

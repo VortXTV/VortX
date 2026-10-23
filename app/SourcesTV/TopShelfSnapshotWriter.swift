@@ -33,6 +33,9 @@ enum TopShelfSnapshotWriter {
     @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
     @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
     @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
+    // At most five added lines per app process. Existing successful-publication logging remains.
+    @MainActor private static var reportedWriteResults: Set<TopShelfSnapshot.WriteResult> = []
+    @MainActor private static var reportedGroupSource = false
 
     /// Redirects are admitted only while every hop remains an exact first-party Trakt image URL. The
     /// initial URL is validated before the request starts; this delegate closes the privacy gap where a
@@ -112,6 +115,11 @@ enum TopShelfSnapshotWriter {
         guard snapshot.intent.isCurrent() else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
+        // A signing service's group can be shared by other apps it signs for this viewer. Trakt and SIMKL
+        // history, and Trakt's warmed artwork, never go there: such a queue leaves the static shelf image.
+        guard selection.source == .local || TopShelfSnapshot.appGroupSource != .signer else {
+            cancelWarm(clearArtwork: true); publish([]); return
+        }
         // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
         // finished, removed, or temporary seeds; those rows never render and must not consume one of the
         // bounded eight private-image requests.
@@ -186,6 +194,20 @@ enum TopShelfSnapshotWriter {
     }
 
     // MARK: Mapping
+
+    /// Exact bounded shelf content plus its original owner/source epoch. Home already captured
+    /// this selection for rendering; observing this value avoids sorting history again or relying
+    /// on the first title / legacy history receipt to notice native progress and interior changes.
+    /// This is a change key, not publication authority: callbacks still use publishCurrent().
+    struct PublicationKey: Equatable {
+        let intent: HomeContinueWatchingSelection.Intent
+        let items: [TopShelfSnapshot.Item]
+    }
+
+    static func publicationKey(for snapshot: HomeContinueWatchingSelection.Snapshot) -> PublicationKey {
+        .init(intent: snapshot.intent, items: items(from: snapshot.selection.items,
+            source: snapshot.selection.source, displayProgress: snapshot.selection.displayProgress))
+    }
 
     /// Flatten the engine's local Continue Watching into the wire items. Kept as a compatibility overload
     /// for existing call sites and tests; private Trakt rows use the source-aware overload below.
@@ -446,13 +468,21 @@ enum TopShelfSnapshotWriter {
 
     @MainActor
     private static func publish(_ items: [TopShelfSnapshot.Item]) {
-        // No container => unsigned build / no App Group / Lite. Nothing to do, nothing to log loudly.
-        guard TopShelfSnapshot.containerURL != nil else { return }
-        let changed = TopShelfSnapshot.write(items)
-        guard changed else { return }
+        let result = TopShelfSnapshot.writeResult(items)
+        if result != .written, reportedWriteResults.insert(result).inserted {
+            // Fixed first-seen status, not an error string or a claim about the signer.
+            DiagnosticsLog.log("topshelf", "write=\(result.rawValue) group=\(TopShelfSnapshot.appGroupSource.rawValue)")
+        }
+        if !reportedGroupSource {
+            reportedGroupSource = true
+            DiagnosticsLog.log("topshelf", "group=\(TopShelfSnapshot.appGroupSource.rawValue)")
+        }
+        guard result == .written else { return }
         // Only nudge the system when the content actually moved: this wakes the extension, so firing
         // it on every unchanged Home re-seed would be pure churn.
         TVTopShelfContentProvider.topShelfContentDidChange()
-        DiagnosticsLog.log("topshelf", "published \(items.count) item(s)")
+        // Overflow may compact/drop unrepresentable cache rows. Do not report the input count
+        // as the number actually written, and do not re-read the file just for logging.
+        DiagnosticsLog.log("topshelf", "published snapshot")
     }
 }

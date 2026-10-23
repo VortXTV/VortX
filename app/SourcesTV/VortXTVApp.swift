@@ -118,6 +118,8 @@ struct VortXTVApp: App {
             .environmentObject(ProfileStore.shared)
             .environmentObject(VortXSyncManager.shared)
             .preferredColorScheme(.dark)
+            // Settings > Effects and performance > Animations, read once here for every view below.
+            .visualEffectsRoot()
             // The app's own `vortx://` scheme. Its only minter today is the Top Shelf extension handing
             // back a tap from the tvOS Home screen; the router parks the destination and RootView
             // presents it, so a link that arrives during the splash / profile picker still lands.
@@ -143,6 +145,7 @@ struct VortXTVApp: App {
                 @unknown default: break
                 }
                 if phase == .active {
+                    InfuseReturnCoordinator.applyReturned()   // a position Infuse reported before VortX was ready
                     UpdateChecker.shared.checkIfStale()
                     // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero call
                     // sites anywhere in the repo, so the only refreshes were the cold-launch fetch and the
@@ -153,15 +156,8 @@ struct VortXTVApp: App {
                     // fail-soft by construction (refresh never throws and keeps last-good on any error).
                     Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
                     #if !VORTX_NO_EMBEDDED_SERVER
-                    // #130: after a suspension (Home, app switch, screensaver exit) tvOS can tear down the
-                    // server's bound listener while node keeps ticking, so the server reads Offline until a
-                    // manual restart. recoverIfSuspended subsumes the old drift-latch probe (isOnline) and,
-                    // on a CONNECTION-REFUSED result while the process is alive, signals the in-node rebind.
-                    // A timeout is left alone (busy-but-alive), so it never touches a mid-stream listener.
-                    Task.detached(priority: .utility) { await NodeServer.recoverIfSuspended() }
-                    // Phase 8: the flag-gated in-process engine server stops on background (below), so
-                    // foreground restarts it on a fresh ephemeral port; the player follows via
-                    // StremioServer.embeddedPort. No-op while `vortxNativeServer` is off.
+                    // The in-process engine server stops on background (below), so foreground restarts it
+                    // on a fresh ephemeral port; the player follows via StremioServer.embeddedPort.
                     VortxNativeServer.startIfNeeded()
                     #endif
                     Task {
@@ -183,6 +179,10 @@ struct VortXTVApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { TabBarHealer.heal("foreground+1.5s") }
                 }
                 if phase == .background {
+                    // TV Home does not close the mounted player, so RootTabView's playback-exit
+                    // callback may not run. Publish the latest acknowledged queue before suspension;
+                    // this does not invent a final progress ACK or bypass the writer's owner gates.
+                    TopShelfSnapshotWriter.publishCurrent()
                     #if !VORTX_NO_EMBEDDED_SERVER
                     // Phase 8: stop the flag-gated in-process engine server on background (graceful
                     // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.

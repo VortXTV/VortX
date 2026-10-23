@@ -13,9 +13,13 @@ import Foundation
 actor LandscapeBackdropCache {
     static let shared = LandscapeBackdropCache()
 
-    private var cache: [String: (backdrop: String?, logo: String?)] = [:]
+    private struct Request: Hashable {
+        let id: String
+        let type: String
+    }
+    private var cache: [Request: (backdrop: String?, logo: String?)] = [:]
     /// In-flight resolves, so N cards of the same title on screen issue ONE TMDB lookup, not N.
-    private var inflight: [String: Task<(backdrop: String?, logo: String?), Never>] = [:]
+    private var inflight: [Request: Task<(backdrop: String?, logo: String?), Never>] = [:]
 
     /// The clean 16:9 backdrop URL for a title, or nil when TMDB has none (caller composites the poster).
     static func backdrop(id: String, type: String) async -> String? {
@@ -28,10 +32,11 @@ actor LandscapeBackdropCache {
     }
 
     private func resolve(id: String, type: String) async -> (backdrop: String?, logo: String?) {
-        if let hit = cache[id] { return hit }
-        if let task = inflight[id] { return await task.value }
+        let request = Request(id: id, type: type)
+        if let hit = cache[request] { return hit }
+        if let task = inflight[request] { return await task.value }
         let task = Task { await TMDBClient.landscapeImages(metaID: id, type: type) }
-        inflight[id] = task
+        inflight[request] = task
         let result = await task.value
         // Only cache a POSITIVE result. A transient TMDB failure returns (nil, nil); caching that latched the
         // card into poster-fallback for the WHOLE session. Leaving a miss uncached lets a later appear retry.
@@ -39,9 +44,9 @@ actor LandscapeBackdropCache {
             // Bounded so a long browsing session cannot grow the map without limit; on overflow reset the whole
             // cache (worst case a re-resolve of the few visible cards, still correct), mirroring ResumeSeedGuard.
             if cache.count > 2000 { cache.removeAll(keepingCapacity: true) }
-            cache[id] = result
+            cache[request] = result
         }
-        inflight[id] = nil
+        inflight[request] = nil
         return result
     }
 }

@@ -79,8 +79,10 @@ let refresh = section(bridge, from: "private func refreshAddons()", until: "/// 
 let continueWatching = section(bridge, from: "func rebuildContinueWatching()", until: "/// FLOOR each engine")
 let event = section(bridge, from: "fileprivate func handleEvent", until: "// MARK: meta_details coalesce")
 let libraryEvent = section(event, from: "if fields.contains(\"library\")", until: "if fields.contains(\"search\")")
-let catalogAdd = section(bridge, from: "func addToLibrary(metaId:", until: "/// Add a fully-formed meta object")
+let catalogAdd = section(bridge, from: "func addToLibrary(metaId:", until: "func addToLibraryFromMenu(")
 let catalogWatched = section(bridge, from: "func setCatalogWatched(metaId:", until: "/// The raw `MetaItemPreview`")
+let menuAdd = section(bridge, from: "func addToLibraryFromMenu(", until: "func removeFromLibraryFromMenu(")
+let menuRemove = section(bridge, from: "func removeFromLibraryFromMenu(", until: "/// Add a fully-formed meta object")
 let tvCards = source("SourcesTV/SharedUI.swift")
 let iosCards = source("SourcesiOS/iOSRootView.swift")
 let meta = section(bridge, from: "private func scheduleMetaDetailsRepublish()", until: "private static func appleCWMetaRefreshIsSettled")
@@ -153,6 +155,7 @@ check(appearsBefore("facade.addCatalogItem", "let binding = settledActiveAccount
                 && nativeAutoAdd.contains("allowInsert: stampIntent"),
               "native auto-add uses captured native metadata and durable membership without a Stremio receipt")
 let nativeBootstrap = section(syncSource, from: "func restoreNativeCheckpoint", until: "/// Shared account-owner epoch")
+let nativeAdmission = section(syncSource, from: "private func nativeRestoreDocument", until: "func restoreNativeCheckpoint")
 check(appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)", "await CoreBridge.shared.closeNativeSession()", in: nativeBootstrap)
       && appearsBefore("validateLegacyCompatibility", "await CoreBridge.shared.closeNativeSession()", in: nativeBootstrap)
       && nativeBootstrap.contains("let finalCheckpoint = try probe.authenticatedCheckpoint(scope: scope)"),
@@ -166,12 +169,18 @@ check(ownPreparation.contains("classifyDeferredOwnAccountOverlays(document: docu
       && ownPreparation.contains("if validatedSync != nil && !attributed")
       && ownPreparation.contains("if historical == nil || historical?[\"verifiedStreamingUid\"] == source[\"verifiedStreamingUid\"]"),
       "cold own overlay evidence remains UID-bound and pending is sealed alongside the native candidate")
-check(nativeBootstrap.contains("resolveRoster(from: document, fullOnly: true)")
+check(nativeAdmission.contains("resolveRoster(from: document, fullOnly: true)")
+                && nativeBootstrap.contains("self.nativeRestoreDocument(pulled, capture: capture, selectedProfile: selectedProfile, generation: generation)")
                 && nativeBootstrap.contains("let checkpoint = try probe.authenticatedCheckpoint(scope: scope)")
                 && nativeBootstrap.contains("let hadCheckpoint = checkpoint != nil")
                 && nativeBootstrap.contains("if !hadCheckpoint")
+                && section(nativeBootstrap, from: "if !hadCheckpoint {", until: "let archive = try material.map")
+                    .contains("guard let material else { throw VortxNativeError.invalidSnapshot }")
                 && nativeBootstrap.contains("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)")
-                && nativeBootstrap.contains("VortxNativeBootstrapArchive.encode(document: documentBytes, material: material, authenticatedSourceArchive: prepared.sourceArchive)")
+                && nativeBootstrap.contains("let material = prepared?.material")
+                && nativeBootstrap.contains("let archive = try material.map { try VortxNativeBootstrapArchive.encode(document: documentBytes, material: $0, authenticatedSourceArchive: prepared?.sourceArchive) }")
+                && nativeBootstrap.contains("bootstrap: archive, bootstrapScope: scope")
+                && appearsBefore("let archive = try material.map", "bootstrap: archive, bootstrapScope: scope", in: nativeBootstrap)
                 && nativeBootstrap.contains("allowNewAccount: !hadCheckpoint, initialActions: initialActions")
                 && nativeBootstrap.contains("if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }")
                 && appearsBefore("validateLegacyCompatibility", "let session = try VortxNativeSession", in: nativeBootstrap)
@@ -192,12 +201,19 @@ check(detachedSeed.contains("VortxNativeSession.detachedLegacySync")
       && !detachedSeed.contains("rememberAuthenticatedScope") && !detachedSeed.contains("installNativeSession"),
       "proven-empty seed is detached until create-only PUT and authenticated winner readback")
 let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "// Read-merge the pulled doc's tombstone stamps")
-check(nativePush.contains("await prepareNativeLegacyMaterial(doc, capture: capture)") && nativePush.contains("legacyMaterial: prepared.material")
+check(nativePush.contains("let conversion = nativeLegacyConversionDecision(doc, capture: capture)")
+                && nativePush.contains("var prepared: NativeLegacyPreparation?")
+                && nativePush.contains("if conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }")
+                && nativePush.contains("legacyMaterial: prepared?.material")
+                && nativePush.contains("sourceAuthority: prepared?.authority, authenticatedSourceArchive: prepared?.sourceArchive")
+                && nativePush.contains("if prepared != nil { recordNativeLegacyConversion(conversion.digest, capture: capture) }")
+                && appearsBefore("if conversion.convert {", "CoreBridge.shared.mergeNativeAccountDocument", in: nativePush)
                 && nativePush.contains("VortxNativeSyncExportPolicy.permitsStateOnlyExport")
                 && nativePush.contains("hasDirtySettings: (try? nativeGlobalEdits()) == nil")
                 && nativePush.contains("doc[\"nativeHostPreferences\"]")
                 && nativePush.contains("orderIntent != nil || pendingAddonOrderIntent != nil")
-                && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision)\n#else"),
+                && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+                    + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n#else"),
               "native export checks the legacy receipt and returns unchanged sibling carriers without legacy mirror rewrites")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
@@ -337,11 +353,21 @@ check(catalogAdd.contains("rawMetaPreview(forId: metaId) ?? fallbackPreview?.dic
                 && catalogWatched.contains("rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary")
                 && catalogWatched.contains("canDispatchCatalogAdd"),
               "unloaded catalog actions retain a validated minimal card preview after resident lookup")
-check(tvCards.contains("fallbackPreview: catalogPreview")
-                && iosCards.contains("fallbackPreview: catalogPreview")
-                && tvCards.contains("expectedType: type")
-                && iosCards.contains("expectedType: catalogPreview.type"),
+check(tvCards.contains("addToLibraryFromMenu(catalogPreview)")
+                && iosCards.contains("addToLibraryFromMenu(catalogPreview)")
+                && menuAdd.contains("addToLibrary(metaId: card.id, expectedType: card.type, fallbackPreview: card, target: target)"),
               "Apple card menus pass their rendered id, type, name, and poster to the guarded fallback path")
+check(menuAdd.contains("guard addToLibrary(metaId: card.id")
+                && menuAdd.contains("ScrobbleCoordinator.shared.addedToLibrary(")
+                && menuAdd.contains("setNativeLibraryMembership(id: resident.id")
+                && !menuAdd.contains("dispatchCtx(")
+                && menuRemove.contains("setNativeLibraryMembership(id: saved.id")
+                && menuRemove.contains("ScrobbleCoordinator.shared.removedFromLibrary(")
+                && tvCards.contains("removeFromLibraryFromMenu(catalogPreview)")
+                && iosCards.contains("removeFromLibraryFromMenu(catalogPreview)")
+                && !catalogAdd.contains("ScrobbleCoordinator")
+                && !autoAddSource.contains("FromMenu"),
+              "card-menu library adds and removes mirror to Trakt/SIMKL only after the save, while auto-add on play never does")
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }")
                 && event.contains("self.loadSearchRange()"),
               "ctx search-range redispatch is dropped for stale or blocked account context")

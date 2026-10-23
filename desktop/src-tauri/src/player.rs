@@ -17,12 +17,10 @@
 //! would. So a DV title plays and looks right (HDR tonemapped), but this is not certified DV
 //! passthrough. Document this expectation rather than implying parity with hardware DV.
 //!
-//! TORRENT GATE. This module is only ever handed a URL that is ALREADY playable: the frontend's
-//! detail.ts runs the unchanged prepareTorrent -> resolveUrl pipeline (server.ts), which returns a
-//! loopback `http://127.0.0.1:11470/<hash>/<idx>` URL ONLY after `isListening()` is true, and null
-//! otherwise. `mpv_play` additionally refuses the URL until the embedded server passes its
-//! owner-authenticated health challenge, as a defensive backstop so a different process merely
-//! holding the port cannot satisfy the gate.
+//! TORRENT GATE. The web client (webapp/src/lib/desktop.ts) only builds a loopback
+//! `http://127.0.0.1:<port>/<hash>/<idx>` URL once the shell has reported the in-process VortX
+//! streaming server's address. `mpv_play` re-checks the URL against that exact authority, which this
+//! process bound itself, so no other process holding some port can satisfy the gate.
 //!
 //! How it's wired: the frontend calls the `mpv_play` / typed transport / `mpv_stop` Tauri commands
 //! (see lib.rs). `mpv_play` spawns mpv bound to a borderless child window (`--wid=<handle>` when a
@@ -47,11 +45,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::child_supervisor::SupervisedChild;
 
-/// Loopback host + port the embedded streaming server binds (see server.rs). Used only to recognize
-/// a torrent/loopback URL so we can enforce the torrent gate before handing it to mpv. Kept in sync
-/// with server.rs by intent; a drift here only weakens the defensive backstop, not the primary gate
-/// (which lives in the TS resolveUrl pipeline).
-const SERVER_AUTHORITY: &str = "127.0.0.1:11470";
+/// The latest resume position accepted from the web client (one week), so a malformed value cannot
+/// reach mpv's command line.
+const MAX_START_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 
 /// How long to wait for mpv to create its IPC server socket after spawn before giving up. mpv opens
 /// the socket within tens of ms once the process is up; this is a generous ceiling so a slow cold
@@ -120,12 +116,11 @@ fn set_state(state: PlayerState) {
 
 // ---- Playback-progress reporting (Continue Watching / resume) -----------------------------------
 //
-// Desktop used to play but never tell the engine where the user was, so Continue Watching and resume
-// never reflected desktop playback. This samples mpv's position over the IPC we already have and
-// forwards it to the engine Player as a `TimeChanged` action (the same report the Apple apps send).
-// player.rs stays decoupled from the runtime: lib.rs registers a sink closure at init.
+// This samples mpv's position over the IPC we already have and hands it to the web client, which
+// records Continue Watching and resume through the VortX account with the same rules as its in-page
+// player. player.rs stays decoupled from the window: lib.rs registers a sink closure at startup.
 
-/// Forwards a sampled position (time_ms, duration_ms) to the engine. None until lib.rs registers it.
+/// Forwards a sampled position (time_ms, duration_ms). None until lib.rs registers it.
 type ProgressSink = Box<dyn Fn(u64, u64) + Send + Sync>;
 static PROGRESS_SINK: Lazy<RwLock<Option<ProgressSink>>> = Lazy::new(Default::default);
 /// Guards the single long-lived reporter thread so it is spawned at most once.
@@ -134,7 +129,7 @@ static REPORTER_STARTED: AtomicBool = AtomicBool::new(false);
 /// engine (and the IPC). Matches the Apple apps' periodic report, not a per-frame update.
 const PROGRESS_POLL: Duration = Duration::from_secs(5);
 
-/// Register the engine progress sink. Called once from lib.rs at engine init.
+/// Register the progress sink. Called once from lib.rs at startup.
 pub fn set_progress_sink(sink: ProgressSink) {
     if let Ok(mut guard) = PROGRESS_SINK.write() {
         *guard = Some(sink);
@@ -142,7 +137,7 @@ pub fn set_progress_sink(sink: ProgressSink) {
 }
 
 /// Start the single background thread that, while mpv is Playing, samples its position every
-/// `PROGRESS_POLL` and forwards it to the engine. Idempotent (a second call is a no-op).
+/// `PROGRESS_POLL` and forwards it to the sink. Idempotent (a second call is a no-op).
 pub fn start_progress_reporter() {
     if REPORTER_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -202,7 +197,7 @@ pub fn status() -> PlayerState {
 }
 
 /// The platform-tagged mpv path under `resources/` (mirrors server.rs's `node_binary_name()` and the
-/// fetch script's per-platform staging). Keep these in lockstep with scripts/fetch-server-deps.sh.
+/// fetch script's per-platform staging). Keep these in lockstep with scripts/fetch-mpv.sh.
 /// On Windows/Linux the staged artifact is a single self-contained binary; on macOS mpv is dynamically
 /// linked, so the fetch script stages the whole self-contained `mpv.app` and this returns the path to
 /// its inner executable (the bundle's dylibs resolve via @executable_path, so spawning it directly works).
@@ -231,17 +226,19 @@ fn mpv_binary_name() -> &'static str {
     }
 }
 
-/// Resolve the staged mpv binary path, preferring the bundled `resources/` copy and falling back to
-/// a `mpv` already on PATH (handy for `tauri dev` before the binary is staged, and on Linux where a
-/// system mpv is common). Returns the path to run, or None if neither is available.
+/// Resolve the packaged runtime. A release must not silently run an unrelated PATH executable
+/// when its bundle is incomplete. Only debug builds retain the explicit system-mpv convenience.
 fn resolve_mpv_binary(resource_dir: &Path) -> Option<PathBuf> {
     let bundled = resource_dir.join(mpv_binary_name());
-    if bundled.exists() {
+    if bundled.is_file() {
         return Some(bundled);
     }
-    // PATH fallback: trust the OS to resolve a plain `mpv`/`mpv.exe`. We only return the bare name;
-    // Command will search PATH. We can't cheaply prove it exists here, so callers treat a spawn
-    // failure as "no mpv" via the Failed state.
+    debug_system_mpv()
+}
+
+/// Debug builds only: an mpv on PATH, for local development without a staged bundle.
+#[cfg(debug_assertions)]
+fn debug_system_mpv() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let path_name = "mpv.exe";
     #[cfg(not(target_os = "windows"))]
@@ -249,7 +246,14 @@ fn resolve_mpv_binary(resource_dir: &Path) -> Option<PathBuf> {
     which_on_path(path_name).map(PathBuf::from)
 }
 
+/// Release builds never fall back to an unrelated PATH executable.
+#[cfg(not(debug_assertions))]
+fn debug_system_mpv() -> Option<PathBuf> {
+    None
+}
+
 /// Best-effort `which`: is `name` resolvable on PATH? Used only for the dev/system-mpv fallback.
+#[cfg(debug_assertions)]
 fn which_on_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -298,18 +302,21 @@ fn fresh_ipc_endpoint() -> Result<(PathBuf, Option<tempfile::TempDir>), String> 
     }
 }
 
-/// True only for the embedded server's torrent-file route:
-/// `http://127.0.0.1:11470/<40-hex-infohash>/<decimal-index>`.
+/// True only for the embedded server's torrent-file route at the exact authority it bound:
+/// `http://127.0.0.1:<port>/<40-hex-infohash>/<decimal-index>`.
 ///
 /// Reject every other local route, query, and authority form because the bundled server also has
 /// redirecting `/yt`, `/proxy`, and root handlers. Passing one of those to native mpv would turn a
 /// loopback-only gate back into a remote fetch.
-fn is_loopback_torrent_url(url: &str) -> bool {
+fn is_loopback_torrent_url(url: &str, server_authority: &str) -> bool {
+    if !server_authority.starts_with("127.0.0.1:") {
+        return false;
+    }
     let Ok(uri) = url.parse::<http::Uri>() else {
         return false;
     };
     if uri.scheme_str() != Some("http")
-        || uri.authority().map(|authority| authority.as_str()) != Some(SERVER_AUTHORITY)
+        || uri.authority().map(|authority| authority.as_str()) != Some(server_authority)
         || uri.query().is_some()
     {
         return false;
@@ -334,17 +341,19 @@ fn is_loopback_torrent_url(url: &str) -> bool {
 
 /// Start mpv on `url` and load it over IPC. `resource_dir` locates the staged mpv binary; `wid` is an
 /// optional native window handle to embed into (the Tauri main window's surface). When None, mpv
-/// opens its own borderless window. `server_listening` is the backend's current view of the embedded
-/// streaming server, used to enforce the torrent gate. Any previously running mpv is stopped first
-/// (single-player model: one playback at a time, matching the single fullscreen player on Apple).
+/// opens its own borderless window. `server_authority` is the in-process streaming server's bound
+/// `127.0.0.1:<port>` (None while it is down), used to enforce the torrent gate. `start` resumes at a
+/// position in seconds. Any previously running mpv is stopped first (single-player model: one playback
+/// at a time, matching the single fullscreen player on Apple).
 pub fn play(
     resource_dir: &Path,
     url: &str,
     wid: Option<isize>,
-    server_listening: bool,
+    server_authority: Option<&str>,
+    start: Option<f64>,
 ) -> Result<(), String> {
     run_lifecycle(&PLAYER_LIFECYCLE, || {
-        play_locked(resource_dir, url, wid, server_listening)
+        play_locked(resource_dir, url, wid, server_authority, start)
     })
 }
 
@@ -352,7 +361,8 @@ fn play_locked(
     resource_dir: &Path,
     url: &str,
     wid: Option<isize>,
-    server_listening: bool,
+    server_authority: Option<&str>,
+    start: Option<f64>,
 ) -> Result<(), String> {
     // A new play request always owns the single-player slot, even when policy rejects the new URL.
     // This prevents a prior native child continuing behind a webview fallback.
@@ -363,8 +373,13 @@ fn play_locked(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("refusing to play a non-http(s) URL".to_owned());
     }
+    if let Some(seconds) = start {
+        if !(seconds.is_finite() && (0.0..=MAX_START_SECONDS).contains(&seconds)) {
+            return Err("refusing an invalid start position".to_owned());
+        }
+    }
 
-    play_native(resource_dir, url, wid, server_listening)
+    play_native(resource_dir, url, wid, server_authority, start)
 }
 
 #[cfg(target_os = "windows")]
@@ -372,7 +387,8 @@ fn play_native(
     _resource_dir: &Path,
     _url: &str,
     _wid: Option<isize>,
-    _server_listening: bool,
+    _server_authority: Option<&str>,
+    _start: Option<f64>,
 ) -> Result<(), String> {
     Err("secure native playback on Windows requires bounded named-pipe IPC support".to_owned())
 }
@@ -382,20 +398,21 @@ fn play_native(
     resource_dir: &Path,
     url: &str,
     wid: Option<isize>,
-    server_listening: bool,
+    server_authority: Option<&str>,
+    start: Option<f64>,
 ) -> Result<(), String> {
-    let loopback = is_loopback_torrent_url(url);
-    if !loopback {
+    let loopback =
+        server_authority.is_some_and(|authority| is_loopback_torrent_url(url, authority));
+    if !loopback && server_authority.is_some() {
         return Err(
             "secure native playback for remote URLs requires an attested bundled mpv runtime"
                 .to_owned(),
         );
     }
 
-    // TORRENT GATE (defensive backstop). The primary gate is the TS resolveUrl pipeline, which only
-    // yields a loopback URL once isListening() is true. Re-check here so a loopback URL can never be
-    // played while the embedded server is down.
-    if !server_listening {
+    // TORRENT GATE (defensive backstop). The web client only builds a loopback URL once the shell has
+    // reported the server's address; re-check here so nothing plays while the server is down.
+    if !loopback {
         return Err(
             "the embedded streaming server is not listening yet; torrent stream not ready"
                 .to_owned(),
@@ -404,7 +421,7 @@ fn play_native(
 
     let mpv_bin = resolve_mpv_binary(resource_dir).ok_or_else(|| {
         format!(
-            "mpv runtime missing ({}). Drop the mpv binary into resources/ (see fetch-server-deps.sh) or install mpv on PATH.",
+            "packaged mpv runtime missing ({}). Restage the verified runtime before packaging; PATH fallback is debug-only.",
             mpv_binary_name()
         )
     })?;
@@ -414,7 +431,7 @@ fn play_native(
             reason: reason.clone(),
         });
     })?;
-    let supervisor = spawn_mpv(&mpv_bin, &ipc_path, wid).map_err(|e| {
+    let supervisor = spawn_mpv(&mpv_bin, &ipc_path, wid, start).map_err(|e| {
         let reason = format!("failed to launch mpv: {e}");
         set_state(PlayerState::Failed {
             reason: reason.clone(),
@@ -509,14 +526,15 @@ fn spawn_mpv(
     mpv_bin: &Path,
     ipc_path: &Path,
     wid: Option<isize>,
+    start: Option<f64>,
 ) -> std::io::Result<SupervisedChild> {
-    let mut cmd = SupervisedChild::command(mpv_bin, &mpv_args(ipc_path, wid))?;
+    let mut cmd = SupervisedChild::command(mpv_bin, &mpv_args(ipc_path, wid, start))?;
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     SupervisedChild::spawn(cmd)
 }
 
-fn mpv_args(ipc_path: &Path, wid: Option<isize>) -> Vec<String> {
+fn mpv_args(ipc_path: &Path, wid: Option<isize>, start: Option<f64>) -> Vec<String> {
     let mut args = vec![
         format!("--input-ipc-server={}", ipc_path.to_string_lossy()),
         "--vo=gpu-next".to_owned(),
@@ -536,6 +554,10 @@ fn mpv_args(ipc_path: &Path, wid: Option<isize>) -> Vec<String> {
         // playback inside the app window; without it mpv opens its own borderless window, which is a
         // fine fallback on platforms where embedding is unreliable.
         args.push(format!("--wid={handle}"));
+    }
+    if let Some(seconds) = start.filter(|seconds| *seconds > 0.0) {
+        // Validated finite and bounded in play_locked; a plain decimal cannot carry another option.
+        args.push(format!("--start={seconds:.3}"));
     }
     args
 }
@@ -861,6 +883,47 @@ fn try_connect(ipc_path: &Path) -> Result<IpcStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_AUTHORITY: &str = "127.0.0.1:11470";
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn torrent_gate_follows_the_bound_server_authority() {
+        let url = format!("http://127.0.0.1:52311/{HASH}/0");
+        assert!(is_loopback_torrent_url(&url, "127.0.0.1:52311"));
+        assert!(!is_loopback_torrent_url(&url, TEST_AUTHORITY));
+        assert!(!is_loopback_torrent_url(
+            &format!("http://0.0.0.0:52311/{HASH}/0"),
+            "0.0.0.0:52311"
+        ));
+    }
+
+    #[test]
+    fn start_position_is_bounded_and_passed_as_a_plain_decimal() {
+        let socket = Path::new("/tmp/vortx-test.sock");
+        assert!(mpv_args(socket, None, Some(90.5)).contains(&"--start=90.500".to_owned()));
+        assert!(!mpv_args(socket, None, None)
+            .iter()
+            .any(|arg| arg.starts_with("--start")));
+        assert!(!mpv_args(socket, None, Some(0.0))
+            .iter()
+            .any(|arg| arg.starts_with("--start")));
+        let _guard = TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let url = format!("http://127.0.0.1:11470/{HASH}/0");
+        for bad in [f64::NAN, f64::INFINITY, -1.0, MAX_START_SECONDS + 1.0] {
+            let error = play(
+                &std::env::temp_dir(),
+                &url,
+                None,
+                Some(TEST_AUTHORITY),
+                Some(bad),
+            )
+            .unwrap_err();
+            assert!(error.contains("invalid start"), "got: {error}");
+        }
+    }
     use std::process::Command;
     use std::sync::mpsc;
 
@@ -932,23 +995,32 @@ mod tests {
     #[test]
     fn exact_loopback_torrent_urls_are_recognized() {
         assert!(is_loopback_torrent_url(
-            "http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0"
+            "http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0",
+            TEST_AUTHORITY
         ));
         assert!(is_loopback_torrent_url(
-            "http://127.0.0.1:11470/ABCDEF0123456789ABCDEF0123456789ABCDEF01/4294967295"
+            "http://127.0.0.1:11470/ABCDEF0123456789ABCDEF0123456789ABCDEF01/4294967295",
+            TEST_AUTHORITY
         ));
         assert!(!is_loopback_torrent_url(
-            "https://cdn.example.com/movie.mkv"
-        ));
-        assert!(!is_loopback_torrent_url("http://127.0.0.1:8080/other"));
-        assert!(!is_loopback_torrent_url(
-            "http://localhost:11470/0123456789abcdef0123456789abcdef01234567/0"
+            "https://cdn.example.com/movie.mkv",
+            TEST_AUTHORITY
         ));
         assert!(!is_loopback_torrent_url(
-            "http://evil.example/?next=http://127.0.0.1:11470/abc/1"
+            "http://127.0.0.1:8080/other",
+            TEST_AUTHORITY
         ));
         assert!(!is_loopback_torrent_url(
-            "http://127.0.0.1.evil.example:11470/abc/1"
+            "http://localhost:11470/0123456789abcdef0123456789abcdef01234567/0",
+            TEST_AUTHORITY
+        ));
+        assert!(!is_loopback_torrent_url(
+            "http://evil.example/?next=http://127.0.0.1:11470/abc/1",
+            TEST_AUTHORITY
+        ));
+        assert!(!is_loopback_torrent_url(
+            "http://127.0.0.1.evil.example:11470/abc/1",
+            TEST_AUTHORITY
         ));
         for rejected in [
             "https://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0",
@@ -961,7 +1033,7 @@ mod tests {
             "http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/4294967296",
         ] {
             assert!(
-                !is_loopback_torrent_url(rejected),
+                !is_loopback_torrent_url(rejected, TEST_AUTHORITY),
                 "unexpectedly accepted: {rejected}"
             );
         }
@@ -979,7 +1051,7 @@ mod tests {
             "ftp://example.com/x",
             "javascript:alert(1)",
         ] {
-            let err = play(&dir, bad, None, true).unwrap_err();
+            let err = play(&dir, bad, None, Some(TEST_AUTHORITY), None).unwrap_err();
             assert!(
                 err.contains("non-http(s)"),
                 "expected non-http rejection for {bad}, got: {err}"
@@ -997,7 +1069,8 @@ mod tests {
             &std::env::temp_dir(),
             "https://cdn.example.com/movie.mkv",
             None,
-            true,
+            Some(TEST_AUTHORITY),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("attested bundled mpv runtime"), "got: {err}");
@@ -1015,7 +1088,8 @@ mod tests {
             &dir,
             "http://127.0.0.1:11470/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/0",
             None,
-            false,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1066,7 +1140,7 @@ mod tests {
 
     #[test]
     fn spawned_mpv_args_fail_closed_on_media_tls() {
-        let args = mpv_args(Path::new("/tmp/vortx-test.sock"), Some(42));
+        let args = mpv_args(Path::new("/tmp/vortx-test.sock"), Some(42), None);
         let expected_security = [
             "--no-config",
             "--load-scripts=no",
@@ -1176,7 +1250,8 @@ mod tests {
             "http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0",
             "https://cdn.example.com/movie.mkv",
         ] {
-            let error = play(&std::env::temp_dir(), url, None, true).unwrap_err();
+            let error =
+                play(&std::env::temp_dir(), url, None, Some(TEST_AUTHORITY), None).unwrap_err();
             assert!(error.contains("bounded named-pipe IPC"), "got: {error}");
         }
         assert!(set_paused(true)

@@ -73,6 +73,22 @@ class NativeOwnAccountSourcesTest {
         assertEquals(20_001L, material.getJSONObject("watches").getJSONArray(child.id).getJSONObject(0).getLong("positionMs"))
     }
 
+    @Test fun `malformed own row is held without losing valid siblings or raw source bytes`() = runBlocking {
+        val raw = JSONObject(String(library())).also {
+            it.getJSONArray("result").getJSONObject(0).put("state", "not-an-object")
+            it.getJSONArray("result").put(JSONObject(String(library("good-title"))).getJSONArray("result").getJSONObject(0))
+        }.toString().toByteArray()
+        val journal = Journal()
+        val source = producer(raw).fetch(capture(journal), root())
+        val rows = source.legacyDocument().getJSONObject("vortx").getJSONArray("library")
+        assertEquals(2, rows.length())
+        assertTrue(rows.getJSONObject(0).has(NATIVE_LEGACY_HELD_REASON))
+        assertFalse(rows.getJSONObject(0).has("id"))
+        assertEquals("good-title", rows.getJSONObject(1).getString("id"))
+        val archive = JSONObject(String(Base64.getDecoder().decode(source.archiveBase64())))
+        assertArrayEquals(raw, Base64.getDecoder().decode(archive.getString("libraryResponseBase64")))
+    }
+
     @Test fun `same UID requires separate complete buckets for each exact UUID`() = runBlocking {
         val journal = Journal(); val second = child.copy(id = "22222222-2222-2222-2222-222222222222")
         val a = producer().fetch(capture(journal), root())

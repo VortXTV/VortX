@@ -4,69 +4,235 @@ Notable VortX changes, newest first. VortX is Apple TV first, with iPhone/iPad, 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.5.6 beta 2 - 2026-10-18
+## 0.5.6 - Native all the way, safer profiles and lighter playback
 
-Build **276**. Published as [v0.5.6-beta.2](https://github.com/VortXTV/VortX/releases/tag/v0.5.6-beta.2), with four Apple packages, three Android packages, checksums and hosted provenance. The earlier beta 1 candidate was not published.
+Build **280** across Apple and Android. This brings the 0.5.6 beta repairs together, removes the old comparison engine and Node runtime from the native apps, and keeps your add-ons, profiles and saved data on the VortX engine. Stremio-compatible add-ons, optional Stremio account/library import and Cinemeta are still supported.
 
-### Fixed
+### Fixed and improved
 
-- **Older profile import/recovery failures (#262, #265):** recognize valid legacy display values without rewriting their original bytes. Distinguish a confirmed missing backup from unreadable/unavailable storage, so a read failure does not authorize replacing it with an empty account. Lost encryption keys cannot be recovered by this change.
-- **Repeated recovery after seeking/skipping credits:** inner seek and outer playback recovery share a retry allowance. An unfinished episode retains its resume position and is not marked watched or advanced to conceal an early EOF. The upstream source ending early remains a separate problem.
-- **Controls and Mac lifecycle:** auto-hide follows the current interaction, covered preparation work leaves the UI actor, server restarts are bounded and quit waits for the server owned by that app.
-- **Intro/credit timing (#266):** Apple and Android use IntroDB v4 with matching-episode response handling. Stale responses cannot overwrite the current episode's timings; Android validates cached results.
-- **Profile ownership:** Continue Watching imports and Watch Stats keep the profile/attempt they started with, instead of publishing into a replacement profile or clearing newer work.
+- **Profiles, catalogs, episodes and sources.** Profile changes keep the current native callback stream alive, so fresh catalogs, seasons, episode lists and source results reach the screen. A late result from the old profile cannot overwrite the new one.
+- **Older accounts that would not open ([#262](https://github.com/VortXTV/VortX/issues/262), [#265](https://github.com/VortXTV/VortX/issues/265)).** Valid older display values, including sticky-series labels supplied by add-ons, are no longer mistaken for hidden credentials. Original saved bytes, unknown fields and pending changes are kept. An unreadable account is never treated as an empty one.
+- **Android sign-in and recovery ([#277](https://github.com/VortXTV/VortX/issues/277)).** Expensive key derivation and native sync run off the UI thread. Cancelled sign-ins release unclaimed key material, and native failures are contained without replacing the account with empty data. Profile saves, account publication and Continue Watching share a consistent ownership and lock order.
+- **Stremio import ownership.** Reconnects and delayed library/history imports remain bound to the account and profile that started them. An incomplete import stays retryable without discarding accepted data; this is not a claim that every reported import failure has been resolved.
+- **Mac playback after pausing.** Recovery no longer leaves Play waiting behind an unfinished replacement or shows that replacement's temporary position. Skip Intro and Skip Credits stay above the controls when you move the mouse.
+- **Repeated playback recovery.** Seek recovery and mid-play recovery share a bounded allowance instead of reopening the same failing region indefinitely. An unfinished episode keeps its position; it is not marked watched or advanced to hide a failure. A remote source ending early remains a separate possible failure.
+- **Lighter glass on iPhone, iPad and Mac.** Player chrome is more transparent, with a deeper Crimson tint and local contrast protection around time labels. Reduce Transparency and Effects Off retain their readable fallbacks; controls stay in their existing positions.
+- **Apple TV controls and next-episode work.** Up reveals the controls before checking skip and Up Next prompts. Impossible or not-yet-due checks are rejected before building large episode inventories, and next-episode preparation remains bounded.
+- **Self-hosted add-ons.** User-selected LAN, localhost and Tailscale add-ons install, restore and receive requests normally on Apple and Android. Certificate checks, metadata-address exclusions and response limits stay in place.
+- **Top Shelf in Full TV.** The extension is part of the normal Full app installation. It follows the shared container actually granted to the signed app and extension, with bounded queue snapshots and refreshes for progress and artwork changes. The signer must still provision a matching shared capability for both targets; Lite does not include Top Shelf.
+- **Less background uploading.** Playback saves are batched while you watch and flushed sooner on pause or stop. History, Home and catalog operations avoid repeated work, and failed reads retain the last complete saved snapshot.
+- **Clearer recovery.** Watched-history Retry can restore a missing account session, Android diagnostics can be shared before entering Settings, and Trakt connection failures are classified without exposing credentials.
+
+### New and changed
+
+- **Richer Collections**, with nested groups, ordering, artwork and optional Xperience import/refresh inside the existing editor. A refresh cannot overwrite newer local edits.
+- **Playback badges**, with icons, current track information and the selected audio language. Apple TV Settings has focused categories and keeps search.
+- **Updated native player inputs.** Apple and Android Full use the reviewed custom mpv/libplacebo path with FFmpeg **9.0.2**. Android Play uses **Media3 1.11.1** and retains its GPL-free packaging boundary.
+- **Native-only app composition.** The retired comparison engine, Node runtime, `server.js` and legacy web-host target are removed from Apple and Android release paths. Optional Stremio integration and compatible community add-ons are not removed.
+
+### Installation and remaining work
+
+Update using the same platform and variant to preserve its identity and saved data. Apple IPAs require compatible sideload signing. The Apple-silicon Mac app is ad-hoc signed, not notarized. Android remains a technical preview, with Full MPV and Play Media3 variants for phones, tablets and Android TV.
+
+The full first-party Swift 6 migration, wider performance/audit work and every dependency upgrade are **not** claimed complete. Codec, HDR, audio-route and Top Shelf behaviour still depend on the device, source and signing capabilities. If an account or playback still fails, export diagnostics before deleting data, resetting credentials or reinstalling.
+
+## 0.5.6 beta 5 - Mac playback fixes, self-hosted add-ons and lighter syncing
+
+Build **278** across Apple and Android. Beta 5 builds on beta 4 with Mac playback and player fixes, self-hosted
+add-ons and less background work while you watch.
+
+### Fixed and improved
+
+- **Mac playback that would not resume after a pause.** A recovery after pausing could leave Play waiting indefinitely and show the replacement player's temporary position. Recovery now completes, keeps your original position, and Play is no longer held behind it.
+- **Skip Intro and Skip Credits hidden by the controls.** Moving the mouse brought up the controls and removed the Skip button. It now stays visible and sits above the controls as they appear.
+- **Mac player controls** use a lighter translucent glass instead of an opaque grey panel; the solid fallback for Reduce Transparency is kept.
+- **Self-hosted add-ons.** Add-ons on your home network, localhost or Tailscale install normally instead of being refused as private addresses, on Apple and Android, and they are no longer marked unreachable or dropped when restored from sync. Certificate checks and size limits stay in place.
+- **Apple TV keyboard from iPhone.** Typing into Apple TV search from an iPhone keyboard no longer erases what you typed (thanks to the contributor of PR #274).
+- **Subtitles from some public sites** whose names begin with "fc" or "fd" were wrongly refused as private addresses. They download now.
+- **Playback badges** no longer publish a track list before the audio and subtitle choices have loaded.
+- **Much less uploading while you watch.** Your place was saved every 20 seconds, and each save uploaded your whole account, about every 25 seconds of playback. Saves now batch: while you keep watching the account uploads once every five minutes, and a pause or stop uploads it within a minute so your other devices pick up where you left off.
+- **Mac quits reported as crashes.** Every Mac launch recorded the previous session as ending unexpectedly after 0 seconds. Normal quits are now recorded as normal, and the session length is tracked, so diagnostics only flag real problems.
+
+## 0.5.6 beta 4 - Faster start, working Top Shelf, safer Stremio sync and richer Collections
+
+Build **277** across Apple and Android. Beta 3 was tagged but not published; this is its corrected build. This beta opens your account from this device straight away instead
+of waiting on a full download first, carries Stremio library and watch history through the native account
+path, adds richer Collections with optional Xperience import, and shows what you are actually playing.
+
+### Fixed and improved
+
+- **A faster start.** VortX waited to download, decrypt and merge your whole account before opening it, and at launch it did that twice. It now opens from this device's saved copy and catches up with the cloud right after. A first sign-in, or a device without a saved copy, still downloads first.
+- **Stremio library and watch history ([#267](https://github.com/VortXTV/VortX/issues/267)).** Connecting Stremio carries the owner's library and watched history through the native account path, not just add-ons. Import, reconnect and sync keep the account and profile that started them; a late result cannot replace a different account, and a failed save never acknowledges changes it did not keep.
+- **Older accounts carried over without losing saved data ([#262](https://github.com/VortXTV/VortX/issues/262)).** Valid older library titles are no longer mistaken for unsafe data. Unknown fields, pending changes and the original account copy are kept, and unreadable data is never treated as an empty account.
+- **Interests saved to the right profile.** Changing profile while the For You interests picker was open could save one profile's choices into another. The picker now saves only for the profile it opened for, and closes when the profile changes.
+- **Saved Collections kept when storage cannot be read.** Signed-out edits no longer replace unreadable saved Collections with an empty copy.
+- **Top Shelf stayed static after re-signing.** A signing service re-signs VortX under its own team and gives the app and its Top Shelf a shared group of its own, but VortX only looked for the group it ships with, so the two never found each other and the shelf showed the static image under every signing service. VortX now uses the group your signed copy was actually given. Movies and series that share an ID no longer collide, a long queue is trimmed to fit instead of being rejected, and progress, artwork and queue changes trigger an update. Full includes Top Shelf in the normal app; there is no separate extension to install.
+- **Apple TV player controls.** Up reveals the controls before checking Up Next and skip prompts, so less work runs first in the credits window.
+- **TV previews and playback audio.** Silent previews cannot reopen an audio output, and their wake-ups and recovery are bounded.
+- **History updates.** Trakt history reads follow every page before replacing the saved result, cancelled SIMKL reads keep the last complete snapshot, and account changes keep newer local edits.
+- **Android login and sync ([#270](https://github.com/VortXTV/VortX/issues/270)).** A realtime connection that fails to start no longer discards the saved session, and malformed Stremio rows are held without losing their valid neighbours.
+- **Clearer Trakt connection failures ([#271](https://github.com/VortXTV/VortX/issues/271)).** Authentication failures are classified without exposing credentials.
+
+### New
+
+- **Richer Collections ([#269](https://github.com/VortXTV/VortX/issues/269)).** Collections can carry nested groups, ordering, artwork and richer presentation inside the existing Collections editor.
+- **Optional Xperience import and refresh.** Bring in a compatible Xperience collection export and refresh it when you choose; your own edits are protected from an older refresh.
+- **Playback badges** with icons and the selected audio language, from the video and audio actually playing. They clear when a new item starts.
+- **Apple TV Settings categories ([#268](https://github.com/VortXTV/VortX/issues/268)).** Settings is split into focused categories, with search kept.
 
 ### Changed
 
-- Home/catalog operations reuse saved visibility/order snapshots. Watched-history imports avoid redundant retry work and pool repeated evidence without dropping pending history.
-- Apple TV skips not-yet-due Up Next work before building episode inventories. Discover observation and decorative seek updates are more narrowly scoped.
-- Updated controls share glass/Effects Off rules, disabled styles and Mac semantic text colors more consistently.
+- **Updated player components.** Apple uses the updated custom mpv with FFmpeg 9.0.2. Android's native player includes mpv 0.41 and FFmpeg 8.1.3 with maintenance updates to its subtitle, font and codec libraries, and Media3 1.11.1.
+- **Tighter certificate checks** in the native player and engine.
 
-The full first-party Swift 6 migration, wider audit and player-performance work are **not complete**. These changes do not establish physical-device smoothness or universal sync/provider acceptance. #267 is queued, not fixed. See [ROADMAP.md](ROADMAP.md) and [diagnostic guidance](docs/SUPPORT.md).
+### What is still being worked on
 
-## 0.5.5 - 2026-10-17
+The main apps are not yet fully migrated to Swift 6, some component upgrades remain, and smoothness, Top Shelf and the open customer reports still need checking on real devices.
 
-Build **274**. [Release notes](https://github.com/VortXTV/VortX/releases/tag/v0.5.5).
+## 0.5.6 beta 2 - Recovery, safer profile changes and less repeated work
 
-- Stabilized the legacy-data fingerprint so unchanged 0.4 data does not keep triggering conversion and whole-account uploads during sync.
-- Restored hero-trailer startup on the affected Apple surfaces.
-- Mac/iPad series pages scroll to the in-progress or next episode, and watched episode cards use an even dimmed presentation.
-- Reduced fallback polling while the live connection is healthy; missed-change checks remain when it is not.
+Build **276** across Apple and Android. Published as [v0.5.6-beta.2](https://github.com/VortXTV/VortX/releases/tag/v0.5.6-beta.2),
+with four Apple packages, three Android packages, checksums and hosted provenance. It is an
+incremental audit repair, not completion of the full audit or the Apple Swift 6 migration.
+The earlier beta1 candidate was not published; saved-data safety checks remain intact.
 
-This addressed identified repeated-conversion work, not every later profile or performance report.
+### Fixed and improved
 
-## 0.5.4 - 2026-10-16
+- **Profile import and recovery ([#262](https://github.com/VortXTV/VortX/issues/262), [#265](https://github.com/VortXTV/VortX/issues/265)).** Older profile display values are validated without rewriting their original saved bytes. Recovery markers distinguish confirmed missing data from unreadable or unavailable storage, so a failed read does not authorize an empty replacement. These changes do not recover an already-lost encryption key.
+- **Repeated recovery after skipping credits.** Inner seek recovery and outer playback recovery share a retry allowance instead of repeatedly reopening the same failing region. An unfinished episode keeps its resume position; it is not marked watched or automatically advanced to hide the failure. The underlying premature end of a remote media stream remains a separate diagnosis.
+- **Player controls and Mac lifecycle.** Control auto-hide follows the current interaction lifecycle, preparation work is moved off the UI actor where covered, and server restarts are bounded. Mac quit waits for the server it owns to finish shutting down and reports a retained-child failure instead of silently starting more copies.
+- **Intro and credit lookup ([#266](https://github.com/VortXTV/VortX/issues/266)).** Apple and Android use IntroDB v4 with checked request identity and response handling. Apple TV span updates and Android cache validation follow the same requested episode rather than accepting a stale response.
+- **Profile ownership.** Continue Watching migration attempts and Watch Stats retain their original profile ownership. An old completion cannot clear a newer attempt's busy state or publish another profile's statistics.
+- **Less repeated work.** Catalog sorting reads the saved order once per operation and Home reads the hidden-row set once per build. Apple TV rejects hidden or not-yet-due Up Next checks before constructing episode inventories. Watched-history migration avoids redundant retry preflight and pools repeated evidence while preserving pending history. Discover observation and decorative TV seek motion are narrowed to their relevant state.
+- **Shared presentation and safety.** Glass eligibility and Effects Off are applied through shared control policy, disabled chip styles and desktop semantic text colours are more consistent, and browser account/view ownership and diagnostic log bounds are tightened.
 
-Build **273**. [Release notes](https://github.com/VortXTV/VortX/releases/tag/v0.5.4).
+### What is still being worked on
 
-- Recognized legacy profile/Stremio fingerprint fields that could incorrectly block account migration.
-- Narrowed migration change detection and avoided re-applying unchanged synced profiles/settings.
-- Opened previously saved accounts locally while remaining conversion work settles, and retained clearer failure diagnostics.
-- Restored dimmed watched episodes, corrected artwork framing and improved Usenet NZB handling.
+The main iOS, Mac, Full TV and Lite TV apps are **not yet fully migrated to Swift 6**.
+This candidate retains the integrated Swift 6 Top Shelf and standalone Watch Stats work;
+remaining Apple caller integration, preference/UI-queue candidates, household/client and
+SDK adoption, broader cleanup and audit coverage continue after this prerelease. Isolated tests
+are not physical-device sync, playback or measured smoothness acceptance.
 
-Later releases refined migration detection and recovery further; this entry is not a claim that all accounts were fixed by 0.5.4.
+This beta does not deploy backend/database changes or automatically promote stable
+update feeds. Apple IPAs require sideload signing. The Mac app is ad-hoc signed, not
+notarized; installation instructions remain in [Release artifacts](docs/RELEASE-ARTIFACTS.md).
 
-## 0.5.3 - 2026-10-16
+## 0.5.5 - Smooth for real, hero trailers and your next episode
 
-Build **272**. [Release notes](https://github.com/VortXTV/VortX/releases/tag/v0.5.3).
+Build **274** across Apple and Android. 0.5.4 still converted your 0.4 data again on every sync, every
+ten seconds or so, on every Apple device. This release stops that for good, starts hero trailers again
+and opens a series on your episode on Mac and iPad.
 
-- Narrowed player/detail observations and reduced repeated save/serialization work during playback.
-- Restored missing add-on groups in All sources and the ability to re-enable switched-off built-ins.
-- Added broader rating displays, episode ratings/cards and Trailers & Extras on Apple.
-- Added tinted glass player controls on supported systems and Android rating/presentation updates.
+### Fixed
 
-## 0.5.2 - 2026-10-14
+- **Lag, stutter and slow taps on every Apple device.** The check that decides whether your 0.4 data has changed gave a different answer each time it ran, even when nothing had changed. So 0.5.4 converted everything again on every sync, about every 11 seconds, and uploaded the whole account each time: 895 times in three hours on one Mac. The check now gives the same answer for the same data, so the conversion runs once after updating and then stays skipped. The splash screen is shorter too, since the same conversion was competing with opening your account.
+- **Hero trailers never started** on Home and title pages on iPhone, iPad and Mac, or on title pages on Apple TV. The clip waited for a step that never ran. It runs now.
+- **Mac and iPad open a series on your episode.** A long season opened on episode 1. The episode grid now scrolls to the episode in progress, or the next one after the episode you last played.
+- **Watched episode cards** are dimmer and clean: the whole card darkens and loses its colour evenly instead of fading into a smeared double image.
 
-Build **271**. [Release notes](https://github.com/VortXTV/VortX/releases/tag/v0.5.2).
+### Changed
 
-- Added per-profile interests, For You rows and smart collections, actor pages, network shares and a live-channel TV guide where schedule data exists.
-- Updated series/season presentation, hero navigation, source/add-on controls and TV effects/performance settings.
-- Added diagnostic export entry points before normal sign-in/profile browsing is available.
-- Repaired identified account migration, Continue Watching/Library and Usenet paths. Subsequent reports and follow-up fixes remain documented separately.
+- **Less background syncing.** Changes from your other devices still arrive the moment they happen over the live sync connection. While that connection is up, the backup check runs every five minutes instead of every 3 seconds; if it drops, the check runs every few seconds again.
+- **A bigger Home billboard on Mac**, running down to just above Customize.
 
-## 0.5.1 - 2026-10-11
+### Android
 
-Build **268**. [Release notes](https://github.com/VortXTV/VortX/releases/tag/v0.5.1) cover Apple TV profiles, history import and sync follow-ups in the native 0.5 line. The complete historical release bodies remain available on GitHub; an older release title is not a current acceptance claim.
+Android checks for missed changes every five minutes while its live sync connection is up, instead of every 3 seconds. The Android APK is still an early technical preview, so expect missing features and rough edges.
+
+## 0.5.4 - A smoother app, a faster start and better episode lists
+
+Build **273** across Apple and Android. This release fixes accounts that still would not open
+after updating from 0.4, removes the background work that made 0.5.3 freeze every minute or
+so, most of all on Apple TV, opens your account faster, and
+brings back dimmed watched episodes, with a series opening on its next episode on iPhone, iPad and Mac.
+
+### Fixed
+
+- **Accounts that still would not open after updating from 0.4 ([#262](https://github.com/VortXTV/VortX/issues/262)).** Before it converts your account, VortX checks the saved copy for anything that looks like hidden data, so a password can never slip through. On accounts where a profile is connected to a Stremio account, it could mistake the normal fingerprints of that profile's Stremio data for hidden data and stop the whole account, so profiles, add-ons and the Stremio connection all failed together. Those fingerprints are recognised now, and every other field is still checked. If an account still fails, the diagnostics log now names the part of the account that was refused, without its contents.
+- **Freezing and lag across the app, most of all on Apple TV.** VortX checks whether the data carried over from 0.4 has changed before converting it again, but that check also counted the 0.5 data every sync rewrites, so it always looked changed. Every sync converted everything again, which took up to half a minute on Apple TV and froze menus, Settings and the remote every minute or so. The check now looks only at the 0.4 data, so the conversion runs once and then stays skipped.
+- **A slow start.** An account this device already holds now opens straight from what is saved on the device, and any conversion still due runs in the background and is applied when it finishes. A first sign-in still converts before it opens.
+- **Every screen redrawing on each sync.** Each sync re-applied the same profiles, rewrote every profile setting and redrew every screen, even under the player. Nothing is re-applied when nothing changed. On Apple TV, Settings also stopped slowing the app down while it sits open in the background.
+- **Continue Watching blanking out** for a moment while the app synced.
+- **Artwork on phones** on title and episode pages showed only the left side of the picture. It is centred now.
+- **Usenet:** gzipped NZBs and NZBs saved in older text encodings play, indexers that link to their NZBs over http work, results without a download link fall back to the item's link, and when an indexer refuses an NZB the error says so instead of reporting a damaged file. Anime episodes that indexers number by absolute episode are found.
+- **Settings > Engine** on iPhone, iPad and Mac names the VortX core build instead of an outdated schema number.
+
+### New
+
+- **Dimmed watched episodes** are back on every Apple platform, and on iPhone, iPad and Mac opening a series scrolls to its next episode.
+- **Pinned season posters on Mac and iPad.** The season posters stay at the top while the episodes scroll beneath them.
+
+### Android
+
+Android gets the usenet fixes that live in the shared engine: gzipped and older-encoding NZBs play, and indexer refusals are named. The Android APK is still an early technical preview, so expect missing features and rough edges.
+
+## 0.5.3 - Every rating, new episode cards and a quicker player
+
+Build **272** across Apple and Android. Ratings now come from every major service and show as
+each service's logo on cards, title pages, episodes and posters. Series pages get new episode
+cards and a Trailers & Extras row, and the player answers the remote much faster.
+
+### Fixed
+
+- **A slow, glitchy player, most of all on Apple TV.** The player rebuilt its whole screen on every background update, including the progress it saves when you pause and every 20 seconds while you watch. That made the controls slow to appear when you paused and could make playback stutter. The player now redraws only for what it shows, on Apple TV, iPhone, iPad and Mac.
+- **Much less work while you watch, most of all on Mac.** Saving your place used to check and rewrite your whole account as often as every 5 seconds, twice per save, and upload all of it once a minute. VortX now saves your place every 20 seconds and writes it to disk at most every 30 seconds, and straight away when you pause, seek, close the player, switch away from the app or quit. While you keep watching, it uploads your place at most every 5 minutes, and within seconds once you pause or stop. Titles with thousands of sources no longer slow the player controls down, the title page behind the player stops redrawing while you watch, and data carried over from 0.4 is converted once instead of on every sync.
+- **All sources shows every add-on again.** On a title with hundreds of sources, choosing All showed the first add-on's rows and left every other add-on as an empty heading. Each add-on now shows its top sources, and Show more adds more. iPhone, iPad and Mac.
+- **Built-in add-ons you switched off can be switched back on.** A built-in add-on switched off on another device, on the web or in an older version had no way back on. The eye button now shows for any add-on that is off, on every platform.
+- **Mac:** the window buttons show and hide together with the player controls.
+
+### New
+
+- **Every rating, everywhere.** IMDb, Rotten Tomatoes, the Popcornmeter, Metacritic, TMDB, Letterboxd, Trakt, SIMKL, MyAnimeList and Kitsu, on Home, Library, Discover, title pages and posters. Each score shows the service's own mark: the IMDb tag, a tomato that turns into a green splat below 60%, Metacritic's coloured score square and so on. Cards show as many scores as they fit, and the title page shows all of them. Some titles gain more scores over the next days as they are collected.
+- **Episode ratings.** Each episode shows its IMDb, TMDB and Trakt scores, and a season's best episode is marked Top rated.
+- **New episode cards on iPhone, iPad, Mac and Apple TV.** The full episode still with a frosted panel below for the number, title, synopsis, runtime and air date, plus Up next, Watched and progress. Season posters now show on iPhone too.
+- **Trailers & Extras on Apple.** Title pages list trailers, teasers, clips and featurettes from TMDB, ready to play.
+- **Frosted glass player controls** tinted with your accent colour on iOS 26 and macOS 26.
+
+### Android
+
+Android gets every rating with the services' marks on cards, title pages and episodes, ratings on landscape cards and Android TV backdrop cards (which showed none before), the fix for switched-off built-in add-ons, and lighter saving while you watch: your place is written every 20 seconds instead of every 5. The Android APK is still an early technical preview, so expect missing features and rough edges.
+
+## 0.5.2 - Up next, a new series page, For You, network shares and a TV guide
+
+Build **271** across Apple and Android. This release fixes accounts that would not load after
+updating from 0.4, keeps a series in Continue Watching after you finish an episode, and keeps
+everything you watch in your Library. It adds a redesigned series page, actor pages, For You
+rows built from what you like, network shares from your own NAS, and a TV guide for live
+channels. Android catches up with the Apple apps on design and features.
+
+### Fixed
+
+- **Accounts that would not load after updating from 0.4 (#262).** One unusual item saved by an older VortX version stopped the whole account, so profiles, add-ons and Stremio sign-in all failed. That item is now set aside and everything else loads. Converting older account data when the app opens or syncs is also about twice as fast. Thanks to BattleCrusader and atanukn for the reports and logs.
+- **A series leaving Continue Watching after an episode.** Finishing an episode used to remove the whole series. It now stays as Up next, and choosing it opens the next unwatched episode. A series leaves only when you remove it, mark the whole show watched, or mark it unwatched.
+- **Watched titles stay in your Library.** Everything you watch or start stays in the Library until you remove it, and watching it again brings it back. Removing a title from Continue Watching no longer removes it from the Library.
+- **Missing source details.** Debridio and similar add-ons showed only a label like "Debridio 1080p". The file name and size show again.
+- **Next episodes keep your quality.** A binge no longer steps down from 1080p to 720p to 480p.
+- **Usenet with your own provider** plays through your own servers, trusts the file an add-on picks, and accepts indexer addresses typed without /api.
+- **Saving to the Library from a catalog menu** reaches your Trakt and SIMKL watchlists too, like the button on a title's page.
+- **Stremio QR sign-in** now finishes or shows an error instead of waiting forever.
+- **Apple TV remote feels quicker.** Screens no longer redo their work on every press or redraw for changes they cannot show.
+- **Mac:** every settings page has Back and Esc, the top bar floats over scrolling content (also on wide iPad), and the NZB indexer editor opens.
+- **Choosing a season** starts its episodes at episode 1.
+- **Your accent colour reaches everything**, including the player, the Mac volume slider, segmented choices and loading spinners.
+
+### New
+
+- **A new series page on Mac, iPad and Apple TV.** Seasons appear as their posters and each season's episodes as a grid. Trailer sits beside Play. iPhone keeps the swipeable episode row.
+- **Actor pages.** Select a cast member, or search for a name: photo, age, biography and links, then their films and shows, newest first, filtered by All, Movies or Shows.
+- **Swipe the Home hero** on touch screens, with a two-finger swipe or the arrows on Mac, or tap its dots.
+- **One add-on row under your sources**, in your accent colour, with arrows for a mouse.
+- **For You.** The first time you open Home, each profile can pick what it likes. Home then adds rows built from those interests, plus smart collections by genre, cast, year or rating. The question waits until a profile is chosen.
+- **Network shares.** Library > Network shares browses folders on a NAS or computer and plays videos straight from them, with no media server needed. SMB, WebDAV (Synology, QNAP, TrueNAS, Nextcloud) and web-server folders work. Shares and their passwords stay on the device.
+- **TV guide.** Live > TV guide shows your live channels with what is on now and later, for channels whose add-on publishes a schedule.
+- **Your place comes back from Infuse.** When you stop in Infuse, VortX saves where you stopped. On Android the same works with MX Player and VLC.
+- **Effects and performance controls on Apple TV and Android TV:** focus backdrop, glass and blur, animations, and artwork quality. Auto follows your Performance setting.
+- **Usenet downloads ahead to storage.** The Streaming cache setting now sets how much of a release is saved ahead of playback, up to the whole file, and connections are sized for your device.
+- **Export the diagnostic log before signing in**, from the sign-in and profile screens, so a failed start can still be reported. Logs for PIN-protected profiles stay behind their PIN.
+
+### Android
+
+Android now matches the Apple apps: the new series page on tablets and Android TV, actor pages, people in search, the swipeable hero, the add-on row, the accent-coloured player, For You, network shares, the TV guide, the Effects controls, and diagnostic log export. Playback progress no longer uploads your whole account every few seconds, and add-ons are asked in your order. VortX is Apple first, and the Android APK is still an early technical preview, so expect missing features and rough edges.
 
 ## 0.5.0-beta.3 - Account loading, watch state, and Cinema polish
 

@@ -1,13 +1,10 @@
-# Native Android repository integration (0.5 native default)
+# Native Android repository integration (0.5.6 native-only)
 
-`android/app/build.gradle.kts` defaults `vortx.nativeEngine` to true, and
-`vortx.nativeResourceHost` follows that selection unless independently overridden.
-`VortXApplication.catalogRepository` selects `NativeCatalogRepository` in native
-mode; its `authRepository` selects the separate `NativeStreamingAuthRepository`
-described below. Native catalog access never falls back to the legacy engine or
-preview data, and direct construction of `EngineStremioRepository` is guarded.
-The legacy implementation remains available only for explicit non-native comparison
-selection. Source selection is not a claim that every 0.5 runtime/release gate has passed.
+`VortXApplication.catalogRepository` uses `NativeCatalogRepository`; account import
+uses the separate `NativeStreamingAuthRepository` described below. Catalog access
+never falls back to the removed legacy engine or preview data. Optional Stremio
+account/library import, Cinemeta and community add-ons remain supported. Native-only
+source selection is not a claim that runtime, package or release gates have passed.
 
 ## Android native 0.5 build and artifact contract
 
@@ -18,45 +15,30 @@ invocation boundary:
 ./gradlew <release-or-debug-tasks> -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
 ```
 
-`android/app/build.gradle.kts` resolves those properties (with the matching
-`VORTX_NATIVE_ENGINE` / `VORTX_NATIVE_RESOURCE_HOST` environment variables as a
-local-tooling fallback) before Android variants are configured. Gradle properties
-take precedence over environment values; an explicit false/blank native selection
-chooses comparison mode even over an exported native environment value. With no
-separate resource-host override it follows the native flag. Resolved native mode
-with resource-host disabled fails configuration; a native application must compile
-the `jni,server,resource-host` `vortx-ffi` feature set. `BuildConfig.NATIVE_ENGINE_ENABLED`
-comes from that same resolved native flag, so a server-only/resource-host artifact
-cannot be presented as a native application by accident. Non-native builds retain
-the existing explicit `jni,server` feature set.
+These two Gradle properties and their matching `VORTX_NATIVE_ENGINE` /
+`VORTX_NATIVE_RESOURCE_HOST` environment variables are retained only as true-valued
+script compatibility inputs. False, blank and malformed selections fail configuration;
+no comparison mode or `BuildConfig.NATIVE_ENGINE_ENABLED` selector remains. Every
+native application compiles `vortx-ffi` with `jni,server,resource-host`.
 
 Both `.github/workflows/android.yml` and `.github/workflows/android-release.yml`
-pass both Gradle properties for their engine-required builds. Their APK/AAB gates
+build the fixed `jni,server,resource-host` native selection. Their APK/AAB gates
 inspect each shipped `arm64-v8a`, `armeabi-v7a`, and `x86_64` slice with the pinned
-NDK `llvm-readelf`, require callable JNI exports and the resource-host ABI, and
-inspect packaged DEX with Android build-tools `dexdump` for
-`BuildConfig.NATIVE_ENGINE_ENABLED=true` (`classes*.dex` in APKs and
-`base/dex/classes*.dex` in AABs). The reusable
-`scripts/verify-android-native-build-config.sh` parser tracks the target static
-field/value pair and stops at whitespace-tolerant class boundaries. The signed candidate lane also retains
-`scripts/verify-native-android-artifacts.sh` before upload. A release artifact that
-contains a resource-host library but advertises `BuildConfig.NATIVE_ENGINE_ENABLED=false` is rejected.
+NDK `llvm-readelf`, and require the complete callable owner-history, resource-host
+and server JNI ABI. `scripts/verify-native-android-artifacts.sh` also verifies the
+exact admitted source revision and staged-versus-packaged native payload before upload.
 
-Native `preBuild` schedules `cargoNdkBuildVortxFfi`, not the legacy `cargoNdkBuild`.
-The legacy JNI output directory is attached only in comparison mode, and native
-packaging explicitly excludes `libstremiox_core.so`. The workflows invoke
+Native `preBuild` schedules `cargoNdkBuildVortxFfi`; the legacy task and JNI output
+directory are removed. Packaging explicitly rejects `libstremiox_core.so`. The workflows invoke
 `verify-native-android-artifacts.sh --native-only`: it rejects that legacy library,
 requires exactly one VortX engine slice for each shipped ABI, checks callable
 resource-host/server JNI and ELF architecture, and compares packaged bytes with
-fresh staged bytes after the same pinned strip normalization. The verifier's
-default two-engine mode remains a comparison contract, not the native workflow gate.
+fresh staged bytes after the same pinned strip normalization. There is no two-engine
+shipping path. Historical source-to-ABI admissions remain explicit for older packages.
 
 Both Android workflows now pin `VortXTV/vortx-core` to
-`7e3e68be5bf2b11c65d158c1823be94bd1608d1b`. They also
-retain a `VortXTV/stremiox-core` checkout at
-`31c66611822043e089f5819ad232a5df93975873` for comparison/tooling; checkout presence
-does not mean it is built or packaged in native variants. These exact source pins
-replace the former pending-candidate description, but do not prove that the
+`0c30f4782aee544a2b7e33169ad60d03630d4097`, matching Apple and Desktop's manifest/lock.
+They no longer fetch or build `stremiox-core`. This exact source selection does not prove that the
 latest host's complete native server capability contract is in a freshly built,
 signed Android artifact. Compatible real SDK slices, successful CI/artifact
 readback, signing and device/runtime gates must be evidenced separately; older or

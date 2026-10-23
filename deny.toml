@@ -1,14 +1,14 @@
-# cargo-deny advisory policy. Consumed by .github/workflows/security.yml, which runs
-# `cargo deny check advisories` against the Rust crates so that REAL security vulnerabilities and
-# yanked crates fail CI automatically. Documented, non-actionable transitive advisories from Tauri's
-# Linux GTK3 webview stack (and the stremio-core engine tree) are accepted explicitly below.
+# cargo-deny policy for source-accessible local/private-workspace checks. The secretless public
+# security.yml job instead runs pinned cargo-audit directly on the committed desktop lockfile;
+# it checks this file's exact advisory exception and yanked policy before auditing, without
+# resolving/fetching the private engine. Shipping native engine graphs remain separate gates.
 #
 # Run locally:  cargo deny --manifest-path desktop/src-tauri/Cargo.toml --config deny.toml check advisories
 
 [advisories]
 version = 2
 # Yanked crates fail CI. (Actual `vulnerability`-class advisories always fail unless ignored below;
-# we ignore NONE — there are currently zero real vulnerabilities in the tree.)
+# the current retained audit report is authoritative; do not infer a clean tree from this policy.)
 yanked = "deny"
 # "unmaintained" advisories here are all deep transitive deps we cannot action: the gtk-rs GTK3
 # bindings (atk/gdk/gtk/gdkx11/gdkwayland/... — pulled by Tauri's Linux webkit2gtk webview), plus

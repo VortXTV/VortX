@@ -6,7 +6,7 @@ If you want to use VortX, install the [official packages](INSTALLING.md). Contri
 
 ## Apple project generation
 
-`app/project.yml` is the retained project specification. Current native release packaging generates a separate native specification with `scripts/generate-native-apple-project.rb`, rather than treating the retained legacy project as the shipping build.
+`app/project.yml` is the native-only project specification. Release packaging uses `scripts/generate-native-apple-project.rb` to bind the exact reviewed engine revision, player package and linker-map provenance before XcodeGen runs. The retired engine, Node runtime and legacy web-host target are not build options.
 
 The generator requires an explicit reviewed engine revision and a verified MPVKit package. It selects native iOS, Mac, Full TV and Lite TV targets and the Full TV Top Shelf extension, while omitting legacy core/Node payloads. Required native SDKs, headers and the Mac daemon must already exist and pass their input gates.
 

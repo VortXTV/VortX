@@ -1,48 +1,22 @@
 #if os(iOS) || os(tvOS)
 import Foundation
-#if canImport(VortxEngine)
 import VortxEngine
-#endif
 
-/// Phase 8 (engine/apple-cutover), server slice: run the vortx-core streaming server IN-PROCESS on
-/// iOS/tvOS via the vortx-ffi C server ABI (vortx_server_start / vortx_server_port /
-/// vortx_server_base_url / vortx_server_stop), the platforms where a subprocess spawn is impossible
-/// so the server MUST live inside the app binary. This is the iOS/tvOS sibling of
-/// `MacNodeServer.swift` (macOS runs the server as a child process): same lifecycle shape
-/// (start on launch/foreground, stop on background, publish the bound port for the player), same
-/// SourcesShared home.
+/// The VortX engine's streaming server, run IN-PROCESS on iOS/tvOS via the vortx-ffi C server ABI
+/// (vortx_server_start / vortx_server_port / vortx_server_base_url / vortx_server_stop). These
+/// platforms cannot spawn a subprocess, so the server lives inside the app binary; macOS runs the
+/// same server as a child process (`MacNodeServer.swift`). Start on launch/foreground, stop on
+/// background, publish the bound port for the player. A start failure stays explicit until the
+/// next foreground or relaunch.
 ///
-/// FLAG-GATED. `vortxNativeServer` defaults OFF in legacy builds; VORTX_NATIVE_DATA_ENGINE requires
-/// native transport. Selection is latched for the process lifetime because Node cannot be stopped
-/// in-process. Exactly one engine starts. Native failure remains unavailable until recovery/relaunch.
-///
-/// Compile gating, two layers:
-///   - `canImport(VortxEngine)`: the target links VortxEngine.xcframework at all (today only
-///     VortXiOSNative; a target without the framework compiles the inert stubs below).
-///   - `VORTX_ENGINE_SERVER` (a per-target SWIFT_ACTIVE_COMPILATION_CONDITIONS entry in
-///     project.yml): the linked slice actually CARRIES the 4 server symbols. `canImport` cannot
-///     see symbols, only the module, so a kernel-only slice (the `--no-server` fallback build of
-///     scripts/build-ffi-xcframework.sh, or a tvOS slice if the tier-3 cross-compile walls) would
-///     pass `canImport` and then fail at link. The project.yml condition is set exactly where the
-///     xcframework slice is server-inclusive, keeping "compiles" and "links" in agreement.
+/// `VORTX_ENGINE_SERVER` (a per-target SWIFT_ACTIVE_COMPILATION_CONDITIONS entry in project.yml)
+/// marks targets whose linked VortxEngine slice carries the server symbols. The Lite build links
+/// no server, so it compiles the inert stubs below.
 enum VortxNativeServerFlag {
-    /// Settings-parity rule: the SAME key on every app (VortXiOSNative, VortXTV; macOS task #61
-    /// uses this name for its native-server flag too, so one key governs the native-server
-    /// cutover on every platform when the branches meet).
-    static let key = "vortxNativeServer"
-    // Node is a one-shot in-process runtime. Latch selection before either runtime starts;
-    // preference changes take effect on relaunch, never by running both engines together.
-    static let isOn = NativeTransportPolicy.selectsNative(
-        required: NativeTransportPolicy.isRequired, preference: UserDefaults.standard.bool(forKey: key))
-    static var needsRestart: Bool {
-        isOn != NativeTransportPolicy.selectsNative(
-            required: NativeTransportPolicy.isRequired, preference: UserDefaults.standard.bool(forKey: key))
-    }
-
-    /// Whether THIS build can run the in-process engine server (framework linked AND the slice is
-    /// server-inclusive). Settings uses it to show the toggle only where flipping it can work.
+    /// Whether THIS build can run the in-process engine server (the linked slice is
+    /// server-inclusive). The Lite build has no streaming server.
     static var isSupported: Bool {
-        #if canImport(VortxEngine) && VORTX_ENGINE_SERVER
+        #if VORTX_ENGINE_SERVER
         return true
         #else
         return false
@@ -53,7 +27,7 @@ enum VortxNativeServerFlag {
 /// The in-process engine streaming-server manager. All entry points exist on every iOS/tvOS
 /// target (inert stubs when the engine server is not linked), so call sites need no conditionals.
 enum VortxNativeServer {
-    #if canImport(VortxEngine) && VORTX_ENGINE_SERVER
+    #if VORTX_ENGINE_SERVER
 
     /// Serializes the whole lifecycle. The FFI contract is one call at a time per handle, and both
     /// start (bind + rqbit session) and stop (graceful shutdown, up to ~4 s with open streams)
@@ -92,36 +66,30 @@ enum VortxNativeServer {
         publishLock.unlock()
     }
 
-    /// One-line state for Settings diagnostics, mirroring NodeServer.statusDescription's role.
+    /// One-line state for Settings diagnostics.
     static var statusDescription: String {
-        if VortxNativeServerFlag.needsRestart { return "Restart VortX to change streaming engines." }
-        guard VortxNativeServerFlag.isOn else { return "Off" }
         if let base = publishedBaseURL { return "In-process engine server running at \(base)" }
         publishLock.lock(); defer { publishLock.unlock() }
         if let failure = _failure { return failure }
         return "Enabled, waiting to start"
     }
 
-    /// Piece-cache self-bound. The node server defaults to a 2 GB torrent cache, which the app has
-    /// to cap after boot via POST /settings; the engine server takes the cap up front in its start
-    /// config. 128 MiB sits inside the 96-192 MiB range the FFI documents for the iOS/tvOS
+    /// Piece-cache self-bound, taken up front in the start config. 128 MiB sits inside the 96-192 MiB range the FFI documents for the iOS/tvOS
     /// sandbox (Apple TV HD is the 2 GB floor device).
     private static let cacheSizeBytes = 134_217_728
     /// Peer-connection self-bound for the same sandbox (fd budget shared with mpv + URLSession;
     /// the value the FFI docs give for iOS/tvOS).
     private static let btMaxConnections = 35
 
-    /// Start the engine server if the flag is on and it is not already running. Async on the
-    /// serial queue, so calling from app init / scenePhase never blocks the main thread.
-    /// Idempotent; a start failure remains explicit and never starts Node.
+    /// Start the engine server if it is not already running. Async on the serial queue, so
+    /// calling from app init / scenePhase never blocks the main thread. Idempotent; a start
+    /// failure remains explicit.
     static func startIfNeeded() {
-        guard VortxNativeServerFlag.isOn else { return }
         queue.async {
             guard handle == nil else { return }
             publishLock.lock(); _failure = nil; publishLock.unlock()
-            // The same writable root the node server uses (tvOS may only write Caches + tmp, so
-            // Application Support, the Mac's choice, is not portable here). Its own subdir keeps
-            // the engine server's settings.json / piece cache / port file apart from node's.
+            // tvOS may only write Caches + tmp, so Application Support (the Mac's choice) is not
+            // portable here. The subdir holds the server's settings.json / piece cache / port file.
             let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
                 ?? NSTemporaryDirectory()
             let home = (caches as NSString).appendingPathComponent("vortx-server")
@@ -154,7 +122,7 @@ enum VortxNativeServer {
                 vortx_string_free(c)
             }
             publish(port: port, baseURL: base)
-            DiagnosticsLog.log("server", "engine in-process server started at \(base) (flag vortxNativeServer)")
+            DiagnosticsLog.log("server", "engine in-process server started at \(base)")
         }
     }
 
@@ -179,18 +147,16 @@ enum VortxNativeServer {
     /// FIFO queue after this stop, even if shutdown takes time. A detached Task could enqueue its
     /// stop after that foreground start and leave the newly active app without its native server.
     /// Shutdown never runs on the main thread. Known trade-off, documented rather
-    /// than hidden: with the flag ON, backgrounding tears the engine server down, so a torrent
-    /// stream continued in PiP/background dies with it; foreground restarts on a fresh ephemeral
-    /// port and `StremioServer.embeddedPort` follows. The node path (flag OFF) is unaffected.
+    /// than hidden: backgrounding tears the engine server down, so a torrent stream continued in
+    /// PiP/background dies with it; foreground restarts on a fresh ephemeral port and
+    /// `StremioServer.embeddedPort` follows.
     static func stopOnBackground() {
-        guard VortxNativeServerFlag.isOn else { return }
         queue.async { stopOnQueue() }
     }
 
     #else
 
-    // Engine server not linked in this target (no VortxEngine.xcframework, a kernel-only slice,
-    // or the Lite build): every entry point is an inert no-op so call sites compile unchanged.
+    // Engine server not linked in this target (the Lite build): every entry point is an inert no-op so call sites compile unchanged.
     static var publishedPort: Int? { nil }
     static var publishedBaseURL: String? { nil }
     static var statusDescription: String { "Native streaming is not available in this build." }

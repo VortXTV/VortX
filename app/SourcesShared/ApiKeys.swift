@@ -172,7 +172,6 @@ final class ApiKeys: ObservableObject {
             loadingScope = false
             return
         }
-#if VORTX_NATIVE_DATA_ENGINE
         let provider: String? = if account == ApiKeySlots.tmdb(owner) { "tmdb" }
             else if account == ApiKeySlots.mdblist(owner) { "mdblist" }
             else if account == ApiKeySlots.fanart(owner) { "fanart" } else { nil }
@@ -181,7 +180,6 @@ final class ApiKeys: ObservableObject {
             loadingScope = true; restore(); loadingScope = false
             return
         }
-#endif
         VortXSyncManager.shared.requestSyncSoon()
     }
 

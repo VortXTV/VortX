@@ -9,6 +9,7 @@ import type {
   Stream,
   StreamResponse,
 } from "./types";
+import { isNativeAddonManifest } from "./nativeSyncProjection";
 
 // The Stremio add-on protocol client. This is the web equivalent of the embedded stremio-core engine:
 // instead of dispatching JSON actions to a Rust runtime (the desktop/iOS path), we resolve add-on
@@ -80,8 +81,12 @@ function normalizeAddonUrl(raw: string): string {
 export async function loadAddon(transportUrl: string): Promise<Addon> {
   const url = normalizeAddonUrl(transportUrl);
   const manifest = await fetchJson<AddonManifest>(url);
-  if (!manifest || typeof manifest.id !== "string") {
-    throw new Error(`Not a valid add-on manifest: ${url}`);
+  // Validate every known shape consumed by catalog/resource UI before installation. Public
+  // manifests may omit version; supply that default only to the native shape validator, while
+  // retaining the original document and all unknown extensions unchanged for callers.
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
+    || !isNativeAddonManifest({ ...manifest, version: manifest.version === undefined ? "" : manifest.version })) {
+    throw new Error("Not a valid add-on manifest.");
   }
   return { transportUrl: url, manifest };
 }

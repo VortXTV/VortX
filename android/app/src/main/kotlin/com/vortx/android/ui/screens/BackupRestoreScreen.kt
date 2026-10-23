@@ -91,9 +91,7 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(payload) }
                         ?: error("Could not open that location for writing.")
                 }
-                if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
-                    "Settings backed up. Use your VortX account to restore profiles and watch history."
-                } else "Settings backed up. Import this file on another device to bring your settings and profiles across."
+                "Settings backed up. Use your VortX account to restore profiles and watch history."
             }.getOrElse { "Backup failed: ${it.message ?: "the file could not be written."}" }
         }
     }
@@ -113,15 +111,13 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     ?: error("That file is not a VortX settings backup.")
                 // Check source keys, not only typed writable values: malformed profile values must
                 // not be silently omitted while other settings are imported and reported successful.
-                val sourceKeys = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
-                    SettingsBackup.decodeDomain(bytes)?.keys ?: error("That file is not a VortX settings backup.")
-                } else values.keys
+                val sourceKeys = SettingsBackup.decodeDomain(bytes)?.keys ?: error("That file is not a VortX settings backup.")
                 withContext(Dispatchers.IO) {
-                    withLocalSettingsRestoreAdmission(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED, sourceKeys) {
+                    withLocalSettingsRestoreAdmission(true, sourceKeys) {
                         applyRestore(prefs, values)
                     }
                 }
-                // Native reload uses only the mounted projection; comparison mode rereads its legacy roster.
+                // Reload uses only the mounted native projection.
                 ProfileStore.sharedOrNull()?.reloadFromDefaults()
                 if (values.isEmpty()) {
                     "That backup held no restorable settings."
@@ -153,30 +149,23 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
         ) {
             SettingsSection(
                 title = "Settings backup",
-                footer = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
-                    "Use your VortX account to restore profiles and watch history. " +
-                        "Here you can import files that contain settings only."
-                } else "Backs up your syncable settings and profiles to a file, no account needed. " +
-                    "Device-only settings such as the streaming cache size and server address are left out. " +
-                    "Importing merges a backup in and never removes settings that are not in the file.",
+                footer = "Use your VortX account to restore profiles and watch history. " +
+                    "Here you can import files that contain settings only.",
             ) {
                 ActionRow(
                     icon = VortXIcons.download,
                     label = "Back up settings",
-                    detail = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) "Save your settings to a file. Restore profiles through your VortX account."
-                        else "Save your settings and profiles to a file.",
+                    detail = "Save your settings to a file. Restore profiles through your VortX account.",
                     enabled = !busy,
                     onClick = {
                         busy = true
                         scope.launch {
                             val bytes = withContext(Dispatchers.IO) {
                                 SettingsBackup.makeBackup(localSettingsBackupInput(
-                                    com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED, prefs.all), bundleId = appContext.packageName)
+                                    true, prefs.all), bundleId = appContext.packageName)
                             }
                             if (bytes == null) {
-                                status = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
-                                    "Nothing to back up yet. Change a setting first."
-                                } else "Nothing to back up yet. Change a setting or add a profile first."
+                                status = "Nothing to back up yet. Change a setting first."
                                 busy = false
                                 return@launch
                             }

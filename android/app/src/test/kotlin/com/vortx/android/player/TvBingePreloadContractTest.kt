@@ -8,6 +8,40 @@ import org.junit.Test
 /** Integration contracts complement the executable preload-policy and task-owner regressions. */
 class TvBingePreloadContractTest {
     @Test
+    fun `audio lifetime resets outer routes but preserves mounted handoffs retry and Ready consumption`() {
+        val vm = source("ui/viewmodel/DetailViewModel.kt")
+        val cold = vm.substringAfter("suspend fun resolveEpisodeSwitch(").substringBefore("private fun preparedEpisodeResolution(")
+        assertTrue(cold.contains("val prefs = playbackSourcePreferences()"))
+        assertTrue(cold.contains("val groups = settled?.groups"))
+        assertFalse(cold.contains("settled?.best"))
+        assertTrue(cold.contains("audioRevision == playbackAudioPreference.revision"))
+        assertTrue(vm.substringAfter("suspend fun warmNextEpisode(").substringBefore("fun playNextEpisode()")
+            .contains("val prefs = playbackSourcePreferences()"))
+        assertTrue(vm.substringAfter("private fun play(").substringBefore("suspend fun resolveSourceSwitch(")
+            .contains("if (freshPlayback) resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("private fun playBest(").substringBefore("private suspend fun resolveBestViaFailover(")
+            .contains("if (freshPlayback) resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("fun playTrailer() {").substringBefore("fun playBest(").contains("resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("fun abandonPlaybackRoute() {").substringBefore("private fun canPublishPlaybackResolve")
+            .contains("resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("private fun rebuildForProfile(").substringBefore("private suspend fun loadMetaAndSources(")
+            .contains("resetPlaybackAudioIntent(refreshRanking = false)"))
+        assertFalse(vm.substringAfter("fun clearPlayback() {").substringBefore("fun clearMutationError()")
+            .contains("resetPlaybackAudioIntent"))
+        assertFalse(vm.substringAfter("suspend fun resolveSourceSwitch(").substringBefore("private fun preparedEpisodeResolution(")
+            .contains("resetPlaybackAudioIntent"))
+        assertTrue(vm.substringAfter("fun retrySameSource(").substringBefore("fun retryNextSource(")
+            .contains("preserveAudioIntent = true"))
+        assertTrue(vm.substringAfter("fun retryNextSource(").substringBefore("fun playerSourceOptions(")
+            .contains("preserveAudioIntent = true"))
+        val refresh = vm.substringAfter("private fun refreshPlaybackAudioRanking() {").substringBefore("fun hasPreparedNextEpisode(")
+        assertTrue(refresh.contains("sourceModel.setContext(updated)"))
+        assertFalse(refresh.contains("sourceRequestFence.begin"))
+        assertFalse(refresh.contains("startSourceLoad"))
+        assertFalse(refresh.contains("repo."))
+    }
+
+    @Test
     fun `TV wires preload natural end and binge boundary rather than exit defaults`() {
         val app = source("ui/tv/TvApp.kt")
         val player = app.substringAfter("PlayerScreen(").substringBefore("return@VortXTheme")
@@ -19,8 +53,9 @@ class TvBingePreloadContractTest {
         assertTrue(player.contains("vm.warmNextEpisode(next.id)"))
         assertTrue(player.contains("preloadPolicy.complete(attempt"))
         assertTrue(player.contains("historyIdentity.acceptedRevision"))
-        assertTrue(player.contains("vm.playNextEpisode()"))
-        assertTrue(player.contains("autoAdvanceStreak[0]++"))
+        assertTrue(player.contains("episodeHandoffRequest = PlayerEpisodeHandoffRequest("))
+        assertTrue(player.contains("automatic = true"))
+        assertTrue(player.contains("autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0"))
         assertTrue(player.contains("!advancingEpisode"))
     }
 
@@ -40,18 +75,16 @@ class TvBingePreloadContractTest {
         assertTrue(exit.contains("retryingSource = false"))
         assertTrue(exit.contains("returnToBrowse()"))
         assertTrue(app.contains("playerVm?.abandonPlaybackRoute()"))
-        assertTrue(app.contains("takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }"))
+        assertTrue(app.contains("takeIf { it === launchedPlayerViewModel && !retryingSource }"))
         assertTrue(app.contains("if (advancingEpisode || retryingSource) return@onWarmNext"))
         assertTrue(app.contains("BackHandler(onBack = ::exitPlayer)"))
         assertTrue(app.contains("onBack = ::exitPlayer"))
         assertTrue(app.contains("onError = ::exitPlayer"))
-        val advance = app.substringAfter("LaunchedEffect(advancingEpisode, retryPlayback)")
-            .substringBefore("LaunchedEffect(retryingSource, retryPlayback)")
-        assertTrue(advance.contains("launchedPlayerPrincipal != currentPlayerPrincipal"))
-        assertTrue(advance.contains("is Playback.Ready"))
-        assertTrue(advance.contains("playing = state.playable"))
-        assertTrue(advance.contains("is Playback.Failed"))
-        assertTrue(advance.contains("exitPlayer()"))
+        assertFalse(app.contains("LaunchedEffect(advancingEpisode, retryPlayback)"))
+        val advance = app.substringAfter("onSwitchEpisode =").substringBefore("episodeHandoffRequest =")
+        assertTrue(advance.contains("launchedPlayerPrincipal == currentPlayerPrincipal"))
+        assertTrue(advance.contains("vm.resolveEpisodeSwitch(episodeId)"))
+        assertFalse(advance.contains("exitPlayer()"))
     }
 
     @Test
@@ -74,7 +107,7 @@ class TvBingePreloadContractTest {
         val commit = resolver.substringAfter("commitAccepted = {")
         assertTrue(commit.contains("invalidateWarmNextSource()"))
         assertTrue(commit.indexOf("invalidateWarmNextSource()") < commit.indexOf("lastPlayedSource = source"))
-        assertTrue(commit.contains("sourceSticky.record(it, source.addon, source.bingeGroup)"))
+        assertTrue(commit.contains("sourceSticky.record(it, source.addon, source.bingeGroup, StreamRanking.knownResolution(source))"))
     }
 
     @Test

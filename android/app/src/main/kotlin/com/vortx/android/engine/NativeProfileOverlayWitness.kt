@@ -25,13 +25,23 @@ internal object NativeProfileOverlayWitness {
     fun parseDocument(bytes: ByteArray): JSONObject = parse(bytes) as? JSONObject ?: error("Account document must be an object")
     /** Actual decrypted native-account ingress. Preflight scoped overlay values while numeric
      * lexemes are still exact; later platform JSONObject copies cannot bless rounded overflow. */
-    fun parseAccountDocument(bytes: ByteArray): JSONObject = parseDocument(bytes).also { document ->
+    fun parseAccountDocument(bytes: ByteArray): JSONObject = parseAccount(bytes).also { document ->
         fun member(parent: JSONObject?, key: String): JSONObject? = if (parent == null || !parent.has(key)) null
             else parent.optJSONObject(key) ?: error("Malformed account overlay branch")
         val profiles = member(member(document, "vortx"), "byProfile")
         val removed = member(member(member(document, "webProgress"), "removed"), "byProfile")
         val ids = profiles?.keys()?.asSequence().orEmpty().toSet() + removed?.keys()?.asSequence().orEmpty().toSet()
         ids.forEach { digest(exactOverlay(profiles, removed, it)) }
+    }
+    /** Whole-account framing has a separate byte/depth bound matching the raw carrier. Each JSON
+     * node consumes at least one original byte, so the byte count also bounds parser allocations.
+     * Overlay digests above still enforce their original 100k-node/depth-64 scope. Unknown native
+     * or future account data does not become an overlay merely by sharing the encrypted envelope. */
+    private fun parseAccount(bytes: ByteArray): JSONObject {
+        require(bytes.size <= OHJson.MAX) { "Account JSON exceeds limit" }
+        val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
+        return Parser(text, 128, bytes.size).read() as? JSONObject ?: error("Account document must be an object")
     }
     /** Borrow the original parsed nodes for immediate validation only. Do NOT call the ordinary
      * source-copy helper: Android JSONObject(String) would round its BigDecimal values first. */
@@ -160,7 +170,7 @@ internal object NativeProfileOverlayWitness {
         override fun toString() = token
     }
 
-    private class Parser(private val text: String) {
+    private class Parser(private val text: String, private val maxDepth: Int = 64, private val maxNodes: Int = 100_000) {
         private var position = 0
         private var nodes = 0
         fun read(): Any {
@@ -173,7 +183,7 @@ internal object NativeProfileOverlayWitness {
             whitespace(); require(position < text.length && text[position++] == expected) { "Malformed overlay JSON" }
         }
         private fun value(depth: Int): Any {
-            require(depth <= 64 && ++nodes <= 100_000) { "Overlay JSON structure exceeds limit" }
+            require(depth <= maxDepth && ++nodes <= maxNodes) { "JSON structure exceeds limit" }
             whitespace(); require(position < text.length) { "Missing overlay JSON value" }
             return when (text[position]) {
                 '{' -> {
@@ -181,7 +191,7 @@ internal object NativeProfileOverlayWitness {
                     if (position < text.length && text[position] == '}') { position++; result }
                     else {
                         while (true) {
-                            require(++nodes <= 100_000 && depth + 1 <= 64)
+                            require(++nodes <= maxNodes && depth + 1 <= maxDepth)
                             whitespace(); val key = string(); require(names.add(key)) { "Duplicate overlay JSON key" }
                             take(':'); result.put(key, value(depth + 1)); whitespace()
                             if (position < text.length && text[position] == '}') { position++; break }

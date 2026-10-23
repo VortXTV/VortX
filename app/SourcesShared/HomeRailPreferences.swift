@@ -16,6 +16,8 @@ import SwiftUI
 ///     (`stremiox.catalog.order` / `.hidden`). This type moves the whole **Add-on Catalogs** block as one
 ///     section; the per-catalog order inside it stays with `CatalogPreferences`.
 enum HomeRail: String, CaseIterable, Identifiable, Hashable {
+    case forYou
+    case smartCollections
     case collectionsHub
     case topPicks
     case becauseYouWatched
@@ -34,6 +36,8 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
     /// per-server / per-catalog names), so the editor shows one representative name per section.
     var title: LocalizedStringKey {
         switch self {
+        case .forYou:               return "For You"
+        case .smartCollections:     return "Smart Collections"
         case .collectionsHub:       return "Collections"
         case .topPicks:             return "Top Picks for you"
         case .becauseYouWatched:    return "Because You Watched"
@@ -51,6 +55,8 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
     /// SF Symbol for the editor row.
     var systemImage: String {
         switch self {
+        case .forYou:               return "heart.text.square"
+        case .smartCollections:     return "line.3.horizontal.decrease.circle"
         case .collectionsHub:       return "square.grid.2x2"
         case .topPicks:             return "sparkles"
         case .becauseYouWatched:    return "arrow.triangle.branch"
@@ -68,14 +74,14 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
     /// Default Home section order on touch/desktop (iPhone / iPad / Mac). Continue Watching is pinned
     /// above these. This MUST match `iOSHomeView`'s render order so an un-customized Home is byte-identical.
     static let iOSDefaultOrder: [HomeRail] = [
-        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
+        .forYou, .smartCollections, .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
         .upcomingEpisodes, .upcomingMovies, .addonCatalogs, .editorialCollections, .importedLists,
     ]
 
     /// Default Home section order on tvOS. Continue Watching is pinned above these; tvOS has no editorial
     /// rails and lists Imported before Upcoming. MUST match `HomeView`'s render order (zero default change).
     static let tvDefaultOrder: [HomeRail] = [
-        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
+        .forYou, .smartCollections, .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
         .importedLists, .upcomingEpisodes, .upcomingMovies, .addonCatalogs,
     ]
 }
@@ -121,18 +127,26 @@ final class HomeRailPreferences: ObservableObject {
     }
 
     /// Merge the saved order with the platform's default set: honor the saved positions for rails the
-    /// platform knows about, then append any default rail not yet in the saved order at its default spot.
-    /// This keeps an un-customized Home identical to the hard-coded order AND stays forward-compatible when
-    /// a new rail ships (it slots into its default position) or when the saved order came from another
-    /// surface with a different set (unknown rails are dropped, missing ones appended).
+    /// platform knows about, then slot any default rail not yet in the saved order in right after its
+    /// nearest default predecessor (at the top when it has none). This keeps an un-customized Home
+    /// identical to the hard-coded order AND stays forward-compatible: a newly shipped rail such as For You
+    /// lands where it ships, not below every add-on catalog, and an order saved by another surface with a
+    /// different set drops unknown rails and gains the missing ones.
     func arrange(_ defaults: [HomeRail]) -> [HomeRail] {
-        guard !order.isEmpty else { return defaults }
+        Self.arrange(saved: order, defaults: defaults)
+    }
+
+    nonisolated static func arrange(saved: [String], defaults: [HomeRail]) -> [HomeRail] {
+        guard !saved.isEmpty else { return defaults }
         let allowed = Set(defaults)
-        var result = order.compactMap(HomeRail.init(rawValue:)).filter { allowed.contains($0) }
-        var seen = Set(result)
-        for rail in defaults where !seen.contains(rail) {
+        var result: [HomeRail] = []
+        for rail in saved.compactMap(HomeRail.init(rawValue:)) where allowed.contains(rail) && !result.contains(rail) {
             result.append(rail)
-            seen.insert(rail)
+        }
+        for (index, rail) in defaults.enumerated() where !result.contains(rail) {
+            let anchor = defaults[..<index].reversed().first { result.contains($0) }
+            let position = anchor.flatMap { result.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
+            result.insert(rail, at: position)
         }
         return result
     }

@@ -97,11 +97,8 @@ enum DownloadSourceClassifier {
 @MainActor
 struct NativeDownloadOwner {
     private let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
-    private let nativeSelected = StremioServer.nativeTransportSelected
 
     var isCurrent: Bool {
-        guard nativeSelected || StremioServer.nativeTransportSelected else { return true }
-        guard nativeSelected == StremioServer.nativeTransportSelected else { return false }
         return !Task.isCancelled && target.stillOwnsCurrentContext(core: CoreBridge.shared)
     }
 

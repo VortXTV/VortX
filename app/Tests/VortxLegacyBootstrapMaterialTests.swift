@@ -23,10 +23,40 @@ enum VortxLegacyBootstrapMaterialTests {
         try pendingMembershipPreparation()
         try fractionalPlaybackPrecision()
         try conflictingWatchPreparation()
+        try legacyAccountHolds()
+        try literalAddonManifestArchive()
     }
 
     static func check(_ condition: @autoclosure () -> Bool, _ message: String) {
         precondition(condition(), message)
+    }
+    static func literalAddonManifestArchive() throws {
+        // Exercise the actual account-preparation order, not just a handwritten material shape.
+        let label = "[4K] Community catalog"
+        let description = "{Public} Films and shows"
+        let addon: Object = ["transportUrl": "https://addon.example/manifest.json", "manifest": [
+            "id": "fixture.community", "version": "1.0.0", "name": label, "description": description
+        ]]
+        let document = doc(["addons": [addon], "library": [movie()]])
+        let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(document)
+        let projected = try VortxLegacyBootstrapMaterial.encode(document: clean, roster: [owner, child], ownerProfileID: owner.id,
+                                                                rosterModifiedSeconds: 1720000000.1234)
+        let result = try JSONSerialization.jsonObject(with: projected) as! Object
+        let ownerAddons = (result["addons"] as! [String: Object])[owner.id.uuidString]!
+        let manifest = (ownerAddons["items"] as! [Object])[0]["manifest"] as! Object
+        check(manifest["name"] as? String == label && manifest["description"] as? String == description,
+              "Literal public labels survive the actual legacy projection")
+        check((result["roster"] as! [Object]).count == 2, "One display label must not block either profile")
+        let archive = try VortxNativeBootstrapArchive.encode(document: clean, material: projected)
+        try VortxNativeBootstrapArchive.validate(archive)
+        let retained = try VortxNativeBootstrapArchive.encode(document: clean, material: projected, authenticatedSourceArchive: archive)
+        try VortxNativeBootstrapArchive.validate(retained)
+        let root = try JSONSerialization.jsonObject(with: retained) as! Object
+        check(NSDictionary(dictionary: root["legacyImportMaterial"] as! Object).isEqual(to: result),
+              "Archive retention does not rewrite legacy evidence")
+        check(NSDictionary(dictionary: root["authenticatedSourceArchive"] as! Object).isEqual(to: document),
+              "Retained account source preserves labels and unrelated library data")
+        print("Issue #263 actual legacy preparation: both profiles, exact manifest labels, library and retained material survive capture/projection/archive validation")
     }
     static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
                          documentData: Data? = nil,
@@ -72,6 +102,22 @@ enum VortxLegacyBootstrapMaterialTests {
     }
     static func watches(_ material: Object, profile: UserProfile = owner) -> [Object] {
         (material["watches"] as! [String: [Object]])[profile.id.uuidString]!
+    }
+    /// Issue #262: a unit the projection cannot represent is held, never fatal. The material still
+    /// builds, the hold names its reason, and the material is byte-identical on every projection.
+    @discardableResult
+    static func held(_ document: Object, _ phrase: String, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
+                     ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = []) throws -> Object {
+        let data = try JSONSerialization.data(withJSONObject: document)
+        func project() throws -> VortxLegacyBootstrapMaterial.Preparation {
+            try VortxLegacyBootstrapMaterial.project(document: data, roster: roster, ownerProfileID: owner.id,
+                rosterModifiedSeconds: modified, ownAccountSources: ownAccountSources, preparePendingMembership: false)
+        }
+        let first = try project(), second = try project()
+        check(first.held.contains { $0.reason.contains(phrase) }, "Expected a hold for \(phrase); got \(first.held)")
+        check(first.material == second.material, "Holding \(phrase) keeps the material deterministic")
+        check(!VortxLegacyBootstrapMaterial.heldSummary(first.held).isEmpty, "Holds summarize for diagnostics")
+        return try JSONSerialization.jsonObject(with: first.material) as! Object
     }
     static func fail(_ document: Object, _ phrase: String, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234) throws {
         do { _ = try material(document, roster: roster, modified: modified); preconditionFailure("Expected failure: " + phrase) }
@@ -228,24 +274,24 @@ enum VortxLegacyBootstrapMaterialTests {
         let ownSavedReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(
                 libraryRows: [ownMovie], addons: [ownAddon], profileOverlay: ownSavedOverlay))
-        do {
-            _ = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: ownSavedOverlay),
-                roster: [owner, own], ownerProfileID: owner.id, ownAccountSources: [ownSavedReceipt], accountID: "account.fixture")
-            preconditionFailure("Independent saved-only source was deferred into the root ledger")
-        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
-            check(error.reason.contains("Saved-only overlay"), "Independent saved-only overlay remains strict in prepare")
-        }
+        let savedOnly = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: ownSavedOverlay),
+            roster: [owner, own], ownerProfileID: owner.id, ownAccountSources: [ownSavedReceipt], accountID: "account.fixture")
+        check(savedOnly.pendingCount == 0, "Independent saved-only source is never deferred into the root ledger")
+        check(savedOnly.held.contains { $0.kind == "own_profile_overlay_row" && $0.reason.contains("Saved-only overlay") },
+              "Independent saved-only overlay is held in prepare")
+        let savedOnlyMaterial = try JSONSerialization.jsonObject(with: savedOnly.material) as! Object
+        check(!watches(savedOnlyMaterial, profile: own).contains { $0["metaId"] as? String == "saved-only" }, "Held saved-only row imports nothing")
         var conflictingOwnMovie = ownMovie; conflictingOwnMovie["_id"] = "tmdb:own-alternate"
         let ownConflictReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(
                 libraryRows: [ownMovie, conflictingOwnMovie], addons: [ownAddon]))
-        do {
-            _ = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: root),
-                roster: [owner, own], ownerProfileID: owner.id, ownAccountSources: [ownConflictReceipt], accountID: "account.fixture")
-            preconditionFailure("Independent conflicting watch source was deferred into the root ledger")
-        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
-            check(error.reason.contains("conflicting title identities"), "Independent watch identity conflict remains strict in prepare")
-        }
+        let ownConflict = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: root),
+            roster: [owner, own], ownerProfileID: owner.id, ownAccountSources: [ownConflictReceipt], accountID: "account.fixture")
+        check(ownConflict.pendingCount == 0, "Independent conflicting watch source is never deferred into the root ledger")
+        check(ownConflict.held.contains { $0.kind == "own_watch" && $0.reason.contains("conflicting title identities") },
+              "Independent watch identity conflict is held in prepare")
+        let ownConflictMaterial = try JSONSerialization.jsonObject(with: ownConflict.material) as! Object
+        check(!watches(ownConflictMaterial, profile: own).contains { $0["videoId"] as? String == "tt-own" }, "Held conflicting unit imports neither side")
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [overlayReceipt]); preconditionFailure("unbound source overlay imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("differs from its authenticated source"), "Root own overlay must match its authenticated envelope slice")
@@ -275,8 +321,8 @@ enum VortxLegacyBootstrapMaterialTests {
         }
 
         // A current schema-4 slot is newer than legacyImport.baseline after a same-UID rebind.
-        // Its complete typed carrier must therefore decide witness admission, rather than letting
-        // an immutable historical baseline fabricate a stale pending result.
+        // Its complete typed carrier decides overlay witness admission, but must not relift
+        // already acknowledged native events into the older global legacy receipt.
         let witnessedOverlayBytes = try JSONSerialization.data(withJSONObject: overlay, options: [.sortedKeys, .withoutEscapingSlashes])
         let witnessedOverlayReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(schemaVersion: 2,
@@ -304,31 +350,64 @@ enum VortxLegacyBootstrapMaterialTests {
               "The active schema-4 own slot takes precedence over historical legacyImport baseline")
         let slottedCold = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes, retainedOwnAccountBaseline: retainedOverlayBaseline,
                                        retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: witnessedDisposition)
-        check(((slottedCold["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
-              "Witness-admitted cold material copies the active slot tuple verbatim")
+        let historicalOverlayMaterial = try JSONSerialization.jsonObject(with: retainedOverlayBaseline) as! Object
+        check(NSDictionary(dictionary: (slottedCold["ownAccountSources"] as! [String: Object])[own.id.uuidString]!).isEqual(to:
+              (historicalOverlayMaterial["ownAccountSources"] as! [String: Object])[own.id.uuidString]!),
+              "Witness-admitted cold material retains the acknowledged global source tuple")
+        for field in ["addons", "libraries", "watches", "identityLinks"] {
+            let currentField = try JSONSerialization.data(withJSONObject: slottedCold[field]!, options: [.sortedKeys])
+            let acknowledgedField = try JSONSerialization.data(withJSONObject: historicalOverlayMaterial[field]!, options: [.sortedKeys])
+            check(currentField == acknowledgedField,
+                  "Cold material must not relift already native slot events into legacy " + field)
+        }
+        let activeEnvelope = VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope(profileID: own.id, sourceDocument: witnessedOverlayReceipt.sourceDocument)
+        let slottedWithEnvelope = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+            retainedOwnAccountBaseline: retainedOverlayBaseline, retainedOwnAccountSourceEnvelopes: [activeEnvelope],
+            retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: witnessedDisposition)
+        check(NSDictionary(dictionary: slottedWithEnvelope).isEqual(to: slottedCold),
+              "Active sealed envelope proves the overlay without relabelling the older typed source")
 
-        // Material 1 predates a profile that later became independently authenticated. Its
-        // complete schema-4 active slot is sufficient; historical absence is not a malformed
-        // partial material-2 tuple.
-        let oldNoOwnBaseline = Data("{\"schemaVersion\":1}".utf8)
+        // A profile that was shared in the acknowledged migration remains shared in global
+        // material after an independent native CAS. A slot is not a new legacy import receipt.
+        do {
+            _ = try material(root, roster: [owner, own],
+                retainedOwnAccountBaseline: Data("{\"schemaVersion\":1}".utf8), retainedOwnAccountSlotBaselines: [activeSlot])
+            preconditionFailure("Partial schema-only origin baseline admitted")
+        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("complete baseline"), "Origin classification requires the complete validated material")
+        }
+        var originalShared = own; originalShared.usesOwnAccount = false
+        let oldNoOwnBaseline = try JSONSerialization.data(withJSONObject: material(root, roster: [owner, originalShared]))
         let lateOwnDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
             roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: oldNoOwnBaseline,
             retainedOwnAccountSlotBaselines: [activeSlot])
-        check(lateOwnDisposition.count == 1 && lateOwnDisposition[0].status == .matchedWitness,
-              "A new own persona may use a complete active slot when historical material predates it")
+        check(lateOwnDisposition.isEmpty, "A native own slot does not attribute the original shared overlay")
         let lateOwnMaterial = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
                                            retainedOwnAccountBaseline: oldNoOwnBaseline,
                                            retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: lateOwnDisposition)
-        check(((lateOwnMaterial["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
-              "Late own persona retains the active slot's exact source proof")
+        check(lateOwnMaterial["ownAccountSources"] == nil,
+              "A native own slot never adds a source for a baseline-existing shared profile")
+        let originalPolicy = (lateOwnMaterial["roster"] as! [Object]).first { $0["id"] as? String == own.id.uuidString }!
+        check((originalPolicy["account"] as! Object)["kind"] as? String == "shared",
+              "The original global policy survives a native rebind")
         let retainedClockCarrier = Data(("{\"source\":{\"verifiedStreamingUid\":\"verified-own-uid\",\"sourceDocumentSha256\":\""
             + String(repeating: "d", count: 64)
             + "\"},\"addons\":{\"items\":[],\"order\":[],\"intents\":[]},\"library\":{\"items\":[],\"intents\":[]},\"watches\":[{\"metaId\":\"tt-retained-clock-a\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock-a\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583576},{\"metaId\":\"tt-retained-clock-b\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock-b\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583587}],\"identityLinks\":[]}").utf8)
         let retainedClockSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: own.id,
             sourceBaseline: retainedClockCarrier)
+        // Precision is tested through a real historical own tuple; a fake schema-only baseline
+        // must not grant permission to promote a current slot into the global import receipt.
+        let clockCarrier = try VortxProfileOverlayWitness.decodeObject(json: retainedClockCarrier)
+        var clockBaseline = witnessedOverlayMaterial
+        for (materialField, carrierField) in [("ownAccountSources", "source"), ("addons", "addons"),
+                                               ("libraries", "library"), ("watches", "watches"), ("identityLinks", "identityLinks")] {
+            var bucket = clockBaseline[materialField] as! Object
+            bucket[own.id.uuidString] = clockCarrier[carrierField]
+            clockBaseline[materialField] = bucket
+        }
         let retainedClockMaterial = try VortxLegacyBootstrapMaterial.encode(document: try JSONSerialization.data(withJSONObject: root),
             roster: [owner, own], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
-            retainedOwnAccountBaseline: oldNoOwnBaseline, retainedOwnAccountSlotBaselines: [retainedClockSlot])
+            retainedOwnAccountBaseline: JSONSerialization.data(withJSONObject: clockBaseline), retainedOwnAccountSlotBaselines: [retainedClockSlot])
         let retainedClockOutput = try VortxProfileOverlayWitness.decodeObject(json: retainedClockMaterial)
         let retainedClockRows = ((retainedClockOutput["watches"] as? [String: Any])?[own.id.uuidString] as? [[String: Any]])
         let retainedClockA = retainedClockRows?.first { $0["metaId"] as? String == "tt-retained-clock-a" }?["lastPlayedAtMs"] as? NSNumber
@@ -355,9 +434,39 @@ enum VortxLegacyBootstrapMaterialTests {
               "A changed raw own overlay remains distinguishably pending against the active slot witness")
         let deferredChanged = try material(changedRootOverlay, roster: [owner, own], documentData: changedRootOverlayBytes, retainedOwnAccountBaseline: retainedOverlayBaseline,
                                            retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: changedDisposition)
-        check(NSArray(array: watches(deferredChanged, profile: own)).isEqual(to: watches(witnessedOverlayMaterial, profile: own))
+        check(NSArray(array: watches(deferredChanged, profile: own)).isEqual(to: watches(historicalOverlayMaterial, profile: own))
               && !(watches(deferredChanged, profile: own).contains { $0["videoId"] as? String == "newer-overlay-video" }),
-              "A classifier-issued changed disposition preserves the kernel tuple and never acknowledges raw pending overlay")
+              "A classifier-issued changed disposition preserves the legacy tuple and never acknowledges raw pending overlay")
+        let deferredChangedEnvelope = try material(changedRootOverlay, roster: [owner, own], documentData: changedRootOverlayBytes,
+            retainedOwnAccountBaseline: retainedOverlayBaseline, retainedOwnAccountSourceEnvelopes: [activeEnvelope],
+            retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: changedDisposition)
+        check(NSDictionary(dictionary: deferredChangedEnvelope).isEqual(to: deferredChanged),
+              "Changed raw overlay stays pending even when the prior active envelope is retained")
+        do {
+            _ = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                retainedOwnAccountBaseline: retainedOverlayBaseline, retainedOwnAccountSourceEnvelopes: [activeEnvelope],
+                retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: changedDisposition)
+            preconditionFailure("Disposition from a different exact root admitted")
+        } catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
+        do {
+            _ = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                ownAccountSources: [witnessedOverlayReceipt], retainedOwnAccountBaseline: retainedOverlayBaseline,
+                retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: witnessedDisposition)
+            preconditionFailure("Retained disposition borrowed by a fresh authenticated source")
+        } catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
+        let anotherSourceReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: witnessedOverlayReceipt.verifiedStreamingUID,
+            sourceDocument: witnessedOverlayReceipt.sourceDocument + Data(" ".utf8),
+            profileOverlaySHA256: witnessedOverlayReceipt.profileOverlaySHA256)
+        let anotherSourceMaterial = try material(rootWithOwnOverlay, roster: [owner, own], ownAccountSources: [anotherSourceReceipt])
+        let anotherSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: own.id,
+            sourceBaseline: try sourceBaseline(anotherSourceMaterial))
+        do {
+            _ = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                retainedOwnAccountBaseline: retainedOverlayBaseline, retainedOwnAccountSlotBaselines: [anotherSlot],
+                deferredOwnAccountOverlays: witnessedDisposition)
+            preconditionFailure("Disposition from another source digest admitted")
+        } catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
 
         let sealedDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
             roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,
@@ -573,7 +682,7 @@ enum VortxLegacyBootstrapMaterialTests {
             let expected = pair[1]["w"] as! Bool ? "markedAtMs" : "resetAtMs"
             check(row[expected] as? Double == 100.25 && row.count >= 3, "Actor order controls owner watched ties")
         }
-        try fail(doc(["library": [movie()], "ownerWatched": ["a": intent(true, "a"), "b": intent(false, "a")]]), "Conflicting owner")
+        try held(doc(["library": [movie()], "ownerWatched": ["a": intent(true, "a"), "b": intent(false, "a")]]), "Conflicting owner")
     }
     static func descriptorAndRemovalPolicies() throws {
         let url = "https://example.com/Config/manifest.json"
@@ -592,7 +701,7 @@ enum VortxLegacyBootstrapMaterialTests {
         check(watches(result, profile: child)[0]["removedAtMs"] as? Double == 1767225700000.75, "Exact matching title removal")
         check((result["identityLinks"] as! [String: [[String]]])[child.id.uuidString]!.isEmpty, "No invented alias links")
         var other = addon; other["transportUrl"] = url.lowercased()
-        try fail(doc(["addons": [addon, other], "deletedAddons": [url.lowercased()]]), "Ambiguous legacy add-on")
+        try held(doc(["addons": [addon, other], "deletedAddons": [url.lowercased()]]), "Ambiguous legacy add-on")
     }
     static func watchConsolidation() throws {
         var old = movie(position: 12); old["v"] = "tt123"; old["eventEpochMs"] = 1000.125
@@ -605,7 +714,7 @@ enum VortxLegacyBootstrapMaterialTests {
         check(a["positionMs"] as? Int == 0 && a["durationMs"] as? Int == 100000, "Newer zero rewind preserves omitted duration")
         check(NSDictionary(dictionary: a).isEqual(to: b), "Fragment order independence")
         newer["eventEpochMs"] = 1000.125
-        try fail(doc(["byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [old, newer]]]]), "Equal viewing clocks")
+        try held(doc(["byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [old, newer]]]]), "Equal viewing clocks")
     }
     static func websiteIntentV3() throws {
         let url = "https://example.com/Config/manifest.json"
@@ -624,33 +733,33 @@ enum VortxLegacyBootstrapMaterialTests {
         for (key, value) in [("version", 4 as Any), ("counter", "01"), ("counter", "18446744073709551615"),
                              ("eventId", "A" + String(repeating: "a", count: 31)), ("wallTime", true), ("future", "unknown")] {
             var invalid = v3; invalid[key] = value
-            try fail(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": invalid]]]), key == "wallTime" ? "Malformed clock" : "Unsupported add-on intentV3")
+            try held(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": invalid]]]), key == "wallTime" ? "Malformed clock" : "Unsupported add-on intentV3")
         }
         // Authoritative removed v3 can legitimately have no live descriptor, even if its retained
         // old addedAt is larger. A later genuine legacy add still requires a descriptor.
         _ = try material(doc(["deletedAddonsTs": [url: ["addedAt": 1000.75, "removedAt": 500.5, "intentV3": v3]]]))
-        try fail(doc(["deletedAddonsTs": [url: ["addedAt": 1001.0, "removedAt": 500.5, "intentV3": v3]]]), "Live add-on install")
+        try held(doc(["deletedAddonsTs": [url: ["addedAt": 1001.0, "removedAt": 500.5, "intentV3": v3]]]), "Live add-on install")
         var present = v3; present["state"] = "present"
-        try fail(doc(["deletedAddonsTs": [url: ["intentV3": present]]]), "Live add-on install")
+        try held(doc(["deletedAddonsTs": [url: ["intentV3": present]]]), "Live add-on install")
         var older = v3; older["counter"] = "1"; older["legacyAddedSeen"] = 2000.25
         let aliases = try material(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": v3], "HTTPS://Example.COM/Config/manifest.json": ["intentV3": older]]]))
         let aliasIntent = ((aliases["addons"] as! [String: Object])[owner.id.uuidString]!["intents"] as! [Object])[0]["intentV3"] as! Object
         check(aliasIntent["counter"] as? String == v3["counter"] as? String && aliasIntent["legacyAddedSeen"] as? Double == 2000.25,
               "Alias merge keeps causal winner and componentwise observed legacy maxima")
-        try fail(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": v3], "HTTPS://Example.COM/Config/manifest.json": ["intentV3": present]]]), "Ambiguous legacy add-on intentV3 aliases")
+        try held(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": v3], "HTTPS://Example.COM/Config/manifest.json": ["intentV3": present]]]), "Ambiguous legacy add-on intentV3 aliases")
         print("Strict website intentV3 typed forwarding, unchanged clocks, future metadata rejection and descriptor fences passed")
     }
     static func rejectedEvidence() throws {
         var bits = movie(position: 1); bits["watched"] = "opaque-bitfield"
-        try fail(doc(["library": [bits]]), "bitfield")
-        try fail(doc(["byProfile": [child.id.uuidString: ["library": [movie()]]]]), "Saved-only overlay")
-        try fail(doc(["addons": [["transportUrl": "https://example.com/manifest.json"]]]), "manifest reconciliation")
+        try held(doc(["library": [bits]]), "bitfield")
+        try held(doc(["byProfile": [child.id.uuidString: ["library": [movie()]]]]), "Saved-only overlay")
+        try held(doc(["addons": [["transportUrl": "https://example.com/manifest.json"]]]), "manifest reconciliation")
         let fractional = try material(doc(["library": [movie(position: 1.00001)]]))
         check(watches(fractional)[0]["positionMs"] as? Int == 1000,
               "Sub-millisecond playback offset quantizes without changing causal clocks")
-        try fail(doc(["deletedLibrary": ["tt999"]]), "title-type reconciliation")
+        try held(doc(["deletedLibrary": ["tt999"]]), "title-type reconciliation")
         try fail(doc(["library": "not-an-array"]), "Malformed array")
-        try fail(doc(["byProfile": ["unknown": ["watched": Object()]]]), "unknown profile")
+        try held(doc(["byProfile": ["unknown": ["watched": Object()]]]), "unknown profile")
         try fail(doc(["deletedProfiles": [owner.id.uuidString.lowercased()]]), "Owner profile")
         try fail(doc(), "Duplicate", roster: [owner, child, child])
         try fail(doc(), "Invalid clock", modified: .infinity)
@@ -660,16 +769,16 @@ enum VortxLegacyBootstrapMaterialTests {
         try fail(doc(), "Owner profile cannot use", roster: [ownerOwn, child])
         for pin in ["1234", "sha256:bad"] { var bad = child; bad.pin = pin; try fail(doc(), "malformed PIN", roster: [owner, bad]) }
         var boolProgress = movie(); boolProgress["t"] = true
-        try fail(doc(["library": [boolProgress]]), "Malformed clock")
+        try held(doc(["library": [boolProgress]]), "Malformed clock")
         var numericBool = movie(); numericBool["currentVideoWatched"] = 1
-        try fail(doc(["library": [numericBool]]), "Malformed boolean")
+        try held(doc(["library": [numericBool]]), "Malformed boolean")
         var ambiguousSeries = movie(); ambiguousSeries["type"] = "series"; ambiguousSeries["currentVideoWatched"] = true
-        try fail(doc(["library": [ambiguousSeries]]), "exact video identity")
+        try held(doc(["library": [ambiguousSeries]]), "exact video identity")
         ambiguousSeries["v"] = "tt123"
-        try fail(doc(["library": [ambiguousSeries]]), "Whole-series completion")
+        try held(doc(["library": [ambiguousSeries]]), "Whole-series completion")
         let secret: Object = ["transportUrl": "https://example.com/manifest.json", "manifest": ["id": "fixture", "name": "Fixture", "version": "1.0.0", "accessToken": "sanitized-placeholder"]]
-        try fail(doc(["addons": [secret]]), "Credential-bearing")
-        try fail(doc(["byProfile": [child.id.uuidString: ["watched": ["untyped-title": ["w": ["untyped-title"]]]]]]), "Whole-title")
+        try held(doc(["addons": [secret]]), "Credential-bearing")
+        try held(doc(["byProfile": [child.id.uuidString: ["watched": ["untyped-title": ["w": ["untyped-title"]]]]]]), "Whole-title")
         let deletedID = "30000000-0000-0000-0000-000000000001"
         let result = try material(doc(["deletedProfiles": [deletedID], "byProfile": [deletedID: ["future": "retained in original"]]]))
         check(result["deletedProfileIds"] as? [String] == [deletedID], "Missing deleted rows remain tombstones")
@@ -702,7 +811,7 @@ enum VortxLegacyBootstrapMaterialTests {
         check(watches(collision).count == 1 && watches(collision, profile: fixedChild).isEmpty, "Historical history bucket does not rekey or overwrite colliding profile")
         var first = movie(position: 1); first["v"] = "same-unit"; first["eventEpochMs"] = 1000.25
         var second = movie("tt999", position: 1); second["v"] = "same-unit"; second["eventEpochMs"] = 1000.75
-        try fail(doc(["byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [first, second]]]]), "conflicting title")
+        try held(doc(["byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [first, second]]]]), "conflicting title")
         let typed = try material(doc(["deletedLibraryTs": ["series:removed-id": ["removedAt": 1000.125]]]))
         let library = (typed["libraries"] as! [String: Object])[owner.id.uuidString]!
         check((library["intents"] as! [Object])[0]["key"] as? String == "series:removed-id", "Already typed tombstone retained without guessing")
@@ -710,7 +819,7 @@ enum VortxLegacyBootstrapMaterialTests {
 
     static func completenessAndClockEvidence() throws {
         var removed = movie(position: 1); removed["removed"] = true; removed["eventEpochMs"] = 1000.25
-        try fail(doc(["library": [removed]]), "proven membership tombstone")
+        try held(doc(["library": [removed]]), "proven membership tombstone")
         let proven = try material(doc(["library": [removed], "deletedLibraryTs": ["tt123": ["removedAt": 2000.75]]]))
         let library = (proven["libraries"] as! [String: Object])[owner.id.uuidString]!
         check((library["intents"] as! [Object])[0]["removedAtMs"] as? Double == 2000.75, "Removal uses membership clock only")
@@ -720,12 +829,12 @@ enum VortxLegacyBootstrapMaterialTests {
         let url = "https://example.com/manifest.json"
         var web = doc(["deletedAddonsTs": [url: Object()]])
         web["webAddonRemovals"] = [url]
-        try fail(web, "Unclocked web add-on")
-        try fail(doc(["deletedAddons": [url], "deletedAddonsTs": [url: ["removedAt": 0]]]), "zero-stamp add-on")
-        try fail(doc(["library": [movie()], "deletedLibrary": ["tt123"], "deletedLibraryTs": ["tt123": ["removedAt": 0]]]), "zero-stamp library")
+        try held(web, "Unclocked web add-on")
+        try held(doc(["deletedAddons": [url], "deletedAddonsTs": [url: ["removedAt": 0]]]), "zero-stamp add-on")
+        try held(doc(["library": [movie()], "deletedLibrary": ["tt123"], "deletedLibraryTs": ["tt123": ["removedAt": 0]]]), "zero-stamp library")
         var old = movie(position: 1); old["w"] = ["stale-episode"]
         var newer = movie(position: 2); newer["w"] = [String](); newer["lastWatched"] = "2026-01-02T00:00:00Z"
-        try fail(doc(["byProfile": [child.id.uuidString: ["library": [old, newer]]]]), "Duplicate overlay")
+        try held(doc(["byProfile": [child.id.uuidString: ["library": [old, newer]]]]), "Duplicate overlay")
         var edits = doc(["library": [movie()]])
         edits["profileEdits"] = ["editedAt": 1720000000000.0, "roster": [["id": child.id.uuidString]], "libraryAdds": [owner.id.uuidString: [["id": "tt123", "type": "movie"]]]]
         _ = try material(edits)
@@ -783,7 +892,7 @@ enum VortxLegacyBootstrapMaterialTests {
         check(pending.allSatisfy { $0["sourceDocumentSha256"] as? String == expectedDigest }, "Every pending row binds the exact complete source digest")
         let sourceAfter = try JSONSerialization.data(withJSONObject: source, options: [.sortedKeys])
         check(bytes == sourceAfter, "Preparation never rewrites caller source")
-        try fail(source, "Live add-on install")
+        try held(source, "Live add-on install")
         let noPending = try prepare(JSONSerialization.data(withJSONObject: doc(["addons": [addon]])))
         check(noPending.pendingCount == 0 && noPending.pendingMembershipReceipts == nil, "Complete material has no pending archive")
         let removedV3: Object = ["version": 3, "counter": "7", "eventId": String(repeating: "a", count: 32),
@@ -801,8 +910,9 @@ enum VortxLegacyBootstrapMaterialTests {
                                    doc(["deletedAddonsTs": [missing: ["intentV3": malformedV3]]]),
                                    doc(["byProfile": [child.id.uuidString: ["library": [movie("saved").merging(["credential": "reject"]) { _, new in new }]]]]),
                                    doc(["byProfile": [child.id.uuidString: ["library": [movie("saved").merging(["d": "bad"]) { _, new in new }]]]])] {
-            do { _ = try prepare(JSONSerialization.data(withJSONObject: malformed)); preconditionFailure("Malformed receipt was deferred") }
-            catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
+            // Pending is not a malformed-input escape hatch: a malformed unit is held, never deferred.
+            let outcome = try prepare(JSONSerialization.data(withJSONObject: malformed))
+            check(outcome.pendingCount == 0 && outcome.pendingMembershipReceipts == nil && !outcome.held.isEmpty, "Malformed receipt was deferred")
         }
         do {
             _ = try VortxLegacyBootstrapMaterial.prepare(document: bytes, roster: [owner, child], ownerProfileID: owner.id)
@@ -813,8 +923,81 @@ enum VortxLegacyBootstrapMaterialTests {
         let large = try prepare(JSONSerialization.data(withJSONObject: doc(["deletedLibraryTs": many])))
         check(large.pendingCount == 1001, "More than a screenful of pending receipts survives without trimming")
         for index in 1001...VortxLegacyBootstrapMaterial.maximumPendingMembershipReceipts { many["missing-\(index)"] = ["removedAt": 1000.25] }
-        do { _ = try prepare(JSONSerialization.data(withJSONObject: doc(["deletedLibraryTs": many]))); preconditionFailure("Over-limit pending receipts admitted") }
-        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired { check(error.reason.contains("count limit"), "Explicit pending count cap") }
+        let capped = try prepare(JSONSerialization.data(withJSONObject: doc(["deletedLibraryTs": many])))
+        check(capped.pendingCount == VortxLegacyBootstrapMaterial.maximumPendingMembershipReceipts
+              && capped.held.count == 1 && capped.held[0].reason.contains("count limit"), "Explicit pending count cap holds the overflow")
+    }
+
+    /// Issue #262: a 0.4 account carrying rows the native engine cannot represent still loads. Each
+    /// such unit is held with a named reason; every other unit imports exactly as before.
+    static func legacyAccountHolds() throws {
+        let addon: Object = ["transportUrl": "https://example.com/manifest.json",
+                             "manifest": ["id": "fixture", "name": "Fixture", "version": "1.0.0"]]
+        let urlOnly: Object = ["transportUrl": "https://old.example.com/manifest.json", "name": "Old"]
+        let fragment: Object = ["transportUrl": "https://frag.example.com/manifest.json#cfg",
+                                "manifest": ["id": "frag", "name": "Frag", "version": "1.0.0"]]
+        var channel = movie("yt-channel"); channel["type"] = "channel"; channel["t"] = 0
+        var live = movie("iptv-one"); live["type"] = "tv"; live["t"] = 0
+        var temporary = movie("tt-temp"); temporary["temp"] = true
+        var noVideo = movie("tt-series", position: 42); noVideo["type"] = "series"; noVideo["v"] = ""
+        var noClock = movie("tt-noclock", position: 30); noClock["lastWatched"] = ""
+        let stray = "30000000-0000-0000-0000-000000000003"
+        var picky = child
+        picky.playback = UserProfile.PlaybackPrefs(audioLang: "en", subtitleLang: "en", forcedPolicy: "auto", subFont: "system",
+                                                   subSize: "medium", subColor: "white", subBackground: "none")
+        picky.playback?.maxResolution = 1440
+        let source = doc(["library": [movie("tt-kept", position: 12), channel, live, temporary, noVideo, noClock],
+                          "addons": [addon, urlOnly, fragment],
+                          "deletedProfiles": ["not-a-uuid"],
+                          "byProfile": [stray: ["watched": ["tt-stray": ["w": ["tt-stray"]]]],
+                                        child.id.uuidString: ["watched": ["tt-child": ["ma": ["tt-child:1:1": 1500.5]]]]]])
+        var withOrder = source; withOrder["addonOrder"] = ["https://old.example.com/manifest.json", "https://example.com/manifest.json"]
+        let data = try JSONSerialization.data(withJSONObject: withOrder)
+        let prepared = try VortxLegacyBootstrapMaterial.project(document: data, roster: [owner, picky], ownerProfileID: owner.id,
+            rosterModifiedSeconds: 1720000000.1234, preparePendingMembership: false)
+        let result = try JSONSerialization.jsonObject(with: prepared.material) as! Object
+
+        let library = (result["libraries"] as! [String: Object])[owner.id.uuidString]!
+        let saved = Set((library["items"] as! [Object]).map { $0["id"] as! String })
+        check(saved == ["tt-kept", "tt-series", "tt-noclock"], "Representable titles stay saved, including ones whose progress is held; got \(saved)")
+        let ownerWatches = watches(result)
+        check(ownerWatches.contains { $0["metaId"] as? String == "tt-kept" && $0["positionMs"] as? Int == 12000 }, "Valid progress imports")
+        check(!ownerWatches.contains { ["tt-series", "tt-noclock", "yt-channel", "iptv-one", "tt-temp"].contains($0["metaId"] as? String ?? "") },
+              "Held rows and held progress import nothing")
+        let addons = (result["addons"] as! [String: Object])[owner.id.uuidString]!
+        check((addons["items"] as! [Object]).map { $0["transportUrl"] as! String } == ["https://example.com/manifest.json"], "Only representable add-ons import")
+        check(addons["order"] as? [String] == ["https://example.com/manifest.json"], "Add-on order keeps known descriptors only")
+        check(watches(result, profile: picky).contains { $0["videoId"] as? String == "tt-child:1:1" }, "A valid profile bucket imports beside a held stray bucket")
+        let pickySettings = ((result["roster"] as! [Object]).first { $0["id"] as? String == picky.id.uuidString }!["settings"] as! Object)
+        check((pickySettings["ranking"] as! Object)["max_resolution"] == nil, "An unsupported resolution cap keeps the native default")
+
+        let reasons = prepared.held.map { $0.kind + ":" + $0.reason }
+        for expected in ["library_row:Unsupported catalog content type", "library_row:Temporary owner-library membership",
+                         "library_progress:Series progress or completion requires an exact video identity",
+                         "library_progress:Progress lacks a genuine viewing clock",
+                         "addon:URL-only add-on requires manifest reconciliation", "addon:Unsupported add-on transport URL",
+                         "addon_order:Add-on order has duplicate or unknown descriptors", "deleted_profile:Invalid deleted profile identity",
+                         "profile_overlay:Watch carrier references an unknown profile", "profile_setting:Unsupported profile resolution cap"] {
+            check(reasons.contains { $0.hasPrefix(expected) }, "Expected hold \(expected); got \(reasons)")
+        }
+        check(reasons.filter { $0.hasPrefix("library_row:Unsupported catalog content type") }.count == 2, "Each unsupported row holds alone")
+        let summary = VortxLegacyBootstrapMaterial.heldSummary(prepared.held)
+        check(!summary.contains("tt-") && !summary.contains(stray) && !summary.contains("example.com"), "Hold summary carries no source values: \(summary)")
+        check(VortxLegacyBootstrapMaterial.scrubbedReason("Malformed clock tt123:1:2") == "malformed_clock_x", "Source keys scrub out of reasons")
+        check(VortxLegacyBootstrapMaterial.scrubbedReason("Malformed object carrier " + stray) == "malformed_object_carrier_x", "Profile IDs scrub out of reasons")
+
+        // A unit is atomic: a progress record that fails after appending one mark leaves nothing behind.
+        var partial = movie("tt-partial"); partial["t"] = 0; partial["w"] = ["ep1"]; partial["ma"] = ["ep2": "bad"]
+        let rolledBack = try held(doc(["library": [partial]]), "Malformed clock")
+        check(!watches(rolledBack).contains { $0["metaId"] as? String == "tt-partial" }, "A held unit's earlier marks are undone")
+        check(((rolledBack["libraries"] as! [String: Object])[owner.id.uuidString]!["items"] as! [Object]).count == 1,
+              "Membership survives its held progress")
+        // A later carrier contradicting an imported title holds only the contradicting row.
+        var history = movie("tt-both", position: 5); history["type"] = "series"; history["v"] = "tt-both:1:1"; history["eventEpochMs"] = 2000.5
+        let crossed = try held(doc(["library": [movie("tt-both", position: 3)],
+                                    "byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [history]]]]), "conflicting movie/series ownership")
+        check(watches(crossed).count == 1 && watches(crossed)[0]["type"] as? String == "movie", "The first representable title keeps its type")
+        print("Issue #262 holds: one unrepresentable unit never stops the account, and a held unit leaves no trace")
     }
 
     static func fractionalPlaybackPrecision() throws {
@@ -828,9 +1011,9 @@ enum VortxLegacyBootstrapMaterialTests {
             check(overlay.count == 1 && overlay[0]["positionMs"] as? Int == expected,
                   "Positive raw progress remains genuine even when rounded position is zero")
         }
-        try fail(doc(["library": [movie(position: 9_007_199_254_741)]]), "Excessive progress")
+        try held(doc(["library": [movie(position: 9_007_199_254_741)]]), "Excessive progress")
         var missingClock = movie(position: 0.00001); missingClock.removeValue(forKey: "lastWatched")
-        try fail(doc(["library": [missingClock]]), "genuine viewing clock")
+        try held(doc(["library": [missingClock]]), "genuine viewing clock")
     }
 
     static func conflictingWatchPreparation() throws {
@@ -840,7 +1023,7 @@ enum VortxLegacyBootstrapMaterialTests {
         let source = doc(["library": [imdb, movie("tt333", position: 3)],
                           "byProfile": [owner.id.uuidString: ["ownerHistory": [tmdb]]],
                           "ownerWatched": ["original-intent": intent]])
-        try fail(source, "conflicting title identities")
+        try held(source, "conflicting title identities")
         let prepared = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: source),
             roster: [owner, child], ownerProfileID: owner.id, accountID: "account.fixture")
         let native = try JSONSerialization.jsonObject(with: prepared.material) as! Object
@@ -865,7 +1048,7 @@ enum VortxLegacyBootstrapMaterialTests {
         let provenanceChild = UserProfile(id: UUID(uuidString: "ABCDEF12-3456-7890-ABCD-EF1234567890")!, name: "Child", avatar: "C")
         let capturedChildID = provenanceChild.id.uuidString.lowercased()
         let childSource = doc(["byProfile": [capturedChildID: ["library": [imdb, tmdb]]]])
-        try fail(childSource, "conflicting title identities", roster: [owner, provenanceChild])
+        try held(childSource, "conflicting title identities", roster: [owner, provenanceChild])
         let childPrepared = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: childSource),
             roster: [owner, provenanceChild], ownerProfileID: owner.id, accountID: "account.fixture")
         let childNative = try JSONSerialization.jsonObject(with: childPrepared.material) as! Object
@@ -902,11 +1085,11 @@ enum VortxLegacyBootstrapMaterialTests {
               "Historical owner source locator is not replaced by the target owner's UUID")
         var brokenIntent = intent; brokenIntent["u"] = 0
         var broken = source; var v = broken["vortx"] as! Object; v["ownerWatched"] = ["original-intent": brokenIntent]; broken["vortx"] = v
-        do {
-            _ = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: broken),
-                roster: [owner, child], ownerProfileID: owner.id, accountID: "account.fixture")
-            preconditionFailure("Malformed owner intent hidden by conflicting watch deferral")
-        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired { check(error.reason.contains("Unclocked owner"), "Malformed source still fails") }
+        let brokenPrepared = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: broken),
+            roster: [owner, child], ownerProfileID: owner.id, accountID: "account.fixture")
+        check(brokenPrepared.held.contains { $0.reason.contains("Unclocked owner") }, "Malformed owner intent hidden by conflicting watch deferral")
+        check(!String(decoding: brokenPrepared.pendingMembershipReceipts ?? Data(), as: UTF8.self).contains("/vortx/ownerWatched/original-intent"),
+              "A held malformed intent is never retained as pending evidence")
         // A compact authenticated source can fan out the same exact raw evidence into many
         // conflicting cohorts. Bound the retained ledger incrementally, before serialization
         // can turn that fan-out into unbounded memory consumption.
@@ -916,10 +1099,10 @@ enum VortxLegacyBootstrapMaterialTests {
         largeA["w"] = units; largeB["w"] = units
         largeA["sourcePadding"] = String(repeating: "x", count: 500_000)
         largeB["sourcePadding"] = String(repeating: "y", count: 500_000)
-        do {
-            _ = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: doc(["library": [largeA, largeB]])),
-                roster: [owner, child], ownerProfileID: owner.id, accountID: "account.fixture")
-            preconditionFailure("Unbounded repeated watch provenance was admitted")
-        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired { check(error.reason.contains("archive limit"), "Explicit pending byte cap") }
+        let bounded = try VortxLegacyBootstrapMaterial.prepare(document: JSONSerialization.data(withJSONObject: doc(["library": [largeA, largeB]])),
+            roster: [owner, child], ownerProfileID: owner.id, accountID: "account.fixture")
+        check(bounded.held.contains { $0.reason.contains("archive limit") }
+              && (bounded.pendingMembershipReceipts?.count ?? 0) <= 32 * 1024 * 1024 + 1024 * 1024,
+              "Explicit pending byte cap holds the overflow and bounds the retained ledger")
     }
 }

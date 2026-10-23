@@ -154,7 +154,7 @@ class AddonHealthStore internal constructor(
             if (url.scheme != "http" && url.scheme != "https") return false
             if (url.username.isNotEmpty() || url.password.isNotEmpty()) return false
             if (isStrictLoopbackHost(url.host)) return true
-            return runCatching { PublicAddressPolicy.requireLiteralPublicOrHostname(url.host) }.isSuccess
+            return runCatching { PublicAddressPolicy.requireAddonLiteralOrHostname(url.host) }.isSuccess
         }
 
         internal fun isStrictLoopbackHost(host: String): Boolean {
@@ -174,15 +174,14 @@ class AddonHealthStore internal constructor(
 }
 
 /**
- * A discard-response GET using the existing add-on manifest client's no-proxy and guarded-DNS
- * policy. Redirects stay disabled: a 3xx is itself a live response and no second target is visited.
- * Only strict loopback hosts swap to system DNS, preserving the installed local add-on exception.
+ * A discard-response GET to an installed add-on, including LAN/Tailscale hosts. DNS remains bounded;
+ * redirects stay disabled, so a 3xx is a live response and no second private target is visited.
  */
 internal class OkHttpAddonHealthProbe(
     timeoutMillis: Long,
     private val publicClient: OkHttpClient = buildAddonManifestClient(
         timeoutMillis.coerceIn(1, Int.MAX_VALUE.toLong()).toInt(),
-    ),
+    ).newBuilder().dns(DeadlinePublicDns(timeoutMillis, PublicAddressPolicy::requireAddon)).build(),
     private val loopbackClient: OkHttpClient = publicClient.newBuilder().dns(Dns.SYSTEM).build(),
     maxConcurrentProbes: Int = MAX_CONCURRENT_PROBES,
 ) : AddonHealthProbe {

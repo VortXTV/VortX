@@ -49,6 +49,41 @@ class PlaybackSessionLifecycleTest {
     }
 
     @Test
+    fun `progress reaches the engine at most every 20 seconds per session`() = runTest {
+        val reported = mutableListOf<Pair<Long, Long>>()
+        var generation = 0L
+        var clock = 0L
+        val lifecycle = PlaybackSessionLifecycle(
+            scope = this,
+            beginSession = { _, _ -> PlaybackSessionToken(++generation) },
+            reportSession = { token, positionMs, _ -> reported += token.generation to positionMs },
+            endSession = { _, _, _ -> null },
+            nanoClock = { clock },
+        )
+        val handle = lifecycle.newHandle()
+        lifecycle.begin(handle)
+        runCurrent()
+
+        lifecycle.report(handle, 5_000L, 100_000L)
+        clock += 5_000_000_000L
+        lifecycle.report(handle, 10_000L, 100_000L)
+        clock += 14_999_999_999L
+        lifecycle.report(handle, 15_000L, 100_000L)
+        clock += 1L
+        lifecycle.report(handle, 25_000L, 100_000L)
+        advanceUntilIdle()
+        assertEquals(listOf(1L to 5_000L, 1L to 25_000L), reported)
+
+        // A replacement session on the same handle reports at once.
+        lifecycle.end(handle, 26_000L, 100_000L)
+        lifecycle.begin(handle)
+        advanceUntilIdle()
+        lifecycle.report(handle, 1_000L, 50_000L)
+        advanceUntilIdle()
+        assertEquals(listOf(1L to 5_000L, 1L to 25_000L, 2L to 1_000L), reported)
+    }
+
+    @Test
     fun `local context is captured once and later shell changes cannot retarget the session`() = runTest {
         val received = mutableListOf<PlaybackContext?>()
         var generation = 0L

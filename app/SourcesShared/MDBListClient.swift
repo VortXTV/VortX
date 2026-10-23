@@ -19,9 +19,24 @@ struct MDBListRatings: Equatable {
     let metacritic: Int?
     /// TMDB user score percentage 0-100, when present.
     let tmdb: Int?
+    /// Rotten Tomatoes audience (Popcornmeter) percentage 0-100 (MDBList source "popcorn"/"audience").
+    var rtAudience: Int? = nil
+    /// Letterboxd average on its native 0-5 scale (e.g. 4.1).
+    var letterboxd: Double? = nil
+    /// Trakt community percentage 0-100.
+    var trakt: Int? = nil
+    /// MyAnimeList score on its native 0-10 scale, for anime.
+    var mal: Double? = nil
+    /// SIMKL community score on its native 0-10 scale.
+    var simkl: Double? = nil
+    /// Kitsu average percentage 0-100, for anime.
+    var kitsu: Int? = nil
 
     /// True when at least one provider rating is present, i.e. there is something to render.
-    var hasAny: Bool { imdb != nil || rottenTomatoes != nil || metacritic != nil || tmdb != nil }
+    var hasAny: Bool {
+        imdb != nil || rottenTomatoes != nil || metacritic != nil || tmdb != nil
+            || rtAudience != nil || letterboxd != nil || trakt != nil || mal != nil || simkl != nil || kitsu != nil
+    }
 }
 
 enum MDBListClient {
@@ -53,7 +68,11 @@ enum MDBListClient {
                 imdb: bySource["imdb"],
                 rottenTomatoes: bySource["tomatoes"].map { Int($0.rounded()) },
                 metacritic: bySource["metacritic"].map { Int($0.rounded()) },
-                tmdb: bySource["tmdb"].map { Int($0.rounded()) }
+                tmdb: bySource["tmdb"].map { Int($0.rounded()) },
+                rtAudience: (bySource["popcorn"] ?? bySource["audience"]).map { Int($0.rounded()) },
+                letterboxd: bySource["letterboxd"].flatMap { RatingsFormat.scaled($0, max: 5) },
+                trakt: bySource["trakt"].map { Int(($0 <= 10 ? $0 * 10 : $0).rounded()) },
+                mal: bySource["myanimelist"].flatMap { RatingsFormat.scaled($0, max: 10) }
             )
             return ratings.hasAny ? ratings : nil
         } catch { return nil }

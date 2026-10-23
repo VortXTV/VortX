@@ -1,0 +1,167 @@
+import Foundation
+// SDK-free boundary adapters. The sort, currentIndex and seven TV getters below are literal extracts.
+final class Meter { var sources = 0, fields = 0, meta = 0; func reset() { sources = 0; fields = 0; meta = 0 } }
+struct CoreVideo {
+    let rawID: String; let rawSeason: Int?; let rawEpisode: Int?; let meter: Meter
+    var id: String { meter.fields += 1; return rawID }
+    var season: Int? { meter.fields += 1; return rawSeason }
+    var episode: Int? { meter.fields += 1; return rawEpisode }
+}
+struct AppleManualEpisodeNavigationCandidate: Equatable {
+    let id: String
+    let season: Int?
+    let episode: Int?
+}
+enum AppleManualEpisodeNavigationPolicy {
+    static func currentIndex(
+        currentID: String?,
+        currentSeason: Int?,
+        currentEpisode: Int?,
+        inventory: [AppleManualEpisodeNavigationCandidate]
+    ) -> Int? {
+        if let currentID, let exact = inventory.firstIndex(where: { $0.id == currentID }) {
+            return exact
+        }
+        guard let currentSeason, currentSeason >= 0,
+              let currentEpisode, currentEpisode > 0 else { return nil }
+        return inventory.firstIndex {
+            $0.season == currentSeason && $0.episode == currentEpisode
+        }
+    }
+}
+extension Array where Element == CoreVideo {
+    var orderedBySeasonEpisode: [CoreVideo] {
+        sorted {
+            let ls = $0.season ?? 0, rs = $1.season ?? 0
+            if ls != rs { return ls < rs }
+            let le = $0.episode ?? 0, re = $1.episode ?? 0
+            if le != re { return le < re }
+            return $0.id < $1.id
+        }
+    }
+}
+struct FixtureMeta { let videoId: String; let season: Int?; let episode: Int?; let usesSeriesLifecycle: Bool }
+enum FixtureSkipKind: Equatable { case credits, intro }
+struct FixtureSkip { let kind: FixtureSkipKind }
+final class Fixture {
+    let meter: Meter
+    var launch: [CoreVideo], loaded: [CoreVideo], metadata: FixtureMeta?
+    var episodes: [CoreVideo] { meter.sources += 1; return launch }
+    var loadedEpisodes: [CoreVideo] { meter.sources += 1; return loaded }
+    var curMeta: FixtureMeta? { meter.meta += 1; return metadata }
+    var hasStartedPlaying = true, loadFailed = false, upNextSuppressed = false
+    var isCurrentLiveStream = false, pendingAdvance = false // Context only: neither getter reads these.
+    var duration = 600.0, currentTime = 580.0
+    var currentSkip: FixtureSkip? = FixtureSkip(kind: .credits)
+    init(_ meter: Meter, _ rows: [CoreVideo]) { self.meter = meter; launch = rows; loaded = [] }
+    private var navigationEpisodeSource: [CoreVideo] {
+        guard !episodes.isEmpty else { return loadedEpisodes }
+        return loadedEpisodes.count > episodes.count ? loadedEpisodes : episodes
+    }
+    private var allEpisodes: [CoreVideo] { navigationEpisodeSource.orderedBySeasonEpisode }
+    private var manualEpisodeNavigationInventory: [AppleManualEpisodeNavigationCandidate] {
+        allEpisodes.map {
+            AppleManualEpisodeNavigationCandidate(id: $0.id, season: $0.season, episode: $0.episode)
+        }
+    }
+    private var episodeIndex: Int? {
+        guard let m = curMeta else { return nil }
+        return AppleManualEpisodeNavigationPolicy.currentIndex(
+            currentID: m.videoId,
+            currentSeason: m.season,
+            currentEpisode: m.episode,
+            inventory: manualEpisodeNavigationInventory
+        )
+    }
+    private var hasNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodes.count } ?? false }
+    private var upNextRemaining: Int? {
+        guard hasStartedPlaying, !loadFailed, hasNextEpisode, !upNextSuppressed,
+              duration > 60, currentTime > 0 else { return nil }
+        let remaining = duration - currentTime
+        guard remaining > 0, remaining <= 20 else { return nil }
+        return Int(remaining.rounded(.up))
+    }
+    /// Show the Up Next band IN PLACE of the credits Skip pill: the moment the play head enters a
+    /// credits segment (the same detection that drove the old Skip-Credits pill) and a next episode
+    /// exists, the band owns the bottom-right corner so the two never fight for it (the band used to
+    /// only appear in the last 20s, surfacing "after the credits were gone"). The last episode (no
+    /// next) keeps its plain Skip pill. Its countdown line still appears only inside the last-20s window.
+    private var isCreditsUpNext: Bool {
+        hasStartedPlaying && !loadFailed && currentSkip?.kind == .credits
+            && hasNextEpisode && !upNextSuppressed && duration > 60
+    }
+    func measured() -> (Int?, Bool, Bool) {
+        let remaining = upNextRemaining, credits = isCreditsUpNext
+        meter.reset() // Cost ledger is ONLY the literal hidden-UP precheck, not these correctness reads.
+        let hidden = upNextRemaining != nil || isCreditsUpNext
+        return (remaining, credits, hidden)
+    }
+}
+@main enum TVUpNextPrecheckFixture {
+    static func meta(_ id: String, _ season: Int?, _ episode: Int?, _ series: Bool = true) -> FixtureMeta {
+        FixtureMeta(videoId: id, season: season, episode: episode, usesSeriesLifecycle: series)
+    }
+    static func main() {
+        var checks = 0
+        for n in [20, 1_000, 5_000] {
+            let meter = Meter(), half = n / 2
+            let rows = (1...n).reversed().map { i in
+                CoreVideo(rawID: "e\(i)", rawSeason: i <= half ? 1 : 2,
+                          rawEpisode: i <= half ? i : i - half, meter: meter)
+            }
+            let f = Fixture(meter, rows)
+            func check(_ name: String, _ remaining: Int?, _ credits: Bool) {
+                let value = f.measured()
+                guard value.0 == remaining, value.1 == credits,
+                      value.2 == (remaining != nil || credits) else {
+                    print("FAIL \(n)/\(name): \(value)"); exit(1)
+                }
+                checks += 1
+                print("PASS \(n)/\(name) r=\(String(describing: value.0)) c=\(value.1) hidden=\(value.2) sources=\(meter.sources) fields=\(meter.fields) meta=\(meter.meta)")
+            }
+            let identities: [(String, FixtureMeta?, Bool)] = [
+                ("exact-first", meta("e1", 1, 1), true), ("exact-last", meta("e\(n)", 2, half), false),
+                ("fallback-first", meta("old", 1, 1), true), ("fallback-last", meta("old", 2, half), false),
+                ("exact-wins", meta("e1", 2, half), true), ("missing", meta("missing", nil, nil), false),
+                ("invalid-coordinates", meta("missing", -1, 0), false), ("nil-current", nil, false),
+                ("movie", meta("movie", nil, nil, false), false), ("live", meta("live", nil, nil, false), false),
+                ("pending", meta("e1", 1, 1), true), ("movie-exact", meta("e1", 1, 1, false), true),
+                ("live-exact", meta("e1", 1, 1, false), true),
+            ]
+            for (name, metadata, next) in identities {
+                f.metadata = metadata; f.isCurrentLiveStream = name.hasPrefix("live"); f.pendingAdvance = name == "pending"
+                check(name, next ? 20 : nil, next)
+            }
+            f.metadata = meta("e1", 1, 1); f.isCurrentLiveStream = false; f.pendingAdvance = false
+            typealias Probe = (String, Double, Double, Bool, Bool, Bool, Bool, Int?, Bool)
+            let probes: [Probe] = [
+                ("far",600,100,true,false,false,false,nil,false), ("final20",600,580,true,false,false,false,20,false),
+                ("fraction",600,599.1,true,false,false,false,1,false), ("at-end",600,600,true,false,false,true,nil,true),
+                ("past-end",600,601,true,false,false,true,nil,true), ("credits-far",600,100,true,false,false,true,nil,true),
+                ("not-started",600,580,false,false,false,true,nil,false), ("load-failed",600,580,true,true,false,true,nil,false),
+                ("suppressed",600,580,true,false,true,true,nil,false), ("short60",60,40,true,false,false,true,nil,false),
+                ("zero",0,0,true,false,false,true,nil,false), ("d-nan",.nan,100,true,false,false,true,nil,false),
+                ("d-pos-inf",.infinity,100,true,false,false,true,nil,true), ("d-neg-inf",-.infinity,100,true,false,false,true,nil,false),
+                ("t-nan",600,.nan,true,false,false,true,nil,true), ("t-pos-inf",600,.infinity,true,false,false,true,nil,true),
+                ("t-neg-inf",600,-.infinity,true,false,false,true,nil,true), ("both-inf",.infinity,.infinity,true,false,false,true,nil,true),
+                ("t-zero",600,0,true,false,false,true,nil,true), ("t-negative",600,-1,true,false,false,true,nil,true),
+            ]
+            for p in probes {
+                f.duration = p.1; f.currentTime = p.2; f.hasStartedPlaying = p.3; f.loadFailed = p.4
+                f.upNextSuppressed = p.5; f.currentSkip = p.6 ? FixtureSkip(kind: .credits) : nil
+                check(p.0, p.7, p.8)
+            }
+            f.duration = 600; f.currentTime = 580; f.hasStartedPlaying = true; f.loadFailed = false
+            f.upNextSuppressed = false; f.currentSkip = FixtureSkip(kind: .credits); f.metadata = meta("e1", nil, nil)
+            f.launch = []; f.loaded = rows; check("loaded-only", 20, true)
+            f.launch = Array(rows.prefix(1)); check("loaded-longer", 20, true)
+            f.launch = rows; f.loaded = rows.map {
+                CoreVideo(rawID: "loaded:" + $0.rawID, rawSeason: $0.rawSeason, rawEpisode: $0.rawEpisode, meter: meter)
+            }
+            check("equal-length-keeps-launch", 20, true)
+            f.launch = []; f.loaded = []; f.pendingAdvance = true; check("pending-empty", nil, false)
+        }
+        guard checks == 111 else { print("FAIL incomplete matrix \(checks)"); exit(1) }
+        print("TV Up Next precheck: 111 cases passed")
+    }
+}

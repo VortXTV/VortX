@@ -1,0 +1,89 @@
+// Explicit host gate only: actual public source/tests and the separately built real host JNI.
+// APK cross-builds stay in the following existing workflow step.
+gradle.taskGraph.whenReady { graph ->
+    def forbidden = graph.allTasks.findAll { task ->
+        task.name ==~ /(?i)(cargoNdkBuild.*|.*externalNativeBuild.*|configureCMake.*|buildCMake.*|merge.*JniLibFolders|assemble.*|bundle.*(Aar|Apk|Aab)|package.*(Apk|Bundle)|install.*)/
+    }
+    if (!forbidden.empty) throw new GradleException("Host unit gate refuses native/package/install tasks")
+    def tests = graph.allTasks.findAll { it instanceof org.gradle.api.tasks.testing.Test }
+    if (tests*.path != [":app:testPlayDebugUnitTest"])
+        throw new GradleException("Host gate requires exactly the actual Play unit Test task")
+}
+allprojects {
+    tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { task ->
+        if (task.path == ":app:testPlayDebugUnitTest") {
+            def expected = [
+                "com.vortx.android.engine.NativeOwnerHistoryRuntimeTest": 7L,
+                "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": 18L,
+                "com.vortx.android.engine.NativeOwnerHistoryJniTest": 5L,
+                "com.vortx.android.engine.VortxNativeSessionTest": 2L,
+                "com.vortx.android.player.PlaybackMetadataTest": 5L,
+                "com.vortx.android.player.ExoPlayerEngineStatePolicyTest": 17L,
+            ]
+            def observed = [:].withDefault { 0L }
+            def names = [] as Set
+            def media3Class = "com.vortx.android.player.ExoPlayerEngineStatePolicyTest"
+            def libraryPath = System.getenv("VORTX_JNI_LIBRARY")
+            def receiptPath = System.getenv("VORTX_JNI_RECEIPT")
+            if (!libraryPath || !new File(libraryPath).isAbsolute() ||
+                    !receiptPath || !new File(receiptPath).isAbsolute())
+                throw new GradleException("Exact host JNI and receipt paths are required")
+            maxParallelForks = 1
+            maxHeapSize = "512m"
+            jvmArgs "-XX:ActiveProcessorCount=1", "-XX:+UseSerialGC",
+                "-Djava.library.path=" + new File(libraryPath).parent,
+                "-Dkotlinx.coroutines.io.parallelism=1",
+                "-Dkotlinx.coroutines.scheduler.core.pool.size=1",
+                "-Dkotlinx.coroutines.scheduler.max.pool.size=2"
+            filter.failOnNoMatchingTests = true
+            ignoreFailures = false
+            outputs.upToDateWhen { false }
+            outputs.cacheIf { false }
+            def requireExactLibrary = {
+                def sha = System.getenv("VORTX_JNI_EXPECTED_SHA256")
+                if (!(sha ==~ /[0-9a-f]{64}/))
+                    throw new GradleException("Actual host JNI SHA is required")
+                def receipt = new groovy.json.JsonSlurper().parse(new File(receiptPath))
+                if (receipt.schema != 1 ||
+                    receipt.engineSource != "0c30f4782aee544a2b7e33169ad60d03630d4097" ||
+                    receipt.engineSource != System.getenv("VORTX_ENGINE_SOURCE_SHA") ||
+                    receipt.appSource != System.getenv("GITHUB_SHA") ||
+                    receipt.features != "jni,server,resource-host" ||
+                    receipt.toolchain != "nightly-2026-07-19" ||
+                    receipt.hostTarget != "x86_64-unknown-linux-gnu" ||
+                    receipt.libraryPath != libraryPath || receipt.librarySha256 != sha)
+                    throw new GradleException("Host JNI provenance differs from the reviewed lane")
+                def library = new File(libraryPath)
+                if (!library.isFile() || library.length() == 0L ||
+                        library.canonicalPath != libraryPath)
+                    throw new GradleException("Exact host JNI artifact is absent or indirect")
+                def digest = java.security.MessageDigest.getInstance("SHA-256")
+                library.withInputStream { input ->
+                    byte[] bytes = new byte[65536]
+                    int count
+                    while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
+                }
+                def actual = digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+                if (actual != sha) throw new GradleException("Host JNI bytes changed")
+            }
+            doFirst { requireExactLibrary() }
+            afterTest { descriptor, result ->
+                def identity = [descriptor.className, descriptor.name]
+                if (!expected.containsKey(descriptor.className) || !names.add(identity))
+                    throw new GradleException("Unexpected or repeated host test")
+                observed[descriptor.className] += result.testCount
+            }
+            afterSuite { descriptor, result ->
+                if (descriptor.parent == null) {
+                    requireExactLibrary()
+                    def ownerCount = observed.findAll { key, value -> key != media3Class }.values().sum(0L)
+                    if (observed != expected || ownerCount != 37L || observed[media3Class] != 17L ||
+                            result.testCount != 54L || result.skippedTestCount != 0L ||
+                            result.failedTestCount != 0L)
+                        throw new GradleException("Require original owner-history37 plus Media3 17, zero skips/failures")
+                    logger.lifecycle("Executed owner-history37 and Media3 17 with unchanged real host JNI")
+                }
+            }
+        }
+    }
+}

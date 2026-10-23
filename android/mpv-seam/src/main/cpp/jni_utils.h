@@ -27,5 +27,6 @@ UTIL_EXTERN jmethodID seam_MpvSeam_eventProperty_S,
         seam_MpvSeam_eventProperty_Sd,
         seam_MpvSeam_eventProperty_SS,
         seam_MpvSeam_eventEndFile_II,
+        seam_MpvSeam_eventStartFile_J,
         seam_MpvSeam_event,
         seam_MpvSeam_logMessage_SiS;

@@ -35,8 +35,13 @@ import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.BuildConfig
+import com.vortx.android.profile.ProfileSelectionRequest
+import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.update.UpdatePromptHost
@@ -83,13 +88,17 @@ fun TvApp(
         // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
         // skip it by construction, because ProfileStore.needsPicker is false in both cases.
         var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var profileSelection by remember { mutableStateOf<ProfileSelectionRequest?>(null) }
+        profileSelection?.let { request ->
+            val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
+            ProfileSelectionSurface(request, handoff,
+                onComplete = { profileSelection = null; showPicker = false },
+                onChooseAgain = { profileSelection = null; showPicker = true })
+            return@VortXTheme
+        }
         if (showPicker) {
-            BackHandler {
-                val store = profileStore
-                if (store != null) store.active?.let { store.select(it) }
-                showPicker = false
-            }
-            TvWhosWatching(onDone = { showPicker = false })
+            // The picker owns Back, its nested editor and exact native selection admission.
+            TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it })
             return@VortXTheme
         }
 
@@ -247,6 +256,9 @@ fun TvApp(
             }
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var advancingEpisode by remember(playable) { mutableStateOf(false) }
+            var episodeHandoffSequence by remember(playable) { mutableStateOf(0L) }
+            var episodeResolveSequence by remember(playable) { mutableStateOf(0L) }
+            var episodeHandoffRequest by remember(playable) { mutableStateOf<PlayerEpisodeHandoffRequest?>(null) }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             val retryPlayback = if (playerVm != null) {
                 playerVm.playback.collectAsStateWithLifecycle().value
@@ -256,6 +268,7 @@ fun TvApp(
             fun exitPlayer() {
                 cancelPreload()
                 advancingEpisode = false
+                episodeHandoffRequest = null
                 retryingSource = false
                 autoAdvanceStreak[0] = 0
                 returnToBrowse()
@@ -270,21 +283,6 @@ fun TvApp(
                     // Audio/source preference edits must not stop healthy mounted playback.
                     // Retire only continuation work; the rebuilt VM does not own this episode.
                     cancelPreload()
-                }
-            }
-            LaunchedEffect(advancingEpisode, retryPlayback) {
-                if (!advancingEpisode || playerVm == null || launchedPlayerViewModel !== playerVm || launchedPlayerPrincipal != currentPlayerPrincipal) return@LaunchedEffect
-                when (val state = retryPlayback) {
-                    is Playback.Ready -> {
-                        playerVm.clearPlayback()
-                        advancingEpisode = false
-                        playing = state.playable
-                    }
-                    is Playback.Failed -> {
-                        playerVm.clearPlayback()
-                        exitPlayer()
-                    }
-                    else -> Unit
                 }
             }
             LaunchedEffect(retryingSource, retryPlayback) {
@@ -322,9 +320,9 @@ fun TvApp(
                 qualityOptions = playerQualityOptions,
                 episodeOptions = playerEpisodeOptions,
                 currentSource = playerVm?.currentPlayerSource(),
-                onSwitchSource = playerVm?.takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }?.let { vm ->
+                onSwitchSource = playerVm?.takeIf { it === launchedPlayerViewModel && !retryingSource }?.let { vm ->
                     { source ->
-                        check(!advancingEpisode && !retryingSource) { "Episode handoff in progress" }
+                        check(!retryingSource) { "Source retry in progress" }
                         check(launchedPlayerPrincipal == currentPlayerPrincipal) { "Playback owner changed" }
                         cancelPreload()
                         advancingEpisode = false
@@ -332,18 +330,28 @@ fun TvApp(
                         try { vm.resolveSourceSwitch(source) } finally { cancelPreload() }
                     }
                 },
-                onSwitchEpisode = playerVm?.takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }?.let { vm ->
+                onSwitchEpisode = playerVm?.takeIf { it === launchedPlayerViewModel && !retryingSource }?.let { vm ->
                     { episodeId ->
-                        check(!advancingEpisode && !retryingSource) { "Episode handoff in progress" }
+                        check(!retryingSource) { "Source retry in progress" }
                         check(launchedPlayerPrincipal == currentPlayerPrincipal) { "Playback owner changed" }
                         cancelPreload()
-                        advancingEpisode = false
-                        autoAdvanceStreak[0] = 0
-                        vm.resolveEpisodeSwitch(episodeId)
+                        val sequence = ++episodeResolveSequence
+                        advancingEpisode = true
+                        try { vm.resolveEpisodeSwitch(episodeId) } finally {
+                            if (sequence == episodeResolveSequence) advancingEpisode = false
+                        }
                     }
                 },
-                onEpisodeSwitched = { replacement, acceptedRevision ->
-                    autoAdvanceStreak[0] = 0
+                episodeHandoffRequest = episodeHandoffRequest,
+                onEpisodeHandoffQueued = { sequence ->
+                    if (episodeHandoffRequest?.sequence == sequence) episodeHandoffRequest = null
+                },
+                onAudioIntentChanged = { intent ->
+                    cancelPreload()
+                    launchedPlayerViewModel?.notePlaybackAudioIntent(intent.language)
+                },
+                onEpisodeSwitched = { replacement, acceptedRevision, automatic ->
+                    autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0
                     historyIdentity = advancePlayerEpisodeHistory(
                         current = historyIdentity,
                         replacement = replacement,
@@ -357,6 +365,7 @@ fun TvApp(
                     val vm = playerVm ?: return@onWarmNext
                     val next = vm.nextEpisode() ?: return@onWarmNext
                     val target = NextEpisodePreloadPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                    if (preloadPolicy.isReady(target) && !vm.hasPreparedNextEpisode(next.id)) preloadPolicy.warmFailed(target)
                     val attempt = preloadPolicy.evaluate(
                         target, positionMs, durationMs, android.os.SystemClock.elapsedRealtime(),
                     ) ?: return@onWarmNext
@@ -366,6 +375,7 @@ fun TvApp(
                         onComplete = { ready ->
                             preloadPolicy.complete(attempt, ready, android.os.SystemClock.elapsedRealtime())
                         },
+                        timeoutMs = (attempt.deadlineMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
                     )
                 },
                 onBack = ::exitPlayer,
@@ -377,10 +387,8 @@ fun TvApp(
                     } else if (!advancingEpisode && vm != null && vm.nextEpisode() != null) {
                         cancelPreload()
                         retryingSource = false
-                        autoAdvanceStreak[0]++
-                        advancingEpisode = true
-                        vm.playNextEpisode()
-                    } else if (!advancingEpisode) {
+                        episodeHandoffRequest = PlayerEpisodeHandoffRequest(++episodeHandoffSequence, requireNotNull(vm.nextEpisode()), automatic = true)
+                    } else if (!advancingEpisode && episodeHandoffRequest == null) {
                         exitPlayer()
                     }
                 },
@@ -481,6 +489,7 @@ fun TvApp(
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
                 TvShell(
+                    onProfileSelected = { profileSelection = it },
                     repo = repo,
                     auth = auth,
                     destination = shellDestination,

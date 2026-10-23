@@ -23,7 +23,10 @@ enum VortxResourceProjection {
                 payload = .object(["type": .string("Ready"), "content": value])
             }
         } else {
-            payload = .object(["type": .string("Err"), "content": .object(["code": .string(group.error?.code ?? group.status.rawValue)])])
+            let failure = group.error ?? .init(code: group.status.rawValue)
+            var receipt: [String: VortxJSON] = ["code": .string(failure.code)]
+            if let status = failure.status { receipt["status"] = .integer(Int64(status)) }
+            payload = .object(["type": .string("Err"), "content": .object(receipt)])
         }
         return .object(["request": .object(["base": .string(addon.transportUrl), "path": try path(request)]), "content": payload])
     }

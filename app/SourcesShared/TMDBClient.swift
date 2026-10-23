@@ -368,6 +368,49 @@ enum TMDBClient {
         return await discoverGenrePage(media: "tv", genreID: tvGenreID, key: key)
     }
 
+    /// A For You or smart collection row: one /discover page per media from `ForYouQuery` (the parameters
+    /// after `api_key`; nil skips that media), interleaved and resolved to playable tt previews exactly
+    /// like the genre rails. Fail-soft: [].
+    static func ruleTitles(movieQuery: String?, tvQuery: String?, limit: Int = 20) async -> [MetaPreview] {
+        let key = ApiKeys.effectiveTMDBKey()
+        async let movieRows = rulePage(media: "movie", query: movieQuery, key: key)
+        async let tvRows = rulePage(media: "tv", query: tvQuery, key: key)
+        return await resolveRows(interleave(await movieRows, await tvRows), key: key, limit: limit)
+    }
+
+    private static func rulePage(media: String, query: String?, key: String) async -> [DiscoverRow] {
+        guard let query else { return [] }
+        return parseDiscover(await get("/discover/\(media)?api_key=\(key)&\(query)&language=en-US&page=1"), media: media)
+    }
+
+    /// A followed person's best-known work for a For You row: acting plus directing and writing credits,
+    /// most-voted first, resolved to tt previews. Self appearances and talk, news and reality shows are
+    /// left out (they list every guest spot, not the person's work). Fail-soft: [].
+    static func personTopTitles(id: Int, limit: Int = 20) async -> [MetaPreview] {
+        guard id > 0 else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/person/\(id)/combined_credits?api_key=\(key)") else { return [] }
+        let cast = (obj["cast"] as? [[String: Any]]) ?? []
+        let crew = ((obj["crew"] as? [[String: Any]]) ?? []).filter {
+            ["Directing", "Writing"].contains($0["department"] as? String ?? "")
+        }
+        let appearanceGenres: Set<Int> = [10763, 10764, 10767]
+        var seen = Set<String>()
+        var ranked: [(row: DiscoverRow, votes: Int)] = []
+        for entry in cast + crew {
+            guard let tmdbID = entry["id"] as? Int, let media = entry["media_type"] as? String,
+                  media == "movie" || media == "tv", seen.insert("\(media):\(tmdbID)").inserted else { continue }
+            let character = (entry["character"] as? String ?? "").lowercased()
+            if ["self", "himself", "herself"].contains(where: { character.hasPrefix($0) }) { continue }
+            if !Set((entry["genre_ids"] as? [Int]) ?? []).isDisjoint(with: appearanceGenres) { continue }
+            let name = (entry["title"] as? String) ?? (entry["name"] as? String) ?? ""
+            let poster = (entry["poster_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
+            ranked.append(((tmdbID, media, name, poster), (entry["vote_count"] as? Int) ?? 0))
+        }
+        let rows = ranked.sorted { $0.votes > $1.votes }.map(\.row)
+        return await resolveRows(rows, key: key, limit: limit)
+    }
+
     /// "Top New": the most popular movies + shows released in the last `newWindowMonths`, merged and
     /// resolved to tt previews. Sorted by popularity (what's hot right now among recent releases).
     static func topNewTitles(region: String = deviceRegion, limit: Int = 24) async -> [MetaPreview] {
@@ -1214,6 +1257,17 @@ enum TMDBClient {
         let placeOfBirth: String?
         let profileURL: String?        // w342 headshot, nil when TMDB has none
         let knownForDepartment: String?
+        var imdbID: String? = nil      // "nm…", for the IMDb link
+        var birthdayISO: String? = nil // "yyyy-MM-dd", for the age
+        var deathdayISO: String? = nil
+    }
+
+    /// One filmography entry: the card preview plus its release or first-air date ("yyyy-MM-dd", may be empty).
+    struct PersonCredit: Hashable, Identifiable {
+        let preview: MetaPreview
+        let date: String
+        var id: String { preview.id }
+        var year: String? { date.count >= 4 ? String(date.prefix(4)) : nil }
     }
 
     /// Full person record via /3/person/{id}. `id` is a TMDB person id (the one `CastMember` carries). Nil on
@@ -1228,16 +1282,178 @@ enum TMDBClient {
         let profile = (obj["profile_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
         let dept = (obj["known_for_department"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let place = (obj["place_of_birth"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let isoDate: (String) -> String? = { key in (obj[key] as? String).flatMap { $0.isEmpty ? nil : $0 } }
         return PersonDetail(name: name, biography: bio,
                             birthday: prettyDate(obj["birthday"] as? String),
-                            placeOfBirth: place, profileURL: profile, knownForDepartment: dept)
+                            placeOfBirth: place, profileURL: profile, knownForDepartment: dept,
+                            imdbID: isoDate("imdb_id"), birthdayISO: isoDate("birthday"), deathdayISO: isoDate("deathday"))
+    }
+
+    /// A person matched by name in Search: enough to paint the result tile and open the Person page.
+    struct PersonResult: Hashable, Identifiable, Sendable {
+        let id: Int
+        let name: String
+        let profileURL: String?
+        let department: String?
+    }
+
+    /// People whose name matches `query`, via /3/search/person through the keyless edge, most popular first.
+    /// Only people with a photo or a known-for credit are kept (bare name collisions are noise). Fail-soft: [].
+    static func searchPeople(query: String, limit: Int = 20) async -> [PersonResult] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2,
+              let encoded = trimmed.addingPercentEncoding(
+                withAllowedCharacters: CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&+=?#"))
+              ) else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/search/person?query=\(encoded)&include_adult=false&api_key=\(key)"),
+              let results = obj["results"] as? [[String: Any]] else { return [] }
+        let ranked: [(PersonResult, Double)] = results.compactMap { entry in
+            guard let id = entry["id"] as? Int, id > 0,
+                  let name = entry["name"] as? String, !name.isEmpty else { return nil }
+            let profile = (entry["profile_path"] as? String).flatMap { $0.isEmpty ? nil : "https://image.tmdb.org/t/p/w185\($0)" }
+            let knownFor = (entry["known_for"] as? [[String: Any]]) ?? []
+            guard profile != nil || !knownFor.isEmpty else { return nil }
+            let department = (entry["known_for_department"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return (PersonResult(id: id, name: name, profileURL: profile, department: department),
+                    (entry["popularity"] as? Double) ?? 0)
+        }
+        return ranked.sorted { $0.1 > $1.1 }.prefix(limit).map(\.0)
+    }
+
+    /// Season poster art for a series, keyed by season number (0 = Specials), from /3/tv/{id}. Accepts the
+    /// catalog id forms the detail page carries (`tt…` resolved through /find, or `tmdb:<id>`); any other id,
+    /// a miss or an error returns [:] and the season selector falls back to the series poster.
+    static func seasonPosters(metaID: String) async -> [Int: String] {
+        let tvID: Int?
+        if metaID.hasPrefix("tmdb:") {
+            tvID = Int(metaID.dropFirst("tmdb:".count))
+        } else {
+            tvID = await tmdbNumericID(imdbID: metaID, type: "series")
+        }
+        guard let tvID, tvID > 0 else { return [:] }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let show = await get("/tv/\(tvID)?api_key=\(key)"),
+              let seasons = show["seasons"] as? [[String: Any]] else { return [:] }
+        var posters: [Int: String] = [:]
+        for season in seasons {
+            guard let number = season["season_number"] as? Int,
+                  let path = season["poster_path"] as? String, !path.isEmpty else { continue }
+            posters[number] = "https://image.tmdb.org/t/p/w342\(path)"
+        }
+        return posters
+    }
+
+    /// One of a title's videos for the Trailers & Extras row. YouTube only: the site the trailer player plays.
+    struct TitleVideo: Identifiable, Hashable, Sendable {
+        let key: String
+        let name: String
+        /// TMDB's type: Trailer, Teaser, Featurette, Behind the Scenes, Clip, Bloopers.
+        let kind: String
+        let official: Bool
+        let language: String
+        let published: String?
+        var id: String { key }
+        var thumbnail: URL? { URL(string: "https://i.ytimg.com/vi/\(key)/hqdefault.jpg") }
+    }
+
+    private static let videoKindRank: [String: Int] = [
+        "trailer": 0, "teaser": 1, "featurette": 2, "behind the scenes": 3, "clip": 4, "bloopers": 5,
+    ]
+
+    /// A title's trailers, teasers, featurettes, clips and behind-the-scenes videos from /3/{tv|movie}/{id}/videos,
+    /// in the viewer's trailer languages first, then English, then everything else; within that, by kind
+    /// (trailers lead), official before unofficial, newest first. Fail-soft: [] on any miss.
+    static func titleVideos(metaID: String, type: String, limit: Int = 16) async -> [TitleVideo] {
+        let media = type == "series" ? "tv" : "movie"
+        let tmdbID: Int?
+        if metaID.hasPrefix("tmdb:") {
+            tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
+        } else {
+            tmdbID = await tmdbNumericID(imdbID: metaID, type: type)
+        }
+        guard let tmdbID, tmdbID > 0 else { return [] }
+        let preferred = preferredTrailerLanguages
+        let languages = (preferred + ["en", "null"]).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/\(media)/\(tmdbID)/videos?api_key=\(key)&include_video_language=\(languages.joined(separator: ","))"),
+              let results = obj["results"] as? [[String: Any]] else { return [] }
+        return rankTitleVideos(results, preferredLanguages: preferred, limit: limit)
+    }
+
+    /// Pure ordering for `titleVideos`, kept separate so it is testable without the network.
+    static func rankTitleVideos(_ results: [[String: Any]], preferredLanguages: [String], limit: Int) -> [TitleVideo] {
+        var seen = Set<String>()
+        let videos: [TitleVideo] = results.compactMap { v in
+            guard (v["site"] as? String)?.lowercased() == "youtube",
+                  let key = v["key"] as? String, !key.isEmpty, seen.insert(key).inserted,
+                  let kind = v["type"] as? String, videoKindRank[kind.lowercased()] != nil else { return nil }
+            let name = (v["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return TitleVideo(key: key, name: (name?.isEmpty == false ? name! : kind), kind: kind,
+                              official: v["official"] as? Bool ?? false,
+                              language: ((v["iso_639_1"] as? String) ?? "").lowercased(),
+                              published: v["published_at"] as? String)
+        }
+        func languageRank(_ video: TitleVideo) -> Int {
+            if let index = preferredLanguages.firstIndex(of: video.language) { return index }
+            return video.language == "en" ? preferredLanguages.count : preferredLanguages.count + 1
+        }
+        return videos.sorted { a, b in
+            let la = languageRank(a), lb = languageRank(b)
+            if la != lb { return la < lb }
+            let ka = videoKindRank[a.kind.lowercased()] ?? 9, kb = videoKindRank[b.kind.lowercased()] ?? 9
+            if ka != kb { return ka < kb }
+            if a.official != b.official { return a.official }
+            return (a.published ?? "") > (b.published ?? "")
+        }
+        .prefix(limit).map { $0 }
+    }
+
+    /// Per-episode TMDB ratings for one season (episode number to vote average) from /3/tv/{id}/season/{n}.
+    /// Episodes with fewer than five votes are left out, so a chip never shows a two-vote 10.0. Fail-soft: [:].
+    static func seasonEpisodeRatings(metaID: String, season: Int) async -> [Int: Double] {
+        let tvID: Int?
+        if metaID.hasPrefix("tmdb:") {
+            tvID = Int(metaID.dropFirst("tmdb:".count))
+        } else {
+            tvID = await tmdbNumericID(imdbID: metaID, type: "series")
+        }
+        guard let tvID, tvID > 0, season >= 0 else { return [:] }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/tv/\(tvID)/season/\(season)?api_key=\(key)"),
+              let episodes = obj["episodes"] as? [[String: Any]] else { return [:] }
+        var ratings: [Int: Double] = [:]
+        for episode in episodes {
+            guard let number = episode["episode_number"] as? Int,
+                  let average = (episode["vote_average"] as? NSNumber)?.doubleValue, average > 0,
+                  (episode["vote_count"] as? Int ?? 0) >= 5 else { continue }
+            ratings[number] = average
+        }
+        return ratings
+    }
+
+    /// Per-episode scores for one season: the VortX ratings service (IMDb, TMDB, Trakt) first, then TMDB
+    /// directly, so a service outage or a `tmdb:` id still shows the TMDB score. Fail-soft: [:].
+    static func seasonEpisodeScores(metaID: String, season: Int) async -> [Int: EpisodeScores] {
+        if let scores = await VortXRatingsClient.episodes(seriesID: metaID, season: season), !scores.isEmpty {
+            return scores
+        }
+        return await seasonEpisodeRatings(metaID: metaID, season: season)
+            .mapValues { EpisodeScores(imdb: nil, tmdb: Int(($0 * 10).rounded()), trakt: nil) }
+    }
+
+    /// A season's standout episodes: the best-rated one(s), when at least three episodes are rated and the best
+    /// reaches 8.0. Ties all count.
+    static func topRatedEpisodes(_ ratings: [Int: Double]) -> Set<Int> {
+        guard ratings.count >= 3, let best = ratings.values.max(), best >= 8.0 else { return [] }
+        return Set(ratings.filter { $0.value >= best - 0.0001 }.keys)
     }
 
     /// A person's filmography via /3/person/{id}/combined_credits, mapped onto the same `MetaPreview` cards the
     /// hub rails use: id = "tmdb:<id>", type from `media_type`, name from title/name, poster from poster_path.
-    /// Deduped by id; entries with no poster or no title are dropped; sorted most-popular first, then newest.
-    /// Fail-soft: [] on a non-positive id or any error, matching this file's fail-soft contract.
-    static func personCredits(id: Int) async -> [MetaPreview] {
+    /// Deduped by id; entries with no poster or no title are dropped; sorted newest first (undated last), then by
+    /// popularity. Fail-soft: [] on a non-positive id or any error, matching this file's fail-soft contract.
+    static func personCredits(id: Int) async -> [PersonCredit] {
         guard id > 0 else { return [] }
         let key = ApiKeys.effectiveTMDBKey()
         guard let obj = await get("/person/\(id)/combined_credits?api_key=\(key)"),
@@ -1259,8 +1475,9 @@ enum TMDBClient {
             return (preview, popularity, date)
         }
         return ranked.sorted { a, b in
-            a.popularity != b.popularity ? a.popularity > b.popularity : a.date > b.date
-        }.map(\.preview)
+            if a.date.isEmpty != b.date.isEmpty { return !a.date.isEmpty }
+            return a.date != b.date ? a.date > b.date : a.popularity > b.popularity
+        }.map { PersonCredit(preview: $0.preview, date: $0.date) }
     }
 
     /// VortX's keyless catalog edge: a cached, app-gated TMDB proxy that injects OUR key server-side, so

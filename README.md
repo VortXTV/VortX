@@ -24,9 +24,9 @@ VortX is Apple first. Android is available now as a technical preview, not a pro
 
 ## Current release
 
-**[0.5.6 beta 2, build 276](https://github.com/VortXTV/VortX/releases/tag/v0.5.6-beta.2)** adds safer recovery for older profiles, a shared limit on repeated seek/playback recovery, IntroDB v4 intro and credit timings, profile-owned history/statistics updates and less repeated Apple TV playback work.
+This source prepares **0.5.6, build 280** for the stable release track: native-only app composition, safer profile recovery, profile-owned live catalogs/episodes/sources, Android sign-in safeguards, lighter Apple player glass, playback recovery, richer Collections and updated native player inputs. [Download the latest published release](https://github.com/VortXTV/VortX/releases/latest); a source version is not confirmation that its packages have been published.
 
-These are targeted repairs. The full Swift 6 migration, wider performance work and remaining reported bugs are not finished. See the [changelog](CHANGELOG.md) for released changes and the [roadmap](ROADMAP.md) for what remains.
+Removing the old comparison engine and Node runtime does **not** remove Stremio-compatible add-ons, optional Stremio account/library import or Cinemeta. Android remains a technical preview. The full Swift 6 migration, wider performance work, all dependency upgrades and remaining reported bugs are not finished. See the [changelog](CHANGELOG.md) for changes and the [roadmap](ROADMAP.md) for what remains.
 
 ## Choose your download
 

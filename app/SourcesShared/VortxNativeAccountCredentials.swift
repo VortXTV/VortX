@@ -53,6 +53,22 @@ enum VortxNativeAccountCredentials {
             return key
         }
     }
+    struct SelectedOwnerIdentity: Sendable {
+        let verifiedUID: String
+        let slot: String
+        let selection: String
+    }
+    /// Durable intent + immutable credential readback are the authority, not a decoded pointer.
+    /// This exposes only the original authenticated identity, never token bytes or a new login.
+    static func selectedOwnerIdentity(scope: String, ownerProfileID: UUID,
+        read: (String) throws -> String?) throws -> SelectedOwnerIdentity? {
+        try lock.withLock {
+            guard let slot = try selectedOwnerSlot(scope: scope, ownerProfileID: ownerProfileID, read: read),
+                  let raw = try read(ownerSelectionKey(scope: scope, ownerProfileID: ownerProfileID)) else { return nil }
+            let selection = try JSONDecoder().decode(OwnerSelection.self, from: Data(raw.utf8))
+            return SelectedOwnerIdentity(verifiedUID: selection.verifiedUID, slot: slot, selection: raw)
+        }
+    }
     /// A verified owner login changes only this captured account's device-local selector. The
     /// previous UID/revision remains securely retained, and failed CAS leaves it selected.
     @discardableResult

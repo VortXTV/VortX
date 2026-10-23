@@ -1153,7 +1153,7 @@ private func testTraktBrokerHostAndRequestPolicy() async -> (
         _ = try await invalid.requestDeviceCode()
         hostRejected = false
     } catch let error as TraktAuthError {
-        hostRejected = error == .brokerUnavailable(status: 0)
+        hostRejected = error == .configuration(.invalidBrokerConfiguration)
             && FixtureURLProtocol.fixture.requestSnapshots().isEmpty
     } catch {
         hostRejected = false
@@ -1177,6 +1177,182 @@ private func testTraktBrokerHostAndRequestPolicy() async -> (
         && snapshots[0].cookieHeader == nil
         && snapshots[0].signatureHeader == "signed"
     return (hostRejected, requestHardened)
+}
+
+/// Closed local classifications expose no configuration, signer or request values. The unsigned
+/// fixture has no provisioned production signer; every transport still uses the local URLProtocol.
+private func testTraktLocalBrokerFailureDiagnostics() async -> Bool {
+    let unsignedSession = URLSessionConfiguration.ephemeral
+    unsignedSession.protocolClasses = [FixtureURLProtocol.self]
+    let unsigned = TraktAuth(
+        sessionConfiguration: unsignedSession,
+        credentials: MemoryCredentials().store,
+        configuration: TraktAuthConfiguration(
+            clientID: "test-client", apiBase: "https://fixture.invalid", brokerBase: "https://oauth.vortx.tv"
+        )
+    )
+    let cases: [(TraktAuth, TraktAuthConfigurationFailure)] = [
+        (makeAuth(store: MemoryCredentials(), brokerBase: "https://private-url-marker.invalid"), .invalidBrokerConfiguration),
+        (unsigned, .signingUnavailable),
+        (makeAuth(store: MemoryCredentials(), oauthRequestSigner: { _, _ in nil }), .signingFailed),
+        (makeAuth(store: MemoryCredentials(), oauthRequestSigner: { request, _ in
+            var changed = request
+            changed.url = URL(string: "https://private-url-marker.invalid")
+            return changed
+        }), .requestRejected),
+        (makeAuth(store: MemoryCredentials(), oauthRequestSigner: { request, _ in
+            var changed = request
+            changed.httpMethod = "GET"
+            return changed
+        }), .requestRejected),
+        (makeAuth(store: MemoryCredentials(), oauthRequestSigner: { request, _ in
+            var changed = request
+            changed.httpBody = Data("private-body-marker".utf8)
+            return changed
+        }), .requestRejected),
+    ]
+    var messages: Set<String> = []
+    for (auth, reason) in cases {
+        FixtureURLProtocol.fixture.set(status: 200, json: "{}")
+        DiagnosticsLog.reset()
+        do {
+            _ = try await auth.requestDeviceCode()
+            return false
+        } catch let error as TraktAuthError {
+            let message = error.errorDescription ?? ""
+            let logs = DiagnosticsLog.messages().joined(separator: "\n")
+            guard error == .configuration(reason), error.isTransient,
+                  error.brokerDiagnosticReason == reason.rawValue,
+                  !message.isEmpty,
+                  logs.contains("event=broker_failure stage=local reason=\(reason.rawValue)"),
+                  FixtureURLProtocol.fixture.requestSnapshots().isEmpty,
+                  !message.contains("private-"), !logs.contains("private-"),
+                  !message.contains("https://"), !logs.contains("https://") else { return false }
+            if reason != .requestRejected { messages.insert(message) }
+        } catch { return false }
+    }
+    return messages.count == 3
+}
+
+private func testTraktRequestSizeFailureDiagnostics() async -> Bool {
+    let auth = makeAuth(store: MemoryCredentials())
+    let opaque = String(repeating: "private-session-marker", count: 900)
+    FixtureURLProtocol.fixture.set(status: 200, json: """
+    {"session":"\(opaque)","user_code":"fixture-code","verification_url":"https://trakt.tv/activate","expires_in":600,"interval":1}
+    """)
+    guard let code = try? await auth.requestDeviceCode() else { return false }
+    FixtureURLProtocol.fixture.set(status: 200, json: "{}")
+    DiagnosticsLog.reset()
+    do {
+        _ = try await auth.poll(session: code.session)
+        return false
+    } catch let error as TraktAuthError {
+        let logs = DiagnosticsLog.messages().joined(separator: "\n")
+        return error == .configuration(.requestTooLarge)
+            && error.isTransient
+            && FixtureURLProtocol.fixture.requestSnapshots().isEmpty
+            && logs.contains("event=broker_failure stage=local reason=request_too_large")
+            && !logs.contains("private-session-marker")
+            && !(error.errorDescription ?? "").contains("private-session-marker")
+    } catch { return false }
+}
+
+/// HTTP auth/policy faults are service outcomes, not evidence of a local signer defect or account loss.
+private func testTraktHTTPBrokerFailureDiagnostics() async -> Bool {
+    let statuses: [(Int, String)] = [(401, "http_unauthorized"), (403, "http_forbidden"),
+                                   (429, "http_rate_limited"), (500, "http_server_error"),
+                                   (503, "http_server_error"), (302, "http_redirect"), (418, "http_client_error")]
+    let hostile = "private-response-marker"
+    let body = "{\"status\":\"invalid_grant\",\"access_token\":\"\(hostile)\",\"device_code\":\"\(hostile)\"}"
+    var messages: Set<String> = []
+    for (status, reason) in statuses {
+        let auth = makeAuth(store: MemoryCredentials())
+        FixtureURLProtocol.fixture.set(status: status, json: body,
+                                       headers: ["Location": "https://private-url-marker.invalid/collect", "X-Private": hostile])
+        DiagnosticsLog.reset()
+        do {
+            _ = try await auth.requestDeviceCode()
+            return false
+        } catch let error as TraktAuthError {
+            let message = error.errorDescription ?? ""
+            let logs = DiagnosticsLog.messages().joined(separator: "\n")
+            guard error == .brokerUnavailable(status: status), error.isTransient,
+                  error.brokerDiagnosticReason == reason,
+                  logs.contains("event=broker_failure stage=http reason=\(reason) status=\(status)"),
+                  FixtureURLProtocol.fixture.requestSnapshots().count == 1,
+                  !message.contains("reconnect"), !message.contains("expired"),
+                  !message.contains("private-"), !logs.contains("private-"),
+                  !message.contains("https://"), !logs.contains("https://"),
+                  !logs.contains("access_token"), !logs.contains("device_code") else { return false }
+            messages.insert(message)
+        } catch { return false }
+    }
+    return messages.count == statuses.count
+}
+
+private func testTraktUnknownBrokerStateDiagnostics() async -> Bool {
+    let auth = makeAuth(store: MemoryCredentials())
+    FixtureURLProtocol.fixture.set(status: 200, json: """
+    {"session":"fixture-session","user_code":"fixture-code","verification_url":"https://trakt.tv/activate","expires_in":600,"interval":1}
+    """)
+    guard let code = try? await auth.requestDeviceCode() else { return false }
+    FixtureURLProtocol.fixture.set(status: 200, json: "{\"status\":\"private-status-marker\"}")
+    DiagnosticsLog.reset()
+    do {
+        _ = try await auth.poll(session: code.session)
+        return false
+    } catch let error as TraktAuthError {
+        let logs = DiagnosticsLog.messages().joined(separator: "\n")
+        return error == .brokerUnavailable(status: 200)
+            && error.brokerDiagnosticReason == "unexpected_response"
+            && (error.errorDescription ?? "").contains("unexpected response")
+            && logs.contains("event=broker_failure stage=http reason=unexpected_response status=200")
+            && !logs.contains("private-status-marker")
+            && !(error.errorDescription ?? "").contains("private-status-marker")
+    } catch { return false }
+}
+
+private func testTraktBrokerFaultsPreserveCredentialsAndRefreshFallback() async -> Bool {
+    for status in [401, 403, 429, 500, 503, 302] {
+        let store = MemoryCredentials()
+        let auth = makeAuth(store: store)
+        _ = await auth.adoptTokens(access: "stored-access", refresh: "stored-refresh",
+                                   expiryUnix: Int(Date().timeIntervalSince1970) - 10)
+        let beforeSession = await auth.sessionID
+        let before = await auth.syncableTokens()
+        FixtureURLProtocol.fixture.set(status: status, json: "{\"status\":\"invalid_grant\"}")
+        do {
+            _ = try await auth.validToken()
+            return false
+        } catch let error as TraktAuthError {
+            guard error == .brokerUnavailable(status: status), error.isTransient else { return false }
+        } catch { return false }
+        let afterSession = await auth.sessionID
+        let after = await auth.syncableTokens()
+        guard beforeSession != nil, afterSession == beforeSession,
+              before != nil, after?.access == before?.access,
+              after?.refresh == before?.refresh, after?.expiryUnix == before?.expiryUnix,
+              FixtureURLProtocol.fixture.requestSnapshots().count == 1 else { return false }
+    }
+
+    let store = MemoryCredentials()
+    let auth = makeAuth(store: store, oauthRequestSigner: { _, _ in nil })
+    _ = await auth.adoptTokens(access: "unexpired-access", refresh: "unexpired-refresh",
+                               expiryUnix: Int(Date().timeIntervalSince1970) + 60)
+    // Preserve an original long lifetime: the token is inside early-refresh leeway but not expired.
+    let namespace = CredentialScopeRegistry.shared.currentNamespace()
+    _ = store.store.write(String(Int(Date().timeIntervalSince1970) - 3_600), TraktTokenSlots.createdAt(namespace))
+    let beforeSession = await auth.sessionID
+    FixtureURLProtocol.fixture.set(status: 200, json: "{}")
+    DiagnosticsLog.reset()
+    let fallback = try? await auth.validToken()
+    let afterSession = await auth.sessionID
+    let after = await auth.syncableTokens()
+    return fallback == "unexpired-access"
+        && beforeSession != nil && afterSession == beforeSession
+        && after?.access == "unexpired-access" && after?.refresh == "unexpired-refresh"
+        && FixtureURLProtocol.fixture.requestSnapshots().isEmpty
+        && DiagnosticsLog.messages().contains { $0.contains("stage=local reason=signing_failed") }
 }
 
 private func testTraktBrokerRedirectAndBounds() async -> (
@@ -4694,6 +4870,16 @@ struct TraktSessionSecurityTestRunner {
                "Trakt rejects a broker base outside the fixed oauth.vortx.tv origin before transport")
         expect(brokerPolicy.requestHardened,
                "Trakt broker POSTs are signed, cookie-free, cache-bypassing, and fixed-host")
+        expect(await testTraktLocalBrokerFailureDiagnostics(),
+               "Trakt distinguishes local broker configuration, unavailable/failed signer, and altered signed request without transport or value leakage")
+        expect(await testTraktRequestSizeFailureDiagnostics(),
+               "Trakt classifies an oversized local OAuth request without sending or logging its opaque session")
+        expect(await testTraktHTTPBrokerFailureDiagnostics(),
+               "Trakt distinguishes broker HTTP auth, policy, rate, server and redirect faults without credential or response values")
+        expect(await testTraktUnknownBrokerStateDiagnostics(),
+               "Trakt classifies an unknown broker state without echoing its response value")
+        expect(await testTraktBrokerFaultsPreserveCredentialsAndRefreshFallback(),
+               "Trakt broker faults preserve credentials and the prior unexpired-token fallback")
         let brokerBoundary = await testTraktBrokerRedirectAndBounds()
         expect(brokerBoundary.redirectRejected,
                "Trakt rejects broker redirects without following the signed POST to another origin")

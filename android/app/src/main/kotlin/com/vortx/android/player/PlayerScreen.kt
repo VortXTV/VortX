@@ -67,6 +67,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import com.vortx.android.VortXApplication
+import com.vortx.android.diagnostics.DiagnosticsLog
+import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.cast.CastButton
 import com.vortx.android.cast.CastEligibility
 import com.vortx.android.cast.CastOverlay
@@ -113,8 +115,8 @@ import kotlin.math.roundToLong
 ///
 /// Dolby Vision / Atmos: NOT hand-decoded here. The ExoPlayer engine's DefaultRenderersFactory does the
 /// DV -> HEVC/AVC/AV1 codec fallback and its DefaultAudioSink negotiates Atmos passthrough; that is why
-/// the router routes those streams there. The DV badge in the chrome is gated on the display advertising
-/// Dolby Vision (see [displaySupportsDolbyVision]), so it never promises DV on a panel that cannot present it.
+/// the router routes those streams there. Badges describe observed active media, not the filename,
+/// configured engine, or display/output capabilities.
 // Two opt-in annotations, deliberately: kotlin.OptIn satisfies the Kotlin compiler's own experimental-API
 // check; androidx.annotation.OptIn is the separate one Android Lint's UnsafeOptInUsageError looks for
 // (S01 lint-config baseline surfaced this -- ExoPlayerEngine(context) below, inside an inline `remember`
@@ -126,7 +128,8 @@ fun PlayerScreen(
     playable: Playable,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
-    emberAccent: Color = DefaultEmber,
+    /** The chosen accent, so the scrubber, volume, spinners and HUD follow Appearance like the rest of the app. */
+    emberAccent: Color = VortXTheme.colors.accent,
     engineOverride: PlayerEngineRouter.Override = PlayerEngineRouter.Override.AUTO,
     /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
     /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
@@ -163,7 +166,10 @@ fun PlayerScreen(
     onSwitchEpisode: (suspend (episodeId: String) -> Result<PlayerSourceSwitchResolution>)? = null,
     /// Fired when an episode switch is ACCEPTED, so the host can advance its own history identity (a new
     /// engine playback session for the new episode) even when the replacement Playable is value-equal.
-    onEpisodeSwitched: (Playable, acceptedRevision: Long) -> Unit = { _, _ -> },
+    onEpisodeSwitched: (Playable, acceptedRevision: Long, automatic: Boolean) -> Unit = { _, _, _ -> },
+    episodeHandoffRequest: PlayerEpisodeHandoffRequest? = null,
+    onEpisodeHandoffQueued: (sequence: Long) -> Unit = {},
+    onAudioIntentChanged: (PlaybackAudioIntent) -> Unit = {},
     /// Fired periodically while playback rolls with the live (positionMs, durationMs), so the host can drive
     /// its next-episode PRELOAD policy (warm the next episode's source before the current one ends). Default
     /// no-op keeps the screen usable in isolation; the phone shell wires it to [NextEpisodePreloadPolicy].
@@ -198,9 +204,12 @@ fun PlayerScreen(
     val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
     val currentOnSwitchEpisode by rememberUpdatedState(onSwitchEpisode)
     val currentOnEpisodeSwitched by rememberUpdatedState(onEpisodeSwitched)
+    val currentOnEpisodeHandoffQueued by rememberUpdatedState(onEpisodeHandoffQueued)
+    val currentOnAudioIntentChanged by rememberUpdatedState(onAudioIntentChanged)
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    var playbackAudioIntent by remember(outerPlaybackSessionId) { mutableStateOf<PlaybackAudioIntent?>(null) }
     // EOF/error received from the outgoing engine while a source replacement resolves must remain
     // quarantined even if that resolver later fails and exposes the old revision again.
     val sourceTerminalFence = remember(outerPlaybackSessionId) { PlayerTerminalFence() }
@@ -866,16 +875,26 @@ fun PlayerScreen(
             resolver = { source -> resolver?.invoke(source) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
             latestPositionMs = { latestState.positionMs },
-            publishState = { replacement ->
+            publishState = { replacement, acknowledgePublished ->
                 // Keep the old frame alive while resolving, then cut its audio at the linearized
                 // accepted replacement boundary. An already-paused viewer remains paused.
                 if (replacement.revision > sourceSwitchState.revision) engine.pause()
                 sourceSwitchState = replacement
+                acknowledgePublished()
             },
         )
     }
     // In-player EPISODE switch resolver: same coordinator/authority machinery as the source switch, but
     // the accepted episode starts from the top and notifies the host so it opens a fresh history session.
+    LaunchedEffect(outerPlaybackSessionId, episodeHandoffRequest?.sequence) {
+        val request = episodeHandoffRequest ?: return@LaunchedEffect
+        if (playerExitRequested) return@LaunchedEffect
+        sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+        sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+            sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, request.episode, authority, request.automatic)
+            currentOnEpisodeHandoffQueued(request.sequence)
+        }
+    }
     val pendingEpisodeSwitch = sourceSwitchState.pendingEpisodeSwitch
     LaunchedEffect(pendingEpisodeSwitch?.authority) {
         val pending = pendingEpisodeSwitch ?: return@LaunchedEffect
@@ -885,12 +904,13 @@ fun PlayerScreen(
             pending = pending,
             resolver = { episode -> resolver?.invoke(episode.id) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
-            publishState = { accepted ->
+            publishState = { accepted, acknowledgePublished ->
                 val previous = sourceSwitchState
                 if (accepted.revision > previous.revision) engine.pause()
                 sourceSwitchState = accepted
+                acknowledgePublished()
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
-                    currentOnEpisodeSwitched(replacement.playable, replacement.revision)
+                    currentOnEpisodeSwitched(replacement.playable, replacement.revision, pending.automatic)
                 }
             },
         )
@@ -1032,6 +1052,18 @@ fun PlayerScreen(
     val effectiveError = playerState.hasError || stallError || runtimeMismatch || knownAudioMismatch
     LaunchedEffect(playerState.hasEnded, effectiveError) {
         playbackIntent.setSourceTerminal(playerState.hasEnded || effectiveError)
+    }
+    // Which failure class ended this source, for the diagnostic log (no title, URL or source name).
+    LaunchedEffect(playbackSessionKey, effectiveError) {
+        if (!effectiveError) return@LaunchedEffect
+        val reason = when {
+            playerState.hasError -> "engine_error"
+            stallError -> "stall"
+            runtimeMismatch -> "runtime_mismatch"
+            else -> "audio_mismatch"
+        }
+        DiagnosticsLog.log("playback", "source_failed reason=$reason engine=${engine?.javaClass?.simpleName ?: "none"} " +
+            "position_s=${playerState.positionMs / 1000} local=$isLocalSession")
     }
 
     // STILL WATCHING idle guard: a single long-lived poll re-checks the deadline; when the session looks
@@ -1280,10 +1312,11 @@ fun PlayerScreen(
         // Fidelity refinement: among same-language audio tracks, honour the channel layout the active
         // output route can render, the tie-break Apple's picker cannot make (TrackSelector.swift documents
         // MPVTrack carries no channel counts). Fail-soft: unknown channels leave the language pick as-is.
+        val intentTracks = playbackAudioIntent?.matchingTracks(audioTracks).orEmpty()
         val audioId = com.vortx.android.player.audio.AudioTrackFidelity.refine(
-            audioTracks,
-            pick.audioId,
-            trackPreferences.rejectTerms,
+            intentTracks.ifEmpty { audioTracks },
+            intentTracks.firstOrNull()?.id ?: pick.audioId,
+            if (intentTracks.isNotEmpty()) emptyList() else trackPreferences.rejectTerms,
             com.vortx.android.player.audio.AudioRoute.current(context),
         )
         if (defaults.selectAudio) audioId?.let { engine.selectAudioTrack(it) }
@@ -1298,7 +1331,7 @@ fun PlayerScreen(
     // then reject only a labelled file with no requested/English audio, never a manual source/audio.
     LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, trackSelectionPhases.audio) {
         if (currentPlayable.isTrailer || currentPlayable.isLive || currentPlayable.userForcedSource || isLocalSession ||
-            trackSelectionPhases.audio == DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION) {
+            playbackAudioIntent != null || trackSelectionPhases.audio == DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION) {
             knownAudioMismatch = false
             return@LaunchedEffect
         }
@@ -1615,7 +1648,7 @@ fun PlayerScreen(
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
                 // A LOCAL session never drives it: warming resolves through the host's detail ViewModel,
                 // which for a download play can belong to an earlier streamed title (AND-DL-01).
-                if (!isLocalSession) currentOnWarmNext(s.positionMs, s.durationMs)
+                if (!isLocalSession && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1897,21 +1930,8 @@ fun PlayerScreen(
                 stallError -> playerState.copy(hasError = true)
                 else -> playerState
             },
-            // DV BADGE HONESTY (Apple: the badge is earned only by the true-DV lane): show DOLBY VISION only
-            // when this is a DV source, the live engine is the DV lane (ExoPlayer), AND the panel presents
-            // DV. On the libmpv lane a DV source is tone-mapped to HDR10, so no DV badge there -- the
-            // Dynamic range row below tells the honest truth instead.
-            dolbyVisionAvailable = currentPlayable.isDolbyVision &&
-                engine is ExoPlayerEngine &&
-                displaySupportsDolbyVision(context),
-            // The honest dynamic-range line for the Playback Info sheet: true DV on the DV lane, else the
-            // "HDR10 tone-mapped from Dolby Vision" truth for a DV source on the libmpv lane. Null (omit the
-            // row) for a non-DV source, whose codec/HDR is already shown by the engine stats.
-            dynamicRange = when {
-                !currentPlayable.isDolbyVision -> null
-                engine is ExoPlayerEngine && displaySupportsDolbyVision(context) -> "Dolby Vision"
-                else -> "HDR10 (tone-mapped from Dolby Vision)"
-            },
+            // Share the same active-media evidence as the badge row; unknown range stays absent.
+            dynamicRange = playerState.metadata.dynamicRange.label,
             seekStepMs = seekStepMs,
             seekStepSeconds = seekStepSeconds,
             playerVolume = playerVolume,
@@ -1981,6 +2001,11 @@ fun PlayerScreen(
                 }
                 trackSelectionPhases = trackSelectionPhases.holdAudio()
                 engine.selectAudioTrack(it)
+                latestState.audioTracks.firstOrNull { track -> track.id == it }?.let { track ->
+                    val intent = PlaybackAudioIntent.fromTrack(track)
+                    playbackAudioIntent = intent
+                    currentOnAudioIntentChanged(intent)
+                }
             },
             onSelectSubtitle = {
                 showControls()
@@ -2005,6 +2030,7 @@ fun PlayerScreen(
             episodeOptions = if (currentOnSwitchEpisode != null) episodeOptions else emptyList(),
             currentSource = sourceSwitchState.currentSource,
             sourceSwitching = sourceSwitchState.isSwitching,
+            episodeSwitchPending = sourceSwitchState.pendingEpisodeSwitch != null,
             sourceSwitchError = sourceSwitchState.errorMessage,
             failedEpisode = sourceSwitchState.failedEpisode,
             onRetryEpisode = {
@@ -2023,13 +2049,10 @@ fun PlayerScreen(
                     resolver != null &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
-                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
-                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
-                        sourceSwitchState = beginPlayerSourceSwitch(
-                            state = sourceSwitchState,
-                            source = source,
-                            authority = authority,
-                        )
+                    val replacement = requestPlayerSourceSwitch(sourceSwitchState, source, sourceSwitchCoordinator)
+                    if (replacement !== sourceSwitchState) {
+                        sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+                        sourceSwitchState = replacement
                     }
                 }
             },
@@ -2583,8 +2606,6 @@ private const val EXPECTED_RUNTIME_SLACK_MS = 10 * 60_000L
 /// file is under 2 minutes, but plenty of legitimate short content sits just above it, so this only
 /// catches outright samples/stubs. (Trailers never reach the check at all.)
 private const val JUNK_DURATION_FLOOR_MS = 2 * 60_000L
-
-internal val DefaultEmber = Color(0xFFD97706)
 
 /// Tile width for a captured trickplay frame, in pixels. 480 == the `maxWidth` Apple passes on both of its
 /// capture paths. The sheet builder downscales again to its own 320x180 tile, so this is only the

@@ -4,6 +4,16 @@ cd "$(dirname "$0")/.."
 source scripts/native-watched-swift-inputs.sh
 mkdir -p app/build
 website_host_dir=$(mktemp -d app/build/native-website-host.XXXXXX)
+host_source=app/SourcesShared/VortxNativeHostPreferences.swift
+edit_host_source=app/SourcesShared/VortxNativeProfileEditHost.swift
+if [[ ${1:-} == --baseline-ref ]]; then
+    test $# -eq 2
+    git show "$2:$host_source" > "$website_host_dir/HostPreferencesBaseline.swift"
+    git show "$2:$edit_host_source" > "$website_host_dir/ProfileEditHostBaseline.swift"
+    host_source="$website_host_dir/HostPreferencesBaseline.swift"
+    edit_host_source="$website_host_dir/ProfileEditHostBaseline.swift"
+fi
+shasum -a 256 "$host_source" "$edit_host_source" app/Tests/VortxNativeProfileEditHostTests.swift
 sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$website_host_dir/UserProfile.swift"
 {
     printf '%s\n' 'import Foundation'
@@ -22,8 +32,8 @@ writeFileSync(process.argv[2],JSON.stringify(values.map(value=>({value,canonical
 NODE
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
-    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
+    app/SourcesShared/VortxNativeBootstrapArchive.swift "$host_source" "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+    app/SourcesShared/ProfileAddonPreferences.swift "$edit_host_source" app/SourcesShared/VortxNativeProfiles.swift \
     "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeProfileEditHostTests.swift \
     -o "$website_host_dir/website-host"
 "$website_host_dir/website-host" "$website_host_dir/vectors.json"

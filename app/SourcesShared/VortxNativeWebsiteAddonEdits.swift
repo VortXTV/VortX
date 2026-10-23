@@ -76,7 +76,7 @@ enum VortxNativeWebsiteAddonEdits {
               receipt["scope"] == .string(scope.account), event["scope"] == .string(scope.account),
               receipt["ownerProfileId"] == .string(scope.ownerProfileID), event["ownerProfileId"] == .string(scope.ownerProfileID),
               receipt["profileId"] == event["profileId"], receipt["expectedBinding"] == event["expectedBinding"],
-              state["nativeSync"]?["schemaVersion"] == .integer(5),
+              [VortxJSON.integer(5), .integer(6)].contains(state["nativeSync"]?["schemaVersion"] ?? .null),
               state["nativeSync"]?["websiteAddonReceipts"]?[id] == receipt else { throw VortxNativeError.invalidResponse }
         return (id, fingerprint)
     }
@@ -85,6 +85,10 @@ enum VortxNativeWebsiteAddonEdits {
     /// newer native uninstall/rebind must remain visible as a conflict instead of a false success.
     static func conflict(event: VortxJSON, receipt: (id: String, fingerprint: String),
                          state: VortxJSON, runtime: VortxNativeRuntime) throws -> Conflict? {
+        try conflict(event: event, receipt: receipt, state: state, resolve: { try runtime.resolve($0) })
+    }
+    static func conflict(event: VortxJSON, receipt: (id: String, fingerprint: String),
+                         state: VortxJSON, resolve: (String) throws -> String) throws -> Conflict? {
         guard case .string(let profileID) = event["profileId"], let profile = state["roster"]?["profiles"]?[profileID] else {
             throw VortxNativeError.invalidResponse
         }
@@ -94,7 +98,7 @@ enum VortxNativeWebsiteAddonEdits {
             return .init(eventId: receipt.id, code: "account_binding_changed", paths: ["expectedBinding"])
         }
         let query: VortxJSON = .object(["kind": .string("installed_addons"), "profileId": .string(profileID)])
-        let response = try JSONDecoder().decode(VortxJSON.self, from: Data(runtime.resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)).utf8))
+        let response = try JSONDecoder().decode(VortxJSON.self, from: Data(resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)).utf8))
         guard response["kind"] == .string("installed_addons"), response["profileId"] == .string(profileID),
               let addons = response["addons"]?.array, let mutations = event["mutations"]?.array else { throw VortxNativeError.invalidResponse }
         let urls = try addons.map { addon -> String in

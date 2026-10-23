@@ -1,16 +1,18 @@
 import type { Stream } from "./types";
 import type { StreamGroup } from "./addon";
 import type { Settings } from "./settings";
+import { torrentsAvailable } from "./desktop";
 
 // Ranks loaded streams so the strongest source surfaces first and "Watch" can auto-pick one, and
 // groups them per add-on for the source filter + quality picker. A focused port of the Apple app's
-// StreamRanking.swift (and desktop/src/streamRanking.ts). The dominant signals are resolution, source
+// StreamRanking.swift. The dominant signals are resolution, source
 // class (remux > bluray > web > ...), HDR/Dolby Vision, audio, file size, and cache/instant markers.
 //
-// KEY WEB DIFFERENCE FROM DESKTOP: the web client has no embedded streaming server, so a TORRENT
-// (infoHash, no url) stream is NOT playable here. `isPlayable` accepts only direct/debrid HTTP(S)
-// urls. Torrent-only sources are still surfaced (see playableState) but greyed out with an
-// explanation, per the README's "direct/debrid/HLS-first" contract.
+// TORRENTS: in a browser there is no streaming server, so a TORRENT (infoHash, no url) stream is NOT
+// playable and `isPlayable` accepts only direct/debrid HTTP(S) urls; torrent-only sources are still
+// surfaced (see playableState) but greyed out with an explanation, per the README's
+// "direct/debrid/HLS-first" contract. Inside the VortX desktop shell the embedded VortX streaming
+// server makes torrents playable too, once it is listening (see desktop.ts).
 //
 // MIN-SAFARI CONSTRAINT (conscious): the codec/quality-marker regexes below use lookbehind assertions
 // ((?<![a-z0-9]) word-boundary guards on codec/container/CAM/AV1 tokens). Regex literals are parsed at
@@ -32,10 +34,11 @@ export function isTorrent(stream: Stream): boolean {
   return !stream.url && !!stream.infoHash;
 }
 
-/** A stream the browser can play directly: any direct/debrid HTTP(S) url. Torrents are NOT playable
- *  on the web client (no streaming server) and YouTube-only streams are handled separately. */
+/** A playable stream: any direct/debrid HTTP(S) url, plus torrents inside the desktop shell once its
+ *  streaming server is up. YouTube-only streams are handled separately. */
 export function isPlayable(stream: Stream): boolean {
-  return !!stream.url && /^https?:\/\//i.test(stream.url);
+  if (stream.url) return /^https?:\/\//i.test(stream.url);
+  return isTorrent(stream) && torrentsAvailable();
 }
 
 /** Whether at least one source exists but none are playable (torrents only) - drives the empty-state

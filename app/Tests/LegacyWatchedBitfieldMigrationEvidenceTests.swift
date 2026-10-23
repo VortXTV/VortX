@@ -18,6 +18,26 @@ enum LegacyWatchedBitfieldMigrationEvidenceTests {
         try await validatesOwnSourceIdentity()
         try await validatesResolvedOwnerAndTypedHistory()
         try await rejectsCancelledColdReplay()
+        try await validatesLongAndEscapedSourceStrings()
+    }
+
+    private static func validatesLongAndEscapedSourceStrings() async throws {
+        // A settings backup is one long ASCII/base64 string in the real account document.
+        // Parsing it must not repeatedly copy the whole accumulated UnicodeScalarView.
+        let text = String(repeating: "ABCD0123", count: 128 * 1024)
+        let original = String(decoding: sharedSource(), as: UTF8.self)
+        let source = Data(("{\"settingsFixture\":\"" + text + "\",\"escaped\":\"é\\n\\uD83C\\uDF38\\t\\\"\\\\fin\","
+            + original.dropFirst()).utf8)
+        let scope = try LegacyWatchedBitfieldMigrationEvidence.Scope(accountID: "account-a", profileID: profileID, ownerProfileID: profileID)
+        let evidence = try await capture(scope: scope, source: source, raw: metadata())
+        precondition(evidence.source == source && evidence.watchedVideoIDs.count == 5)
+        for member in [#""escaped":"\uD800""#, #""escaped":"\uDC00""#,
+                       #""escaped":"\q""#, #""\u0076ortx":{}"#] {
+            await expectFailure {
+                _ = try await capture(scope: scope, source: Data(("{" + member + "," + original.dropFirst()).utf8), raw: metadata())
+            }
+        }
+        print("Strict source strings: 1 MiB ASCII, UTF-8 and JSON escapes preserve exact evidence; invalid escapes/surrogates and duplicate decoded keys reject")
     }
 
     private static func capturesBoundedOriginalEvidence() async throws {

@@ -45,7 +45,7 @@ data class SourceContributorSettlement(
 ///   3. OFF-THREAD ASSEMBLY, PUBLISH ONCE: on a coalesced change it snapshots the immutable inputs, runs the
 ///      merge + subtraction + rank on [Dispatchers.Default], and publishes ONE [SourceListState] to [state].
 ///
-/// The engine's own [EngineStremioRepository.streams] already ranks the raw add-on groups, and
+/// The engine's own [NativeCatalogRepository.streams] already ranks the raw add-on groups, and
 /// [com.vortx.android.ui.viewmodel.DetailViewModel] already merges the media-server groups. This model is the
 /// unified assembler that folds ALL the lanes (add-on + TorBox + Singularity + media-server) into ONE ranked
 /// list through the SAME [StreamRanking] the rest of the app uses, so every lane is ranked together. Wiring it
@@ -132,7 +132,7 @@ class SourceListModel(
         }
     }
 
-    /// Replace the raw engine stream groups (the ranked add-on lane from [EngineStremioRepository.streams]).
+    /// Replace the raw engine stream groups (the ranked add-on lane from [NativeCatalogRepository.streams]).
     fun setRawGroups(groups: List<StreamGroup>) { rawGroups.value = groups }
 
     /// Replace the media-server direct-play groups (the lane [com.vortx.android.ui.viewmodel.DetailViewModel]

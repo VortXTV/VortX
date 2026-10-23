@@ -6,6 +6,8 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
     private var next: UInt = 0
     private var states: [UInt: String] = [:]
     private var playbackUnavailable = false
+    private var progressCount = 0
+    var progressDispatches: Int { lock.withLock { progressCount } }
     func failPlaybackQueries() { lock.withLock { playbackUnavailable = true } }
     func create(ownerID: String, ownerName: String) -> UInt {
         hydrate("{\"roster\":{\"profiles\":{\"\(ownerID)\":{\"id\":\"\(ownerID)\",\"owner\":true,\"deleted\":false,\"addons\":\"own\"},\"kid\":{\"id\":\"kid\",\"owner\":false,\"addons\":\"share_primary\"}}},\"activeProfileId\":\"\(ownerID)\",\"libraries\":{\"kid\":{},\"\(ownerID)\":{\"watchContexts\":{\"episode\":{\"name\":\"Retain context\",\"durationMs\":1200001}}}}}")
@@ -18,6 +20,7 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
         guard var state = try? JSONSerialization.jsonObject(with: Data(states[handle]!.utf8)) as? [String: Any],
               let action = try? JSONSerialization.jsonObject(with: Data(action.utf8)) as? [String: Any] else { return nil }
         if action["type"] as? String == "fail" { return "{\"ok\":false}" }
+        if action["type"] as? String == "report_progress" { progressCount += 1 }
         if action["type"] as? String == "bind_sync_scope" {
             let roster = state["roster"] as! [String: Any]
             let profiles = roster["profiles"] as! [String: [String: Any]]
@@ -32,7 +35,7 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
                   incoming["scope"] as? String == (state["nativeSync"] as? [String: Any])?["scope"] as? String else { return "{\"ok\":false}" }
             state["nativeSync"] = incoming
         }
-        state["fixtureMutation"] = action["value"] ?? now
+        state["fixtureMutation"] = action["value"] ?? action["type"] ?? now
         if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) { states[handle] = String(decoding: data, as: UTF8.self) }
         return "{\"ok\":true}"
     }
@@ -40,6 +43,10 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard var query = try? JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any] else { return nil }
         if query["kind"] as? String == "installed_addons" { query["addons"] = [] }
+        if query["kind"] as? String == "external_cw_eligibility" {
+            let candidates = query.removeValue(forKey: "candidates") as! [[String: Any]]
+            query["verdicts"] = candidates.map { ["key": $0["key"]!, "disposition": "eligible", "reason": "clear"] }
+        }
         if query["kind"] as? String == "profile_playback" {
             if playbackUnavailable { return "{\"kind\":\"error\"}" }
             query["continueWatching"] = [["metaId": "unsaved-series", "videoId": "opaque-video", "name": "In progress", "type": "series", "offsetMs": 120001, "durationMs": 1200001, "updatedAt": 1700000000, "watched": false, "timesWatched": 0]]
@@ -80,11 +87,164 @@ private final class SessionStore: VortxCheckpointStore, @unchecked Sendable {
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
         try commit(snapshot, scope: scope); lock.withLock { host = hostPreferences }
     }
+    private var commitCount = 0
+    var commits: Int { lock.withLock { commitCount } }
     func commit(_ snapshot: String, scope: VortxAccountScope) throws {
         lock.lock(); defer { lock.unlock() }
+        commitCount += 1
         if block { block = false; entered.signal(); precondition(release.wait(timeout: .now() + 5) == .success) }
         if !failure || installBeforeFailure { value = snapshot }
         if failure { throw VortxNativeError.unavailable }
+    }
+}
+
+// Fixture-only source witness: genuinely nonrecursive, never a fake production API.
+private final class FIFOTestSource: VortxMutationAuthority, @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+    func revoke() { lock.withLock { active = false } }
+    func withActive(_ operation: () throws -> Void) throws {
+        try lock.withLock {
+            guard active else { throw VortxNativeError.superseded }
+            try operation()
+        }
+    }
+}
+
+/// Synthetic external budget/witness boundary only, not a complete-account budget proof.
+/// Session invokes withActive BEFORE taking its lease, original source or Facade commit locks.
+private final class FIFOTestCheckpoint: VortxProspectiveCheckpointValidator, @unchecked Sendable {
+    private let lock = NSLock()
+    private var hold: Bool
+    private var validations = 0
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    init(hold: Bool = false) { self.hold = hold }
+    var validationCount: Int { lock.withLock { validations } }
+    func withActive(_ operation: () throws -> Void) throws {
+        let wait = lock.withLock { let value = hold; hold = false; return value }
+        if wait {
+            entered.signal()
+            precondition(release.wait(timeout: .now() + 5) == .success, "unreleased FIFO validator")
+        }
+        try operation()
+    }
+    func validate(native: VortxJSON, host: VortxJSON, profileEditResults: VortxJSON) throws {
+        lock.withLock { validations += 1 }
+    }
+}
+
+private final class FIFOTestPublications: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var facade: VortxNativeCoreFacade?
+    private var snapshots: [VortxJSON] = []
+    func attach(_ value: VortxNativeCoreFacade) { lock.withLock { facade = value } }
+    func record(_ fields: [String]) {
+        guard fields.contains("native_state") else { return }
+        // Never acquire Facade while holding this fixture's observation lock.
+        let current = lock.withLock { facade }
+        guard let bytes = current?.stateData("native_state"),
+              let state = try? JSONDecoder().decode(VortxJSON.self, from: bytes) else {
+            preconditionFailure("FIFO publication had no actual acknowledged state")
+        }
+        lock.withLock { snapshots.append(state) }
+    }
+    var states: [VortxJSON] { lock.withLock { snapshots } }
+}
+
+private enum MigrationDraftFixtureFailure: Error { case read, witnessReached, wrongDispatch, lostAcknowledgement }
+
+/// Deliberately implements only the old synchronous draft requirement, and returns
+/// unchecked bytes. The protocol default must isolate and fully inspect this result.
+private final class MigrationDraftFallbackStore: VortxCheckpointStore, @unchecked Sendable {
+    private let checkpoint = SessionStore()
+    private let lock = NSLock()
+    private var draft: Data?
+    private var failRead = false
+    private var reads = 0
+    private var writes = 0
+    private var readOnMain = false
+    init(_ draft: Data?) { self.draft = draft }
+    func setDraft(_ value: Data?, fail: Bool = false) { lock.withLock { draft = value; failRead = fail } }
+    var bytes: Data? { lock.withLock { draft } }
+    var draftReads: Int { lock.withLock { reads } }
+    var draftWrites: Int { lock.withLock { writes } }
+    var usedMainThread: Bool { lock.withLock { readOnMain } }
+    var commits: Int { checkpoint.commits }
+    func read(scope: VortxAccountScope) throws -> String? { try checkpoint.read(scope: scope) }
+    func readHostPreferences(scope: VortxAccountScope) throws -> Data? { try checkpoint.readHostPreferences(scope: scope) }
+    func commit(_ snapshot: String, scope: VortxAccountScope) throws { try checkpoint.commit(snapshot, scope: scope) }
+    func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
+        try checkpoint.commit(snapshot, scope: scope, hostPreferences: hostPreferences)
+    }
+    func readMigrationDraft(scope: VortxAccountScope) throws -> Data? {
+        try lock.withLock {
+            reads += 1; readOnMain = readOnMain || Thread.isMainThread
+            if failRead { throw MigrationDraftFixtureFailure.read }
+            return draft
+        }
+    }
+    func retainMigrationDraft(_ archive: Data, scope: VortxAccountScope, expected: Data?, authority: any VortxMutationAuthority) throws {
+        try VortxNativeWatchedArchive.validate(archive, scope: scope)
+        try lock.withLock {
+            try authority.withActive {
+                guard draft == expected else { throw VortxNativeError.superseded }
+                draft = archive; writes += 1
+            }
+        }
+    }
+}
+
+private final class MigrationProgressAuthority: VortxMutationAuthority, @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+    func retireThroughABA() { lock.withLock { generation += 2 } }
+    func withActive(_ operation: () throws -> Void) throws {
+        try lock.withLock {
+            guard generation == 0 else { throw VortxNativeError.superseded }
+            try operation()
+        }
+    }
+}
+
+/// This existential must reach the witness requirement. The old entry point fails
+/// loudly; the real encrypted store still owns exact CAS, sealing and readback.
+private struct MigrationProgressWitnessStore: VortxCheckpointStore {
+    let encrypted: VortxEncryptedCheckpointStore
+    let installs = MutationCounter()
+    let checkpointFailures = MutationCounter()
+    func read(scope: VortxAccountScope) throws -> String? { try encrypted.read(scope: scope) }
+    func readHostPreferences(scope: VortxAccountScope) throws -> Data? { try encrypted.readHostPreferences(scope: scope) }
+    func commit(_ snapshot: String, scope: VortxAccountScope) throws {
+        guard checkpointFailures.value == 0 else { throw VortxNativeError.unavailable }
+        try encrypted.commit(snapshot, scope: scope)
+    }
+    func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
+        guard checkpointFailures.value == 0 else { throw VortxNativeError.unavailable }
+        try encrypted.commit(snapshot, scope: scope, hostPreferences: hostPreferences)
+    }
+    func readMigrationDraft(scope: VortxAccountScope) throws -> Data? { try encrypted.readMigrationDraft(scope: scope) }
+    func retainMigrationDraft(_ archive: Data, scope: VortxAccountScope, expected: Data?, authority: any VortxMutationAuthority) throws {
+        throw MigrationDraftFixtureFailure.wrongDispatch
+    }
+    func retainValidatedMigrationDraft(_ draft: VortxNativeWatchedArchive.ValidatedDraft,
+        scope: VortxAccountScope, expected: Data?, authority: any VortxMutationAuthority) throws {
+        installs.increment()
+        try encrypted.retainValidatedMigrationDraft(draft, scope: scope, expected: expected, authority: authority)
+    }
+}
+
+/// Distinct markers prove existential dispatch selects the async witness rather than
+/// the compatibility extension. Neither path returns unvalidated fixture bytes.
+private struct MigrationDraftWitnessStore: VortxCheckpointStore {
+    let checkpoint = SessionStore()
+    func read(scope: VortxAccountScope) throws -> String? { try checkpoint.read(scope: scope) }
+    func commit(_ snapshot: String, scope: VortxAccountScope) throws { try checkpoint.commit(snapshot, scope: scope) }
+    func readMigrationDraft(scope: VortxAccountScope) throws -> Data? { throw MigrationDraftFixtureFailure.wrongDispatch }
+    func readMigrationDraftCooperatively(scope: VortxAccountScope,
+        isCurrent: @escaping @Sendable () -> Bool,
+        checkpoint: (@Sendable () async throws -> Void)?) async throws -> Data? {
+        throw MigrationDraftFixtureFailure.witnessReached
     }
 }
 
@@ -206,7 +366,8 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         if request.resource == .stream && addonID == "source6" { throw VortxNativeError.unavailable }
         let content: VortxJSON
         if request.resource == .meta {
-            content = .object(["meta": .object(["id": .string(request.id), "type": .string(request.type), "name": .string("Fixture \(attempt)")])])
+            content = .object(["meta": .object(["id": .string(request.id), "type": .string(request.type), "name": .string("Fixture \(attempt)"),
+                "videos": .array([.object(["id": .string(request.id + ":1:1"), "season": .integer(1), "episode": .integer(1)])])])])
         } else if addonID == "source7" {
             content = .object(["streams": .array([.string("malformed")])])
         } else { content = .object(["streams": .array([.object(["url": .string("https://fixture.invalid/video.mp4?attempt=\(attempt)")])])]) }
@@ -220,6 +381,267 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
 
 @main enum VortxNativeSessionTests {
     static func check(_ value: Bool, line: Int = #line) { precondition(value, "session assertion at line \(line)") }
+    @MainActor static func migrationProgressLeaseTests() async throws {
+        let owner = UUID(uuidString: "90000000-0000-0000-0000-000000000009")!
+        let scope = VortxAccountScope(account: "lease-draft.fixture", ownerProfileID: owner.uuidString)
+        let source = Data(#"{"vortx":{"library":[{"id":"tt2934286","type":"series","watched":"tt2934286:1:5:5:eJyTZwAAAEAAIA=="},{"id":"tt2934287","type":"series","watched":"tt2934287:1:5:5:eJyTZwAAAEAAIA=="}],"addons":[{"transportUrl":"https://original.invalid/manifest.json","manifest":{"id":"original","name":"Original","version":"1.0.0","resources":["meta"],"types":["series"]}}]},"futureSource":{"keep":42}}"#.utf8)
+        let pending = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner,
+            document: source, profileIDs: [owner], isCurrent: { true }, fetch: { _ in
+                throw URLError(.notConnectedToInternet) // Synthetic failure; no provider/network call.
+            })
+        let originalPending = try pending.pendingArchives
+        check(originalPending.count == 2)
+        let originalSource = try VortxNativeBootstrapArchive.encode(document: Data(#"{"originalFuture":{"kept":true}}"#.utf8))
+        let envelope = try VortxNativeBootstrapArchive.encode(document: Data(#"{"future":{"keep":42},"apiKeys":{"provider":"fixture-excluded"}}"#.utf8),
+            material: Data(#"{"schemaVersion":1,"sourceClock":1000.125}"#.utf8), authenticatedSourceArchive: originalSource)
+        let pooled = try VortxNativeWatchedArchive.retaining(envelope, pending: originalPending, scope: scope)
+        let archive = Data(" \n".utf8) + pooled + Data("\n".utf8)
+        let candidate = archive + Data(" \n".utf8), winner = archive + Data(" \t\n".utf8)
+        let worker = VortxNativeWatchedArchive.RecoveryWorker(scope: scope, isCurrent: { true })
+        var callerBytes = archive
+        let proof = try await worker.validatedDraft(callerBytes)
+        callerBytes.append(0x20)
+        check(try proof.bytes(for: scope) == archive)
+        check(callerBytes != archive)
+        for foreign in [VortxAccountScope(account: "foreign", ownerProfileID: owner.uuidString),
+                        VortxAccountScope(account: scope.account, ownerProfileID: UUID().uuidString)] {
+            do { _ = try proof.bytes(for: foreign); preconditionFailure("Witness escaped its exact owner/account scope") }
+            catch VortxNativeError.invalidSnapshot {}
+            do {
+                _ = try await VortxNativeWatchedArchive.RecoveryWorker(scope: foreign, isCurrent: { true }).validatedDraft(archive)
+                preconditionFailure("Full replay accepted another scope's pending records")
+            } catch {}
+        }
+        let composed = VortxAccountScope(account: "caf\u{e9}", ownerProfileID: owner.uuidString)
+        let decomposed = VortxAccountScope(account: "cafe\u{301}", ownerProfileID: owner.uuidString)
+        check(composed.account == decomposed.account && composed.authenticatedData != decomposed.authenticatedData)
+        let exactScopeProof = try await VortxNativeWatchedArchive.RecoveryWorker(scope: composed, isCurrent: { true }).validatedDraft(envelope)
+        do { _ = try exactScopeProof.bytes(for: decomposed); preconditionFailure("Witness compared Unicode-canonical scope instead of exact bytes") }
+        catch VortxNativeError.invalidSnapshot {}
+        let fallback = MigrationDraftFallbackStore(nil)
+        let generic: any VortxCheckpointStore = fallback
+        try generic.retainValidatedMigrationDraft(proof, scope: scope, expected: nil, authority: MigrationProgressAuthority())
+        check(fallback.bytes == archive && fallback.draftWrites == 1)
+        do { try generic.retainValidatedMigrationDraft(proof, scope: scope, expected: nil, authority: MigrationProgressAuthority())
+            preconditionFailure("Generic fallback bypassed expected bytes") }
+        catch VortxNativeError.superseded {}
+        check(fallback.bytes == archive && fallback.draftWrites == 1)
+
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("phase-b-session-draft")
+        let key = SymmetricKey(data: Data(repeating: 0x52, count: 32))
+        let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        let witness = MigrationProgressWitnessStore(encrypted: encrypted)
+        let erased: any VortxCheckpointStore = witness
+        let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: erased, transport: SessionTransport(), allowNewAccount: true)
+        let initialState = try encrypted.read(scope: scope), initialHost = try encrypted.readHostPreferences(scope: scope)
+        let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
+        let draftURL = directory.appendingPathComponent("native-migration-draft-v1-\(digest).sealed")
+        let visits = MutationCounter(), sentinel = MutationCounter()
+        try await session.retainMigrationProgress(archive, expected: nil, authority: MigrationProgressAuthority(), checkpoint: {
+            visits.increment()
+            // For this one-source/two-pending journal, boundary 10 is between the
+            // strict pending replays. No continuation or elapsed threshold is used.
+            if visits.value == 10 {
+                await MainActor.run { sentinel.increment() }
+                _ = try await session.authenticatedSourceArchive() // Must acquire the session lease now.
+            }
+        })
+        check(visits.value >= 10 && sentinel.value == 1 && witness.installs.value == 1)
+        check(try encrypted.readMigrationDraft(scope: scope) == archive)
+        check(Set(try VortxNativeWatchedArchive.entries(archive, key: VortxNativeWatchedArchive.pendingKey)) == Set(originalPending))
+        check(try encrypted.read(scope: scope) == initialState)
+        check(try encrypted.readHostPreferences(scope: scope) == initialHost)
+        let originalCiphertext = try Data(contentsOf: draftURL)
+        let sourceDigest = SHA256.hash(data: source).map { String(format: "%02x", $0) }.joined()
+        let mismatchedPool = Data(String(decoding: archive, as: UTF8.self)
+            .replacingOccurrences(of: sourceDigest, with: String(repeating: "0", count: 64)).utf8)
+        check(mismatchedPool != archive)
+        let invalid = [Data("not-json".utf8), mismatchedPool,
+            Data(#"{"schemaVersion":1,"excludedCredentialPaths":[],"hostDocument":{"authKey":"synthetic-not-a-credential"}}"#.utf8),
+            Data(#"{"schemaVersion":1,"excludedCredentialPaths":[],"hostDocument":{"nativeWatchedMigrationEvidence":["not-base64"]}}"#.utf8)]
+        for bad in invalid {
+            do { try await session.retainMigrationProgress(bad, expected: archive, authority: MigrationProgressAuthority())
+                preconditionFailure("Session minted an invalid or credential-bearing draft witness") }
+            catch {}
+            check(witness.installs.value == 1)
+            check(try Data(contentsOf: draftURL) == originalCiphertext)
+        }
+        let cancelledVisits = MutationCounter()
+        let cancelled = Task {
+            try await session.retainMigrationProgress(candidate, expected: archive, authority: MigrationProgressAuthority(), checkpoint: {
+                cancelledVisits.increment()
+                if cancelledVisits.value == 10 { withUnsafeCurrentTask { $0?.cancel() } }
+            })
+        }
+        do { try await cancelled.value; preconditionFailure("Cancelled leased retention installed bytes") }
+        catch is CancellationError {}
+        check(cancelledVisits.value == 10 && witness.installs.value == 1)
+        let retired = MigrationProgressAuthority(), retiredVisits = MutationCounter()
+        do {
+            try await session.retainMigrationProgress(candidate, expected: archive, authority: retired, checkpoint: {
+                retiredVisits.increment()
+                if retiredVisits.value == 10 { retired.retireThroughABA() }
+            })
+            preconditionFailure("Retired source generation installed bytes")
+        } catch LegacyWatchedBitfieldMigrationEvidence.Failure.admissionRevoked {}
+        check(retiredVisits.value == 10 && witness.installs.value == 1)
+        check(try Data(contentsOf: draftURL) == originalCiphertext)
+        let refusedVisits = MutationCounter()
+        do { try await session.retainMigrationProgress(candidate, expected: archive, authority: retired,
+                checkpoint: { refusedVisits.increment() })
+            preconditionFailure("Already-retired source started validation") }
+        catch VortxNativeError.superseded {}
+        check(refusedVisits.value == 0 && witness.installs.value == 1)
+        do { try encrypted.retainValidatedMigrationDraft(proof, scope: scope, expected: archive, authority: retired)
+            preconditionFailure("Validation witness substituted for live source authority") }
+        catch VortxNativeError.superseded {}
+        check(try Data(contentsOf: draftURL) == originalCiphertext)
+
+        // Semantic equality cannot replace exact expected bytes. A concurrent winner
+        // is installed while replay is suspended, and must survive the losing CAS.
+        let conflictVisits = MutationCounter()
+        do {
+            try await session.retainMigrationProgress(candidate, expected: archive, authority: MigrationProgressAuthority(), checkpoint: {
+                conflictVisits.increment()
+                if conflictVisits.value == 10 {
+                    try encrypted.retainMigrationDraft(winner, scope: scope, expected: archive, authority: MigrationProgressAuthority())
+                }
+            })
+            preconditionFailure("Stale prevalidated bytes replaced a concurrent winner")
+        } catch VortxNativeError.superseded {}
+        check(conflictVisits.value >= 10)
+        check(try encrypted.readMigrationDraft(scope: scope) == winner)
+        let afterWinner = try Data(contentsOf: draftURL)
+        do { try encrypted.retainValidatedMigrationDraft(proof, scope: scope, expected: archive, authority: MigrationProgressAuthority())
+            preconditionFailure("Witness bypassed concrete expected-byte CAS") }
+        catch VortxNativeError.superseded {}
+        check(try Data(contentsOf: draftURL) == afterWinner)
+        let lost = VortxNativeWatchedArchive.DraftPublisher(expected: winner) { bytes, expected in
+            try await session.retainMigrationProgress(bytes, expected: expected, authority: MigrationProgressAuthority())
+            throw MigrationDraftFixtureFailure.lostAcknowledgement
+        }
+        do { try await lost.publish(candidate); preconditionFailure("Missing lost-ACK fixture error") }
+        catch MigrationDraftFixtureFailure.lostAcknowledgement {}
+        let afterLostACK = try Data(contentsOf: draftURL)
+        do { try await lost.publish(candidate); preconditionFailure("Lost ACK advanced publisher expected bytes") }
+        catch VortxNativeError.superseded {}
+        check(try Data(contentsOf: draftURL) == afterLostACK)
+        check(try encrypted.readMigrationDraft(scope: scope) == candidate)
+        let abaVisits = MutationCounter()
+        do {
+            try await session.retainMigrationProgress(archive, expected: candidate, authority: MigrationProgressAuthority(), checkpoint: {
+                abaVisits.increment()
+                if abaVisits.value == 10 {
+                    await session.close()
+                    let replacement = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+                        store: erased, transport: SessionTransport())
+                    do { try await replacement.retainMigrationProgress(winner, expected: candidate, authority: MigrationProgressAuthority()) }
+                    catch { await replacement.close(); throw error }
+                    await replacement.close()
+                }
+            })
+            preconditionFailure("Same-account reopen reactivated the old session lease")
+        } catch LegacyWatchedBitfieldMigrationEvidence.Failure.admissionRevoked {}
+        check(abaVisits.value == 10)
+        check(try encrypted.readMigrationDraft(scope: scope) == winner)
+        let uncertain = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: erased, transport: SessionTransport())
+        let uncertainVisits = MutationCounter(), installsBeforeUncertain = witness.installs.value
+        let beforeUncertain = try Data(contentsOf: draftURL)
+        do {
+            try await uncertain.retainMigrationProgress(candidate, expected: winner, authority: MigrationProgressAuthority(), checkpoint: {
+                uncertainVisits.increment()
+                if uncertainVisits.value == 10 {
+                    witness.checkpointFailures.increment()
+                    do { _ = try await uncertain.dispatch([#"{"type":"fixture-change","value":99}"#], now: 1)
+                        preconditionFailure("Missing checkpoint-failure fixture error") }
+                    catch VortxNativeError.checkpointUncertain {}
+                }
+            })
+            preconditionFailure("Suspended validation ignored newly uncertain checkpoint")
+        } catch VortxNativeError.checkpointUncertain {}
+        check(uncertainVisits.value >= 10 && witness.installs.value == installsBeforeUncertain)
+        check(try Data(contentsOf: draftURL) == beforeUncertain)
+        await uncertain.close()
+        let cold = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        check(try cold.readMigrationDraft(scope: scope) == winner)
+        check(try cold.read(scope: scope) == initialState)
+        check(try cold.readHostPreferences(scope: scope) == initialHost)
+        print("Leased draft retention: strict witness, existential/fallback, cancellation, source/session ABA, exact CAS, lost ACK and conservation passed")
+    }
+    @MainActor static func migrationDraftProtocolTests() async throws {
+        let scope = VortxAccountScope(account: "protocol-draft.fixture", ownerProfileID: "90000000-0000-0000-0000-000000000009")
+        let original = try VortxNativeBootstrapArchive.encode(document: Data(#"{"future":{"exact":"retained"}}"#.utf8))
+        // Keep noncanonical envelope whitespace too: readers may inspect, never rewrite.
+        let bytes = Data(" \n".utf8) + original + Data("\n".utf8)
+        let backing = MigrationDraftFallbackStore(bytes)
+        let erased: any VortxCheckpointStore = backing
+        check(try await erased.readMigrationDraftCooperatively(scope: scope, isCurrent: { true }, checkpoint: nil) == bytes)
+        check(backing.draftReads == 1 && !backing.usedMainThread)
+        let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: erased, transport: SessionTransport(), allowNewAccount: true)
+        let initialCommits = backing.commits
+        check(try await session.migrationDraft() == bytes)
+        check(backing.bytes == bytes && !backing.usedMainThread && backing.commits == initialCommits)
+        let invalid = [Data("not-json".utf8),
+            Data(#"{"schemaVersion":1,"excludedCredentialPaths":[],"hostDocument":{"authKey":"synthetic-not-a-credential"}}"#.utf8),
+            Data(#"{"schemaVersion":1,"excludedCredentialPaths":[],"hostDocument":{"nativeWatchedMigrationEvidence":["not-base64"]}}"#.utf8)]
+        for bad in invalid {
+            backing.setDraft(bad)
+            do { _ = try await erased.readMigrationDraftCooperatively(scope: scope, isCurrent: { true }, checkpoint: nil)
+                preconditionFailure("Generic existential accepted malformed or credential-bearing draft") }
+            catch {}
+            do { _ = try await session.migrationDraft(); preconditionFailure("Session accepted malformed or credential-bearing draft") }
+            catch {}
+            check(backing.bytes == bad && backing.commits == initialCommits)
+        }
+        backing.setDraft(nil)
+        check(try await session.migrationDraft() == nil)
+        backing.setDraft(bytes, fail: true)
+        do { _ = try await session.migrationDraft(); preconditionFailure("Draft read error became absence") }
+        catch MigrationDraftFixtureFailure.read {}
+        backing.setDraft(bytes)
+        let readsBeforeRevocation = backing.draftReads
+        do { _ = try await session.migrationDraft(isCurrent: { false }); preconditionFailure("Revoked draft read admitted") }
+        catch {}
+        check(backing.draftReads == readsBeforeRevocation && backing.bytes == bytes)
+        // The second fallback boundary is after the immutable read but before replay.
+        // Deterministic callback cancellation needs no park continuation or timing claim.
+        let cancelVisits = MutationCounter()
+        let cancelled = Task {
+            try await erased.readMigrationDraftCooperatively(scope: scope, isCurrent: { true }, checkpoint: {
+                cancelVisits.increment()
+                if cancelVisits.value == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+            })
+        }
+        do { _ = try await cancelled.value; preconditionFailure("Cancelled generic read returned bytes") }
+        catch is CancellationError {}
+        check(cancelVisits.value == 2 && backing.bytes == bytes && backing.commits == initialCommits)
+        let closeVisits = MutationCounter()
+        do {
+            _ = try await session.migrationDraft(checkpoint: {
+                closeVisits.increment()
+                // Actual session closure must be able to acquire its lease while the
+                // migrationDraft call is suspended; a held lease would deadlock here.
+                if closeVisits.value == 2 { await session.close() }
+            })
+            preconditionFailure("Closed session published a suspended draft read")
+        } catch {}
+        check(closeVisits.value == 2 && backing.bytes == bytes && backing.commits == initialCommits)
+        // A distinct conformer's witness must be reached through both existential and
+        // actual session dispatch, not replaced by the extension's synchronous fallback.
+        let witness: any VortxCheckpointStore = MigrationDraftWitnessStore()
+        do { _ = try await witness.readMigrationDraftCooperatively(scope: scope, isCurrent: { true }, checkpoint: nil)
+            preconditionFailure("Witness marker missing") }
+        catch MigrationDraftFixtureFailure.witnessReached {}
+        let witnessSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: witness, transport: SessionTransport(), allowNewAccount: true)
+        do { _ = try await witnessSession.migrationDraft(); preconditionFailure("Session witness marker missing") }
+        catch MigrationDraftFixtureFailure.witnessReached {}
+        await witnessSession.close()
+        print("Migration draft protocol: strict generic fallback, existential witness, session revocation and exact bytes passed")
+    }
     static func eventually(_ predicate: () -> Bool, line: Int = #line) async throws {
         for _ in 0..<400 {
             if predicate() { return }
@@ -251,6 +673,12 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(transport.maximumActive == 6 && transport.started.count == 6)
         check(!transport.started.contains("title:1:1/stream/source4"))
         check(state(facade)?["streams"]?.array?.count == 22)
+        // Profile/sync admission needs only native FIFO settlement, never these held resources.
+        let nativeSettled = MutationCounter()
+        let settlement = Task { await facade.settleNativeMutations(); nativeSettled.increment() }
+        try await eventually { nativeSettled.value == 1 }
+        await settlement.value
+        check(state(facade)?["streams"]?.array?.first?["content"]?["type"] == .string("Loading"))
         transport.release(blocked[2])
         try await eventually { state(facade)?["streams"]?.array?[2]["content"]?["type"] == .string("Ready") }
         check(state(facade)?["streams"]?.array?[0]["content"]?["type"] == .string("Loading"))
@@ -534,7 +962,400 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         await cold.close()
         print("Native watchlist: busy host FIFO add/remove, acknowledged membership, stable busy target, profile ABA/account rebind/logout rejection and cold readback passed")
     }
+    static func checkpointRecoveryTests() async throws {
+        let nested = NSError(domain: NSPOSIXErrorDomain, code: Int(EIO), userInfo: [NSLocalizedDescriptionKey: "private-data"])
+        let failure = NSError(domain: NSCocoaErrorDomain, code: 512,
+            userInfo: [NSFilePathErrorKey: "/private/account-checkpoint", NSUnderlyingErrorKey: nested])
+        check(VortxCheckpointDiagnostics.summary(stage: .installedReadback, error: failure)
+            == "stage=installed_readback domain=cocoa code=512 underlying_domain=posix code=5")
+        check(VortxCheckpointDiagnostics.summary(stage: .stageWrite,
+            error: NSError(domain: "private-account-domain", code: 17)) == "stage=stage_write domain=other code=17")
+        for operation in ["library", "watched"] {
+            for afterInstall in [false, true] {
+                let scope = VortxAccountScope(account: "checkpoint-\(operation)-\(afterInstall)", ownerProfileID: "owner")
+                let store = SessionStore(), accepted = MutationCounter()
+                let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(), store: store,
+                    transport: DetailFanoutTransport(held: []), allowNewAccount: true)
+                let registry = [VortxResourceAddon(id: "source0", transportUrl: "https://fixture.invalid/manifest.json",
+                    manifest: .object(["resources": .array([.string("meta")])]))]
+                let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry,
+                    mutationAccepted: { accepted.increment() }, changed: { _ in })
+                let metaPath = try VortxResourceProjection.path(.init(resource: .meta, type: "series", id: "title"))
+                let load: VortxJSON = .object(["action": .string("Load"), "args": .object(["model": .string("MetaDetails"),
+                    "args": .object(["metaPath": metaPath])])])
+                check(facade.dispatch(data: try JSONEncoder().encode(load), field: "meta_details"))
+                await facade.settled()
+                let epoch = facade.accountGeneration
+                @Sendable func mutate(_ present: Bool) async throws {
+                    if operation == "library" {
+                        try await facade.setLibraryMembership(id: "title", type: "series", name: "Fixture", poster: nil,
+                            present: present, profileID: "owner", expectedAccountGeneration: epoch)
+                    } else {
+                        try await facade.setWatchedVideosAcknowledged(metaID: "title", videoIDs: ["title:1:1"], name: "Fixture",
+                            type: "series", poster: nil, watched: present, profileID: "owner", expectedAccountGeneration: epoch)
+                    }
+                }
+                // Compare decoded values, never encoder bytes: JSONEncoder does not keep key order stable
+                // across encodes of the same value, so equal states could serialize differently.
+                func nativeState() -> VortxJSON? {
+                    facade.stateData("native_state").flatMap { try? JSONDecoder().decode(VortxJSON.self, from: $0) }
+                }
+                let original = nativeState()!
+                store.blockNextWrite()
+                let completion = MutationCounter()
+                let mutation = Task { try await mutate(true); completion.increment() }
+                await withCheckedContinuation { done in DispatchQueue.global().async {
+                    precondition(store.entered.wait(timeout: .now() + 5) == .success); done.resume()
+                } }
+                check(completion.value == 0 && accepted.value == 0 && nativeState() == original)
+                let settled = MutationCounter()
+                let settlement = Task { await facade.settleNativeMutations(); settled.increment() }
+                await Task.yield()
+                check(settled.value == 0)
+                store.release.signal(); try await mutation.value; await settlement.value
+                check(completion.value == 1 && accepted.value == 1 && settled.value == 1)
+                let acknowledged = nativeState()!
+                let checkpointBefore = try store.read(scope: scope)!
+                store.failWrites(afterInstall: afterInstall)
+                do { try await mutate(false); check(false) } catch VortxNativeError.checkpointUncertain {}
+                check(!facade.isAvailable && facade.requiresCheckpointReopen)
+                check(nativeState() == acknowledged && facade.profileSnapshot() != nil)
+                check(accepted.value == 1)
+                let authoritative = try store.read(scope: scope)!
+                check((authoritative != checkpointBefore) == afterInstall)
+                store.recover()
+                do { try await mutate(true); check(false) } catch VortxNativeError.checkpointUncertain {}
+                check(try store.read(scope: scope) == authoritative && !facade.isAvailable)
+                await facade.shutdown()
+                let reopened = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(), store: store,
+                    transport: SessionTransport())
+                check(try await reopened.stateJSON() == authoritative)
+                await reopened.close()
+            }
+        }
+        print("Checkpoint recovery: Library/Watched ACK gates, FIFO settlement, failure before/after install, readable uncertified state, authoritative reopen and redacted diagnostics passed")
+    }
+    static func hydrationPreservationTests() throws {
+        let scope = VortxAccountScope(account: "synthetic-hydration", ownerProfileID: "owner")
+        let context: VortxJSON = .object(["name": .string("Retained"), "durationMs": .integer(123456)])
+        let original: [String: VortxJSON] = [
+            "roster": .object(["profiles": .object(["owner": .object(["id": .string("owner"), "owner": .bool(true)])])]),
+            "activeProfileId": .string("owner"),
+            "libraries": .object(["owner": .object(["watchContexts": .object(["retained": context])])]),
+            "nativeSync": .object(["schemaVersion": .integer(5), "scope": .string(scope.account), "ownerProfileId": .string("owner")])]
+        func raw(_ value: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(value), as: UTF8.self) }
+        let before = try raw(.object(original))
+        try scope.validateHydration(from: before, to: before)
+        var addition = original
+        addition["libraries"] = .object(["owner": .object(["watchContexts": .object(["retained": context, "derived": context])])])
+        try scope.validateHydration(from: before, to: raw(.object(addition)))
+        var failures: [VortxJSON] = []
+        for contexts: VortxJSON in [.object([:]), .object(["retained": .object(["name": .string("Changed"), "durationMs": .integer(123456)])]),
+                                    .object(["retained": .object(["name": .string("Retained"), "durationMs": .integer(1)])]), .null] {
+            var changed = original; changed["libraries"] = .object(["owner": .object(["watchContexts": contexts])]); failures.append(.object(changed))
+        }
+        var missing = original; missing["libraries"] = .object(["owner": .object([:])]); failures.append(.object(missing))
+        var changedAuthority = addition
+        changedAuthority["nativeSync"] = .object(["schemaVersion": .integer(4), "scope": .string(scope.account), "ownerProfileId": .string("owner")])
+        failures.append(.object(changedAuthority))
+        for value in failures {
+            do { try scope.validateHydration(from: before, to: raw(value)); check(false) }
+            catch VortxNativeError.invalidSnapshot {}
+        }
+        print("Hydration preservation: derived additions accepted; deletion, name/duration changes, null/missing contexts and changed native authority rejected")
+    }
+#if canImport(VortxEngine) && VORTX_ENGINE_STATE_BRIDGE
+    static func liveHydrationPreservationTests() throws {
+        let scope = VortxAccountScope(account: "synthetic-live-hydration", ownerProfileID: "10000000-0000-0000-0000-000000000123")
+        let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: scope.ownerProfileID, ownerName: "Synthetic")
+        defer { runtime.close() }
+        func raw(_ value: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(value), as: UTF8.self) }
+        func dispatch(_ action: VortxJSON) throws {
+            let result = try JSONDecoder().decode(VortxJSON.self, from: Data(runtime.dispatch(raw(action), now: 1000).utf8))
+            check(result["ok"] == .bool(true))
+        }
+        try dispatch(.object(["type": .string("bind_sync_scope"), "scope": .string(scope.account)]))
+        for id in ["retained", "derived"] {
+            try dispatch(.object(["type": .string("report_progress"), "metaId": .string(id), "name": .string("Synthetic"),
+                "positionMs": .integer(2000), "durationMs": .integer(120000), "metadata": .object(["type": .string("movie")])]))
+        }
+        let complete = try scope.validateSnapshot(runtime.stateJSON())
+        var captured = try complete.decode([String: VortxJSON].self)
+        var library = try complete["libraries"]![scope.ownerProfileID]!.decode([String: VortxJSON].self)
+        var contexts = try library["watchContexts"]!.decode([String: VortxJSON].self)
+        check(contexts.count == 2 && contexts.removeValue(forKey: "derived") != nil)
+        library["watchContexts"] = .object(contexts)
+        var libraries = try complete["libraries"]!.decode([String: VortxJSON].self)
+        libraries[scope.ownerProfileID] = .object(library); captured["libraries"] = .object(libraries)
+        let original = try raw(.object(captured))
+        let reopened = try VortxNativeRuntime(abi: VortxCABI(), snapshot: original)
+        defer { reopened.close() }
+        let hydrated = try reopened.stateJSON(), restored = try scope.validateSnapshot(hydrated)
+        check(captured["nativeSync"] == restored["nativeSync"])
+        check(restored["libraries"]?[scope.ownerProfileID]?["watchContexts"] == complete["libraries"]?[scope.ownerProfileID]?["watchContexts"])
+        check(captured["libraries"]?[scope.ownerProfileID]?["watchContexts"] != restored["libraries"]?[scope.ownerProfileID]?["watchContexts"])
+        try scope.validateHydration(from: original, to: hydrated)
+        check(try VortxNativeSession.authenticatedAccountSync(scope: scope, ownerName: "Synthetic", snapshot: original,
+            nativeSync: nil, abi: VortxCABI()) == complete["nativeSync"])
+        print("Actual packaged ABI hydration: unchanged native authority reconstitutes one derived context while preserving the retained context exactly; authenticated preparation passes")
+    }
+#endif
+    /// Playback progress: the duplicate lane of one tick is dropped, position ticks are written at most every 30 s,
+    /// every other change writes at once with the latest position, and a flush writes what was held back.
+    static func progressWriteTests() async throws {
+        let abi = SessionABI(), store = SessionStore()
+        let scope = VortxAccountScope(account: "progress-writes", ownerProfileID: "owner")
+        let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: SessionTransport(),
+                                             allowNewAccount: true)
+        func durable() throws -> Int? {
+            try JSONDecoder().decode(VortxJSON.self, from: Data(store.read(scope: scope)!.utf8))["fixtureMutation"]?.decode(Int.self)
+        }
+        func progress(_ value: Int) -> String { #"{"type":"report_progress","value":"# + "\(value)}" }
+        var commits = store.commits
+        _ = try await session.dispatch([progress(1)], now: 1)
+        check(try store.commits == commits + 1 && durable() == 1)                         // the first position writes
+        commits = store.commits
+        _ = try await session.dispatch([progress(2)], now: 2)
+        _ = try await session.dispatch([progress(3)], now: 3)
+        check(try store.commits == commits && durable() == 1)                             // later ticks stay in memory
+        let live = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check((try live["fixtureMutation"]?.decode(Int.self)) == 3)
+        _ = try await session.dispatch([#"{"type":"edit","value":4}"#], now: 4)
+        check(try store.commits == commits + 1 && durable() == 4)                         // any other change writes
+        _ = try await session.dispatch([progress(5)], now: 5)
+        check((try durable()) == 4)
+        try await session.flushPendingProgress()
+        check((try durable()) == 5)                                                        // a flush writes it
+        _ = try await session.dispatch([progress(6)], now: 6)
+        check((try durable()) == 6)                                                        // so does the next report
+        _ = try await session.dispatch([progress(7)], now: 7)
+        check((try durable()) == 6)
+        store.failWrites()
+        do { try await session.flushPendingProgress(); fatalError("failed progress flush reported success") }
+        catch VortxNativeError.checkpointUncertain {}
+        store.recover()
+        do { _ = try await session.dispatch([progress(8)], now: 8); fatalError("uncertain checkpoint accepted progress") }
+        catch VortxNativeError.checkpointUncertain {}
+        await session.close()
+
+        let laneABI = SessionABI()
+        let laneSession = try VortxNativeSession(scope: .init(account: "progress-lanes", ownerProfileID: "owner"), ownerName: "Owner",
+                                                 abi: laneABI, store: SessionStore(), transport: SessionTransport(), allowNewAccount: true)
+        let facade = try await VortxNativeCoreFacade.create(session: laneSession, registry: [], changed: { _ in })
+        func report(_ meta: String, _ video: String?, _ ms: UInt64) -> Bool {
+            var action: [String: VortxJSON] = ["type": .string("report_progress"), "metaId": .string(meta), "name": .string(meta),
+                                               "positionMs": .unsigned(ms), "durationMs": .unsigned(3_600_000)]
+            if let video { action["videoId"] = .string(video) }
+            return facade.dispatchForProfile(.object(action), profileID: "owner", expectedAccountGeneration: facade.accountGeneration)
+        }
+        let base = laneABI.progressDispatches
+        check(report("tt1", nil, 60_000) && report("tt1", "tt1", 60_400))                  // both lanes of one movie tick
+        await facade.settleNativeMutations()
+        check(laneABI.progressDispatches == base + 1)
+        guard let duplicateBinding = facade.watchlistBinding, let duplicateRegistry = facade.registryBinding else {
+            preconditionFailure("missing acknowledged progress fixture binding")
+        }
+        let duplicateRead = try facade.captureNativeMutationRead(expected: duplicateBinding, registry: duplicateRegistry,
+            sourceAuthority: FIFOTestSource())
+        check(report("tt1", nil, 60_400)); await facade.settleNativeMutations()
+        check(laneABI.progressDispatches == base + 1) // duplicate admits no member and preserves read authority
+        try duplicateRead.withActive {}
+        check(report("tt1", nil, 65_000)); await facade.settleNativeMutations()
+        check(laneABI.progressDispatches == base + 2)                                      // a real move still reports
+        do { try duplicateRead.withActive {}; preconditionFailure("real progress admission revived old read") }
+        catch VortxNativeError.superseded {}
+        check(report("tt2", "tt2:1:1", 65_000)); await facade.settleNativeMutations()
+        check(laneABI.progressDispatches == base + 3)                                      // another title still reports
+        check(facade.dispatchForProfile(.object(["type": .string("mark_watched"), "metaId": .string("tt2"),
+                                                 "videoId": .string("tt2:1:1")]),
+                                        profileID: "owner", expectedAccountGeneration: facade.accountGeneration))
+        check(report("tt2", "tt2:1:1", 65_000)); await facade.settleNativeMutations()
+        check(laneABI.progressDispatches == base + 4)                                      // a watched change lets it through
+        await facade.shutdown()
+        print("Native progress writes: duplicate lane dropped, 30 s coalescing, immediate non-progress writes, flush and failure passed")
+    }
+    // Actual Facade/Session task-chain tests; only kernel, transport, checkpoint and
+    // external witness boundaries are synthetic. No owner-history transaction is wired.
+    static func fifoHandoffTests() async throws {
+        func mount(_ label: String, publications: FIFOTestPublications = FIFOTestPublications(),
+                   accepted: MutationCounter = MutationCounter()) async throws
+            -> (VortxNativeCoreFacade, VortxNativeSession, SessionStore, FIFOTestPublications, MutationCounter) {
+            let scope = VortxAccountScope(account: "fifo-handoff-" + label, ownerProfileID: "owner")
+            let store = SessionStore()
+            let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+                store: store, transport: SessionTransport(), allowNewAccount: true)
+            let facade = try await VortxNativeCoreFacade.create(session: session, registry: [],
+                mutationAccepted: { accepted.increment() }, changed: { publications.record($0) })
+            publications.attach(facade)
+            return (facade, session, store, publications, accepted)
+        }
+        func capture(_ facade: VortxNativeCoreFacade, _ source: FIFOTestSource) throws
+            -> VortxNativeCoreFacade.OriginalReadCapability {
+            guard let binding = facade.watchlistBinding, let registry = facade.registryBinding else {
+                throw VortxNativeError.superseded
+            }
+            return try facade.captureNativeMutationRead(expected: binding, registry: registry, sourceAuthority: source)
+        }
+        func rejected(_ expected: VortxNativeError = .superseded, _ operation: () throws -> Void) throws {
+            do { try operation(); preconditionFailure("FIFO authority unexpectedly remained usable") }
+            catch let error as VortxNativeError { check(error == expected) }
+        }
+        func waitFor(_ semaphore: DispatchSemaphore) async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global().async {
+                    precondition(semaphore.wait(timeout: .now() + 5) == .success, "FIFO barrier not reached")
+                    continuation.resume()
+                }
+            }
+        }
+        func action(_ type: String, id: String? = nil) throws -> Data {
+            var value: [String: VortxJSON] = ["type": .string(type)]
+            if let id { value["id"] = .string(id) }
+            return try JSONEncoder().encode(VortxJSON.object(["action": .string("Vortx"), "args": .object(value)]))
+        }
+        let currentWatch = #"{"type":"mark_watched","metaId":"fifo-fixture-title","name":"Fixture"}"#
+
+        // An admitted predecessor retires an old read even after its task settles.
+        do {
+            let (facade, _, store, _, _) = try await mount("predecessor")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            store.blockNextWrite()
+            check(facade.dispatch(data: try action("get_state"), field: nil))
+            await waitFor(store.entered)
+            try rejected { _ = try capture(facade, source) } // actual busy queue, not profile getter rejection
+            try rejected { try read.withActive {} }
+            store.release.signal(); await facade.settleNativeMutations()
+            try rejected { try read.withActive {} }
+            try capture(facade, source).withActive {}
+            await facade.shutdown()
+        }
+        // The actual public flush path participates even if there is no buffered progress.
+        do {
+            let (facade, _, _, _, _) = try await mount("flush")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            facade.flushPendingProgress()
+            try rejected { try read.withActive {} }
+            await facade.settleNativeMutations()
+            try rejected { try read.withActive {} }
+            try capture(facade, source).withActive {}
+            await facade.shutdown()
+        }
+        // Hold BEFORE commit locks so a genuine later profile intent can enqueue safely.
+        do {
+            let (facade, _, store, publications, accepted) = try await mount("later-profile")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            let validator = FIFOTestCheckpoint(hold: true)
+            let before = store.commits
+            let submitted = Task.detached {
+                try await facade.dispatchCapturedNativeActions([currentWatch], read: read, checkpointValidator: validator)
+            }
+            await waitFor(validator.entered)
+            try rejected { _ = try capture(facade, source) }
+            check(facade.dispatch(data: try action("switch_profile", id: "kid"), field: nil))
+            try read.withActive {} // later pending transition must not revoke OWN running member
+            check(store.commits == before && publications.states.isEmpty && accepted.value == 0)
+            validator.release.signal()
+            _ = try await submitted.value
+            await facade.settleNativeMutations()
+            let states = publications.states
+            check(states.count == 2)
+            check(states[0]["activeProfileId"] == .string("owner"))
+            check(states[0]["fixtureMutation"] == .string("mark_watched"))
+            check(states[1]["activeProfileId"] == .string("kid"))
+            check(store.commits == before + 2 && validator.validationCount == 1 && accepted.value == 2)
+            try rejected { try read.withActive {} }
+            await facade.shutdown()
+        }
+        // Revocation/cancellation before the final source check writes nothing and does
+        // not consume a later legitimate profile intent or invent a successful callback.
+        for cancel in [false, true] {
+            let (facade, _, store, publications, accepted) = try await mount(cancel ? "cancel" : "source-revoke")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            let validator = FIFOTestCheckpoint(hold: true)
+            let before = store.commits
+            let submitted = Task.detached {
+                try await facade.dispatchCapturedNativeActions([currentWatch], read: read, checkpointValidator: validator)
+            }
+            await waitFor(validator.entered)
+            if cancel { submitted.cancel() } else { source.revoke() }
+            check(facade.dispatch(data: try action("switch_profile", id: "kid"), field: nil))
+            check(store.commits == before && publications.states.isEmpty && accepted.value == 0)
+            validator.release.signal()
+            do { _ = try await submitted.value; preconditionFailure("revoked source saved") }
+            catch VortxNativeError.superseded {}
+            await facade.settleNativeMutations()
+            check(store.commits == before + 1 && validator.validationCount == 0 && accepted.value == 1)
+            check(publications.states.count == 1 && publications.states[0]["activeProfileId"] == .string("kid"))
+            await facade.shutdown()
+        }
+        // Acknowledged A -> B -> A does not revive the original read.
+        do {
+            let (facade, _, _, _, _) = try await mount("profile-aba")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            check(facade.dispatch(data: try action("switch_profile", id: "kid"), field: nil))
+            await facade.settleNativeMutations()
+            check(facade.dispatch(data: try action("switch_profile", id: "owner"), field: nil))
+            await facade.settleNativeMutations()
+            try rejected { try read.withActive {} }
+            try capture(facade, source).withActive {}
+            await facade.shutdown()
+        }
+        // Registry generation retires the read even when replacement values return to A.
+        do {
+            let (facade, _, _, _, _) = try await mount("registry-aba")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            guard let first = facade.registryBinding else { preconditionFailure("missing registry A") }
+            let replacement: [VortxResourceAddon] = [.init(id: "fifo-registry-b", transportUrl: "https://fixture.invalid/manifest.json",
+                manifest: .object(["id": .string("fifo-registry-b"), "name": .string("Fixture B")]))]
+            try await facade.rebindRegistry(replacement, expected: first)
+            guard let second = facade.registryBinding else { preconditionFailure("missing registry B") }
+            try await facade.rebindRegistry([], expected: second)
+            check(first != second)
+            try rejected { try read.withActive {} }
+            try capture(facade, source).withActive {}
+            await facade.shutdown()
+        }
+        // A possibly installed checkpoint cannot reopen this Facade/FIFO for another write.
+        do {
+            let (facade, _, store, publications, accepted) = try await mount("uncertain")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            let validator = FIFOTestCheckpoint()
+            store.failWrites(afterInstall: true)
+            do {
+                _ = try await facade.dispatchCapturedNativeActions([currentWatch], read: read, checkpointValidator: validator)
+                preconditionFailure("uncertain captured checkpoint reported success")
+            } catch VortxNativeError.checkpointUncertain {}
+            await facade.settleNativeMutations()
+            check(facade.requiresCheckpointReopen && !facade.isAvailable)
+            check(publications.states.isEmpty && accepted.value == 0)
+            try rejected(.checkpointUncertain) { try read.withActive {} }
+            check(!facade.dispatch(data: try action("get_state"), field: nil))
+            await facade.shutdown()
+        }
+        do {
+            let (facade, _, _, _, _) = try await mount("closed")
+            let source = FIFOTestSource(), read = try capture(facade, source)
+            facade.close()
+            try rejected(.closed) { try read.withActive {} }
+            check(!facade.dispatch(data: try action("get_state"), field: nil))
+            await facade.shutdown()
+        }
+        print("Native FIFO handoff: actual Facade membership, later profile ordering, revocation, flush, ABA and uncertainty passed")
+    }
+
     static func main() async throws {
+        if CommandLine.arguments.contains("--external-cw-host") {
+            try await checkExternalCWQueryReceipts(); return
+        }
+        try await migrationDraftProtocolTests()
+        try await migrationProgressLeaseTests()
+        try hydrationPreservationTests()
+        try await progressWriteTests()
+        try await fifoHandoffTests()
+#if canImport(VortxEngine) && VORTX_ENGINE_STATE_BRIDGE
+        try liveHydrationPreservationTests()
+#endif
+        try await checkpointRecoveryTests()
         try await detailFanoutTests()
         try await catalogFanoutTests()
         try await watchlistAdmissionTests()
@@ -680,6 +1501,13 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(try indexedA.authenticatedCheckpoint(scope: scope) == before)
         try indexedA.rememberAuthenticatedScope(scope)
         check(try indexedB.authenticatedCheckpoint(scope: scopeB) == nil)
+        // A preparation probe must carry the installation proof, just like the opener.
+        // Without it, another account's healthy indexed history cannot prove B is absent.
+        let unindexedPreparationProbe = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: keyB)
+        do {
+            _ = try unindexedPreparationProbe.authenticatedCheckpoint(scope: scopeB)
+            fatalError("account-only preparation probe admitted unrelated indexed history")
+        } catch VortxNativeError.invalidSnapshot {}
         do { _ = try indexedB.recovery(account: scope.account); fatalError("inventory key decrypted another account") } catch {}
         let stateB = before.replacingOccurrences(of: "account-a", with: "account-b")
         try indexedB.commit(stateB, scope: scopeB)
@@ -797,6 +1625,17 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(try encrypted.read(scope: scope) == before)
         try encrypted.commit(before, scope: scope)
         check(try archived(Data(contentsOf: files[0])) == archive)
+        // A repeat commit of identical state writes nothing (the file keeps its exact bytes), and a file replaced
+        // underneath is opened in full again, so a corrupt replacement is refused, never overwritten.
+        let settledCheckpoint = try Data(contentsOf: files[0])
+        try encrypted.commit(before, scope: scope)
+        check(try Data(contentsOf: files[0]) == settledCheckpoint)
+        try Data("not a checkpoint".utf8).write(to: files[0], options: .atomic)
+        do { try encrypted.commit(before, scope: scope); fatalError("replaced checkpoint overwritten without a full open") } catch {}
+        check(try Data(contentsOf: files[0]) == Data("not a checkpoint".utf8))
+        try settledCheckpoint.write(to: files[0], options: .atomic)
+        try encrypted.commit(before, scope: scope)
+        check(try encrypted.read(scope: scope) == before)
         let wrongKey = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
         do { _ = try wrongKey.recovery(account: scope.account); fatalError("wrong key recovered account locator") } catch {}
         do { _ = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: wrongKey, transport: transport, allowNewAccount: true); fatalError("decrypt failure seeded empty owner") }
@@ -896,7 +1735,11 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(nativeCW["items"]?.array?.first?["state"]?["timeOffset"] == .integer(120001))
         check(nativeCW["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-video"))
         let nativeLibrary = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("library")!)
-        check(nativeLibrary["catalog"] == .array([])) // history/resume is not saved membership
+        // Nothing is saved, but every title watched or started stays in the Library as previously watched.
+        func ids(_ rows: VortxJSON?) -> Set<String> {
+            Set((rows?.array ?? []).compactMap { row -> String? in if case .string(let id)? = row["_id"] { return id }; return nil })
+        }
+        check(!ids(nativeCW["items"]).isEmpty && ids(nativeCW["items"]).isSubset(of: ids(nativeLibrary["catalog"])))
         check(facade.cachedResumeSeconds(id: "opaque-video") == 120.001)
         check(facade.cachedResumeSeconds(id: "finished") == 0)
         check(facade.cachedResumeSeconds(id: "unknown") == nil)
@@ -938,5 +1781,46 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         catch VortxNativeError.invalidResponse {}
         await unavailableSession.close()
         print("Native session: acknowledged transactions, sealed cold state/context, legacy preservation and independent screen/logout fences passed")
+    }
+}
+
+extension VortxNativeSessionTests {
+    /// Focused actual Session method test; SessionABI supplies response bytes only.
+    static func checkExternalCWQueryReceipts() async throws {
+        let owner = "92000000-0000-0000-0000-000000000029"
+        let scope = VortxAccountScope(account: "external-cw.session.fixture", ownerProfileID: owner)
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("external-cw-session")
+        let a = try VortxNativeBootstrapArchive.encode(document: Data("{\"future\":\"A\"}".utf8))
+        let b = try VortxNativeBootstrapArchive.encode(document: Data("{\"future\":\"B\"}".utf8))
+        let key = SymmetricKey(data: Data(repeating: 9, count: 32))
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: a, bootstrapScope: scope)
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        let session = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: SessionABI(),
+            store: store, transport: SessionTransport(), allowNewAccount: true)
+        let fifo = VortxNativeFIFOAdmission(lock: NSRecursiveLock()), source = FIFOTestSource()
+        let candidate = VortxNativeExternalCW.Candidate(key: "candidate", type: "series", metaId: "show",
+            videoId: "opaque", titleSpellings: ["show"], season: 1, episode: 2)
+        let original = try fifo.capture(source: source) {}
+        let first = try await session.externalCWEligibility([candidate], profileID: owner, original: original)
+        precondition(first.verdicts.first?.disposition == .eligible)
+        try first.authority.withActive {}
+        try original.withActive {} // Query did not admit or finish the reading capability.
+        try probe.retainMigrationDraft(b, scope: scope, expected: nil, authority: source)
+        do { try first.authority.withActive {}; preconditionFailure("Session offer survived draft write") } catch {}
+        let secondRead = try fifo.capture(source: source) {}
+        let second = try await session.externalCWEligibility([candidate], profileID: owner, original: secondRead)
+        // Direct Session mutation (no fixture FIFO admission) must still retire this result.
+        _ = try await session.dispatch(["{\"type\":\"fixture_mutation\"}"], now: 1)
+        do { try second.authority.withActive {}; preconditionFailure("Session generation failed to retire offer") } catch {}
+        let thirdRead = try fifo.capture(source: source) {}
+        let third = try await session.externalCWEligibility([candidate], profileID: owner, original: thirdRead)
+        let later = try fifo.admit()
+        do { try third.authority.withActive {}; preconditionFailure("new FIFO intent failed to retire read") } catch {}
+        try later.begin(); later.finish()
+        let fourthRead = try fifo.capture(source: source) {}
+        let fourth = try await session.externalCWEligibility([candidate], profileID: owner, original: fourthRead)
+        await session.close()
+        do { try fourth.authority.withActive {}; preconditionFailure("closed Session revived offer") } catch {}
+        print("External CW actual Session: reading phase, draft, direct mutation, FIFO and close retirement passed")
     }
 }

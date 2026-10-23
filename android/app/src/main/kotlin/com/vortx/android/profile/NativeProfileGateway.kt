@@ -4,6 +4,11 @@ package com.vortx.android.profile
 internal interface NativeProfileGateway {
     data class Projection(val profiles: List<UserProfile>, val activeID: String)
     fun read(): Projection
+    /** Publish only while the same native projection and account still own this mutation. */
+    fun <T> withProjection(expected: Projection, action: () -> T): T = synchronized(this) {
+        check(read() == expected) { "Native profile projection changed" }
+        action()
+    }
     fun select(id: String): Projection
     fun save(profile: UserProfile, adding: Boolean): Projection
     fun remove(id: String): Projection

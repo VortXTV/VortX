@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The series episode-list Up boundary. Only its first row hands focus to the selected season;
-/// every deeper row belongs to tvOS's native previous-row navigation.
+/// The series episode-grid Up boundary. Only the grid's first row hands focus to the selected season;
+/// every deeper row belongs to tvOS's native grid navigation. `columns == 1` is the old single list.
 enum TVDetailEpisodeListFocusPolicy {
     enum Destination: Equatable {
         case seasonPicker
@@ -9,22 +9,31 @@ enum TVDetailEpisodeListFocusPolicy {
         case native
     }
 
-    static func rowOwnsUpEscape(at index: Int) -> Bool {
-        index == 0
+    static func rowOwnsUpEscape(at index: Int, columns: Int = 1) -> Bool {
+        index >= 0 && index < max(1, columns)
     }
 
-    /// Row zero owns the detail-page escape and its first downward list handoff. The latter is explicit
-    /// because a registered `onMoveCommand` must not depend on framework propagation to reach row one.
+    /// A first-row card owns the detail-page escape and every other move out of it. All four directions are
+    /// explicit because a registered `onMoveCommand` must not depend on framework propagation to reach its
+    /// neighbours. Down from a first-row card past the last partial row lands on the final episode.
     static func destination(for direction: MoveCommandDirection,
                             fromEpisodeIndex index: Int,
-                            episodeCount: Int) -> Destination {
-        guard rowOwnsUpEscape(at: index) else { return .native }
+                            episodeCount: Int,
+                            columns: Int = 1) -> Destination {
+        let columns = max(1, columns)
+        guard rowOwnsUpEscape(at: index, columns: columns), index < episodeCount else { return .native }
         switch direction {
         case .up:
             return .seasonPicker
-        case .down where episodeCount > 1:
-            return .episode(1)
-        default:
+        case .down:
+            let below = index + columns
+            if below < episodeCount { return .episode(below) }
+            return episodeCount > columns ? .episode(episodeCount - 1) : .native
+        case .left:
+            return index > 0 ? .episode(index - 1) : .native
+        case .right:
+            return index + 1 < min(columns, episodeCount) ? .episode(index + 1) : .native
+        @unknown default:
             return .native
         }
     }

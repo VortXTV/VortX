@@ -73,6 +73,17 @@ private final class AddonCheckpointStore: VortxCheckpointStore, @unchecked Senda
         let braceID = "e9" + String(repeating: "0", count: 30)
         let typedBrace = replacing(first, "eventId", .string(braceID))
         try VortxNativeWebsiteAddonEdits.validateSource([typedBrace])
+        let literalAddon = replacing(mutation(url)["addon"]!, "manifest",
+            replacing(replacing(mutation(url)["addon"]!["manifest"]!, "name", .string("[4K] Community catalog")),
+                      "description", .string("{Public} Films and shows")))
+        let literalMutation = replacing(mutation(url), "addon", literalAddon)
+        let literalEvent = event(99, mutations: [literalMutation])
+        try VortxNativeWebsiteAddonEdits.validateSource([literalEvent])
+        var literalHost = try VortxNativeHostPreferences(scope: scope, actor: actor)
+        literalHost.local.websiteAddonPending = [literalEvent]
+        let literalReopened = try VortxNativeHostPreferences(scope: scope, actor: actor, sealed: literalHost.encoded())
+        check(literalReopened.local.websiteAddonPending == [literalEvent])
+        print("Issue #263 website add-on validation and sealed pending reopen preserve exact literal manifest labels")
         do {
             try VortxNativeWebsiteAddonEdits.validateSource([.object(["eventId": .string(braceID)])])
             fatalError("untyped event identifier bypassed opaque inspection")
@@ -143,6 +154,18 @@ private final class AddonCheckpointStore: VortxCheckpointStore, @unchecked Senda
             return response
         })
         check(imported == [descriptor])
+        // Issue #262: one descriptor the engine cannot represent is skipped; the rest still import.
+        let urlOnly = VortxJSON.object(["transportUrl": .string("https://old.example.invalid/manifest.json"), "name": .string("Old")])
+        let mixed = AuthenticatedHTTPResponse(data: try JSONEncoder().encode(VortxJSON.object(["result": .object(["addons": .array([urlOnly, descriptor])])])), statusCode: 200)
+        let partial = try await VortxNativeOwnerAddonImport.fetch(authKey: "synthetic-token", verifiedUID: "verified-fixture-uid", owner: owner,
+                                                                  authority: ImportAuthority(), send: { _ in mixed })
+        check(partial == [descriptor])
+        let duplicated = AuthenticatedHTTPResponse(data: try JSONEncoder().encode(VortxJSON.object(["result": .object(["addons": .array([descriptor, descriptor])])])), statusCode: 200)
+        do {
+            _ = try await VortxNativeOwnerAddonImport.fetch(authKey: "synthetic-token", verifiedUID: "verified-fixture-uid", owner: owner,
+                                                            authority: ImportAuthority(), send: { _ in duplicated })
+            fatalError("duplicate descriptors silently collapsed")
+        } catch VortxNativeError.invalidResponse {}
         do {
             _ = try await VortxNativeOwnerAddonImport.fetch(authKey: "synthetic-token", verifiedUID: "verified-fixture-uid", owner: owner, authority: authority, send: { _ in
                 authority.invalidate(); return response

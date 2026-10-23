@@ -114,6 +114,8 @@ protocol PlayerEngine: AnyObject {
     // Chapters + media info
     func chapters() -> [MPVChapter]
     func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int)
+    /// Active selected/decoded media evidence for the shared read-only metadata pills.
+    func playbackMetadataFacts() -> PlaybackMetadataFacts
     func playbackStats() -> [(String, String)]
     func playbackDiagnostics() -> PlaybackDiagnostics
 
@@ -185,6 +187,7 @@ extension PlayerEngine {
     func mediaDurationSeconds() -> Double { 0 }
     func currentSubDelaySeconds() -> Double { 0 }
     func playbackDiagnostics() -> PlaybackDiagnostics { PlaybackDiagnostics() }
+    func playbackMetadataFacts() -> PlaybackMetadataFacts { PlaybackMetadataFacts() }
 
     /// Default 0 for any engine that doesn't override (the wall-clock capture driver falls back to the
     /// chrome's own `currentTime` when this is 0). Both concrete engines override with the real position.

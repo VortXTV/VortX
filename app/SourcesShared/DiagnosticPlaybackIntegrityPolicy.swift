@@ -101,9 +101,14 @@ struct PlaybackCompletionEvidence<Token: Equatable> {
         duration = seconds
     }
 
-    mutating func consumeEOF(owner: Token, isLive: Bool, isTrailer: Bool) -> Decision {
+    mutating func consumeEOF(owner: Token, isLive: Bool, isTrailer: Bool,
+                             knownDurationFallback: Double? = nil) -> Decision {
         guard self.owner == owner, !rejectedEOF else { return .ignore }
-        guard !isLive, !isTrailer, let position, let duration else { return .allowCompletion }
+        // A same-source reopen can end before its duration notification arrives. Only a caller's
+        // exact owned finite source receipt may provide this fallback; a current duration wins.
+        let finiteFallback = knownDurationFallback.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        guard !isLive, !isTrailer, let position,
+              let duration = duration ?? finiteFallback else { return .allowCompletion }
         let tailTolerance = min(30, max(2, duration * 0.01))
         guard position < duration - tailTolerance else { return .allowCompletion }
         rejectedEOF = true
@@ -143,6 +148,32 @@ struct PlaybackIdleTimerLease<Owner: Equatable> {
         guard owns(owner) else { return false }
         self.owner = nil
         return true
+    }
+}
+
+/// The runtime options that `MPVMetalViewController.configureLiveMode` changes before issuing a
+/// `loadfile` command. A rejected command must put the still-playing source back exactly where it was;
+/// in particular, `demuxer-max-back-bytes` may already be reduced by a real memory shed and must not be
+/// reconstructed from the normal VOD profile.
+struct MPVPlaybackProfileSnapshot<Value> {
+    let configuredLiveMode: Bool
+    private let values: [(name: String, value: Value)]
+
+    init?(configuredLiveMode: Bool, read: (String) -> Value?) {
+        self.configuredLiveMode = configuredLiveMode
+        var values: [(name: String, value: Value)] = []
+        for name in ["demuxer-readahead-secs", "demuxer-max-back-bytes", "demuxer-lavf-o",
+                     "stream-lavf-o", "cache-pause-initial", "cache-pause-wait"] {
+            // A failed native read does not imply that a write would also fail. Refuse preparation before
+            // any profile mutation if even one prior value cannot be restored.
+            guard let value = read(name) else { return nil }
+            values.append((name, value))
+        }
+        self.values = values
+    }
+
+    func restore(using set: (String, Value) -> Void) {
+        for (name, value) in values { set(name, value) }
     }
 }
 

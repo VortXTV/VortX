@@ -126,8 +126,11 @@ private const val HIGH_TEXT_CONTRAST_ENABLED = "high_text_contrast_enabled"
 /// one OS-gate-plus-Reduce-Transparency fallback, so the upgrade and the fallback are identical across
 /// every preset instead of re-derived per modifier.
 @Composable
-fun rememberGlassOpaque(): Boolean =
-    Build.VERSION.SDK_INT < Build.VERSION_CODES.S || rememberReduceTransparency()
+fun rememberGlassOpaque(): Boolean {
+    // Settings > Effects and performance > Glass and blur off is the in-app reduce-transparency switch.
+    val effectsGlass = com.vortx.android.ui.prefs.currentVisualEffects().glass
+    return Build.VERSION.SDK_INT < Build.VERSION_CODES.S || rememberReduceTransparency() || !effectsGlass
+}
 
 /// Apply the VortX glass material in [shape]: a soft drop [shadow], the warm translucent fill (or the
 /// opaque warm fallback per [rememberGlassOpaque]), an optional interior sheen, an optional [activeFill]

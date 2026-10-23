@@ -26,42 +26,51 @@ struct LoginView: View {
     var body: some View {
         ZStack {
             Theme.Palette.canvas.ignoresSafeArea()
-            VStack(spacing: Theme.Space.lg) {
-                VortXWordmark(fontSize: 54)
+            GeometryReader { geometry in
+                ScrollView {
+                    VStack(spacing: Theme.Space.lg) {
+                        VortXWordmark(fontSize: 54)
 
-                Text(headline)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .multilineTextAlignment(.center)
+                        Text(headline)
+                            .font(Theme.Typography.body)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .multilineTextAlignment(.center)
 
-                switch mode {
-                case .vortx:           VortXAccountJoinerView(onSignedIn: { dismiss() })
-                case .stremioLink:     LinkLoginView(account: account)
-                case .stremioPassword: passwordLogin
+                        switch mode {
+                        case .vortx:           VortXAccountJoinerView(onSignedIn: { dismiss() })
+                        case .stremioLink:     LinkLoginView(account: account)
+                        case .stremioPassword: passwordLogin
+                        }
+
+                        secondaryActions
+                        DiagnosticLogExportButton()
+                    }
+                    .padding(Theme.Space.screenEdge)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: geometry.size.height)
                 }
-
-                secondaryActions
             }
-            .padding(Theme.Space.screenEdge)
         }
         // The Stremio paths finish through StremioAccount.isSignedIn; the VortX path dismisses itself via
         // the joiner's onSignedIn. This sink covers only the Stremio link/password sign-in handoff.
         .onReceive(account.$isSignedIn) { signedIn in
-            guard signedIn, !didHandleSignIn else { return }
-            didHandleSignIn = true
-            core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
-            // Account-owns-everything snapshot-on-import: once the engine has pulled this Stremio account's
-            // add-ons, snapshot the full descriptor set into the VortX account doc so the account OWNS them
-            // (they hydrate later with no live Stremio session). We AWAIT the engine's PullAddonsFromAPI
-            // settling (awaitAddonsHydrated) rather than a fixed delay: a fixed delay snapshotted a slow
-            // host mid-pull, capturing only SOME add-ons (the partial-import bug). No-op (never-zero guarded)
-            // if still empty / signed out.
-            Task { @MainActor in
-                await core.awaitAddonsHydrated()
-                await VortXSyncManager.shared.snapshotOwnedFromEngine()
-            }
-            dismiss()
+            handleStremioSignIn(signedIn: signedIn)
         }
+        .onChange(of: account.credentialBoundaryGeneration) { _ in
+            handleStremioSignIn(signedIn: account.isSignedIn)
+        }
+    }
+
+    private func handleStremioSignIn(signedIn: Bool) {
+        guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
+        didHandleSignIn = true
+        core.signedInWithLegacyAuthKey()
+        // Await actual add-on hydration, not a fixed delay, before the never-zero import snapshot.
+        Task { @MainActor in
+            await core.awaitAddonsHydrated()
+            await VortXSyncManager.shared.snapshotOwnedFromEngine()
+        }
+        dismiss()
     }
 
     private var headline: String {

@@ -140,6 +140,7 @@ enum SeriesSourceSticky {
     struct Choice: Sendable {
         let source: StickySource
         let audioLanguage: String?
+        var resolution: Int? = nil
         fileprivate let revision: Int
     }
 
@@ -551,6 +552,7 @@ enum StreamRanking {
     static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity: String?, binge: String?,
                                  pin: ResolvedPin?, sticky: StickySource, stickyAuthoritative: Bool,
                                  preserveChosenRelease: Bool, desiredAudioLanguage: String?,
+                                 qualityFloor: Int? = nil,
                                  providerPenalty: (String) -> Int, debridCachedHashes: Set<String>) -> [CoreStream] {
         groups.flatMap(\.streams)
     }

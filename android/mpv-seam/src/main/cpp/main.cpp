@@ -3,6 +3,7 @@
 // final surface ownership inside native destruction so Java teardown cannot race a freed instance.
 #include <jni.h>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <ctime>
 #include <clocale>
@@ -35,6 +36,7 @@ extern "C" {
     jni_func(void, nativeInit, jlong instance);
     jni_func(void, nativeDestroy, jlong instance);
     jni_func(void, nativeCommand, jlong instance, jobjectArray jarray);
+    jni_func(jlong, nativeLoadFileWithEntryID, jlong instance, jstring jurl);
 };
 
 static void prepare_environment(JNIEnv *env, MPVInstance* instance) {
@@ -191,6 +193,41 @@ jni_func(void, nativeDestroy, jlong instance) {
         // with pthread_detach: modern bionic aborts the process for invalid non-null thread handles.
         ALOGE("event thread join failed (%d); deferred teardown remains event-thread owned", join_result);
     }
+}
+
+// One load command, never retried. Unknown/malformed return data disables metadata admission;
+// it does not undo an otherwise successful load or manufacture a playback terminal.
+jni_func(jlong, nativeLoadFileWithEntryID, jlong instance, jstring jurl) {
+    auto mpv_instance = reinterpret_cast<MPVInstance*>(instance);
+    if (!mpv_instance || !mpv_instance->mpv || !jurl)
+        return -1;
+    const char *url = env->GetStringUTFChars(jurl, nullptr);
+    if (!url)
+        return -1;
+    const char *arguments[] = { "loadfile", url, "replace", nullptr };
+    mpv_node result{};
+    const int status = mpv_command_ret(mpv_instance->mpv, arguments, &result);
+    env->ReleaseStringUTFChars(jurl, url);
+    jlong entry_id = -1;
+    if (status >= 0 && result.format == MPV_FORMAT_NODE_MAP && result.u.list &&
+        result.u.list->num >= 0 && result.u.list->num <= 64 &&
+        result.u.list->keys && result.u.list->values) {
+        bool found = false;
+        for (int i = 0; i < result.u.list->num; ++i) {
+            const char *key = result.u.list->keys[i];
+            if (!key || std::strcmp(key, "playlist_entry_id") != 0)
+                continue;
+            const mpv_node &value = result.u.list->values[i];
+            if (found || value.format != MPV_FORMAT_INT64 || value.u.int64 < 0) {
+                entry_id = -1;
+                break;
+            }
+            found = true;
+            entry_id = static_cast<jlong>(value.u.int64);
+        }
+    }
+    mpv_free_node_contents(&result);
+    return entry_id;
 }
 
 jni_func(void, nativeCommand, jlong instance, jobjectArray jarray) {

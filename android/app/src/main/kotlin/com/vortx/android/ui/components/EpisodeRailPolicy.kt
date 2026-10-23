@@ -5,3 +5,8 @@ internal fun episodeRailTargetIndex(ids: List<String>, target: String?): Int? =
 
 internal fun episodeRailPageIndex(first: Int, visibleCount: Int, total: Int, forward: Boolean): Int =
     if (total <= 0) 0 else (first + (if (forward) 1 else -1) * visibleCount.coerceAtLeast(1)).coerceIn(0, total - 1)
+
+/// The first episode index of the grid page that holds [targetIndex], for pages of [pageSize] episodes;
+/// 0 when there is no target. A paged grid keeps a long season (hundreds of episodes) to one page of cards.
+internal fun episodeGridPageStart(targetIndex: Int?, pageSize: Int): Int =
+    if (targetIndex == null || targetIndex < 0 || pageSize <= 0) 0 else targetIndex / pageSize * pageSize

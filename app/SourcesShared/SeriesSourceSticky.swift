@@ -31,6 +31,8 @@ enum SeriesSourceSticky {
         var ts: Date
         /// Actual selected audio, never inferred from the subtitle preference or release title.
         var audioLanguage: String? = nil
+        /// The chosen release's resolution, a floor for later episodes so one fallback cannot lower the binge.
+        var resolution: Int? = nil
     }
 
     struct Snapshot: Equatable, Sendable {
@@ -39,6 +41,7 @@ enum SeriesSourceSticky {
         let addon: String?
         let bingeGroup: String?
         let audioLanguage: String?
+        let resolution: Int?
         var source: (addon: String?, bingeGroup: String?) { (addon, bingeGroup) }
     }
 
@@ -57,7 +60,8 @@ enum SeriesSourceSticky {
         let (profile, choices) = loaded()
         let choice = choices[seriesKey]
         return Snapshot(seriesKey: seriesKey, profile: profile, addon: choice?.addon,
-                        bingeGroup: choice?.bingeGroup, audioLanguage: choice?.audioLanguage)
+                        bingeGroup: choice?.bingeGroup, audioLanguage: choice?.audioLanguage,
+                        resolution: choice?.resolution)
     }
 
     static func admits(_ frozen: Snapshot?) -> Bool {
@@ -134,13 +138,13 @@ enum SeriesSourceSticky {
 
     /// Remember the source the viewer just chose by hand for `seriesKey` (the show's meta id, so every episode
     /// shares it). A pick carrying neither signal is not worth a record.
-    static func record(seriesKey: String, addon: String?, bingeGroup: String?) {
+    static func record(seriesKey: String, addon: String?, bingeGroup: String?, resolution: Int? = nil) {
         guard !seriesKey.isEmpty,
               addon?.isEmpty == false || bingeGroup?.isEmpty == false else { return }
         let (profile, existing) = loaded()
         var dict = existing
         dict[seriesKey] = Choice(addon: addon, bingeGroup: bingeGroup, ts: Date(),
-                                 audioLanguage: existing[seriesKey]?.audioLanguage)
+                                 audioLanguage: existing[seriesKey]?.audioLanguage, resolution: resolution)
         if dict.count > maxSeries {   // cap per profile, least recently chosen out
             dict = Dictionary(uniqueKeysWithValues:
                 dict.sorted { $0.value.ts > $1.value.ts }.prefix(keepSeries).map { ($0.key, $0.value) })

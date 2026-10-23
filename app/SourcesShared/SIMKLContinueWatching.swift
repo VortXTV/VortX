@@ -177,6 +177,11 @@ actor SIMKLContinueWatchingReader {
     private var state = Snapshot()
 
     func refresh(session expected: SIMKLSessionID, transport: any SIMKLContinueWatchingTransport) async -> Snapshot {
+        // A cancelled caller cannot retire an admitted flight or switch the reader's owner.
+        if Task.isCancelled {
+            guard session == expected, transport.continueWatchingSessionIsCurrent(expected) else { return Snapshot() }
+            return state
+        }
         if session != expected {
             generation &+= 1; session = expected; activity = [:]; watching = [:]; playback = []; state = Snapshot()
         }
@@ -186,6 +191,7 @@ actor SIMKLContinueWatchingReader {
         let captured = generation
         do {
             let data = try await transport.continueWatchingRead(path: "/sync/activities", query: [:], session: expected)
+            try Task.checkCancellation()
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let rawAll = root["all"] else { throw SIMKLError.decoding }
             // Explicit null means no recorded activity, not a fabricated timestamp/cursor.
@@ -207,10 +213,13 @@ actor SIMKLContinueWatchingReader {
             if full || nextActivity["all"] != activity["all"] {
                 // Complete every type before committing. Status transitions remove previous watching rows.
                 for type in ["movies", "shows", "anime"] {
+                    try Task.checkCancellation()
                     var query = ["next_watch_info": "yes"]
                     if !full, all != nil, let cursor = activity["all"] { query["date_from"] = cursor }
-                    let changes = try SIMKLContinueWatchingFold.entries(await transport.continueWatchingRead(
-                        path: "/sync/all-items/\(type)", query: query, session: expected))
+                    let listData = try await transport.continueWatchingRead(
+                        path: "/sync/all-items/\(type)", query: query, session: expected)
+                    try Task.checkCancellation()
+                    let changes = try SIMKLContinueWatchingFold.entries(listData)
                     for key in changes.keys.sorted() {
                         guard let change = changes[key] else { continue }
                         let matching = nextWatching.filter {
@@ -228,14 +237,22 @@ actor SIMKLContinueWatchingReader {
             }
             // Paused records can expire without an activities/tombstone change. Reconcile the
             // complete paused set on each throttled refresh before advancing any list cursor.
-            nextPlayback = try SIMKLContinueWatchingFold.playback(await transport.continueWatchingRead(
-                path: "/sync/playback", query: ["limit": "10000"], session: expected))
+            try Task.checkCancellation()
+            let playbackData = try await transport.continueWatchingRead(
+                path: "/sync/playback", query: ["limit": "10000"], session: expected)
+            try Task.checkCancellation()
+            nextPlayback = try SIMKLContinueWatchingFold.playback(playbackData)
+            let nextState = Snapshot(items: SIMKLContinueWatchingFold.merge(watching: Array(nextWatching.values), playback: nextPlayback), hasSnapshot: true)
+            try Task.checkCancellation()
             guard generation == captured, session == expected, transport.continueWatchingSessionIsCurrent(expected) else { return Snapshot() }
             watching = nextWatching; playback = nextPlayback; activity = nextActivity
-            state = Snapshot(items: SIMKLContinueWatchingFold.merge(watching: Array(watching.values), playback: playback), hasSnapshot: true)
+            state = nextState
         } catch {
             guard generation == captured, session == expected, transport.continueWatchingSessionIsCurrent(expected) else { return Snapshot() }
-            state.failed = true // Keep the prior complete snapshot AND cursor for retry.
+            // Cancellation is not a failed snapshot and cannot advance any staged list cursor.
+            if !(error is CancellationError), !Task.isCancelled {
+                state.failed = true // Keep the prior complete snapshot AND cursor for retry.
+            }
         }
         return state
     }

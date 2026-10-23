@@ -19,7 +19,9 @@
   <!-- Network access to Cinemeta + user-installed add-on / debrid hosts. -->
   <tizen:privilege name="http://tizen.org/privilege/internet"/>
   <access origin="*" subdomains="true"/>
-  <tizen:allow-navigation>*</tizen:allow-navigation>
+  <!-- Arbitrary provider networking is intentional; it does not authorize replacing
+       the packaged UI with an arbitrary remote top-level document. External navigation
+       is not allow-listed. Packaged index.html also carries the shared web CSP. -->
   <!-- hwkey-event delivers the remote Back key (keyCode 10009) as a keydown so tvnav.ts can handle it;
        landscape only; no background running (playback stops when the app is backgrounded). -->
   <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable"

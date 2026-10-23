@@ -67,7 +67,12 @@ final class VXDiagExport: @unchecked Sendable {
         let logSnapshot: VXProbeLogSnapshot
     }
 
-    private init() {}
+    private let presentationOwned: Bool
+    private init(presentationOwned: Bool = false) { self.presentationOwned = presentationOwned }
+
+    /// A presentation owns this listener, rather than stopping an unrelated Settings export through
+    /// the singleton. Each retry/presentation gets its own capability and teardown lifetime.
+    static func makeSession() -> VXDiagExport { VXDiagExport(presentationOwned: true) }
 
     // MARK: - Public contract
 
@@ -113,37 +118,63 @@ final class VXDiagExport: @unchecked Sendable {
     /// retry is needed, each `start()` re-mints the capability exactly as a fresh export should, and the
     /// last successful attempt is the live one; the serve-once contract is untouched.
     func startAsync() async -> (url: String, qr: Image)? {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let deadline = Date().addingTimeInterval(Self.coldStartBudget)
-                var result = self.start()
-                while result == nil, Self.lanIPv4() != nil, Date() < deadline {
-                    Thread.sleep(forTimeInterval: Self.coldStartRetryGap)
-                    result = self.start()
+        guard !presentationOwned || !Task.isCancelled else { return nil }
+        let cancellation = VXDiagExportStartCancellation()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let deadline = Date().addingTimeInterval(Self.coldStartBudget)
+                    var result = cancellation.isCancelled ? nil : self.start()
+                    while result == nil, !cancellation.isCancelled,
+                          Self.lanIPv4() != nil, Date() < deadline {
+                        Thread.sleep(forTimeInterval: Self.coldStartRetryGap)
+                        guard !cancellation.isCancelled else { break }
+                        result = self.start()
+                    }
+                    // A cancelled cold start must not leave a newly opened listener behind. The
+                    // presentation also checks cancellation after await, closing the final-return race.
+                    if cancellation.isCancelled {
+                        self.stop()
+                        result = nil
+                    }
+                    continuation.resume(returning: result)
                 }
-                continuation.resume(returning: result)
             }
+        } onCancel: {
+            // Existing Settings callers share one singleton: an old caller must not tear down a
+            // replacement caller's listener. Only a dedicated presentation-owned instance can stop.
+            if self.presentationOwned { cancellation.cancel() }
         }
     }
 
     /// Tear the listener down so the log is no longer served. Safe to call when not started.
     func stop() {
-        queue.sync {
-            listener?.cancel()
-            listener = nil
-            port = 0
-            // Cancel any connection still mid-request so a stalled phone is not left holding an open socket.
-            stateLock.lock()
-            let open = Array(connections.values)
-            connections.removeAll()
-            transferGate.reset()
-            capabilityPath = ""   // retire the capability with the listener
-            stateLock.unlock()
-            open.forEach { $0.cancel() }
-            // LAN sends never clear the rolling log without app-layer receiver acknowledgement. Stopping also
-            // retires the capability and cancels any incomplete connection.
-            NSLog("[diag] export: stopped")
-        }
+        queue.sync { tearDownListener() }
+    }
+
+    /// A dismissed login/picker export must not wait on the main actor behind cold listener bring-up.
+    /// The UI retires its identity immediately; cleanup is serialized behind any in-flight start, and
+    /// the post-await guard requests cleanup again if that start finishes after dismissal.
+    func stopOwnedSession() {
+        guard presentationOwned else { return }
+        queue.async { self.tearDownListener() }
+    }
+
+    /// Runs only on queue, through either synchronous legacy teardown or owned deferred teardown.
+    private func tearDownListener() {
+        listener?.cancel()
+        listener = nil
+        port = 0
+        // Cancel any connection still mid-request so a stalled phone is not left holding an open socket.
+        stateLock.lock()
+        let open = Array(connections.values)
+        connections.removeAll()
+        transferGate.reset()
+        capabilityPath = ""   // retire the capability with the listener
+        stateLock.unlock()
+        open.forEach { $0.cancel() }
+        // LAN sends never clear the rolling log without app-layer receiver acknowledgement.
+        NSLog("[diag] export: stopped")
     }
 
     // MARK: - Listener lifecycle
@@ -485,6 +516,16 @@ final class VXDiagExport: @unchecked Sendable {
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
         return CIContext().createCGImage(scaled, from: scaled.extent)
     }
+}
+
+/// Cancellation crosses from a Swift task to the blocking Network-framework bring-up worker. It must
+/// not read UI state off-thread or block the main actor waiting for that worker's semaphore.
+private final class VXDiagExportStartCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
 }
 
 #if os(macOS)

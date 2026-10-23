@@ -46,6 +46,33 @@ internal fun collectionsHubSlot(catalogs: List<Catalog>, order: List<HomeRail>):
 internal sealed interface HomeRowItem {
     data class CatalogRow(val catalog: Catalog) : HomeRowItem
     data object HubRow : HomeRowItem
+    /** "For you" heading with Tune, right above the first For You row. */
+    data object ForYouHeader : HomeRowItem
+    /** "Tell VortX what you like", at For You's slot when the profile has no interests to build rows from. */
+    data object ForYouInvite : HomeRowItem
+}
+
+/**
+ * Put the For You heading before the first For You row, or, with no For You rows and [showInvite], the
+ * invite at For You's slot in the Customize-Home [order] (after Continue Watching and any section ordered
+ * before it). Shared by phone and TV Home, like the hub slot.
+ */
+internal fun homeRowsWithForYou(rows: List<HomeRowItem>, order: List<HomeRail>, showInvite: Boolean): List<HomeRowItem> {
+    val first = rows.indexOfFirst { it is HomeRowItem.CatalogRow && HomeRail.forCatalog(it.catalog) == HomeRail.FOR_YOU }
+    if (first >= 0) return rows.toMutableList().apply { add(first, HomeRowItem.ForYouHeader) }
+    if (!showInvite) return rows
+    val rank = order.indexOf(HomeRail.FOR_YOU).takeIf { it >= 0 } ?: return rows
+    var slot = 0
+    for (row in rows) {
+        val before = when (row) {
+            is HomeRowItem.CatalogRow -> row.catalog.id == HomeRail.CONTINUE_CATALOG_ID ||
+                order.indexOf(HomeRail.forCatalog(row.catalog)) in 0 until rank
+            HomeRowItem.HubRow -> order.indexOf(HomeRail.COLLECTIONS_HUB) in 0 until rank
+            else -> false
+        }
+        if (before) slot++ else break
+    }
+    return rows.toMutableList().apply { add(slot, HomeRowItem.ForYouInvite) }
 }
 
 /** Interleave the hub band into the catalog list at [hubSlot] (null hides it). Shared by phone + TV Home. */
@@ -61,4 +88,6 @@ internal fun homeRowsWithHub(catalogs: List<Catalog>, hubSlot: Int?): List<HomeR
 internal fun homeRowKey(row: HomeRowItem): String = when (row) {
     is HomeRowItem.CatalogRow -> row.catalog.id
     HomeRowItem.HubRow -> "vortx.home.collectionsHub"
+    HomeRowItem.ForYouHeader -> "vortx.home.forYou.header"
+    HomeRowItem.ForYouInvite -> "vortx.home.forYou.invite"
 }

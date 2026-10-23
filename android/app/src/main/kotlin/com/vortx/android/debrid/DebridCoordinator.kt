@@ -61,13 +61,13 @@ internal class DebridCoordinator(
     private val keys: DebridKeys,
     private val appContext: android.content.Context? = null,
     private val usenetProviderStore: UsenetProviderStore? = null,
-    private val nativeUsenetEnabled: Boolean = com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+    private val nativeUsenetEnabled: Boolean = true,
     nzbTransport: NativeNzbTransport? = null,
 ) {
     private val nativeNzbTransport by lazy { nzbTransport ?: NativeNzbTransport(serverBase = {
         val context = appContext ?: throw NativeNzbTransport.Unavailable()
         VortxServer.awaitStartIfNeeded(context)
-    }) }
+    }, diskAllowance = { appContext?.let(com.vortx.android.usenet.UsenetDiskAllowance::current) }) }
     /// Convenience: build the resolver + key store from the app context (the assembly/play layer already
     /// owns a [DebridResolver]; prefer sharing that via the primary constructor when possible).
     constructor(context: Context) : this(
@@ -381,12 +381,21 @@ internal class DebridCoordinator(
                 torBoxConfigured = keys.isConfigured(DebridService.TOR_BOX, owner),
                 isCurrent = current,
                 local = { urls, providers ->
-                    nativeNzbTransport.create(urls, providers, timeoutMs = 24_000,
-                        selection = NativeNzbTransport.Selection(candidate.fileIdx, candidate.fileMustInclude, episode?.season, episode?.episode),
-                        playbackIsCurrent = playbackCurrent,
-                        isCurrent = current)
+                    val strict = NativeNzbTransport.Selection(candidate.fileIdx, candidate.fileMustInclude, episode?.season, episode?.episode)
+                    try {
+                        nativeNzbTransport.create(urls, providers, timeoutMs = 35_000, selection = strict,
+                            playbackIsCurrent = playbackCurrent, isCurrent = current)
+                    } catch (unmatched: NativeNzbTransport.SelectionUnmatched) {
+                        // Our episode numbers matched no file: follow the add-on's own file pattern instead.
+                        val addonOnly = strict.addonPatternOnly ?: throw NativeNzbTransport.Unavailable()
+                        nativeNzbTransport.create(urls, providers, timeoutMs = 35_000, selection = addonOnly,
+                            playbackIsCurrent = playbackCurrent, isCurrent = current)
+                    }
                 },
-                torBox = { url -> resolver.resolveUsenet(url, candidate.usenetKnownHash, candidate.fileMustInclude, candidate.fileIdx, episode, owner) },
+                torBox = { url, allowCreate ->
+                    resolver.resolveUsenet(url, candidate.usenetKnownHash, candidate.fileMustInclude, candidate.fileIdx,
+                        episode, owner, allowCreate = allowCreate)
+                },
             ) ?: return null
             if (!current()) {
                 result.lease.close()

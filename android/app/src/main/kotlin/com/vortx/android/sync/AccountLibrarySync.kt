@@ -26,7 +26,7 @@ import org.json.JSONObject
  * [com.vortx.android.home.ExternalWatchlistModels]; together they are the two directions.
  *
  * WIRED at the account-library chokepoints only. The hook lives inside the `HistoryRoute.Engine` branch of
- * [com.vortx.android.engine.EngineStremioRepository]'s add/removeFromLibrary, which is the exact place an
+ * [com.vortx.android.engine.NativeCatalogRepository]'s add/removeFromLibrary, which is the exact place an
  * ACCOUNT library mutation happens - an overlay profile takes the `HistoryRoute.Overlay` branch and never
  * reaches here. So this leg is already main-profile-only by construction; [AccountSyncGate] re-checks it
  * anyway (belt-and-suspenders, and it also guards [drainPending] which runs off a profile-change effect).

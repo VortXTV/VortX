@@ -16,6 +16,23 @@ import Foundation
                                otherPinned: false, otherPriority: 0, otherRank: 1, otherOffset: 0), "missing release uses generic ranking")
         precondition(P.precedes(pinned: false, priority: 0, rank: 1, offset: 0,
                                otherPinned: false, otherPriority: 0, otherRank: 1, otherOffset: 1), "ties preserve original order")
+        // Quality floor (the explicit pick's resolution). Without one every stream meets it, so the orders above hold.
+        precondition(P.precedes(pinned: false, priority: 2, rank: 1, offset: 1, meetsFloor: true,
+                               otherPinned: false, otherPriority: 3, otherRank: 100_000, otherOffset: 0, otherMeetsFloor: false),
+                     "in the chosen add-on, a release at the chosen resolution beats a lower fallback that only matches the group")
+        precondition(P.precedes(pinned: false, priority: 2, rank: 1, offset: 1, meetsFloor: false,
+                               otherPinned: false, otherPriority: 0, otherRank: 100_000, otherOffset: 0, otherMeetsFloor: true),
+                     "the floor never moves the binge off the chosen add-on")
+        precondition(P.precedes(pinned: false, priority: 0, rank: 1, offset: 1, meetsFloor: true,
+                               otherPinned: false, otherPriority: 0, otherRank: 100_000, otherOffset: 0, otherMeetsFloor: false),
+                     "with the chosen add-on absent, a release at the chosen resolution still leads")
+        precondition(!P.precedes(pinned: false, priority: 3, rank: 1, offset: 1, meetsFloor: true,
+                                otherPinned: true, otherPriority: 0, otherRank: 1, otherOffset: 0, otherMeetsFloor: false),
+                     "an explicit pin stays authoritative over the floor")
+        precondition(P.meetsFloor(resolution: 1080, floor: 1080) && P.meetsFloor(resolution: 2160, floor: 1080)
+                     && !P.meetsFloor(resolution: 720, floor: 1080) && P.meetsFloor(resolution: 480, floor: nil)
+                     && P.meetsFloor(resolution: 0, floor: 0),
+                     "the floor is the chosen resolution or better; no recorded resolution means no floor")
         let paths = ["app/SourcesTV/TVPlayerView.swift", "app/SourcesiOS/iOSDetailView.swift", "app/SourcesiOS/iOSBatchDownloadCoordinator.swift", "app/SourcesiOS/iOSRootView.swift"]
         for path in paths {
             let source = try String(contentsOfFile: path, encoding: .utf8)
@@ -39,6 +56,6 @@ import Foundation
                      "the selected index must belong to the owner-filtered candidate list")
         precondition(batch.contains("downloadCandidates.dropFirst(selected.index + 1)"),
                      "transfer retry must use that same list and not resurrect earlier resolution failures")
-        print("PASS production release priority/comparator, provenance wiring, binge/preload/CW/batch fallback opt-in")
+        print("PASS production release priority/comparator, quality floor, provenance wiring, binge/preload/CW/batch fallback opt-in")
     }
 }

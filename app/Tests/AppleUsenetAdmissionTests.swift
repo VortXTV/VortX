@@ -92,6 +92,13 @@ extension StreamRanking {
         let localExpected = true
         let label = "mobile Full"
         #endif
+        // Add-ons such as Debridio put the file name and size in the older `title` field.
+        let titled = try stream(["url": "https://fixture.invalid/a.mkv", "name": "Debridio 1080p", "title": "Movie.2020.1080p.mkv 2.1 GB"])
+        check("\(label) stream details fall back to the older title field", titled.description == "Movie.2020.1080p.mkv 2.1 GB")
+        let described = try stream(["url": "https://fixture.invalid/a.mkv", "description": "Details", "title": "Older"])
+        check("\(label) a present description still wins", described.description == "Details")
+        let blank = try stream(["url": "https://fixture.invalid/a.mkv", "description": "  ", "title": "Older"])
+        check("\(label) a blank description falls back to the title", blank.description == "Older")
         let saved = try stream(["nzbUrl": "https://fixture.invalid/episode.nzb"])
         let addon = try stream(["nzbUrls": ["https://fixture.invalid/episode.nzb"],
                                 "servers": ["nntps://fixture:synthetic@news.invalid:563/4"]])

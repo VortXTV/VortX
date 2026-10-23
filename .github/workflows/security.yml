@@ -1,11 +1,10 @@
 name: Security Audit (Rust)
 
-# Gates the Rust dependency tree on security advisories via cargo-deny, using the root deny.toml
-# policy. Real `vulnerability`-class advisories and yanked crates fail CI; documented, non-actionable
-# transitive advisories (Tauri's Linux GTK3 stack, the stremio-core engine tree) are accepted in
-# deny.toml. Auditing the desktop crate covers BOTH the Tauri stack and the embedded stremio-core
-# engine, since desktop/src-tauri depends on stremio-core. Runs weekly so newly-published advisories
-# against unchanged dependencies are caught even with no code change.
+# Read the committed Rust lockfile directly: manifest resolution would fetch the private engine
+# in this deliberately secretless PR job. Vulnerabilities, yanked crates and unsound advisories
+# fail; only the existing exact deny.toml exception is retained. No compilation/private fetch.
+# This audits the desktop lockfile's resolved registry graph, not the different shipping Apple /
+# Android engine graph. The protected native source/package gates remain separate.
 
 on:
   push:
@@ -14,6 +13,8 @@ on:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
       - "deny.toml"
+      - "scripts/check-rust-audit-policy.py"
+      - "scripts/tests/test_rust_audit_policy.py"
       - ".github/workflows/security.yml"
   pull_request:
     branches: [main, beta]
@@ -21,6 +22,8 @@ on:
       - "**/Cargo.lock"
       - "**/Cargo.toml"
       - "deny.toml"
+      - "scripts/check-rust-audit-policy.py"
+      - "scripts/tests/test_rust_audit_policy.py"
       - ".github/workflows/security.yml"
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
@@ -40,12 +43,44 @@ jobs:
         with:
           toolchain: 1.97.1
 
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+      - name: Install pinned cargo-audit
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: cargo-deny
+          tool: cargo-audit@0.22.2
 
-      # cargo-deny walks up from the manifest to find the root deny.toml. Auditing the desktop crate
-      # covers the Tauri Linux stack + the embedded stremio-core engine tree in one pass.
-      - name: Rust advisory audit
-        run: cargo deny --manifest-path desktop/src-tauri/Cargo.toml check advisories
+      - name: Rust lockfile advisory audit without private source resolution
+        run: |
+          set -euo pipefail
+          test -s desktop/src-tauri/Cargo.lock
+          # Keep the narrowly documented waiver synchronized; never silently add another.
+          python3 - <<'PY'
+          import pathlib, tomllib
+          policy = tomllib.loads(pathlib.Path("deny.toml").read_text())
+          assert policy["advisories"]["ignore"] == ["RUSTSEC-2024-0429"]
+          assert policy["advisories"]["yanked"] == "deny"
+          PY
+          report="$RUNNER_TEMP/cargo-audit.json"
+          set +e
+          cargo audit --file desktop/src-tauri/Cargo.lock --format json \
+            --deny yanked --deny unsound --ignore RUSTSEC-2024-0429 > "$report"
+          status=$?
+          set -e
+          test -s "$report"
+          jq -e 'type == "object" and has("vulnerabilities")' "$report" >/dev/null
+          cat "$report"
+          set +e
+          python3 scripts/check-rust-audit-policy.py \
+            --manifest desktop/src-tauri/Cargo.toml --policy deny.toml --report "$report"
+          policy_status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then status="$policy_status"; fi
+          exit "$status"
+
+      - name: Retain the actual lockfile advisory report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Rust-lockfile-advisories
+          path: ${{ runner.temp }}/cargo-audit.json
+          if-no-files-found: error
+          retention-days: 90

@@ -9,9 +9,8 @@ import Foundation
 /// process runs and CLASSIFIED on the next launch, then folded into the exportable probe log.
 ///
 /// Split mirrors VortXCrashReporter: writes are cheap bounded JSON (atomic replace, no growth);
-/// classification is pure and unit-tested in the harness; folding respects VXProbe.enabled like the
-/// crash fold does (receipt is preserved, never deleted, when diagnostics is off so a later
-/// diagnostics-on launch can still report it).
+/// classification and current-process transitions are pure and unit-tested in the harness. Folding
+/// respects VXProbe.enabled; a new process always starts a fresh receipt after inspecting the prior one.
 enum TerminationReceiptPolicy {
 
     /// Last-known session state persisted by the runtime helper.
@@ -26,6 +25,31 @@ enum TerminationReceiptPolicy {
             Receipt(startedAtEpoch: now, lastHeartbeatEpoch: now,
                     lastPhase: TerminationReceiptPolicy.phaseActive,
                     lastMemoryWarningEpoch: nil, lastMemoryWarningFootprintMB: nil)
+        }
+    }
+
+    /// Process-local state. Never seed this from the prior process's receipt: that receipt is
+    /// evidence to fold, not this process's start time or memory-warning history.
+    struct Session {
+        private(set) var receipt: Receipt
+
+        init(now: TimeInterval) { receipt = .initial(now: now) }
+
+        mutating func note(phase: String, now: TimeInterval) {
+            guard receipt.lastPhase != phaseTerminating else { return }
+            receipt.lastPhase = phase
+            receipt.lastHeartbeatEpoch = now
+        }
+
+        mutating func heartbeat(now: TimeInterval) {
+            guard receipt.lastPhase != phaseTerminating else { return }
+            receipt.lastHeartbeatEpoch = now
+        }
+
+        mutating func memoryWarning(now: TimeInterval, footprintMB: Int64) {
+            guard receipt.lastPhase != phaseTerminating else { return }
+            receipt.lastMemoryWarningEpoch = now
+            receipt.lastMemoryWarningFootprintMB = footprintMB
         }
     }
 
@@ -50,11 +74,11 @@ enum TerminationReceiptPolicy {
     /// Classify how the PRIOR run ended. Pure so the harness can pin every branch.
     static func classify(receipt: Receipt?, crashMarkerExists: Bool, now: TimeInterval) -> Decision {
         guard let r = receipt else { return .firstRun }
-        if r.lastPhase == phaseTerminating { return .cleanExit }
         if crashMarkerExists {
             // A crash marker wins over phase heuristics: the signal handler observed the death.
             return .crash
         }
+        if r.lastPhase == phaseTerminating { return .cleanExit }
         guard now - r.lastHeartbeatEpoch <= staleAfterSeconds else { return .staleUncertain }
         if r.lastPhase == phaseBackground || r.lastPhase == phaseInactive {
             return .likelyJetsamWhileBackgrounded
@@ -73,9 +97,9 @@ enum TerminationReceiptPolicy {
         case .crash:
             return "prior run ended in a captured crash"
         case .likelyJetsamWhileBackgrounded:
-            return evidence("terminated while backgrounded (likely jetsam)", receipt)
+            return evidence("terminated while backgrounded without a crash marker (cause uncertain)", receipt)
         case .likelyForegroundKill:
-            return evidence("terminated while foregrounded without a crash marker (watchdog or jetsam)", receipt)
+            return evidence("terminated while foregrounded without a crash marker (cause uncertain)", receipt)
         case .staleUncertain:
             return "stale prior-session receipt, cause uncertain"
         }

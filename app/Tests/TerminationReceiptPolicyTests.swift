@@ -35,6 +35,10 @@ enum TerminationReceiptPolicyTests {
         boundaryExpiryIsStaleNotAttributed()
         summariesCarryEvidenceFields()
         summaryLinesAreStable()
+        aFreshSessionDoesNotReuseHistoricalEvidence()
+        heartbeatPreservesTheLastScenePhase()
+        intentionalTerminationIgnoresLateCallbacks()
+        capturedCrashWinsOverIntentionalTermination()
         print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
         if failures > 0 { exit(1) }
     }
@@ -114,7 +118,7 @@ enum TerminationReceiptPolicyTests {
         r.lastMemoryWarningEpoch = 250
         r.lastMemoryWarningFootprintMB = 1400
         let line = TerminationReceiptPolicy.summaryLine(.likelyJetsamWhileBackgrounded, receipt: r)
-        check("the jetsam summary names the cause", line.contains("(likely jetsam)"))
+        check("a receipt alone leaves the termination cause uncertain", line.contains("(cause uncertain)") && !line.contains("likely jetsam"))
         check("the jetsam summary carries session runtime", line.contains("session ran"))
         check("the jetsam summary carries the last phase", line.contains("last phase background"))
         check("the jetsam summary carries the memory warning snapshot",
@@ -133,4 +137,51 @@ enum TerminationReceiptPolicyTests {
         check("stale line",
               TerminationReceiptPolicy.summaryLine(.staleUncertain, receipt: nil) == "stale prior-session receipt, cause uncertain")
     }
+    static func aFreshSessionDoesNotReuseHistoricalEvidence() {
+        var prior = TerminationReceiptPolicy.Receipt.initial(now: 1)
+        prior.lastHeartbeatEpoch = 50_000
+        prior.lastPhase = TerminationReceiptPolicy.phaseBackground
+        prior.lastMemoryWarningEpoch = 49_000
+        prior.lastMemoryWarningFootprintMB = 1400
+        let preserved = prior
+        let folded = TerminationReceiptPolicy.summaryLine(.likelyJetsamWhileBackgrounded, receipt: prior)
+        var current = TerminationReceiptPolicy.Session(now: 50_100)
+        current.heartbeat(now: 50_160)
+        check("prior receipt remains available unchanged for folding", prior == preserved && folded.contains("49999s"))
+        check("new process starts its own uptime", current.receipt.startedAtEpoch == 50_100 && current.receipt.lastHeartbeatEpoch == 50_160)
+        check("new process does not inherit memory-warning evidence", current.receipt.lastMemoryWarningEpoch == nil && current.receipt.lastMemoryWarningFootprintMB == nil)
+        check("new process starts active", current.receipt.lastPhase == TerminationReceiptPolicy.phaseActive)
+    }
+
+    static func heartbeatPreservesTheLastScenePhase() {
+        var current = TerminationReceiptPolicy.Session(now: 100)
+        for phase in [TerminationReceiptPolicy.phaseInactive, TerminationReceiptPolicy.phaseBackground, TerminationReceiptPolicy.phaseActive] {
+            current.note(phase: phase, now: 101)
+            current.heartbeat(now: 160)
+            check("heartbeat retains scene phase " + phase, current.receipt.lastPhase == phase && current.receipt.lastHeartbeatEpoch == 160)
+        }
+        current.memoryWarning(now: 170, footprintMB: 321)
+        check("memory warnings belong to the current process", current.receipt.lastMemoryWarningEpoch == 170 && current.receipt.lastMemoryWarningFootprintMB == 321)
+    }
+
+    static func intentionalTerminationIgnoresLateCallbacks() {
+        var current = TerminationReceiptPolicy.Session(now: 100)
+        current.memoryWarning(now: 110, footprintMB: 321)
+        current.note(phase: TerminationReceiptPolicy.phaseTerminating, now: 120)
+        let terminated = current.receipt
+        current.heartbeat(now: 180)
+        current.note(phase: TerminationReceiptPolicy.phaseActive, now: 181)
+        current.note(phase: TerminationReceiptPolicy.phaseInactive, now: 182)
+        current.note(phase: TerminationReceiptPolicy.phaseBackground, now: 183)
+        current.memoryWarning(now: 184, footprintMB: 999)
+        check("late heartbeat, scene and warning callbacks cannot rewrite intentional exit", current.receipt == terminated)
+        check("intentional restart classifies cleanly without a crash", TerminationReceiptPolicy.classify(receipt: current.receipt, crashMarkerExists: false, now: 185) == .cleanExit)
+    }
+
+    static func capturedCrashWinsOverIntentionalTermination() {
+        var current = TerminationReceiptPolicy.Session(now: 100)
+        current.note(phase: TerminationReceiptPolicy.phaseTerminating, now: 120)
+        check("a crash observed after exit intent is still a captured crash", TerminationReceiptPolicy.classify(receipt: current.receipt, crashMarkerExists: true, now: 121) == .crash)
+    }
+
 }

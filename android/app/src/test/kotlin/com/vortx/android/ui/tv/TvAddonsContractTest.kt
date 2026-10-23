@@ -33,7 +33,6 @@ class TvAddonsContractTest {
     @Test
     fun `TV move controls use the shared reorder path and stable URL focus`() {
         val addons = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvAddonsScreen.kt")
-        val repository = readProjectFile("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt")
         assertTrue(addons.contains("latestInstalled.map(InstalledAddon::transportUrl)"))
         assertTrue(addons.contains("tvAddonMove(latestUrls, transportUrl, direction)"))
         assertTrue(addons.contains("viewModel.applyOrder(result.order)"))
@@ -41,8 +40,6 @@ class TvAddonsContractTest {
         assertTrue(addons.contains("FocusRequester()"))
         assertTrue(addons.contains("enabled = canMoveUp"))
         assertTrue(addons.contains("enabled = canMoveDown"))
-        assertTrue(repository.contains("addonPrefs.setAppliedOrder(transportUrls)"))
-        assertTrue(repository.contains("changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))"))
     }
 
     @Test

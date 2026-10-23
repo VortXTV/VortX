@@ -4,8 +4,8 @@ import com.vortx.android.engine.NativeProfileOverlayWitness
 import java.math.BigDecimal
 import org.json.JSONObject
 
-/** The worker accepts strictly newer versions, not an arbitrary client's base CAS. A candidate
- * derived from base N must therefore use N+1 so concurrent candidates collide and re-merge.
+/** A witnessed worker write requires the candidate's exact GET base and its successor revision.
+ * A candidate derived from base N uses N+1; authenticated absence uses create-only revision zero.
  * Wall time, local high-water marks, and a rejected PUT's echo are never candidate authority. */
 internal object BackupRevisionPolicy {
     const val MAX_VERSION = 9_007_199_254_740_991L

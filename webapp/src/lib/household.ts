@@ -15,6 +15,7 @@
 //   5. Leave (self) / the household re-keys so the leaver reads nothing new.
 import {
   type Session,
+  captureSessionOwnership,
   householdStatus,
   householdBlobGet,
   householdKeyRequest,
@@ -27,13 +28,29 @@ import {
   mutateSyncDoc,
   type HouseholdStatus,
 } from "./vault";
-import { currentSession } from "./account";
+import { currentSession, subscribe } from "./account";
 import { addAddon } from "./store";
 import { updateSettings, getSettings } from "./settings";
 
 const FAM_API = "https://api.vortx.tv";
 const te = new TextEncoder();
 const td = new TextDecoder();
+
+// Keep the consent action bound to the account/key/token that started it, including an
+// intervening sign-out or account switch that later returns to the original session.
+function captureSession(session: Session): { isCurrent: () => boolean; dispose: () => void } {
+  const accountId = session.account.id, token = session.token, dataKey = session.dataKey.slice();
+  const owns = captureSessionOwnership(session);
+  let valid = true;
+  const matches = (candidate: Session | null): boolean => !!candidate && candidate.account.id === accountId
+    && candidate.token === token && candidate.dataKey.length === dataKey.length
+    && dataKey.every((byte, index) => candidate.dataKey[index] === byte);
+  const dispose = subscribe((candidate) => { if (!matches(candidate)) valid = false; });
+  return { isCurrent: () => valid && matches(currentSession()) && owns(), dispose };
+}
+function requireCurrent(isCurrent: () => boolean): void {
+  if (!isCurrent()) throw new Error("Account changed while accepting shared content. Please try again.");
+}
 
 // --- The shared blob shape (matches the spec + the dashboard's SharedJSON exactly) -----------------
 export interface SharedAddon { transportUrl: string; name?: string; contributorAccountId: string; }
@@ -253,23 +270,27 @@ export async function snapshot(): Promise<HouseholdSnapshot> {
 export async function acceptShared(channel: Channel): Promise<boolean> {
   const session = currentSession();
   if (!session) return false;
-  let st: HouseholdStatus | null;
-  try { st = await householdStatus(session); } catch { return false; }
-  if (!st || !st.hasBlob || st.hhKeyVersion <= 0) return false;
-  const hhKey = await recoverOwnHhKey(session, st.hhKeyVersion);
-  if (!hhKey) return false;
-  const shared = await loadSharedBlob(session, hhKey);
-  if (!shared) return false;
-  const acct = session.account.id;
+  const action = captureSession(session);
+  try {
+    let st: HouseholdStatus | null;
+    try { st = await householdStatus(session); } catch { return false; }
+    if (!action.isCurrent() || !st || !st.hasBlob || st.hhKeyVersion <= 0) return false;
+    const hhKey = await recoverOwnHhKey(session, st.hhKeyVersion);
+    if (!action.isCurrent() || !hhKey) return false;
+    const shared = await loadSharedBlob(session, hhKey);
+    if (!action.isCurrent() || !shared) return false;
+    const fp = await fingerprint(channel === "content" ? contentPayload(shared) : debridPayload(shared));
+    if (!action.isCurrent()) return false;
 
-  if (channel === "content") {
-    acceptConsent("content", await fingerprint(contentPayload(shared)), acct);
-    await applyContent(shared);
-  } else {
-    acceptConsent("debrid", await fingerprint(debridPayload(shared)), acct);
-    applyDebrid(shared);
+    if (channel === "content") await applyContent(shared, action.isCurrent);
+    else await applyDebrid(session, shared, action.isCurrent);
+    if (!action.isCurrent()) return false;
+    // The consent receipt follows the actual adoption, including an explicitly accepted PUT.
+    acceptConsent(channel, fp, session.account.id);
+    return true;
+  } finally {
+    action.dispose();
   }
-  return true;
 }
 
 /** Stop adopting NEW shared content on a channel (already-adopted content stays; install-only). */
@@ -280,10 +301,16 @@ export function declineShared(channel: Channel): void {
 
 /** Apply shared add-ons (install-only) + metadata keys (only when we hold none). Library merge is the app's
  *  job (engine-backed); the web app installs add-ons + adopts metadata keys it can use. */
-async function applyContent(shared: SharedJSON): Promise<void> {
+async function applyContent(shared: SharedJSON, isCurrent: () => boolean): Promise<void> {
   for (const a of shared.addOns) {
-    try { await addAddon(a.transportUrl); } catch { /* a single bad manifest never blocks the rest */ }
+    requireCurrent(isCurrent);
+    try { await addAddon(a.transportUrl, isCurrent); }
+    catch {
+      requireCurrent(isCurrent); // a departed account stops the whole action
+      // A single bad manifest never blocks the remaining shared add-ons.
+    }
   }
+  requireCurrent(isCurrent);
   const cur = getSettings();
   const patch: Record<string, string> = {};
   if (shared.metadataKeys.tmdb && !cur.tmdbKey) patch.tmdbKey = shared.metadataKeys.tmdb;
@@ -294,9 +321,8 @@ async function applyContent(shared: SharedJSON): Promise<void> {
 /** Apply shared debrid keys. The web app's Settings has no debrid field of its own yet, so adopted keys ride
  *  in the account doc (doc.apiKeys.rd/ad/pm/torbox) so the apps + dashboard pick them up; the web app does
  *  not create torrents itself. Install-only: never overwrites a key the account already holds. */
-async function applyDebrid(shared: SharedJSON): Promise<void> {
-  const session = currentSession();
-  if (!session) return;
+async function applyDebrid(session: Session, shared: SharedJSON, isCurrent: () => boolean): Promise<void> {
+  requireCurrent(isCurrent);
   const map: Record<string, string> = {};
   for (const k of ["rd", "ad", "pm", "torbox"] as const) {
     const entry = shared.debridKeys[k];
@@ -308,7 +334,7 @@ async function applyDebrid(shared: SharedJSON): Promise<void> {
     const next = { ...keys };
     for (const [k, v] of Object.entries(map)) if (!next[k]) next[k] = v; // install-only
     doc.apiKeys = next;
-  });
+  }, isCurrent);
 }
 
 /** Member: request the household key + poll once for the owner's answer (a single tick; the Settings view

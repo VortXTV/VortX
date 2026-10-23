@@ -62,12 +62,12 @@ object TraktAuth {
     private const val TAG = "TraktAuth"
 
     @Volatile private var tokenStore: TokenPersistence? = null
-    private val tokenMutations = CredentialMutationCoordinator(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderCredentials.GROUPS[0] else null)
+    private val tokenMutations = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0])
     private val sessionEpoch = AtomicLong(0L)
     private val _sessionBoundary = MutableStateFlow(0L)
 
     /** Changes after a confirmed sign-in replacement or disconnect so mounted Home rails reconcile now. */
-    internal val sessionBoundary: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _sessionBoundary.asStateFlow()
+    internal val sessionBoundary: StateFlow<Long> get() = NativeProviderAccess.revision
 
     /// A single in-flight refresh serializer. Trakt rotates the refresh token on every refresh, so two
     /// concurrent refreshes would race and the loser 401s on an already-spent token, dropping the session.
@@ -80,7 +80,7 @@ object TraktAuth {
         if (tokenStore == null) {
             synchronized(this) {
                 if (tokenStore == null) {
-                    tokenStore = TokenPersistence(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.oauthStore("trakt") else SecureTokenStore(context, PREFS_FILE), ::nowSeconds)
+                    tokenStore = TokenPersistence(NativeProviderAccess.oauthStore("trakt"), ::nowSeconds)
                 }
             }
         }
@@ -405,8 +405,8 @@ object TraktAuth {
         _sessionBoundary.value = next
     }
 
-    private fun currentSessionEpoch(): Long = if (BuildConfig.NATIVE_ENGINE_ENABLED)
-        NativeProviderAccess.read(NativeProviderCredentials.GROUPS[0])?.revision ?: -1 else sessionEpoch.get()
+    private fun currentSessionEpoch(): Long =
+        NativeProviderAccess.read(NativeProviderCredentials.GROUPS[0])?.revision ?: -1
 
     internal class TokenPersistence(
         private val store: CredentialStoreAccess,

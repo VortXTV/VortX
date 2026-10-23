@@ -27,6 +27,9 @@ fi
 STAGE="$ROOT/platforms/$PLATFORM/.stage"
 OUT="$ROOT/platforms/$PLATFORM/out"
 
+# Read the shared webapp's real engine requirements before building or replacing a stage.
+node "$ROOT/platforms/stage-security.mjs" --check-runtime "$WEBAPP/package.json" "$(npm --version)"
+
 echo "==> Building the webapp (shared with the web target)"
 ( cd "$WEBAPP" && npm run build )
 
@@ -34,6 +37,9 @@ echo "==> Staging $PLATFORM app at $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$OUT"
 cp -R "$DIST"/. "$STAGE"/
+# Pages _headers are not HTTP responses in a packaged TV app. Carry the same CSP
+# into the staged document before any executable or resource element is parsed.
+node "$ROOT/platforms/stage-security.mjs" "$STAGE" "$WEBAPP/public/_headers"
 
 if [[ "$PLATFORM" == "webos" ]]; then
   cp "$ROOT/platforms/webos/appinfo.json" "$STAGE/appinfo.json"

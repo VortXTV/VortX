@@ -139,16 +139,25 @@ enum UsenetProviderStore {
 /// `test/server-nntp.test.js`). Local routing therefore submits the user's enabled servers in priority
 /// order as ONE saved-route create instead of blindly re-downloading the NZB once per server.
 enum UsenetLocalResolver {
+    /// The last local route's fixed failure reason, written from the routed create closure.
+    private final class LastFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+        var reason: String? { lock.withLock { value } }
+        func record(_ reason: String) { lock.withLock { value = reason } }
+    }
+
     enum ResolveError: Error, Equatable {
         case unavailable          // compiled out (Lite) or no usable servers
         case createFailed(Int)    // engine could not start the stream (e.g. segments missing) -> clear failure
         case badResponse          // engine answered without a usable key
+        case attemptsFailed(String) // every local route failed; the last route's fixed reason code
     }
 
-    /// Bounded network budget. An NZB fetch + first/last segment probe over a working provider settles in a
-    /// few seconds, and a source that cannot stream 5xx-fails fast; this ceiling only guards a stalled
-    /// provider so a play tap can never hang.
-    static let requestTimeout: TimeInterval = 20
+    /// Bounded network budget, just above the engine's own 30 s preparation window (NZB fetch plus a probe
+    /// of every volume) so the engine's typed timeout arrives instead of a client-side cut-off. A source that
+    /// cannot stream 5xx-fails fast; this ceiling only guards a stalled provider so a tap can never hang.
+    static let requestTimeout: TimeInterval = 35
 
     struct RoutedStream: Sendable {
         let url: URL
@@ -182,7 +191,6 @@ enum UsenetLocalResolver {
 
     struct NativeOwner: Sendable {
         let credential: CredentialScopeRegistry.Capture
-        let requiresNativeAuthority: Bool
         let isCurrent: @Sendable () async -> Bool
 
         func validate() async throws {
@@ -202,10 +210,9 @@ enum UsenetLocalResolver {
     @MainActor
     static func captureNativeOwner() -> NativeOwner {
         let credential = CredentialScopeRegistry.shared.capture()
-        let requiresNativeAuthority = StremioServer.nativeTransportSelected
         let check = nativeOwnerCheck(capture: credential)
         let coherent = CredentialScopeRegistry.shared.isCurrent(credential)
-        return NativeOwner(credential: credential, requiresNativeAuthority: requiresNativeAuthority,
+        return NativeOwner(credential: credential,
                            isCurrent: {
                                guard coherent else { return false }
                                return await check()
@@ -245,23 +252,49 @@ enum UsenetLocalResolver {
         configuration.timeoutIntervalForResource = requestTimeout
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
+        let lastFailure = LastFailure()
 
         // This is the same serial/cancellation policy exercised by the injected transport regression test.
         guard let (route, created) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
             let started = Date()
-            do {
-                let result = try await UsenetNodeClient.createStream(
+            func elapsed() -> Int { Int(Date().timeIntervalSince(started) * 1000) }
+            func create(_ chosen: UsenetNodeClient.Selection) async throws -> UsenetNodeClient.CreatedStream {
+                try await UsenetNodeClient.createStream(
                     endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout,
-                    selection: selection, ownerIsCurrent: ownerIsCurrent
+                    selection: chosen, ownerIsCurrent: ownerIsCurrent
                 )
-                onAttempt(attempt.route, "ready", Int(Date().timeIntervalSince(started) * 1000))
+            }
+            do {
+                let result: UsenetNodeClient.CreatedStream
+                do {
+                    result = try await create(selection)
+                } catch let miss as UsenetNodeClient.ClientError where miss.isEpisodeSelectionMiss {
+                    // Our episode numbers matched no file. Follow the add-on's own file pattern first (its
+                    // episode mapping, e.g. an anime pack numbered differently from the catalogue), then the
+                    // episode's absolute number, which is how most anime is released.
+                    var retried: UsenetNodeClient.CreatedStream?
+                    if miss == .selectionUnmatched, let addonOnly = selection.addonPatternOnly {
+                        onAttempt(attempt.route, "selection_unmatched_retry_addon_pattern", elapsed())
+                        do { retried = try await create(addonOnly) }
+                        catch let again as UsenetNodeClient.ClientError where again.isEpisodeSelectionMiss { retried = nil }
+                    }
+                    if retried == nil, let absolute = selection.absoluteNumberRetry {
+                        onAttempt(attempt.route, "selection_retry_absolute_episode", elapsed())
+                        retried = try await create(absolute)
+                    }
+                    guard let retried else { throw miss }
+                    result = retried
+                }
+                onAttempt(attempt.route, "ready", elapsed())
                 return result
             } catch {
-                onAttempt(attempt.route, UsenetNodeClient.failureReason(error), Int(Date().timeIntervalSince(started) * 1000))
+                let reason = UsenetNodeClient.failureReason(error)
+                lastFailure.record(reason)
+                onAttempt(attempt.route, reason, elapsed())
                 throw error
             }
         }) else {
-            throw ResolveError.badResponse
+            throw ResolveError.attemptsFailed(lastFailure.reason ?? "resolver_error")
         }
         return RoutedStream(url: created.url, route: route, nativeLease: created.lease)
         #endif
@@ -271,9 +304,6 @@ enum UsenetLocalResolver {
     /// E+1 preparation, or a source-list refresh is not an account or playback-owner retirement.
     @MainActor
     static func nativeOwnerCheck(capture: CredentialScopeRegistry.Capture) -> @Sendable () async -> Bool {
-        guard StremioServer.nativeTransportSelected else {
-            return { CredentialScopeRegistry.shared.isCurrent(capture) }
-        }
         let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
         let profileID = ProfileStore.shared.activeID
         return { @MainActor in
