@@ -1,4 +1,7 @@
 import Foundation
+import os
+
+// PRODUCTION_HOME_PROFILE_SELECTION_READ
 
 // Shadow Foundation's persistence API with RAM only. These executable fixtures cannot
 // edit the installed app's UserDefaults, Keychain, credentials, or watch-history cache.
@@ -57,17 +60,44 @@ final class CoreBridge {
     }
 }
 
-final class ProfileStore {
+@MainActor final class ProfileStore {
     static let shared = ProfileStore()
-    var activeID: UUID?
-    var activeUsesEngineHistory = true
+    var profiles: [UserProfile] = [] {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    var activeID: UUID? {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    private var unboundFixtureEligibility = true
+    var activeUsesEngineHistory: Bool {
+        get { active?.usesEngineHistory ?? unboundFixtureEligibility }
+        set {
+            unboundFixtureEligibility = newValue
+            if var profile = active { profile.usesEngineHistory = newValue; active = profile }
+        }
+    }
     var cwItems: [CoreCWItem] = []
-    var active: UserProfile?
+    var active: UserProfile? {
+        get { profiles.first { $0.id == activeID } }
+        set {
+            if let profile = newValue {
+                if let index = profiles.firstIndex(where: { $0.id == profile.id }) { profiles[index] = profile }
+                else { profiles.append(profile) }
+            } else if let id = activeID { profiles.removeAll { $0.id == id } }
+        }
+    }
+    private init() { ProfileSelectionRead.publishInitial(selectionReadSnapshot()) }
+    // PRODUCTION_HOME_PROFILE_SELECTION_PROJECTOR
 }
 struct UserProfile: Equatable {   // Equatable like the real profile (applyNativeProfiles compares rosters)
     struct PlaybackPrefs: Equatable {}
     let id: UUID
     var usesEngineHistory: Bool = true
+    // Compatibility with the real scalar projector; old fixtures model eligibility as one flag.
+    var isOwner: Bool { usesEngineHistory }
+    var usesOwnAccount: Bool { false }
     var discovery: ProfileDiscoveryPreferences? = nil
     var playback: PlaybackPrefs? = nil
     var addonPreferences: ProfileAddonPreferences? = nil

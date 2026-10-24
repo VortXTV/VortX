@@ -1,4 +1,5 @@
 import Foundation
+import os
 #if canImport(AppKit)
 import AppKit
 #elseif canImport(UIKit)
@@ -372,22 +373,20 @@ final class ScrubThumbnailsStore: ObservableObject {
         pendingLocalReadLease = lease
         pendingLocalReadToken = token
         Self.localFrameCache.imageAsync(for: key, time: time, lease: lease) { [weak self] resolved in
-            Task { @MainActor in
-                guard let self,
-                      self.pendingLocalReadLease === lease,
-                      TrickplayPreviewReadGate.accepts(
-                          requestToken: token,
-                          requestMediaKey: key,
-                          currentToken: self.showToken,
-                          currentMediaKey: self.localCacheKey
-                      ), self.pendingLocalReadToken == token else { return }
-                self.pendingLocalReadToken = nil
-                self.pendingLocalReadLease = nil
-                if resolved == nil, let fallback = self.nearestCommunityFallback() {
-                    self.image = fallback; self.previewState = .ready
-                } else {
-                    self.image = resolved; self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
-                }
+            guard let self,
+                  self.pendingLocalReadLease === lease,
+                  TrickplayPreviewReadGate.accepts(
+                      requestToken: token,
+                      requestMediaKey: key,
+                      currentToken: self.showToken,
+                      currentMediaKey: self.localCacheKey
+                  ), self.pendingLocalReadToken == token else { return }
+            self.pendingLocalReadToken = nil
+            self.pendingLocalReadLease = nil
+            if resolved == nil, let fallback = self.nearestCommunityFallback() {
+                self.image = fallback; self.previewState = .ready
+            } else {
+                self.image = resolved; self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
             }
         }
     }
@@ -694,158 +693,152 @@ final class ScrubThumbnailsStore: ObservableObject {
 
 // MARK: - Local frame cache
 
-private final class LocalTrickplayFrameCache {
-    private let bucketSeconds: Double = 2
-    private let maxLookbackBuckets = 180        // ~6 min back at 2 s per bucket
-    /// Radius for the last-resort BIDIRECTIONAL nearest search (both the resident scan and the disk scan below),
-    /// well beyond the at-or-before lookback so a scrub anywhere in a feature-length title still resolves to the
-    /// nearest captured frame. ~4.5 h at 2 s per bucket; the whole retained timeline sits far inside it.
-    private let maxNearestBuckets = 8100
-    private let ttl: TimeInterval = 48 * 3600
-    private let maxDiskBytes: Int64 = 256 * 1024 * 1024
-    private let ioQueue = DispatchQueue(label: "com.stremiox.trickplay.localcache", qos: .utility)
-    /// Bounded in-memory layer of decoded thumbnails. NSCache caps the resident count AND auto-evicts
-    /// under memory pressure (it observes the system memory warning), important on iOS, where this runs
-    /// in-process alongside the embedded streaming server and mpv's 4K decode buffers, so an UNBOUNDED
-    /// frame map (the original [String:[Int:ScrubImage]], which neither store nor image(for:) ever pruned)
-    /// would add straight onto the jetsam pressure. Anything evicted stays on disk and re-decodes on demand.
-    private let memory: NSCache<NSString, ScrubImage> = {
-        let cache = NSCache<NSString, ScrubImage>()
-        #if os(iOS) || os(tvOS)
-        cache.countLimit = 40    // ~40 resident thumbnails; the embedded server shares this app's budget
+private enum LocalTrickplayFramePolicy {
+    static let bucketSeconds: Double = 2
+    static let maxLookbackBuckets = 180        // ~6 min back at 2 s per bucket
+    static let maxNearestBuckets = 8100        // ~4.5 h, preserving the full-range nearest fallback
+    static let ttl: TimeInterval = 48 * 3600
+    static let maxDiskBytes: Int64 = 256 * 1024 * 1024
+
+    static func bucketFor(_ time: Double) -> Int { Int(max(0, floor(time / bucketSeconds))) }
+}
+
+/// Immutable bucket admission from one main-actor resident snapshot. The worker never reads native images.
+private struct LocalTrickplayResidentPlan: Sendable {
+    let buckets: Set<Int>
+    let nearestBucket: Int?
+}
+
+/// Only SDK-owned CGImage and scalar presentation metadata cross back from the disk worker. Native image
+/// decode and macOS cgImage materialization both happen on the original utility queue, never on MainActor.
+private struct LocalTrickplayDecodedFrame: Sendable {
+    let image: CGImage
+    #if canImport(AppKit)
+    let size: CGSize
+    #else
+    let scale: CGFloat
+    let orientation: Int
+    #endif
+
+    static func decode(_ data: Data) -> Self? {
+        guard let decoded = ScrubImage(data: data) else { return nil }
+        #if canImport(AppKit)
+        guard let image = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return Self(image: image, size: decoded.size)
         #else
-        cache.countLimit = 240   // macOS server is a separate process, so the app can hold more
+        guard let image = decoded.cgImage else { return nil }
+        return Self(image: image, scale: decoded.scale, orientation: decoded.imageOrientation.rawValue)
         #endif
-        return cache
-    }()
-    private var lastPrune = Date.distantPast
+    }
 
-    /// Composite NSCache key for one stream's time bucket (`#` never appears in the base64 stream prefix).
-    private func memKey(_ key: String, _ bucket: Int) -> NSString { "\(key)#\(bucket)" as NSString }
+    @MainActor func makeImage() -> ScrubImage {
+        #if canImport(AppKit)
+        return ScrubImage(cgImage: image, size: size)
+        #else
+        return ScrubImage(cgImage: image, scale: scale,
+                          orientation: ScrubImage.Orientation(rawValue: orientation) ?? .up)
+        #endif
+    }
+}
 
-    private lazy var cacheDirectory: URL = {
+private enum LocalTrickplayReadResult: Sendable {
+    case resident(Int)
+    case decoded(bucket: Int, frame: LocalTrickplayDecodedFrame)
+    case missing
+    case cancelled
+}
+
+/// Checked scalar/URL state; the queue retains the original serialization of directory preparation, writes,
+/// reads and pruning. No disk operation, image decode or client callback runs while the state lock is held.
+private struct LocalTrickplayDiskWorker: Sendable {
+    private struct State: Sendable {
+        var directory: URL?
+        var lastPrune = Date.distantPast
+    }
+
+    private let state: OSAllocatedUnfairLock<State>
+    private let ioQueue = DispatchQueue(label: "com.stremiox.trickplay.localcache", qos: .utility)
+
+    init(directory: URL? = nil) {
+        state = OSAllocatedUnfairLock(initialState: State(directory: directory))
+    }
+
+    func prepare() {
+        ioQueue.async { _ = self.cacheDirectory() }
+    }
+
+    func store(data: Data, for key: String, bucket: Int, completion: @escaping @Sendable () -> Void) {
+        ioQueue.async {
+            let directory = self.cacheDirectory()
+            try? TrickplayFrameDiskStore(directory: directory).write(data, mediaKey: key, bucket: bucket)
+            self.pruneIfNeeded(directory: directory)
+            completion()
+        }
+    }
+
+    func read(for key: String, target: Int, resident: LocalTrickplayResidentPlan,
+              lease: TrickplayLocalReadLease,
+              completion: @escaping @Sendable (LocalTrickplayReadResult) -> Void) {
+        ioQueue.async {
+            guard !lease.isCancelled else { completion(.cancelled); return }
+            let diskStore = TrickplayFrameDiskStore(directory: self.cacheDirectory())
+            // 1) Preserve at-or-before priority, checking the admitted resident bucket before its disk file.
+            let minBucket = max(0, target - LocalTrickplayFramePolicy.maxLookbackBuckets)
+            for bucket in stride(from: target, through: minBucket, by: -1) {
+                guard !lease.isCancelled else { completion(.cancelled); return }
+                if resident.buckets.contains(bucket) {
+                    guard !lease.isCancelled else { completion(.cancelled); return }
+                    completion(.resident(bucket)); return
+                }
+                guard let data = diskStore.data(mediaKey: key, bucket: bucket) else { continue }
+                guard !lease.isCancelled else { completion(.cancelled); return }
+                guard let decoded = LocalTrickplayDecodedFrame.decode(data) else { continue }
+                guard !lease.isCancelled else { completion(.cancelled); return }
+                completion(.decoded(bucket: bucket, frame: decoded)); return
+            }
+            // 2) The full-range nearest resident is selected from live NSCache entries in one bounded
+            // snapshot, not 16,200 actor hops. Its higher-bucket tie wins exactly as in the original scan.
+            guard !lease.isCancelled else { completion(.cancelled); return }
+            if let bucket = resident.nearestBucket {
+                completion(.resident(bucket)); return
+            }
+            guard !lease.isCancelled else { completion(.cancelled); return }
+            if let hit = diskStore.nearest(mediaKey: key, targetBucket: target,
+                                            shouldContinue: { !lease.isCancelled }) {
+                guard !lease.isCancelled else { completion(.cancelled); return }
+                guard let decoded = LocalTrickplayDecodedFrame.decode(hit.data) else {
+                    guard !lease.isCancelled else { completion(.cancelled); return }
+                    completion(.missing); return
+                }
+                guard !lease.isCancelled else { completion(.cancelled); return }
+                completion(.decoded(bucket: hit.bucket, frame: decoded)); return
+            }
+            guard !lease.isCancelled else { completion(.cancelled); return }
+            completion(.missing)
+        }
+    }
+
+    private func cacheDirectory() -> URL {
+        if let directory = state.withLock({ $0.directory }) { return directory }
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let dir = base.appendingPathComponent("trickplay-local", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }()
-    private lazy var diskStore = TrickplayFrameDiskStore(directory: cacheDirectory)
-
-    init() {
-        ioQueue.async { _ = self.cacheDirectory }
+        let directory = base.appendingPathComponent("trickplay-local", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        state.withLock { $0.directory = directory }
+        return directory
     }
 
-    func store(image: ScrubImage, data: Data, for key: String, time: Double) {
-        let bucket = bucketFor(time)
-        ioQueue.async {
-            self.memory.setObject(image, forKey: self.memKey(key, bucket))
-            try? self.diskStore.write(data, mediaKey: key, bucket: bucket)
-            self.pruneIfNeeded()
-        }
-    }
-
-    /// Synchronous in-memory-only lookup: returns the nearest already-decoded thumbnail without ever touching
-    /// disk, so a warm scrub can resolve on the main thread with no I/O. Returns nil on a miss; the caller
-    /// then falls back to `imageAsync` for the off-thread read+decode.
-    func memoryImage(for key: String, time: Double) -> ScrubImage? {
-        let target = bucketFor(time)
-        let minBucket = max(0, target - maxLookbackBuckets)
-        for bucket in stride(from: target, through: minBucket, by: -1) {
-            if let cached = memory.object(forKey: memKey(key, bucket)) { return cached }
-        }
-        return nil
-    }
-
-    /// Synchronous BIDIRECTIONAL nearest-resident lookup, no disk: the closest already-decoded thumbnail in
-    /// EITHER direction, searched by expanding radius so the first hit is the nearest by time. This is what
-    /// serves a preview when the scrub is PAST what has been captured (a forward drag into not-yet-watched
-    /// territory, where the closest capture sits just behind the playhead and is still resident) or in a gap
-    /// wider than the at-or-before lookback. NSCache is thread-safe, so this is callable from the main actor
-    /// (instant warm path, bounded radius) and from `ioQueue` (full range). Returns nil when nothing for this
-    /// media is resident within `maxRadius` buckets of the scrub position.
-    func nearestResidentImage(for key: String, time: Double, maxRadius: Int,
-                              cancellation: TrickplayLocalReadLease? = nil) -> ScrubImage? {
-        if cancellation?.isCancelled == true { return nil }
-        let target = bucketFor(time)
-        if let hit = memory.object(forKey: memKey(key, target)) { return hit }
-        var radius = 1
-        while radius <= maxRadius {
-            if cancellation?.isCancelled == true { return nil }
-            if let hit = memory.object(forKey: memKey(key, target + radius)) { return hit }
-            let low = target - radius
-            if low >= 0, let hit = memory.object(forKey: memKey(key, low)) { return hit }
-            radius += 1
-        }
-        return nil
-    }
-
-    /// Bounded radius for the SYNCHRONOUS (main-thread) resident scan in `ScrubThumbnailsStore.show`, so a busy
-    /// scrub cannot spend more than a bounded handful of cache probes on the main actor even when nothing is
-    /// resident. Anything farther is left to the off-main `imageAsync` fallback (full range + disk). ~24 min.
-    var syncNearestRadius: Int { maxLookbackBuckets * 4 }
-
-    /// Off-main-thread read + JPEG decode of the nearest stored frame. Runs on the private `ioQueue` and calls
-    /// `completion` (also on `ioQueue`) with the decoded image or nil. Kept async so scrubbing never blocks the
-    /// main thread on a disk read + decode; the in-memory fast path is `memoryImage(for:)` above.
-    func imageAsync(for key: String, time: Double, lease: TrickplayLocalReadLease,
-                    completion: @escaping (ScrubImage?) -> Void) {
-        let target = bucketFor(time)
-        ioQueue.async {
-            guard !lease.isCancelled else { return }
-            // 1) At-or-before within the primary lookback: the accurate trickplay frame for this position.
-            let minBucket = max(0, target - self.maxLookbackBuckets)
-            for bucket in stride(from: target, through: minBucket, by: -1) {
-                guard !lease.isCancelled else { return }
-                if let cached = self.memory.object(forKey: self.memKey(key, bucket)) {
-                    guard !lease.isCancelled else { return }
-                    completion(cached); return
-                }
-                guard let data = self.diskStore.data(mediaKey: key, bucket: bucket) else { continue }
-                guard !lease.isCancelled else { return }
-                guard let decoded = ScrubImage(data: data) else { continue }
-                guard !lease.isCancelled else { return }
-                self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
-                completion(decoded)
-                return
-            }
-            // 2) FALLBACK: no frame at-or-before within the lookback, so serve the NEAREST captured frame in
-            //    either direction rather than "unavailable" (a scrub past what has been captured, or into a
-            //    gap). Try the resident set first (cheap, no I/O), then a one-shot directory scan for the
-            //    nearest frame that was evicted from memory but is still on disk.
-            guard !lease.isCancelled else { return }
-            if let resident = self.nearestResidentImage(for: key, time: time,
-                                                       maxRadius: self.maxNearestBuckets, cancellation: lease) {
-                guard !lease.isCancelled else { return }
-                completion(resident); return
-            }
-            guard !lease.isCancelled else { return }
-            if let hit = self.diskStore.nearest(mediaKey: key, targetBucket: target,
-                                                shouldContinue: { !lease.isCancelled }) {
-                guard !lease.isCancelled else { return }
-                guard let decoded = ScrubImage(data: hit.data) else {
-                    guard !lease.isCancelled else { return }
-                    completion(nil); return
-                }
-                guard !lease.isCancelled else { return }
-                self.memory.setObject(decoded, forKey: self.memKey(key, hit.bucket))
-                completion(decoded)
-                return
-            }
-            guard !lease.isCancelled else { return }
-            completion(nil)
-        }
-    }
-
-    private func bucketFor(_ time: Double) -> Int { Int(max(0, floor(time / bucketSeconds))) }
-
-    private func pruneIfNeeded() {
+    private func pruneIfNeeded(directory: URL) {
         let now = Date()
-        guard now.timeIntervalSince(lastPrune) > 600 else { return }
-        lastPrune = now
+        let shouldPrune = state.withLock { value in
+            guard now.timeIntervalSince(value.lastPrune) > 600 else { return false }
+            value.lastPrune = now
+            return true
+        }
+        guard shouldPrune else { return }
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
         guard let files = try? FileManager.default.contentsOfDirectory(
-            at: cacheDirectory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]
+            at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]
         ) else { return }
         var retained: [(url: URL, date: Date, size: Int64)] = []
         var total: Int64 = 0
@@ -854,18 +847,233 @@ private final class LocalTrickplayFrameCache {
                   vals.isRegularFile == true else { continue }
             let modified = vals.contentModificationDate ?? .distantPast
             let size = Int64(vals.fileSize ?? 0)
-            if now.timeIntervalSince(modified) > ttl { try? FileManager.default.removeItem(at: file); continue }
+            if now.timeIntervalSince(modified) > LocalTrickplayFramePolicy.ttl {
+                try? FileManager.default.removeItem(at: file); continue
+            }
             total += size
             retained.append((file, modified, size))
         }
-        if total > maxDiskBytes {
+        if total > LocalTrickplayFramePolicy.maxDiskBytes {
             for item in retained.sorted(by: { $0.date < $1.date }) {
-                if total <= maxDiskBytes { break }
+                if total <= LocalTrickplayFramePolicy.maxDiskBytes { break }
                 try? FileManager.default.removeItem(at: item.url)
                 total -= item.size
             }
         }
     }
+}
 
+/// This narrow actor owns only decoded-image residency and final delivery. Every actual caller already
+/// enters from ScrubThumbnailsStore on MainActor. File I/O and JPEG materialization stay in the serial worker.
+@MainActor
+private final class LocalTrickplayFrameCache {
+    private final class ResidentFrame {
+        let image: ScrubImage
+        init(_ image: ScrubImage) { self.image = image }
+    }
+
+    private final class WeakResidentFrame {
+        weak var value: ResidentFrame?
+        init(_ value: ResidentFrame) { self.value = value }
+    }
+
+    /// The metadata index holds no frame strongly: NSCache remains the only resident-frame owner, retaining
+    /// its original pressure eviction and 40/240 count budgets. Dead weak entries are compacted at insertion.
+    private var residentIndex: [String: [Int: WeakResidentFrame]] = [:]
+    private let memory: NSCache<NSString, ResidentFrame> = {
+        let cache = NSCache<NSString, ResidentFrame>()
+        #if os(iOS) || os(tvOS)
+        cache.countLimit = 40
+        #else
+        cache.countLimit = 240
+        #endif
+        return cache
+    }()
+    private let diskWorker: LocalTrickplayDiskWorker
+
+    /// Native images and client closures stay in this actor-owned FIFO. One operation completes publication
+    /// before its successor starts, preserving the original serial worker's read/store ordering without
+    /// assuming Task FIFO. In particular an older disk decode cannot overwrite a newer same-bucket capture.
+    private enum Operation {
+        case store(image: ScrubImage, data: Data, key: String, bucket: Int)
+        case read(key: String, target: Int, lease: TrickplayLocalReadLease,
+                  completion: @MainActor (ScrubImage?) -> Void)
+    }
+    private var operations: [Operation?] = []
+    private var operationHead = 0
+    private var operationInFlight = false
+
+    private func memKey(_ key: String, _ bucket: Int) -> NSString { "\(key)#\(bucket)" as NSString }
+
+    init(diskWorker: LocalTrickplayDiskWorker = LocalTrickplayDiskWorker()) {
+        self.diskWorker = diskWorker
+        diskWorker.prepare()
+    }
+
+    func store(image: ScrubImage, data: Data, for key: String, time: Double) {
+        let bucket = LocalTrickplayFramePolicy.bucketFor(time)
+        operations.append(.store(image: image, data: data, key: key, bucket: bucket))
+        startNextOperation()
+    }
+
+    private func insert(_ image: ScrubImage, for key: String, bucket: Int) {
+        residentIndex = residentIndex.compactMapValues { buckets in
+            let live = buckets.filter { $0.value.value != nil }
+            return live.isEmpty ? nil : live
+        }
+        let frame = ResidentFrame(image)
+        memory.setObject(frame, forKey: memKey(key, bucket))
+        residentIndex[key, default: [:]][bucket] = WeakResidentFrame(frame)
+    }
+
+    /// Synchronous in-memory-only lookup; bucket priority and the primary lookback are unchanged.
+    func memoryImage(for key: String, time: Double) -> ScrubImage? {
+        let target = LocalTrickplayFramePolicy.bucketFor(time)
+        let minBucket = max(0, target - LocalTrickplayFramePolicy.maxLookbackBuckets)
+        for bucket in stride(from: target, through: minBucket, by: -1) {
+            if let cached = memory.object(forKey: memKey(key, bucket)) { return cached.image }
+        }
+        return nil
+    }
+
+    /// Synchronous bounded warm path. Higher-bucket wins a bidirectional distance tie, as before.
+    func nearestResidentImage(for key: String, time: Double, maxRadius: Int,
+                              cancellation: TrickplayLocalReadLease? = nil) -> ScrubImage? {
+        if cancellation?.isCancelled == true { return nil }
+        let target = LocalTrickplayFramePolicy.bucketFor(time)
+        if let hit = memory.object(forKey: memKey(key, target)) { return hit.image }
+        var radius = 1
+        while radius <= maxRadius {
+            if cancellation?.isCancelled == true { return nil }
+            if let hit = memory.object(forKey: memKey(key, target + radius)) { return hit.image }
+            let low = target - radius
+            if low >= 0, let hit = memory.object(forKey: memKey(key, low)) { return hit.image }
+            radius += 1
+        }
+        return nil
+    }
+
+    var syncNearestRadius: Int { LocalTrickplayFramePolicy.maxLookbackBuckets * 4 }
+
+    private struct ResidentSnapshot {
+        let images: [Int: ScrubImage]
+        let plan: LocalTrickplayResidentPlan
+    }
+
+    private func residentSnapshot(for key: String, target: Int) -> ResidentSnapshot {
+        let minBucket = max(0, target - LocalTrickplayFramePolicy.maxLookbackBuckets)
+        var primary: [Int: ScrubImage] = [:]
+        var nearest: (bucket: Int, image: ScrubImage)?
+        for (bucket, reference) in residentIndex[key] ?? [:] {
+            guard reference.value != nil,
+                  let frame = memory.object(forKey: memKey(key, bucket)) else { continue }
+            if bucket <= target, bucket >= minBucket { primary[bucket] = frame.image }
+            let distance = abs(bucket - target)
+            guard distance <= LocalTrickplayFramePolicy.maxNearestBuckets else { continue }
+            if let current = nearest {
+                let currentDistance = abs(current.bucket - target)
+                guard distance < currentDistance || (distance == currentDistance && bucket > current.bucket) else { continue }
+            }
+            nearest = (bucket, frame.image)
+        }
+        var images = primary
+        if let nearest { images[nearest.bucket] = nearest.image }
+        return ResidentSnapshot(images: images, plan: LocalTrickplayResidentPlan(
+            buckets: Set(primary.keys), nearestBucket: nearest?.bucket
+        ))
+    }
+
+    /// One actor-owned receiver retains the original completion and admitted resident images until delivery.
+    /// The queue only captures its checked MainActor reference. An old lease cannot publish into a successor.
+    @MainActor
+    private final class ReadReceiver {
+        let cache: LocalTrickplayFrameCache
+        let key: String
+        let lease: TrickplayLocalReadLease
+        let snapshot: ResidentSnapshot
+        let completion: @MainActor (ScrubImage?) -> Void
+
+        init(cache: LocalTrickplayFrameCache, key: String, lease: TrickplayLocalReadLease,
+             snapshot: ResidentSnapshot, completion: @escaping @MainActor (ScrubImage?) -> Void) {
+            self.cache = cache; self.key = key; self.lease = lease
+            self.snapshot = snapshot; self.completion = completion
+        }
+
+        func complete(_ result: LocalTrickplayReadResult) {
+            guard !lease.isCancelled else { return }
+            switch result {
+            case .resident(let bucket):
+                completion(snapshot.images[bucket])
+            case .decoded(let bucket, let frame):
+                let image = frame.makeImage()
+                guard !lease.isCancelled else { return }
+                cache.insert(image, for: key, bucket: bucket)
+                completion(image)
+            case .missing:
+                completion(nil)
+            case .cancelled:
+                break
+            }
+        }
+    }
+
+    /// Disk and JPEG work stays off-main; only bounded residency and the one original UI completion are
+    /// actor-owned. The final hop occurs exactly once, not once for each primary or nearest-search bucket.
+    func imageAsync(for key: String, time: Double, lease: TrickplayLocalReadLease,
+                    completion: @escaping @MainActor (ScrubImage?) -> Void) {
+        let target = LocalTrickplayFramePolicy.bucketFor(time)
+        operations.append(.read(key: key, target: target, lease: lease, completion: completion))
+        startNextOperation()
+    }
+
+    private func startNextOperation() {
+        guard !operationInFlight else { return }
+        while let operation = takeNextOperation() {
+            switch operation {
+            case .store(let image, let data, let key, let bucket):
+                operationInFlight = true
+                insert(image, for: key, bucket: bucket)
+                diskWorker.store(data: data, for: key, bucket: bucket) {
+                    Task { @MainActor in self.finishOperation() }
+                }
+                return
+            case .read(let key, let target, let lease, let completion):
+                guard !lease.isCancelled else { continue }
+                operationInFlight = true
+                let snapshot = residentSnapshot(for: key, target: target)
+                let receiver = ReadReceiver(cache: self, key: key, lease: lease,
+                                            snapshot: snapshot, completion: completion)
+                diskWorker.read(for: key, target: target, resident: snapshot.plan, lease: lease) { result in
+                    Task { @MainActor in
+                        receiver.complete(result)
+                        self.finishOperation()
+                    }
+                }
+                return
+            }
+        }
+    }
+
+    private func takeNextOperation() -> Operation? {
+        guard operationHead < operations.count else {
+            operations.removeAll(keepingCapacity: true)
+            operationHead = 0
+            return nil
+        }
+        let operation = operations[operationHead]
+        operations[operationHead] = nil // Release retired native images and callbacks immediately.
+        operationHead += 1
+        // Amortized compaction: a cancelled scrub burst must not cause repeated O(n) main-actor shifts.
+        if operationHead >= 64, operationHead >= operations.count - operationHead {
+            operations.removeFirst(operationHead)
+            operationHead = 0
+        }
+        return operation
+    }
+
+    private func finishOperation() {
+        operationInFlight = false
+        startNextOperation()
+    }
 }
 #endif

@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p app/build
 nzb_operation_dir=$(mktemp -d app/build/apple-nzb-operation.XXXXXX)
+printf 'Apple NZB operation evidence: %s\n' "$nzb_operation_dir"
 baseline_flag=()
 additional_sources=()
 warm_baseline=""
@@ -15,6 +16,17 @@ if [[ ${1:-} == --fallback-baseline ]]; then
   fallback_baseline=$2
   shift 2
 fi
+host_arch="$(uname -m)"
+case "$host_arch" in arm64|x86_64) ;; *) echo 'Unsupported host architecture' >&2; exit 2 ;; esac
+host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+swift_language=6
+if [[ $# -gt 0 || -n $warm_baseline || -n $fallback_baseline ]]; then
+  swift_language=5
+  printf '%s\n' 'Historical mixed-source compatibility run; NOT current Swift 6 migration proof.'
+fi
+swift_flags=(-parse-as-library -swift-version "$swift_language" -strict-concurrency=complete -warnings-as-errors
+  -j 1 -num-threads 1 -target "$host_arch-apple-macosx14.0" -sdk "$host_sdk"
+  -module-cache-path "$nzb_operation_dir/module-cache")
 if [[ $# -gt 0 ]]; then
   git show "$1:app/SourcesShared/UsenetNodeClient.swift" > "$nzb_operation_dir/client.swift"
   baseline_flag=(-D NZB_OPERATION_BASELINE)
@@ -65,10 +77,11 @@ else
       sed -n '/    private func resolvePlaybackRef(/,/        let selectionEpisode = episode.map/p' app/SourcesShared/DebridResolver.swift | sed '$d'
       printf '%s\n' 'let selectionEpisode = episode; let nzb = stream.usenetURLs[0]' \
         'if true {' 'var nativeFallbackOwner: UsenetLocalResolver.NativeOwner?'
-      sed -n '/            let ownsNativeAttempt = nativeOwner.requiresNativeAuthority/,/            let usenetRevision = latestCredentialRevision/p' \
+      sed -n '/            let ownsNativeAttempt = !(confirmedUsenetURLs?.contains(nzb) ?? false)/,/            let usenetRevision = latestCredentialRevision/p' \
         app/SourcesShared/DebridResolver.swift \
         | sed '/^[[:space:]]*#else$/,/^[[:space:]]*#endif$/d; /^[[:space:]]*#if/d; /^[[:space:]]*#endif/d'
-      sed -n '/            let resolverAtCapture = /,/            if resumingCloudJob,/p' app/SourcesShared/DebridResolver.swift
+      rg -Fq 'if resumingCloudJob { nativeFallbackOwner = nativeOwner }' app/SourcesShared/DebridResolver.swift
+      sed -n '/            let resolverAtCapture = /,/            if resumingCloudJob { nativeFallbackOwner = nativeOwner }/p' app/SourcesShared/DebridResolver.swift
     fi
     if [[ -n $warm_baseline ]]; then
       printf '%s\n' 'let usenetSavedServers = savedServers' 'do {'
@@ -86,7 +99,7 @@ else
     app/SourcesShared/UsenetRoutingPolicy.swift)
 fi
 {
-  printf '%s\n' 'import Foundation' 'final class PlaybackHooks {'
+  printf '%s\n' 'import Foundation' '@MainActor final class PlaybackHooks {'
   if [[ $# -gt 0 ]]; then
     printf '%s\n' 'struct Reference { let nativeUsenetLease: UsenetNodeClient.OperationLease? }'
   else
@@ -94,12 +107,13 @@ fi
   fi
   printf '%s\n' 'struct Pending { let debridRef: Reference? }' \
     'var curDebridRef: Reference?' 'var pendingAdvance: Pending?' \
-    'func replacementCallback() -> (UsenetNodeClient.OperationLease?) -> Void {'
+    'func replacementCallback() -> (UsenetNodeClient.OperationLease?, UsenetNodeClient.OperationLease?) -> Void {'
   if [[ $# -gt 0 ]]; then
-    printf '%s\n' 'return { _ in }'
+    printf '%s\n' 'return { _, _ in }'
   else
-    sed -n '/.onChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/Sources/PlayerScreen.swift \
-      | sed '1s/.*{ \[/return { [/'
+    sed -n '/.onValueChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/Sources/PlayerScreen.swift \
+      | sed '1c\
+return { oldLease, newLease in'
   fi
   printf '%s\n' '}'
   for method in presentTerminalLoadFailure leavePlayback; do
@@ -112,18 +126,35 @@ fi
   done
   printf '%s\n' '}'
 } > "$nzb_operation_dir/hooks.swift"
-# TV and handheld hooks must remain byte-for-byte equivalent in lease behavior.
+# TV and handheld hooks must remain equivalent in lease behavior. Only the observed-value
+# header differs: the iOS16-compatible helper supplies the previous value explicitly on newer OSes.
 if [[ $# -eq 0 ]]; then
+  rg -Fq '.onValueChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in' app/Sources/PlayerScreen.swift
+  rg -Fq '.onChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in' app/SourcesTV/TVPlayerView.swift
+  rg -Fq 'onChange(of: value, initial: false, action)' app/SourcesShared/ValueChangeObservation.swift
+  rg -Fq 'onChange(of: value) { [value] newValue in action(value, newValue) }' app/SourcesShared/ValueChangeObservation.swift
   for method in presentTerminalLoadFailure leavePlayback; do
     diff -u \
       <(sed -n "/func $method()/,/^    }/p" app/Sources/PlayerScreen.swift | sed -n '/nativeUsenetLease?.close()/p') \
       <(sed -n "/func $method()/,/^    }/p" app/SourcesTV/TVPlayerView.swift | sed -n '/nativeUsenetLease?.close()/p')
   done
   diff -u \
-    <(sed -n '/.onChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/Sources/PlayerScreen.swift) \
-    <(sed -n '/.onChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/SourcesTV/TVPlayerView.swift)
+    <(sed -n '/.onValueChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/Sources/PlayerScreen.swift | sed '1d') \
+    <(sed -n '/.onChange(of: curDebridRef?.nativeUsenetLease)/,/^        }/p' app/SourcesTV/TVPlayerView.swift | sed '1d')
 fi
-xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors "${baseline_flag[@]}" \
+if [[ $# -eq 0 && -z $warm_baseline && -z $fallback_baseline ]]; then
+  for marker in 'enum UsenetLocalResolver {' 'enum TorBoxUsenetCacheGate {' 'func resolvedPlaybackRef(' 'func recoverUsenetPlayback(' 'nativeUsenetLease: local.nativeLease'; do
+    rg -Fq "$marker" "$nzb_operation_dir/resolver.swift"
+  done
+  rg -Fq 'let ownsNativeAttempt = !(confirmedUsenetURLs?.contains(nzb) ?? false)' "$nzb_operation_dir/resolver.swift"
+  [[ $(rg -Fc 'let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false' "$nzb_operation_dir/resolver.swift") == 1 ]]
+  [[ $(rg -Fc 'let resolverAtCapture = torboxUsenet' "$nzb_operation_dir/resolver.swift") == 1 ]]
+  rg -Fq 'return { oldLease, newLease in' "$nzb_operation_dir/hooks.swift"
+  rg -Fq 'oldLease?.close()' "$nzb_operation_dir/hooks.swift"
+  rg -Fq 'UsenetProviderStore.loadEnabledServers(ownerCapture: usenetCapture)' app/SourcesShared/DebridResolver.swift
+  rg -Fq 'savedServers' "$nzb_operation_dir/resolver.swift"
+fi
+nice -n 15 xcrun swiftc "${swift_flags[@]}" "${baseline_flag[@]}" \
   app/SourcesShared/NativeTransportPolicy.swift "$nzb_operation_dir/client.swift" \
   "$nzb_operation_dir/hooks.swift" "${additional_sources[@]}" app/Tests/AppleNZBOperationTests.swift -o "$nzb_operation_dir/operation"
 python3 test/apple-nzb-operation-http.py "$nzb_operation_dir/operation"

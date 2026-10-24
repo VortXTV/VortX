@@ -1,13 +1,23 @@
 import Foundation
+import os
+
+// INSERT ACTUAL PROFILE SELECTION READ
 
 // The runner splices the actual Profiles.swift observer block here; these are only dependencies
 // and mutation drivers, not a copied implementation of its lifecycle decisions.
 private struct UserProfile {
+    struct Discovery {
+        var continueWatchingSource: String?
+        var continueWatchingWindow: String?
+    }
     let id: UUID
     var name: String
     var isOwner: Bool
     var usesOwnAccount: Bool
+    var discovery: Discovery? = nil
 }
+// This plain-property fixture does not call publishInitial or read the new mirror. It tests
+// legacy observer/ownership behavior only; actual Combine reentrancy and startup are separate gates.
 private final class LegacyProfileLifecycleHarness {
     // INSERT ACTUAL LEGACY WATCH LIFECYCLE PROJECTION
     var retirements = 0
@@ -116,8 +126,8 @@ enum LegacyProfileLifecycleTests {
         check(LegacyProfileRecoveryPolicy.mirrorOfferCompleted(Data("{\"result\":{\"success\":true}}".utf8)), "completed non-error offer response positive control, not durability proof")
 
         let profiles = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/Profiles.swift"), encoding: .utf8)
-        for assignment in ["profiles[index] = profile", "profiles = remote", "profiles = list", "profiles = merged"] {
-            check(profiles.contains(assignment), "actual editor and replacement paths use the observed roster: \(assignment)")
+        for assignment in ["profiles = incoming; activeID = selected", "profiles = remote", "profiles = list", "profiles = merged"] {
+            check(profiles.contains(assignment), "acknowledged native and retained restore/merge paths use the observed roster: \(assignment)")
         }
         let noticeStart = profiles.range(of: "var legacyHistoryRecoveryNotice: String?")!.lowerBound
         let noticeEnd = profiles.range(of: "func retireLegacyHistoryNotices()", range: noticeStart..<profiles.endIndex)!.lowerBound
@@ -125,15 +135,19 @@ enum LegacyProfileLifecycleTests {
         check(noticeGetter.contains("legacyHistoryNoticeState.visible(matching:") && noticeGetter.contains("expected.matchesPresentation"), "actual rendered notice uses process-local display projection")
         check(!noticeGetter.contains("currentLegacyNoticeOwner(") && !noticeGetter.contains("Keychain.") && !noticeGetter.contains("keychainAccount("), "actual notice getter performs no credential backend or slot lookup")
         let certifiedStart = profiles.range(of: "private func currentLegacyNoticeOwner()")!.lowerBound
-        let certifiedEnd = profiles.range(of: "#if VORTX_NATIVE_DATA_ENGINE", range: certifiedStart..<profiles.endIndex)!.lowerBound
+        let certifiedEnd = profiles.range(of: "\n    }", range: certifiedStart..<profiles.endIndex)!.upperBound
         check(profiles[certifiedStart..<certifiedEnd].contains("Keychain.confirmedString(slot)"), "certified credential read remains at notice capture/publication boundaries")
-        check(profiles.contains("self.currentLegacyNoticeOwner() == owner"), "async inspection/mirror results cannot assign another owner status")
+        check(profiles.contains("self.currentLegacyNoticeOwner() == owner"), "retained async mirror results cannot assign another owner status")
         let view = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/ProfilesView.swift"), encoding: .utf8)
-        check(view.contains("if isNew { store.add(draft) } else { store.update(draft) }"), "real legacy editor reaches the observed update path")
-        let legacyEvents = view.range(of: "// Owner changes must invalidate an already-rendered warning")!
-        let eventEnd = view.range(of: "#endif", range: legacyEvents.upperBound..<view.endIndex)!.lowerBound
-        let events = view[legacyEvents.lowerBound..<eventEnd]
-        check(events.contains("LegacyWatchOwnership.sessionDidChange") && events.contains("VortXSyncManager.credentialScopeDidChangeNote") && events.components(separatedBy: "store.retireLegacyHistoryNotices()").count == 3, "actual rendered warning retires on both legacy and VortX credential events")
+        check(view.contains("let admission = core.captureNativeProfileActionAdmission()")
+            && view.contains("await store.saveNative(profile, creating: creating, admission: admission, preferenceBaseline: preferenceBaseline)"),
+              "current editor uses captured native admission and preference baseline, not a direct legacy roster write")
+        let credentialEvents = view.range(of: ".onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote))")!
+        let eventEnd = view.range(of: "\n        }", range: credentialEvents.upperBound..<view.endIndex)!.lowerBound
+        let events = view[credentialEvents.lowerBound..<eventEnd]
+        check(events.contains("deferredSelection.cancel()") && events.contains("pinTarget = nil; pinCredential = nil")
+            && events.contains("signInCredential = nil; signInProfileID = nil"),
+              "current picker retires deferred selection, PIN and sign-in captures on credential change")
         let sync = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/ProfileSync.swift"), encoding: .utf8)
         let putStart = sync.range(of: "private static func putDocument(")!.lowerBound
         let putEnd = sync.range(of: "private static func post(", range: putStart..<sync.endIndex)!.lowerBound

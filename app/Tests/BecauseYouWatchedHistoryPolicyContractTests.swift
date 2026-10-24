@@ -68,9 +68,10 @@ private struct BecauseYouWatchedHistoryPolicyContractTests {
                     source.contains("account.$credentialBoundaryGeneration"),
                   "\(name) Home gates consumers and observes same-slot account boundaries")
         }
-        check(ios.contains(".onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in") &&
+        check(ios.contains(".onValueChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in") &&
                 ios.contains("guard core.lastAcceptedHistoryReceipt != nil else { return }") &&
                 !ios.contains(".onChange(of: core.revision) { _ in") &&
+                !ios.contains(".onValueChange(of: core.revision) { _ in") &&
                 !ios.contains("guard core.changedFields.contains(\"continue_watching_preview\")"),
               "iOS Home retries on the published history receipt rather than every engine revision")
 

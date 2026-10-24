@@ -45,7 +45,7 @@ enum VXProbeRedaction {
 }
 
 /// `SourcePin.activeProfileKey` reads `ProfileStore.shared.activeID?.uuidString`.
-final class ProfileStore {
+@MainActor final class ProfileStore {
     static let shared = ProfileStore()
     var activeID: UUID?
 }

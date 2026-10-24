@@ -2,6 +2,7 @@
 import Foundation
 import Network
 import Darwin
+import os
 
 /// THE ENGINE HOST: the Mac side of external engine mode.
 ///
@@ -596,14 +597,32 @@ final class VortXEngineHost: @unchecked Sendable {
     private static let maximumBodyBytes = 64 * 1024
     private static let headerDeadline: TimeInterval = 10
 
+    /// One original request owns this deadline. The timer and receive chain share only a checked scalar;
+    /// cancellation and expiration arbitrate once, and no SDK operation runs under the state lock.
+    private struct RequestDeadline: Sendable {
+        private let live = OSAllocatedUnfairLock(initialState: true)
+
+        func cancel() { live.withLock { $0 = false } }
+
+        func claimExpiration() -> Bool {
+            live.withLock {
+                guard $0 else { return false }
+                $0 = false
+                return true
+            }
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
-        let deadline = DispatchWorkItem { connection.cancel() }
-        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadline)
+        let deadline = RequestDeadline()
+        queue.asyncAfter(deadline: .now() + Self.headerDeadline) {
+            if deadline.claimExpiration() { connection.cancel() }
+        }
         read(connection, buffer: Data(), deadline: deadline)
     }
 
-    private func read(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
+    private func read(_ connection: NWConnection, buffer: Data, deadline: RequestDeadline) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 32_768) { [weak self] chunk, _, isComplete, error in
             guard let self else { connection.cancel(); return }
             if error != nil { deadline.cancel(); connection.cancel(); return }
@@ -637,7 +656,7 @@ final class VortXEngineHost: @unchecked Sendable {
     }
 
     private func readBody(_ connection: NWConnection, request: VortXEngineHTTPRequest,
-                          body: Data, deadline: DispatchWorkItem) {
+                          body: Data, deadline: RequestDeadline) {
         guard body.count < request.contentLength else {
             deadline.cancel()
             queue.async { self.handle(connection, request: request, body: body) }
@@ -975,22 +994,21 @@ final class VortXEngineHost: @unchecked Sendable {
                 sessionID: id,
                 mountGeneration: request.mountGeneration,
                 producerQuiescent: true)
-            self.stateLock.lock()
-            let stillCurrent = self.sessions[id] === session
-                && session.mountGeneration == request.mountGeneration
-            if stillCurrent {
-                self.sessions.removeValue(forKey: id)
-                if self.completedTeardowns.count >= 64,
-                   let oldest = self.completedTeardowns.keys.sorted().first {
-                    self.completedTeardowns.removeValue(forKey: oldest)
+            let stillCurrent = self.stateLock.withLock {
+                let current = self.sessions[id] === session
+                    && session.mountGeneration == request.mountGeneration
+                if current {
+                    self.sessions.removeValue(forKey: id)
+                    if self.completedTeardowns.count >= 64,
+                       let oldest = self.completedTeardowns.keys.sorted().first {
+                        self.completedTeardowns.removeValue(forKey: oldest)
+                    }
+                    self.completedTeardowns[id] = CompletedTeardown(principalID: principalID, receipt: receipt)
                 }
-                self.completedTeardowns[id] = CompletedTeardown(principalID: principalID, receipt: receipt)
+                return current
             }
-            self.stateLock.unlock()
             if !stillCurrent {
-                self.stateLock.lock()
-                let completed = self.completedTeardowns[id]
-                self.stateLock.unlock()
+                let completed = self.stateLock.withLock { self.completedTeardowns[id] }
                 if let completed, completed.principalID == principalID,
                    completed.receipt.mountGeneration == request.mountGeneration {
                     self.reply(connection, status: "200 OK", body: completed.receipt)
@@ -1091,12 +1109,18 @@ private enum VortXEngineRemoteInputPolicy {
             guard getnameinfo(UnsafePointer(withUnsafePointer(to: &storage) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 } }),
                               socklen_t(node.pointee.ai_addrlen), &numeric, socklen_t(numeric.count), nil, 0,
                               NI_NUMERICHOST) == 0 else { return false }
-            let text = String(cString: numeric)
-            guard isPublicNumericAddress(text) else { return false }
+            guard let text = decodeNumericAddress(numeric), isPublicNumericAddress(text) else { return false }
             found = true
             cursor = node.pointee.ai_next
         }
         return found
+    }
+
+    /// getnameinfo writes a bounded CChar array. Reject a missing terminator rather than reading beyond it;
+    /// valid numeric address bytes retain their exact UTF-8 spelling up to the first NUL.
+    private static func decodeNumericAddress(_ characters: [CChar]) -> String? {
+        guard let terminator = characters.firstIndex(of: 0) else { return nil }
+        return String(decoding: characters[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// Reject every non-global class, including IPv4 embedded in IPv6/NAT64 textual forms.  This intentionally

@@ -78,7 +78,7 @@ struct InHeroYouTubeTrailerView: View {
         // A fullscreen player presented over this hero unmounts the embed (WKWebView torn down, no more decode).
         // On close, re-run the still-hold beat and fade the fresh embed back in, matching the first-mount reveal.
         // Single-parameter onChange for iOS 16 (the zero-parameter iOS 17 overload broke the CI iOS build once).
-        .onChange(of: playbackGate.playerActive) { active in
+        .onValueChange(of: playbackGate.playerActive) { active in
             if active {
                 showClip = false
             } else {

@@ -117,6 +117,14 @@ PYTHON_TOOLCHAIN
         mkdir -p "$upstream/$(dirname "$relative")"
         cp "$overlay/$relative" "$upstream/$relative"
     done
+    # Keep the selected producer's HTTP interruption fix and use the same new
+    # upstream audio/seek backports as Apple. All patch bytes are input-hash bound.
+    mkdir -p "$upstream/buildscripts/patches/mpv"
+    cp "$root/scripts/mpv-http-seek-interrupt.patch" "$upstream/buildscripts/patches/mpv/0001-http-seek-interrupt.patch"
+    cp "$root/scripts/mpv-upstream-audio-layout-bounds.patch" "$upstream/buildscripts/patches/mpv/0002-upstream-audio-layout-bounds.patch"
+    cp "$root/scripts/mpv-upstream-gpu-next-seek-reset.patch" "$upstream/buildscripts/patches/mpv/0003-upstream-gpu-next-seek-reset.patch"
+    # Same original-source witness prerequisite as Apple; no renderer/consumer activation.
+    cp "$root/scripts/mpv-original-local-file-witness.patch" "$upstream/buildscripts/patches/mpv/0004-original-local-file-witness.patch"
     git -C "$upstream" apply --check "$root/scripts/native-media-hosted/android-assembly.patch"
     git -C "$upstream" apply "$root/scripts/native-media-hosted/android-assembly.patch"
     # Use the hosted SDK; bypass upstream download-sdk.sh's moving gas-preprocessor/master fetch.

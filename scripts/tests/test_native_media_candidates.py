@@ -25,9 +25,42 @@ class NativeMediaProducer(unittest.TestCase):
             self.assertNotIn(name, names)
             names.add(name)
             self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), expected)
-        self.assertEqual(len(names), 18)
+        self.assertEqual(len(names), 20)
         self.assertIn('scripts/native-media-hosted/android/buildscripts/include/download-libunibreak.sh', names)
         self.assertIn('scripts/native-media-hosted/android/buildscripts/scripts/ffmpeg.sh', names)
+        self.assertIn('scripts/mpv-upstream-audio-layout-bounds.patch', names)
+        self.assertIn('scripts/mpv-upstream-gpu-next-seek-reset.patch', names)
+
+    def test_android_preserves_selected_custom_source_family(self):
+        import re
+        apple = (ROOT / "scripts/mpvkit-dvfel.patch").read_text()
+        android = (ROOT / "scripts/native-media-hosted/android/buildscripts/include/depinfo.sh").read_text()
+        for android_key, apple_key in [("v_mpv_sha", "mpvPinnedSHA"),
+                                       ("v_libplacebo_sha", "placeboPinnedSHA"),
+                                       ("v_ffmpeg_sha", "ffmpegPinnedSHA")]:
+            actual = re.search(r"^" + android_key + r"=([0-9a-f]{40})$", android, re.M).group(1)
+            expected = re.search(r"static let " + apple_key + r' = "([0-9a-f]{40})"', apple).group(1)
+            self.assertEqual(actual, expected, android_key)
+        self.assertIn("v_ffmpeg=9.0.2\n", android)
+        self.assertNotIn("v_mpv=0.41.0", android)
+        self.assertNotIn("v_libplacebo=7.360.1", android)
+        download = (ROOT / "scripts/native-media-hosted/android/buildscripts/include/download-deps.sh").read_text()
+        self.assertIn('fetch_commit mpv https://github.com/mpv-player/mpv.git "$v_mpv_sha"', download)
+        self.assertIn('fetch_commit libplacebo https://code.videolan.org/videolan/libplacebo.git "$v_libplacebo_sha"', download)
+        self.assertIn('[ "$(git -C "$dir" rev-parse HEAD)" = "$sha" ]', download)
+
+    def test_both_candidate_recipes_apply_the_same_backports(self):
+        apple = (ROOT / "scripts/build-mpvkit-dvfel.sh").read_text()
+        android = (ROOT / "scripts/native-media-hosted/build.sh").read_text()
+        for source, apple_number, android_number in [
+                ("mpv-http-seek-interrupt.patch", "0006-http-seek-interrupt.patch", "0001-http-seek-interrupt.patch"),
+                ("mpv-upstream-audio-layout-bounds.patch", "0007-upstream-audio-layout-bounds.patch", "0002-upstream-audio-layout-bounds.patch"),
+                ("mpv-upstream-gpu-next-seek-reset.patch", "0008-upstream-gpu-next-seek-reset.patch", "0003-upstream-gpu-next-seek-reset.patch")]:
+            self.assertIn('copy_exact "$REPO/scripts/' + source + '"', apple)
+            self.assertIn('"$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/' + apple_number + '"', apple)
+            self.assertIn('cp "$root/scripts/' + source + '" "$upstream/buildscripts/patches/mpv/' + android_number + '"', android)
+        self.assertLess(android.index("0003-upstream-gpu-next-seek-reset.patch"),
+                        android.index("bash patch.sh"))
 
     def test_android_python_closure_is_pinned_and_isolated(self):
         workflow = (ROOT / ".github/workflows/native-media-candidates.yml").read_text()

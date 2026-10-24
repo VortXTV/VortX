@@ -165,6 +165,11 @@ packages:
 # public, so a real value must never appear here. The Info.plist VortXEdgeSecret key substitutes it.
 settings:
   base:
+    # One policy for every first-party target, including the offline UI renderer.
+    # Native release generation validates it before writing any derived inputs.
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
     VORTX_EDGE_SECRET: ""
     # External sync provider credentials (Trakt Lane C, SIMKL Lane D). EMPTY by default so a fresh
     # clone / CI always builds; the Info.plist TraktClientId/SIMKLClientId keys substitute these, and
@@ -546,8 +551,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
-        SWIFT_VERSION: "6.0"
-        SWIFT_STRICT_CONCURRENCY: complete
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "280"
         # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no

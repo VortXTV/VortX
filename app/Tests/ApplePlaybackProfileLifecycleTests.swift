@@ -10,10 +10,10 @@ import Foundation
     static func profile(live: Bool, shed: Bool = false) -> [String: NativeValue] {
         ["demuxer-readahead-secs": .scalar(live ? "18" : "300"),
          "demuxer-max-back-bytes": .scalar(live || shed ? "8MiB" : "24MiB"),
-         "demuxer-lavf-o": .map(live ? ["live_start_index": "-3"] : [:]),
+         "demuxer-lavf-o": .map(live ? ["tls_verify": "1", "live_start_index": "-3"] : ["tls_verify": "1"]),
          "stream-lavf-o": .map(live
-            ? ["reconnect": "1", "reconnect_streamed": "0", "reconnect_delay_max": "1"]
-            : ["reconnect": "1", "reconnect_streamed": "1", "reconnect_delay_max": "7", "multiple_requests": "1"]),
+            ? ["tls_verify": "1", "reconnect": "1", "reconnect_streamed": "0", "reconnect_delay_max": "1"]
+            : ["tls_verify": "1", "reconnect": "1", "reconnect_streamed": "1", "reconnect_delay_max": "7", "multiple_requests": "1"]),
          "cache-pause-initial": .scalar("no"), "cache-pause-wait": .scalar("1")]
     }
 
@@ -61,6 +61,23 @@ import Foundation
         let stopped = MPVMetalViewController(); stopped.mpv = nil
         _ = stopped.loadProfile(live: true)
         check("nil native handle cannot mutate profile or issue load", port.values == custom && port.writes.isEmpty && port.commands == 0 && !stopped.configuredLiveMode)
+
+        for requestedPause in [false, true] {
+            for accepted in [false, true] {
+                port.missingReads = []; port.values = profile(live: false)
+                port.commandStatus = accepted ? 0 : -1
+                let player = MPVMetalViewController()
+                let parkedOwner = PlayerLoadToken()
+                player.seekEOFTerminalPark.park(owner: parkedOwner, pausedIntent: requestedPause)
+                let label = "parked \(requestedPause ? "Pause" : "Play") \(accepted ? "accepted" : "rejected")"
+                _ = player.loadProfile(live: false)
+                check("\(label) restores intent only after accepted load", player.paused == (accepted ? requestedPause : true))
+                check("\(label) retires original parking owner only after acceptance",
+                      player.seekEOFTerminalPark.owner == (accepted ? nil : parkedOwner))
+                check("\(label) retains unaccepted pause intent",
+                      player.seekEOFTerminalPark.pausedIntent == (accepted ? nil : requestedPause))
+            }
+        }
     }
 
     static func idleTests() {

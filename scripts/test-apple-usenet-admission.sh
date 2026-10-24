@@ -3,6 +3,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p app/build
 usenet_test_dir=$(mktemp -d app/build/apple-usenet-admission.XXXXXX)
+printf 'Apple Usenet admission evidence: %s\n' "$usenet_test_dir"
+host_arch="$(uname -m)"
+case "$host_arch" in arm64|x86_64) ;; *) echo 'Unsupported host architecture' >&2; exit 2 ;; esac
+host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+swift_language=6
+if [[ $# -gt 0 ]]; then
+  swift_language=5
+  printf '%s\n' 'Historical mixed-source compatibility run; NOT current Swift 6 migration proof.'
+fi
+swift_flags=(-parse-as-library -swift-version "$swift_language" -strict-concurrency=complete -warnings-as-errors
+  -j 1 -num-threads 1 -target "$host_arch-apple-macosx14.0" -sdk "$host_sdk"
+  -module-cache-path "$usenet_test_dir/module-cache")
 if [[ $# -gt 0 ]]; then
   git show "$1:app/SourcesShared/CoreModels.swift" > "$usenet_test_dir/models-source.swift"
   git show "$1:app/SourcesShared/DebridPlaybackAvailability.swift" > "$usenet_test_dir/availability-source.swift"
@@ -34,6 +46,11 @@ sed 's/#if os(macOS)/#if USENET_ADMISSION_MAC/g' "$usenet_test_dir/availability-
   printf '%s\n' '}'
   sed -n '/^enum UsenetLocalResolver {/,/^\/\/ MARK: - Settings screen/p' app/SourcesShared/UsenetProvider.swift | sed '$d'
 } > "$usenet_test_dir/production-methods.swift"
+for marker in 'struct CoreStream:' 'static func playableTorrentFileIndex(' 'enum UsenetLocalResolver {' 'func coordinatorWouldAttemptLocal('; do
+  rg -Fq "$marker" "$usenet_test_dir/production-methods.swift"
+done
+rg -Fq 'return loading || preparing || best?.playableURL(isEpisode: true) == nil' "$usenet_test_dir/production-methods.swift"
+rg -Fq 'return !torBoxHasItCached && !resumingCloudJob &&' "$usenet_test_dir/production-methods.swift"
 runtime_failed=0
 for variant in mobile mac lite; do
   case "$variant" in
@@ -41,7 +58,8 @@ for variant in mobile mac lite; do
     mac) variant_flag=USENET_ADMISSION_MAC ;;
     lite) variant_flag=VORTX_NO_EMBEDDED_SERVER ;;
   esac
-  xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors -D "$variant_flag" \
+  printf 'Apple Usenet admission variant: %s\n' "$variant"
+  nice -n 15 xcrun swiftc "${swift_flags[@]}" -D "$variant_flag" \
     "$usenet_test_dir/availability.swift" "$usenet_test_dir/production-methods.swift" \
     app/SourcesShared/UsenetStreamValidation.swift app/SourcesShared/UsenetProviderConfiguration.swift \
     app/SourcesShared/UsenetRoutingPolicy.swift app/SourcesShared/NativeTransportPolicy.swift \

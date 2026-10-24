@@ -1,6 +1,8 @@
 import Foundation
+import os
 
 // Generated fixture inserts exact declarations; no mirrored snapshot/binding predicates.
+// PRODUCTION_SELECTION_READ
 // PRODUCTION_JSON
 // PRODUCTION_POLICY
 typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
@@ -15,9 +17,31 @@ final class CredentialScopeRegistry: @unchecked Sendable {
     var current = Capture(generation: UUID())
     func isCurrent(_ capture: Capture) -> Bool { capture == current }
 }
-final class ProfileStore: @unchecked Sendable {
+// Synthetic roster rows supply explicit scalar facts; they are not a credential or playback authority.
+struct FixtureSelectionProfile {
+    struct Discovery {
+        var continueWatchingSource: String?
+        var continueWatchingWindow: String?
+    }
+    let id: UUID
+    let isOwner: Bool
+    let usesOwnAccount: Bool
+    var discovery: Discovery? = nil
+}
+@MainActor final class ProfileStore {
     static let shared = ProfileStore()
-    var activeID: UUID?
+    var profiles: [FixtureSelectionProfile] = [] {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    var activeID: UUID? {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    // Only this singleton is constructed. @MainActor setup accesses it before bridge capture;
+    // subsequent contexts mutate the same mirror. Its real projector is extracted unchanged.
+    private init() { ProfileSelectionRead.publishInitial(selectionReadSnapshot()) }
+    // PRODUCTION_SELECTION_SNAPSHOT
 }
 
 /// Peripheral scheduler only: a controlled owner change immediately after the captured
@@ -80,6 +104,8 @@ class FixtureBridge {
 }
 final class CoreBridge: FixtureBridge {
     // PRODUCTION_BRIDGE
+    // PRODUCTION_CURRENT_WATCHLIST_BRIDGE
+    func fixtureHasWatchlistTarget() -> Bool { captureNativeWatchlistTarget() != nil }
 }
 final class LegacyCoreBridge: FixtureBridge {
     // PRODUCTION_BASELINE_BRIDGE
@@ -113,6 +139,7 @@ final class LegacyCoreBridge: FixtureBridge {
     @MainActor static func context(_ value: VortxJSON?) -> (UUID, VortxNativeCoreFacade, CoreBridge) {
         // Explicit alphabetic digits make the exact-case rejection deterministic.
         let profile = UUID(uuidString: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")!
+        ProfileStore.shared.profiles = [.init(id: profile, isOwner: true, usesOwnAccount: false)]
         ProfileStore.shared.activeID = profile
         CredentialScopeRegistry.shared.current = .init(generation: UUID())
         let facade = VortxNativeCoreFacade(profile: profile, projection: value)
@@ -165,6 +192,19 @@ final class LegacyCoreBridge: FixtureBridge {
         check(bridge.nativePlaybackSnapshot() == nil, "bridge rejects revoked facade")
         check(retained == legacy, "held owned value survives revocation without reauthorization")
     }
+    @MainActor static func missingRosterRowTests(_ value: VortxJSON) {
+        let (profile, _, bridge) = context(value)
+        let roster = ProfileStore.shared.profiles
+        check(bridge.fixtureHasWatchlistTarget(), "actual current watchlist capture accepts mounted synthetic row")
+        ProfileStore.shared.profiles = []
+        check(ProfileStore.shared.activeID == profile && ProfileSelectionRead.snapshot()?.activeProfile == nil,
+              "missing-row fixture retains selected UUID while real scalar projector reports no member")
+        check(bridge.nativePlaybackSnapshot() == nil, "playback binding rejects selected UUID without roster member")
+        check(!bridge.fixtureHasWatchlistTarget(), "actual current watchlist capture rejects selected UUID without roster member")
+        ProfileStore.shared.profiles = roster
+        check(bridge.nativePlaybackSnapshot() == value, "restored matching roster member permits fresh playback binding")
+        check(bridge.fixtureHasWatchlistTarget(), "restored matching roster member permits fresh watchlist capture")
+    }
     @MainActor static func bridgeRaces(_ value: VortxJSON) {
         for scenario in 0..<7 {
             let (profile, facade, bridge) = context(value)
@@ -209,6 +249,7 @@ final class LegacyCoreBridge: FixtureBridge {
     @MainActor static func main() throws {
         let value = try projection(titles: 3)
         try facadeTests(value)
+        missingRosterRowTests(value)
         bridgeRaces(value)
         if failures == 0 && ProcessInfo.processInfo.environment["VORTX_SNAPSHOT_SKIP_BENCHMARK"] != "1" { try benchmark() }
         print("Native playback snapshot: \(checks) checks, \(failures) failures")

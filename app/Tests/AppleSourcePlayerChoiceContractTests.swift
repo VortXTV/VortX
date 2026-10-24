@@ -55,6 +55,16 @@ private func ordered(_ needles: [String], in source: String) -> Bool {
     return true
 }
 
+/// Both menu choices must reach the current add-on-aware dispatch, with the legacy engine callback
+/// retained as a compatibility fallback. Inspect the actual bridge instead of a retired direct call.
+private func iosSourceChoicesWired(menu: String, dispatch: String) -> Bool {
+    menu.contains("playSourceRow(stream, url, addon: addon, preference: .mpv)")
+        && menu.contains("playSourceRow(stream, url, addon: addon, preference: .avfoundation)")
+        && menu.contains("canHonorAVPlayerChoice")
+        && dispatch.contains("playWithAddon(stream, url, addon, preference)")
+        && dispatch.contains("playWithEngine(stream, url, preference)")
+}
+
 /// The movie hero may update its ephemeral source-ranking state, but must never write an audio preference
 /// or any persistence store from a Menu action. Kept as a source contract because the production view is
 /// SwiftUI-only and this executable suite deliberately does not link the app target.
@@ -205,10 +215,19 @@ private enum AppleSourcePlayerChoiceContractTests {
               !tvMenu.contains("UserDefaults") && !tvMenu.contains("overrideKey"))
 
         let iosMenu = section(iosDetail, from: "private func sourcePlayerMenu", to: "private func pinMenu")
+        let iosDispatch = section(iosDetail, from: "private func playSourceRow", to: "@ViewBuilder private func sourcePlayerMenu")
         check("iOS/macOS source menu offers one-launch VortX and eligible AVPlayer routes",
-              iosMenu.contains("playWithEngine(stream, url, .mpv)")
-                && iosMenu.contains("playWithEngine(stream, url, .avfoundation)")
-                && iosMenu.contains("canHonorAVPlayerChoice"))
+              iosSourceChoicesWired(menu: iosMenu, dispatch: iosDispatch))
+        for needle in ["preference: .mpv", "preference: .avfoundation", "canHonorAVPlayerChoice"] {
+            check("iOS menu contract rejects removal of \(needle)",
+                  !iosSourceChoicesWired(menu: iosMenu.replacingOccurrences(of: needle, with: "REMOVED"),
+                                        dispatch: iosDispatch))
+        }
+        for needle in ["playWithAddon(stream, url, addon, preference)", "playWithEngine(stream, url, preference)"] {
+            check("iOS dispatch contract rejects removal of \(needle)",
+                  !iosSourceChoicesWired(menu: iosMenu,
+                                        dispatch: iosDispatch.replacingOccurrences(of: needle, with: "REMOVED")))
+        }
         check("iOS/macOS external choices reuse installed and eligibility APIs",
               iosMenu.contains("ExternalPlayer.canRouteExternally")
                 && iosMenu.contains("externalPlayerTargets"))
@@ -256,7 +275,9 @@ private enum AppleSourcePlayerChoiceContractTests {
                 "case .sourceAudio:      openPanel(.sources, preferredAccessibilityID: \"sources.audio\")")
                 && !tvRemoteHandling.contains("case .sourceAudio:      closePanel()"))
         check("tvOS episode advance preserves the outgoing surface until a replacement is issued",
-              tvPlayer.contains("if pendingAdvance?.issued == true {")
+              section(tvPlayer, from: "private var firstFrameCoverMetadata:", to: "private var firstFrameCoverMedia:")
+                .contains("pendingAdvance?.issued == true")
+                && tvPlayer.contains("firstFrameCoverLayer")
                 && !tvPlayer.contains("if pendingAdvance != nil {\n                Color.black.ignoresSafeArea()"))
         check("tvOS transport warm caller gates before claiming warmed identity",
               ordered([

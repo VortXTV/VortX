@@ -63,6 +63,7 @@ enum VortXEngineDaemon {
     ///
     /// Everything here is fail-soft. A missing or malformed config file is ignored. A control port that will not
     /// bind logs and exits non-zero so `launchd` reports a real failure rather than flapping silently.
+    @MainActor
     @discardableResult
     static func bootIfRequested() -> Bool {
         guard isRequested else { return false }
@@ -114,23 +115,30 @@ enum VortXEngineDaemon {
     /// `DispatchSource` rather than `signal()`: a dispatch source handler runs on a real queue where it is safe
     /// to do the work, whereas a C signal handler may call almost nothing. `SIG_IGN` first is required, because
     /// the dispatch source observes the signal rather than replacing the default action.
+    @MainActor
     private static func installSignalHandlers() {
         for sig in [SIGTERM, SIGINT] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            source.setEventHandler {
-                log("received signal \(sig); stopping")
-                VortXEngineHost.shared.stop()
-                exit(0)
-            }
+            source.setEventHandler(handler: makeSignalHandler(sig))
             source.resume()
             sources.append(source)
         }
     }
 
+    /// Construct the original callback outside the startup actor. Only the signal scalar is captured;
+    /// neither the handler nor its body can inherit the actor that retains the DispatchSource instances.
+    nonisolated private static func makeSignalHandler(_ sig: Int32) -> @Sendable () -> Void {
+        {
+            log("received signal \(sig); stopping")
+            VortXEngineHost.shared.stop()
+            exit(0)
+        }
+    }
+
     /// Retained for the process lifetime. A dispatch source that is not held is cancelled immediately, which
     /// would silently drop the clean-shutdown behaviour above.
-    nonisolated(unsafe) private static var sources: [DispatchSourceSignal] = []
+    @MainActor private static var sources: [DispatchSourceSignal] = []
 
     /// Log to stderr as well as to the app's diagnostic log. `launchd` captures stderr into whatever
     /// `StandardErrorPath` names, which is the only log a user administering a background service will look at.

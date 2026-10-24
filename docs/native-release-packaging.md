@@ -8,13 +8,17 @@ independent review, full-build and artifact gates remain required before publica
 
 ## Pinned shipping inputs
 
-The checkout and post-checkout equality assertion in `release-tvos.yml`, `android.yml` and
-`android-release.yml`, plus Desktop's manifest and resolved lock, must select one identical,
-reviewed native source revision. Their current
-source contract is `0c30f4782aee544a2b7e33169ad60d03630d4097`. Updating this pin does not establish
-private CI, fresh cross-platform SDK, app, signing or release acceptance; those gates must pass
-against the final combined public source before shipping. The Stremio comparison engine and Node
-runtime have been removed; native packages must still reject either payload if it reappears.
+The checkout and post-checkout equality assertions in `release-tvos.yml`, `android.yml` and
+`android-release.yml` select the identical reviewed source revision
+`2ea2e0f27dd2e53b7b28228435ca35a70f92831f` for future Apple/Android builds. This is a source
+candidate, not evidence that its Android ABIs or the other Apple slices have been built. Updating
+this pin does not establish private CI, fresh cross-platform SDK, app, signing or release
+acceptance; those gates must pass against the final combined public source before shipping.
+Desktop's manifest and five resolved lock records retain their separately reviewed
+`0c30f4782aee544a2b7e33169ad60d03630d4097` pin. Desktop is not one of the seven Apple/Android
+release assets; its later source adoption requires an intentional manifest/lock update and its
+own build/runtime gates. The Stremio comparison engine and Node runtime have been removed;
+native packages must still reject either payload if it reappears.
 
 For a downloaded release, read its pin from that exact source tag and immutable handoff rather
 than assuming a moving documentation page describes every older package.

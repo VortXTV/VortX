@@ -66,7 +66,7 @@ require_grep "signed candidate APK and AAB both verify complete engine ABIs" \
     'verify-native-android-artifacts\.sh .*--native-only|--native-only --staged-dir android/app/src/main/jniLibs' \
     <(printf '%s\n' "$candidate_signing_step")
 native_pin="$(awk '/^      NORMAL_NATIVE_REVISION:/{print $2}' "$APPLE_RELEASE_WF")"
-[[ "$native_pin" = 0c30f4782aee544a2b7e33169ad60d03630d4097 ]] || fail "Apple normal native pin differs from the reviewed revision"
+[[ "$native_pin" = 2ea2e0f27dd2e53b7b28228435ca35a70f92831f ]] || fail "Apple normal native pin differs from the reviewed revision"
 apple_native_ref="$(awk '/repository: VortXTV\/vortx-core/{active=1; next}
     active && /^[[:space:]]+ref:/{sub(/^[[:space:]]+ref: /, ""); print; exit}' "$APPLE_RELEASE_WF")"
 [[ "$apple_native_ref" = '${{ steps.native_source.outputs.revision }}' ]] || fail "Apple checkout must consume the authenticated source selection"
@@ -231,7 +231,7 @@ native_abi_step="$(awk '/name: Verify complete native engine ABI/{active=1; next
     active && /^[[:space:]]+- name:/{exit} active{print}' "$APPLE_RELEASE_WF")"
 for native_abi_literal in \
     'EXPECTED_NATIVE_REVISION: ${{ steps.native_source.outputs.revision }}' \
-    '0c30f4782aee544a2b7e33169ad60d03630d4097)' \
+    '2ea2e0f27dd2e53b7b28228435ca35a70f92831f)' \
     './scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework owner-history ;;' \
     '0c201563c6aa54eeb0545b55ad01582c0c3bcae3)' \
     './scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host ;;' \
@@ -263,6 +263,8 @@ done
 require_grep "native-only Android verifier invokes its source-selected extended ABI" \
     'verify-native-engine-abi\.sh.*android.*\$abi_mode' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 for native_abi_literal in \
+    '2ea2e0f27dd2e53b7b28228435ca35a70f92831f) abi_mode=owner-history ;;' \
+    'd2ca37b89556c732da6edc1e5ca1f5908cf5d508) abi_mode=owner-history ;;' \
     '0c30f4782aee544a2b7e33169ad60d03630d4097) abi_mode=owner-history ;;' \
     'af29b22e4c45740a1f5b6cb415b81f8430f55b9f) abi_mode=resource-host ;;' \
     '*) echo "native-only ABI mode has no admitted source revision" >&2; exit 1 ;;'; do
@@ -1086,9 +1088,9 @@ bash -n "$REPO_ROOT/scripts/package-macos-dmg.sh"
 
 # Keep the shared settings deployment floor and release-feed commit identity explicit.
 require_grep "shared settings availability fixture runs before app packaging" \
-    'app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ServerConfigView.swift' "$APPLE_RELEASE_WF"
-require_grep "shared settings fixture targets supported iOS 16" \
-    'swiftc -typecheck -swift-version 5 -target arm64-apple-ios16.0' "$APPLE_RELEASE_WF"
+    'app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ValueChangeObservation.swift app/SourcesShared/ServerConfigView.swift' "$APPLE_RELEASE_WF"
+require_grep "shared settings fixture uses strict Swift 6 at supported iOS 16" \
+    'swiftc -typecheck -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 -target arm64-apple-ios16.0' "$APPLE_RELEASE_WF"
 require_grep "release feed commits retain Mamaclapper authorship" \
     'author:\{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"\}' "$APPLE_RELEASE_WF"
 require_grep "release feed commits retain Mamaclapper committer identity" \

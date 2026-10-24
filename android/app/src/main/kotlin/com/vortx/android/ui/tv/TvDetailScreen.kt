@@ -61,6 +61,7 @@ import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.randompick.RandomEpisodePickControls
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
@@ -126,6 +127,10 @@ fun TvDetailScreen(
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
     onOpenTitle: (MetaItem) -> Unit = {},
+    autoWatch: Boolean = false,
+    onAutoWatchConsumed: () -> Boolean = { true },
+    autoWatchAdmission: () -> Boolean = { true },
+    onAutoWatchCancelled: () -> Boolean = { true },
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -140,9 +145,14 @@ fun TvDetailScreen(
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
+    val beginManualPlayback: (() -> Unit) -> Unit = { action ->
+        if (onAutoWatchCancelled()) beginPlayback(action)
+    }
     val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
-        pendingLaunchEnginePreference = engine
-        action()
+        if (onAutoWatchCancelled()) {
+            pendingLaunchEnginePreference = engine
+            action()
+        }
     }
 
     BackHandler { onBack() }
@@ -150,9 +160,26 @@ fun TvDetailScreen(
     // A resolved source -> hand the Playable to the shell (which shows the player) and reset the ViewModel's
     // playback latch, mirroring the phone DetailScreen exactly.
     LaunchedEffect(playback, metaState) {
+        val ready = playback as? Playback.Ready
+        if (ready != null && !ready.isAdmitted()) {
+            if (viewModel.playback.value === ready) {
+                ready.playable.playbackLease?.close()
+                viewModel.clearPlayback()
+            }
+            return@LaunchedEffect
+        }
         val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        if (viewModel.playback.value !== playback) return@LaunchedEffect
         onPlay(resolved.playable, resolved.metadata, pendingLaunchEnginePreference)
         viewModel.clearPlayback()
+    }
+
+    // Consume before dispatch; the immutable request admission also stays attached to the resolver.
+    val resolving = playback is Playback.Resolving
+    LaunchedEffect(autoWatch, metaState, streamsState, resolving) {
+        if (!autoWatch || resolving || metaState !is UiState.Success || viewModel.bestSource() == null) return@LaunchedEffect
+        if (!onAutoWatchConsumed()) return@LaunchedEffect
+        beginPlayback { viewModel.playBestWhen(autoWatchAdmission) }
     }
 
     val colors = VortXTheme.colors
@@ -171,9 +198,10 @@ fun TvDetailScreen(
                 launchPlayerChoices = launchPlayerChoices,
                 launchEnginePreference = launchEnginePreference,
                 onSelectLaunchEngine = { launchEnginePreference = it },
-                beginPlayback = beginPlayback,
+                beginPlayback = beginManualPlayback,
                 beginPlaybackWithEngine = beginPlaybackWithEngine,
                 onOpenTitle = onOpenTitle,
+                onManualAction = onAutoWatchCancelled,
             )
         }
     }
@@ -192,6 +220,7 @@ private fun TvDetailContent(
     beginPlayback: (() -> Unit) -> Unit,
     beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit,
     onOpenTitle: (MetaItem) -> Unit,
+    onManualAction: () -> Boolean,
 ) {
     val context = LocalContext.current
     val colors = VortXTheme.colors
@@ -210,6 +239,7 @@ private fun TvDetailContent(
     // episode below retargets the hero Watch/Resume + the source list, exactly as the phone screen does.
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
+    val randomEpisodePick by viewModel.randomEpisodePickState.collectAsStateWithLifecycle()
     val episodeBrowseAnchor by viewModel.episodeBrowseAnchor.collectAsStateWithLifecycle()
     var focusRestoreEpisodeId by remember(detail.id) { mutableStateOf<String?>(null) }
     var focusRestoreRevision by remember(detail.id) { mutableStateOf(0) }
@@ -249,6 +279,7 @@ private fun TvDetailContent(
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
     val sourceAudioLanguageHint by viewModel.sourceAudioLanguageHint.collectAsStateWithLifecycle()
+    val cacheDisplayRevision by com.vortx.android.debrid.DebridKeys.credentialRevision.collectAsStateWithLifecycle()
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
 
     // View-local Person overlay + TMDB cast enrichment, mirroring the phone [DetailScreen] (held in the view,
@@ -313,6 +344,10 @@ private fun TvDetailContent(
             onBack = { personTarget = null },
         )
         return
+    }
+
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.clearRandomEpisodePick() }
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -499,12 +534,14 @@ private fun TvDetailContent(
                     TvFilterChip(
                         label = "Re-find",
                         selected = false,
-                        onClick = viewModel::refreshSources,
+                        onClick = { if (onManualAction()) viewModel.refreshSources() },
                         modifier = Modifier.focusRequester(sourcesFocus),
                     )
                 }
                 TvSourceList(
                     streamsState = streamsState,
+                    quickFilterScope = viewModel to selectedEpisodeId,
+                    currentCacheRevision = maxOf(cacheDisplayRevision, com.vortx.android.debrid.DebridKeys.credentialRevision.value),
                     best = viewModel.bestSource(),
                     resolving = playback is Playback.Resolving,
                     failure = (playback as? Playback.Failed)?.message,
@@ -512,7 +549,7 @@ private fun TvDetailContent(
                     sort = sourceSort,
                     onSortChange = viewModel::setSourceSort,
                     audioLanguageHint = sourceAudioLanguageHint,
-                    onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
+                    onAudioLanguageHintChange = { language -> if (onManualAction()) viewModel.setSourceAudioLanguageHint(language) },
                     pin = pinUi,
                     entryNoun = viewModel.pinEntryNoun,
                     onPlay = { source -> beginPlayback { viewModel.play(source) } },
@@ -551,6 +588,25 @@ private fun TvDetailContent(
             // selects it (loading its sources up top) and scrolls back to the hero where Watch/Resume now
             // targets it; the per-episode + per-season watched toggles route through the ViewModel's
             // profile-aware history writes.
+            if (detail.type == MediaType.SERIES) {
+                RandomEpisodePickControls(
+                    state = randomEpisodePick,
+                    onPick = { if (onManualAction()) viewModel.pickRandomEpisode() },
+                    onOpen = {
+                        if (onManualAction()) {
+                            viewModel.openRandomEpisode { episode ->
+                                focusRestoreEpisodeId = episode.id
+                                focusRestoreRevision++
+                                scope.launch { scrollState.animateScrollTo(0) }
+                            }
+                        }
+                    },
+                    onPlay = { beginPlayback { viewModel.playRandomEpisode() } },
+                    playEnabled = playback !is Playback.Resolving,
+                    tv = true,
+                    modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
+                )
+            }
             if (detail.type == MediaType.SERIES && detail.videos.isNotEmpty()) {
                 TvSeasonEpisodeSection(
                     detail = detail,
@@ -558,12 +614,14 @@ private fun TvDetailContent(
                     selectedEpisodeId = selectedEpisodeId,
                     focusRestoreEpisodeId = focusRestoreEpisodeId,
                     focusRestoreRevision = focusRestoreRevision,
-                    onSelectSeason = viewModel::selectSeason,
+                    onSelectSeason = { season -> if (onManualAction()) viewModel.selectSeason(season) },
                     onSelectEpisode = { episodeId ->
-                        focusRestoreEpisodeId = episodeId
-                        focusRestoreRevision++
-                        viewModel.selectEpisode(episodeId)
-                        scope.launch { scrollState.animateScrollTo(0) }
+                        if (onManualAction()) {
+                            focusRestoreEpisodeId = episodeId
+                            focusRestoreRevision++
+                            viewModel.selectEpisode(episodeId)
+                            scope.launch { scrollState.animateScrollTo(0) }
+                        }
                     },
                     onToggleWatched = viewModel::setVideoWatched,
                     onMarkSeasonWatched = viewModel::setSeasonWatched,
@@ -573,7 +631,7 @@ private fun TvDetailContent(
             TvCastCreditsSection(
                 detail = detail,
                 castMembers = castMembers,
-                onPersonTap = { personTarget = it },
+                onPersonTap = { if (onManualAction()) personTarget = it },
             )
 
             // Where to Watch: legal region providers (TMDB, keyless edge). Gated off live content (no

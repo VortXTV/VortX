@@ -21,7 +21,7 @@ final class MediaServerCatalogsModel: ObservableObject {
     /// The rails to render, newest-server-first. Empty hides them.
     @Published private(set) var rails: [Rail] = []
 
-    private static let maxItems = 25
+    private nonisolated static let maxItems = 25
     private static let refreshInterval: TimeInterval = 30 * 60
     private var lastRefresh: Date?
     private var loadTask: Task<Void, Never>?

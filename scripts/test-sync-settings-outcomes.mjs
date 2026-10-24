@@ -30,7 +30,7 @@ function block(startText, endText) {
   return production.slice(start + startText.length, end);
 }
 const reset = block('.onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in\n', '\n        }');
-const recovery = block('.onChange(of: sync.lastSyncAt) { stamp in\n', '\n        }');
+const recovery = block('.onValueChange(of: sync.lastSyncAt) { stamp in\n', '\n        }');
 const methodStart = production.indexOf('    private func syncNow() {');
 const methodEnd = production.indexOf('\n    }', methodStart);
 assert(methodStart >= 0 && methodEnd > methodStart);

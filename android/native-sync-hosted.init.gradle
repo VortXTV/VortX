@@ -45,7 +45,7 @@ allprojects {
                     throw new GradleException("Actual host JNI SHA is required")
                 def receipt = new groovy.json.JsonSlurper().parse(new File(receiptPath))
                 if (receipt.schema != 1 ||
-                    receipt.engineSource != "0c30f4782aee544a2b7e33169ad60d03630d4097" ||
+                    receipt.engineSource != "2ea2e0f27dd2e53b7b28228435ca35a70f92831f" ||
                     receipt.engineSource != System.getenv("VORTX_ENGINE_SOURCE_SHA") ||
                     receipt.appSource != System.getenv("SOURCE_COMMIT") ||
                     receipt.features != "jni,server,resource-host" ||

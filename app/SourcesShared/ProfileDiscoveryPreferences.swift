@@ -7,7 +7,7 @@ import Foundation
 /// nil fields are wire-compatible with pre-feature and partially upgraded rosters. On a real
 /// profile switch they resolve to the documented flat-key defaults; during a background sync fold
 /// they leave the current live value intact until that viewer is explicitly selected.
-struct ProfileDiscoveryPreferences: Codable, Equatable {
+struct ProfileDiscoveryPreferences: Codable, Equatable, Sendable {
     var hiddenCatalogs: [String]? = nil
     var catalogOrder: [String]? = nil
     var hiddenHubCategories: [String]? = nil

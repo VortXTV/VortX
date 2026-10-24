@@ -21,10 +21,17 @@ const paths = {
 };
 const inputs = Object.fromEntries(await Promise.all(Object.entries(paths).map(async ([key, path]) => [key, await read(path)])));
 function member(source, signature) {
-  const start = source.indexOf(signature);
-  assert(start >= 0 && source.indexOf(signature, start + signature.length) < 0, `missing/ambiguous ${signature}`);
+  const markerStart = source.indexOf(signature);
+  assert(markerStart >= 0 && source.indexOf(signature, markerStart + signature.length) < 0, `missing/ambiguous ${signature}`);
+  let start = source.lastIndexOf('\n', markerStart - 1) + 1;
+  // Actor/availability attributes are part of the production declaration, not fixture decoration.
+  while (start > 0) {
+    const previousStart = source.lastIndexOf('\n', start - 2) + 1;
+    if (!source.slice(previousStart, start).trim().startsWith('@')) break;
+    start = previousStart;
+  }
   let depth = 0, opened = false, state = 'code', escaped = false, blockDepth = 0;
-  for (let i = start; i < source.length; i++) {
+  for (let i = markerStart; i < source.length; i++) {
     const c = source[i], next = source[i + 1];
     if (state === 'line') { if (c === '\n') state = 'code'; continue; }
     if (state === 'block') {
@@ -86,10 +93,11 @@ const extracted = {
   card: member(inputs.card, 'private func handleStremioSignIn(')
 };
 for (const key of ['card', 'tvLogin', 'iosLogin']) {
-  const boundaryCallback = member(inputs[key], '.onChange(of: account.credentialBoundaryGeneration)');
+  const observer = key === 'tvLogin' ? '.onChange' : '.onValueChange';
+  const boundaryCallback = member(inputs[key], observer + '(of: account.credentialBoundaryGeneration)');
   assert(boundaryCallback.includes('handleStremioSignIn(signedIn: account.isSignedIn)'), `${key} needs a wired true-to-true retry success event`);
   const signedCallback = member(inputs[key], key === 'iosLogin'
-    ? '.onChange(of: account.isSignedIn)' : '.onReceive(account.$isSignedIn)');
+    ? '.onValueChange(of: account.isSignedIn)' : '.onReceive(account.$isSignedIn)');
   assert(signedCallback.includes('handleStremioSignIn(signedIn: signedIn)'), `${key} must preserve incoming published value`);
 }
 assert(inputs.card.includes('if connecting {') && inputs.card.includes('} else if account.isSignedIn {'), 'partial card must keep retry UI mounted');

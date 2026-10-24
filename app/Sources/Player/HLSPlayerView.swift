@@ -497,10 +497,12 @@ private final class AVPlayerModel: NSObject, ObservableObject {
     private func observePiP(_ pip: AVPictureInPictureController?) {
         guard let pip else { return }
         let possible = pip.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] pip, _ in
-            Task { @MainActor in self?.isPiPPossible = pip.isPictureInPicturePossible }
+            let isPossible = pip.isPictureInPicturePossible
+            Task { @MainActor in self?.isPiPPossible = isPossible }
         }
         let active = pip.observe(\.isPictureInPictureActive, options: [.new]) { [weak self] pip, _ in
-            Task { @MainActor in self?.isPiPActive = pip.isPictureInPictureActive }
+            let isActive = pip.isPictureInPictureActive
+            Task { @MainActor in self?.isPiPActive = isActive }
         }
         observations.append(contentsOf: [possible, active])
     }
@@ -579,6 +581,7 @@ extension HLSPlayerView {
             controller.player = nil
         }
 
+        @MainActor
         final class Coordinator {
             private let resumeSeconds: Double
             private let onProgress: (Double, Double) -> Void
@@ -588,6 +591,11 @@ extension HLSPlayerView {
             private var readyObserver: NSKeyValueObservation?
             private var didResume = false
             private var didFail = false
+            private var generation = UUID()
+            private weak var activeItem: AVPlayerItem?
+            private var activeItemIdentity: ObjectIdentifier?
+            private var activePlayerIdentity: ObjectIdentifier?
+            private var isTornDown = true
 
             init(resumeSeconds: Double, onProgress: @escaping (Double, Double) -> Void, onLoadFailed: @escaping () -> Void = {}) {
                 self.resumeSeconds = resumeSeconds
@@ -596,44 +604,162 @@ extension HLSPlayerView {
             }
 
             func attach(_ player: AVPlayer, item: AVPlayerItem) {
+                // A representable coordinator is normally attached once, but SwiftUI may reuse it. Retire
+                // the old observers synchronously before replacing the admission identity so an old KVO/task
+                // callback cannot start or fail the new item.
+                let attachmentGeneration = UUID()
+                generation = attachmentGeneration
+                if !isTornDown {
+                    let finalProgress = retireCurrent()
+                    // The progress callback is external and may synchronously attach or tear down this
+                    // coordinator. Do not overwrite that newer authority when it returns.
+                    if let finalProgress { onProgress(finalProgress.0, finalProgress.1) }
+                    guard generation == attachmentGeneration else { return }
+                }
+                activeItem = item
+                activeItemIdentity = ObjectIdentifier(item)
+                activePlayerIdentity = ObjectIdentifier(player)
+                isTornDown = false
+                didResume = false
+                didFail = false
                 self.player = player
+                let itemIdentity = ObjectIdentifier(item)
+                let playerIdentity = ObjectIdentifier(player)
                 // Seek to the saved position once the item is ready, then play. If AVFoundation cannot open
                 // the item (.failed), hand the stream back to the caller so it can re-present on libmpv -
                 // without this, a remote HLS / DV-in-MP4 that AVPlayer chokes on left a black screen with no
                 // recovery (the tvOS "nothing plays" bug). Mirrors PlayerScreen.avEngineFailed on iOS/macOS.
-                readyObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                    guard let self else { return }
-                    if item.status == .failed, !self.didFail {
-                        self.didFail = true
-                        Task { @MainActor in self.onLoadFailed() }
-                        return
+                readyObserver = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
+                    let failed = observedItem.status == .failed
+                    let ready = observedItem.status == .readyToPlay
+                    let itemIdentity = ObjectIdentifier(observedItem)
+                    Task { @MainActor [weak self] in
+                        self?.receiveStatus(
+                            failed: failed,
+                            ready: ready,
+                            itemIdentity: itemIdentity,
+                            playerIdentity: playerIdentity,
+                            generation: attachmentGeneration)
                     }
-                    guard item.status == .readyToPlay, !self.didResume else { return }
-                    self.didResume = true
-                    if self.resumeSeconds > 1 {
-                        player.seek(to: CMTime(seconds: self.resumeSeconds, preferredTimescale: 600))
-                    }
-                    player.play()
                 }
                 // Report progress every second so Continue Watching updates, mirroring the libmpv hook.
                 timeObserver = player.addPeriodicTimeObserver(
                     forInterval: CMTime(seconds: 1, preferredTimescale: 1), queue: .main
                 ) { [weak self] time in
-                    guard let self, let dur = self.player?.currentItem?.duration.seconds,
-                          dur.isFinite, dur > 0 else { return }
-                    self.onProgress(time.seconds, dur)
+                    let seconds = time.seconds
+                    Task { @MainActor [weak self] in
+                        self?.receiveProgress(
+                            seconds: seconds,
+                            itemIdentity: itemIdentity,
+                            playerIdentity: playerIdentity,
+                            generation: attachmentGeneration)
+                    }
                 }
             }
 
+            private func admitsCallback(itemIdentity: ObjectIdentifier?,
+                                       playerIdentity: ObjectIdentifier?,
+                                       generation callbackGeneration: UUID) -> Bool {
+                guard !isTornDown,
+                      generation == callbackGeneration,
+                      activeItemIdentity == itemIdentity,
+                      activePlayerIdentity == playerIdentity,
+                      let player,
+                      ObjectIdentifier(player) == playerIdentity,
+                      let currentItem = player.currentItem,
+                      let activeItem,
+                      currentItem === activeItem,
+                      ObjectIdentifier(currentItem) == itemIdentity else { return false }
+                return true
+            }
+
+            private func receiveStatus(failed: Bool,
+                                       ready: Bool,
+                                       itemIdentity: ObjectIdentifier,
+                                       playerIdentity: ObjectIdentifier?,
+                                       generation callbackGeneration: UUID) {
+                guard admitsCallback(
+                    itemIdentity: itemIdentity,
+                    playerIdentity: playerIdentity,
+                    generation: callbackGeneration) else { return }
+                // The callback may have been queued while AVFoundation advanced the same item through a
+                // later status. Sample the live status on the actor so a queued ready edge cannot start
+                // playback after a failure edge has already become authoritative.
+                let currentStatus = player?.currentItem?.status
+                if failed {
+                    guard currentStatus == .failed, !didFail else { return }
+                    didFail = true
+                    onLoadFailed()
+                    return
+                }
+                guard ready, currentStatus == .readyToPlay, !didFail, !didResume, let player else { return }
+                didResume = true
+                if resumeSeconds > 1 {
+                    player.seek(to: CMTime(seconds: resumeSeconds, preferredTimescale: 600))
+                }
+                player.play()
+            }
+
+            private func receiveProgress(seconds: Double,
+                                         itemIdentity: ObjectIdentifier?,
+                                         playerIdentity: ObjectIdentifier?,
+                                         generation callbackGeneration: UUID) {
+                guard admitsCallback(
+                    itemIdentity: itemIdentity,
+                    playerIdentity: playerIdentity,
+                    generation: callbackGeneration),
+                      let dur = player?.currentItem?.duration.seconds,
+                      dur.isFinite, dur > 0 else { return }
+                onProgress(seconds, dur)
+            }
+
             func teardown() {
-                if let player, let timeObserver { player.removeTimeObserver(timeObserver) }
-                timeObserver = nil
-                readyObserver?.invalidate(); readyObserver = nil
+                // Rotate first even when state is already retired: an outer attach may be between its
+                // synchronous retirement and external final-progress callback, and that callback can call
+                // teardown to revoke the pending attach before it resumes.
+                generation = UUID()
+                guard !isTornDown else { return }
+                // Fence queued ready/progress tasks before invalidating AVFoundation observers. Final progress
+                // remains synchronous and is emitted from the still-admitted teardown call below.
+                isTornDown = true
+                let finalProgress = retireCurrent()
                 // Flush a final position so the resume point is current. The close itself is driven by the
                 // onExitCommand, so no onClose here (avoids a double dismiss).
-                if let player, let dur = player.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
-                    onProgress(player.currentTime().seconds, dur)
+                if let finalProgress { onProgress(finalProgress.0, finalProgress.1) }
+            }
+
+            /// Retires every callback and identity before returning control to an external progress callback.
+            /// It deliberately does not change `generation`; callers choose the fence before invoking it and
+            /// can detect a reentrant attach/teardown by comparing that captured generation afterward.
+            private func retireCurrent() -> (Double, Double)? {
+                let currentPlayer = player
+                let admittedItem = activeItem
+                let finalProgress: (Double, Double)?
+                if let currentPlayer,
+                   let activePlayerIdentity,
+                   ObjectIdentifier(currentPlayer) == activePlayerIdentity,
+                   let currentItem = currentPlayer.currentItem,
+                   let admittedItem,
+                   currentItem === admittedItem,
+                   let activeItemIdentity,
+                   ObjectIdentifier(currentItem) == activeItemIdentity {
+                    let duration = currentItem.duration.seconds
+                    finalProgress = duration.isFinite && duration > 0
+                        ? (currentPlayer.currentTime().seconds, duration) : nil
+                } else {
+                    finalProgress = nil
                 }
+                if let currentPlayer, let timeObserver {
+                    currentPlayer.removeTimeObserver(timeObserver)
+                }
+                timeObserver = nil
+                readyObserver?.invalidate(); readyObserver = nil
+                activeItem = nil
+                activeItemIdentity = nil
+                activePlayerIdentity = nil
+                isTornDown = true
+                player = nil
+                return finalProgress
             }
         }
     }
@@ -661,40 +787,71 @@ private struct MacVideoPlayer: View {
             .onDisappear { model.stop(onProgress: onProgress) }
     }
 
+    @MainActor
     final class Model: ObservableObject {
         let player = AVPlayer()
         private var timeObserver: Any?
         private var statusObserver: NSKeyValueObservation?
         private var didResume = false
+        private var generation = UUID()
+        private var progressAction: ((Double, Double) -> Void)?
 
         func start(url: URL, headers: [String: String]?, resume: Double, onProgress: @escaping (Double, Double) -> Void) {
+            // A reused surface must retire its old callbacks before installing another item.
+            // KVO does not promise main-actor delivery; only the captured ready value crosses below.
+            let originalGeneration = UUID()
+            generation = originalGeneration
+            retireCurrent(onProgress: progressAction ?? { _, _ in })
+            // The final old progress action may synchronously replace this surface itself.
+            guard generation == originalGeneration else { return }
+            didResume = false
+            progressAction = onProgress
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
             let item = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
             player.replaceCurrentItem(with: item)
             player.allowsExternalPlayback = true
             statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                guard let self, item.status == .readyToPlay, !self.didResume else { return }
-                self.didResume = true
-                if resume > 1 { self.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600)) }
-                self.player.play()
+                let ready = item.status == .readyToPlay
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, ready, self.generation == originalGeneration, !self.didResume else { return }
+                    self.didResume = true
+                    if resume > 1 { self.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600)) }
+                    self.player.play()
+                }
             }
             timeObserver = player.addPeriodicTimeObserver(
                 forInterval: CMTime(seconds: 1, preferredTimescale: 1), queue: .main
             ) { [weak self] time in
-                guard let self, let dur = self.player.currentItem?.duration.seconds, dur.isFinite, dur > 0 else { return }
-                onProgress(time.seconds, dur)
+                let seconds = time.seconds
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == originalGeneration,
+                          let dur = self.player.currentItem?.duration.seconds, dur.isFinite, dur > 0 else { return }
+                    self.progressAction?(seconds, dur)
+                }
             }
         }
 
         func stop(onProgress: (Double, Double) -> Void) {
+            generation = UUID()
+            retireCurrent(onProgress: onProgress)
+        }
+
+        private func retireCurrent(onProgress: (Double, Double) -> Void) {
+            let finalProgress: (Double, Double)?
+            if let dur = player.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
+                finalProgress = (player.currentTime().seconds, dur)
+            } else {
+                finalProgress = nil
+            }
             if let timeObserver { player.removeTimeObserver(timeObserver) }
             timeObserver = nil
             statusObserver?.invalidate(); statusObserver = nil
-            if let dur = player.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
-                onProgress(player.currentTime().seconds, dur)
-            }
             player.pause()
             player.replaceCurrentItem(with: nil)
+            progressAction = nil
+            // Publish last: reentrant callbacks cannot flush or tear down the old item twice,
+            // nor can this old cleanup remove a replacement installed by that callback.
+            if let finalProgress { onProgress(finalProgress.0, finalProgress.1) }
         }
     }
 }

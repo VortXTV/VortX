@@ -244,7 +244,7 @@ final class FeaturedHeroModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.heroRotateInterval)
                 guard !Task.isCancelled else { return }
-                await self?.advanceIfNotHeld()
+                self?.advanceIfNotHeld()
             }
         }
     }
@@ -347,7 +347,7 @@ final class FeaturedHeroModel: ObservableObject {
         resumeTask = Task { [weak self] in
             try? await Task.sleep(for: Self.heroResumeAfter)
             guard !Task.isCancelled else { return }
-            await self?.releaseInteractionHold()
+            self?.releaseInteractionHold()
         }
     }
 
@@ -561,8 +561,7 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
     /// has no logo for the id the bounded logo loader fails and `titleOrLogo` falls back to the styled serif name.
     /// Nil for non-IMDB ids (tmdb:/tvdb:/kitsu:), which only metahub-by-IMDB can't cover.
     static func metahubLogo(forId id: String) -> String? {
-        guard id.hasPrefix("tt") else { return nil }
-        return "https://images.metahub.space/logo/medium/\(id)/img"
+        PosterArtwork.metahubLogo(forID: id)
     }
 
     /// The VortX `/clip` URL for this title's ambient hero trailer (libmpv plays the muted mp4; the still

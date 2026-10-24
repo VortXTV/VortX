@@ -97,16 +97,18 @@ enum OwnerLibraryPositionPolicy {
         }
     }
 
-    private static let fractionalISO8601: ISO8601DateFormatter = {
+    // Formatters are operation-local: Foundation does not expose a checked Sendable formatter.
+    // Keep both parsing option sets and their fractional-then-plain fallback order unchanged.
+    private static var fractionalISO8601: ISO8601DateFormatter {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
-    }()
+    }
 
-    private static let plainISO8601: ISO8601DateFormatter = {
+    private static var plainISO8601: ISO8601DateFormatter {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
-    }()
+    }
 
 }

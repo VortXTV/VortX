@@ -134,7 +134,7 @@ struct InHeroTrailerView: View {
         // closes, instead of flashing a black not-yet-decoding surface at full opacity.
         // Single-parameter onChange form: the iOS target deploys to 16.0, where the zero-parameter
         // iOS 17 overload does not exist (it broke the CI iOS build).
-        .onChange(of: playbackGate.playerActive) { active in
+        .onValueChange(of: playbackGate.playerActive) { active in
             if active { showClip = false; didStart = false; startedDelay = false }
         }
         // Decorative ambient layer; the hero title / actions carry the accessible content.

@@ -1267,10 +1267,15 @@ enum VortxLegacyDeltaSummary {
 
 actor VortxNativeSession {
     enum CatalogScreen: String, Sendable { case board, discover, search }
+    /// Installed by the real opener, never synthesized from a later account capture.
+    /// Unconfigured synthetic/generic sessions keep nil and cannot select the typed owner.
+    typealias OwnerHistoryLocalCheckpointPreparation = @Sendable
+        (Data, VortxAccountScope, any VortxMutationAuthority) async throws -> OwnerHistoryPreparedExport
     let scope: VortxAccountScope
     private let abi: any VortxRuntimeABI
     private let store: any VortxCheckpointStore
     private let transport: any VortxResourceTransport
+    private let ownerHistoryLocalCheckpointPreparation: OwnerHistoryLocalCheckpointPreparation?
     // Quarantined before transfer retirement; no generic route may reuse it afterward.
     private var runtime: VortxNativeRuntime!
     private var genericRetirementUnconfirmed = false
@@ -1338,13 +1343,15 @@ actor VortxNativeSession {
          ownerHistoryColdTarget: OwnerHistorySessionCoordinator.Target? = nil,
          ownerHistoryColdCheckpoint: VortxEncryptedCheckpointStore.OwnerHistoryRead? = nil,
          ownerHistoryReadOnly: Bool = false,
-         ownerHistoryColdPeer: OwnerHistoryColdPeer? = nil) throws {
+         ownerHistoryColdPeer: OwnerHistoryColdPeer? = nil,
+         ownerHistoryLocalCheckpointPreparation: OwnerHistoryLocalCheckpointPreparation? = nil) throws {
         try scope.validate()
         self.diagnostics = diagnostics
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
+        self.ownerHistoryLocalCheckpointPreparation = ownerHistoryLocalCheckpointPreparation
         if let input = ownerHistoryColdPeer {
-            guard Self.ownerHistoryRoutingEnabled, ownerHistoryColdCheckpoint == nil,
+            guard Self.ownerHistoryRoutingEnabled, ownerHistoryLocalCheckpointPreparation != nil, ownerHistoryColdCheckpoint == nil,
                   let encrypted = store as? VortxEncryptedCheckpointStore, let sourceAuthority,
                   initialActions.isEmpty, initialLegacyMaterial == nil, authenticatedSourceArchive == nil,
                   legacy == nil, !allowNewAccount else { throw VortxNativeError.unavailable }
@@ -1394,7 +1401,7 @@ actor VortxNativeSession {
             return
         }
         if let checkpoint = ownerHistoryColdCheckpoint {
-            guard Self.ownerHistoryRoutingEnabled,
+            guard Self.ownerHistoryRoutingEnabled, ownerHistoryLocalCheckpointPreparation != nil,
                   let encrypted = store as? VortxEncryptedCheckpointStore,
                   checkpoint.format == "vortx-native-owner-history-checkpoint-v1",
                   let target = ownerHistoryColdTarget, let sourceAuthority,
@@ -1696,6 +1703,7 @@ actor VortxNativeSession {
         additionalSource: (any VortxMutationAuthority)? = nil) throws -> OwnerHistorySessionPublication {
         let read = acknowledged.originalRead
         guard Self.ownerHistoryRoutingEnabled else { throw OwnerHistoryRoutingFailure.activationDisabled }
+        guard ownerHistoryLocalCheckpointPreparation != nil else { throw VortxNativeError.unavailable }
         try requireActiveRoute()
         guard ownerHistory == nil, ownerHistoryTransferCandidate == nil else {
             throw OwnerHistoryRoutingFailure.alreadyActivated
@@ -2679,6 +2687,7 @@ actor VortxNativeSession {
             // Account-native commands do not fetch/import Stremio data. The real original
             // account source, running FIFO member and complete-account CAS remain mandatory.
             guard let fifoAuthority else { throw VortxNativeError.superseded }
+            guard let prepareLocalCheckpoint = ownerHistoryLocalCheckpointPreparation else { throw VortxNativeError.unavailable }
             let source = OwnerHistoryOrdinarySource(lease: lease, source: sourceAuthority, member: fifoAuthority,
                 peerSource: typedPeer?.sourceAuthority)
             try source.withActive {}
@@ -2695,8 +2704,7 @@ actor VortxNativeSession {
                     capture: capture, transaction: peer.transaction))
             } else {
                 let base = try ownerHistory.acknowledgedAccountBase(capture: capture)
-                let prepared = try await VortXSyncManager.shared.prepareOwnerHistoryLocalCheckpoint(
-                    base: base, scope: scope, source: source)
+                let prepared = try await prepareLocalCheckpoint(base, scope, source)
                 let transaction: any OwnerHistoryCompleteCheckpointAuthority
                 if let checkpointValidator {
                     transaction = OwnerHistoryAdditionalCheckpointAuthority(raw: prepared, additional: checkpointValidator)

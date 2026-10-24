@@ -67,6 +67,37 @@ enum CredentialPublicationOutbox {
         fileprivate let epoch: UInt64
     }
 
+    /// Constructed only after the original Bridge and Facade accepted-owner proofs join.
+    /// A job retains this receipt from initiation; there is no latest-owner fallback.
+    struct SubtitleMountOwner: Equatable, Sendable {
+        fileprivate let id: UUID
+        fileprivate init(id: UUID) { self.id = id }
+    }
+    struct SubtitleEffectLease: Equatable, Sendable {
+        fileprivate let id: UInt64
+        fileprivate let epoch: UInt64
+        fileprivate let ownerID: UUID
+        fileprivate init(id: UInt64, epoch: UInt64, ownerID: UUID) {
+            self.id = id; self.epoch = epoch; self.ownerID = ownerID
+        }
+    }
+    struct SubtitleRetirement: Equatable, Sendable {
+        fileprivate let id: UUID
+        fileprivate init(id: UUID) { self.id = id }
+    }
+    private struct SubtitleOwnerRecord {
+        let proof: VortxNativeCoreFacade.NativeSubtitleOwnerProof
+        let epoch: UInt64
+    }
+    private struct SubtitleEffectRecord {
+        let lease: SubtitleEffectLease
+        let domains: Set<UUID>
+    }
+    private struct SubtitleRetirementRecord {
+        let domain: UUID
+        let effectID: UInt64?
+    }
+
     private struct DispatchRecord {
         let account: String
         let threadID: ObjectIdentifier
@@ -84,6 +115,10 @@ enum CredentialPublicationOutbox {
         var active: [UInt64: DispatchRecord] = [:]
         var mutations: [UInt64: MutationRecord] = [:]
         var boundaryWaiters: [CheckedContinuation<BoundaryAcquisition, Never>] = []
+        var subtitleOwners: [UUID: SubtitleOwnerRecord] = [:]
+        var subtitleEffect: SubtitleEffectRecord?
+        var subtitleRetirements: [UUID: SubtitleRetirementRecord] = [:]
+        var subtitleDrainWaiters: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
     }
 
     private static let coordination = Coordination()
@@ -184,6 +219,7 @@ enum CredentialPublicationOutbox {
             return nil
         }
         guard !coordination.boundaryActive,
+              coordination.subtitleEffect == nil,
               coordination.boundaryWaiters.isEmpty else {
             coordination.condition.unlock()
             return nil
@@ -218,6 +254,7 @@ enum CredentialPublicationOutbox {
         let threadID = ObjectIdentifier(Thread.current)
         coordination.condition.lock()
         guard !coordination.boundaryActive,
+              coordination.subtitleEffect == nil,
               coordination.boundaryWaiters.isEmpty,
               !coordination.active.values.contains(where: { $0.account == account }),
               case let .pending(existing) = state(account: account, read: read),
@@ -251,6 +288,113 @@ enum CredentialPublicationOutbox {
         }
         coordination.condition.unlock()
         waiter?.resume(returning: .acquired)
+    }
+
+    /// Called only inside B -> F by the Facade's authoritative capture body. Both proof
+    /// initializers are fileprivate in their writer files; a caller-supplied DTO cannot grant.
+    /// The condition contains scalar bookkeeping only, never a callback or native pointer.
+    static func registerSubtitleOwner(
+        _ proof: VortxNativeCoreFacade.NativeSubtitleOwnerProof
+    ) -> SubtitleMountOwner? {
+        coordination.condition.lock()
+        defer { coordination.condition.unlock() }
+        let domains: Set<UUID> = [proof.bridge.domain, proof.bridge.sourceID]
+        guard !coordination.boundaryActive,
+              coordination.boundaryWaiters.isEmpty,
+              coordination.active.isEmpty, coordination.mutations.isEmpty,
+              !coordination.subtitleRetirements.values.contains(where: { domains.contains($0.domain) }),
+              CredentialScopeRegistry.shared.isCurrent(proof.bridge.credential) else { return nil }
+        if let existing = coordination.subtitleOwners.first(where: {
+            $0.value.epoch == coordination.epoch && $0.value.proof == proof
+        }) { return .init(id: existing.key) }
+        // There is one live accepted registration for this Bridge, never one per subtitle job.
+        coordination.subtitleOwners = coordination.subtitleOwners.filter {
+            $0.value.proof.bridge.domain != proof.bridge.domain
+        }
+        let id = UUID()
+        coordination.subtitleOwners[id] = .init(proof: proof, epoch: coordination.epoch)
+        return .init(id: id)
+    }
+
+    /// Typed admission only. No callback parameter is accepted and no native work occurs here.
+    /// Its ID participates in the SAME mutation drain already used by credential bind/clear.
+    static func tryBeginSubtitleEffect(_ owner: SubtitleMountOwner) -> SubtitleEffectLease? {
+        if callbackLeaseIsActive() { return nil }
+        let threadID = ObjectIdentifier(Thread.current)
+        coordination.condition.lock()
+        defer { coordination.condition.unlock() }
+        guard let record = coordination.subtitleOwners[owner.id], record.epoch == coordination.epoch,
+              !coordination.boundaryActive, coordination.boundaryWaiters.isEmpty,
+              coordination.active.isEmpty, coordination.mutations.isEmpty,
+              coordination.subtitleEffect == nil,
+              CredentialScopeRegistry.shared.isCurrent(record.proof.bridge.credential) else { return nil }
+        let domains: Set<UUID> = [record.proof.bridge.domain, record.proof.bridge.sourceID]
+        guard !coordination.subtitleRetirements.values.contains(where: { domains.contains($0.domain) }) else { return nil }
+        // This is the final denying predicate while C is held. A successful E read is
+        // admission's linearization point; the reserved effect below is its predecessor
+        // even if E retires immediately afterward. Every native successor drains C.
+        guard LegacyWatchOwnership.applicationEpochIsCurrent(record.proof.bridge.originalApplicationEpoch) else { return nil }
+        coordination.nextLeaseID &+= 1
+        let lease = SubtitleEffectLease(id: coordination.nextLeaseID, epoch: coordination.epoch, ownerID: owner.id)
+        coordination.mutations[lease.id] = MutationRecord(threadID: threadID)
+        coordination.subtitleEffect = SubtitleEffectRecord(lease: lease, domains: domains)
+        return lease
+    }
+
+    static func endSubtitleEffect(_ lease: SubtitleEffectLease) {
+        coordination.condition.lock()
+        guard coordination.subtitleEffect?.lease == lease else {
+            coordination.condition.unlock(); return
+        }
+        coordination.subtitleEffect = nil
+        coordination.mutations.removeValue(forKey: lease.id)
+        let drains = coordination.subtitleDrainWaiters.removeValue(forKey: lease.id) ?? []
+        let boundary = acquireNextBoundaryWaiterLocked()
+        coordination.condition.broadcast()
+        coordination.condition.unlock()
+        // Reentrant auth or profile work runs only after every coordinator lock is released.
+        for drain in drains { drain.resume() }
+        boundary?.resume(returning: .acquired)
+    }
+
+    /// Denial is synchronous, draining is cooperative. Repeated retirement cannot revive a
+    /// retired owner ID. The ticket remains closed until its actual writer finishes transition.
+    static func beginSubtitleRetirement(domain: UUID) -> SubtitleRetirement {
+        coordination.condition.lock()
+        defer { coordination.condition.unlock() }
+        let effect = coordination.subtitleEffect
+        let id = UUID()
+        coordination.subtitleRetirements[id] = .init(domain: domain,
+            effectID: effect?.domains.contains(domain) == true ? effect?.lease.id : nil)
+        coordination.subtitleOwners = coordination.subtitleOwners.filter {
+            $0.value.proof.bridge.domain != domain && $0.value.proof.bridge.sourceID != domain
+        }
+        return .init(id: id)
+    }
+
+    /// Cancellation never releases somebody else's effect. A cancelled writer still drains its
+    /// already-admitted predecessor, then its own ordinary cancellation path can finish the ticket.
+    static func waitForSubtitleRetirement(_ retirement: SubtitleRetirement) async {
+        await withCheckedContinuation { continuation in
+            coordination.condition.lock()
+            if let effectID = coordination.subtitleRetirements[retirement.id]?.effectID,
+               coordination.subtitleEffect?.lease.id == effectID {
+                coordination.subtitleDrainWaiters[effectID, default: []].append(continuation)
+                coordination.condition.unlock()
+            } else {
+                coordination.condition.unlock(); continuation.resume()
+            }
+        }
+    }
+
+    @discardableResult
+    static func finishSubtitleRetirement(_ retirement: SubtitleRetirement) -> Bool {
+        coordination.condition.lock()
+        defer { coordination.condition.unlock() }
+        guard let record = coordination.subtitleRetirements[retirement.id] else { return false }
+        guard record.effectID == nil || record.effectID != coordination.subtitleEffect?.lease.id else { return false }
+        coordination.subtitleRetirements.removeValue(forKey: retirement.id)
+        return true
     }
 
     static func state(

@@ -39,7 +39,7 @@ enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} 
 
 @main enum MobileNativeServerLifecycleTests {
     static func main() {
-        precondition(VortxNativeServerFlag.isOn && VortxNativeServerFlag.isSupported)
+        precondition(VortxNativeServerFlag.isSupported)
         for cycle in 0..<64 {
             VortxNativeServer.startIfNeeded()
             VortxNativeServer.startIfNeeded() // duplicate foreground startup is idempotent

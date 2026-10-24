@@ -88,7 +88,6 @@ final class WatchedIndex: ObservableObject {
     @Published private(set) var ids: Set<String> = []
 }
 
-#if VORTX_NATIVE_DATA_ENGINE
 final class CoreBridge: ObservableObject {
     static let shared = CoreBridge()
     struct NativeWatchlistTarget {}
@@ -114,7 +113,6 @@ final class CoreBridge: ObservableObject {
     @MainActor func saveNativeLegacyCuration(_ edit: VortxNativeHostFieldEdit, target: NativeXperienceTarget,
                                             validator: XperiencePreparedExport) async throws -> VortxJSON { .null }
 }
-#endif
 
 #if os(tvOS)
 final class FocusedItemModel: ObservableObject {}

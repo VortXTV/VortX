@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import CoreFoundation
+import os
 
 // External environment only. The extractor appends the production receive, merge,
 // projection and main-queue publication functions without replacing their bodies.
@@ -36,10 +37,20 @@ typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
 
 // ProfileStore is the presentation sink; actual CoreBridge.refreshNativeProfiles
 // performs production native/host decoding and chooses the acknowledged active UUID.
-final class ProfileStore: @unchecked Sendable {
+@MainActor
+final class ProfileStore {
     static let shared = ProfileStore()
-    var profiles: [UserProfile] = []
-    var activeID: UUID? = UUID(uuidString: AppleSyncReceivePublicationPeer.owner)
+    var profiles: [UserProfile] = [] {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    var activeID: UUID? = UUID(uuidString: AppleSyncReceivePublicationPeer.owner) {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    // One singleton per peer process, first accessed by @MainActor receive setup. The real
+    // namespace/projector and these fileprivate writer callsites share Combined.swift.
+    private init() { ProfileSelectionRead.publishInitial(selectionReadSnapshot()) }
     var active: UserProfile? { profiles.first { $0.id == activeID } }
     var activeUsesEngineHistory: Bool { active?.usesEngineHistory ?? true }
     var activeKeychainAccount: String { "synthetic.account" }
@@ -85,11 +96,16 @@ final class CoreBridge: @unchecked Sendable {
     var continueWatching: [CoreCWItem] = []
     var library: CoreLibrary?
     let continueWatchingRebuildLock = NSLock()
-    var continueWatchingRebuildGeneration: UInt64 = 0
-    struct PublicationToken: Equatable { let epoch: UInt64 }
-    let publicationEpochLock = NSLock()
-    var publicationEpoch: UInt64 = 1
+    var continueWatchingRebuildGeneration: Int = 0
+    struct PublicationToken: Equatable, Sendable { let epoch: UInt64 }
+    let publicationEpochState = OSAllocatedUnfairLock(initialState: UInt64(1))
+    let nativeCallbackLifetime = NativeCallbackLifetime()
+    var nativeCallbackGeneration = UUID()
+    let nativePlaybackReadLifetime = NativePlaybackReadLifetime()
+    let nativeMetadataAdmissionFence = VortxNativeMetadataAdmissionFence()
+    @MainActor
     var acceptedHistoryReceiptRevision = 0
+    @MainActor
     var lastAcceptedHistoryReceipt: BecauseYouWatchedHistoryPolicy.Snapshot?
     var localHistoryDeviceReceiptPending = true
     struct LocalRecommendationHistory { let library: [CoreCWItem]; let continueWatching: [CoreCWItem]; let receipt: BecauseYouWatchedHistoryPolicy.Snapshot }
@@ -97,21 +113,24 @@ final class CoreBridge: @unchecked Sendable {
         let snapshot: LocalRecommendationHistory; let context: Int?
         let credentialCapture: CredentialScopeRegistry.Capture; let publicationToken: PublicationToken
     }
+    @MainActor
     var localRecommendationHistoryState: LocalRecommendationHistoryState?
     var changedFields: Set<String> = []
     var revision = 0
     var addons: [CoreDescriptor] = []
     var rawAddonsByUrl: [String: [String: Any]] = [:]
     var addonNamesCache: [String: String]?
+    @MainActor
     var logoutAccountMutationPending = false
     var boardRowsLoaded = 30
     var boardCatalogTotal = 0
     var boardPageInFlight = false
     var boardRowPageInFlight: [Int: Int] = [:]
     var deferredBoardRangeDepth: Int?
-    let playerActiveSnapshotLock = NSLock()
-    var playerActiveSnapshotValue = false
+    let playerActiveSnapshotState = OSAllocatedUnfairLock(initialState: false)
+    @MainActor
     func settledActiveAccountBinding() -> PlaybackMutationOwnershipPolicy.SettledAccountBinding? { nil }
+    @MainActor
     func settledLocalHistoryOwner(credentialCapture: CredentialScopeRegistry.Capture) -> BecauseYouWatchedHistoryPolicy.Owner? {
         guard CredentialScopeRegistry.shared.isCurrent(credentialCapture), let id = ProfileStore.shared.activeID else { return nil }
         return .init(profileID: id, keychainAccount: ProfileStore.shared.activeKeychainAccount, uid: nil, generation: credentialCapture.generation)
@@ -460,8 +479,8 @@ struct SIMKLContinueWatchingShadow {
                 let accepted = await manager.uploadForFixture(document, version: command.version!)
                 try emit(["accepted": accepted, "version": manager.lastSyncedVersion, "stamped": manager.stamped, "actor": hostActor])
             } else if command.mode == "receive-sequence" {
-                let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { CoreBridge.shared.handleHistoryFields($0) })
-                core.nativeFacadeStorage = facade; core.nativeCredentialCapture = CredentialScopeRegistry.shared.capture()
+                let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], sourceEvent: core.makeHistorySourceCallbackForFixture(), changed: { _ in })
+                core.installHistoryFacadeForFixture(facade)
                 core.nativePublishedAccountGeneration = facade.accountGeneration
                 try core.refreshProfilesForFixture()
                 // Seed the real observable cache before any receive. Reading defaults alone
@@ -572,8 +591,8 @@ struct SIMKLContinueWatchingShadow {
                 let uploaded = await manager.uploadForFixture(["nativeSync": native, "nativeHostPreferences": host], version: 1)
                 print(String(decoding: try JSONSerialization.data(withJSONObject: ["accepted": uploaded, "stamped": manager.stamped, "version": manager.lastSyncedVersion]), as: UTF8.self))
             } else {
-                let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { fields in CoreBridge.shared.handleHistoryFields(fields) })
-                core.nativeFacadeStorage = facade; core.nativeCredentialCapture = CredentialScopeRegistry.shared.capture()
+                let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], sourceEvent: core.makeHistorySourceCallbackForFixture(), changed: { _ in })
+                core.installHistoryFacadeForFixture(facade)
                 core.nativePublishedAccountGeneration = facade.accountGeneration
                 try core.refreshProfilesForFixture()
                 let originalAccountGeneration = facade.accountGeneration

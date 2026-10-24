@@ -188,9 +188,10 @@ private func preservationContract(_ value: String) -> Bool {
 private func lateIdentityContract(_ value: String, requiresRefresh: Bool) -> Bool {
     let establish = functionSection(value, "private func establishSubtitleTimingScopeIfAvailable")
     let body = functionSection(value, "var body: some View")
+    let sourceObserver = requiresRefresh ? ".onChange" : ".onValueChange"
     let triggerNeedles = requiresRefresh
         ? [
-            ".onChange(of: core.streamsEpoch)",
+            "\(sourceObserver)(of: core.streamsEpoch)",
             "refreshSourceOptionCounts()",
             "establishSubtitleTimingScopeIfAvailable()",
             "if appliedAutoTracks",
@@ -198,7 +199,7 @@ private func lateIdentityContract(_ value: String, requiresRefresh: Bool) -> Boo
             "applyCurrentSubtitleDelayIfReady(force: false)"
         ]
         : [
-            ".onChange(of: core.streamsEpoch)",
+            "\(sourceObserver)(of: core.streamsEpoch)",
             "establishSubtitleTimingScopeIfAvailable()",
             "if appliedAutoTracks",
             "restoreSubtitleTimingOffsetIfReady()",
@@ -344,6 +345,7 @@ enum SubtitleTimingSurfaceContractTests {
         )
 
         for (surfaceName, surface) in [("tvOS", tvSource), ("iOS/Mac", iOSSource)] {
+            let sourceObserver = surfaceName == "tvOS" ? ".onChange" : ".onValueChange"
             requireRejectedMutant(
                 "01 \(surfaceName) accepted-engine-zero",
                 original: surface,
@@ -579,8 +581,8 @@ enum SubtitleTimingSurfaceContractTests {
                     replaceFirstAfter(
                         $0,
                         marker: "var body: some View",
-                        old: ".onChange(of: core.streamsEpoch)",
-                        with: ".onChange(of: core.sourceEpoch)"
+                        old: "\(sourceObserver)(of: core.streamsEpoch)",
+                        with: "\(sourceObserver)(of: core.sourceEpoch)"
                     )
                 }
             )
@@ -590,7 +592,7 @@ enum SubtitleTimingSurfaceContractTests {
                 mutation: {
                     replaceFirstAfter(
                         $0,
-                        marker: ".onChange(of: core.streamsEpoch)",
+                        marker: "\(sourceObserver)(of: core.streamsEpoch)",
                         old: "restoreSubtitleTimingOffsetIfReady()",
                         with: "// late restore removed"
                     )

@@ -24,8 +24,9 @@ enum AppleEpisodeResolverAdmission {
     }
 
     /// Execute the already-admitted route. The route enum makes the no-fallback decision once, before any
-    /// async work or caller-owned playback state can be consumed.
-    static func resolve<Output>(_ route: Route<Output>) async -> Output? {
+    /// async work or caller-owned playback state can be consumed. Keep this dispatch seam on the caller's
+    /// executor: its closures and prepared result retain caller-owned, non-Sendable playback resources.
+    nonisolated(nonsending) static func resolve<Output>(_ route: Route<Output>) async -> Output? {
         switch route {
         case .launch(let id, let resolver):
             return await resolver(id)

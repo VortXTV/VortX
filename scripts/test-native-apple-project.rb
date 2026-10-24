@@ -4,6 +4,7 @@ require 'yaml'
 require 'fileutils'
 require 'open3'
 require 'json'
+require_relative 'native-apple-swift6-policy'
 
 root = File.expand_path('..', __dir__)
 app = File.join(root, 'app')
@@ -12,6 +13,103 @@ revision = 'ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4'
 output = File.join(app, ".native-project-contract-#{Process.pid}.yml")
 project_bytes = File.binread(File.join(app, 'project.yml'))
 project_spec = YAML.safe_load(project_bytes, permitted_classes: [], permitted_symbols: [], aliases: false)
+NativeAppleSwift6Policy.validate!(project_spec)
+policy_checks = 1
+%w[CinemaUISmokeRenderer.yml CinemaUISmokeIOSRenderer.yml].each do |filename|
+  diagnostic = YAML.safe_load(File.read(File.join(app, filename)), permitted_classes: [], permitted_symbols: [], aliases: false)
+  NativeAppleSwift6Policy.validate!(diagnostic)
+  policy_checks += 1
+end
+# Exercise the production validator with RAM-only settings mutations, never by
+# rewriting project.yml or a credential-bearing xcconfig.
+NativeAppleSwift6Policy::REQUIRED.each do |key, expected|
+  wrong = { 'SWIFT_VERSION' => '5.0', 'SWIFT_STRICT_CONCURRENCY' => 'minimal',
+            'SWIFT_TREAT_WARNINGS_AS_ERRORS' => 'NO' }.fetch(key)
+  %w[project-base project-config target-base target-config sdk-conditional template group].each do |scope|
+    candidate = Marshal.load(Marshal.dump(project_spec))
+    target = candidate.fetch('targets').fetch('VortXMac')
+    case scope
+    when 'project-base' then candidate.fetch('settings').fetch('base')[key] = wrong
+    when 'project-config' then candidate.fetch('settings')['configs'] = { 'Release' => { key => wrong } }
+    when 'target-base' then target.fetch('settings').fetch('base')[key] = wrong
+    when 'target-config' then target.fetch('settings')['configs'] = { 'Debug' => { key => wrong } }
+    when 'sdk-conditional' then target.fetch('settings').fetch('base')["#{key}[sdk=appletvos*]"] = wrong
+    when 'template' then candidate['targetTemplates'] = { 'Test' => { 'settings' => { 'base' => { key => wrong } } } }
+    when 'group' then candidate['settingGroups'] = { 'Test' => { key => wrong } }
+    end
+    begin
+      NativeAppleSwift6Policy.validate!(candidate)
+    rescue ArgumentError => error
+      abort "wrong policy failure for #{scope}/#{key}: #{error}" unless error.message.include?(key)
+      policy_checks += 1
+      next
+    end
+    abort "Swift 6 downgrade accepted: #{scope}/#{key}"
+  end
+  inherited = Marshal.load(Marshal.dump(project_spec))
+  inherited.fetch('targets').fetch('VortXTV').fetch('settings')['configs'] = { 'Release' => { key => expected } }
+  NativeAppleSwift6Policy.validate!(inherited)
+  policy_checks += 1
+end
+objects = {
+  'project' => { 'isa' => 'PBXProject', 'buildConfigurationList' => 'project-list', 'targets' => [] },
+  'project-list' => { 'isa' => 'XCConfigurationList', 'buildConfigurations' => %w[project-debug project-release] }
+}
+%w[Debug Release].each do |configuration|
+  objects["project-#{configuration.downcase}"] = {
+    'isa' => 'XCBuildConfiguration', 'name' => configuration,
+    'buildSettings' => NativeAppleSwift6Policy::REQUIRED.dup
+  }
+end
+NativeAppleSwift6Policy::ROSTERS.fetch('native').each do |target|
+  objects['project']['targets'] << target
+  objects[target] = { 'isa' => 'PBXNativeTarget', 'name' => target, 'buildConfigurationList' => "#{target}-list" }
+  objects["#{target}-list"] = { 'isa' => 'XCConfigurationList', 'buildConfigurations' => [] }
+  %w[Debug Release].each do |configuration|
+    id = "#{target}-#{configuration}"
+    objects["#{target}-list"]['buildConfigurations'] << id
+    objects[id] = { 'isa' => 'XCBuildConfiguration', 'name' => configuration, 'buildSettings' => {} }
+  end
+end
+generated_fixture = { 'rootObject' => 'project', 'objects' => objects }
+abort 'generated policy omits target configurations' unless NativeAppleSwift6Policy.validate_generated!(generated_fixture, 'native').length == 10
+policy_checks += 1
+mutations = {
+  'target Swift 5' => ->(pbx) { pbx['objects']['VortXMac-Release']['buildSettings']['SWIFT_VERSION'] = '5.0' },
+  'SDK-specific Swift 5' => ->(pbx) { pbx['objects']['VortXTV-Release']['buildSettings']['SWIFT_VERSION[sdk=appletvos*]'] = '5.0' },
+  # Keep project/target lists consistent so only the exact configuration-roster
+  # guard can reject these, rather than the separate inheritance-shape guard.
+  'missing Release' => ->(pbx) {
+    pbx['objects'].each_value do |object|
+      object['buildConfigurations'].pop if object['isa'] == 'XCConfigurationList'
+    end
+  },
+  'extra configuration' => ->(pbx) {
+    lists = pbx['objects'].select { |_, object| object['isa'] == 'XCConfigurationList' }
+    lists.each do |id, list|
+      extra = "#{id}-extra"
+      list['buildConfigurations'] << extra
+      pbx['objects'][extra] = { 'isa' => 'XCBuildConfiguration', 'name' => 'Extra',
+                               'buildSettings' => NativeAppleSwift6Policy::REQUIRED.dup }
+    end
+  },
+  'missing target' => ->(pbx) { pbx['objects']['project']['targets'].pop },
+  'external xcconfig' => ->(pbx) { pbx['objects']['VortXMac-Release']['baseConfigurationReference'] = 'unresolved-config' }
+}
+mutations.each do |label, mutate|
+  candidate = Marshal.load(Marshal.dump(generated_fixture))
+  mutate.call(candidate)
+  begin
+    NativeAppleSwift6Policy.validate_generated!(candidate, 'native')
+  rescue ArgumentError => error
+    if ['missing Release', 'extra configuration'].include?(label)
+      abort "wrong configuration-roster failure for #{label}: #{error}" unless error.message == 'expected exactly Debug and Release configurations'
+    end
+    policy_checks += 1
+    next
+  end
+  abort "generated project policy accepted #{label}"
+end
 native_names = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
 base_plists = native_names.to_h do |name|
   relative = project_spec.dig('targets', name, 'settings', 'base', 'INFOPLIST_FILE')
@@ -38,6 +136,9 @@ begin
     '--mpvkit', File.join(app, 'Vendor', 'MPVKit-DVFEL'), '--output', output)
   abort "generator failed: #{stdout} #{stderr}" unless status.success?
   spec = YAML.safe_load(File.read(output), permitted_classes: [], permitted_symbols: [], aliases: false)
+  NativeAppleSwift6Policy.validate!(spec)
+  abort 'native generator changed shared Swift policy' unless spec.fetch('settings') == project_spec.fetch('settings')
+  policy_checks += 1
   expected = %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf]
   abort 'unexpected native target roster' unless spec.fetch('targets').keys.sort == expected.sort
   abort 'web/diagnostic scheme survived native generation' unless spec.fetch('schemes').keys.sort == (expected - ['VortXTopShelf']).sort
@@ -115,6 +216,7 @@ begin
   abort 'release workflow lost the existing complete ABI gate' unless workflow.include?('./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host')
   abort 'release workflow lost the existing aggregate artifact gate' unless workflow.include?('./scripts/verify-apple-engine-artifacts.sh')
   puts 'PASS: native Apple project selection, rejected collapsed output paths, four actual provenance plists, retained base properties, dependency/resource removal, floors and required Mac server'
+  puts "PASS: Swift 6/complete/warnings-as-errors shared policy, both diagnostic specs and #{policy_checks} real-validator checks"
 ensure
   FileUtils.rm_f(output)
   generated_plists.each { |path| FileUtils.rm_f(path) }

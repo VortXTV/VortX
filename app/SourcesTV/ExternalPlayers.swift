@@ -11,10 +11,10 @@ import UIKit
 /// this app's embedded server, which suspends with the app, so a handed-off torrent
 /// would die seconds after the switch.
 enum ExternalPlayers {
-    struct Player: Identifiable {
+    struct Player: Identifiable, Sendable {
         let name: String
         let scheme: String                       // bare scheme for the canOpenURL probe
-        let launch: (URL, PlaybackMeta?) -> URL? // stream + optional metadata -> open URL
+        let launch: @Sendable (URL, PlaybackMeta?) -> URL? // stream + optional metadata -> open URL
         var id: String { name }
     }
 
@@ -47,6 +47,7 @@ enum ExternalPlayers {
     ]
 
     /// Players detected as installed via canOpenURL.
+    @MainActor
     static func detected() -> [Player] {
         candidates.filter {
             guard let url = URL(string: "\($0.scheme)://") else { return false }
@@ -59,6 +60,7 @@ enum ExternalPlayers {
     /// which is why the menu was showing only VLC even with nothing installed), so every player
     /// stays selectable and the user picks whichever they actually have. Detected players sort
     /// first so a known-installed one is the top pick; opening an absent player just no-ops.
+    @MainActor
     static func menu() -> [Player] {
         let installed = detected()
         let installedIDs = Set(installed.map(\.id))
@@ -66,6 +68,7 @@ enum ExternalPlayers {
     }
 
     /// True when this player is detected as installed (so the menu can mark untested rows).
+    @MainActor
     static func isInstalled(_ player: Player) -> Bool {
         guard let url = URL(string: "\(player.scheme)://") else { return false }
         return UIApplication.shared.canOpenURL(url)

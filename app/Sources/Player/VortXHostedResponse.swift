@@ -29,13 +29,26 @@ final class VortXRangedSpoolPump: @unchecked Sendable {
         case readError
     }
 
-    typealias Send = (Data, @escaping (Bool) -> Void) -> Void
+    typealias Send = (Data, @escaping @Sendable (Bool) -> Void) -> Void
 
+    private struct Callbacks {
+        let cancelled: () -> Bool
+        let send: Send
+        let terminal: (Terminal) -> Void
+    }
+
+    // Existing unchecked conformance is backed by one actual serial response owner.
+    // The original non-Sendable transport callbacks never leave this owner.
+    private let ownerQueue = DispatchQueue(label: "vortx.spool.response.range", qos: .utility)
+    private let ownerKey = DispatchSpecificKey<UUID>()
+    private let ownerIdentity = UUID()
     private let lease: VortXHLSSessionSpool.ResourceLease
     private let chunkSize: Int
     private var remaining: Int
     private var started = false
     private var terminated = false
+    private var callbacks: Callbacks?
+    private var pendingSend: UUID?
 
     /// `range` is INCLUSIVE and must already have been resolved against `lease.length` by
     /// `VortXEngineHostPolicy.resolve`. Returns nil (having closed the lease) when the range cannot be honoured,
@@ -61,49 +74,74 @@ final class VortXRangedSpoolPump: @unchecked Sendable {
         self.lease = lease
         self.chunkSize = chunkSize
         self.remaining = range.count
+        ownerQueue.setSpecific(key: ownerKey, value: ownerIdentity)
     }
 
-    /// Send `header` then exactly `range.count` bytes. Mirrors `VortXSpoolResponsePump.start` so the two behave
-    /// identically on every terminal edge, including releasing the lease exactly once.
+    /// Send `header` then exactly `range.count` bytes. The original lease remains owned
+    /// through the first terminal edge; later duplicate or stale ACKs cannot advance it.
     func start(header: Data,
                cancelled: @escaping () -> Bool,
                send: @escaping Send,
                terminal: @escaping (Terminal) -> Void) {
-        guard !started, !terminated else { return }
-        started = true
-        guard !cancelled() else { finish(.cancelled, terminal: terminal); return }
-        send(header) { [self] succeeded in
-            guard succeeded else { finish(.sendError, terminal: terminal); return }
-            sendNext(cancelled: cancelled, send: send, terminal: terminal)
+        let register = {
+            dispatchPrecondition(condition: .onQueue(self.ownerQueue))
+            guard !self.started, !self.terminated else { return }
+            self.started = true
+            self.callbacks = .init(cancelled: cancelled, send: send, terminal: terminal)
+            guard !cancelled() else { self.finish(.cancelled); return }
+            self.sendOwned(header)
+        }
+        if DispatchQueue.getSpecific(key: ownerKey) == ownerIdentity { register() }
+        else { ownerQueue.sync(execute: register) }
+    }
+
+    private func sendOwned(_ data: Data) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, pendingSend == nil, let callbacks else { return }
+        let receipt = UUID()
+        pendingSend = receipt
+        callbacks.send(data) { [self, receipt] succeeded in
+            // Even an inline transport completion is a queued checked-value ingress.
+            ownerQueue.async { [self, receipt, succeeded] in
+                acknowledge(receipt, succeeded: succeeded)
+            }
         }
     }
 
-    private func sendNext(cancelled: @escaping () -> Bool,
-                          send: @escaping Send,
-                          terminal: @escaping (Terminal) -> Void) {
-        guard !terminated else { return }
-        guard !cancelled() else { finish(.cancelled, terminal: terminal); return }
-        guard remaining > 0 else { finish(.complete, terminal: terminal); return }
+    private func acknowledge(_ receipt: UUID, succeeded: Bool) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, pendingSend == receipt else { return }
+        pendingSend = nil
+        guard succeeded else { finish(.sendError); return }
+        sendNext()
+    }
+
+    private func sendNext() {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, let callbacks else { return }
+        guard !callbacks.cancelled() else { finish(.cancelled); return }
+        guard remaining > 0 else { finish(.complete); return }
         let data: Data
         do {
             data = try lease.read(maxLength: min(chunkSize, remaining))
         } catch {
-            finish(.readError, terminal: terminal)
+            finish(.readError)
             return
         }
-        guard !data.isEmpty else { finish(.readError, terminal: terminal); return }
+        guard !data.isEmpty else { finish(.readError); return }
         remaining -= data.count
-        send(data) { [self] succeeded in
-            guard succeeded else { finish(.sendError, terminal: terminal); return }
-            sendNext(cancelled: cancelled, send: send, terminal: terminal)
-        }
+        sendOwned(data)
     }
 
-    private func finish(_ outcome: Terminal, terminal: (Terminal) -> Void) {
+    private func finish(_ outcome: Terminal) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
         guard !terminated else { return }
         terminated = true
+        pendingSend = nil
+        let terminal = callbacks?.terminal
+        callbacks = nil
         lease.close()
-        terminal(outcome)
+        terminal?(outcome)
     }
 }
 #endif

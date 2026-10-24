@@ -103,7 +103,6 @@ enum DebridProbe {
     static func usenetFailure(_ error: Error) -> String { UsenetNodeClient.failureReason(error) }
 }
 enum StremioServer {
-    static let nativeTransportSelected = true
     nonisolated(unsafe) static var usenetEndpoint: UsenetNodeClient.Endpoint?
 }
 extension DebridPlaybackRef {

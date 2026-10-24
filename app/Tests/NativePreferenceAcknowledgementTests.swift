@@ -89,8 +89,67 @@ private typealias ManagerNativeDiscoveryProjectionSource = NativeDiscoveryProjec
 @main private enum NativePreferenceAcknowledgementTests {
     @MainActor static func main() async {
         var failures = 0
-        func check(_ condition: Bool, _ message: String) { print("\(condition ? "PASS" : "FAIL") \(message)"); if !condition { failures += 1 } }
+        var checks = 0
+        func check(_ condition: Bool, _ message: String) {
+            checks += 1
+            print("\(condition ? "PASS" : "FAIL") \(message)")
+            if !condition { failures += 1 }
+        }
         let p = PreferenceHarness()
+        // Checked values can cross a worker boundary without carrying the mutable ProfileStore.
+        // These are the actual production declarations supplied by the runner, not fixture copies.
+        var transferProfile = p.active!
+        transferProfile.playback = p.flatPlayback
+        transferProfile.discovery = p.flatDiscovery
+        transferProfile.discovery?.filtersData = Data([0, 1, 255])
+        transferProfile.addonPreferences = .init(
+            disabledAddonURLsOverride: ["https://example.invalid/fixture"],
+            rankingOverride: .init(addonOrder: [], sourceTypeOrder: ["debrid", "torrent"], useAddonOrder: true))
+        let capturedProfile = transferProfile
+        let capturedWatch = WatchEntry(videoId: "fixture:1:2", timeOffsetMs: 12_000, durationMs: 60_000,
+            lastWatched: "2026-10-24T00:00:00Z", name: "Fixture", type: "series", poster: nil,
+            watchedVideoIds: ["fixture:1:1"], markedAt: ["fixture:1:1": 10], unmarkedAt: [:])
+        let transferred = await Task.detached { () -> (UserProfile, WatchEntry) in
+            var profile = capturedProfile
+            var watch = capturedWatch
+            profile.playback?.audioLang = "worker-copy"
+            profile.discovery?.catalogOrder = ["worker-copy"]
+            profile.discovery?.filtersData?.append(7)
+            profile.addonPreferences?.rankingOverride?.sourceTypeOrder.reverse()
+            watch.watchedVideoIds.append("fixture:1:2")
+            watch.markedAt?["fixture:1:1"] = 20
+            return (profile, watch)
+        }.value
+        check(capturedProfile.playback?.audioLang == "en"
+              && capturedProfile.discovery?.catalogOrder == []
+              && capturedProfile.discovery?.filtersData == Data([0, 1, 255])
+              && capturedProfile.addonPreferences?.rankingOverride?.sourceTypeOrder == ["debrid", "torrent"]
+              && capturedWatch.watchedVideoIds == ["fixture:1:1"]
+              && capturedWatch.markedAt == ["fixture:1:1": 10],
+              "worker mutations leave captured profile and watch carriers unchanged")
+        check(transferred.0.playback?.audioLang == "worker-copy"
+              && transferred.0.discovery?.catalogOrder == ["worker-copy"]
+              && transferred.0.discovery?.filtersData == Data([0, 1, 255, 7])
+              && transferred.0.addonPreferences?.rankingOverride?.sourceTypeOrder == ["torrent", "debrid"]
+              && transferred.1.watchedVideoIds == ["fixture:1:1", "fixture:1:2"]
+              && transferred.1.markedAt == ["fixture:1:1": 20],
+              "checked profile and watch values transfer through the detached task")
+        let profileBytes = try? JSONEncoder().encode(capturedProfile)
+        let watchBytes = try? JSONEncoder().encode(capturedWatch)
+        check(profileBytes.flatMap { try? JSONDecoder().decode(UserProfile.self, from: $0) } == capturedProfile
+              && watchBytes.flatMap { try? JSONDecoder().decode(WatchEntry.self, from: $0) } == capturedWatch,
+              "checked value annotations leave represented Codable fields unchanged")
+        let legacyProfile = Data(#"{"id":"00000000-0000-0000-0000-00000000F00D","name":"Legacy","avatar":"fixture"}"#.utf8)
+        let decodedLegacyProfile = try? JSONDecoder().decode(UserProfile.self, from: legacyProfile)
+        check(decodedLegacyProfile?.name == "Legacy" && decodedLegacyProfile?.textScale == 1
+              && decodedLegacyProfile?.playback == nil && decodedLegacyProfile?.discovery == nil
+              && decodedLegacyProfile?.addonPreferences == nil && decodedLegacyProfile?.usesOwnAccount == false,
+              "older sparse roster keeps tolerant defaults and nil preference inheritance")
+        let legacyWatch = Data(#"{"videoId":"fixture:1:2","timeOffsetMs":12000,"durationMs":60000,"lastWatched":"2026-10-24T00:00:00Z","name":"Fixture","type":"series","watchedVideoIds":["fixture:1:1"]}"#.utf8)
+        let decodedLegacyWatch = try? JSONDecoder().decode(WatchEntry.self, from: legacyWatch)
+        check(decodedLegacyWatch?.watchedVideoIds == ["fixture:1:1"]
+              && decodedLegacyWatch?.markedAt == nil && decodedLegacyWatch?.unmarkedAt == nil,
+              "older watch entry keeps history and absent optional gesture clocks")
         p.active?.discovery = .init(catalogOrder: [])
         p.establishBaselines()
         check(p.nativePreferenceIsAcknowledged("audio"), "applied effective playback defaults acknowledge an optional native profile")
@@ -138,6 +197,7 @@ private typealias ManagerNativeDiscoveryProjectionSource = NativeDiscoveryProjec
         check(!(await cold.retryNativePreferenceProjection(keys: ["audio"])) && cold.saves == 0, "pre-mount values cannot acquire a new profile owner through retry")
         let retired = PreferenceHarness(); retired.establishBaselines(); retired.flatPlayback.audioLang = "hi"; retired.retireWhileSaving = true
         check(!(await retired.retryNativePreferenceProjection(keys: ["audio"])) && !retired.nativePreferenceIsAcknowledged("audio"), "retired binding cannot acknowledge a suspended preference retry")
+        print("\(checks) checks, \(failures) failures; actual checked values and RAM acknowledgement collaborators")
         if failures > 0 { exit(1) }
     }
 }

@@ -226,7 +226,7 @@ struct HomeView: View {
                 TraktNextEpisodeHomeDestination(offer: target.offer)
             }
         }
-        .onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching)) { _ in
+        .onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching)) {
             // Re-read and validate the CURRENT context; never publish rows captured by an older render.
             TopShelfSnapshotWriter.publishCurrent()
         }
@@ -248,19 +248,19 @@ struct HomeView: View {
             refreshReleaseCalendar()
             if showCollectionsHub { collectionsHub.load() }
         }
-        .onChange(of: isActive) { active in
+        .onChange(of: isActive) { _, active in
             if active, scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             if phase == .active, isActive { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
         }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
+        .onChange(of: showCollectionsHub) { _, show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         // The old `.onChange(of: core.revision)` hook observed every board/meta event. Observe the
         // durable history-receipt revision instead: Home first appearing after a board event reads the
         // retained receipt above, while unrelated revisions do not fan out recommendation work.
-        .onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
+        .onChange(of: core.lastAcceptedHistoryReceipt?.revision) {
             guard core.lastAcceptedHistoryReceipt != nil else { return }
             seed()
             refreshTopPicks()
@@ -269,16 +269,16 @@ struct HomeView: View {
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
         // Overlay history is bounded, so observe the exact watched/progress fingerprint rather than only
         // the first id. Interior mutations must refresh recommendations for the active local profile.
-        .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
+        .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) {
             seed(); refreshTopPicks()
         }
         .onChange(of: profiles.activeID) { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles); seed(); refreshTopPicks() }
-        .onChange(of: continueWatchingSource) { _ in
+        .onChange(of: continueWatchingSource) {
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             seed()
             refreshTopPicks()
         }
-        .onChange(of: continueWatchingWindow) { _ in seed() }
+        .onChange(of: continueWatchingWindow) { seed() }
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             traktContinueWatchingRevision &+= 1; seed()
@@ -304,8 +304,8 @@ struct HomeView: View {
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
-        .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
-        .onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
+        .onChange(of: account.isSignedIn) { refreshTopPicks() }
+        .onChange(of: becauseYouWatchedOwnerKey) { refreshTopPicks() }
         // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
         // replacement. Email is published by the successful sign-in path, so observe that event directly.
         .onReceive(account.$email) { _ in refreshTopPicks() }
@@ -327,14 +327,14 @@ struct HomeView: View {
     private var homeForYouHandlers: some View {
         homeChangeHandlers
         .onAppear { engineGate.setOpen(engineOpen, announce: false) }
-        .onChange(of: engineOpen) { open in engineGate.setOpen(open, announce: true) }
-        .onChange(of: forYou.interests) { _ in refreshForYou() }
-        .onChange(of: forYou.collections) { _ in refreshForYou() }
-        .onChange(of: forYou.ready) { _ in refreshForYou() }
-        .onChange(of: forYou.profileID) { _ in refreshForYou() }
-        .onChange(of: isActive) { _ in offerInterestsIfNeeded() }
-        .onChange(of: presenter.request == nil) { _ in offerInterestsIfNeeded() }
-        .onChange(of: profiles.needsPicker) { _ in offerInterestsIfNeeded() }
+        .onChange(of: engineOpen) { _, open in engineGate.setOpen(open, announce: true) }
+        .onChange(of: forYou.interests) { refreshForYou() }
+        .onChange(of: forYou.collections) { refreshForYou() }
+        .onChange(of: forYou.ready) { refreshForYou() }
+        .onChange(of: forYou.profileID) { refreshForYou() }
+        .onChange(of: isActive) { offerInterestsIfNeeded() }
+        .onChange(of: presenter.request == nil) { offerInterestsIfNeeded() }
+        .onChange(of: profiles.needsPicker) { offerInterestsIfNeeded() }
         .fullScreenCover(item: $interestsPresentation) { presentation in
             ForYouInterestsView(session: presentation.session, firstRun: presentation.firstRun) {
                 if interestsPresentation?.id == presentation.id { interestsPresentation = nil }

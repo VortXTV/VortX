@@ -18,19 +18,26 @@ enum OwnerResumeStore {
     /// Process-local ownership prevents the previous VortX account's UserDefaults rows from being readable
     /// during startup, sign-out, or an account transition. The rows themselves remain account-namespaced so
     /// returning to the same account can still use its own cache after a fresh authoritative refresh.
-    private static var ownerID: String?
+    private struct State: Sendable {
+        var ownerID: String?
+    }
+    private static let state = OSAllocatedUnfairLock(initialState: State())
 
     static func bind(ownerID rawOwnerID: String?) {
         guard let rawOwnerID, let scope = CredentialScope(canonicalRemoteAccountID: rawOwnerID) else {
-            ownerID = nil
+            state.withLock { $0.ownerID = nil }
             return
         }
-        ownerID = scope.keychainOwnerID
+        state.withLock { $0.ownerID = scope.keychainOwnerID }
     }
 
     private static var storageKeys: (cache: String, receipt: String)? {
-        guard let ownerID else { return nil }
-        return (keyPrefix + ownerID, receiptKeyPrefix + ownerID)
+        // Pin both keys to one binding. Raw dictionaries and defaults operations remain local to
+        // the caller; no conversion drops unknown rows and no defaults callback runs under this lock.
+        state.withLock { value in
+            guard let ownerID = value.ownerID else { return nil }
+            return (keyPrefix + ownerID, receiptKeyPrefix + ownerID)
+        }
     }
 
     /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a
@@ -38,7 +45,7 @@ enum OwnerResumeStore {
     /// parsable clock). The clock is what lets a reader prove a cached REMOTE position is newer than a
     /// stale positive ENGINE position, so a warm device converges to the peer's playback (including an
     /// explicit remote finish-0) instead of trusting its own older copy.
-    struct Entry { let t: Double; let d: Double; let v: String?; let lw: Double }
+    struct Entry: Sendable { let t: Double; let d: Double; let v: String?; let lw: Double }
 
     /// Upsert owner-library resume entries from a pulled document. `t`/`d` are in SECONDS. A library page is
     /// not a complete snapshot, so omission must never delete another title's cached resume. Explicit library
@@ -118,17 +125,19 @@ enum OwnerResumeStore {
         return (formatter.date(from: base.replacingOccurrences(of: "Z", with: ""))?.timeIntervalSince1970 ?? 0) * 1000
     }
 
-    private static let fractionalISO8601: ISO8601DateFormatter = {
+    // Operation-local formatter references never cross an isolation boundary. Parsing order,
+    // options and the existing legacy DateFormatter fallback remain unchanged.
+    private static var fractionalISO8601: ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
-    }()
+    }
 
-    private static let plainISO8601: ISO8601DateFormatter = {
+    private static var plainISO8601: ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
-    }()
+    }
 
     /// The cached resume entry for an owner-library id, or nil when the cache has none.
     static func entry(forId id: String) -> Entry? {
@@ -150,7 +159,7 @@ enum OwnerResumeStore {
 
 /// One title's watch state inside a profile's private overlay: enough to render Continue Watching,
 /// resume, and watched markers without touching the account's shared library.
-struct WatchEntry: Codable, Equatable {
+struct WatchEntry: Codable, Equatable, Sendable {
     var videoId: String?          // movie id, or imdbId:season:episode for the episode in progress
     var timeOffsetMs: Int
     var durationMs: Int
@@ -238,7 +247,11 @@ enum ProfileSync {
 
     /// nil = not probed yet; false = the API refused our collection, cloud sync is disabled and
     /// profiles stay per-device (never fall back to libraryItem smuggling again).
-    private(set) static var cloudAvailable: Bool?
+    private static let availability = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+    private(set) static var cloudAvailable: Bool? {
+        get { availability.withLock { $0 } }
+        set { availability.withLock { $0 = newValue } }
+    }
 
     private static func watchID(_ profileID: UUID) -> String { "stremiox:watch:\(profileID.uuidString)" }
 

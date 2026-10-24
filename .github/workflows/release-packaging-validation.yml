@@ -121,6 +121,12 @@ jobs:
           VORTX_KEY_PASSWORD: vortx-adhoc-ci-store
         run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
 
+      - name: Check player startup caller contracts
+        run: |
+          mkdir -p android/app/build/first-frame-focused
+          receipt_dir="$(mktemp -d "$PWD/android/app/build/first-frame-focused/receipt.XXXXXX")"
+          node scripts/tests/android-first-frame-presentation/source-contracts.mjs "$PWD" "$receipt_dir"
+
       # Preserve the bounded recovery filters and exercise the actual shared Media3 metadata
       # policies. JNI-gated cases still skip without the real private native runtime.
       - name: Test Android sync, account recovery and active-media metadata
@@ -138,13 +144,32 @@ jobs:
           --tests com.vortx.android.engine.NativeWatchedMigrationProducerTest
           --tests com.vortx.android.sync.VortXSyncManagerStaleAddonEnvelopeTest
           --tests com.vortx.android.ui.viewmodel.PlaybackResolveFenceTest
+          --tests com.vortx.android.ui.randompick.RandomPickPolicyTest
+          --tests com.vortx.android.ui.randompick.RandomLibraryPickModelTest
+          --tests com.vortx.android.ui.randompick.RandomEpisodePickModelTest
+          --tests com.vortx.android.ui.randompick.RandomEpisodePlaybackLeaseTest
+          --tests com.vortx.android.ui.randompick.RandomEpisodeAccessTest
+          --tests com.vortx.android.ui.randompick.RandomTitlePlayRequestTest
+          --tests com.vortx.android.ui.randompick.RandomPickControlsContractTest
+          --tests com.vortx.android.ui.tv.TvDetailSourcesActionContractTest
           --tests com.vortx.android.whatsnew.ChangelogParserTest
           --tests com.vortx.android.player.ExoPlayerEngineStatePolicyTest
           --tests com.vortx.android.player.PlaybackMetadataTest
+          --tests com.vortx.android.player.PlaybackStartupPresentationTest
+          --tests com.vortx.android.player.ExoStartupAdmissionTest
+          --tests com.vortx.android.player.SessionAudioPresetSessionTest
+          --tests com.vortx.android.player.SessionAudioPresetSourceContractTest
+          --tests com.vortx.android.sources.SourceQuickFiltersTest
+          --tests com.vortx.android.sources.SourceQuickFilterCallerContractTest
+          --tests com.vortx.android.sources.SourceQuickFilterTrustTest
+          --tests com.vortx.android.sources.SourceQuickFilterRankingConservationTest
           --tests com.vortx.android.foryou.ForYouRowsModelTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerPresentationTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerArtworkStartupTest
           --tests com.vortx.android.iptv.LiveGuideTest
+          --tests com.vortx.android.player.subtitles.SubtitleTimingSessionTest
+          --tests com.vortx.android.player.SubtitleOffsetBoundaryTest
+          --tests com.vortx.android.player.SubtitleOffsetMemoryTest
           --tests 'com.vortx.android.engine.NativeOwnAccountSourcesTest.malformed own row is held without losing valid siblings or raw source bytes'
           --no-daemon --stacktrace
 
@@ -154,6 +179,7 @@ jobs:
           ./gradlew :app:testFullDebugUnitTest
           -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
           --tests com.vortx.android.player.mpv.MpvMetadataLoadIdentityTest
+          --tests com.vortx.android.player.mpv.MpvSessionAudioRouteTest
           --no-daemon --stacktrace
 
       - name: Retain current-source recovery test execution and skips
@@ -347,6 +373,7 @@ jobs:
             --engine-revision 0000000000000000000000000000000000000000 \
             --mpvkit "$PWD/Vendor/MPVKit-DVFEL" --output "$PWD/.native-ci-project.yml"
           xcodegen generate --spec .native-ci-project.yml
+          ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
       # Real compile/link/package per platform shell. Signing is disabled outright (no identity,
       # none needed for simulator or unsigned macOS builds). Each produced .app must carry the

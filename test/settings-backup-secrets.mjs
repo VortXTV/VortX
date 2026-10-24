@@ -16,8 +16,18 @@ const backup = readFileSync(backupPath, 'utf8');
 const sharedInputs = ['CredentialScope.swift', 'Keychain.swift', 'LegacySyncRetention.swift',
   'SettingsDirtyKeys.swift', 'NativeForegroundSyncPolicy.swift']
   .map(name => join(root, 'app/SourcesShared', name));
+const proofComposer = join(root, 'scripts/extract-subtitle-proof-hosts.cjs');
+const proofHostPath = join(out, 'NativeSubtitleProofHosts.swift');
+const proofHostReceipt = join(out, 'native-subtitle-proof-hosts.json');
+const proofRun = spawnSync(process.execPath, [proofComposer, root, 'full-shells', proofHostPath],
+  { cwd: root, encoding: 'utf8' });
+if (proofRun.error || proofRun.status !== 0) throw new Error('Actual subtitle proof extraction failed: ' + (proofRun.stderr || proofRun.error));
+writeFileSync(proofHostReceipt, proofRun.stdout);
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-const inputs = [backupPath, testPath, ...sharedInputs].map(path => ({
+const proofOwners = [proofComposer, join(root, 'app/SourcesShared/CoreBridge.swift'),
+  join(root, 'app/SourcesShared/LegacyWatchOwnership.swift'),
+  join(root, 'app/SourcesShared/VortxNativeCoreFacade.swift')];
+const inputs = [backupPath, testPath, ...sharedInputs, ...proofOwners, proofHostPath, proofHostReceipt].map(path => ({
   path, sha256: digest(readFileSync(path)),
 }));
 
@@ -67,7 +77,7 @@ try {
     writeFileSync(source, variant.source);
     const compilation = command('xcrun', ['swiftc', '-j', '1', '-num-threads', '1', '-whole-module-optimization', '-swift-version', '5', '-o', binary,
       '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', plist,
-      source, ...sharedInputs, testPath], join(dir, 'compiler.log'));
+      source, ...sharedInputs, proofHostPath, testPath], join(dir, 'compiler.log'));
     if (compilation.status !== 0) throw new Error(`${variant.name} compile failed; inspect ${dir}/compiler.log`);
     const absentEnv = { ...process.env };
     delete absentEnv.VORTX_SETTINGS_TEST_BUNDLE_ID;

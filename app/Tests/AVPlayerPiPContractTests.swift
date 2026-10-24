@@ -302,8 +302,61 @@ private func testSourceContracts() {
             && engine.contains("isPictureInPictureTransitioning"))
     check("engine source: replacement callbacks compare controller identity",
           engine.contains("pipController === pictureInPictureController"))
+    let kvoCallbacks = section(in: engine,
+        from: "private func observePictureInPicture(",
+        to: "// MARK: Observation -> MPVProperty events") ?? ""
+    check("engine source: both KVO inputs share the original attachment mailbox",
+          kvoCallbacks.contains("[weak callback] observedController")
+            && kvoCallbacks.contains("callback?.observe(observedController, generation: generation)")
+            && !kvoCallbacks.contains("Task {")
+            && engine.contains("case .observed(let possible, let active):")
+            && engine.contains("pipState.observe(possible: possible, active: active, generation: generation)"))
     check("engine source: stale callbacks compare generation",
           engine.contains("generation: generation"))
+    check("engine source: Objective-C PiP delegate has a checked nonisolated bridge",
+          engine.contains("private final class AVPlayerPiPDelegateBridge: NSObject, AVPictureInPictureControllerDelegate, Sendable")
+            && !engine.contains("extension AVPlayerEngineController: AVPictureInPictureControllerDelegate"))
+    let delegateBridge = section(in: engine,
+        from: "private final class AVPlayerPiPDelegateBridge:",
+        to: "// A main-actor owner for the existing non-Sendable PlayerEngine completion API.") ?? ""
+    check("engine source: one checked attachment mailbox owns reservation-order delivery",
+          containsInOrder(delegateBridge, ["$0.ready[reservation.ordinal] = event", "$0.ready[$0.nextDelivery] != nil", "$0.drainScheduled = true", "if schedule { DispatchQueue.main.async"])
+            && delegateBridge.contains("while let event = state.ready.removeValue(forKey: state.nextDelivery)")
+            && delegateBridge.contains("state.nextDelivery &+= 1")
+            && delegateBridge.contains("for event in batch { receive(event) }")
+            && !delegateBridge.contains("Task {"))
+    let startCallback = section(in: delegateBridge,
+        from: "func pictureInPictureControllerDidStartPictureInPicture(",
+        to: "func pictureInPictureController(_ controller:") ?? ""
+    let failureCallback = section(in: delegateBridge,
+        from: "failedToStartPictureInPictureWithError error:",
+        to: "func pictureInPictureControllerWillStopPictureInPicture(") ?? ""
+    check("engine source: event admission reserves before SDK payload preparation",
+          delegateBridge.contains("$0.lastReserved += 1")
+            && containsInOrder(startCallback, ["reserve(for: controller, expectedGeneration: nil)",
+                                               "controller.isPictureInPicturePossible", "reservation: original"])
+            && containsInOrder(failureCallback, ["reserve(for: controller, expectedGeneration: nil)",
+                                                 "error.localizedDescription", "reservation: original"]))
+    check("engine source: original attachment cannot be reactivated after retirement",
+          containsInOrder(delegateBridge, ["guard case .pending = $0.phase", "$0.phase = .active(generation)"])
+            && delegateBridge.contains("$0.phase = .retired")
+            && delegateBridge.contains("original == reservation.generation"))
+    let restore = section(in: delegateBridge,
+        from: "restoreUserInterfaceForPictureInPictureStopWithCompletionHandler",
+        to: "\n    }") ?? ""
+    check("engine source: restore completion remains synchronous on the original callback",
+          containsInOrder(restore, ["let restored = isActive(for: controller)", "completionHandler(restored)"])
+            && !restore.contains("DispatchQueue") && !restore.contains("Task"))
+    let frameCapture = section(in: engine,
+        from: "func captureFrameJPEGData(maxWidth:",
+        to: "/// AVPlayerLayer negotiates HDR/DV") ?? ""
+    check("engine source: SDK-sendable image owns the frame before background encoding",
+          containsInOrder(frameCapture, ["let image = CIImage(cvPixelBuffer: pixelBuffer)",
+                                        "DispatchQueue.global(qos: .utility).async",
+                                        "Self.encodeJPEG(from: image",
+                                        "DispatchQueue.main.async { delivery.deliver(data) }"])
+            && frameCapture.contains("nonisolated private static func encodeJPEG(from ci: CIImage")
+            && !frameCapture.contains("encodeJPEG(from: pixelBuffer"))
     let loadFile = section(
         in: engine,
         from: "func loadFile(_ url: URL",
@@ -333,6 +386,9 @@ private func testSourceContracts() {
         to: "private func publishPictureInPictureState") ?? ""
     check("engine source: reset helper accepts only an invalidating ownership event",
           resetController.contains("event.invalidatesController"))
+    check("engine source: retired delegate admission closes before source callbacks",
+          containsInOrder(resetController, ["retiredDelegate?.retire()", "retiredController?.delegate = nil",
+                                           "pipController = nil", "retiredController?.stopPictureInPicture()"]))
     check("engine source: AirPlay remains enabled",
           engine.contains("player.allowsExternalPlayback = true"))
 

@@ -1,7 +1,7 @@
 import Foundation
 
 private final class TransportFixture: URLProtocol, @unchecked Sendable {
-    enum Scenario: Sendable { case native, legacy, oldServer, unsupported }
+    enum Scenario: Sendable { case native, oldServer, unsupported }
     private final class State: @unchecked Sendable {
         let lock = NSLock()
         var scenario: Scenario = .native
@@ -44,7 +44,7 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
             defer { session.invalidateAndCancel() }
             do {
                 _ = try await UsenetNodeClient.createStream(
-                    endpoint: .init(base: CommandLine.arguments[2], requiresNativeCapabilities: true),
+                    endpoint: .init(base: CommandLine.arguments[2]),
                     nzbURLs: ["https://fixture.example/one.nzb"], servers: ["nntps://fixture:password@news.example:563/4"],
                     session: session, timeout: 2, ownerIsCurrent: { true })
                 preconditionFailure("Credential POST followed a redirect")
@@ -52,10 +52,9 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
             print("PASS real HTTP credential POST redirect is rejected")
             return
         }
-        for required in [false, true] {
-            for preference in [false, true] {
-                precondition(NativeTransportPolicy.selectsNative(required: required, preference: preference) == (required || preference))
-            }
+        for raw in ["http://127.0.0.1:1", "http://127.0.0.1:65535/", "http://[::1]:54321"] {
+            precondition(NativeTransportPolicy.localControlBase(raw) != nil,
+                         "A literal loopback origin with an explicit valid port must be accepted")
         }
         for override in [nil, "0", "1", "true", "unexpected"] as [String?] {
             var inherited = ["PRESERVED_FIXTURE": "unchanged", "VORTX_PROXY_ALLOW_LOOPBACK": "0"]
@@ -77,8 +76,8 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         config.protocolClasses = [TransportFixture.self]
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
-        let endpoint = UsenetNodeClient.Endpoint(base: "http://127.0.0.1:54321", requiresNativeCapabilities: true)
-        func create(_ target: UsenetNodeClient.Endpoint = endpoint) async throws -> UsenetNodeClient.CreatedStream {
+        let endpoint = UsenetNodeClient.Endpoint(base: "http://127.0.0.1:54321")
+        @Sendable func create(_ target: UsenetNodeClient.Endpoint = endpoint) async throws -> UsenetNodeClient.CreatedStream {
             try await UsenetNodeClient.createStream(endpoint: target, nzbURLs: ["https://fixture.example/one.nzb"],
                 servers: ["nntps://fixture:password@news.example:563/4"], session: session, timeout: 1,
                 ownerIsCurrent: { true })
@@ -91,17 +90,26 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         precondition(TransportFixture.requests.map(\.httpMethod) == ["GET", "POST"])
         precondition(TransportFixture.requests.allSatisfy { $0.value(forHTTPHeaderField: "Origin") == nil })
         precondition(TransportFixture.requests.first?.httpBody == nil)
-        // Keep the native lease alive until after request assertions (discarding it retires its UUID).
-        withExtendedLifetime(created) {}
+        precondition(created.lease != nil && created.lease?.isClosed == false,
+                     "Every native create must return its live operation lease")
+        // Retain the result through request assertions, then explicitly retire its operation.
+        created.lease?.close()
 
         TransportFixture.reset(.oldServer)
         do { _ = try await create(); preconditionFailure("Old native server received credentials") }
         catch UsenetNodeClient.ClientError.nativeUnavailable {}
         precondition(TransportFixture.requests.count == 1)
 
-        TransportFixture.reset(.legacy)
-        _ = try await create(.init(base: endpoint.base, requiresNativeCapabilities: false))
-        precondition(TransportFixture.requests.map { $0.url!.path } == ["/nzb/create"])
+        TransportFixture.reset(.native)
+        let baseCreated = try await UsenetNodeClient.createStream(
+            base: endpoint.base, nzbURLs: ["https://fixture.example/one.nzb"],
+            servers: ["nntps://fixture:password@news.example:563/4"], session: session, timeout: 1,
+            ownerIsCurrent: { true })
+        precondition(TransportFixture.requests.map { $0.url!.path } == ["/nzb/capabilities", "/nzb/create"])
+        precondition(TransportFixture.requests.map(\.httpMethod) == ["GET", "POST"])
+        precondition(baseCreated.lease != nil && baseCreated.lease?.isClosed == false,
+                     "The base overload cannot bypass capabilities or operation ownership")
+        baseCreated.lease?.close()
 
         TransportFixture.reset(.unsupported)
         do { _ = try await create(); preconditionFailure("Unsupported archive accepted") }
@@ -110,7 +118,7 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         for raw in ["http://192.168.1.50:11470", "https://server.example", "http://localhost:11470",
                     "http://127.0.0.1:11470/remote", "http://u:p@127.0.0.1:11470", "http://127.0.0.1:11470?x=1"] {
             TransportFixture.reset(.native)
-            do { _ = try await create(.init(base: raw, requiresNativeCapabilities: true)); preconditionFailure("Unsafe endpoint accepted") }
+            do { _ = try await create(.init(base: raw)); preconditionFailure("Unsafe endpoint accepted") }
             catch UsenetNodeClient.ClientError.unsafeEndpoint {}
             precondition(TransportFixture.requests.isEmpty)
         }
@@ -128,11 +136,18 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         precondition(TransportFixture.requests.isEmpty)
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let mobile = try String(contentsOf: root.appendingPathComponent("app/Sources/NodeServer.swift"), encoding: .utf8)
-        let bootstrap = mobile.components(separatedBy: "static func startIfNeeded() {")[1]
-            .components(separatedBy: "guard !started else")[0]
-        precondition(bootstrap.contains("if VortxNativeServerFlag.isOn {") && bootstrap.contains("VortxNativeServer.startIfNeeded()\n            return"))
+        precondition(mobile.contains("static func startIfNeeded() {")
+                     && mobile.contains("VortxNativeServer.startIfNeeded()")
+                     && !mobile.contains("NativeTransportPolicy.selectsNative")
+                     && !mobile.contains("nativeServerEnabled") && !mobile.contains("NodeJS"),
+                     "The mobile facade must start only the native engine, with no legacy selection path")
         let selection = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/VortxNativeServer.swift"), encoding: .utf8)
-        precondition(selection.contains("static let isOn = NativeTransportPolicy.selectsNative("))
+        precondition(selection.contains("static var isSupported: Bool")
+                     && selection.contains("#if VORTX_ENGINE_SERVER")
+                     && !selection.contains("static let isOn"))
+        let client = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/UsenetNodeClient.swift"), encoding: .utf8)
+        precondition(!client.contains("requiresNativeCapabilities"),
+                     "Native capability validation must not have an opt-out endpoint flag")
         let mac = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/MacNodeServer.swift"), encoding: .utf8)
         let nativeLaunch = mac.components(separatedBy: "private static func spawnNative(binPath: String) {")[1]
             .components(separatedBy: "proc.environment = env")[0]
@@ -146,6 +161,6 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
             let initialBootstrap = app.components(separatedBy: "NodeServer.startIfNeeded()")[1].prefix(250)
             precondition(!initialBootstrap.contains("VortxNativeServer.startIfNeeded()"))
         }
-        print("PASS native transport: capability before POST, legacy contract, unsupported archive, local credential boundary, cancellation")
+        print("PASS native transport: mandatory capabilities and leases for both overloads, unsupported archive, local credential boundary, cancellation")
     }
 }

@@ -310,10 +310,10 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 try await streamOperation(
                     .init(url: currentURL, method: request.method, headers: currentHeaders,
                           allowsInsecureHTTP: route.scope == .debrid),
-                    { head in
+                    { [weak self] head in
+                        guard let self else { throw Failure.unavailable }
                         if (300...399).contains(head.statusCode) { throw RedirectReceived(head: head) }
-                        try await state.accept(head: head, send: { [weak self] status, responseHeaders in
-                            guard let self else { throw Failure.unavailable }
+                        try await state.accept(head: head, send: { status, responseHeaders in
                             try await self.sendHead(connection, status: status, headers: responseHeaders)
                         })
                     },

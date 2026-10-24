@@ -180,10 +180,9 @@ awk '/^\/\/\/ FIFO for Trakt/{exit} {print}' app/SourcesShared/TraktScrobbleProg
 test "$(rg -c '^struct TraktSessionID:' "$run_dir/TraktSessionBoundary.swift")" = 1
 test "$(rg -c '^enum TraktAuthBoundary' "$run_dir/TraktSessionBoundary.swift")" = 1
 
-# TraktModels depends on the CoreModels EPG formatter extension. Extract the already-existing
-# OAuth contract fixture verbatim: same actual formatter construction/options, but fresh computed
-# instances for a strict6 standalone test. This is NOT proof of CoreModels' shared-cache concurrency.
-# Neither production TraktModels nor a parsing/formatting algorithm is rewritten or stubbed here.
+# Compile CoreModels' actual Sendable parser handles, preserving its thread-private legacy
+# formatter implementation. Retain the old fresh-instance OAuth donor as a separately pinned
+# historical oracle, not as a replacement for the production parsing code.
 formatter_donor="$repo_root/app/Tests/TraktOAuthBrokerContractTests.swift"
 formatter_actual="$repo_root/app/SourcesShared/CoreModels.swift"
 extract_formatter_extension() {
@@ -199,12 +198,12 @@ extract_formatter_extension "$formatter_actual" > "$run_dir/CoreModelsEPGFormatt
 extract_formatter_extension "$formatter_donor" > "$run_dir/TraktEPGFormatter.donor.swift"
 {
   printf 'import Foundation\n\n'
-  sed '' "$run_dir/TraktEPGFormatter.donor.swift"
+  sed '' "$run_dir/CoreModelsEPGFormatter.actual.swift"
 } > "$run_dir/TraktEPGFormatter.swift"
 printf '%s  %s\n' \
-  5002dda6ea34769312bc0d85566f13a28595e9f011c818aa380987277d540a93 "$run_dir/CoreModelsEPGFormatter.actual.swift" \
+  b620fb48849415ca6bd2d888e7bc33ceea7fc03d1e141855c9976b791f48126e "$run_dir/CoreModelsEPGFormatter.actual.swift" \
   6de164e822df8c8feebf9ac67d2d2ceeb6f6fceac414401ed8fb735afbe5d38a "$run_dir/TraktEPGFormatter.donor.swift" \
-  ee82aaf6c2f5758e3efa73ad1141ba85eeb57feb3179b95c54a6a7dd706506bb "$run_dir/TraktEPGFormatter.swift" \
+  5a2b08a30e624f9bd1fabe438141113c930e7400840d7e906c77e8a19fcca9e3 "$run_dir/TraktEPGFormatter.swift" \
   > "$run_dir/formatter-extraction.sha256"
 shasum -a 256 --check "$run_dir/formatter-extraction.sha256"
 inputs=("$watched_script_path" "$supervisor" "$watched_reader" "$watched_cases" "$watched_engine"

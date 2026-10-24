@@ -359,7 +359,7 @@ struct AddonPairingView: View {
         case let .claim(deliveryID, token, deliveryRevision, authoritySession, authorityGeneration):
             let gen = generation
             let task = Task { @MainActor in
-                var authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
+                let authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
                 guard gen == generation, !Task.isCancelled else { return }
                 let success = await AddonPairingClient.claim(token: token, authority: authority,
                                                              deliveryIDs: [deliveryID],

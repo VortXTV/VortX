@@ -46,7 +46,7 @@ final class HomeGroupsModel: ObservableObject {
     @Published private(set) var groups: [CollectionGroup] = []
 
     /// At most this many cards per child rail, matching the editorial rails' density.
-    private static let maxItemsPerRail = 30
+    nonisolated private static let maxItemsPerRail = 30
 
     /// The key (region + recent-watch seed signature) the groups were built for, so a locale change OR a
     /// new watch rebuilds while a routine re-emit does not. Folding the seed signature in keeps the

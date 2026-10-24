@@ -1,10 +1,11 @@
 import Foundation
 
 @main
+@MainActor
 struct HomeContinueWatchingSelectionTests {
     private static var checks = 0
     private static var failures: [String] = []
-    private static let profileA = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+    nonisolated private static let profileA = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
     private static let profileB = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
     private static let sessionA = TraktSessionID(rawValue: "fixture-trakt-A")
     private static let sessionB = TraktSessionID(rawValue: "fixture-trakt-B")

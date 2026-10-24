@@ -60,7 +60,8 @@ extension UsenetNodeClient {
             session: session, timeout: 4)
         return .init(url: url, lease: native ? .init() : nil)
         #else
-        return try await UsenetNodeClient.createStream(endpoint: .init(base: base, requiresNativeCapabilities: native),
+        // Current production has no legacy capability/lease opt-out.
+        return try await UsenetNodeClient.createStream(endpoint: .init(base: base),
             nzbURLs: ["https://fixture.invalid/" + scenario],
             servers: ["nntps://fixture:first@one.invalid:563/2", "nntps://fixture:second@two.invalid:563/2"],
             session: session, timeout: 4, selection: selection, ownerIsCurrent: { owner.check() })
@@ -108,10 +109,19 @@ extension UsenetNodeClient {
         let cancellations = try await snapshot()["cancels"] as! [String]
         check(cancellations.filter { $0 == id }.count == 1, "repeated close is idempotent")
 
+        #if NZB_OPERATION_BASELINE
         let legacy = try await create(selection: .init(fileIdx: 7), native: false)
         let legacyBody = try await creates().last!
         check(legacy.lease == nil && legacyBody["operationId"] == nil && legacyBody["fileIdx"] == nil,
               "legacy payload and lifetime unchanged")
+        #else
+        let nativeOnly = try await create(selection: .init(fileIdx: 7))
+        let nativeOnlyBody = try await creates().last!
+        check(nativeOnly.lease != nil && UUID(uuidString: nativeOnlyBody["operationId"] as? String ?? "") != nil
+              && nativeOnlyBody["fileIdx"] as? Int == 7,
+              "current native-only endpoint always preserves operation ownership and selectors")
+        nativeOnly.lease?.close()
+        #endif
 
         let beforePending = try await creates().count
         let pending = Task { try await create("pending") }
@@ -149,17 +159,35 @@ extension UsenetNodeClient {
               "discarded prewarm closes only its own operation")
 
         let successor = try await create()
-        // Exact one-argument SwiftUI onChange closure body/capture is extracted by the runner.
+        // Exact two-value SwiftUI observer body is extracted by the runner.
         let replacement = PlaybackHooks()
         replacement.curDebridRef = .init(nativeUsenetLease: current.lease)
         let changed = replacement.replacementCallback()
-        changed(current.lease)
+        changed(current.lease, current.lease)
         check(!(await cancelled(current.lease!.id)), "same lease engine handoff does not retire playback")
-        changed(successor.lease)
+        changed(current.lease, successor.lease)
         let replacedCancelled = await eventually { await cancelled(current.lease!.id) }
         let successorStillLive = !(await cancelled(successor.lease!.id))
         check(replacedCancelled && successorStillLive,
               "accepted differing lease closes old playback while launch copy survives")
+
+        #if !NZB_OPERATION_BASELINE
+        let eventOld = try await create()
+        let eventNew = try await create()
+        let unrelated = try await create()
+        replacement.curDebridRef = .init(nativeUsenetLease: unrelated.lease)
+        changed(eventOld.lease, eventNew.lease)
+        let eventOldClosed = await eventually { await cancelled(eventOld.lease!.id) }
+        let eventNewLive = !(await cancelled(eventNew.lease!.id))
+        let unrelatedLive = !(await cancelled(unrelated.lease!.id))
+        check(eventOldClosed && eventNewLive && unrelatedLive,
+              "observer closes the event's old lease, not a later mutable view reference")
+        changed(nil, eventNew.lease)
+        check(!(await cancelled(eventNew.lease!.id)), "nil-to-lease observation preserves incoming operation")
+        changed(eventNew.lease, nil)
+        check(await eventually { await cancelled(eventNew.lease!.id) }, "lease-to-nil observation retires outgoing operation")
+        unrelated.lease?.close()
+        #endif
 
         let incoming = try await create()
         replacement.curDebridRef = .init(nativeUsenetLease: successor.lease)
@@ -223,7 +251,7 @@ extension UsenetNodeClient {
         let profileCheck = UsenetLocalResolver.nativeOwnerCheck(capture: freshCapture)
         await MainActor.run { ProfileStore.shared.activeID = UUID() }
         check(!(await profileCheck()), "actual owner predicate rejects profile change")
-        await MainActor.run { StremioServer.usenetEndpoint = .init(base: base, requiresNativeCapabilities: true) }
+        await MainActor.run { StremioServer.usenetEndpoint = .init(base: base) }
         let routed = try await UsenetLocalResolver.resolveRouted(
             nzbURLs: ["https://fixture.invalid/ready"], servers: ["nntps://fixture:one@one.invalid:563/2"],
             selection: .init(fileIdx: 3, episode: .init(season: 0, episode: 1)), ownerIsCurrent: { true })!

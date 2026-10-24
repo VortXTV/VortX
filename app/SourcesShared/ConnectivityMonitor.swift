@@ -27,6 +27,7 @@ import Network
 ///
 /// Dependency-free by design (Foundation + Network + Combine only): no engine, no account, no UI, so
 /// every target that compiles SourcesShared can start it without dragging anything else in.
+@MainActor
 final class ConnectivityMonitor: ObservableObject {
     static let shared = ConnectivityMonitor()
 
@@ -54,8 +55,9 @@ final class ConnectivityMonitor: ObservableObject {
 
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "tv.vortx.connectivity", qos: .utility)
-    private var pending: DispatchWorkItem?
-    private var pinConfirmation: DispatchWorkItem?
+    // A value ticket, not a non-Sendable work item. Revocation is checked by the main reducer.
+    private var pending: UUID?
+    private var pinConfirmation: UUID?
     private var started = false
     /// Whether `apply` has seen the first path callback (distinct from `launchOffline == nil`, which
     /// also spans the offline confirmation window). Main-thread only.
@@ -97,22 +99,22 @@ final class ConnectivityMonitor: ObservableObject {
         // immediately (the whole point of the window: the network came up, so the launch was not
         // meaningfully offline and no routing should fire). The banner change rides the debounce below.
         if launchOffline == nil, !offline {
-            pinConfirmation?.cancel()
             pinConfirmation = nil
             launchOffline = false
         }
         // Any new verdict supersedes a pending one. This is what makes a flap a no-op: the bounce-back
-        // cancels the not-yet-applied change and then matches the current state, so nothing publishes.
-        pending?.cancel()
+        // revokes the not-yet-applied ticket and then matches the current state, so nothing publishes.
         pending = nil
         guard offline != isOffline else { return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isOffline != offline else { return }
+        let ticket = UUID()
+        pending = ticket
+        DispatchQueue.main.asyncAfter(deadline: .now() + changeDebounce) { [weak self] in
+            guard let self, self.pending == ticket else { return }
+            self.pending = nil
+            guard self.isOffline != offline else { return }
             self.isOffline = offline
             if !offline { self.didBecomeOnline.send() }
         }
-        pending = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + changeDebounce, execute: work)
     }
 
     /// Pin `launchOffline` only after `offlinePinConfirm` seconds, and from the FRESHEST raw verdict at
@@ -121,11 +123,12 @@ final class ConnectivityMonitor: ObservableObject {
     /// shells' launch routing therefore triggers up to ~2s after mount; their `tab == .home` /
     /// `selection == 0` guards make that safe (a user who already navigated is deliberately left alone).
     private func confirmOfflinePinLater() {
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.launchOffline == nil else { return }
+        let ticket = UUID()
+        pinConfirmation = ticket
+        DispatchQueue.main.asyncAfter(deadline: .now() + offlinePinConfirm) { [weak self] in
+            guard let self, self.pinConfirmation == ticket, self.launchOffline == nil else { return }
+            self.pinConfirmation = nil
             self.launchOffline = self.lastRawOffline
         }
-        pinConfirmation = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + offlinePinConfirm, execute: work)
     }
 }

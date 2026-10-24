@@ -14,9 +14,11 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -32,6 +34,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.library.LibrarySegment
 import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.randompick.RandomLibraryPickHeader
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
@@ -66,12 +69,37 @@ fun TvLibraryScreen(
     entryFocusRequesters: Map<TvLibraryRoute, FocusRequester> = emptyMap(),
     onSmartCollections: (() -> Unit)? = null,
     onNetworkShares: (() -> Unit)? = null,
+    onDirectResume: (MetaItem) -> Unit = onItem,
+    pickerActive: Boolean = true,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
+    val randomPick by viewModel.randomPickState.collectAsStateWithLifecycle()
+    val pickerIsActive by rememberUpdatedState(pickerActive)
+    DisposableEffect(viewModel, pickerActive) {
+        if (!pickerActive) viewModel.clearRandomPick()
+        onDispose { viewModel.clearRandomPick() }
+    }
+    val randomPickHeader: @Composable () -> Unit = {
+        RandomLibraryPickHeader(
+            state = randomPick,
+            onPick = { filter -> if (pickerIsActive) viewModel.pickRandom(filter) },
+            onOpen = {
+                if (pickerIsActive) viewModel.randomPickForAction { item -> if (pickerIsActive) onItem(item) }
+            },
+            onPlay = {
+                if (pickerIsActive) viewModel.randomPickForAction { item -> if (pickerIsActive) onDirectResume(item) }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            tv = true,
+        )
+    }
 
     Column(modifier = modifier.fillMaxSize()) {
-        if (state !is UiState.Success) TvLibraryEntries(onDownloads, onWatchlist, onPreviouslyWatched, entryFocusRequesters, onSmartCollections, onNetworkShares)
+        if (state !is UiState.Success) {
+            TvLibraryEntries(onDownloads, onWatchlist, onPreviouslyWatched, entryFocusRequesters, onSmartCollections, onNetworkShares)
+            randomPickHeader()
+        }
         when (val s = state) {
             is UiState.Loading -> TvLoading()
             is UiState.Error -> TvError(s.message, onRetry = viewModel::retry)
@@ -90,6 +118,7 @@ fun TvLibraryScreen(
                 onSmartCollections = onSmartCollections,
                 entryFocusRequesters = entryFocusRequesters,
                 onNetworkShares = onNetworkShares,
+                randomPickHeader = randomPickHeader,
             )
         }
     }
@@ -109,6 +138,7 @@ private fun TvLibraryContent(
     onWatchlist: () -> Unit,
     onPreviouslyWatched: () -> Unit,
     entryFocusRequesters: Map<TvLibraryRoute, FocusRequester>,
+    randomPickHeader: @Composable () -> Unit,
     onSmartCollections: (() -> Unit)? = null,
     onNetworkShares: (() -> Unit)? = null,
 ) {
@@ -168,6 +198,9 @@ private fun TvLibraryContent(
                     onToggleFilter = { smartSelected = LibrarySmartFilter.toggle(smartSelected, it) },
                     onSelectSort = onSelectSort,
                 )
+            }
+            item(key = "library-random-pick", span = { GridItemSpan(maxLineSpan) }) {
+                randomPickHeader()
             }
             if (shown.isEmpty()) item(key = "library-empty", span = { GridItemSpan(maxLineSpan) }) {
                 Text(

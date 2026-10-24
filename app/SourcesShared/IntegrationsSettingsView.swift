@@ -140,7 +140,11 @@ private struct TraktMyListsCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .vortxSettingsCard()
             }
+            #if os(tvOS)
+            .vortxCardButton()
+            #else
             .buttonStyle(.plain)
+            #endif
         }
     }
 }

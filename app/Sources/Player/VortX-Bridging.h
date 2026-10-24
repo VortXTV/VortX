@@ -1,7 +1,33 @@
 #import <AVFoundation/AVFoundation.h>
 
+#include <TargetConditionals.h>
+
+#if TARGET_OS_TV
+#include <Security/SecItem.h>
+
+// Explicit tvOS SDK compatibility exception, not a nondeprecated API migration.
+// Security's public Fail constant preserves noninteractive failures, while its
+// recommended LAContext.interactionNotAllowed replacement is unavailable here.
+// Never substitute default Allow, silent Skip, or a previously authenticated context.
+// Only this original constant initializer is excepted from deprecation diagnostics;
+// every other warning, availability check and warnings-as-errors policy remains active.
+static inline CFStringRef _Nonnull VortXTVKeychainAuthenticationUIFailCompatibilityValue(void)
+    CF_RETURNS_NOT_RETAINED;
+
+static inline CFStringRef _Nonnull VortXTVKeychainAuthenticationUIFailCompatibilityValue(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    const CFStringRef value = kSecUseAuthenticationUIFail;
+#pragma clang diagnostic pop
+    return value;
+}
+#endif
+
 // C11-atomic cancellation/progress bridge for the noncapturing FFmpeg remux callback.
 #include "VortXRemuxInputProbe.h"
+
+// Process-lifetime C-owned crash signal state; no Swift executes on a fatal signal.
+#include "VortXCrashSignal.h"
 
 // Network shares over SMB: the libsmbclient calls the share browser makes (see the header for why these are
 // declared rather than imported). Quoted path relative to this header, like the QuickJS bridge below.
@@ -11,6 +37,10 @@
 // (JSProviderRuntime.swift calls VortXQuickJSRun / VortXQuickJSFree). Quoted path is relative to this
 // header's directory and resolves on every target that compiles the QuickJS C sources.
 #include "../../SourcesShared/JSProviders/QuickJS/VortXQuickJSBridge.h"
+
+// The trailer range proxy owns Network.framework objects in Objective-C. Swift receives only value callbacks
+// (lease ID, port and success/failure), so no nw_* object crosses the Swift 6 boundary.
+#include "VXTrailerNetworkOwner.h"
 
 // macOS 26 (Tahoe) SwiftUI toolbar-crash guard. Swallows the NSException thrown by
 // NSToolbar's private -_insertNewItemWithItemIdentifier:... under SwiftUI's
@@ -39,6 +69,6 @@ void VortXInstallToolbarCrashGuard(void);
 @interface AVDisplayCriteria ()
 @property(readonly) int videoDynamicRange;
 @property(readonly, nonatomic) float refreshRate;
-- (instancetype)initWithRefreshRate:(float)refreshRate videoDynamicRange:(int)videoDynamicRange;
+- (instancetype _Null_unspecified)initWithRefreshRate:(float)refreshRate videoDynamicRange:(int)videoDynamicRange;
 @end
 #endif

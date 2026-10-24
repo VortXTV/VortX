@@ -84,77 +84,243 @@ enum MPVHardwareDecodePolicy {
 /// controller reference inside means a callback racing teardown resolves to nil instead of
 /// dereferencing a freed controller. Released only after `mpv_terminate_destroy` returns,
 /// at which point mpv guarantees no further callbacks.
-fileprivate final class WakeupRelay: @unchecked Sendable {
-    // Immutable configuration + thread-safe weak reference; mutable admission is lock-protected.
-    private weak var controller: MPVMetalViewController?
-    private let handle: OpaquePointer
+fileprivate final class WakeupRelay: Sendable {
+    private struct State: Sendable {
+        enum Phase: Sendable { case idle, scheduled, draining }
+        var phase = Phase.idle
+        var pending = false
+        var retired = false
+    }
+    private let controller: @Sendable () -> MPVMetalViewController?
+    private let contextID: ObjectIdentifier
     private let coalescesPreviewWakeups: Bool
-    private let lock = NSLock()
-    private enum Phase { case idle, scheduled, draining }
-    private var phase = Phase.idle
-    private var pending = false
-    private var retired = false
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
-    init(_ controller: MPVMetalViewController, handle: OpaquePointer,
+    init(_ controller: MPVMetalViewController, context: MPVNativeHandle,
          coalescesPreviewWakeups: Bool) {
-        self.controller = controller
-        self.handle = handle
+        self.controller = { [weak controller] in controller }
+        self.contextID = ObjectIdentifier(context)
         self.coalescesPreviewWakeups = coalescesPreviewWakeups
     }
 
-    /// Notification only: never call mpv or hold this lock across dispatch/controller work.
-    /// A native callback may occur reentrantly while the caller owns loadTokenLock.
+    /// Notification only. Never borrow mpv or hold state across dispatch/controller work:
+    /// mpv can call this reentrantly inside a load-admission transaction.
     func signal() {
-        guard coalescesPreviewWakeups else {
-            controller?.readEvents()
-            return
+        let shouldEnqueue = state.withLock { state -> Bool in
+            guard !state.retired else { return false }
+            guard coalescesPreviewWakeups else { return true }
+            state.pending = true
+            guard state.phase == .idle else { return false }
+            state.phase = .scheduled
+            return true
         }
-        lock.lock()
-        guard !retired else { lock.unlock(); return }
-        pending = true
-        guard phase == .idle else { lock.unlock(); return }
-        phase = .scheduled
-        lock.unlock()
-        enqueueDrain()
+        if shouldEnqueue { enqueueDrain() }
     }
 
     private func enqueueDrain() {
-        guard let controller else { retire(); return }
+        guard let controller = controller() else { retire(); return }
         controller.enqueueEventDrain(previewRelay: self)
     }
 
-    /// The queued closure retains this exact relay; it never substitutes a newer relay.
+    func owns(_ context: MPVNativeHandle) -> Bool {
+        contextID == ObjectIdentifier(context)
+    }
+
+    /// The queued closure retains this exact relay, including for the non-coalesced lane.
     func beginDrain() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !retired, phase == .scheduled else { return false }
-        phase = .draining
-        pending = false
-        return true
+        state.withLock { state in
+            guard !state.retired else { return false }
+            guard coalescesPreviewWakeups else { return true }
+            guard state.phase == .scheduled else { return false }
+            state.phase = .draining
+            state.pending = false
+            return true
+        }
     }
 
-    func permitsPolling(handle: OpaquePointer) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !retired && phase == .draining && self.handle == handle
+    func permitsPolling(context: MPVNativeHandle) -> Bool {
+        guard owns(context) else { return false }
+        return state.withLock {
+            !$0.retired && (!coalescesPreviewWakeups || $0.phase == .draining)
+        }
     }
 
-    /// Atomic pending/idle handoff closes the last-wake race after MPV_EVENT_NONE.
-    /// A wake before finish gets one continuation; a wake after idle enqueues itself.
+    /// Atomic pending/idle handoff closes the final-wake race after MPV_EVENT_NONE.
     func finishDrain() {
-        lock.lock()
-        guard !retired, phase == .draining else { lock.unlock(); return }
-        let continueDraining = pending
-        phase = continueDraining ? .scheduled : .idle
-        lock.unlock()
+        guard coalescesPreviewWakeups else { return }
+        let continueDraining = state.withLock { state -> Bool in
+            guard !state.retired, state.phase == .draining else { return false }
+            let pending = state.pending
+            state.phase = pending ? .scheduled : .idle
+            return pending
+        }
         if continueDraining { enqueueDrain() }
     }
 
-    /// Permanent native-context retirement, never reset by logical media replacement.
-    /// Already-queued closures become inert; native destruction stays on the serial queue.
     func retire() {
-        lock.lock(); defer { lock.unlock() }
-        retired = true
-        pending = false
-        phase = .idle
+        state.withLock {
+            $0.retired = true
+            $0.pending = false
+            $0.phase = .idle
+        }
+    }
+}
+
+/// The only new unchecked boundary is the opaque C context itself. libmpv permits concurrent
+/// commands/property reads; Swift has no Sendable representation for its OpaquePointer.
+/// Only the main-actor controller keeps the setup/UI alias. Worker borrows are synchronous,
+/// never escape their closure, and require this exact serial queue. Retirement first closes
+/// admission, disables callbacks and optionally requests quit, then enqueues destruction
+/// behind every in-flight borrow. Queued work retains this owner and cannot borrow after
+/// retirement. No actor/model state, callback payload, or policy is made unchecked here.
+fileprivate final class MPVNativeHandle: @unchecked Sendable {
+    private struct Lifecycle: Sendable {
+        var retired = false
+        var destroyed = false
+        var relay: WakeupRelay?
+    }
+    private let handle: OpaquePointer
+    private let queue: DispatchQueue
+    private let lifecycle = OSAllocatedUnfairLock(initialState: Lifecycle())
+
+    init(handle: OpaquePointer, queue: DispatchQueue) {
+        self.handle = handle
+        self.queue = queue
+    }
+
+    var isRetired: Bool { lifecycle.withLock { $0.retired } }
+
+    @MainActor
+    func install(_ relay: WakeupRelay) {
+        lifecycle.withLock {
+            precondition(!$0.retired && $0.relay == nil)
+            $0.relay = relay
+        }
+        let retained = Unmanaged.passRetained(relay)
+        mpv_set_wakeup_callback(handle, { context in
+            guard let context else { return }
+            Unmanaged<WakeupRelay>.fromOpaque(context).takeUnretainedValue().signal()
+        }, retained.toOpaque())
+    }
+
+    /// Return values must be owned Swift values, never a native pointer or node view.
+    @discardableResult
+    func withBorrow<Result: Sendable>(_ body: (OpaquePointer) -> Result) -> Result? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard !isRetired else { return nil }
+        return body(handle)
+    }
+
+    func retire(sendQuit: Bool, surface: String? = nil) {
+        let admission = lifecycle.withLock { state -> (Bool, WakeupRelay?) in
+            guard !state.retired else { return (false, nil) }
+            state.retired = true
+            return (true, state.relay)
+        }
+        guard admission.0 else { return }
+        admission.1?.retire()
+        mpv_set_wakeup_callback(handle, nil, nil)
+        if sendQuit { mpv_command_string(handle, "quit") }
+        queue.async { [self] in
+            dispatchPrecondition(condition: .onQueue(queue))
+            mpv_terminate_destroy(handle)
+            let relay = lifecycle.withLock { state -> WakeupRelay? in
+                precondition(state.retired && !state.destroyed)
+                state.destroyed = true
+                defer { state.relay = nil }
+                return state.relay
+            }
+            // Balances only install's native +1. The Swift reference keeps the relay alive
+            // through this release; terminate_destroy has joined every native callback.
+            if let relay { Unmanaged.passUnretained(relay).release() }
+            if let surface { DiagnosticsLog.log("mpv", "destroy-finished surface=\(surface)") }
+        }
+    }
+}
+
+private struct MPVCacheReanchorEventWitness: Equatable, Sendable {
+    let id: UInt64
+    let owner: PlayerLoadToken
+    let attempt: Int
+    let commandGeneration: UInt64
+}
+
+/// Policies have checked value conformances in their defining files. The recursive
+/// transaction retains the existing command/dequeue admission boundary while individual
+/// accesses use a checked lock. Recursion is solely for accessors inside that transaction;
+/// the unfair storage lock is never held across native calls or arbitrary callbacks.
+private final class MPVNativeState: Sendable {
+    struct State: Sendable {
+        var context: MPVNativeHandle?
+        var loadProvenance = PlayerLoadProvenanceState()
+        var initializationFailure = MPVInitializationFailureState<PlayerLoadToken>()
+        var requestedFreshOrigin: Double?
+        var requestedFreshOriginGeneration: UInt64 = 0
+        var freshOrigin = FreshPlaybackOriginPolicy<PlayerLoadToken>()
+        var cacheReanchorEventWitness: MPVCacheReanchorEventWitness?
+        var seekSettlement = MPVSeekSettlementPolicy<PlayerLoadToken>()
+        var nativeSeekDiagnostics = MPVNativeSeekDiagnosticPolicy<PlayerLoadToken>()
+        var previewSeekStorm = MPVPreviewSeekStormPolicy<PlayerLoadToken>()
+        var latestAcceptedAbsoluteSeek: MPVResumeSeekTicket<PlayerLoadToken>?
+        var startMuted = false
+        var loopPlayback = false
+        var probeChannel: StaticString = "player"
+        var playURLHost: String?
+        var decoderFailureReceipts = Set<String>()
+        var lastTimePosEmit: TimeInterval = 0
+        var lastCacheTimeEmit: TimeInterval = 0
+        var userSeekedSinceRampSample = false
+        var cacheReadaheadRampGeneration: UInt64 = 0
+        var cacheReadaheadRampAppliedSecs = 0
+        var cacheReadaheadRampLastFrameDrop = 0
+        var cacheReadaheadRampStartSecs = 0
+        var externalSubtitleRequestGeneration: UInt64 = 0
+        var subtitleAlignmentGeneration: UInt64 = 0
+        #if os(tvOS)
+        var seekCacheHoldArmed = false
+        #endif
+    }
+    let transaction = NSRecursiveLock()
+    private let storage = OSAllocatedUnfairLock(initialState: State())
+
+    /// Wakeup notification must not acquire the command/dequeue transaction: libmpv
+    /// can notify reentrantly while that transaction is held across a native command.
+    /// No native call runs under this short storage lock.
+    var currentContext: MPVNativeHandle? { storage.withLock { $0.context } }
+
+    func read<Value: Sendable>(_ body: @Sendable (State) -> Value) -> Value {
+        transaction.lock(); defer { transaction.unlock() }
+        return storage.withLock { body($0) }
+    }
+
+    @discardableResult
+    func update<Value: Sendable>(_ body: @Sendable (inout State) -> Value) -> Value {
+        transaction.lock(); defer { transaction.unlock() }
+        return storage.withLock(body)
+    }
+
+    func takeContext() -> MPVNativeHandle? {
+        transaction.lock(); defer { transaction.unlock() }
+        return storage.withLock {
+            defer { $0.context = nil }
+            return $0.context
+        }
+    }
+}
+
+/// The protocol's legacy completion type is not Sendable. Keep it on its calling
+/// actor and carry only an immutable result across the native/capture/I/O boundary.
+@MainActor
+private final class MPVMainCompletion<Value: Sendable> {
+    private var completion: ((Value) -> Void)?
+    init(_ completion: @escaping (Value) -> Void) { self.completion = completion }
+
+    nonisolated func finish(_ value: Value) {
+        DispatchQueue.main.async { [self] in
+            let callback = completion
+            completion = nil
+            callback?(value)
+        }
     }
 }
 
@@ -208,34 +374,50 @@ private final class TVOSMemorySampleThrottle: @unchecked Sendable {
 #endif
 
 final class MPVMetalViewController: PlatformViewController {
+    private nonisolated let native = MPVNativeState()
+    private nonisolated var nativeContext: MPVNativeHandle? { native.currentContext }
     var metalLayer = MetalLayer()
-    var mpv: OpaquePointer!
-    /// The +1 relay currently registered with mpv; balanced with release() after terminate.
-    private var wakeupRelay: Unmanaged<WakeupRelay>?
+    /// Main-actor setup/UI alias; worker code borrows only through nativeContext.
+    private var mpv: OpaquePointer!
     var playDelegate: MPVPlayerDelegate?
-    lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
+    nonisolated let queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     /// mpv loads asynchronously after `loadfile` returns. Bind logical request tokens through mpv's unique
     /// playlist-entry IDs instead of assuming START_FILE order. The same lock covers command registration
     /// and event binding, so a wakeup cannot observe START_FILE before its exact entry ID is registered.
-    private let loadTokenLock = NSLock()
-    private var loadProvenance = PlayerLoadProvenanceState()
-    private var initializationFailure = MPVInitializationFailureState<PlayerLoadToken>()
+    private nonisolated var loadTokenLock: NSRecursiveLock { native.transaction }
+    private nonisolated var loadProvenance: PlayerLoadProvenanceState {
+        get { native.read { $0.loadProvenance } }
+        set { native.update { $0.loadProvenance = newValue } }
+    }
+    private nonisolated var initializationFailure: MPVInitializationFailureState<PlayerLoadToken> {
+        get { native.read { $0.initializationFailure } }
+        set { native.update { $0.initializationFailure = newValue } }
+    }
+    /// UI/main-actor-owned and intentionally not persisted; ordinary loadfile/source changes retain it.
+    private(set) var sessionAudioPreset = PlayerSessionAudioPresetState()
     // Protected by loadTokenLock: load admission, raw event reads, and explicit UI seeks all
     // participate. An origin is one-shot configuration for the next load, never inherited.
-    private var requestedFreshOrigin: Double?
-    private var requestedFreshOriginGeneration: UInt64 = 0
-    private var freshOrigin = FreshPlaybackOriginPolicy<PlayerLoadToken>()
+    private nonisolated var requestedFreshOrigin: Double? {
+        get { native.read { $0.requestedFreshOrigin } }
+        set { native.update { $0.requestedFreshOrigin = newValue } }
+    }
+    private nonisolated var requestedFreshOriginGeneration: UInt64 {
+        get { native.read { $0.requestedFreshOriginGeneration } }
+        set { native.update { $0.requestedFreshOriginGeneration = newValue } }
+    }
+    private nonisolated var freshOrigin: FreshPlaybackOriginPolicy<PlayerLoadToken> {
+        get { native.read { $0.freshOrigin } }
+        set { native.update { $0.freshOrigin = newValue } }
+    }
     /// One destructive cache flight per controller; all mutations occur on the main queue.
     private var cacheFlushFlight = CacheFlushSingleFlight<PlayerLoadToken>()
     /// Mirrored under loadTokenLock so queued main-queue callbacks retain the command attempt
     /// they actually observed, rather than adopting whichever flight exists when they execute.
-    private struct CacheReanchorEventWitness: Equatable {
-        let id: UInt64
-        let owner: PlayerLoadToken
-        let attempt: Int
-        let commandGeneration: UInt64
+    private typealias CacheReanchorEventWitness = MPVCacheReanchorEventWitness
+    private nonisolated var cacheReanchorEventWitness: CacheReanchorEventWitness? {
+        get { native.read { $0.cacheReanchorEventWitness } }
+        set { native.update { $0.cacheReanchorEventWitness = newValue } }
     }
-    private var cacheReanchorEventWitness: CacheReanchorEventWitness?
     private func acceptsCacheReanchorEventWitness(_ witness: CacheReanchorEventWitness?) -> Bool {
         guard let witness else { return false }
         loadTokenLock.lock()
@@ -257,14 +439,26 @@ final class MPVMetalViewController: PlatformViewController {
     private var seekEOFRecovery = SeekEOFRecoveryPolicy<PlayerLoadToken>()
     private var seekEOFTerminalPark = SeekEOFTerminalParkPolicy<PlayerLoadToken>()
     /// Protected by loadTokenLock, including command admission and raw event dequeue.
-    private var seekSettlement = MPVSeekSettlementPolicy<PlayerLoadToken>()
+    private nonisolated var seekSettlement: MPVSeekSettlementPolicy<PlayerLoadToken> {
+        get { native.read { $0.seekSettlement } }
+        set { native.update { $0.seekSettlement = newValue } }
+    }
     // All three policies share loadTokenLock and reset only on accepted replacement/invalidation.
-    private var nativeSeekDiagnostics = MPVNativeSeekDiagnosticPolicy<PlayerLoadToken>()
-    private var previewSeekStorm = MPVPreviewSeekStormPolicy<PlayerLoadToken>()
-    private var latestAcceptedAbsoluteSeek: MPVResumeSeekTicket<PlayerLoadToken>?
+    private nonisolated var nativeSeekDiagnostics: MPVNativeSeekDiagnosticPolicy<PlayerLoadToken> {
+        get { native.read { $0.nativeSeekDiagnostics } }
+        set { native.update { $0.nativeSeekDiagnostics = newValue } }
+    }
+    private nonisolated var previewSeekStorm: MPVPreviewSeekStormPolicy<PlayerLoadToken> {
+        get { native.read { $0.previewSeekStorm } }
+        set { native.update { $0.previewSeekStorm = newValue } }
+    }
+    private nonisolated var latestAcceptedAbsoluteSeek: MPVResumeSeekTicket<PlayerLoadToken>? {
+        get { native.read { $0.latestAcceptedAbsoluteSeek } }
+        set { native.update { $0.latestAcceptedAbsoluteSeek = newValue } }
+    }
     /// A callback can cross the main queue after a newer seek on the SAME file was issued.
     /// Source ownership alone is insufficient; retain the generation captured at raw dequeue.
-    private func acceptsCurrentSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
+    private nonisolated func acceptsCurrentSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
                                          owner: PlayerLoadToken) -> Bool {
         guard let evidence else { return false }
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
@@ -272,14 +466,14 @@ final class MPVMetalViewController: PlatformViewController {
     }
     /// Terminal callbacks need generation ownership, not settled/non-EOF proof: EOF itself cannot
     /// be a settled playback sample. Capture this evidence beside raw dequeue under loadTokenLock.
-    private func acceptsCurrentTerminalSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
+    private nonisolated func acceptsCurrentTerminalSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
                                                   owner: PlayerLoadToken) -> Bool {
         guard let evidence else { return false }
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return seekSettlement.accepts(evidence, owner: owner)
     }
 
-    private func acceptsSettledPosition(_ evidence: MPVSeekSettlementEvidence?,
+    private nonisolated func acceptsSettledPosition(_ evidence: MPVSeekSettlementEvidence?,
                                         owner: PlayerLoadToken) -> Bool {
         guard let evidence, evidence.settled else { return false }
         return acceptsCurrentSeekEvent(evidence, owner: owner)
@@ -288,7 +482,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// Native SEEK + non-EOF RESTART can prove a physical position even when overlapping
     /// commands cannot be individually attributed. Preserve that distinction at UI delivery;
     /// command-driven resume/EOF/recovery decisions retain acceptsSettledPosition's stricter gate.
-    private func acceptsCurrentPosition(_ evidence: MPVSeekSettlementEvidence,
+    private nonisolated func acceptsCurrentPosition(_ evidence: MPVSeekSettlementEvidence,
                                         owner: PlayerLoadToken) -> Bool {
         guard evidence.settled else { return false }
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
@@ -297,7 +491,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Called on the controller or event queue while loadTokenLock fences the exact accepted
     /// source and seek generation. Values are observational, never a replacement for settlement.
-    private func nativeSeekSnapshot(handle: OpaquePointer) -> MPVSeekNativeSnapshot {
+    private nonisolated func nativeSeekSnapshot(handle: OpaquePointer) -> MPVSeekNativeSnapshot {
         let cache = MPVDemuxerCacheSnapshot.read(from: handle)
         return MPVSeekNativeSnapshot(
             position: diagnosticDouble(MPVProperty.timePos, handle: handle),
@@ -313,7 +507,7 @@ final class MPVMetalViewController: PlatformViewController {
             softwareDecoder: diagnosticString("hwdec-current", handle: handle).map { $0 == "no" })
     }
 
-    private func cacheReanchorNativeSample(handle: OpaquePointer) -> MPVCacheReanchorPolicy.Sample {
+    private nonisolated func cacheReanchorNativeSample(handle: OpaquePointer) -> MPVCacheReanchorPolicy.Sample {
         let cache = MPVDemuxerCacheSnapshot.read(from: handle)
         return .init(position: diagnosticDouble(MPVProperty.timePos, handle: handle),
                      seeking: diagnosticFlag("seeking", handle: handle),
@@ -326,27 +520,36 @@ final class MPVMetalViewController: PlatformViewController {
     /// settlement, source replacement, or stop makes each pending observation inert. These do
     /// not seek, change pause/decoder options, or extend the surface's recovery deadline.
     private func scheduleNativeSeekWitness(owner: PlayerLoadToken, evidence: MPVSeekSettlementEvidence) {
+        guard let context = nativeContext else { return }
         for delay in [2.0, 6.0, 11.0] {
-            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, let handle = self.mpv else { return }
-                self.loadTokenLock.lock()
-                guard self.loadProvenance.callbackToken(requiresLoadedFile: true) == owner,
-                      self.seekSettlement.accepts(evidence, owner: owner),
-                      self.seekSettlement.needsNativeWitness else {
+            queue.asyncAfter(deadline: .now() + delay) { [weak self, context] in
+                guard let self, self.nativeContext === context else { return }
+                context.withBorrow { handle in
+                    self.loadTokenLock.lock()
+                    guard self.loadProvenance.callbackToken(requiresLoadedFile: true) == owner,
+                          self.seekSettlement.accepts(evidence, owner: owner),
+                          self.seekSettlement.needsNativeWitness else {
+                        self.loadTokenLock.unlock()
+                        return
+                    }
+                    let snapshot = self.nativeSeekSnapshot(handle: handle)
+                    let transport = MPVSeekTransportDiagnostic.read(from: handle)
                     self.loadTokenLock.unlock()
-                    return
+                    DiagnosticsLog.log("playback", "seek-native pending=\(Int(delay))s load=\(owner.hashValue) seek=\(evidence.generation) \(snapshot.receipt) \(transport.receipt)")
                 }
-                let snapshot = self.nativeSeekSnapshot(handle: handle)
-                let transport = MPVSeekTransportDiagnostic.read(from: handle)
-                self.loadTokenLock.unlock()
-                DiagnosticsLog.log("playback", "seek-native pending=\(Int(delay))s load=\(owner.hashValue) seek=\(evidence.generation) \(snapshot.receipt) \(transport.receipt)")
             }
         }
     }
     private var seekEOFReloadSource: SeekEOFReloadSource?
     private var seekEOFRecoveryTimeout: DispatchWorkItem?
+    private var trailerProxyOwnerID: UInt64?
+    /// A trailer listener may be preparing asynchronously. The generation is
+    /// invalidated by stop, seek, or a newer source before any prepared URL is
+    /// admitted into mpv.
+    private var trailerPreparationGeneration: UInt64 = 0
+    private var trailerPreparationTask: Task<Void, Never>?
     private static let seekEOFRecoveryTimeoutSeconds: TimeInterval = 12
-    var activeLoadToken: PlayerLoadToken? {
+    nonisolated var activeLoadToken: PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return loadProvenance.activeToken ?? initializationFailure.activeToken
     }
@@ -358,7 +561,12 @@ final class MPVMetalViewController: PlatformViewController {
     // Tracks the Metal device for which the capture queue/scaler were built. Drawable size and format
     // are handled lazily inside MetalLayer because the bounded target follows each capture request.
     private var capturePipelineDevice: ObjectIdentifier?
-    var playUrl: URL?
+    var playUrl: URL? {
+        didSet {
+            let host = playUrl?.host
+            native.update { $0.playURLHost = host }
+        }
+    }
     var playHeaders: [String: String]?
     var playUrlLive = false
     var startPaused = false
@@ -374,22 +582,31 @@ final class MPVMetalViewController: PlatformViewController {
     /// sets it, so its audio + transport behaviour is unchanged. When muted, the route-aware audio-session
     /// machinery is skipped entirely so this lightweight preview instance never claims `.playback` or
     /// disturbs the main player's audio session.
-    var startMuted = false
-    var loopPlayback = false
+    nonisolated var startMuted: Bool {
+        get { native.read { $0.startMuted } }
+        set { native.update { $0.startMuted = newValue } }
+    }
+    nonisolated var loopPlayback: Bool {
+        get { native.read { $0.loopPlayback } }
+        set { native.update { $0.loopPlayback = newValue } }
+    }
     /// The VXProbe channel this instance narrates under. The real playback surface keeps `"player"`, which
     /// every existing diagnostic and export tool greps for; the ambient hero trailer sets `"trailer"` so its
     /// buffering / playing / endfile lines cannot be misread as the main player's. A muted decorative clip
     /// impersonating `[player]` produced phantom overlapping playbacks in an exported device log and cost a
     /// diagnosis. `StaticString` because a VXProbe category is a compile-time literal, never runtime text.
-    var probeChannel: StaticString = "player"
+    nonisolated var probeChannel: StaticString {
+        get { native.read { $0.probeChannel } }
+        set { native.update { $0.probeChannel = newValue } }
+    }
     /// True only for the real playback surface. `VXProbeState.shared` holds ONE player line that the heartbeat
     /// prints, so an ambient trailer writing into it overwrites the real player's position, duration, buffering
     /// and state with a muted decorative clip's - which is exactly the phantom-playback confusion `probeChannel`
     /// was added to end, left half-fixed because the narration moved channel but the shared STATE writes did
     /// not. Compared through `description` because `StaticString` is not `Equatable`; every call site below is
     /// an event (load, pause, buffering, duration) or already coalesced to a few Hz, so the cost is noise.
-    private var ownsSharedProbeState: Bool { probeChannel.description == "player" }
-    private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
+    private nonisolated var ownsSharedProbeState: Bool { probeChannel.description == "player" }
+    private nonisolated let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     /// What the app/user asked mpv to use. This intentionally differs from `hwdec-current`, which is the
     /// negotiated truth and can silently become `no` when VideoToolbox cannot decode the stream.
     private var requestedHardwareDecoder = MPVHardwareDecodePolicy.videoToolbox
@@ -397,7 +614,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// later fallback is visible without repeating the same line in every 30-second performance receipt.
     private var loggedHardwareDecoderNegotiation = false
     /// Event-queue owned, bounded for the controller lifetime. Only allowlisted decoder receipts escape.
-    private var decoderFailureReceipts = Set<String>()
+    private nonisolated var decoderFailureReceipts: Set<String> {
+        get { native.read { $0.decoderFailureReceipts } }
+        set { native.update { $0.decoderFailureReceipts = newValue } }
+    }
     private var configuredLiveMode = false
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
@@ -455,13 +675,25 @@ final class MPVMetalViewController: PlatformViewController {
     /// authoritative even when the user has requested a streaming disk cache.
     private var diskCacheOnDiskArmed = false
     /// Forward read-ahead ramp state (disk-cache-armed remote VOD). See armDiskCacheReadaheadRamp.
-    private var cacheReadaheadRampWork: DispatchWorkItem?
-    private var cacheReadaheadRampGeneration: UInt64 = 0
-    private var cacheReadaheadRampAppliedSecs = 0
-    private var cacheReadaheadRampLastFrameDrop = 0
+    // Pending ramp closures are cancelled by the checked generation below; no actor-bound work item.
+    private nonisolated var cacheReadaheadRampGeneration: UInt64 {
+        get { native.read { $0.cacheReadaheadRampGeneration } }
+        set { native.update { $0.cacheReadaheadRampGeneration = newValue } }
+    }
+    private nonisolated var cacheReadaheadRampAppliedSecs: Int {
+        get { native.read { $0.cacheReadaheadRampAppliedSecs } }
+        set { native.update { $0.cacheReadaheadRampAppliedSecs = newValue } }
+    }
+    private nonisolated var cacheReadaheadRampLastFrameDrop: Int {
+        get { native.read { $0.cacheReadaheadRampLastFrameDrop } }
+        set { native.update { $0.cacheReadaheadRampLastFrameDrop = newValue } }
+    }
     /// The rung the ramp started at (loadFile), so a drop-burst back-off never sinks the forward depth below the
     /// opening cache-secs. Stored per file alongside the applied depth.
-    private var cacheReadaheadRampStartSecs = 0
+    private nonisolated var cacheReadaheadRampStartSecs: Int {
+        get { native.read { $0.cacheReadaheadRampStartSecs } }
+        set { native.update { $0.cacheReadaheadRampStartSecs = newValue } }
+    }
     /// Set on a USER-initiated seek (the remote's directional hop, a scrub commit, the iOS control bar), read-and-
     /// cleared by each read-ahead ramp sample. A high-bitrate 4K HDR remux legitimately re-decodes from a keyframe
     /// on a user seek and drops well past the burst threshold; without this the ramp reads that one-off seek burst
@@ -471,20 +703,23 @@ final class MPVMetalViewController: PlatformViewController {
     /// entry points and read/cleared in the ramp step, both marshalled on `queue` (the serial mpv queue), so the
     /// two never race. Internal reseeks/watchdog/track-change refresh-seeks deliberately leave it unset, so genuine
     /// internal stalls are still caught.
-    private var userSeekedSinceRampSample = false
-    private static let diskCacheReadaheadRampStepSecs = 60      // cache-secs added per stable rung
-    private static let diskCacheReadaheadRampIntervalSecs: TimeInterval = 15   // wall time between rungs
-    private static let diskCacheRampReadaheadFloorSecs = 30     // demuxer-readahead-secs during the ramp (< start)
-    private static let diskCacheReadaheadRampDropTolerance = 2  // output drops since last rung that still count as steady
+    private nonisolated var userSeekedSinceRampSample: Bool {
+        get { native.read { $0.userSeekedSinceRampSample } }
+        set { native.update { $0.userSeekedSinceRampSample = newValue } }
+    }
+    private nonisolated static let diskCacheReadaheadRampStepSecs = 60      // cache-secs added per stable rung
+    private nonisolated static let diskCacheReadaheadRampIntervalSecs: TimeInterval = 15   // wall time between rungs
+    private nonisolated static let diskCacheRampReadaheadFloorSecs = 30     // demuxer-readahead-secs during the ramp (< start)
+    private nonisolated static let diskCacheReadaheadRampDropTolerance = 2  // output drops since last rung that still count as steady
     /// A REAL output-drop burst since the last rung (well past the jitter tolerance): the disk-offload fill is
     /// starving the Metal present thread NOW, so the ramp backs OFF one rung instead of merely holding, then
     /// resumes climbing once a clean rung passes. Tuned above the tolerance so ordinary jitter still only holds.
-    private static let diskCacheReadaheadRampBurstDropThreshold = 6
+    private nonisolated static let diskCacheReadaheadRampBurstDropThreshold = 6
     /// Bitrate-aware depth guard. A very-high-bitrate stream (UHD remux, ~80 Mbit/s+) tops out below the 900s
     /// ceiling so the forward payload the disk cache commits never over-fills; the byte budget is generous
     /// enough that ordinary 4K (well under it) keeps the FULL configured depth. Never trims below the floor.
-    private static let diskCacheReadaheadRampMaxReadaheadBytes: Int64 = 8 << 30   // 8 GiB forward-payload budget
-    private static let diskCacheReadaheadRampBitrateFloorSecs = 300               // never trim the ceiling below 5 min
+    private nonisolated static let diskCacheReadaheadRampMaxReadaheadBytes: Int64 = 8 << 30   // 8 GiB forward-payload budget
+    private nonisolated static let diskCacheReadaheadRampBitrateFloorSecs = 300               // never trim the ceiling below 5 min
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
     /// every file load and teardown so the FIRST re-evaluation of a new file always applies (the guard
@@ -530,7 +765,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     #if os(tvOS)
-    private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
+    private nonisolated let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
     /// B-instrument: last logged chroma arm-decision signature, so the one-shot decision receipt in
     /// updateFramePresentationPolicy logs only when the decision or its inputs actually change (a policy pass
     /// runs on many events and must not spam). Instrumentation only.
@@ -933,6 +1168,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setupMpv() {
+        sessionAudioPreset = PlayerSessionAudioPresetState()
         // The in-hero trailer preview (#44) is silent, so it must NOT claim the `.playback` audio
         // session: doing so would interrupt other audio and fight the main player's session. Only the
         // real player configures the route-aware audio policy.
@@ -970,7 +1206,10 @@ final class MPVMetalViewController: PlatformViewController {
 #if os(macOS)
         checkError(mpv_set_option_string(mpv, "input-media-keys", "yes"))
 #endif
-        checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &metalLayer))
+        // mpv expects an int64_t containing the layer address, not a pointer to a Swift reference.
+        // The controller continues to own the layer; this borrowed handle transfers no ownership.
+        var windowID = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
+        checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &windowID))
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
         // Point libass at the bundled fonts for non-Latin subtitle rendering. Every target ships
@@ -1302,13 +1541,11 @@ final class MPVMetalViewController: PlatformViewController {
         // mpv gets a retained relay holding a WEAK controller reference, never the controller
         // itself: an unretained `self` was a use-after-free if the wakeup fired (on mpv's
         // internal thread) while the controller was mid-dealloc.
-        let relay = Unmanaged.passRetained(WakeupRelay(self, handle: self.mpv,
-            coalescesPreviewWakeups: startMuted && loopPlayback))
-        wakeupRelay = relay
-        mpv_set_wakeup_callback(self.mpv, { ctx in
-            guard let ctx else { return }
-            Unmanaged<WakeupRelay>.fromOpaque(ctx).takeUnretainedValue().signal()
-        }, relay.toOpaque())
+        let context = MPVNativeHandle(handle: mpv, queue: queue)
+        native.update { $0.context = context }
+        let relay = WakeupRelay(self, context: context,
+            coalescesPreviewWakeups: startMuted && loopPlayback)
+        context.install(relay)
 
         setupNotification()
     }
@@ -1448,7 +1685,27 @@ final class MPVMetalViewController: PlatformViewController {
     }
     #endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only
 
+    private func retirePendingTrailerPreparation(invalidateNativeLease: Bool = false) {
+        trailerPreparationGeneration &+= 1
+        trailerPreparationTask?.cancel()
+        trailerPreparationTask = nil
+        guard invalidateNativeLease, let owner = trailerProxyOwnerID else { return }
+        // Teardown releases only this controller's ownership. A second
+        // controller may still be using the shared native listener.
+        VXTrailerProxy.shared.release(owner: owner)
+        trailerProxyOwnerID = nil
+    }
+
+    private func ensureTrailerProxyOwnerID() -> UInt64? {
+        if let trailerProxyOwnerID { return trailerProxyOwnerID }
+        guard let owner = VXTrailerProxy.shared.registerOwner() else { return nil }
+        trailerProxyOwnerID = owner
+        return owner
+    }
+
     func invalidateLoadToken() {
+        retireSubtitleAlignment()
+        retirePendingTrailerPreparation(invalidateNativeLease: true)
         finishCacheFlushFlight(cacheFlushFlight.reset())
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
         seekEOFRecovery.reset()
@@ -1464,27 +1721,27 @@ final class MPVMetalViewController: PlatformViewController {
         requestedFreshOriginGeneration &+= 1
     }
 
-    private func callbackLoadToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
+    private nonisolated func callbackLoadToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return loadProvenance.callbackToken(requiresLoadedFile: requiresLoadedFile)
     }
 
-    private func bindStartFile(entryID: Int64) {
+    private nonisolated func bindStartFile(entryID: Int64) {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.bindStart(entryID: entryID)
     }
 
-    private func markActiveFileLoaded() {
+    private nonisolated func markActiveFileLoaded() {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.markFileLoaded()
     }
 
-    private func loadToken(forEntryID entryID: Int64) -> PlayerLoadToken? {
+    private nonisolated func loadToken(forEntryID entryID: Int64) -> PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return loadProvenance.token(forEntryID: entryID)
     }
 
-    private func propagateRedirect(_ event: mpv_event_end_file) {
+    private nonisolated func propagateRedirect(_ event: mpv_event_end_file) {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.propagateRedirect(
             from: event.playlist_entry_id,
@@ -1497,6 +1754,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
+        sessionAudioPreset = PlayerSessionAudioPresetState()
         seekEOFTerminalPark.reset()
         loadTokenLock.lock()
         initializationFailure.stop()
@@ -1508,7 +1766,6 @@ final class MPVMetalViewController: PlatformViewController {
         invalidateLoadToken()
         NotificationCenter.default.removeObserver(self)
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
-        cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
         cacheReadaheadRampGeneration &+= 1
 #if os(tvOS)
         cancelSeekRefillWatchdog()   // no pending reseek may fire after teardown
@@ -1523,51 +1780,20 @@ final class MPVMetalViewController: PlatformViewController {
         }
 #endif
         appliedDynamicRange = nil
-        // Fence every preview wake/continuation before clearing or destroying this context.
-        wakeupRelay?.takeUnretainedValue().retire()
-        guard let handle = mpv else { return }
-        // Nil the handle SYNCHRONOUSLY so exactly one owner destroys it: deinit's safety net
-        // sees nil (no double terminate when dealloc beats the queued block), the event drain
-        // stops picking it up, and every property accessor becomes a guarded no-op.
+        // Retire the main-actor alias synchronously, then detach this exact native owner.
+        // Every queued worker retains that owner and its borrow refuses retirement.
+        guard mpv != nil else { return }
         mpv = nil
+        let context = native.takeContext()
         let surface = isFullPlayerPresentation || probeChannel.description == "player" ? "player" : "ambient"
         DiagnosticsLog.log("mpv", "stop-requested surface=\(surface)")
-        mpv_set_wakeup_callback(handle, nil, nil)
-        // Tell the core to wind down NOW (mpv_command_string is thread-safe): decode and network
-        // stop immediately. Without this, destruction waited its turn on the event queue, and a
-        // stalled network read kept a ZOMBIE core decoding 4K invisibly for over a minute after
-        // close (seen live), starving the UI hard enough to wedge the tab bar.
-        mpv_command_string(handle, "quit")
-        let relay = wakeupRelay
-        wakeupRelay = nil
-        queue.async {
-            mpv_terminate_destroy(handle)
-            DiagnosticsLog.log("mpv", "destroy-finished surface=\(surface)")
-            relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
-        }
+        context?.retire(sendQuit: true, surface: surface)
     }
 
     deinit {
-        // Safety net: if the view controller is torn down without stop() (e.g. an
-        // unexpected dealloc), make sure mpv can't call back into freed memory. Mirror stop()'s
-        // SERIALIZED teardown rather than destroying inline: an inline mpv_terminate_destroy here
-        // could race an in-flight readEvents drain on `queue` (double-destroy / use-after-free), so
-        // nil the handle synchronously (one owner) and dispatch the destroy onto the event queue.
-        // The gate is main-queue-owned. stop()/invalidateLoadToken() cancels its timeout before normal teardown;
-        // if deinit is the safety-net path, the timeout's weak self capture makes the queued work a no-op.
-        wakeupRelay?.takeUnretainedValue().retire()
-        if let handle = mpv {
-            mpv = nil
-            mpv_set_wakeup_callback(handle, nil, nil)
-            let relay = wakeupRelay
-            wakeupRelay = nil
-            queue.async {
-                mpv_terminate_destroy(handle)
-                relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
-            }
-        } else {
-            wakeupRelay?.release()
-        }
+        // No actor-isolated pointer/queue access from deinit. The checked state detaches
+        // once; the native owner closes wakeups and destroys only on its serial queue.
+        native.takeContext()?.retire(sendQuit: false)
     }
 
     private func finishCacheFlushFlight(
@@ -1624,8 +1850,37 @@ final class MPVMetalViewController: PlatformViewController {
         audioSidecar: URL? = nil,
         reusing loadToken: PlayerLoadToken? = nil
     ) -> PlayerLoadToken {
-        loadFile(url, headers: headers, live: live, audioSidecar: audioSidecar,
-                 reusing: loadToken, preservingSeekEOFRecovery: false)
+        // A deferred trailer preparation is already a new intent, before its native load can start.
+        retireSubtitleAlignment()
+        let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
+        let needsTrailerProxy =
+            (isGoogleVideo(url) && !YouTubeDirectResolver.isManifestURL(url)) ||
+            isGoogleVideo(audioSidecar)
+        if needsTrailerProxy {
+            retirePendingTrailerPreparation()
+            let issuedToken = PlayerLoadToken()
+            let generation = trailerPreparationGeneration
+            guard let owner = ensureTrailerProxyOwnerID() else { return issuedToken }
+            trailerPreparationTask = Task { @MainActor [weak self] in
+                let prepared = await VXTrailerProxy.shared.prepare(video: url, audio: audioSidecar, owner: owner)
+                guard let self, !Task.isCancelled,
+                      self.trailerPreparationGeneration == generation else { return }
+                self.trailerPreparationTask = nil
+                _ = self.loadFile(
+                    url, headers: headers, live: live, audioSidecar: audioSidecar,
+                    reusing: nil, preservingSeekEOFRecovery: false,
+                    preparedTrailer: prepared, preissuedToken: issuedToken
+                )
+            }
+            return issuedToken
+        }
+        retirePendingTrailerPreparation()
+        // reusing remains source-compatible for callers, but ordinary
+        // loads always mint a fresh provenance token. Only the private async
+        // trailer continuation may pass its reserved token below.
+        return loadFile(url, headers: headers, live: live, audioSidecar: audioSidecar,
+                        reusing: nil, preservingSeekEOFRecovery: false,
+                        preissuedToken: nil)
     }
 
     @discardableResult
@@ -1635,11 +1890,18 @@ final class MPVMetalViewController: PlatformViewController {
         live: Bool = false,
         audioSidecar: URL? = nil,
         reusing loadToken: PlayerLoadToken? = nil,
-        preservingSeekEOFRecovery: Bool
+        preservingSeekEOFRecovery: Bool,
+        preparedTrailer: VXTrailerPreparedURLs? = nil,
+        preissuedToken: PlayerLoadToken? = nil
     ) -> PlayerLoadToken {
+        // Even a retry/rejected replacement retires work prepared before this new load intent.
+        retireSubtitleAlignment()
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
         // including internal reloads, so a queued callback can never become valid again through token reuse.
-        let issuedToken = PlayerLoadToken()
+        // Ordinary and internal synchronous loads are fresh. A pre-issued
+        // token is accepted only from the private async trailer preparation
+        // transaction that reserved it before awaiting native readiness.
+        let issuedToken = preissuedToken ?? PlayerLoadToken()
         loadTokenLock.lock()
         let requestedOrigin = requestedFreshOrigin
         let requestedOriginGeneration = requestedFreshOriginGeneration
@@ -1732,8 +1994,8 @@ final class MPVMetalViewController: PlatformViewController {
         // trailer swaps these to their local VXTrailerProxy (127.0.0.1) equivalents below, BEFORE they are handed
         // to mpv via `args` and the `audio-files` append. Everything downstream (args, isLocalStream, the audio
         // sidecar append, the redacted log) reads these, so the swap flows through the rest of loadFile untouched.
-        var playURL = url
-        var sidecar = audioSidecar
+        var playURL = preparedTrailer?.video ?? url
+        var sidecar = preparedTrailer?.audio ?? audioSidecar
         var args = [playURL.absoluteString]
 
         args.append("replace")
@@ -1761,11 +2023,15 @@ final class MPVMetalViewController: PlatformViewController {
                     // then never returns a manifest URL).
                     playURL = url
                 } else {
-                    playURL = VXTrailerProxy.shared.proxied(url, mime: "video/mp4") ?? url
+                    playURL = preparedTrailer?.video
+                        ?? VXTrailerProxy.shared.proxied(url, mime: "video/mp4")
+                        ?? url
                 }
             }
             if let audioSidecar, isGoogleVideo(audioSidecar) {
-                sidecar = VXTrailerProxy.shared.proxied(audioSidecar, mime: "audio/mp4") ?? audioSidecar
+                sidecar = preparedTrailer?.audio
+                    ?? VXTrailerProxy.shared.proxied(audioSidecar, mime: "audio/mp4")
+                    ?? audioSidecar
             }
             args[0] = playURL.absoluteString
             // Trailer audio-language belt-and-suspenders: the resolver already selects the preferred-language
@@ -1986,7 +2252,6 @@ final class MPVMetalViewController: PlatformViewController {
             if usesConfirmedDiskOffload {
                 armDiskCacheReadaheadRamp()
             } else {
-                cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
                 cacheReadaheadRampGeneration &+= 1
             }
             // Only an accepted replacement owns the new per-file cache lifecycle. A rejected command leaves
@@ -2082,7 +2347,6 @@ final class MPVMetalViewController: PlatformViewController {
         let ceiling = max(1, RemoteConfig.snapshot.diskCacheReadaheadSecs)
         let start = min(RemoteConfigDefaults.diskCacheReadaheadStartSecs, ceiling)
         cacheReadaheadRampGeneration &+= 1
-        cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
         cacheReadaheadRampAppliedSecs = start
         cacheReadaheadRampStartSecs = start
         cacheReadaheadRampLastFrameDrop = diagnosticInt(MPVProperty.frameDropCount) ?? 0
@@ -2097,7 +2361,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// below the configured 900s so the offloaded forward payload never over-commits; an unknown or ordinary
     /// bitrate keeps the FULL configured ceiling (the byte budget is generous, so normal 4K is unaffected). Only
     /// ever lowers, and never below the floor.
-    private func bitrateBoundedRampCeiling(configured: Int, handle: OpaquePointer) -> Int {
+    private nonisolated func bitrateBoundedRampCeiling(configured: Int, handle: OpaquePointer) -> Int {
         let videoBits = max(0, diagnosticDouble("video-bitrate", handle: handle) ?? 0)
         let audioBits = max(0, diagnosticDouble("audio-bitrate", handle: handle) ?? 0)
         let bytesPerSec = (videoBits + audioBits) / 8
@@ -2109,12 +2373,13 @@ final class MPVMetalViewController: PlatformViewController {
         return max(bounded, min(configured, Self.diskCacheReadaheadRampBitrateFloorSecs))
     }
 
-    private func scheduleDiskCacheReadaheadRampStep(generation: UInt64, ceiling: Int) {
-        let work = DispatchWorkItem { [weak self] in
-            // Borrow only after this work starts; destruction uses this same serial queue
-            // and cannot overtake the running work. A raw pointer alone does not own mpv.
-            guard let self, let handle = self.mpv,
-                  self.cacheReadaheadRampGeneration == generation else { return }
+    private nonisolated func scheduleDiskCacheReadaheadRampStep(generation: UInt64, ceiling: Int) {
+        guard let context = nativeContext else { return }
+        queue.asyncAfter(deadline: .now() + Self.diskCacheReadaheadRampIntervalSecs) { [weak self, context] in
+            guard let self, self.nativeContext === context else { return }
+            context.withBorrow { handle in
+            self.loadTokenLock.lock(); defer { self.loadTokenLock.unlock() }
+            guard self.cacheReadaheadRampGeneration == generation else { return }
             // Read-and-clear the user-seek marker for THIS sample window (serialized with the seek entry points on
             // `queue`). A user seek's keyframe re-decode legitimately bursts frame drops, so its window must never
             // be mistaken for fill starvation and trigger a back-off; see userSeekedSinceRampSample.
@@ -2153,9 +2418,8 @@ final class MPVMetalViewController: PlatformViewController {
                 return
             }
             self.scheduleDiskCacheReadaheadRampStep(generation: generation, ceiling: ceiling)
+            }
         }
-        cacheReadaheadRampWork = work
-        queue.asyncAfter(deadline: .now() + Self.diskCacheReadaheadRampIntervalSecs, execute: work)
     }
 
     func togglePause() {
@@ -2818,10 +3082,14 @@ final class MPVMetalViewController: PlatformViewController {
             return
         }
 
+        guard let context = nativeContext else { return }
         framePresentationRestorePending = true
-        queue.async { [weak self] in
+        queue.async { [weak self, context] in
             guard let self else { return }
-            guard let handle = self.mpv else {
+            let restoreValue = TVOSFramePresentationPolicy.restoreCscaleValue(prior: prior)
+            guard let status = context.withBorrow({ handle in
+                mpv_set_property_string(handle, "cscale", restoreValue)
+            }) else {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.framePresentationRestorePending = false
@@ -2832,11 +3100,8 @@ final class MPVMetalViewController: PlatformViewController {
                 return
             }
 
-            // The default sentinel returns cscale to mpv's unset state (empty string = libplacebo
-            // default); a real recorded scaler restores verbatim. Never a wrong literal on default.
-            let restoreValue = TVOSFramePresentationPolicy.restoreCscaleValue(prior: prior)
-            let status = mpv_set_property_string(handle, "cscale", restoreValue)
-            DispatchQueue.main.async { [weak self] in
+            // Only the status and exact owner cross to the UI; the borrowed pointer does not.
+            DispatchQueue.main.async { [weak self, context] in
                 guard let self else { return }
                 self.framePresentationRestorePending = false
                 guard self.framePresentationMitigationApplied,
@@ -2854,7 +3119,7 @@ final class MPVMetalViewController: PlatformViewController {
                 // If a future controller lifecycle ever replaces the live handle,
                 // keep the state fail-closed instead of crediting the replacement
                 // with an old handle's result.
-                guard self.mpv == handle else { return }
+                guard self.nativeContext === context else { return }
                 guard status >= 0 else {
                     self.mpvLog.error(
                         "tvOS frame presentation cscale restore failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
@@ -2960,22 +3225,17 @@ final class MPVMetalViewController: PlatformViewController {
               !framePresentationDiagnostics.hasVOPasses(generation: generation) else {
             return
         }
-        let work = DispatchWorkItem { [weak self] in
-            // stop() nils mpv before enqueueing destruction on this same serial queue.
-            // One local handle therefore stays valid for every read in this work item.
-            guard let self,
-                  let handle = self.mpv,
-                  self.framePresentationDiagnostics.currentGeneration() == generation,
-                  PlayerLoadProvenanceState.accepts(
-                    callbackToken: loadToken,
-                    activeToken: self.callbackLoadToken(requiresLoadedFile: true)
-                  ) else {
-                return
+        guard let context = nativeContext else { return }
+        let work = DispatchWorkItem { @Sendable [weak self, context] in
+            guard let self, self.nativeContext === context else { return }
+            context.withBorrow { handle in
+                guard self.framePresentationDiagnostics.currentGeneration() == generation,
+                      PlayerLoadProvenanceState.accepts(
+                        callbackToken: loadToken,
+                        activeToken: self.callbackLoadToken(requiresLoadedFile: true)
+                      ) else { return }
+                self.captureFramePresentationVOPasses(handle: handle, generation: generation)
             }
-            self.captureFramePresentationVOPasses(
-                handle: handle,
-                generation: generation
-            )
         }
         framePresentationVOPassesWork = work
         queue.asyncAfter(
@@ -2986,7 +3246,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// One bounded snapshot shortly after a generation's first drop. Raw sample arrays
     /// and perf-info are intentionally not read.
-    private func captureFramePresentationVOPasses(
+    private nonisolated func captureFramePresentationVOPasses(
         handle: OpaquePointer,
         generation: UInt64
     ) {
@@ -3300,6 +3560,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func seek(to seconds: Double) {
+        retirePendingTrailerPreparation()
         cancelCacheReanchorForExplicitSeek()
         supersedeSeekEOFRecoveryForExplicitSeek()
         // Mark this as a USER seek so the disk-cache read-ahead ramp does not misread the keyframe re-decode drop
@@ -3342,6 +3603,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// completes.  A stored resume must be allowed to fail independently of presentation, so it issues
     /// the same mpv command without adopting that manual-scrub cache hold/watchdog transaction.
     func seekForResume(to seconds: Double) {
+        retirePendingTrailerPreparation()
         cancelCacheReanchorForExplicitSeek()
         supersedeSeekEOFRecoveryForExplicitSeek()
         let owner = callbackLoadToken(requiresLoadedFile: true)
@@ -3407,6 +3669,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func seekForPausedRecovery(to seconds: Double, owner: PlayerLoadToken) -> Bool {
+        retirePendingTrailerPreparation()
         guard seconds.isFinite, activeLoadToken == owner,
               callbackLoadToken(requiresLoadedFile: true) == owner else { return false }
         cancelCacheReanchorForExplicitSeek()
@@ -3427,6 +3690,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Apply the same cache-window
     /// decision as an absolute scrub: a ten-second backward hop can exceed the small back buffer.
     func seek(by seconds: Double) {
+        retirePendingTrailerPreparation()
         cancelCacheReanchorForExplicitSeek()
         supersedeSeekEOFRecoveryForExplicitSeek()
         // Mark this as a USER seek (the tvOS remote's directional hop routes here via hiddenSeek) so the disk-cache
@@ -3489,7 +3753,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// (a scrub commit, or the demuxer refresh-seek an audio/subtitle track change triggers).
     /// Main-thread only: armed from the UI's seek/track calls, released via a main hop from the
     /// event drain (mirroring pausedStateChanged).
-    private var seekCacheHoldArmed = false
+    private nonisolated var seekCacheHoldArmed: Bool {
+        get { native.read { $0.seekCacheHoldArmed } }
+        set { native.update { $0.seekCacheHoldArmed = newValue } }
+    }
 
     /// Bounded, progress-aware watchdog for the OUT-OF-WINDOW scrub refill. An out-of-window jump empties the
     /// forward cache and then refills from a cold mid-file range read; on some sources (slow debrid CDN edges)
@@ -3686,7 +3953,7 @@ final class MPVMetalViewController: PlatformViewController {
         return getString(name, handle: handle)
     }
 
-    private func getString(_ name: String, handle: OpaquePointer) -> String? {
+    private nonisolated func getString(_ name: String, handle: OpaquePointer) -> String? {
         let cstr = mpv_get_property_string(handle, name)
         let str: String? = cstr == nil ? nil : String(cString: cstr!)
         mpv_free(cstr)
@@ -3698,7 +3965,7 @@ final class MPVMetalViewController: PlatformViewController {
         return getFlag(name, handle: handle)
     }
 
-    private func getFlag(_ name: String, handle: OpaquePointer) -> Bool {
+    private nonisolated func getFlag(_ name: String, handle: OpaquePointer) -> Bool {
         var data = Int32()   // MPV_FORMAT_FLAG is a 4-byte C int, not Int/Int64; an 8-byte read only works by little-endian luck
         mpv_get_property(handle, name, MPV_FORMAT_FLAG, &data)
         return data > 0
@@ -3716,7 +3983,7 @@ final class MPVMetalViewController: PlatformViewController {
         return getInt(name, handle: handle)
     }
 
-    private func getInt(_ name: String, handle: OpaquePointer) -> Int {
+    private nonisolated func getInt(_ name: String, handle: OpaquePointer) -> Int {
         var data = Int64()
         mpv_get_property(handle, name, MPV_FORMAT_INT64, &data)
         return Int(data)
@@ -3729,7 +3996,7 @@ final class MPVMetalViewController: PlatformViewController {
         return diagnosticDouble(name, handle: handle)
     }
 
-    private func diagnosticDouble(_ name: String, handle: OpaquePointer) -> Double? {
+    private nonisolated func diagnosticDouble(_ name: String, handle: OpaquePointer) -> Double? {
         if name.hasPrefix("demuxer-cache-state/") {
             return MPVDemuxerCacheSnapshot.read(from: handle).double(String(name.dropFirst("demuxer-cache-state/".count)))
         }
@@ -3744,7 +4011,7 @@ final class MPVMetalViewController: PlatformViewController {
         return diagnosticInt(name, handle: handle)
     }
 
-    private func diagnosticInt(_ name: String, handle: OpaquePointer) -> Int? {
+    private nonisolated func diagnosticInt(_ name: String, handle: OpaquePointer) -> Int? {
         if name.hasPrefix("demuxer-cache-state/") {
             return MPVDemuxerCacheSnapshot.read(from: handle).integer(String(name.dropFirst("demuxer-cache-state/".count)))
         }
@@ -3758,7 +4025,7 @@ final class MPVMetalViewController: PlatformViewController {
         return diagnosticFlag(name, handle: handle)
     }
 
-    private func diagnosticFlag(_ name: String, handle: OpaquePointer) -> Bool? {
+    private nonisolated func diagnosticFlag(_ name: String, handle: OpaquePointer) -> Bool? {
         if name.hasPrefix("demuxer-cache-state/") {
             return MPVDemuxerCacheSnapshot.read(from: handle).flag(String(name.dropFirst("demuxer-cache-state/".count)))
         }
@@ -3772,7 +4039,7 @@ final class MPVMetalViewController: PlatformViewController {
         return diagnosticString(name, handle: handle)
     }
 
-    private func diagnosticString(_ name: String, handle: OpaquePointer) -> String? {
+    private nonisolated func diagnosticString(_ name: String, handle: OpaquePointer) -> String? {
         guard let cString = mpv_get_property_string(handle, name) else { return nil }
         defer { mpv_free(cString) }
         let value = String(cString: cString)
@@ -3784,7 +4051,7 @@ final class MPVMetalViewController: PlatformViewController {
         setString(name, value, handle: handle)
     }
 
-    private func setString(_ name: String, _ value: String, handle: OpaquePointer) {
+    private nonisolated func setString(_ name: String, _ value: String, handle: OpaquePointer) {
         mpv_set_property_string(handle, name, value)
     }
 
@@ -3800,7 +4067,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// enhancement-layer" warning from mpv means the EL decoder came up and libplacebo is
     /// compositing it. Single-track interleaved Profile 7 uses mpv's splitter instead of track
     /// pairing, backed by `dovi_split` in the pinned FFmpeg release/9.0 build.
-    private func probeEnhancementLayer(handle: OpaquePointer) {
+    private nonisolated func probeEnhancementLayer(handle: OpaquePointer) {
         let count = getInt("track-list/count", handle: handle)
         guard count > 0 else { return }
         var videoTracks = 0
@@ -3863,6 +4130,10 @@ final class MPVMetalViewController: PlatformViewController {
         setString(MPVProperty.aid, id < 0 ? "no" : String(id))
     }
     func setSubtitleTrack(_ id: Int) {
+        retireSubtitleAlignment()
+        // Off or an embedded pick supersedes an older external download for this load.
+        // Its final sub-add guard shares this transaction, so a late result cannot undo the choice.
+        native.update { $0.externalSubtitleRequestGeneration &+= 1 }
         #if os(tvOS)
         armSeekCacheHold()   // a sid change triggers the same demuxer refresh-seek as an audio switch
         #endif
@@ -3897,6 +4168,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// top, and setting an unknown property is a harmless no-op, so this is safe across engine versions. The
     /// user's subtitle style (font, size, colour) applies to both tracks automatically.
     func setSecondarySubtitleTrack(_ id: Int) {
+        retireSubtitleAlignment()
         secondarySubtitleID = id
         #if os(tvOS)
         armSeekCacheHold()   // a secondary-sid change triggers the same demuxer refresh-seek as a primary sid switch
@@ -3912,40 +4184,50 @@ final class MPVMetalViewController: PlatformViewController {
     /// Session-lived map of add-on subtitle URL -> already-downloaded LOCAL file. Once a subtitle has been
     /// fetched, re-selecting that track or re-opening the same episode hands the on-disk file straight to mpv
     /// with NO network (see below), so it loads instantly instead of re-downloading from scratch every time.
-    /// Guarded by `subtitleCacheLock`; keyed by the remote URL. Static so it survives player teardown within a
+    /// Guarded by the checked `subtitleCache` lock; keyed by the remote URL. Static so it survives player teardown within a
     /// session (re-opening an episode makes a fresh controller).
-    private static var subtitleFileCache: [URL: URL] = [:]
-    /// Insertion order for `subtitleFileCache`, so a long binge that samples many distinct subtitle URLs evicts
-    /// the oldest entry past the cap instead of growing the map unbounded for the whole process lifetime.
-    private static var subtitleCacheOrder: [URL] = []
-    private static let subtitleCacheCap = 256
-    private static let subtitleCacheLock = NSLock()
+    private struct SubtitleCache: Sendable {
+        var files: [URL: URL] = [:]
+        var order: [URL] = []
+    }
+    private nonisolated static let subtitleCache = OSAllocatedUnfairLock(initialState: SubtitleCache())
+    private nonisolated static let subtitleCacheCap = 256
 
-    /// Record `remote -> local` under the cap, evicting the oldest entry (FIFO) when full. Caller must NOT hold
-    /// `subtitleCacheLock`; this takes it.
-    private static func rememberSubtitleFile(_ remote: URL, _ local: URL) {
-        subtitleCacheLock.lock(); defer { subtitleCacheLock.unlock() }
-        if subtitleFileCache[remote] == nil {
-            subtitleCacheOrder.append(remote)
-            while subtitleCacheOrder.count > subtitleCacheCap {
-                let oldest = subtitleCacheOrder.removeFirst()
-                subtitleFileCache[oldest] = nil
+    /// Record under the checked cache lock; never retain a controller or callback.
+    private nonisolated static func rememberSubtitleFile(_ remote: URL, _ local: URL) {
+        subtitleCache.withLock { cache in
+            if cache.files[remote] == nil {
+                cache.order.append(remote)
+                while cache.order.count > subtitleCacheCap {
+                    cache.files[cache.order.removeFirst()] = nil
+                }
             }
+            cache.files[remote] = local
         }
-        subtitleFileCache[remote] = local
     }
 
     /// Per-pick network timeout and retry count for subtitle downloads. Hardcoded constants for now (a later
     /// pass may move these to RemoteConfig). 20s rides out a slow provider that shares bandwidth with a big
     /// remux spool (the "subtitle fails to load on big files" report); ONE retry rescues a transient timeout
     /// or flaky first connection.
-    private static let subtitleDownloadTimeout: TimeInterval = 20
-    private static let subtitleDownloadRetries = 1
-    private static let maximumExternalSubtitleBytes = 8 * 1024 * 1024
-    private let externalSubtitleRequestLock = NSLock()
-    private var externalSubtitleRequestGeneration: UInt64 = 0
+    private nonisolated static let subtitleDownloadTimeout: TimeInterval = 20
+    private nonisolated static let subtitleDownloadRetries = 1
+    private nonisolated static let maximumExternalSubtitleBytes = 8 * 1024 * 1024
+    private nonisolated var externalSubtitleRequestGeneration: UInt64 {
+        get { native.read { $0.externalSubtitleRequestGeneration } }
+        set { native.update { $0.externalSubtitleRequestGeneration = newValue } }
+    }
 
-    private static func acceptsExternalSubtitleURL(_ url: URL) -> Bool {
+    var subtitleAlignmentRevision: UInt64? {
+        native.read { $0.subtitleAlignmentGeneration }
+    }
+
+    /// Separate from fetch retirement: changing sync must not cancel a subtitle the viewer is downloading.
+    private nonisolated func retireSubtitleAlignment() {
+        native.update { $0.subtitleAlignmentGeneration &+= 1 }
+    }
+
+    private nonisolated static func acceptsExternalSubtitleURL(_ url: URL) -> Bool {
         guard (url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http"),
               let host = url.host?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]")),
               url.user == nil, url.password == nil else { return false }
@@ -3975,72 +4257,81 @@ final class MPVMetalViewController: PlatformViewController {
                              timeout: TimeInterval = MPVMetalViewController.subtitleDownloadTimeout,
                              completion: ((Bool) -> Void)? = nil) {
         guard let remote = URL(string: url), Self.acceptsExternalSubtitleURL(remote),
-              let requestToken = activeLoadToken else {
+              let requestToken = activeLoadToken, let context = nativeContext else {
             completion?(false)
             return
         }
-        externalSubtitleRequestLock.lock()
-        externalSubtitleRequestGeneration &+= 1
-        let requestGeneration = externalSubtitleRequestGeneration
-        externalSubtitleRequestLock.unlock()
-        let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
-
-        // Fast path: reuse a previously downloaded file if it's still on disk (no network).
-        if let cached = Self.cachedSubtitleFile(for: remote) {
-            self.queue.async { [weak self] in
-                guard let self else { finish(false); return }
-                finish(self.applyExternalSubtitle(
-                    cached, title: title, lang: lang, loadToken: requestToken,
-                    requestGeneration: requestGeneration
+        let requestGeneration = native.update {
+            $0.subtitleAlignmentGeneration &+= 1
+            $0.externalSubtitleRequestGeneration &+= 1
+            return $0.externalSubtitleRequestGeneration
+        }
+        let finish = MPVMainCompletion<Bool> { completion?($0) }
+        let apply: @Sendable (URL?) -> Void = { [weak self, context] localFile in
+            guard let self, let localFile else { finish.finish(false); return }
+            self.queue.async { [weak self, context] in
+                guard let self else { finish.finish(false); return }
+                finish.finish(self.applyExternalSubtitle(
+                    localFile, title: title, lang: lang, context: context,
+                    loadToken: requestToken, requestGeneration: requestGeneration
                 ))
             }
-            return
         }
-
-        Self.downloadSubtitle(remote, timeout: timeout, retriesLeft: Self.subtitleDownloadRetries) { [weak self] localFile in
-            guard let self, let localFile else { finish(false); return }
-            self.queue.async {
-                finish(self.applyExternalSubtitle(
-                    localFile, title: title, lang: lang, loadToken: requestToken,
-                    requestGeneration: requestGeneration
-                ))
+        // File existence and network/file I/O stay off the UI actor, including cache hits.
+        DispatchQueue.global(qos: .utility).async {
+            if let cached = Self.cachedSubtitleFile(for: remote) {
+                apply(cached)
+            } else {
+                Self.downloadSubtitle(remote, timeout: timeout,
+                                      retriesLeft: Self.subtitleDownloadRetries, done: apply)
             }
         }
     }
 
-    private func applyExternalSubtitle(_ localFile: URL, title: String, lang: String,
-                                       loadToken: PlayerLoadToken,
-                                       requestGeneration: UInt64) -> Bool {
-        // Serialize the ownership check and sub-add with replacement load issue. If replacement won the lock,
-        // this fetch is stale and is dropped. If subtitle add won, it completes on the old file before that file
-        // is synchronously replaced, so it cannot attach an E2 subtitle to E3 media.
-        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
-        externalSubtitleRequestLock.lock()
-        let isLatestRequest = externalSubtitleRequestGeneration == requestGeneration
-        externalSubtitleRequestLock.unlock()
-        guard isLatestRequest, PlayerLoadProvenanceState.accepts(
-            callbackToken: loadToken, activeToken: loadProvenance.activeToken
-        ) else { return false }
-        command("sub-add", args: [localFile.path, "select", title, lang])
-        return true
+    private nonisolated func applyExternalSubtitle(
+        _ localFile: URL, title: String, lang: String, context: MPVNativeHandle,
+        loadToken: PlayerLoadToken, requestGeneration: UInt64
+    ) -> Bool {
+        // The exact native owner is borrowed only on its serial queue. Command and both
+        // generations share load admission's transaction; an E2 fetch cannot attach to E3.
+        context.withBorrow { handle in
+            loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+            guard nativeContext === context, !context.isRetired,
+                  externalSubtitleRequestGeneration == requestGeneration,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken, activeToken: loadProvenance.activeToken
+                  ) else { return false }
+            // Retire preparations captured while this file was downloading, under the same final transaction.
+            retireSubtitleAlignment()
+            var arguments = makeCArgs("sub-add", [localFile.path, "select", title, lang])
+                .map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
+            defer {
+                for pointer in arguments where pointer != nil {
+                    free(UnsafeMutablePointer(mutating: pointer!))
+                }
+            }
+            let status = mpv_command(handle, &arguments)
+            checkError(status)
+            return status >= 0
+        } ?? false
     }
 
-    /// Return the cached local file for `remote` only if it was recorded this session AND still exists on
-    /// disk; otherwise drop the stale entry and return nil so the caller re-downloads. Thread-safe.
-    private static func cachedSubtitleFile(for remote: URL) -> URL? {
-        subtitleCacheLock.lock(); defer { subtitleCacheLock.unlock() }
-        guard let file = subtitleFileCache[remote] else { return nil }
-        if FileManager.default.fileExists(atPath: file.path) { return file }
-        subtitleFileCache[remote] = nil   // file was purged (e.g. temp cleanup); force a re-download
-        subtitleCacheOrder.removeAll { $0 == remote }
-        return nil
+    /// The cache contains only owned URLs. A purged file evicts its entry atomically.
+    private nonisolated static func cachedSubtitleFile(for remote: URL) -> URL? {
+        subtitleCache.withLock { cache in
+            guard let file = cache.files[remote] else { return nil }
+            if FileManager.default.fileExists(atPath: file.path) { return file }
+            cache.files[remote] = nil
+            cache.order.removeAll { $0 == remote }
+            return nil
+        }
     }
 
     /// Download `remote` on the shared cached session, write it to a DETERMINISTIC temp file (hashed from the
     /// URL, so it survives and is reused across the session), record it in the cache, and hand the local file
     /// to `done` on failure/success. Retries ONCE on a failed/empty/timed-out response before giving up.
-    private static func downloadSubtitle(_ remote: URL, timeout: TimeInterval, retriesLeft: Int,
-                                         done: @escaping (URL?) -> Void) {
+    private nonisolated static func downloadSubtitle(_ remote: URL, timeout: TimeInterval, retriesLeft: Int,
+                                         done: @escaping @Sendable (URL?) -> Void) {
         // Route through the pinned transport (resolve-once, connect to a vetted numeric peer) so an add-on
         // subtitle hostname cannot re-resolve to a private address between validation and the socket open.
         // Plain-HTTP subtitle URLs fail closed here, exactly like the AVPlayer overlay path (SubtitleFileFetcher).
@@ -4078,7 +4369,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Best-effort subtitle file extension so mpv parses the downloaded bytes (it sniffs format too, but a
     /// correct extension is the reliable hint). Prefer the URL's own extension, then the content type, else srt.
-    private static func subtitleExtension(for url: URL, contentType: String?) -> String {
+    private nonisolated static func subtitleExtension(for url: URL, contentType: String?) -> String {
         let known = ["srt", "vtt", "ass", "ssa", "sub", "smi"]
         let ext = url.pathExtension.lowercased()
         if known.contains(ext) { return ext }
@@ -4090,7 +4381,10 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     /// Manual subtitle sync, in seconds (positive = subtitles appear later). Maps to mpv `sub-delay`.
-    func setSubDelay(_ seconds: Double) { setString("sub-delay", String(format: "%.2f", seconds)) }
+    func setSubDelay(_ seconds: Double) {
+        retireSubtitleAlignment()
+        setString("sub-delay", String(format: "%.2f", seconds))
+    }
 
     /// Video frame-rate for the community-subtitle release fingerprint. Prefers the container-declared fps,
     /// falling back to the estimated video-filter fps; 0 when unknown (the fingerprint tolerates a 0/absent
@@ -4246,12 +4540,76 @@ final class MPVMetalViewController: PlatformViewController {
         )
     }
 
+    /// Presets are session-only and concrete-MPV-only; AVPlayer exposes no equivalent DSP path.
+    /// Re-evaluated on every menu/action so route/output changes cannot use a cached eligibility claim.
+    func sessionAudioPresetUnavailableReason(for preset: PlayerSessionAudioPreset) -> String? {
+        guard mpv != nil, !startMuted else { return "Audio processing isn't ready" }
+        if preset == .normal { return nil } // recovery/bitstream cleanup must remain possible
+        guard sessionAudioPreset.selected != nil else { return PlayerSessionAudioPresetState.unknownState }
+        guard callbackLoadToken(requiresLoadedFile: true) != nil else { return "Audio processing isn't ready" }
+        // Configured bitstream intent is conservative: it may fall back to PCM, but DSP must not
+        // silently force that fallback. nil is unknown/unsupported, never evidence of decoded PCM.
+        guard let spdif = getString("audio-spdif") else { return "Audio processing availability is unknown" }
+        return spdif.isEmpty ? nil : "Unavailable while bitstream passthrough is enabled"
+    }
+
+    @discardableResult
+    func setSessionAudioPreset(_ preset: PlayerSessionAudioPreset) -> Bool {
+        var next = sessionAudioPreset
+        let unavailable = sessionAudioPresetUnavailableReason(for: preset)
+        guard let handle = mpv, !startMuted else {
+            let accepted = next.refuse(unavailable ?? "Audio processing isn't ready")
+            sessionAudioPreset = next
+            return accepted
+        }
+        if preset != .normal, let unavailable {
+            let accepted = next.refuse(unavailable)
+            sessionAudioPreset = next
+            return accepted
+        }
+        if next.selected == preset {
+            let accepted = next.apply(preset, unavailableReason: unavailable,
+                                      command: { _ in -1 }, restore: { -1 })
+            sessionAudioPreset = next
+            return accepted
+        }
+        // Typed af snapshot is the existing lossless native-option transaction helper. Rollback
+        // restores custom filter ordering/options exactly; string serialization is not a backup.
+        guard let snapshot = MPVPlaybackProfileOption(handle: handle, name: "af") else {
+            let accepted = next.refuse("Audio processing can't be safely changed on this player")
+            sessionAudioPreset = next
+            return accepted
+        }
+        let accepted = next.apply(preset, unavailableReason: unavailable, command: { args in
+            var status: Int32 = -1 // command() on an absent handle must never imply acceptance
+            command("af", args: args.map { Optional($0) }, checkForErrors: false) { status = $0 }
+            return status
+        }, restore: {
+            snapshot.restore(handle: handle, name: "af")
+        })
+        sessionAudioPreset = next
+        return accepted
+    }
     /// Switch the audio output policy (Auto / Stereo / Surround / Passthrough) on the playing file.
     /// Persists the choice, then re-applies the channel layout and the spdif bitstream list live so it
     /// takes effect without a reload; mpv re-opens the audio output when these properties change.
     /// `channelPolicy` reads `AudioOutputMode.current`, so persisting first makes it reflect `mode`.
     /// Setting `audio-spdif` to "" (when leaving Passthrough) tells mpv to decode to PCM again.
     func setAudioOutputMode(_ mode: AudioOutputMode) {
+        // Determine effective bitstream intent first, preserving tvOS's decoded-PCM safety fallback.
+        #if os(tvOS)
+        let spdif: String? = nil
+        #elseif canImport(UIKit)
+        // Match setup-time policy: AirPods must never receive raw spdif either.
+        let spdif = routeIsStereoOnly || routeIsAirPods ? nil : mode.spdifCodecs
+        #else
+        let spdif = mode.spdifCodecs
+        #endif
+        // An explicit output choice may disable our own session DSP, but must never silently force
+        // PCM to make a preset work. Failed cleanup leaves the saved/output mode unchanged.
+        if !(spdif ?? "").isEmpty, sessionAudioPreset.selected != .normal {
+            guard setSessionAudioPreset(.normal) else { return }
+        }
         UserDefaults.standard.set(mode.rawValue, forKey: AudioOutputMode.key)
         #if canImport(UIKit)
         // Refresh AVAudioSession before mpv reopens its audio output. This makes an explicit Stereo
@@ -4264,18 +4622,8 @@ final class MPVMetalViewController: PlatformViewController {
         #else
         setString("audio-channels", channelPolicy)
         #endif
-        // Never arm spdif on a stereo-only route (TV built-in / AirPlay): passthrough there freezes
-        // the AO (#78). channelPolicy already forces a stereo downmix for those routes; keep spdif off
-        // so a runtime switch to Passthrough on the built-in speakers degrades to decoded stereo PCM.
-        #if os(tvOS)
-        // tvOS: never arm raw spdif - it wedges the AO and freezes the player (#78/#101). Decode to PCM; the
-        // avfoundation AO + the audio session let the system pass Atmos/multichannel through to the receiver.
-        let spdif: String? = nil
-        #elseif canImport(UIKit)
-        let spdif = routeIsStereoOnly ? nil : mode.spdifCodecs
-        #else
-        let spdif = mode.spdifCodecs
-        #endif
+        // Never arm spdif on a stereo-only route (TV built-in / AirPlay) or AirPods. tvOS never
+        // arms raw spdif here (#78/#101); its existing system-managed multichannel PCM remains intact.
         setString("audio-spdif", spdif ?? "")
     }
 
@@ -4471,8 +4819,11 @@ final class MPVMetalViewController: PlatformViewController {
         return returnValue
     }
 
+    /// Encoding and lease release remain on the capture queue; deliver the owned result on
+    /// the calling UI actor so the legacy non-Sendable completion never crosses queues.
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
+        let finish = MPVMainCompletion<Data?>(completion)
         let captureQueue = captureQueue
         let captureQueueState = captureQueueState
         // Build or rebuild the pipeline lazily; at VIDEO_RECONFIG time the device/drawableSize may
@@ -4495,10 +4846,10 @@ final class MPVMetalViewController: PlatformViewController {
         // handler(nil) is called immediately by MetalLayer if the scale cannot be submitted, so
         // the caller's in-flight guard is always released even when the pipeline isn't ready yet.
         metalLayer.requestCapture(maxWidth: max(1, Int(maxWidth.rounded(.down)))) { [weak self] lease in
-            guard let lease else { completion(nil); return }
+            guard let lease else { finish.finish(nil); return }
             guard self != nil else {
                 lease.release()
-                completion(nil)
+                finish.finish(nil)
                 return
             }
             captureQueue.async {
@@ -4539,12 +4890,12 @@ final class MPVMetalViewController: PlatformViewController {
                 // CI/JPEG has fully materialized the Data. Release the reusable GPU target before
                 // invoking arbitrary caller work so thumbnail decoding cannot hold the next capture.
                 lease.release()
-                completion(jpeg)
+                finish.finish(jpeg)
             }
         }
     }
 
-    private func makeCArgs(_ command: String, _ args: [String?]) -> [String?] {
+    private nonisolated func makeCArgs(_ command: String, _ args: [String?]) -> [String?] {
         if !args.isEmpty, args.last == nil {
             fatalError("Command do not need a nil suffix")
         }
@@ -4556,7 +4907,7 @@ final class MPVMetalViewController: PlatformViewController {
         return strArgs
     }
     
-    private func previewSeekStormHasFailed(owner: PlayerLoadToken) -> Bool {
+    private nonisolated func previewSeekStormHasFailed(owner: PlayerLoadToken) -> Bool {
         guard startMuted, loopPlayback else { return false }
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return previewSeekStorm.hasFailed(owner: owner)
@@ -4565,7 +4916,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// Deliver a property change on the main thread, dropping it if the player has been torn
     /// down (mpv == nil). Without the guard, a queued block force-unwraps the nil IUO mpv and
     /// traps, the crash on close.
-    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+    private nonisolated func emit(_ name: String, _ data: (any Sendable)?, loadToken: PlayerLoadToken? = nil) {
         guard let capturedToken = loadToken ?? callbackLoadToken() else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil,
@@ -4577,7 +4928,7 @@ final class MPVMetalViewController: PlatformViewController {
                 || !self.previewSeekStormHasFailed(owner: capturedToken) else { return }
             if let exhaustion = data as? SeekEOFRecoveryExhaustion,
                !self.seekEOFRecovery.acceptsExhaustion(exhaustion, owner: capturedToken) { return }
-            var deliveredData = data
+            var deliveredData: Any? = data
             if let position = data as? PlayerTimePositionEvent,
                let evidence = position.mpvSeekSettlement {
                 // Preserve raw UI positions; only downgrade authority after an intervening seek.
@@ -4660,8 +5011,14 @@ final class MPVMetalViewController: PlatformViewController {
             return
         }
         DiagnosticsLog.log("player", "seek-eof-recovery begin origin=\(intent.origin) target=\(String(format: "%.3f", intent.target)) paused=\(intent.wasPaused) loadToken=\(loadToken.hashValue)")
+        // EOF recovery is already inside the admitted load path. Do not start
+        // a second asynchronous trailer-preparation task here: the active
+        // native lease is reused synchronously, and the returned token must be
+        // immediately attributable to this recovery transaction.
         let replacement = loadFile(source.url, headers: source.headers, live: source.live,
-                                   audioSidecar: source.audioSidecar, preservingSeekEOFRecovery: true)
+                                   audioSidecar: source.audioSidecar, reusing: nil,
+                                   preservingSeekEOFRecovery: true, preparedTrailer: nil,
+                                   preissuedToken: nil)
         guard PlayerLoadProvenanceState.accepts(callbackToken: replacement, activeToken: activeLoadToken),
               seekEOFRecovery.adoptReload(owner: replacement) != nil else {
             failSeekEOFRecovery(loadToken: loadToken, reason: "same-source reopen command was rejected")
@@ -4722,7 +5079,7 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.error("seek-adjacent EOF recovery failed: \(reason, privacy: .public)")
         VXProbe.event(probeChannel, "seek-eof-recovery failed \(reason)")
         emit(MPVProperty.endFileError,
-             exhaustion.map { $0 as Any } ?? "Seek recovery failed: \(reason)", loadToken: loadToken)
+             exhaustion.map { $0 as any Sendable } ?? "Seek recovery failed: \(reason)", loadToken: loadToken)
     }
 
     /// mpv emits time-pos changes far faster than the UI needs (often per decoded
@@ -4730,14 +5087,20 @@ final class MPVMetalViewController: PlatformViewController {
     /// scrubber. Coalesce to ~4 Hz: smooth for a scrubber, and it stops the playhead
     /// from competing with remote input on the main thread (the player-sluggishness
     /// the audit flagged). Threshold logic in the delegate still fires fine at 4 Hz.
-    private var lastTimePosEmit: TimeInterval = 0
+    private nonisolated var lastTimePosEmit: TimeInterval {
+        get { native.read { $0.lastTimePosEmit } }
+        set { native.update { $0.lastTimePosEmit = newValue } }
+    }
     /// Coalesces the buffered-ahead (`demuxer-cache-time`) emits to ~2 Hz for the grey scrubber band.
-    private var lastCacheTimeEmit: TimeInterval = 0
+    private nonisolated var lastCacheTimeEmit: TimeInterval {
+        get { native.read { $0.lastCacheTimeEmit } }
+        set { native.update { $0.lastCacheTimeEmit = newValue } }
+    }
 
     /// Check raw positions before UI coalescing. In the affected TV receipt, a fresh next episode
     /// first reported 4.046s with resume=0: accepting it immediately committed/skipped its opening.
     /// Reanchor once on the already-warm decoder, without a load/restart, cache flush, or pause toggle.
-    private func acceptsFreshOriginPosition(_ value: Double, owner: PlayerLoadToken) -> Bool {
+    private nonisolated func acceptsFreshOriginPosition(_ value: Double, owner: PlayerLoadToken) -> Bool {
         loadTokenLock.lock()
         let decision = freshOrigin.observe(position: value, owner: owner)
         loadTokenLock.unlock()
@@ -4777,25 +5140,33 @@ final class MPVMetalViewController: PlatformViewController {
         emit(MPVProperty.endFileError, "Could not start this episode from its opening. Try another source.", loadToken: owner)
     }
 
-    func readEvents() {
+    nonisolated func readEvents() {
         // Main-player and non-looping preview scheduling remains one block per notification.
         enqueueEventDrain(previewRelay: nil)
     }
 
-    fileprivate func enqueueEventDrain(previewRelay: WakeupRelay?) {
-        queue.async { [weak self] in
+    fileprivate nonisolated func enqueueEventDrain(previewRelay: WakeupRelay?) {
+        guard let context = nativeContext,
+              previewRelay.map({ $0.owns(context) }) ?? true else {
+            previewRelay?.retire()
+            return
+        }
+        queue.async { [weak self, context] in
             // The closure strongly captures the relay, independently of the native +1 retain.
             // In particular, a continuation queued behind destruction only sees a retired relay.
             if let previewRelay, !previewRelay.beginDrain() { return }
             defer { previewRelay?.finishDrain() }
             guard let self else { previewRelay?.retire(); return }
-            
+            context.withBorrow { handle in
             while true {
                 // Re-check per iteration and hold a local: stop() nils `mpv` from the main
                 // thread mid-drain, and the handle itself stays valid until stop()'s destroy
                 // block, which is queued BEHIND this drain on the same serial queue.
-                guard let handle = self.mpv else { previewRelay?.retire(); break }
-                if let previewRelay, !previewRelay.permitsPolling(handle: handle) {
+                guard !context.isRetired, self.nativeContext === context else {
+                    previewRelay?.retire()
+                    break
+                }
+                if let previewRelay, !previewRelay.permitsPolling(context: context) {
                     previewRelay.retire()
                     break
                 }
@@ -5258,7 +5629,7 @@ final class MPVMetalViewController: PlatformViewController {
                     // current path's host, redacted of any token-bearing query) into the probe state so the
                     // heartbeat names what is playing, and mark the engine as mpv + state playing.
                     let loadedHost = self.getString("path", handle: handle).flatMap { URL(string: $0)?.host }
-                        ?? self.playUrl?.host ?? "?"
+                        ?? self.native.read { $0.playURLHost } ?? "?"
                     if self.ownsSharedProbeState {
                         VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     }
@@ -5386,6 +5757,7 @@ final class MPVMetalViewController: PlatformViewController {
                 }
                 
             }
+            }
         }
     }
     
@@ -5394,7 +5766,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// really open. Poll every 0.5s up to `attemptsRemaining` times (~5s) until `current-ao` is non-nil, then
     /// log once. A genuine no-AO player still logs after the cap with ao="?" (the #78 signal that no audio
     /// output ever opened). Bounded and provenance-gated, so a superseded load stops sampling.
-    private func pollNegotiatedAudio(loadToken: PlayerLoadToken, attemptsRemaining: Int) {
+    private nonisolated func pollNegotiatedAudio(loadToken: PlayerLoadToken, attemptsRemaining: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.mpv != nil,
                   PlayerLoadProvenanceState.accepts(
@@ -5413,7 +5785,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    private func checkError(_ status: CInt) {
+    private nonisolated func checkError(_ status: CInt) {
         if status < 0 {
             mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
         }

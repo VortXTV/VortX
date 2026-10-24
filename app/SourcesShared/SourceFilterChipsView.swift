@@ -28,7 +28,7 @@ struct SourceFilterChipsView: View {
             case .avoid:  return String(localized: "AVOID")
             }
         }
-        var tint: Color {
+        @MainActor var tint: Color {
             switch self {
             case .prefer: return Theme.Palette.accent
             case .only:   return Theme.Palette.accent
@@ -59,7 +59,7 @@ struct SourceFilterChipsView: View {
             autoPickToggle
             previewPanel
         }
-        .onChange(of: prefs.rankingSignature) { _ in preview.refresh() }
+        .onValueChange(of: prefs.rankingSignature) { _ in preview.refresh() }
     }
 
     // MARK: Criterion chips (boolean prefs shown as visible Only / Avoid chips)

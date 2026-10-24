@@ -1,0 +1,181 @@
+VortX original local-file witness prerequisite.
+
+Base: 8c67647b50059406c5c0444903597281b81516cf.
+Apply after the retained platform patches and HTTP/audio/gpu-next backports.
+
+Freeze regular-file identity and a non-reused source generation at the original
+native open. The read-only vortx-original-local-file property returns stored
+scalars under the native core, never a late pathname lookup or a descriptor.
+Timeline wrappers without an original stream and unsupported sources refuse.
+The version-1 map has four identity fields plus a typed osc-disabled flag;
+no-Lua targets report true explicitly rather than relying on a missing option.
+
+This is source-provenance evidence, not immutable-content proof, a descriptor
+grant, stream-index mapping, subtitle alignment, or a final-mount capability.
+Consumers still need original descriptor matching, revalidation, and their
+original load/manual-revision/account/profile/epoch admission. Existing public
+C headers, commands, version pins, playback behavior and subtitle loading are
+unchanged. Generation capture is supported on Apple/Linux; other platforms
+remain compilable but have no witness. No paths, URLs or cue bytes are added to
+the property or logging.
+
+diff --git a/stream/stream.h b/stream/stream.h
+--- a/stream/stream.h
++++ b/stream/stream.h
+@@ -157,6 +157,10 @@
+     char *mime_type; // when HTTP streaming is used
+     char *demuxer; // request demuxer to be used
+     char *lavf_type; // name of expected demuxer type for lavf
++    // Immutable regular-file evidence frozen by stream_file at the ORIGINAL open.
++    // No descriptor, URL or pathname is exposed by the public property.
++    char *original_local_file_identity;
++    int64_t original_local_file_generation;
+     bool streaming : 1; // known to be a network stream if true
+     bool seekable : 1; // presence of general byte seeking support
+     bool fast_skip : 1; // consider stream fast enough to fw-seek by skipping
+diff --git a/stream/stream_file.c b/stream/stream_file.c
+--- a/stream/stream_file.c
++++ b/stream/stream_file.c
+@@ -20,6 +20,8 @@
+ #include "config.h"
+
+ #include <stdio.h>
++#include <inttypes.h>
++#include <stdatomic.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+@@ -96,6 +98,23 @@
+ };
+
+ // Total timeout = RETRY_TIMEOUT * MAX_RETRIES
++// Unique for this process, never reused after exhaustion. A demux reopen of the
++// same pathname/inode is a new source, not renewed authority for an old job.
++#if defined(__APPLE__) || defined(__linux__)
++static atomic_int_fast64_t local_file_generation;
++
++static int64_t next_local_file_generation(void)
++{
++    int_fast64_t old = atomic_load_explicit(&local_file_generation, memory_order_relaxed);
++    while (old < INT64_MAX) {
++        if (atomic_compare_exchange_weak_explicit(&local_file_generation, &old, old + 1,
++                                                memory_order_relaxed, memory_order_relaxed))
++            return old + 1;
++    }
++    return 0;
++}
++#endif
++
+ #define RETRY_TIMEOUT 0.2
+ #define MAX_RETRIES 10
+
+@@ -355,6 +374,29 @@
+         } else if (S_ISREG(st.st_mode)) {
+             p->regular_file = true;
+             stream->is_regular = true;
++            // Reuse this native-worker fstat result. The eventual property getter
++            // must never reopen, stat, read a file, or take the stream's mutable fd.
++            // fd://, append mode, empty, writable and known network files refuse.
++#if defined(__APPLE__) || defined(__linux__)
++            if (stream->is_local_fs && !write && !p->appending && st.st_size > 0 &&
++                !check_stream_network(p->fd)) {
++#if defined(__APPLE__)
++                int64_t ms = st.st_mtimespec.tv_sec, mn = st.st_mtimespec.tv_nsec;
++                int64_t cs = st.st_ctimespec.tv_sec, cn = st.st_ctimespec.tv_nsec;
++#else
++                int64_t ms = st.st_mtim.tv_sec, mn = st.st_mtim.tv_nsec;
++                int64_t cs = st.st_ctim.tv_sec, cn = st.st_ctim.tv_nsec;
++#endif
++                int64_t generation = next_local_file_generation();
++                if (generation > 0) {
++                    stream->original_local_file_identity = talloc_asprintf(stream,
++                        "%"PRId64":%"PRIu64":%"PRId64":%"PRId64":%"PRId64":%"PRId64":%"PRId64,
++                        (int64_t)st.st_dev, (uint64_t)st.st_ino, (int64_t)st.st_size,
++                        ms, mn, cs, cn);
++                    stream->original_local_file_generation = generation;
++                }
++            }
++#endif
+ #ifndef _WIN32
+             // O_NONBLOCK has weird semantics on file locks; remove it.
+             int val = fcntl(p->fd, F_GETFL) & ~(unsigned)O_NONBLOCK;
+diff --git a/demux/demux.h b/demux/demux.h
+--- a/demux/demux.h
++++ b/demux/demux.h
+@@ -227,6 +227,10 @@
+     int64_t filepos;  // input stream current pos.
+     int64_t filesize;
+     char *filename;  // same as stream->url
++    // Owned immutable copy made before starting the demux thread. It remains the
++    // original-open identity even if a fully-read demuxer replaces its stream.
++    char *original_local_file_identity;
++    int64_t original_local_file_generation;
+     bool seekable;
+     bool partially_seekable; // true if _maybe_ seekable; implies seekable=true
+     double start_time;
+diff --git a/demux/demux.c b/demux/demux.c
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -3400,6 +3400,9 @@
+         .packet_pool = demux_packet_pool_get(global),
+         .glog = log,
+         .filename = talloc_strdup(demuxer, sinfo->filename),
++        .original_local_file_identity = stream && stream->original_local_file_identity
++            ? talloc_strdup(demuxer, stream->original_local_file_identity) : NULL,
++        .original_local_file_generation = stream ? stream->original_local_file_generation : 0,
+         .is_network = sinfo->is_network,
+         .is_streaming = sinfo->is_streaming,
+         .stream_origin = sinfo->stream_origin,
+diff --git a/player/command.c b/player/command.c
+--- a/player/command.c
++++ b/player/command.c
+@@ -646,6 +646,41 @@
+     return m_property_strdup_ro(action, arg, demuxer->desc->name);
+ }
+
++// A read-only scalar snapshot, not an fd grant or a late filesystem lookup.
++// Reading all fields in one property binds the source to the actual playing
++// entry under mpv's own core owner, rather than to mutable playlist position 0.
++static int mp_property_original_local_file(void *ctx, struct m_property *prop,
++                                          int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct demuxer *d = mpctx->demuxer;
++    if (mpctx->stop_play || !mpctx->playback_initialized ||
++        !mpctx->playing || mpctx->playing->id <= 0 ||
++        !d || !d->original_local_file_identity || d->original_local_file_generation <= 0 ||
++        d->is_network || d->is_streaming)
++        return M_PROPERTY_UNAVAILABLE;
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++    struct mpv_node *r = arg;
++    node_init(r, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(r, "version", 1);
++    node_map_add_int64(r, "entry-id", mpctx->playing->id);
++    node_map_add_int64(r, "source-generation", d->original_local_file_generation);
++    node_map_add_string(r, "identity", d->original_local_file_identity);
++    // Builtin OSC is not compiled on no-Lua targets. Certify that explicitly;
++    // clients must never reinterpret an arbitrary missing option as disabled.
++#if HAVE_LUA
++    node_map_add_flag(r, "osc-disabled", !mpctx->opts->lua_load_osc);
++#else
++    node_map_add_flag(r, "osc-disabled", true);
++#endif
++    return M_PROPERTY_OK;
++}
++
+ static int mp_property_file_format(void *ctx, struct m_property *prop,
+                                    int action, void *arg)
+ {
+@@ -4614,6 +4649,7 @@
+     {"filename", mp_property_filename},
+     {"env", mp_property_env},
+     {"stream-open-filename", mp_property_stream_open_filename},
++    {"vortx-original-local-file", mp_property_original_local_file},
+     {"file-size", mp_property_file_size},
+     {"path", mp_property_path},
+     {"media-title", mp_property_media_title},

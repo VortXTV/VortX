@@ -63,11 +63,11 @@ struct DiscoverView: View {
         }
         .onAppear { if core.discover == nil { core.loadDiscover() }; seed(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: core.discover?.items.first?.id) { seed() }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Home too
+        .onChange(of: showCollectionsHub) { _, show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Home too
         // Keep the filtered grid full: when a page settles or the filter set changes, pull the next page
         // while too few cards match and more pages exist (loadDiscoverNextPage self-guards duplicate loads).
-        .onChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
-        .onChange(of: catalogPrefs.discoverFilters) { _ in autoFillFilteredGrid() }
+        .onChange(of: core.discover?.items.count ?? 0) { autoFillFilteredGrid() }
+        .onChange(of: catalogPrefs.discoverFilters) { autoFillFilteredGrid() }
         .sheet(isPresented: $showFilters) {
             if let discover = core.discover {
                 DiscoverFilterPanel(prefs: catalogPrefs,

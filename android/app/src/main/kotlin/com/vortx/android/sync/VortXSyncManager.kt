@@ -208,15 +208,17 @@ internal class DurableSessionState<T>(
             "replace must acquire the owner transition before the session monitor"
         }
         return ownerTransition {
-            synchronized(this) {
-                val nextOwnerEpoch = nextOwnerEpoch() ?: return@synchronized false
-                if (!persist(candidate, nextOwnerEpoch)) {
-                    false
-                } else {
-                    value = candidate
-                    ownerEpoch = nextOwnerEpoch
-                    publish()
-                    true
+            com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                synchronized(this) {
+                    val nextOwnerEpoch = nextOwnerEpoch() ?: return@synchronized false
+                    if (!persist(candidate, nextOwnerEpoch)) {
+                        false
+                    } else {
+                        value = candidate
+                        ownerEpoch = nextOwnerEpoch
+                        publish()
+                        true
+                    }
                 }
             }
         }
@@ -227,15 +229,17 @@ internal class DurableSessionState<T>(
             "clear must acquire the owner transition before the session monitor"
         }
         return ownerTransition {
-            synchronized(this) {
-                val nextOwnerEpoch = nextOwnerEpoch() ?: return@synchronized false
-                if (!clearDurably(nextOwnerEpoch)) {
-                    false
-                } else {
-                    value = null
-                    ownerEpoch = nextOwnerEpoch
-                    publish()
-                    true
+            com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                synchronized(this) {
+                    val nextOwnerEpoch = nextOwnerEpoch() ?: return@synchronized false
+                    if (!clearDurably(nextOwnerEpoch)) {
+                        false
+                    } else {
+                        value = null
+                        ownerEpoch = nextOwnerEpoch
+                        publish()
+                        true
+                    }
                 }
             }
         }
@@ -306,15 +310,17 @@ internal class SessionOperationCoordinator {
 
     fun <T> invalidate(mutation: () -> T): T {
         var cancellations = emptyList<() -> Unit>()
-        return try {
-            synchronized(lock) {
-                authGeneration = nextGeneration(authGeneration)
-                sessionGeneration = nextGeneration(sessionGeneration)
-                cancellations = retireCallsLocked { true }
-                mutation()
+        return com.vortx.android.player.PlaybackOwnerEpoch.transition {
+            try {
+                synchronized(lock) {
+                    authGeneration = nextGeneration(authGeneration)
+                    sessionGeneration = nextGeneration(sessionGeneration)
+                    cancellations = retireCallsLocked { true }
+                    mutation()
+                }
+            } finally {
+                cancelCalls(cancellations)
             }
-        } finally {
-            cancelCalls(cancellations)
         }
     }
 
@@ -376,16 +382,18 @@ internal class SessionOperationCoordinator {
                     if (authGeneration != expectedAuthGeneration) {
                         SessionMutationResult.Stale
                     } else {
-                        val nextSessionGeneration = nextGeneration(sessionGeneration)
-                        val committed = mutation()
-                        if (committed) {
-                            sessionGeneration = nextSessionGeneration
-                            cancellations = retireCallsLocked {
-                                it.owner == OutboundCallOwner.SESSION
+                        com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                            val nextSessionGeneration = nextGeneration(sessionGeneration)
+                            val committed = mutation()
+                            if (committed) {
+                                sessionGeneration = nextSessionGeneration
+                                cancellations = retireCallsLocked {
+                                    it.owner == OutboundCallOwner.SESSION
+                                }
+                                onCommitted()
                             }
-                            onCommitted()
+                            SessionMutationResult.Applied(committed)
                         }
-                        SessionMutationResult.Applied(committed)
                     }
                 }
             } finally {
@@ -1203,14 +1211,24 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val loaded = sessionRestoreTestSeam ?: store.load()
         val available = loaded as? SessionLoad.Available
         if (available == null) {
-            _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+            if (_sessionUiState.value != SessionUiState.UnknownOrUnavailable) {
+                com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                    _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+                }
+            }
             return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
         }
         val persisted = available.session
         val live = sessionState.value
         val persistedOwnerEpoch = available.ownerEpoch
         if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable) {
-            sessionState.restore(persisted, persistedOwnerEpoch)
+            // Repeated reads of the same secure tuple are not ownership changes. The session
+            // monitor still covers the original truth/epoch comparison and restore publication.
+            if (!sessionTruthMatches(live, persisted) || sessionState.ownerEpoch != persistedOwnerEpoch) {
+                com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                    sessionState.restore(persisted, persistedOwnerEpoch)
+                }
+            } else sessionState.restore(persisted, persistedOwnerEpoch)
             bindLibraryAccount(persisted?.account?.id)
             AddonTombstones.activateAccount(persisted?.account?.id)
             AddonPrefsStore.activateAccount(persisted?.account?.id)
@@ -1219,7 +1237,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             !sessionTruthMatches(live, persisted) ||
             sessionState.ownerEpoch != persistedOwnerEpoch
         ) {
-            _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+            com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+            }
             return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
         }
         val current = sessionState.value

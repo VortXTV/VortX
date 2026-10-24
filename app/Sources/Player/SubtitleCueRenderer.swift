@@ -133,7 +133,7 @@ final class SubtitleCueRenderer {
         guard blocks.count <= maximumCueCount * 3 else { return [] }
         for rawBlock in blocks {
             guard cues.count < maximumCueCount else { break }
-            var lines = rawBlock.components(separatedBy: "\n")
+            let lines = rawBlock.components(separatedBy: "\n")
             // Drop the WEBVTT header and any VTT metadata block (NOTE / STYLE / REGION) wholesale.
             if let first = lines.first {
                 let head = first.trimmingCharacters(in: .whitespaces).uppercased()

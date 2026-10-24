@@ -11,6 +11,45 @@
 
     <string name="action_retry">Retry</string>
 
+    <!-- Static artwork/status copy shown only while a current player attempt awaits startup evidence. -->
+    <string name="player_startup_title">Starting playback</string>
+    <string name="player_startup_loading">Starting playback…</string>
+
+    <!-- Session-only libmpv owned-label DSP. Shared phone/tablet/TV Audio Settings sheet. -->
+    <string name="player_audio_preset_title">Audio preset · this player session</string>
+    <string name="player_audio_preset_normal">Normal</string>
+    <string name="player_audio_preset_dialogue">Dialogue</string>
+    <string name="player_audio_preset_night">Night</string>
+    <string name="player_audio_preset_normal_detail">No added session processing</string>
+    <string name="player_audio_preset_dialogue_detail">Speech-range emphasis, not voice isolation</string>
+    <string name="player_audio_preset_night_detail">Reduces loud peaks without raising quiet audio</string>
+    <string name="player_audio_preset_media3_unavailable">Audio presets aren\'t available on the Media3 player.</string>
+    <string name="player_audio_preset_not_ready">Audio processing isn\'t ready.</string>
+    <string name="player_audio_preset_passthrough">Unavailable while bitstream passthrough is enabled.</string>
+    <string name="player_audio_preset_safety_unavailable">Audio processing can\'t be safely changed on this player.</string>
+    <string name="player_audio_preset_restored">This preset isn\'t supported by this audio path. Previous processing restored.</string>
+    <string name="player_audio_preset_unknown">Audio processing state is unknown. Close and reopen the player.</string>
+
+    <!-- In-memory Library / Detail picks. Picking alone never changes watch history. -->
+    <string name="random_library_pick_title">Random pick from Library</string>
+    <string name="random_library_filter_all">All</string>
+    <string name="random_library_filter_movies">Movies</string>
+    <string name="random_library_filter_shows">Shows</string>
+    <string name="random_pick_pick">Pick</string>
+    <string name="random_pick_pick_again">Pick again</string>
+    <string name="random_pick_open">Open</string>
+    <string name="random_pick_play">Play</string>
+    <string name="random_pick_loading">Choosing…</string>
+    <string name="random_pick_empty_library">No eligible titles in this Library selection.</string>
+    <string name="random_pick_profile_locked">Choose and unlock a profile to pick.</string>
+    <string name="random_pick_library_error">Library picks are unavailable right now. Try again.</string>
+    <string name="random_pick_library_changed">That pick is no longer available. Pick again.</string>
+    <string name="random_episode_pick_title">Random episode</string>
+    <string name="random_episode_pick_preview">%1$s · S%2$d · E%3$d — %4$s</string>
+    <string name="random_pick_empty_episodes">No eligible episodes are available.</string>
+    <string name="random_pick_episode_error">Episode picks are unavailable right now. Try again.</string>
+    <string name="random_pick_episode_changed">That episode is no longer available. Pick again.</string>
+
     <!-- Search result grouping and honest idle versus settled-empty guidance, shared by phone and TV. -->
     <string name="search_section_movies">Movies</string>
     <string name="search_section_series">Series</string>

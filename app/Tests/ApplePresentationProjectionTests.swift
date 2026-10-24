@@ -148,7 +148,7 @@ struct ApplePresentationProjectionTests {
             && homeSource.contains("library = overlayHistory.value(for: profiles.activeID)?.library ?? []"),
             "recommendation models receive the entire cached ownership exclusion input")
         let watchObserver = homeSource.components(separatedBy: ".onReceive(profiles.$watch) { watch in")[1]
-            .components(separatedBy: ".onChange(of: profiles.activeID)")[0]
+            .components(separatedBy: ".onValueChange(of: profiles.activeID)")[0]
         expect(watchObserver.contains("refreshOverlayHistoryProjection()") && watchObserver.contains("refreshTopPicks()"),
                "real tail watch publication refreshes recommendation exclusion even when the visible key stays unchanged")
         expect(!source.contains("core.searchResults.filter"), "both search surfaces consume the shared production projection")

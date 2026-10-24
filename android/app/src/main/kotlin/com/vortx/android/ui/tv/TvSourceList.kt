@@ -43,6 +43,9 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.sources.SourceQuickFilterIndex
+import com.vortx.android.sources.SourceQuickFilters
+import com.vortx.android.ui.components.SourceQuickFilterControls
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferences
@@ -75,6 +78,8 @@ import com.vortx.android.ui.viewmodel.detailAudioLanguageOptions
 @Composable
 fun TvSourceList(
     streamsState: UiState<List<StreamGroup>>,
+    quickFilterScope: Any,
+    currentCacheRevision: Long,
     best: StreamSource?,
     resolving: Boolean,
     failure: String?,
@@ -102,6 +107,8 @@ fun TvSourceList(
         )
         is UiState.Success -> TvSourceListContent(
             groups = s.data,
+            quickFilterScope = quickFilterScope,
+            currentCacheRevision = currentCacheRevision,
             best = best,
             resolving = resolving,
             failure = failure,
@@ -125,6 +132,8 @@ fun TvSourceList(
 @Composable
 private fun TvSourceListContent(
     groups: List<StreamGroup>,
+    quickFilterScope: Any,
+    currentCacheRevision: Long,
     best: StreamSource?,
     resolving: Boolean,
     failure: String?,
@@ -143,6 +152,12 @@ private fun TvSourceListContent(
 ) {
     val colors = VortXTheme.colors
     // Section jumps, folding and the render window belong only to this title's remote presentation.
+    var quickFilters by remember(quickFilterScope) { mutableStateOf(SourceQuickFilters()) }
+    val facetIndex = remember(groups) { SourceQuickFilterIndex(groups) }
+    val facetGroups = remember(facetIndex, quickFilters, currentCacheRevision) {
+        facetIndex.matchingGroups(quickFilters, currentCacheRevision)
+    }
+    val facetCount = facetGroups.sumOf { it.streams.size }
     // Sorting, quality, audio, pinning, download and playback keep their existing shared owners.
     var jumpGroupKey by remember { mutableStateOf<String?>(null) }
     var jumpRevision by remember { mutableStateOf(0) }
@@ -180,9 +195,9 @@ private fun TvSourceListContent(
     }
 
     // A late section jump adds at most one 40-row window to the normal global render budget.
-    val items = tvSourceWindow(groups, collapsed, renderLimit, jumpGroupKey) { tvSortedStreamsInGroup(it, sort) }
+    val items = tvSourceWindow(facetGroups, collapsed, renderLimit, jumpGroupKey) { tvSortedStreamsInGroup(it, sort) }
     val shownRows = items.count { it is TvSourceItem.Row }
-    val expandableTotal = groups.mapIndexed { index, group ->
+    val expandableTotal = facetGroups.mapIndexed { index, group ->
         if (tvSourceGroupKey(group, index) in collapsed) 0 else group.streams.size
     }.sum()
     val hasMore = shownRows < expandableTotal
@@ -215,13 +230,31 @@ private fun TvSourceListContent(
             onQualityTierChange = { qualityTier = it },
             onPlay = onPlay,
             onFocused = ::acceptFocus,
+            quickFilters = quickFilters,
+            onQuickFiltersChange = {
+                quickFilters = it
+                pinMenuFor = null
+                renderLimit = TV_SOURCE_WINDOW_INITIAL
+                jumpLease = null
+                jumpGroupKey = null
+                jumpRevision++
+            },
+        )
+        Text(
+            text = "List filters · $facetCount of $total sources. Range/codec are provider-reported; " +
+                "cache Unknown means not confirmed. Quality, Audio and Watch Now stay unchanged.",
+            style = VortXTheme.type.label.copy(color = colors.textSecondary),
+        )
+        if (facetCount == 0) Text(
+            text = "No sources match these list filters. Choose All or Reset list filters.",
+            style = VortXTheme.type.label.copy(color = colors.textSecondary),
         )
         // These tabs scroll to a section in the complete ordered list; selecting an add-on never filters
         // away its neighbors or changes the user's installed add-on order.
         if (groups.size > 1) {
             TvSourceSectionTabs(
-                groups = groups,
-                total = total,
+                groups = facetGroups,
+                total = facetCount,
                 jumpGroupKey = jumpGroupKey,
                 onJump = ::requestJump,
                 onFocused = ::acceptFocus,
@@ -230,7 +263,7 @@ private fun TvSourceListContent(
         TvSourceResultsList(
             items = items,
             listState = listState,
-            total = total,
+            total = facetCount,
             best = best,
             resolving = resolving,
             failure = failure,
@@ -469,6 +502,8 @@ private fun TvSourceControlsRow(
     onQualityTierChange: (String?) -> Unit,
     onPlay: (StreamSource) -> Unit,
     onFocused: () -> Unit,
+    quickFilters: SourceQuickFilters,
+    onQuickFiltersChange: (SourceQuickFilters) -> Unit,
 ) {
     var audioOpen by remember { mutableStateOf(false) }
     // The picker is a session filter over the sources currently assembled for this title.  Keep the
@@ -559,6 +594,13 @@ private fun TvSourceControlsRow(
                     }
                 }
             }
+        }
+        item(key = "source-quick-filters") {
+            SourceQuickFilterControls(
+                filters = quickFilters,
+                onChange = onQuickFiltersChange,
+                button = { label, selected, click -> TvFilterChip(label = label, selected = selected, onClick = click) },
+            )
         }
     }
 }

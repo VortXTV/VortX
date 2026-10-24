@@ -112,6 +112,7 @@ import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.ProfileSelectionOrigin
 import com.vortx.android.ui.profilepicker.ProfileSelectionPresentation
+import com.vortx.android.ui.randompick.RandomTitlePlayRequest
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.components.Wordmark
@@ -191,6 +192,8 @@ import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 
 /// Auto-add fires at ~60s of playback, matching Apple's `d >= 60` at PlayerScreen.swift:972 and
@@ -370,6 +373,9 @@ fun VortXApp(
             }
         }
         var pendingDirectResumeTarget by remember { mutableStateOf<DirectResumeTarget?>(null) }
+        // A picker Play is not a Continue Watching resume. Its complete, session-only witness remains
+        // live after consumption so the resolver's immutable admission callback can still reject it.
+        var pendingRandomTitlePlayRequest by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
         val openDetail: (MetaItem?) -> Unit = open@{ item ->
             if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
             if (item?.continueWatchingUnavailableMessage != null) {
@@ -379,6 +385,7 @@ fun VortXApp(
             // Every ordinary Detail route revokes any previous one-shot direct-resume request. Direct
             // Continue Watching callers install their exact target immediately after opening it.
             pendingDirectResumeTarget = null
+            pendingRandomTitlePlayRequest = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
             liveDetailAdmission = item?.continueWatchingAdmission
@@ -416,9 +423,9 @@ fun VortXApp(
         // holder so bumping it never itself recomposes.
         val autoAdvanceStreak = remember { intArrayOf(0) }
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
-            detail?.let {
+            (detail?.let {
                 "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
-            } ?: "no-detail:$detailSourceEpoch",
+            } ?: "no-detail:$detailSourceEpoch") + ":route-$detailGeneration",
         )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
         // the Android analogue of Apple's `curMeta` (`PlaybackMeta`): [Playable] itself carries only the
@@ -494,6 +501,22 @@ fun VortXApp(
         // active screen scrolls its list to the top in response (Apple `TabScrollToTop`).
         var searchReselect by remember { mutableStateOf(0) }
         var discoverReselect by remember { mutableStateOf(0) }
+        LaunchedEffect(repo, profileStore, activeProfile) {
+            repo.ctxUpdates().onStart { emit(Unit) }.collect {
+                val request = pendingRandomTitlePlayRequest ?: return@collect
+                if (!request.isCurrent(
+                        currentOwner = repo.continueWatchingOwner(),
+                        currentProfile = profileStore?.active,
+                        needsPicker = profileStore?.needsPicker != false,
+                        currentType = MediaType.entries.firstOrNull { it.id == savedDetailType },
+                        currentId = savedDetailId,
+                        currentDetailGeneration = detailGeneration,
+                    )
+                ) {
+                    pendingRandomTitlePlayRequest = null
+                }
+            }
+        }
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
@@ -541,6 +564,30 @@ fun VortXApp(
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
+        }
+        val onRandomLibraryPlay: (MetaItem) -> Unit = randomPlay@{ item ->
+            val store = profileStore ?: return@randomPlay
+            val profile = store.active ?: return@randomPlay
+            val owner = repo.continueWatchingOwner()
+            if (store.needsPicker || owner.profileId != profile.id || item.id.isBlank() ||
+                (item.type != MediaType.MOVIE && item.type != MediaType.SERIES) ||
+                store.active != profile || repo.continueWatchingOwner() != owner
+            ) return@randomPlay
+            quickViewItem = null
+            quickWatchIdentity = null
+            detailGeneration += 1
+            openDetail(item)
+            val request = RandomTitlePlayRequest(item.type, item.id, owner, profile, detailGeneration)
+            pendingRandomTitlePlayRequest = request.takeIf {
+                it.isCurrent(
+                    currentOwner = repo.continueWatchingOwner(),
+                    currentProfile = store.active,
+                    needsPicker = store.needsPicker,
+                    currentType = MediaType.entries.firstOrNull { type -> type.id == savedDetailType },
+                    currentId = savedDetailId,
+                    currentDetailGeneration = detailGeneration,
+                )
+            }
         }
         val onCinemaItem: (MetaItem) -> Unit = { item ->
             if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
@@ -1465,9 +1512,9 @@ fun VortXApp(
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
             // navigation when a new deep-link event targets the same media id again.
             key(current.type, current.id, detailGeneration) {
-                // The Compose generation resets local nested-screen state, while the Activity-scoped
-                // ViewModel key remains bounded by target and owner. Reopening the same title therefore
-                // reuses its ViewModel instead of retaining one live repository subscription per visit.
+                // A fresh bounded ViewModel owner follows this route generation, including repeated
+                // picks of the same title, so old manual episode and resolver state cannot leak in.
+                // Replacing the owner clears the previous store rather than retaining past visits.
                 val detailVm: DetailViewModel = viewModel(
                     viewModelStoreOwner = detailVmOwner,
                     key = detailViewModelKey(
@@ -1498,6 +1545,29 @@ fun VortXApp(
                         pendingDirectResumeTarget = null
                     }
                 }
+                val randomRequestForDetail = pendingRandomTitlePlayRequest?.takeIf {
+                    it.type == current.type && it.id == current.id && it.detailGeneration == detailGeneration
+                }
+                val randomDetailGeneration = detailGeneration
+                val randomDetailRouteIsCurrent: () -> Boolean = {
+                    savedDetailType == current.type.id && savedDetailId == current.id &&
+                        detailGeneration == randomDetailGeneration
+                }
+                // This closure deliberately captures the immutable request, not a recomposition's
+                // latest request. Consuming only flips its pending bit; cancelling/remounting revokes it.
+                val randomTitlePlayIsCurrent: () -> Boolean = {
+                    randomDetailRouteIsCurrent() && (randomRequestForDetail == null || (
+                        randomRequestForDetail.sameIntent(pendingRandomTitlePlayRequest) &&
+                            randomRequestForDetail.isCurrent(
+                                currentOwner = repo.continueWatchingOwner(),
+                                currentProfile = profileStore?.active,
+                                needsPicker = profileStore?.needsPicker != false,
+                                currentType = MediaType.entries.firstOrNull { it.id == savedDetailType },
+                                currentId = savedDetailId,
+                                currentDetailGeneration = detailGeneration,
+                            )
+                        ))
+                }
                 // System Back closes the detail overlay back to the browse shell. Composed BEFORE
                 // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
                 // DetailScreen.kt) register later and therefore take precedence while they are open.
@@ -1526,8 +1596,40 @@ fun VortXApp(
                             autoAdvanceStreak[0] = 0
                         } else playable.playbackLease?.close()
                     },
-                    autoWatch = quickWatchIdentity == "${current.type.id}:${current.id}",
-                    onAutoWatchConsumed = { quickWatchIdentity = null },
+                    autoWatch = randomRequestForDetail?.consumed == false ||
+                        quickWatchIdentity == "${current.type.id}:${current.id}",
+                    onAutoWatchConsumed = {
+                        if (!randomDetailRouteIsCurrent()) {
+                            false
+                        } else if (randomRequestForDetail != null) {
+                            val admitted = randomTitlePlayIsCurrent()
+                            if (randomRequestForDetail.sameIntent(pendingRandomTitlePlayRequest)) {
+                                pendingRandomTitlePlayRequest = if (admitted) randomRequestForDetail.copy(consumed = true) else null
+                            }
+                            admitted
+                        } else {
+                            quickWatchIdentity = null
+                            true
+                        }
+                    },
+                    autoWatchAdmission = randomTitlePlayIsCurrent,
+                    onAutoWatchCancelled = {
+                        if (!randomDetailRouteIsCurrent()) {
+                            false
+                        } else if (randomRequestForDetail == null) {
+                            quickWatchIdentity = null
+                            true
+                        } else {
+                            val admitted = randomTitlePlayIsCurrent()
+                            if (randomRequestForDetail.sameIntent(pendingRandomTitlePlayRequest)) {
+                                pendingRandomTitlePlayRequest = null
+                                detailVm.abandonPlaybackRoute()
+                                admitted
+                            } else {
+                                false
+                            }
+                        }
+                    },
                 )
             }
             return@VortXTheme
@@ -1682,6 +1784,7 @@ fun VortXApp(
                         pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
                         detailGeneration += 1
                     },
+                    onRandomPlay = onRandomLibraryPlay,
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },
                     onPreviouslyWatched = { showPreviouslyWatched = true },

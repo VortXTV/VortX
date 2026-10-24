@@ -5,9 +5,7 @@ import Foundation
 final class UsenetAdmissionEnvironment: @unchecked Sendable {
     static let shared = UsenetAdmissionEnvironment()
     struct State {
-        var nativeSelected = true
         var nativeSupported = true
-        var legacyEndpointAvailable = true
         var savedProvider = false
         var endpoint: UsenetNodeClient.Endpoint?
     }
@@ -31,15 +29,6 @@ enum VortxNativeServerFlag {
     static var isSupported: Bool { UsenetAdmissionEnvironment.shared.state.nativeSupported }
 }
 enum StremioServer {
-    static var nativeTransportSelected: Bool { UsenetAdmissionEnvironment.shared.state.nativeSelected }
-    static var usenetNodeBase: String? {
-        let state = UsenetAdmissionEnvironment.shared.state
-        #if VORTX_NO_EMBEDDED_SERVER
-        return nil
-        #else
-        return !state.nativeSelected && state.legacyEndpointAvailable ? "http://127.0.0.1:11470" : nil
-        #endif
-    }
     static var usenetEndpoint: UsenetNodeClient.Endpoint? { UsenetAdmissionEnvironment.shared.state.endpoint }
     static let trailerResolverBase = "https://trailer.invalid"
     static let base = "http://127.0.0.1:11470"
@@ -122,9 +111,11 @@ extension StreamRanking {
 
         environment.nativeSupported = false
         environment.savedProvider = true
+        // A foreign or stale listener is not capability to run this build's native engine.
+        environment.endpoint = .init(base: "http://127.0.0.1:11470")
         UsenetAdmissionEnvironment.shared.set(environment)
         let readsBeforeUnavailable = UsenetAdmissionEnvironment.shared.providerReads
-        assertAdmission("\(label) unavailable native cannot borrow legacy listener", stream: saved, expected: false)
+        assertAdmission("\(label) unavailable native cannot borrow an unrelated listener", stream: saved, expected: false)
         check("\(label) unavailable local runtime does not read saved secrets during ranking",
               UsenetAdmissionEnvironment.shared.providerReads == readsBeforeUnavailable)
         DebridPlaybackAvailability.shared.publish(torBoxConfigured: true)
@@ -133,12 +124,10 @@ extension StreamRanking {
         check("\(label) remote eligibility retains short-circuit secret-read behavior",
               UsenetAdmissionEnvironment.shared.providerReads == readsBeforeRemote)
         DebridPlaybackAvailability.shared.publish(torBoxConfigured: false)
-        environment.nativeSelected = false
+        assertAdmission("\(label) unrelated listener cannot admit add-on NNTP without native capability", stream: addon, expected: false)
+        environment.endpoint = nil
         UsenetAdmissionEnvironment.shared.set(environment)
-        assertAdmission("\(label) legacy endpoint retains saved-provider behavior", stream: saved, expected: localExpected)
-        environment.legacyEndpointAvailable = false
-        UsenetAdmissionEnvironment.shared.set(environment)
-        assertAdmission("\(label) missing legacy endpoint stays unavailable", stream: addon, expected: false)
+        assertAdmission("\(label) absent native capability and endpoint stay unavailable", stream: addon, expected: false)
 
         let direct = try stream(["url": "https://fixture.invalid/video.mp4"])
         assertAdmission("\(label) direct playback unchanged", stream: direct, expected: true)
@@ -149,9 +138,9 @@ extension StreamRanking {
                 && watchDisabled(loading: false, preparing: true, best: direct))
 
         // Capability is not readiness: execute the actual bounded resolver with no endpoint published.
-        environment.nativeSelected = true
         environment.nativeSupported = true
         environment.savedProvider = true
+        environment.endpoint = nil
         UsenetAdmissionEnvironment.shared.set(environment)
         let started = ProcessInfo.processInfo.systemUptime
         do {

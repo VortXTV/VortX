@@ -76,6 +76,10 @@ class SubtitleOffsetMemoryTest {
             updated = 2.0,
         )
         assertNull(savedSubtitleOffset(invalidWrite, "imdb:tt1"))
+        for (outsideBound in listOf(120.04, -120.04)) {
+            val rejected = mutateSubtitleOffsetJson(null, "imdb:tt1", outsideBound, updated = 3.0)
+            assertNull(savedSubtitleOffset(rejected, "imdb:tt1"))
+        }
     }
 
     @Test

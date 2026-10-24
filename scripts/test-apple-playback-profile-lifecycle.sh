@@ -4,8 +4,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 mkdir -p app/build
 test_dir=$(mktemp -d app/build/apple-playback-profile-lifecycle.XXXXXX)
+host_arch="$(uname -m)"
+case "$host_arch" in arm64|x86_64) ;; *) echo "Unsupported host architecture: $host_arch" >&2; exit 2 ;; esac
+host_sdk="$(xcrun --sdk macosx --show-sdk-path)"
 source_ref="${1:-current}"
 if [[ "$source_ref" == "--baseline" ]]; then source_ref=10e425d990036ec801bc2edabd8a688bd0f58e44; fi
+echo "Evidence: $repo_root/$test_dir (source: $source_ref)"
 
 # The same Swift assertions run against either tree. Extract complete declarations and exact production
 # statement ranges; no candidate body rewrites, regex translations, or expected-failure synthesis.
@@ -33,6 +37,21 @@ const player=read('app/Sources/PlayerScreen.swift');
 const tv=read('app/SourcesTV/TVPlayerView.swift');
 const shared=read('app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift');
 const core=read('app/SourcesShared/CoreModels.swift');
+// Current support is explicit in the compiler input list. A historical selector
+// must supply compatible real policy/TLS declarations; an absent/incompatible
+// helper is a fixture-admission failure, never causal runtime regression evidence.
+let cachePolicy, tlsPolicy;
+try {
+  cachePolicy=read('app/Sources/Player/CacheShedPolicy.swift');
+  tlsPolicy=read('app/Sources/Player/MPVTLSOptions.swift');
+} catch (error) {
+  if (ref==='current') throw error;
+  throw new Error(`UNSUPPORTED historical fixture ${ref}: required real support is unavailable; not runtime regression evidence`);
+}
+if (!cachePolicy.includes('struct SeekEOFTerminalParkPolicy') ||
+    tlsPolicy!==fs.readFileSync('app/Sources/Player/MPVTLSOptions.swift','utf8')) {
+  throw new Error(`UNSUPPORTED fixture ${ref}: selected policy/TLS support differs; not runtime regression evidence`);
+}
 const snapshot=shared.includes('struct MPVPlaybackProfileSnapshot') ? declaration(shared,'struct MPVPlaybackProfileSnapshot') : '';
 const native=controller.includes('private final class MPVPlaybackProfileOption') ? declaration(controller,'private final class MPVPlaybackProfileOption') : '';
 const capture=controller.includes('guard let priorPlaybackProfile') ? between(controller,'guard let priorPlaybackProfile','        // Header-admission transaction') : '';
@@ -81,6 +100,7 @@ const generated=`
 import Foundation
 ${declaration(core,'struct PlayerLoadToken: Hashable, Sendable')}
 ${declaration(shared,'struct PlaybackIdleTimerLease')}
+${declaration(cachePolicy,'struct SeekEOFTerminalParkPolicy')}
 ${snapshot}
 ${native}
 
@@ -117,7 +137,7 @@ func mpv_free_node_contents(_ node: inout mpv_node) { node.value=nil }
     } else { NativePort.shared.values[name] = .scalar(value) }
     return 0
 }
-enum MPVProperty { static let speed="speed"; static let endFileError="end-file-error" }
+enum MPVProperty { static let speed="speed"; static let pause="pause"; static let endFileError="end-file-error" }
 enum DiagnosticsLog { static func log(_ category:String,_ text:String) {} }
 enum LocalNNTPBufferPolicy { static func waitSeconds(url:URL,live:Bool,preview:Bool)->Double { 6 } }
 struct Resettable { mutating func reset() {} }
@@ -142,6 +162,7 @@ struct SeekEOFReloadSource { let url:URL; let headers:[String:String]?; let live
     var playDelegate:Delegate?
     var seekEOFRecoveryTimeout:Task<Void,Never>?
     var seekEOFRecovery=Resettable()
+    var seekEOFTerminalPark=SeekEOFTerminalParkPolicy<PlayerLoadToken>()
     var seekEOFReloadSource:SeekEOFReloadSource?
     var cacheFlushFlight=CacheFlight()
     var activeReadAheadCap="old"
@@ -161,6 +182,9 @@ struct SeekEOFReloadSource { let url:URL; let headers:[String:String]?; let live
         _ = mpv_set_property_string(mpv,name,value)
         if name==MPVProperty.speed { appliedRates.append(Double(value)!) }
         if name=="pause" { paused = value == "yes" }
+    }
+    @discardableResult private func setFlag(_ name:String,_ value:Bool)->Int32 {
+        setString(name, value ? "yes" : "no"); return 0
     }
 ${declaration(controller,'    func setSpeed(_ speed: Double)')}
 ${declaration(controller,'    private func configureLiveMode(_ live: Bool)')}
@@ -230,10 +254,14 @@ fs.writeFileSync(`${out}/Generated.swift`,generated);
 fs.writeFileSync(`${out}/source-ref.txt`,`${ref}\n`);
 NODE
 
-xcrun swiftc -swift-version 5 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-    "$test_dir/Generated.swift" app/Tests/ApplePlaybackProfileLifecycleTests.swift \
+nice -n 15 xcrun swiftc -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+    -j 1 -num-threads 1 -target "$host_arch-apple-macosx14.0" -sdk "$host_sdk" \
+    -module-cache-path "$test_dir/module-cache" \
+    "$test_dir/Generated.swift" app/Sources/Player/MPVTLSOptions.swift app/Tests/ApplePlaybackProfileLifecycleTests.swift \
     -o "$test_dir/apple-playback-profile-lifecycle"
-echo "Evidence: $repo_root/$test_dir (source: $source_ref)"
 "$test_dir/apple-playback-profile-lifecycle"
-shasum -a 256 app/Sources/Player/MPVMetalViewController.swift app/Sources/PlayerScreen.swift \
-    app/SourcesTV/TVPlayerView.swift app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift
+shasum -a 256 app/Sources/Player/MPVMetalViewController.swift app/Sources/Player/MPVTLSOptions.swift \
+    app/Sources/Player/CacheShedPolicy.swift app/Sources/PlayerScreen.swift app/SourcesTV/TVPlayerView.swift \
+    app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift app/SourcesShared/CoreModels.swift \
+    app/Tests/ApplePlaybackProfileLifecycleTests.swift "$test_dir/Generated.swift" \
+    scripts/test-apple-playback-profile-lifecycle.sh

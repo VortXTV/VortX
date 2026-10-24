@@ -14,6 +14,7 @@ import Foundation
 ///
 /// Main-thread only (SwiftUI appear/disappear callbacks and view bodies), so no locking is needed. The
 /// two mutators are `@MainActor` so that isolation is compiler-enforced, matching `CoreBridge.setPlayerActive`.
+@MainActor
 final class FullscreenPlaybackGate: ObservableObject {
     static let shared = FullscreenPlaybackGate()
     private init() {}

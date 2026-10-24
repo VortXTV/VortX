@@ -26,9 +26,12 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
 } > "$native_live_dir/Discovery.swift"
 shasum -a 256 scripts/native-watched-swift-inputs.sh scripts/native-owner-history-fixture-inputs.sh \
-    test/xperience-harness-inputs.cjs app/SourcesShared/Profiles.swift \
+    test/xperience-harness-inputs.cjs scripts/extract-subtitle-proof-hosts.cjs \
+    app/SourcesShared/CoreBridge.swift app/SourcesShared/Profiles.swift \
+    app/SourcesShared/LegacyWatchOwnership.swift \
     app/SourcesShared/ProfileDiscoveryPreferences.swift "$0" app/SourcesShared/VortXSyncManager.swift > "$native_live_dir/carrier-sources.sha256"
 node test/xperience-harness-inputs.cjs --owner-history-carriers "$native_live_dir"
+node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-shell "$native_live_dir/NativeSubtitleProofHosts.swift" > "$native_live_dir/native-subtitle-proof-hosts.json"
 shasum -a 256 --check "$native_live_dir/carrier-sources.sha256"
 native_live_inputs=(
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift
@@ -37,6 +40,7 @@ native_live_inputs=(
     app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeLiveABITests.swift
     app/Tests/OwnerHistorySwiftLiveABICases.swift
     "${native_owner_history_fixture_swift_inputs[@]}" "$native_live_dir/OwnerHistoryFixtureCarriers.swift"
+    "$native_live_dir/NativeSubtitleProofHosts.swift"
 )
 # The opt-in real closure overlaps old explicit sources; retain all test entries once.
 native_live_unique=("${native_live_inputs[0]}")
@@ -51,7 +55,7 @@ native_live_inputs=("${native_live_unique[@]}")
 for native_live_input in "${native_live_inputs[@]}"; do
     [[ "$native_live_input" == -lz ]] || shasum -a 256 "$native_live_input" >> "$native_live_dir/carrier-sources.sha256"
 done
-nice -n 15 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+nice -n 15 xcrun swiftc -parse-as-library -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
     -j 1 -num-threads 1 -whole-module-optimization \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$native_live_dir/module-cache" \

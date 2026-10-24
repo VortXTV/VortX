@@ -1,10 +1,11 @@
 import Foundation
 import CryptoKit
+import os
 
 /// One viewer of the app: local view settings (name, avatar, theme, parental PIN) plus an optional
 /// binding to its own Stremio account. Profiles without their own account share the primary one,
 /// so a "Kids" profile can be the same account with a different look and a PIN on the way out.
-struct UserProfile: Codable, Identifiable, Equatable {
+struct UserProfile: Codable, Identifiable, Equatable, Sendable {
     var id = UUID()
     var name: String
     var avatar: String                 // an emoji
@@ -55,7 +56,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// What follows a viewer between profiles: track languages and the subtitle look. Synced
     /// with the roster, so a profile keeps its preferences across devices. Raw-string fields
     /// mirror the UserDefaults representations one-to-one.
-    struct PlaybackPrefs: Codable, Equatable {
+    struct PlaybackPrefs: Codable, Equatable, Sendable {
         var audioLang: String
         var subtitleLang: String
         var forcedPolicy: String
@@ -175,10 +176,66 @@ struct UserProfile: Codable, Identifiable, Equatable {
     }
 }
 
+/// Process-local selection facts for synchronous worker reads. This is not a playback, credential or
+/// navigation authority. A nil read means startup or a synchronous Published mutation is in progress.
+enum ProfileSelectionRead {
+    struct Snapshot: Equatable, Sendable {
+        struct Profile: Equatable, Sendable {
+            let id: UUID
+            let isOwner: Bool
+            let usesOwnAccount: Bool
+            // The stored profile projection, never the unacknowledged flat Picker choice.
+            let continueWatchingSource: String?
+            let continueWatchingWindow: String?
+            var usesEngineHistory: Bool { isOwner || usesOwnAccount }
+        }
+        let activeID: UUID?
+        let activeProfile: Profile?
+        var activeUsesEngineHistory: Bool { activeProfile?.usesEngineHistory ?? true }
+    }
+
+    private struct State: Sendable {
+        var initialized = false
+        var mutationDepth = 0
+        var value: Snapshot?
+    }
+    private static let state = OSAllocatedUnfairLock(initialState: State())
+
+    static func snapshot() -> Snapshot? {
+        state.withLock { value in
+            guard value.initialized, value.mutationDepth == 0 else { return nil }
+            return value.value
+        }
+    }
+
+    // Only the synchronous ProfileStore owner writes this mirror. No external callbacks, defaults,
+    // Keychain, bridge access or actor crossing occurs under this lock. Only the main-actor owner
+    // may publish; worker readers receive the checked immutable scalar snapshot above.
+    @MainActor
+    fileprivate static func beginMutation() { state.withLock { $0.mutationDepth += 1 } }
+    @MainActor
+    fileprivate static func endMutation(_ snapshot: Snapshot) {
+        state.withLock { value in
+            precondition(value.mutationDepth > 0)
+            value.value = snapshot
+            value.mutationDepth -= 1
+        }
+    }
+    @MainActor
+    fileprivate static func publishInitial(_ snapshot: Snapshot) {
+        state.withLock { value in
+            precondition(!value.initialized && value.mutationDepth == 0)
+            value.value = snapshot
+            value.initialized = true
+        }
+    }
+}
+
 /// The profile roster and the active selection. The roster persists as JSON in UserDefaults; each
 /// own-account profile keeps its Stremio authKey in its own Keychain slot, and the pre-profiles
-/// primary slot keeps serving every shared profile. Mutate from the main thread only (the
-/// ThemeManager pattern; views observe via @EnvironmentObject).
+/// primary slot keeps serving every shared profile. The mutable roster, presentation and synchronous
+/// saved-default projections share one main-actor owner; worker helpers below expose values only.
+@MainActor
 final class ProfileStore: ObservableObject {
     /// Dashboard owner-library adds can arrive while another profile/account is visible. Keep their
     /// intent bound to the receiving profile plus the exact credential fingerprint; replay only after
@@ -206,6 +263,7 @@ final class ProfileStore: ObservableObject {
     private var legacySelectionMutationRetirements: [Bool] = []
     @Published private(set) var profiles: [UserProfile] = [] {
         willSet {
+            ProfileSelectionRead.beginMutation()
             let retiresSession = Self.legacyWatchBinding(in: profiles, activeID: activeID)
                 != Self.legacyWatchBinding(in: newValue, activeID: activeID)
             legacyRosterMutationRetirements.append(retiresSession)
@@ -214,11 +272,13 @@ final class ProfileStore: ObservableObject {
         didSet {
             let retiresSession = legacyRosterMutationRetirements.removeLast()
             if retiresSession { retireLegacyHistoryNotices() }
+            ProfileSelectionRead.endMutation(selectionReadSnapshot())
             LegacyWatchOwnership.endProfileMutation()
         }
     }
     @Published private(set) var activeID: UUID? {
         willSet {
+            ProfileSelectionRead.beginMutation()
             let retiresSession = activeID != newValue
             legacySelectionMutationRetirements.append(retiresSession)
             LegacyWatchOwnership.beginProfileMutation(retire: retiresSession)
@@ -226,8 +286,18 @@ final class ProfileStore: ObservableObject {
         didSet {
             let retiresSession = legacySelectionMutationRetirements.removeLast()
             if retiresSession { retireLegacyHistoryNotices() }
+            ProfileSelectionRead.endMutation(selectionReadSnapshot())
             LegacyWatchOwnership.endProfileMutation()
         }
+    }
+    private func selectionReadSnapshot() -> ProfileSelectionRead.Snapshot {
+        // Read actual stored fields after assignment, not willSet's proposed value: a synchronous
+        // Published subscriber may have nested a roster or selection mutation during publication.
+        .init(activeID: activeID, activeProfile: profiles.first(where: { $0.id == activeID }).map {
+            .init(id: $0.id, isOwner: $0.isOwner, usesOwnAccount: $0.usesOwnAccount,
+                  continueWatchingSource: $0.discovery?.continueWatchingSource,
+                  continueWatchingWindow: $0.discovery?.continueWatchingWindow)
+        })
     }
     private static func legacyWatchBinding(in roster: [UserProfile], activeID: UUID?) -> LegacyWatchOwnership.ProfileBinding? {
         roster.first(where: { $0.id == activeID }).map {
@@ -297,7 +367,7 @@ final class ProfileStore: ObservableObject {
     private var continueWatchingMigration: ContinueWatchingMigrationWitness?
     // A retired task may finish after a successor starts; cleanup owns only its attempt.
     private var continueWatchingMigrationAttempt: UUID?
-    static var nativePlaybackProjectionKeys: Set<String> {
+    nonisolated static var nativePlaybackProjectionKeys: Set<String> {
         [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle, TrackPreferences.Key.forced,
          SubtitleStyle.Key.font, SubtitleStyle.Key.size, SubtitleStyle.Key.color, SubtitleStyle.Key.background,
          SubtitleStyle.Key.sizeScale, SubtitleStyle.Key.brightness, SourcePreferences.orderKey,
@@ -308,7 +378,7 @@ final class ProfileStore: ObservableObject {
          SourcePreferences.excludeAV1Key, SourcePreferences.regexKey, SourcePreferences.preferKey,
          SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
     }
-    static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
+    nonisolated static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
     func nativePreferenceProjectionMatches(_ target: PlaybackMutationTarget) -> Bool {
         nativeProjectionTarget == target && target.stillOwnsCurrentContext(core: .shared)
     }
@@ -525,7 +595,7 @@ final class ProfileStore: ObservableObject {
     @MainActor
     private func prepareNativeAction(_ admission: CoreBridge.NativeProfileActionAdmission,
                                      operation: String,
-                                     perform: (PlaybackMutationTarget) async -> Bool) async -> Bool {
+                                     perform: @MainActor (PlaybackMutationTarget) async -> Bool) async -> Bool {
         guard let target = await CoreBridge.shared.prepareNativeProfileActionTarget(admission) else {
             CoreBridge.shared.reportNativeProfileFailure(operation)
             nativeProfileError = CoreBridge.shared.nativeProfileRecoveryMessage
@@ -661,7 +731,7 @@ final class ProfileStore: ObservableObject {
     private static func watchCacheKey(_ id: UUID) -> String { "stremiox.profiles.watch." + id.uuidString }
     private static func watchRemovalKey(_ id: UUID) -> String { "stremiox.profiles.watchRemoved." + id.uuidString }
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
-    static let primaryTokenAccount = "stremiox.authKey"
+    nonisolated static let primaryTokenAccount = "stremiox.authKey"
 
     /// Per-account "already imported the legacy Stremio roster + overlay watch into VortX" flag. Keyed by a
     /// SHA-256 prefix of the Stremio authKey (the same shape as ProfileSync's repair flag) so the raw token
@@ -684,18 +754,18 @@ final class ProfileStore: ObservableObject {
     /// the off-main board build (`buildBoardRows`) and the main-actor `streamGroups` can both read it
     /// cheaply without decoding the whole roster. Same pattern as `applyPlayback` flattening playback
     /// prefs and `CatalogPrefsStore` exposing static UserDefaults reads.
-    static let activeDisabledAddonsKey = "stremiox.profile.disabledAddons"
+    nonisolated static let activeDisabledAddonsKey = "stremiox.profile.disabledAddons"
     /// Add-on transport URLs hidden for the active profile (thread-safe, off-main read). Callers hoist
     /// this once per pass and test `.contains` inside their loop, cheaper than a per-item lookup that
     /// would re-read UserDefaults and rebuild the set on the off-main board path.
-    static func activeDisabledAddons() -> Set<String> {
+    nonisolated static func activeDisabledAddons() -> Set<String> {
         Set(UserDefaults.standard.stringArray(forKey: activeDisabledAddonsKey) ?? [])
     }
 
     /// Only a custom ranking order is mirrored. Missing means read the current account order, so a
     /// remote Main reorder becomes visible without materializing a child-profile snapshot.
-    static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
-    static func activeAddonOrder(accountOrder: [String]) -> [String] {
+    nonisolated static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
+    nonisolated static func activeAddonOrder(accountOrder: [String]) -> [String] {
         // Native descriptors already arrive in the kernel's account order. Never apply the older
         // account mirror (which also folded case-sensitive URL paths) over that authoritative input.
         return UserDefaults.standard.stringArray(forKey: activeAddonOrderOverrideKey) ?? []
@@ -704,8 +774,8 @@ final class ProfileStore: ObservableObject {
     /// Flat mirror of the active profile's Kids flag, same off-main pattern as `activeDisabledAddonsKey`,
     /// so the stream filter (which may run off the main actor) can force the parental content guard on
     /// without decoding the roster.
-    static let activeKidsKey = "stremiox.profile.isKids"
-    static func activeIsKids() -> Bool { UserDefaults.standard.bool(forKey: activeKidsKey) }
+    nonisolated static let activeKidsKey = "stremiox.profile.isKids"
+    nonisolated static func activeIsKids() -> Bool { UserDefaults.standard.bool(forKey: activeKidsKey) }
 
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
@@ -720,6 +790,7 @@ final class ProfileStore: ObservableObject {
     private(set) var deletedProfileIDs: Set<String> = []
 
     private init() {
+        defer { ProfileSelectionRead.publishInitial(selectionReadSnapshot()) }
         loadDeletedTombstones()
         load()
         if profiles.isEmpty { migrateFromSingleAccount() }
@@ -791,7 +862,7 @@ final class ProfileStore: ObservableObject {
         return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)
             ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
     }
-    static func legacyKeychainAccount(for profile: UserProfile) -> String {
+    nonisolated static func legacyKeychainAccount(for profile: UserProfile) -> String {
         // The owner IS the primary account: it always reads the primary slot, no matter what the
         // usesOwnAccount flag says. (A synced roster once arrived with the flag flipped on the
         // owner, which pointed sign-in at an empty per-profile slot and "signed out" every device.)
@@ -905,12 +976,8 @@ final class ProfileStore: ObservableObject {
         let target = CoreBridge.shared.captureNativePlaybackTarget()
         // Capture synchronously: a process exit before the queued Task runs must not lose the
         // edit or force the next launch to guess an owner from account-only flat dirty flags.
-        let admission: [NativePreferenceIntentStore.Intent]?
-        if Thread.isMainThread {
-            admission = MainActor.assumeIsolated { try? VortXSyncManager.shared.prepareNativePreferenceIntents(profile, target: target, editedGroups: editedPreferenceGroups) }
-        } else {
-            admission = DispatchQueue.main.sync { try? VortXSyncManager.shared.prepareNativePreferenceIntents(profile, target: target, editedGroups: editedPreferenceGroups) }
-        }
+        let admission = try? VortXSyncManager.shared.prepareNativePreferenceIntents(
+            profile, target: target, editedGroups: editedPreferenceGroups)
         guard let admission else {
             nativeProfileError = "Couldn't save this profile. Your changes are still here. Tap Try again."
             return
@@ -1360,10 +1427,7 @@ final class ProfileStore: ObservableObject {
 
     private func nativePreferenceIsLocalRevert(_ profile: UserProfile, group: NativePreferenceIntentStore.Group) -> Bool {
         let target = CoreBridge.shared.captureNativePlaybackTarget()
-        if Thread.isMainThread {
-            return MainActor.assumeIsolated { VortXSyncManager.shared.nativePreferenceIsLocalRevert(profile, group: group, target: target) }
-        }
-        return DispatchQueue.main.sync { VortXSyncManager.shared.nativePreferenceIsLocalRevert(profile, group: group, target: target) }
+        return VortXSyncManager.shared.nativePreferenceIsLocalRevert(profile, group: group, target: target)
     }
 
     // MARK: Per-profile playback preferences (languages + subtitle style)
@@ -1654,7 +1718,7 @@ final class ProfileStore: ObservableObject {
 
     private func persist(touch: Bool = true) {
         guard let data = try? JSONEncoder().encode(profiles) else { return }
-        let writeRosterAndActive = {
+        let writeRosterAndActive: @MainActor @Sendable () -> Void = {
             UserDefaults.standard.set(data, forKey: Self.listKey)
             UserDefaults.standard.set(self.activeID?.uuidString, forKey: Self.activeKey)
         }
@@ -2563,7 +2627,7 @@ final class ProfileStore: ObservableObject {
         var current = watchEntriesForSync(for: profileID)
         var changed = false
         for (metaId, incoming) in inbound.entries {
-            guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
+            guard let existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
             // Per-video LWW clocks + scalar LWW by the real lastWatched clock. A NEWER inbound snapshot
             // with a SMALLER watched set SHRINKS it (an unmark converges in either delivery order); an
             // older inbound snapshot is never unioned back over a newer local one. Independent episode
@@ -2631,7 +2695,7 @@ final class ProfileStore: ObservableObject {
         saveWatchRemovals(resolved.removals, for: profileID)
     }
 
-    private static func watchIdentity(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
+    nonisolated private static func watchIdentity(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
         .init(
             id: metaId,
             type: entry.type,
@@ -2641,11 +2705,11 @@ final class ProfileStore: ObservableObject {
         )
     }
 
-    static func watchIdentityForSync(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
+    nonisolated static func watchIdentityForSync(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
         watchIdentity(metaId: metaId, entry: entry)
     }
 
-    private static func watchFreshness(_ value: String) -> Double? {
+    nonisolated private static func watchFreshness(_ value: String) -> Double? {
         guard !value.isEmpty else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

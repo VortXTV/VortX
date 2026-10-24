@@ -39,9 +39,9 @@ final class AddonHealthStore: ObservableObject {
     private var lastProbe: Date?
     private init() {}
 
-    private static let okThresholdMs = 1500
-    private static let timeout: TimeInterval = 6
-    private static let rateLimit: TimeInterval = 20
+    nonisolated private static let okThresholdMs = 1500
+    nonisolated private static let timeout: TimeInterval = 6
+    nonisolated private static let rateLimit: TimeInterval = 20
 
     /// Probe every add-on concurrently. Debounced to once per `rateLimit` seconds unless `force`.
     func probe(_ transportUrls: [String], force: Bool = false) {
@@ -290,7 +290,7 @@ struct AddonsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
-            .onChange(of: profiles.activeID) { _ in
+            .onValueChange(of: profiles.activeID) { _ in
                 addonSheet = nil
                 showPairing = false
                 showUpdateConfirm = false
@@ -680,9 +680,9 @@ struct AddonReorderView: View {
         #endif
         .macBackAffordance()
         .onAppear { reload() }
-        .onChange(of: profiles.activeID) { _ in reload() }
-        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
-        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
+        .onValueChange(of: profiles.activeID) { _ in reload() }
+        .onValueChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
+        .onValueChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
     }
 
     /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
@@ -734,9 +734,9 @@ struct AddonReorderTVView: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { reload() }
-        .onChange(of: profiles.activeID) { _ in reload() }
-        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds
-        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
+        .onValueChange(of: profiles.activeID) { _ in reload() }
+        .onValueChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds
+        .onValueChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
     }
 
     private func reorderRow(_ addon: CoreDescriptor, index: Int) -> some View {

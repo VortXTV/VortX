@@ -1,6 +1,8 @@
 import MediaPlayer
 #if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
 #endif
 
 /// Drives the system Now Playing surface and routes its remote controls back into the player, on EVERY Apple
@@ -18,10 +20,10 @@ import UIKit
 /// property stream (libmpv natively, `AVPlayerEngineController` by synthesising it), so one wiring in each
 /// player chrome covers libmpv AND AVPlayer, including the Dolby Vision remux lane, with no engine branch.
 ///
-/// Threading: main-thread-only by construction. Every caller is a SwiftUI player chrome running on the main
-/// actor, and `MPRemoteCommand` targets are delivered on the main thread, so the static state below is never
-/// touched concurrently. Kept un-isolated (rather than `@MainActor`) so the command handlers can act
-/// synchronously, exactly as the shipping iOS wiring already did.
+/// Main-actor-owned presentation. The system does NOT promise main-actor remote-command delivery:
+/// each handler synchronously enters the main executor, validates its original wire generation, then
+/// invokes its UI action. No remote event or platform image crosses an unstructured Task.
+@MainActor
 enum NowPlayingCenter {
 
     // MARK: - State (main thread only)
@@ -43,6 +45,7 @@ enum NowPlayingCenter {
     private static var artwork: MPMediaItemArtwork?
     private static var artworkURL: String?
     private static var artworkTask: Task<Void, Never>?
+    private static var commandGeneration: UUID?
 
     // MARK: - Publishing
 
@@ -139,7 +142,16 @@ enum NowPlayingCenter {
         artworkTask = Task { @MainActor in
             guard let image = await PosterImageLoader.load(url, maxPixel: 600) else { return }
             guard !Task.isCancelled, identity == publishedIdentity else { return }   // item moved on: drop it
-            artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            // Artwork request callbacks are external too. Capture immutable owned bytes, never
+            // a shared UI/AppKit image; each request receives a newly decoded local image.
+            let size = image.size
+            #if canImport(UIKit)
+            guard let bytes = image.pngData() else { return }
+            artwork = MPMediaItemArtwork(boundsSize: size) { @Sendable _ in UIImage(data: bytes) ?? UIImage() }
+            #elseif canImport(AppKit)
+            guard let bytes = image.tiffRepresentation else { return }
+            artwork = MPMediaItemArtwork(boundsSize: size) { @Sendable _ in NSImage(data: bytes) ?? NSImage(size: .zero) }
+            #endif
             artworkArrived()
         }
     }
@@ -166,46 +178,53 @@ enum NowPlayingCenter {
     ///   - seekTo: absolute position, for a drag on the system progress bar.
     ///   - canScrub: whether position control is meaningful (false for live / durationless streams, where the
     ///     commands stay disabled instead of silently swallowing the input).
-    static func wireCommands(play: @escaping () -> Void,
-                             pause: @escaping () -> Void,
-                             togglePause: @escaping () -> Void,
-                             seekBy: @escaping (Double) -> Void,
-                             seekTo: @escaping (Double) -> Void,
+    static func wireCommands(play: @escaping @MainActor @Sendable () -> Void,
+                             pause: @escaping @MainActor @Sendable () -> Void,
+                             togglePause: @escaping @MainActor @Sendable () -> Void,
+                             seekBy: @escaping @MainActor @Sendable (Double) -> Void,
+                             seekTo: @escaping @MainActor @Sendable (Double) -> Void,
                              stepSeconds: Double,
                              canScrub: Bool) {
+        let original = UUID()
+        commandGeneration = original
         let c = MPRemoteCommandCenter.shared()
 
         c.playCommand.removeTarget(nil)
         c.playCommand.isEnabled = true
-        c.playCommand.addTarget { _ in play(); return .success }
+        c.playCommand.addTarget { @Sendable _ in performCommand(original: original, action: play) }
 
         c.pauseCommand.removeTarget(nil)
         c.pauseCommand.isEnabled = true
-        c.pauseCommand.addTarget { _ in pause(); return .success }
+        c.pauseCommand.addTarget { @Sendable _ in performCommand(original: original, action: pause) }
 
         c.togglePlayPauseCommand.removeTarget(nil)
         c.togglePlayPauseCommand.isEnabled = true
-        c.togglePlayPauseCommand.addTarget { _ in togglePause(); return .success }
+        c.togglePlayPauseCommand.addTarget { @Sendable _ in performCommand(original: original, action: togglePause) }
 
         let step = [NSNumber(value: stepSeconds)]
         c.skipForwardCommand.preferredIntervals = step
         c.skipForwardCommand.removeTarget(nil)
         c.skipForwardCommand.isEnabled = canScrub
-        c.skipForwardCommand.addTarget { _ in seekBy(stepSeconds); return .success }
+        c.skipForwardCommand.addTarget { @Sendable _ in
+            performCommand(original: original) { seekBy(stepSeconds) }
+        }
 
         c.skipBackwardCommand.preferredIntervals = step
         c.skipBackwardCommand.removeTarget(nil)
         c.skipBackwardCommand.isEnabled = canScrub
-        c.skipBackwardCommand.addTarget { _ in seekBy(-stepSeconds); return .success }
+        c.skipBackwardCommand.addTarget { @Sendable _ in
+            performCommand(original: original) { seekBy(-stepSeconds) }
+        }
 
         // The system progress bar's own drag. Without this the Now Playing card draws a scrub bar that does
         // nothing when moved.
         c.changePlaybackPositionCommand.removeTarget(nil)
         c.changePlaybackPositionCommand.isEnabled = canScrub
-        c.changePlaybackPositionCommand.addTarget { event in
+        c.changePlaybackPositionCommand.addTarget { @Sendable event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            seekTo(event.positionTime)
-            return .success
+            let position = event.positionTime
+            guard position.isFinite, position >= 0 else { return .commandFailed }
+            return performCommand(original: original) { seekTo(position) }
         }
 
         // Explicitly off: left enabled with no target these still advertise themselves to the system, which
@@ -214,6 +233,25 @@ enum NowPlayingCenter {
         c.previousTrackCommand.isEnabled = false
         c.seekForwardCommand.isEnabled = false
         c.seekBackwardCommand.isEnabled = false
+    }
+
+    /// Preserve synchronous command status/action ordering without assuming MediaPlayer's callback queue.
+    /// Darwin main-thread ingress must not sync-dispatch onto itself. Foreign-thread ingress executes
+    /// on DispatchQueue.main before the checked actor assertion. Rewire/clear revoke old callbacks.
+    private nonisolated static func performCommand(
+        original: UUID, action: @escaping @MainActor @Sendable () -> Void
+    ) -> MPRemoteCommandHandlerStatus {
+        let perform: @MainActor @Sendable () -> MPRemoteCommandHandlerStatus = {
+            guard commandGeneration == original else { return .commandFailed }
+            action()
+            return .success
+        }
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { perform() }
+        }
+        return DispatchQueue.main.sync {
+            MainActor.assumeIsolated { perform() }
+        }
     }
 
     /// Update ONLY the position-command enablement, for the case where a stream's duration arrives after
@@ -232,6 +270,7 @@ enum NowPlayingCenter {
     /// the card from Control Center; dropping the targets is what stops a stale closure holding the last
     /// player alive and swallowing transport presses meant for whatever plays next.
     static func clear() {
+        commandGeneration = nil
         artworkTask?.cancel(); artworkTask = nil
         artwork = nil; artworkURL = nil
         publishedIdentity = nil

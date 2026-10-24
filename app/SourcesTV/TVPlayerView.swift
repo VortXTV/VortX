@@ -563,6 +563,7 @@ struct TVPlayerView: View {
     /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    @State private var firstFrameCover = PlayerFirstFrameCoverPolicy<PlayerLoadToken>()
     /// Wall-clock uptime of the genuine first-frame event (set only alongside the true `hasStartedPlaying =
     /// true` transition below, never at the "foreground re-mount was not issued, restore the playing state"
     /// sites - those never actually stopped presentation, so resetting this there would wrongly reopen the
@@ -1103,25 +1104,35 @@ struct TVPlayerView: View {
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
 
+    private var firstFrameCoverMetadata: PlaybackMeta? {
+        pendingAdvance?.issued == true ? pendingAdvance?.meta : (curMeta ?? meta)
+    }
+
+    private var firstFrameCoverMedia: PlayerFirstFrameMedia {
+        .init(libraryID: firstFrameCoverMetadata?.libraryId, videoID: firstFrameCoverMetadata?.videoId)
+    }
+
+    private var firstFrameCoverLayer: some View {
+        let metadata = firstFrameCoverMetadata
+        let displayTitle = pendingAdvance?.issued == true
+            ? (pendingAdvance?.title ?? title) : (curTitle.isEmpty ? title : curTitle)
+        return PlayerFirstFrameArtwork(
+            visible: firstFrameCover.showsArtwork(media: firstFrameCoverMedia, failed: loadFailed,
+                exited: leftPlayback, contextCurrent: playbackMutationTarget.stillOwnsCurrentContext(core: core)),
+            id: metadata?.libraryId, type: metadata?.type ?? "movie", title: displayTitle, poster: metadata?.poster
+        )
+        .id(firstFrameCoverMedia)
+    }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             Color.black.ignoresSafeArea()
 
             playerSurface
 
-            // BINGE-ADVANCE SURFACE GATE: while an episode advance is in flight (parked by play(episode:),
-            // cleared exactly at commitPendingAdvanceOnFirstFrame), the surface underneath still holds the
-            // OUTGOING episode: during the resolve window the old file is literally still rendering, and
-            // after the incoming load is issued AVPlayerLayer retains its last decoded contents across
-            // replaceCurrentItem (the mpv Metal layer likewise keeps its last drawable) until the incoming
-            // file's first frame. That read as "plays seconds of the OLD episode" on a binge advance. Hold
-            // an opaque cover for the whole pendingAdvance window; it drops on the same main-actor turn as
-            // the first-frame commit, so the first visible frame IS the committed episode. The published
-            // identity itself is untouched (still first-frame commit); this gates only what is VISIBLE.
-            // Source switches (switchStream) never park a pendingAdvance and are deliberately not covered.
-            if pendingAdvance?.issued == true {
-                Color.black.ignoresSafeArea()
-            }
+            // Shared launch/incoming-episode art replaces the existing pending-advance black gate.
+            // Same-media recovery retains the last revealed picture; identity still commits only below.
+            firstFrameCoverLayer
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
@@ -1195,6 +1206,7 @@ struct TVPlayerView: View {
         .tint(Theme.Palette.accent)
         .onAppear {
             refreshAutoSkipSettings()
+            firstFrameCover.beginPresentation()
             VXProbeState.shared.setRoute("player")
             // #130 mitigation: hold a short background assertion while a loopback (torrent) stream plays, so a
             // quick app-switch away does not immediately suspend us and tear down the server listener. No-op
@@ -1337,15 +1349,15 @@ struct TVPlayerView: View {
         // Quality buttons must appear when they do. `streamsEpoch` bumps ONLY when the engine's ready-stream
         // set actually changed, so this is the exact, cheap edge the cached counts need: no per-body-pass walk,
         // and no waiting for the viewer to open a panel before the buttons show up.
-        .onChange(of: playbackDeadlineClock.isPaused) { _ in refreshPlaybackIdleTimer() }
-        .onChange(of: loadFailed) { _ in refreshPlaybackIdleTimer() }
-        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+        .onChange(of: playbackDeadlineClock.isPaused) { refreshPlaybackIdleTimer() }
+        .onChange(of: loadFailed) { refreshPlaybackIdleTimer() }
+        .onChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
         }
         // The options panel and the failure screen list sources, so they follow every engine change.
-        .onChange(of: showOptions || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
-        .onChange(of: core.streamsEpoch) { _ in
+        .onChange(of: showOptions || loadFailed) { _, listsSources in engineChanges.followAll(listsSources) }
+        .onChange(of: core.streamsEpoch) {
             refreshSourceOptionCounts()
             establishSubtitleTimingScopeIfAvailable()
             if appliedAutoTracks {
@@ -1353,15 +1365,15 @@ struct TVPlayerView: View {
                 applyCurrentSubtitleDelayIfReady(force: false)
             }
         }
-        .onChange(of: account.streamSources) { _ in
+        .onChange(of: account.streamSources) {
             // Account/profile changes replace the add-on and credential authority behind a preload. A source
             // resolved under the old account must never be published into the new one.
             invalidateNextEpisodePreparation(reason: "stream sources changed")
         }
-        .onChange(of: allEpisodes.map(\.id)) { _ in
+        .onChange(of: allEpisodes.map(\.id)) {
             consumePendingManualEpisodeNavigationIfReady()
         }
-        .onChange(of: sourceSwitchGeneration) { _ in
+        .onChange(of: sourceSwitchGeneration) {
             fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
@@ -1671,6 +1683,16 @@ struct TVPlayerView: View {
         loadToken: PlayerLoadToken,
         position: Double
     ) {
+        // Keep delayed asset acceptance on the same exact deferred-start/active-owner transaction.
+        // Delayed acceptance must also reveal; keep this before the existing one-shot effects latch.
+        if pendingAdvance == nil, assetSanityDeferredStartToken == loadToken,
+           assetSanityAttempt.isAccepted(owner: loadToken) {
+            firstFrameCover.acceptStart(callbackOwner: loadToken,
+                activeOwner: coordinator.player?.activeLoadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia, accepted: true,
+                contextCurrent: !leftPlayback && playbackMutationTarget.stillOwnsCurrentContext(core: core))
+        }
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
@@ -1950,6 +1972,9 @@ struct TVPlayerView: View {
         }
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
             adoptResumeSurfaceIfCurrent(loadToken: loadToken)
+            firstFrameCover.bind(owner: loadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia)
             // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
             completionEvidence.begin(owner: loadToken,
                                      mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0)
@@ -3299,6 +3324,29 @@ struct TVPlayerView: View {
     /// and falls back to itself when no translation exists.
     private static func l10n(_ key: String) -> String { String(localized: LocalizedStringResource(stringLiteral: key)) }
 
+    private var audioPresetRows: [OptionRow] {
+        let engine = coordinator.player as? MPVMetalViewController
+        var rows = [OptionRow(accessibilityID: "audio.preset.header",
+                              label: String(localized: "Audio preset · this session"), isHeader: true)]
+        for preset in PlayerSessionAudioPreset.allCases {
+            let unavailable = engine?.sessionAudioPresetUnavailableReason(for: preset)
+                ?? (engine == nil ? PlayerSessionAudioPresetState.avPlayerUnavailable : nil)
+            rows.append(OptionRow(
+                accessibilityID: "audio.preset.\(preset.rawValue)",
+                label: Self.l10n(preset.label),
+                detail: Self.l10n(unavailable ?? preset.detail),
+                isSelected: engine?.sessionAudioPreset.selected == preset,
+                isEnabled: unavailable == nil
+            ) {
+                (coordinator.player as? MPVMetalViewController)?.setSessionAudioPreset(preset)
+            })
+        }
+        if let message = engine?.sessionAudioPreset.message {
+            rows.append(OptionRow(accessibilityID: "audio.preset.status",
+                                  label: Self.l10n(message), isEnabled: false))
+        }
+        return rows
+    }
     /// Rows for the currently-open panel only, never mixed. Tracks are grouped by language; a "Settings"
     /// row drills into a dedicated sub-panel (sync / size / colour for subtitles, sync for audio).
     private var optionRows: [OptionRow] {
@@ -3311,17 +3359,14 @@ struct TVPlayerView: View {
                     rememberSeriesAudio(track.lang, explicit: true)
                 }
             }
-            // Audio Sync is libmpv-only (setAudioDelay is a no-op on AVPlayer, which offers no track offset), so
-            // hide the drill-in when the AVFoundation engine is active (#76). Track selection itself works on both.
-            if !isAVPlayerActive {
-                rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
-            }
+            // Keep the drill-in reachable on AVPlayer so its unsupported session presets are explicit.
+            // Track selection itself remains unchanged on both engines.
+            rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rows
         case .audioSettings:
-            // Reached only on libmpv (the drill-in above is hidden on AVPlayer); guard anyway so a stale
-            // navigation never shows inert controls.
+            // AVPlayer exposes no equivalent preset DSP or manual sync/output route.
             if isAVPlayerActive {
-                return [OptionRow(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)]
+                return [OptionRow(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)] + audioPresetRows
             }
             let now = String(format: "%+.1fs", audioDelay)
             var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true),
@@ -3337,6 +3382,7 @@ struct TVPlayerView: View {
                     coordinator.player?.setAudioOutputMode(m)
                 })
             }
+            rows.append(contentsOf: audioPresetRows)
             return rows
         case .subtitles:
             // Settings FIRST (the user's primary in-session action), then Off, then one row per language.
@@ -4255,6 +4301,10 @@ struct TVPlayerView: View {
         }
         if let issuedToken {
             cancelEmptySourceRecovery()
+            let coverMetadata = pendingAdvance?.meta ?? curMeta ?? meta
+            firstFrameCover.bind(owner: issuedToken,
+                mountGeneration: (player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: .init(libraryID: coverMetadata?.libraryId, videoID: coverMetadata?.videoId))
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
@@ -5049,7 +5099,7 @@ struct TVPlayerView: View {
                     }
                     .padding(Theme.Space.lg)
                 }
-                .onChange(of: optionRow) { _ in
+                .onChange(of: optionRow) {
                     if accessibilityReduceMotion {
                         proxy.scrollTo(optionRow, anchor: .center)
                     } else {
@@ -8945,7 +8995,7 @@ struct TVPlayerView: View {
                                 .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
                         }
                     }
-                    .buttonStyle(.plain)
+                    .vortxSelfFocusButton()
                     .accessibilityLabel("Skip \(segment.kind.rawValue) now")
                     .accessibilityHint("Skips this segment immediately")
 
@@ -8969,7 +9019,7 @@ struct TVPlayerView: View {
                                     )
                                 }
                         }
-                        .buttonStyle(.plain)
+                        .vortxSelfFocusButton()
                         .accessibilityLabel("Cancel automatic skip for \(segment.kind.rawValue)")
                         .accessibilityHint("Hides this prompt and will not auto-skip this segment again")
                     }
@@ -11028,6 +11078,7 @@ struct TVPlayerView: View {
         cancelDirectResumeInventoryRefresh()
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        firstFrameCover.retire()
         cancelEmptySourceRecovery()
         refreshPlaybackIdleTimer()
         refindTask?.cancel(); refindTask = nil; refinding = false   // a settling re-find must not retry into a left player
@@ -12071,6 +12122,10 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
         update(vc)
     }
 
+    static func dismantleUIViewController(_ vc: CatchVC, coordinator: ()) {
+        vc.retireCallbacks()
+    }
+
     private func update(_ vc: CatchVC) {
         vc.onPress = onPress
         vc.onSwipe = onSwipe
@@ -12240,7 +12295,25 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
 
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
+            acceptsRepeat = true
             setNeedsFocusUpdate(); updateFocusIfNeeded()
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            acceptsRepeat = false
+            stopRepeat()
+            super.viewWillDisappear(animated)
+        }
+
+        fileprivate func retireCallbacks() {
+            acceptsRepeat = false
+            stopRepeat()
+            onPress = nil
+            onSwipe = nil
+            onAccessibilityFocus = nil
+            onAccessibilityActivate = nil
+            onAccessibilityAdjust = nil
+            onAccessibilityEscape = nil
         }
 
         /// Lock focus on the catcher. It is the ONLY focusable while playing and it handles every remote
@@ -12292,6 +12365,26 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
         private var repeatTimer: Timer?
         private var repeatType: UIPress.PressType?
         private var repeatCount = 0
+        private var repeatGeneration: UUID?
+        private var acceptsRepeat = false
+
+        /// Foundation retains its target; the target must not retain the controller. Selector delivery
+        /// stays on the main run loop instead of enqueueing a Task for every held-remote tick.
+        @MainActor
+        private final class RepeatTarget: NSObject {
+            weak var owner: CatchVC?
+            let generation: UUID
+
+            init(owner: CatchVC, generation: UUID) {
+                self.owner = owner
+                self.generation = generation
+            }
+
+            @objc func fire(_ timer: Timer) {
+                guard let owner else { timer.invalidate(); return }
+                owner.repeatTick(timer, generation: generation)
+            }
+        }
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             var handled = false
@@ -12330,18 +12423,37 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
 
         private func startRepeat(_ type: UIPress.PressType) {
             stopRepeat()
+            guard acceptsRepeat else { return }
             repeatType = type; repeatCount = 0
-            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] t in
-                guard let self, let type = self.repeatType else { t.invalidate(); return }
-                self.repeatCount += 1
-                if self.repeatCount > 120 { self.stopRepeat(); return }   // ~14s safety cap
-                self.onPress?(type)
-            }
+            let generation = UUID()
+            repeatGeneration = generation
+            let target = RepeatTarget(owner: self, generation: generation)
+            let timer = Timer(timeInterval: 0.12, target: target,
+                              selector: #selector(RepeatTarget.fire(_:)), userInfo: nil, repeats: true)
             timer.fireDate = Date().addingTimeInterval(0.45)              // hold delay before repeats kick in
-            RunLoop.main.add(timer, forMode: .common)
             repeatTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
         }
-        private func stopRepeat() { repeatTimer?.invalidate(); repeatTimer = nil; repeatType = nil }
+
+        private func repeatTick(_ timer: Timer, generation: UUID) {
+            guard acceptsRepeat, repeatGeneration == generation,
+                  repeatTimer === timer, let type = repeatType else {
+                timer.invalidate()
+                return
+            }
+            repeatCount += 1
+            if repeatCount > 120 { stopRepeat(); return }                // ~14s safety cap
+            onPress?(type)
+        }
+
+        private func stopRepeat() {
+            // Retire admission before invalidation, so a queued old tick cannot act on a new hold.
+            repeatGeneration = nil
+            let timer = repeatTimer
+            repeatTimer = nil
+            repeatType = nil
+            timer?.invalidate()
+        }
 
         override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
             super.didUpdateFocus(in: context, with: coordinator)

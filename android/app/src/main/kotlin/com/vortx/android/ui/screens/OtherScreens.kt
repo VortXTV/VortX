@@ -38,6 +38,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -73,6 +74,7 @@ import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.randompick.RandomLibraryPickHeader
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.CollectionsHub
 import com.vortx.android.ui.components.CollectionsBrowseScreen
@@ -292,9 +294,11 @@ fun LibraryScreen(
     onPreviouslyWatched: (() -> Unit)? = null,
     onSmartCollections: (() -> Unit)? = null,
     onNetworkShares: (() -> Unit)? = null,
+    onRandomPlay: (MetaItem) -> Unit = onDirectResume,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
+    val randomPick by viewModel.randomPickState.collectAsStateWithLifecycle()
     val result = (state as? UiState.Success<LibraryResult>)?.data
     val filters = result?.filters
     val allItems = result?.items.orEmpty()
@@ -305,6 +309,10 @@ fun LibraryScreen(
     val applicableFilters = remember(segmentedItems) { LibrarySmartFilter.applicable(segmentedItems) }
     var selectedFilters by remember { mutableStateOf(emptySet<LibrarySmartFilter>()) }
     val activeFilters = selectedFilters intersect applicableFilters.toSet()
+
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.clearRandomPick() }
+    }
 
     val libraryHeader: @Composable () -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
@@ -329,6 +337,13 @@ fun LibraryScreen(
                 available = applicableFilters,
                 active = activeFilters,
                 onToggle = { selectedFilters = LibrarySmartFilter.toggle(selectedFilters, it) },
+            )
+            RandomLibraryPickHeader(
+                state = randomPick,
+                onPick = viewModel::pickRandom,
+                onOpen = { viewModel.randomPickForAction(onItem) },
+                onPlay = { viewModel.randomPickForAction(onRandomPlay) },
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }

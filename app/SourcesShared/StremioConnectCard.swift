@@ -56,15 +56,16 @@ struct StremioConnectCard: View {
         .onReceive(account.$isSignedIn) { signedIn in
             handleStremioSignIn(signedIn: signedIn)
         }
-        .onChange(of: account.credentialBoundaryGeneration) { _ in
+        .onValueChange(of: account.credentialBoundaryGeneration) { _ in
             handleStremioSignIn(signedIn: account.isSignedIn)
         }
-        .onChange(of: account.isSignedIn) { signedIn in
+        .onValueChange(of: account.isSignedIn) { signedIn in
             // Re-arm the one-shot latch after a disconnect so a later reconnect runs the handoff again.
             if !signedIn { didHandleSignIn = false }
         }
     }
 
+    @MainActor
     private func handleStremioSignIn(signedIn: Bool) {
         guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
         didHandleSignIn = true
@@ -76,6 +77,7 @@ struct StremioConnectCard: View {
         }
     }
 
+    @MainActor
     private func disconnect() {
         account.signOut()
         core.logOut()

@@ -54,21 +54,82 @@ enum StreamRanking {
     /// and one score() runs ~15 patterns; a long stream list re-ranked per render meant
     /// thousands of regex compilations per pass (the 0.2.45 sluggishness). Patterns compile
     /// once, and each stream's parsed text and final score are memoized.
-    private static let cacheLock = NSLock()
-    private static var regexCache: [String: NSRegularExpression] = [:]
-    private static var textCache: [Int: String] = [:]
-    /// `qualityLabel` per stream key. The label is a pure function of the cached text, but computing it runs
-    /// several regexes; the player's Quality button asked for it on every render across thousands of sources.
-    private static var labelCache: [Int: String] = [:]
-    private static var scoreCache: [Int: Int] = [:]
+    private struct TextKey: Hashable, Sendable {
+        let name: String?
+        let description: String?
+        let filename: String?
+
+        init(_ stream: CoreStream) {
+            name = stream.name
+            description = stream.description
+            filename = stream.behaviorHints?.filename
+        }
+    }
+
+    /// Scoring reads these structural signals in addition to text. In particular, media-server provenance
+    /// and the NZB-aware torrent classification must not share a memo entry with a different source type.
+    private struct ScoreStreamKey: Hashable, Sendable {
+        let text: TextKey
+        let hasURL: Bool
+        let hasInfoHash: Bool
+        let hasProvider: Bool
+        let isTorrent: Bool
+
+        init(_ stream: CoreStream) {
+            text = TextKey(stream)
+            hasURL = stream.url != nil
+            hasInfoHash = stream.infoHash != nil
+            hasProvider = stream.vortxProvider != nil
+            isTorrent = stream.isTorrent
+        }
+    }
+
+    /// Freeze the preference values used by computeScore BEFORE lookup. A detached task can still be
+    /// ranking an older profile snapshot after Settings invalidates the memo. That result belongs only to
+    /// its own exact preference key, never the current profile's. The same capture drives the computation.
+    private struct ScorePreferences: Sendable {
+        struct Identity: Hashable, Sendable {
+            let tierWeights: [Int]
+            let preferTerms: [String]
+            let avoidBehavior: String
+            let keywordsAreRegex: Bool
+            let excludeTerms: [String]
+            let excludePattern: String?
+            let excludeOptions: UInt?
+        }
+
+        let identity: Identity
+        let excludeRegex: NSRegularExpression?
+
+        init(_ prefs: SourcePrefsReading) {
+            let regex = prefs.excludeRegex
+            excludeRegex = regex
+            identity = Identity(tierWeights: SourceType.allCases.map { prefs.tierWeight(for: $0) },
+                                preferTerms: prefs.preferTerms, avoidBehavior: prefs.avoidBehavior,
+                                keywordsAreRegex: prefs.keywordsAreRegex, excludeTerms: prefs.excludeTerms,
+                                excludePattern: regex?.pattern, excludeOptions: regex?.options.rawValue)
+        }
+
+        func tierWeight(for type: SourceType) -> Int {
+            guard let index = SourceType.allCases.firstIndex(of: type) else { return 0 }
+            return identity.tierWeights[index]
+        }
+    }
+
+    private struct ScoreKey: Hashable, Sendable {
+        let stream: ScoreStreamKey
+        let preferences: ScorePreferences.Identity
+        let audioLanguages: [String]
+        let confirmedCacheHit: Bool
+    }
+
+    private static let regexCache = RankingMemo<String, NSRegularExpression?>(capacity: 256)
+    private static let textCache = RankingMemo<TextKey, String>(capacity: 32_768)
+    private static let labelCache = RankingMemo<TextKey, String>(capacity: 32_768)
+    private static let scoreCache = RankingMemo<ScoreKey, Int>(capacity: 32_768)
 
     private static func regex(_ pattern: String) -> NSRegularExpression? {
-        cacheLock.lock(); defer { cacheLock.unlock() }
-        if let hit = regexCache[pattern] { return hit }
-        guard let compiled = try? NSRegularExpression(pattern: pattern) else { return nil }
-        if regexCache.count > 256 { regexCache.removeAll() }   // defensive cap; the pattern set is fixed today
-        regexCache[pattern] = compiled
-        return compiled
+        regexCache.value(for: pattern) { try? NSRegularExpression(pattern: pattern) }
     }
 
     /// Whether `pattern` matches anywhere in `text`, via the compiled-pattern cache.
@@ -85,20 +146,15 @@ enum StreamRanking {
         return String(text[r])
     }
 
-    /// Per-stream memoization key over every field that feeds the text parse.
-    private static func streamKey(_ s: CoreStream) -> Int {
-        var hasher = Hasher()
-        hasher.combine(s.url); hasher.combine(s.infoHash); hasher.combine(s.name)
-        hasher.combine(s.description); hasher.combine(s.behaviorHints?.filename)
-        return hasher.finalize()
-    }
-
     /// The audio preference contributes to a stream score, so score's memo identity must carry the same
     /// canonical value that languageScore evaluates. The picker and persisted values are user input: normalize
     /// case and whitespace, drop blanks, then remove order/duplicate noise because the ranking treats them as a
     /// membership set rather than a priority list.
     private static func canonicalAudioLanguagePreference() -> [String] {
-        Array(Set(TrackPreferences.current.audioLanguages.compactMap { language in
+        canonicalAudioLanguagePreference(TrackPreferences.current.audioLanguages)
+    }
+    private static func canonicalAudioLanguagePreference(_ languages: [String]) -> [String] {
+        Array(Set(languages.compactMap { language in
             let normalized = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             return normalized.isEmpty ? nil : normalized
         })).sorted()
@@ -106,7 +162,7 @@ enum StreamRanking {
 
     /// Drop memoized scores; called when ranking preferences change (scores embed them).
     static func invalidateCaches() {
-        cacheLock.lock(); scoreCache.removeAll(); cacheLock.unlock()
+        scoreCache.invalidate()
     }
 
     /// The stream's quality text, exposed for source-continuity hints.
@@ -401,59 +457,39 @@ enum StreamRanking {
     static func score(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
         // `TrackPreferences.current` may be task-local for an in-player source-language choice. Freeze its
         // semantic value before building the memo identity AND before computing the score: reading it once for
-        // the key and again in languageScore would let a task-local scope change between those reads and cache
-        // the result under the wrong preference. Empty keeps the legacy keys exactly, including the cached-hit
-        // variant, so the common no-session-override path remains byte-for-byte compatible with its existing
-        // memo entries.
+        // the key and again in languageScore would cache the result under the wrong preference.
         let preferredAudioLanguages = canonicalAudioLanguagePreference()
+        let preferences = ScorePreferences(SourcePreferences.reading)
+        return score(s, debridCachedHashes: debridCachedHashes,
+                     preferredAudioLanguages: preferredAudioLanguages, preferences: preferences)
+    }
+
+    /// Pure shared memo path. Both UI-live and explicit worker captures use the
+    /// same semantic key/computation; this helper never reads mutable preferences.
+    private static func score(_ s: CoreStream, debridCachedHashes: Set<String>,
+                              preferredAudioLanguages: [String], preferences: ScorePreferences) -> Int {
         // A coordinator-confirmed debrid cache hit adjusts the score, so it must NOT share a memo entry with
         // the same stream scored without the cached set (that would leak a hit-adjusted score into an empty-set
         // call and vice-versa). Earlier this BYPASSED the memo for cached hits, but that made every cached
         // stream re-run full computeScore on every call: on iOS the control bar re-ranks per body eval, so
-        // 4000 cached streams times N evals of unmemoized regex scoring saturated the main thread. Instead fold
-        // the cached bit INTO the Int memo key (re-hash of the base key plus the hit flag, the same 64-bit
-        // collision class streamKey itself already tolerates) so both variants coexist and both stay memoized.
+        // 4000 cached streams times N evals of unmemoized regex scoring saturated the main thread. Keep the
+        // confirmed-cache bit in the value key so both variants coexist and both stay memoized.
         // Folding a single BIT is sound because computeScore reads the set only through membership of this
         // stream's own infoHash (the isCached +8000 override), so the score depends on the set through
-        // exactly that bit. The empty set, which is every existing non-debrid call site, keeps the plain
-        // streamKey and is byte-identical to before.
+        // exactly that bit. Exact value equality, rather than an Int hash as identity, keeps unrelated
+        // streams and preference snapshots separate even when their dictionary hashes collide.
         let isCachedHit = !debridCachedHashes.isEmpty
             && (s.infoHash?.lowercased()).map(debridCachedHashes.contains) == true
-        let key: Int
-        if preferredAudioLanguages.isEmpty {
-            if isCachedHit {
-                var hasher = Hasher()
-                hasher.combine(streamKey(s))
-                hasher.combine(true)
-                key = hasher.finalize()
-            } else {
-                key = streamKey(s)
-            }
-        } else {
-            var hasher = Hasher()
-            hasher.combine(streamKey(s))
-            hasher.combine(isCachedHit)
-            hasher.combine(preferredAudioLanguages)
-            key = hasher.finalize()
+        let key = ScoreKey(stream: ScoreStreamKey(s), preferences: preferences.identity,
+                           audioLanguages: preferredAudioLanguages, confirmedCacheHit: isCachedHit)
+        return scoreCache.value(for: key) {
+            computeScore(s, debridCachedHashes: debridCachedHashes,
+                         preferredAudioLanguages: Set(preferredAudioLanguages), preferences: preferences)
         }
-        cacheLock.lock()
-        if let hit = scoreCache[key] { cacheLock.unlock(); return hit }
-        cacheLock.unlock()
-        let value = computeScore(s, debridCachedHashes: debridCachedHashes,
-                                 preferredAudioLanguages: Set(preferredAudioLanguages))
-        cacheLock.lock()
-        // Cap above the largest realistic source list (popular titles return a few thousand
-        // streams across add-ons). At 4096 a single big title thrashed the cache mid-render
-        // (clear, refill, clear) and lost the memoization it exists for; 32768 clears that while
-        // still bounding a runaway.
-        if scoreCache.count > 32_768 { scoreCache.removeAll() }
-        scoreCache[key] = value
-        cacheLock.unlock()
-        return value
     }
 
     private static func computeScore(_ s: CoreStream, debridCachedHashes: Set<String> = [],
-                                     preferredAudioLanguages: Set<String>) -> Int {
+                                     preferredAudioLanguages: Set<String>, preferences: ScorePreferences) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
         // Source ladder: STRICT and the dominant WITHIN-resolution key (issue #68, a remux must beat
@@ -527,7 +563,7 @@ enum StreamRanking {
         // order is the top-level key). Avoid -20000 sinks a matching source well past the quality spread yet
         // stays above the -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole
         // point of "rank"). Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
-        score += chipScoreOffset(text)
+        score += chipScoreOffset(text, preferences: preferences)
         // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (4313), so
         // a cached stream always beats an uncached one of the same source type, which is the
         // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
@@ -540,7 +576,7 @@ enum StreamRanking {
         // awareness-only slice, so it still plays via the torrent server, not debrid. The +8000 cached
         // bonus above lifts it WITHIN the torrent tier; the .debrid retag waits for the cached-PLAY path.
         let type = sourceType(s, text)
-        score += SourcePreferences.reading.tierWeight(for: type)
+        score += preferences.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
         // providers without ever crossing a quality or tier boundary.
         score += providerOffset(for: provider(text))
@@ -570,25 +606,27 @@ enum StreamRanking {
     /// preferred-and-cached source never crosses its source-type tier); -20000 sinks a source below the
     /// quality spread but keeps it above the -100000 junk floor so it stays visible.
     static func chipScoreOffset(_ text: String) -> Int {
-        let prefs = SourcePreferences.reading
+        chipScoreOffset(text, preferences: ScorePreferences(SourcePreferences.reading))
+    }
+
+    private static func chipScoreOffset(_ text: String, preferences: ScorePreferences) -> Int {
+        let prefs = preferences.identity
         var offset = 0
         if !prefs.preferTerms.isEmpty, prefs.preferTerms.contains(where: { text.contains($0) }) {
             offset += 2500
         }
-        if prefs.avoidBehavior == "rank", avoidMatches(text, prefs) {
-            offset -= 20_000
+        if prefs.avoidBehavior == "rank" {
+            let avoided: Bool
+            if prefs.keywordsAreRegex {
+                avoided = preferences.excludeRegex.map {
+                    $0.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+                } ?? false
+            } else {
+                avoided = prefs.excludeTerms.contains(where: { text.contains($0) })
+            }
+            if avoided { offset -= 20_000 }
         }
         return offset
-    }
-
-    /// Whether the stream text matches the viewer's Avoid (Hide / exclude) terms, honoring regex vs
-    /// substring mode the same way `passesUserFilters` does. Used only by the "rank" Avoid path.
-    private static func avoidMatches(_ text: String, _ prefs: SourcePrefsReading) -> Bool {
-        if prefs.keywordsAreRegex {
-            if let rx = prefs.excludeRegex { return prefs.matches(rx, text) }
-            return false
-        }
-        return prefs.excludeTerms.contains(where: { text.contains($0) })
     }
 
     /// `pattern` matched only at delimiter boundaries: no alphanumeric on either side, so "ts"
@@ -929,9 +967,16 @@ enum StreamRanking {
     /// Whether a stream survives the user's keyword + safety filters (Settings > Streams). Default
     /// preferences pass everything, so this is a no-op until the user opts in.
     static func passesUserFilters(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Bool {
-        let prefs = SourcePreferences.reading
-        let preferredAudioLanguages = Set(canonicalAudioLanguagePreference())
-        let kids = ProfileStore.activeIsKids()
+        passesUserFilters(s, debridCachedHashes: debridCachedHashes,
+            preferences: SourcePreferences.reading,
+            preferredAudioLanguages: Set(canonicalAudioLanguagePreference()), kids: ProfileStore.activeIsKids())
+    }
+
+    /// Shared filter body. Snapshot callers never dispatch to a live preference
+    /// owner or profile; the protocol witness here is their immutable Snapshot.
+    private static func passesUserFilters(_ s: CoreStream, debridCachedHashes: Set<String>,
+                                          preferences prefs: SourcePrefsReading,
+                                          preferredAudioLanguages: Set<String>, kids: Bool) -> Bool {
         if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
         let text = qualityText(s)
         if kids {
@@ -1072,15 +1117,94 @@ enum StreamRanking {
     /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first; feeds the
     /// "Watch in 4K" button's resolution dropdown.
     static func resolutionOptions(_ groups: [CoreStreamSourceGroup]) -> [(label: String, stream: CoreStream)] {
+        resolutionOptions(groups, scoring: { score($0) })
+    }
+    private static func resolutionOptions(_ groups: [CoreStreamSourceGroup],
+                                          scoring: (CoreStream) -> Int) -> [(label: String, stream: CoreStream)] {
         let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil && !$0.isYouTubeTrailer }
         var bestByLabel: [String: CoreStream] = [:]
         for s in playable {
             let label = qualityLabel(s)
-            if let existing = bestByLabel[label], score(existing) >= score(s) { continue }
+            if let existing = bestByLabel[label], scoring(existing) >= scoring(s) { continue }
             bestByLabel[label] = s
         }
         return bestByLabel.map { (label: $0.key, stream: $0.value) }
-            .sorted { score($0.stream) > score($1.stream) }
+            .sorted { scoring($0.stream) > scoring($1.stream) }
+    }
+
+
+    /// Captured source-list worker inputs only. No UI payload or singleton gains
+    /// Sendable. TaskLocal/live getters are deliberately absent from this path.
+    struct WorkerPreferences: Sendable {
+        let source: SourcePreferences.Snapshot
+        let audioLanguages: [String]
+        let isKids: Bool
+    }
+
+    /// Exact SourceList presentation policy: ordinary (non-preserveChosenRelease)
+    /// ranking with no binge override, stickyAuthoritative=false. Existing UI and
+    /// binge/preload entry points retain their richer live policy unchanged.
+    static func capturedPresentation(_ input: [CoreStreamSourceGroup], preferences: WorkerPreferences,
+                                     continuity hint: String?, pin: ResolvedPin?,
+                                     sticky: (addon: String?, bingeGroup: String?)?,
+                                     providerPenalty: (@Sendable (String) -> Bool)?,
+                                     debridCachedHashes: Set<String>)
+        -> ([CoreStreamSourceGroup], CoreStream?, [String], [(label: String, stream: CoreStream)]) {
+        let prefs = preferences.source
+        let audio = canonicalAudioLanguagePreference(preferences.audioLanguages)
+        let scorePreferences = ScorePreferences(prefs)
+        let groups: [CoreStreamSourceGroup]
+        let playableInput = stripNonVideo(input)
+        if prefs.noFiltersActive && !preferences.isKids { groups = playableInput }
+        else {
+            groups = playableInput.compactMap { group in
+                let kept = group.streams.filter {
+                    passesUserFilters($0, debridCachedHashes: debridCachedHashes,
+                        preferences: prefs, preferredAudioLanguages: Set(audio), kids: preferences.isKids)
+                }
+                return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)
+            }
+        }
+        let ranked: [CoreStreamSourceGroup]
+        if prefs.useAddonOrder { ranked = groups }
+        else {
+            ranked = groups.map { group in
+                var scored: [(stream: CoreStream, score: Int, index: Int)] = []
+                for (index, stream) in group.streams.enumerated() {
+                    scored.append((stream, score(stream, debridCachedHashes: debridCachedHashes,
+                        preferredAudioLanguages: audio, preferences: scorePreferences)
+                        + pinBonus(stream, addon: group.addon, pin: pin), index))
+                }
+                scored.sort { $0.score != $1.score ? $0.score > $1.score : $0.index < $1.index }
+                return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: scored.map(\.stream))
+            }
+        }
+        let best: CoreStream?
+        if prefs.useAddonOrder {
+            if pin != nil, let hit = firstPinned(ranked, pin: pin) { best = hit }
+            else { best = ranked.flatMap(\.streams).first { $0.playableURL != nil && !$0.isYouTubeTrailer } }
+        } else {
+            best = playablePairs(ranked).max { lhs, rhs in
+                (score(lhs.stream, debridCachedHashes: debridCachedHashes,
+                    preferredAudioLanguages: audio, preferences: scorePreferences)
+                    + callerBonuses(lhs.stream, addon: lhs.addon, hint: hint, binge: nil,
+                        sticky: sticky, stickyAuthoritative: false)
+                    + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)
+                    + healthPenalty(addon: lhs.addon, isUnhealthy: providerPenalty))
+                < (score(rhs.stream, debridCachedHashes: debridCachedHashes,
+                    preferredAudioLanguages: audio, preferences: scorePreferences)
+                    + callerBonuses(rhs.stream, addon: rhs.addon, hint: hint, binge: nil,
+                        sticky: sticky, stickyAuthoritative: false)
+                    + pinBonus(rhs.stream, addon: rhs.addon, pin: pin)
+                    + healthPenalty(addon: rhs.addon, isUnhealthy: providerPenalty))
+            }?.stream
+        }
+        // Preserve the old resolutionOptions(groups) behavior: its score() call
+        // used an empty cache set even when the main source rank used cache hits.
+        let resolutions = resolutionOptions(ranked, scoring: {
+            score($0, debridCachedHashes: [], preferredAudioLanguages: audio, preferences: scorePreferences)
+        })
+        return (ranked, best, tiers(ranked), resolutions)
     }
 
     /// The stream's resolution as a comparable tier number (4000 / 2160 / 1080 / 720 / …), the same
@@ -1284,16 +1408,7 @@ enum StreamRanking {
     /// not the best one.) A bare "4k"/"uhd" tag is only trusted when the file size isn't implausibly
     /// small for 4K, so a low-res file that merely carries a 4k tag isn't promoted to the 4K bucket.
     static func qualityLabel(_ s: CoreStream) -> String {
-        let key = streamKey(s)
-        cacheLock.lock()
-        if let hit = labelCache[key] { cacheLock.unlock(); return hit }
-        cacheLock.unlock()
-        let label = uncachedQualityLabel(qualityText(s))
-        cacheLock.lock()
-        if labelCache.count > 32_768 { labelCache.removeAll() }   // same bound as textCache
-        labelCache[key] = label
-        cacheLock.unlock()
-        return label
+        labelCache.value(for: TextKey(s)) { uncachedQualityLabel(qualityText(s)) }
     }
 
     private static func uncachedQualityLabel(_ t: String) -> String {
@@ -1370,10 +1485,10 @@ enum StreamRanking {
     }
 
     private static func qualityText(_ s: CoreStream) -> String {
-        let key = streamKey(s)
-        cacheLock.lock()
-        if let hit = textCache[key] { cacheLock.unlock(); return hit }
-        cacheLock.unlock()
+        textCache.value(for: TextKey(s)) { uncachedQualityText(s) }
+    }
+
+    private static func uncachedQualityText(_ s: CoreStream) -> String {
         // Container extensions are stripped from the WHOLE text, not just the filename field:
         // add-ons embed file names in the stream name or description too, and a plain ".ts"
         // (MPEG-TS) must never read as a TeleSync marker to the junk detector. Boundary-checked
@@ -1393,15 +1508,6 @@ enum StreamRanking {
             text = re.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
                                                withTemplate: "")
         }
-        cacheLock.lock()
-        // Cap matched to scoreCache (32768): textCache is the substrate under score/qualityLabel/tiers/
-        // flavorTags/sizeText/isNonVideo. At 4096 a popular title returning a few thousand UNIQUE stream
-        // keys (TorBox/Singularity duplicates carry distinct names) thrashed this mid-render (clear, refill,
-        // clear), turning every per-stream text access into a full rebuild and saturating the main thread on
-        // a 4000+ source title (the Infinity War watchdog kill). 32768 clears that while still bounding a runaway.
-        if textCache.count > 32_768 { textCache.removeAll() }
-        textCache[key] = text
-        cacheLock.unlock()
         return text
     }
 

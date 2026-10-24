@@ -81,7 +81,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 0c30f4782aee544a2b7e33169ad60d03630d4097
+          ref: 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "0c30f4782aee544a2b7e33169ad60d03630d4097" \
+          test "$vortx_sha" = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f" \
             || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
           rm -rf vortx-core
@@ -147,7 +147,7 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
-          test "$VORTX_ENGINE_SOURCE_SHA" = 0c30f4782aee544a2b7e33169ad60d03630d4097
+          test "$VORTX_ENGINE_SOURCE_SHA" = 2ea2e0f27dd2e53b7b28228435ca35a70f92831f
           test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
           target="$(mktemp -d "$RUNNER_TEMP/native-sync-host.XXXXXXXX")"
           proof="$GITHUB_WORKSPACE/android/app/build/reports/native-sync-host"

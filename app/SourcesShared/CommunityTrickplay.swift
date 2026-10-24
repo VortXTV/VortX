@@ -1,6 +1,7 @@
 import Foundation
 #if !TRICKPLAY_E2E_POLICY_TESTING
 import CryptoKit
+import os
 #if canImport(AppKit)
 import AppKit
 #elseif canImport(UIKit)
@@ -607,19 +608,20 @@ enum CommunityTrickplay {
 
     /// tmdb->imdb map, persisted so each title resolves over the network at most ONCE per install. It is read
     /// from `cachedIMDbID` (any thread) and mutated from `resolveIMDbID` (detached tasks) concurrently, so
-    /// every access goes through `tmdb2ttLock`. The UserDefaults write runs on a snapshot taken under the lock
+    /// every access goes through `tmdb2ttState`. The UserDefaults write runs on a snapshot taken under the lock
     /// but is issued outside it, so a slow defaults write never holds off other readers.
     private static let tmdb2ttDefaultsKey = "stremiox.trickplay.tmdb2tt"
-    private static let tmdb2ttLock = NSLock()
-    private static var tmdb2ttCache: [String: String] = {
-        (UserDefaults.standard.dictionary(forKey: tmdb2ttDefaultsKey) as? [String: String]) ?? [:]
-    }()
+    private struct TMDBCacheState: Sendable {
+        var values: [String: String]
+    }
+    private static let tmdb2ttState = OSAllocatedUnfairLock(initialState: TMDBCacheState(
+        values: (UserDefaults.standard.dictionary(forKey: tmdb2ttDefaultsKey) as? [String: String]) ?? [:]
+    ))
 
     /// Synchronous cache lookup: the tt id previously resolved for a raw `tmdb:…` library id, or nil.
     static func cachedIMDbID(for rawId: String) -> String? {
         let key = rawId.lowercased()
-        tmdb2ttLock.lock(); defer { tmdb2ttLock.unlock() }
-        return tmdb2ttCache[key]
+        return tmdb2ttState.withLock { $0.values[key] }
     }
 
     /// Resolve a `tmdb:…` library id (the identity our hub/TMDB catalogs key plays with) to its `tt…` IMDb id,
@@ -633,9 +635,7 @@ enum CommunityTrickplay {
     /// nil on an unparseable id / both lookups missing.
     static func resolveIMDbID(rawId: String, seriesHint: Bool) async -> String? {
         let cacheKey = rawId.lowercased()
-        tmdb2ttLock.lock()
-        let cached = tmdb2ttCache[cacheKey]
-        tmdb2ttLock.unlock()
+        let cached = tmdb2ttState.withLock { $0.values[cacheKey] }
         if let cached { return cached }
         // "tmdb:693134" (canonical), tolerating "tmdb:movie:693134" / "tmdb:tv:693134".
         let parts = cacheKey.split(separator: ":").map(String.init)
@@ -644,10 +644,10 @@ enum CommunityTrickplay {
         let order = explicit.map { [$0] } ?? (seriesHint ? ["tv", "movie"] : ["movie", "tv"])
         for media in order {
             if let tt = await fetchExternalIMDbID(media: media, tmdbID: numeric) {
-                tmdb2ttLock.lock()
-                tmdb2ttCache[cacheKey] = tt
-                let snapshot = tmdb2ttCache
-                tmdb2ttLock.unlock()
+                let snapshot = tmdb2ttState.withLock { state in
+                    state.values[cacheKey] = tt
+                    return state.values
+                }
                 UserDefaults.standard.set(snapshot, forKey: tmdb2ttDefaultsKey)
                 VXProbe.log("tp", "resolved \(VXProbeRedaction.identityToken(rawId)) -> \(VXProbeRedaction.identityToken(tt)) (\(media))")
                 return tt

@@ -49,7 +49,7 @@ final class CommunityAddonStore: ObservableObject {
     private init() {}
 
     /// The official, public community collection endpoint (same host the app already uses for auth).
-    private static let url = URL(string: "https://api.strem.io/addonscollection.json")!
+    nonisolated private static let url = URL(string: "https://api.strem.io/addonscollection.json")!
 
     func load(force: Bool = false) {
         guard force || (!loaded && !loading) else { return }

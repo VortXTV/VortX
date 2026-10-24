@@ -184,7 +184,7 @@ private struct PlayerStyledSeekSlider: View {
                 onScrubChanged(target)
             }
             .onEnded { _ in finishDrag() })
-        .onChange(of: gestureActive) { active in
+        .onValueChange(of: gestureActive) { active in
             // SwiftUI also resets GestureState when a drag is cancelled by the system.
             if !active { finishDrag() }
         }
@@ -1142,7 +1142,7 @@ private struct PlayerTouchOptionsButton: View {
                 content()
                 #endif
             }
-            .onChange(of: presented, perform: onVisibilityChanged)
+            .onValueChange(of: presented, perform: onVisibilityChanged)
     }
 }
 
@@ -1624,6 +1624,8 @@ struct PlayerScreen: View {
     @State private var macIsFullScreen = false
     /// Observers for the fullscreen-state notifications, torn down on disappear.
     @State private var macFullScreenObservers: [NSObjectProtocol] = []
+    /// Revokes already-enqueued native callbacks before observers are removed or a new presentation starts.
+    @State private var macFullScreenObservationID: UUID?
     /// Whether the player's window was ALREADY in native fullscreen when the player opened. If so the app
     /// was fullscreen for browsing (the user's own choice) and we leave it that way on teardown; if not, a
     /// fullscreen the PLAYER itself entered is dropped on close so the viewer lands back in windowed browse.
@@ -1989,6 +1991,7 @@ struct PlayerScreen: View {
     /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    @State private var firstFrameCover = PlayerFirstFrameCoverPolicy<PlayerLoadToken>()
     /// Wall-clock uptime of the genuine first-frame event (set only alongside the true `hasStartedPlaying =
     /// true` transition below, never at the "foreground re-mount was not issued, restore the playing state"
     /// site - that one never actually stopped presentation, so resetting this there would wrongly reopen the
@@ -2164,21 +2167,21 @@ struct PlayerScreen: View {
         // whole movie (micro stutter + audio crackle on every stream).
         .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(playbackGateToken); LoopbackPlaybackAssertion.begin(for: url) }
         // Panels and the failure screen list sources, so they follow every engine change.
-        .onChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
+        .onValueChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
         // A first frame, remote resume or dismissed dialog re-arms a visible bar. The original
         // one-shot timer could expire during loading/pausing and never run again until another tap.
-        .onChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }
-        .onChange(of: core.streamsEpoch) { _ in
+        .onValueChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }
+        .onValueChange(of: core.streamsEpoch) { _ in
             establishSubtitleTimingScopeIfAvailable()
             if appliedAutoTracks {
                 restoreSubtitleTimingOffsetIfReady()
                 applyCurrentSubtitleDelayIfReady(force: false)
             }
         }
-        .onChange(of: allEpisodeRefs) { _ in
+        .onValueChange(of: allEpisodeRefs) { _ in
             consumePendingManualEpisodeNavigationIfReady()
         }
-        .onChange(of: sourceSwitchGeneration) { _ in
+        .onValueChange(of: sourceSwitchGeneration) { _ in
             fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
@@ -2369,11 +2372,32 @@ struct PlayerScreen: View {
             .ignoresSafeArea()
     }
 
+    private var firstFrameCoverMetadata: PlaybackMeta? {
+        pendingAdvance?.issued == true ? pendingAdvance?.meta : curMeta
+    }
+
+    private var firstFrameCoverMedia: PlayerFirstFrameMedia {
+        .init(libraryID: firstFrameCoverMetadata?.libraryId, videoID: firstFrameCoverMetadata?.videoId)
+    }
+
+    private var firstFrameCoverLayer: some View {
+        let metadata = firstFrameCoverMetadata
+        let displayTitle = pendingAdvance?.issued == true ? (pendingAdvance?.title ?? title) : curTitle
+        return PlayerFirstFrameArtwork(
+            visible: firstFrameCover.showsArtwork(media: firstFrameCoverMedia, failed: loadFailed,
+                exited: playbackExited, contextCurrent: playbackMutationTarget.stillOwnsCurrentContext(core: core)),
+            id: metadata?.libraryId, type: metadata?.type ?? "movie", title: displayTitle, poster: metadata?.poster
+        )
+        .id(firstFrameCoverMedia)
+    }
+
     private var mpvBody: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             playerSurface
+
+            firstFrameCoverLayer
 
             // A dedicated transparent surface owns one-finger taps independently of pinch. Actual
             // buttons/panels remain above it; decorative buffering must not steal its hit tests.
@@ -2533,6 +2557,7 @@ struct PlayerScreen: View {
         .onAppear {
             refreshAutoSkipSettings()
             playbackExited = false
+            firstFrameCover.beginPresentation()
             persistenceBlockedForExit = false
             // Diagnostic-only: this is the player surface, so the heartbeat reports the player route.
             VXProbeState.shared.setRoute("player")
@@ -2621,7 +2646,7 @@ struct PlayerScreen: View {
             observeMacFullScreen()
             #endif
         }
-        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+        .onValueChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
         }
@@ -2883,6 +2908,16 @@ struct PlayerScreen: View {
         loadToken: PlayerLoadToken,
         position: Double
     ) {
+        // The deferred-start token exists only after the exact existing start/audio transaction.
+        // Delayed acceptance must also reveal; keep this before the existing one-shot effects latch.
+        if pendingAdvance == nil, assetSanityDeferredStartToken == loadToken,
+           assetSanityAttempt.isAccepted(owner: loadToken) {
+            firstFrameCover.acceptStart(callbackOwner: loadToken,
+                activeOwner: coordinator.player?.activeLoadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia, accepted: true,
+                contextCurrent: !playbackExited && playbackMutationTarget.stillOwnsCurrentContext(core: core))
+        }
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
@@ -3136,6 +3171,9 @@ struct PlayerScreen: View {
         }
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
             adoptResumeSurfaceIfCurrent(loadToken: loadToken)
+            firstFrameCover.bind(owner: loadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia)
             // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
             completionEvidence.begin(owner: loadToken,
                                      mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0)
@@ -4151,14 +4189,31 @@ struct PlayerScreen: View {
     /// higher maxWidth), write it to a temp JPEG, and present the share sheet so the still can be saved or
     /// sent anywhere. iOS / Mac only - tvOS has no share sheet.
     private func grabFrame() {
-        coordinator.player?.captureFrameJPEGData(maxWidth: 2560) { data in
+        guard let player = coordinator.player, let originalLoad = player.activeLoadToken else { return }
+        let originalEngine = ObjectIdentifier(player)
+        let originalSource = sourceSwitchGeneration
+        let raw = recordMeta?.name ?? "VortX"
+        let base = raw.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined()
+        let name = "VortX-\(base.isEmpty ? "frame" : base)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString).jpg"
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        player.captureFrameJPEGData(maxWidth: 2560) { data in
             guard let data else { return }
-            let raw = recordMeta?.name ?? "VortX"
-            let base = raw.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined()
-            let name = "VortX-\(base.isEmpty ? "frame" : base)-\(Int(Date().timeIntervalSince1970)).jpg"
-            let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-            guard (try? data.write(to: target)) != nil else { return }
-            DispatchQueue.main.async { self.grabbedFrame = GrabbedFrame(url: target) }
+            // Both engines deliver their legacy completion on the UI owner. File I/O
+            // belongs on utility, and a delayed capture must not present on another load.
+            DispatchQueue.global(qos: .utility).async {
+                guard (try? data.write(to: target, options: .atomic)) != nil else { return }
+                DispatchQueue.main.async {
+                    guard !playbackExited, sourceSwitchGeneration == originalSource,
+                          let current = coordinator.player,
+                          ObjectIdentifier(current) == originalEngine,
+                          current.activeLoadToken == originalLoad else {
+                        // Only this capture's unique, generated temporary file is retired.
+                        DispatchQueue.global(qos: .utility).async { try? FileManager.default.removeItem(at: target) }
+                        return
+                    }
+                    self.grabbedFrame = GrabbedFrame(url: target)
+                }
+            }
         }
     }
 
@@ -4396,6 +4451,10 @@ struct PlayerScreen: View {
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            let coverMetadata = pendingAdvance?.meta ?? curMeta
+            firstFrameCover.bind(owner: issuedToken,
+                mountGeneration: (player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: .init(libraryID: coverMetadata?.libraryId, videoID: coverMetadata?.videoId))
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
@@ -7928,6 +7987,7 @@ struct PlayerScreen: View {
         episodeSourceHydrationGeneration = UUID()
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
+        firstFrameCover.retire()
         invalidateEpisodeResolution()
         episodeSwitchGeneration &+= 1
         episodeResolveGeneration = nil
@@ -10213,6 +10273,29 @@ struct PlayerScreen: View {
         }
     }
 
+    /// Both Apple player surfaces use the same session policy/recipes; no track/volume/sync writes.
+    private var audioPresetRows: [Row] {
+        let engine = coordinator.player as? MPVMetalViewController
+        var rows = [Row(label: String(localized: "Audio preset · this session"), isHeader: true)]
+        for preset in PlayerSessionAudioPreset.allCases {
+            let unavailable = engine?.sessionAudioPresetUnavailableReason(for: preset)
+                ?? (engine == nil ? PlayerSessionAudioPresetState.avPlayerUnavailable : nil)
+            rows.append(Row(
+                label: Self.l10n(preset.label),
+                detail: Self.l10n(unavailable ?? preset.detail),
+                selected: engine?.sessionAudioPreset.selected == preset,
+                isEnabled: unavailable == nil,
+                accessibilityHint: String(localized: "Applies only to this player session")
+            ) {
+                // Resolve the current controller at activation, not the engine captured by an old row.
+                (coordinator.player as? MPVMetalViewController)?.setSessionAudioPreset(preset)
+            })
+        }
+        if let message = engine?.sessionAudioPreset.message {
+            rows.append(Row(label: Self.l10n(message), wraps: true, isEnabled: false))
+        }
+        return rows
+    }
     private func rows(for p: Panel) -> [Row] {
         switch p {
         case .video:
@@ -10448,10 +10531,10 @@ struct PlayerScreen: View {
             rs.append(Row(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rs
         case .audioSettings:
-            // AVPlayer manages audio delay + output routing itself: setAudioDelay / setAudioOutputMode are
-            // no-ops on that engine, so hide the inert controls rather than show rows that do nothing (#76).
+            // AVPlayer retains system-managed delay/output. Show the explicit DSP limitation, not
+            // inert controls or an AVPlayer volume change pretending to be a processing preset.
             if isAVPlayerActive {
-                return [Row(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)]
+                return [Row(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)] + audioPresetRows
             }
             let now = String(format: "%+.1fs", audioDelay)
             var rs = [Row(label: String(localized: "Sync"), isHeader: true),
@@ -10467,6 +10550,7 @@ struct PlayerScreen: View {
                     coordinator.player?.setAudioOutputMode(m)
                 })
             }
+            rs.append(contentsOf: audioPresetRows)
             return rs
         case .quality:
             // Best stream per resolution (4K / 1080p / 720p / …); picking one hot-swaps the source at the
@@ -11096,36 +11180,35 @@ struct PlayerScreen: View {
         let alreadyFullScreen = window?.styleMask.contains(.fullScreen) ?? false
         macIsFullScreen = alreadyFullScreen
         macWasFullScreenAtOpen = alreadyFullScreen
+        let observationID = UUID()
+        macFullScreenObservationID = observationID
+        let windowID = window.map(ObjectIdentifier.init)
+        let receive: @MainActor @Sendable (Bool) -> Void = { fullScreen in
+            guard macFullScreenObservationID == observationID, !playbackExited else { return }
+            macIsFullScreen = fullScreen
+            // AppKit fullscreen re-hosts the backing on entry AND exit. Re-assert the current player's
+            // EDR tags only while this original window observation is still installed; no second hop
+            // can outlive the accepted observation and act on a replacement presentation.
+            (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
+        }
         let nc = NotificationCenter.default
-        // Scope the observers to the player's own window via `object:` so an auxiliary window's fullscreen
-        // transition (a Settings or About window) does not flip the player glyph. When the window is not yet
-        // resolvable (object nil observes all windows), the closure's identity check is the fallback guard.
+        // Keep the original window filter. Only scalar identity and the owned receiver cross the
+        // nonisolated NotificationCenter callback; no NSWindow/Notification is transferred to the turn.
         let enter = nc.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { note in
-            guard window == nil || (note.object as? NSWindow) === window else { return }
-            macIsFullScreen = true
-            // HDR/DV EDR survives fullscreen: AppKit native fullscreen re-hosts the content in a NEW
-            // fullscreen window/backing, which drops the mpv Metal layer's EDR activation + colorspace
-            // association, so PQ/HLG pixels presented as SDR (washed out) until a new file/gamma change.
-            // These notifications fire AFTER the window/backing swap completes, the correct moment to
-            // re-tag the colorspace and re-assert wantsExtendedDynamicRangeContent on the new backing.
-            // mpv lane only; AVPlayerLayer is EDR-native and needs nothing.
-            Task { @MainActor in
-                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
-            }
+            let eventWindowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
+            guard windowID == nil || eventWindowID == windowID else { return }
+            DispatchQueue.main.async { receive(true) }
         }
         let exit = nc.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { note in
-            guard window == nil || (note.object as? NSWindow) === window else { return }
-            macIsFullScreen = false
-            // Same re-sync on the way OUT: exiting fullscreen swaps back to the original window/backing,
-            // which loses the EDR activation the same way (see the enter handler above).
-            Task { @MainActor in
-                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
-            }
+            let eventWindowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
+            guard windowID == nil || eventWindowID == windowID else { return }
+            DispatchQueue.main.async { receive(false) }
         }
         macFullScreenObservers = [enter, exit]
     }
 
     private func unobserveMacFullScreen() {
+        macFullScreenObservationID = nil
         for token in macFullScreenObservers { NotificationCenter.default.removeObserver(token) }
         macFullScreenObservers = []
     }

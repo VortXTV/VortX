@@ -1,7 +1,13 @@
 // Pure synthetic source-extraction fixture. No app, SDK, account, network, or device state.
 import Foundation
+import Darwin
+import os
+
+// PRODUCTION_CHANGE_RECEIPT
 
 // PRODUCTION_JSON
+// PRODUCTION_MEMBERSHIP
+// PRODUCTION_LOCK
 // PRODUCTION_ERROR
 // PRODUCTION_PREVIOUSLY_WATCHED
 // BASELINE_PREVIOUSLY_WATCHED
@@ -11,22 +17,84 @@ private struct FixtureAddon {
     let manifest: VortxJSON?
 }
 
+// This recorder is an in-memory fixture sink. It has no SDK, engine, network, account,
+// persistence or device dependency; it only retains the actual production ChangeReceipt
+// value delivered by the extracted publication closure.
+private final class PublicationRecorder: Sendable {
+    private struct State: Sendable {
+        var owned: [ChangeReceipt] = []
+        var legacy: [[String]] = []
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func recordOwned(_ receipt: ChangeReceipt) {
+        state.withLock { $0.owned.append(receipt) }
+    }
+    func recordLegacy(_ fields: [String]) {
+        state.withLock { $0.legacy.append(fields) }
+    }
+    var ownedReceipts: [ChangeReceipt] { state.withLock { $0.owned } }
+    var legacyEvents: [[String]] { state.withLock { $0.legacy } }
+}
+
 private final class CurrentProjection {
-    private let lock = NSRecursiveLock()
+    private let lock = VortxNativeFacadeLock()
     private let registry: [FixtureAddon] = [.init(transportUrl: "https://fixture.invalid/manifest.json", manifest: .object(["id": .string("fixture")]))]
+    private static let presentationFields: Set<String> = ["ctx", "board", "search", "discover",
+        "library", "meta_details", "local_search", "continue_watching_preview"]
+    private let sourceID = UUID()
+    private var changeSequence: UInt64 = 0
+    private var latestChangeSequence: [String: UInt64] = [:]
+    private var resourceSelections: [String: UUID] = [:]
+    private var resourceValueTasks: [String: UUID] = [:]
+    private var accountEpoch = UUID()
+    private var watchlistProfileGeneration = UUID()
+    private var registryGeneration = UUID()
     private let resourceRegistryValid = true
     private var playback: VortxJSON?
     private var libraryRequest: VortxJSON?
     private var values: [String: VortxJSON]
-    init(playback: VortxJSON?, request: VortxJSON? = nil, detailID: String = "dup") {
+    private var metadataLibraryMembership = VortxLibraryMembership()
+    private var generations: [String: UUID] = [:]
+    private var closed = false
+    // Exact optional generic production hook, left nil in this RAM projection fixture.
+    // No concrete Facade alias or typed source-event identity is manufactured here.
+    // PRODUCTION_SOURCE_CHANGED_DELIVERY
+    private let ownedChange: (@Sendable (ChangeReceipt) -> Void)?
+    private let changed: @Sendable ([String]) -> Void
+    private func observeExternalMetadata(_ value: VortxJSON) {}
+    init(playback: VortxJSON?, request: VortxJSON? = nil, detailID: String = "dup",
+         recorder: PublicationRecorder? = nil) {
         self.playback = playback
         libraryRequest = request
-        values = ["meta_details": .object(["selected": .object(["metaPath": .object(["id": .string(detailID)])])])]
+        values = [
+            "native_state": .object(["activeProfileId": .string("ram-fixture")]),
+            "meta_details": .object(["selected": .object(["metaPath": .object(["id": .string(detailID)])])])
+        ]
+        if let recorder {
+            ownedChange = { recorder.recordOwned($0) }
+            changed = { recorder.recordLegacy($0) }
+        } else {
+            ownedChange = nil
+            changed = { _ in }
+        }
     }
-    func fields(_ state: VortxJSON) throws -> VortxJSON { .object(try stateFields(state)) }
+    func fields(_ state: VortxJSON) throws -> VortxJSON {
+        let fields = try stateFields(state)
+        fields.forEach { values[$0.key] = $0.value }
+        return .object(fields)
+    }
     func library(_ state: VortxJSON, request: VortxJSON?) -> VortxJSON? { libraryProjection(state: state, request: request) }
     func search(_ state: VortxJSON, query: String, limit: Int) -> VortxJSON? { localSearchProjection(state: state, query: query, maxResults: limit) }
+    func resourceDetail(_ id: String, stale: Bool = false) -> VortxJSON? {
+        let ticket = UUID()
+        generations["meta_details"] = stale ? UUID() : ticket
+        publish(["meta_details": .object(["selected": .object(["metaPath": .object(["id": .string(id)])]),
+                                        "unknownFixtureField": .string("retained")])], field: "meta_details", ticket: ticket)
+        return values["meta_details"]
+    }
     // PRODUCTION_CURRENT
+    // PRODUCTION_CURRENT_PUBLICATION
 }
 
 private final class BaselineProjection {
@@ -156,6 +224,47 @@ private final class BaselineProjection {
         do { _ = try newInvalid.fields(.object([:])) } catch { rejected += 1 }
         check(rejected == 2, "missing active library must still reject")
         print("PASS actual production projection: \(comparisons) full JSON/library/search comparisons, all six sorts, type filters, first-match and timestamp/removal boundaries")
+
+        let movies = CurrentProjection(playback: playback, request: request("name", type: "movie"))
+        let movieFields = try movies.fields(document)
+        check(movieFields["library"]?["catalog"]?.array?.contains { $0["_id"] == .string("dup") } == false,
+              "fixture's series really is absent from the filtered movie screen")
+        let seriesDetail = movies.resourceDetail("dup")
+        check(seriesDetail?["libraryItem"]?["_id"] == .string("dup"), "filtered-out saved series must retain resource Detail membership")
+        check(seriesDetail?["watchedVideoIds"] == .array([.string("dup:1:1")]), "watched ids remain from the acknowledged playback projection")
+        check(seriesDetail?["unknownFixtureField"] == .string("retained"), "metadata overlay retains unrelated raw fields")
+        check(movies.resourceDetail("history-only")?["libraryItem"] == .null, "watched-only row is never saved membership")
+        _ = movies.resourceDetail("dup")
+        check(movies.resourceDetail("not-in-library", stale: true)?["libraryItem"]?["_id"] == .string("dup"),
+              "actual publish ticket guard rejects stale metadata before membership lookup")
+        _ = try movies.fields(state([saved("replacement")]))
+        check(movies.resourceDetail("dup")?["libraryItem"] == .null &&
+              movies.resourceDetail("replacement")?["libraryItem"]?["_id"] == .string("replacement"),
+              "acknowledged replacement retires old membership without merging history")
+        let first: VortxJSON = .object(["_id": .string("same"), "opaque": .object(["keep": .unsigned(UInt64.max)])])
+        let watchedOnly: VortxJSON = .object(["_id": .string("same"), "previouslyWatched": .bool(true)])
+        let second: VortxJSON = .object(["_id": .string("same"), "name": .string("later duplicate")])
+        let index = VortxLibraryMembership([watchedOnly, .null, .object(["_id": .integer(7)]), first, second])
+        check(index.item(for: "same") == first && index.item(for: "missing") == nil,
+              "membership keeps first eligible literal-id row and all opaque values")
+        check(VortxLibraryMembership().item(for: "same") == nil, "empty/retired membership has no rows")
+        print("PASS filtered Library/resource metadata: current publish ticket, full membership, first-wins/opaque fields and acknowledged replacement")
+        let recorder = PublicationRecorder()
+        let receiptProjection = CurrentProjection(playback: playback, recorder: recorder)
+        _ = receiptProjection.resourceDetail("receipt-title")
+        let firstReceipt = recorder.ownedReceipts.first
+        check(recorder.ownedReceipts.count == 1 && recorder.legacyEvents == [["meta_details"]],
+              "first changed projection delivers owned receipt and legacy notification")
+        check(firstReceipt?.fields == ["meta_details"]
+              && firstReceipt?.values["meta_details"]?["unknownFixtureField"] == .string("retained")
+              && firstReceipt?.values["native_state"] == nil,
+              "owned receipt freezes presentation values and excludes control state")
+        _ = receiptProjection.resourceDetail("receipt-title")
+        check(recorder.ownedReceipts.count == 2 && recorder.legacyEvents.count == 1
+              && recorder.ownedReceipts[1].sequence > recorder.ownedReceipts[0].sequence,
+              "equal new resource publication carries an owned receipt without a legacy duplicate")
+        print("PASS optional ChangeReceipt publication: RAM fixture receives frozen presentation values")
+        if ProcessInfo.processInfo.environment["VORTX_LIBRARY_PROJECTION_FUNCTIONAL_ONLY"] == "1" { return }
 
         // Worst-shaped ordinary library: every saved row is also in a long CW array.
         // The old oracle runs once, not per sort; timing is host-only, not an installed-device claim.

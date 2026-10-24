@@ -3,12 +3,12 @@ import Foundation
 /// Profile presentation choices only. Account installation membership and deletion receipts never
 /// enter this value. Missing overrides follow the account owner's current choices, including future
 /// changes. An explicitly empty disabled list means all installed add-ons are visible.
-struct ProfileAddonPreferences: Codable, Equatable {
+struct ProfileAddonPreferences: Codable, Equatable, Sendable {
     var disabledAddonURLsOverride: [String]? = nil
     var rankingOverride: ProfileAddonRanking? = nil
 }
 
-struct ProfileAddonRanking: Codable, Equatable {
+struct ProfileAddonRanking: Codable, Equatable, Sendable {
     /// nil is used only by migrated source-ranking preferences that never had a personal add-on order.
     /// It continues following the account order until the viewer explicitly customizes the order.
     var addonOrder: [String]? = nil

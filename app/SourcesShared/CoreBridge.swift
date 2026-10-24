@@ -1,6 +1,8 @@
 import Foundation
 import CoreFoundation
+import Combine
 import CryptoKit
+import os
 #if os(macOS)
 import AppKit
 #endif
@@ -44,13 +46,58 @@ struct CoreBoardPageRequest {
 /// app does. We dispatch JSON actions into it, read JSON state out, and it calls us back (on a Rust
 /// worker thread) whenever model fields change, so the UI can re-pull exactly what changed.
 final class CoreBridge: ObservableObject {
-    static let shared = CoreBridge()
+    @MainActor static let shared = CoreBridge()
     /// In the gated engine every active profile has a native bucket. An unbound session is
     /// unavailable, never permission to read the previous account's global overlay caches.
     var usesNativeProfileState: Bool {
         true
     }
     private let nativeFacadeLock = NSLock()
+    private var nativeSubtitleDomain: UUID { nativePlaybackReadLifetime.subtitleDomain }
+    /// Only actual writer admission constructs this scalar proof, while B is held.
+    /// Facade capture joins its private profile generation under F before registration.
+    struct NativeSubtitleOwnerProof: Equatable, Sendable {
+        let domain: UUID
+        let installation: UUID
+        let credential: CredentialScopeRegistry.Capture
+        let sourceID: UUID
+        let profileID: UUID
+        let accountGeneration: UUID
+        let originalApplicationEpoch: UUID
+        fileprivate init(domain: UUID, installation: UUID, credential: CredentialScopeRegistry.Capture,
+                         sourceID: UUID, profileID: UUID, accountGeneration: UUID,
+                         originalApplicationEpoch: UUID) {
+            self.domain = domain; self.installation = installation; self.credential = credential
+            self.sourceID = sourceID; self.profileID = profileID; self.accountGeneration = accountGeneration
+            self.originalApplicationEpoch = originalApplicationEpoch
+        }
+    }
+    @MainActor
+    func captureNativeSubtitleOwner(_ original: PlaybackMutationTarget,
+                                    originalApplicationEpoch: UUID) -> CredentialPublicationOutbox.SubtitleMountOwner? {
+        nativeFacadeLock.withLock {
+            guard case .native(let requested?) = original,
+                  LegacyWatchOwnership.applicationEpochIsCurrent(originalApplicationEpoch),
+                  currentNativePlaybackBinding() == requested,
+                  let facade = nativeFacadeStorage, let account = requested.accountGeneration else { return nil }
+            return facade.captureNativeSubtitleOwner(.init(domain: nativeSubtitleDomain,
+                installation: requested.sessionGeneration, credential: requested.credential,
+                sourceID: facade.sourceID, profileID: requested.profileID, accountGeneration: account,
+                originalApplicationEpoch: originalApplicationEpoch))
+        }
+    }
+    private let nativePlaybackReadLifetime = NativePlaybackReadLifetime()
+    private let nativeMetadataAdmissionFence = VortxNativeMetadataAdmissionFence()
+    private let nativeCallbackLifetime = NativeCallbackLifetime()
+    @MainActor private lazy var nativeCallbackReceiver = NativeCallbackReceiver(core: self)
+    @MainActor private lazy var metadataDecodeReceiver = NativeMetadataDecodeReceiver(core: self)
+    @MainActor private var ownedMetadataHostIdentity = UUID()
+    @MainActor private var ownedMetadataIntent: NativeMetadataIntent?
+    @MainActor private var ownedMetadataSelection: VortxNativeCoreFacade.MetadataSelectionReceipt?
+    @MainActor private var ownedMetadataDecode = UUID()
+    @MainActor private var ownedMetadataTask: Task<Void, Never>?
+    @MainActor private var ownedMetadataOverlayDecode = UUID()
+    @MainActor private var ownedMetadataOverlayTask: Task<Void, Never>?
     private var nativeFacadeStorage: VortxNativeCoreFacade?
     private var nativeCredentialCapture: CredentialScopeRegistry.Capture?
     private var nativeInstallGeneration = UUID()
@@ -64,6 +111,7 @@ final class CoreBridge: ObservableObject {
     private var nativePublishedAccountGeneration: UUID?
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     #if os(macOS)
+    @MainActor
     private var quitProgressObserver: NSObjectProtocol?
     #endif
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
@@ -93,7 +141,7 @@ final class CoreBridge: ObservableObject {
         let profileID: UUID
         let intent: NativeForegroundSyncPolicy.ResourceIntent
     }
-    private struct NativeResourceIntentScope: Equatable {
+    private struct NativeResourceIntentScope: Equatable, Sendable {
         let credential: CredentialScopeRegistry.Capture
         let profileID: UUID?
     }
@@ -108,26 +156,6 @@ final class CoreBridge: ObservableObject {
         return .init(credential: capture, profileID: profileID,
                      intent: .init(searchQuery: searchLoaded && searchScope == scope ? searchPublication.activeQuery : nil,
                                    metadataAction: metadata.2 == scope ? metadata.0 : nil, metadataGeneration: metadata.1))
-    }
-    @MainActor
-    func replayNativeResourceRestore(_ receipt: NativeResourceRestoreReceipt?, target: PlaybackMutationTarget) {
-        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
-              PlaybackMutationOwnershipPolicy.allowsNative(target, binding: binding) else { return }
-        let scope = NativeResourceIntentScope(credential: binding.credential, profileID: binding.profileID)
-        let oldIntent = receipt.flatMap { $0.credential == binding.credential && $0.profileID == binding.profileID ? $0.intent : nil }
-            ?? .init(searchQuery: nil, metadataAction: nil, metadataGeneration: UUID())
-        let searchScope = nativeFacadeLock.withLock { nativeSearchRequestScope }
-        // A request made between close and install is newer than the held receipt, but was not
-        // dispatchable. Replay it only under its own original owner/profile, including a cold mount.
-        if let query = oldIntent.searchToReplay(currentQuery: searchPublication.activeQuery,
-                                               hasPendingSearch: searchLoaded, pendingScopeIsCurrent: searchScope == scope) { search(query) }
-        let metadata = metaLoadTargetLock.withLock { (nativeMetaRequestAction, nativeMetaRequestGeneration, nativeMetaRequestScope) }
-        if let data = oldIntent.metadataToReplay(currentAction: metadata.0, currentGeneration: metadata.1,
-                                                 pendingScopeIsCurrent: metadata.2 == scope),
-           let action = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            guard nativePlaybackTargetIsCurrent(target) else { return }
-            dispatch(action: action, field: "meta_details")
-        }
     }
     func nativePlaybackSnapshot() -> VortxJSON? {
         guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
@@ -145,6 +173,101 @@ final class CoreBridge: ObservableObject {
     func captureNativePlaybackTarget() -> PlaybackMutationTarget {
         nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }
     }
+    /// Retire inside B BEFORE any install/published-account/source replacement.
+    /// Worker reads release this short scalar lock before touching F or mirrors.
+    fileprivate final class NativePlaybackReadLifetime: Sendable {
+        let subtitleDomain = UUID()
+        private let state = OSAllocatedUnfairLock(initialState: UUID())
+        func capture() -> UUID { state.withLock { $0 } }
+        func accepts(_ original: UUID) -> Bool { state.withLock { $0 == original } }
+        func retire() {
+            // Close admission before the following owner field replacement. This short
+            // synchronous helper does NOT delay that replacement until native drain;
+            // the async install/profile-FIFO paths own their explicit drain tickets.
+            let retirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: subtitleDomain)
+            state.withLock { $0 = UUID() }
+            Task {
+                await CredentialPublicationOutbox.waitForSubtitleRetirement(retirement)
+                CredentialPublicationOutbox.finishSubtitleRetirement(retirement)
+            }
+        }
+    }
+    /// A read predicate only, never FIFO/mutation/checkpoint/metadata authority.
+    /// No CoreBridge reference, actor object or current singleton is retained.
+    struct NativePlaybackReadCapability: Sendable {
+        let binding: PlaybackMutationOwnershipPolicy.NativeBinding
+        let publishedAccount: UUID
+        let facadeBinding: VortxNativeCoreFacade.WatchlistBinding
+        let publicationEpoch: UInt64
+        let sourceID: UUID
+        fileprivate let facade: VortxNativeCoreFacade
+        fileprivate let originalInstallationIsCurrent: @Sendable () -> Bool
+        fileprivate let originalEpochIsCurrent: @Sendable () -> Bool
+        fileprivate init(binding: PlaybackMutationOwnershipPolicy.NativeBinding, publishedAccount: UUID,
+            facadeBinding: VortxNativeCoreFacade.WatchlistBinding, publicationEpoch: UInt64,
+            sourceID: UUID, facade: VortxNativeCoreFacade,
+            originalInstallationIsCurrent: @escaping @Sendable () -> Bool,
+            originalEpochIsCurrent: @escaping @Sendable () -> Bool) {
+            self.binding = binding; self.publishedAccount = publishedAccount
+            self.facadeBinding = facadeBinding; self.publicationEpoch = publicationEpoch
+            self.sourceID = sourceID; self.facade = facade
+            self.originalInstallationIsCurrent = originalInstallationIsCurrent
+            self.originalEpochIsCurrent = originalEpochIsCurrent
+        }
+        func owns(_ original: PlaybackMutationTarget?) -> Bool {
+            original == PlaybackMutationTarget.native(binding)
+        }
+        func isCurrent() -> Bool {
+            guard originalInstallationIsCurrent(), originalEpochIsCurrent(),
+                  CredentialScopeRegistry.shared.isCurrent(binding.credential),
+                  binding.accountGeneration == publishedAccount,
+                  facadeBinding.accountGeneration == publishedAccount,
+                  facadeBinding.profileID == binding.profileID.uuidString,
+                  facadeBinding.scope.account == binding.credential.namespace,
+                  let selection = ProfileSelectionRead.snapshot(),
+                  selection.activeID == binding.profileID,
+                  selection.activeProfile?.id == binding.profileID,
+                  facade.sourceID == sourceID, facade.isAvailable,
+                  facade.registryBinding?.profileID == facadeBinding.profileID,
+                  facade.watchlistBinding == facadeBinding else { return false }
+            // Never hold the lifetime/epoch mutex across F or a profile read.
+            // Recheck the ORIGINAL witnesses, not a newly acquired owner.
+            return originalInstallationIsCurrent() && originalEpochIsCurrent()
+                && CredentialScopeRegistry.shared.isCurrent(binding.credential)
+                && ProfileSelectionRead.snapshot() == selection
+                && facade.watchlistBinding == facadeBinding
+                && facade.registryBinding?.profileID == facadeBinding.profileID
+        }
+    }
+    /// Only an explicit initiating owner entry calls this BEFORE its worker hop.
+    /// B -> scalar/F reads only. No callback, publisher, I/O or await under B.
+    @MainActor
+    func captureNativePlaybackReadCapability(_ target: PlaybackMutationTarget) -> NativePlaybackReadCapability? {
+        let epoch = capturePublicationToken().epoch, epochState = publicationEpochState
+        let callbacks = nativeCallbackLifetime
+        return nativeFacadeLock.withLock {
+            guard case .native(let binding?) = target,
+                  currentNativePlaybackBinding() == binding,
+                  let facade = nativeFacadeStorage,
+                  nativeCredentialCapture == binding.credential,
+                  let published = nativePublishedAccountGeneration,
+                  binding.accountGeneration == published,
+                  let facadeBinding = facade.watchlistBinding,
+                  facadeBinding.accountGeneration == published,
+                  facadeBinding.profileID == binding.profileID.uuidString else { return nil }
+            let lifetime = nativePlaybackReadLifetime, stamp = lifetime.capture()
+            let callbackInstallation = nativeCallbackGeneration, source = facade.sourceID
+            guard callbacks.accepts(callbackInstallation, credential: binding.credential, sourceID: source) else { return nil }
+            let capability = NativePlaybackReadCapability(binding: binding, publishedAccount: published,
+                facadeBinding: facadeBinding, publicationEpoch: epoch, sourceID: source, facade: facade,
+                originalInstallationIsCurrent: {
+                    lifetime.accepts(stamp)
+                        && callbacks.accepts(callbackInstallation, credential: binding.credential, sourceID: source)
+                }, originalEpochIsCurrent: { epochState.withLock { $0 == epoch } })
+            return capability.isCurrent() ? capability : nil
+        }
+    }
+
     func nativePlaybackTargetIsCurrent(_ target: PlaybackMutationTarget) -> Bool { nativePlaybackBinding(target) != nil }
     /// Manual UI gestures acknowledge persistence, not merely admission to the native FIFO.
     @MainActor
@@ -234,7 +357,8 @@ final class CoreBridge: ObservableObject {
     }
     /// Called only under nativeFacadeLock; never substitute a new session into a captured target.
     private func currentNativePlaybackBinding() -> PlaybackMutationOwnershipPolicy.NativeBinding? {
-        guard let profile = ProfileStore.shared.activeID, let capture = nativeCredentialCapture,
+        guard let selection = ProfileSelectionRead.snapshot(), let profile = selection.activeProfile?.id,
+              selection.activeID == profile, let capture = nativeCredentialCapture,
               CredentialScopeRegistry.shared.isCurrent(capture), let facade = nativeFacadeStorage,
               facade.isAvailable, facade.registryBinding?.profileID == profile.uuidString else { return nil }
         let epoch = facade.accountGeneration
@@ -248,6 +372,7 @@ final class CoreBridge: ObservableObject {
             return (facade, binding.profileID)
         }
     }
+    @MainActor
     func nativeResumeSeconds(for meta: PlaybackMeta, target: PlaybackMutationTarget) async -> Double {
         guard let (facade, profile) = nativePlaybackBinding(target), case .native(let binding?) = target, let epoch = binding.accountGeneration else { return 0 }
         let id = meta.usesSeriesLifecycle ? meta.videoId : meta.libraryId
@@ -390,7 +515,13 @@ final class CoreBridge: ObservableObject {
             }.map(\.id)
             VortXSyncManager.shared.updateNativeOwnAccountAvailability(missing: missing, profiles: profiles, capture: capture)
         }
-        nativeFacadeLock.withLock { nativePublishedAccountGeneration = snapshot.generation }
+        nativeFacadeLock.withLock {
+            if nativePublishedAccountGeneration != snapshot.generation {
+                nativePlaybackReadLifetime.retire()
+                nativeMetadataAdmissionFence.retireInstallation()
+            }
+            nativePublishedAccountGeneration = snapshot.generation
+        }
         if shouldReloadCredentials {
             VortxNativeCredentialSelectionRelay.shared.publish {
                 projection.stillOwnsCurrentContext(core: self)
@@ -476,7 +607,7 @@ final class CoreBridge: ObservableObject {
               ProfileStore.shared.activeID == profile else { throw VortxNativeError.closed }
         return try VortxNativeWatchlist.entries(host: snapshot.host, profileID: profile)
     }
-    struct NativeWatchlistTarget {
+    struct NativeWatchlistTarget: Sendable {
         fileprivate let owner: PlaybackMutationOwnershipPolicy.NativeBinding
         fileprivate let binding: VortxNativeCoreFacade.WatchlistBinding
         fileprivate let facade: VortxNativeCoreFacade
@@ -489,7 +620,8 @@ final class CoreBridge: ObservableObject {
     }
     private func captureNativeWatchlistTarget() -> NativeWatchlistTarget? {
         nativeFacadeLock.withLock {
-            guard let profile = ProfileStore.shared.activeID, let capture = nativeCredentialCapture,
+            guard let selection = ProfileSelectionRead.snapshot(), let profile = selection.activeProfile?.id,
+                  selection.activeID == profile, let capture = nativeCredentialCapture,
                   CredentialScopeRegistry.shared.isCurrent(capture), let facade = nativeFacadeStorage,
                   let binding = facade.watchlistBinding, UUID(uuidString: binding.profileID) == profile,
                   nativePublishedAccountGeneration == binding.accountGeneration else { return nil }
@@ -504,7 +636,7 @@ final class CoreBridge: ObservableObject {
     }
     /// Navigation records a displayed identity, not a durable mutation. Ordinary FIFO sync may be
     /// busy while a frame arrives; acknowledged owner/profile epochs still fence that receipt.
-    struct NativeNavigationTarget {
+    struct NativeNavigationTarget: Sendable {
         fileprivate let owner: NativeWatchlistTarget
     }
     func captureNativeNavigationTarget() -> NativeNavigationTarget? {
@@ -512,6 +644,56 @@ final class CoreBridge: ObservableObject {
     }
     func nativeNavigationTargetIsCurrent(_ target: NativeNavigationTarget) -> Bool {
         nativeWatchlistTargetIsCurrent(target.owner)
+    }
+    private struct NativeMetadataDispatchAdmission {
+        let navigation: NativeNavigationTarget
+        let receipt: VortxNativeCoreFacade.AcceptedNavigationReceipt
+        let installation: UUID
+    }
+    private func captureNativeMetadataDispatchAdmission() -> NativeMetadataDispatchAdmission? {
+        let installation = nativeMetadataAdmissionFence.captureInstallation()
+        guard let navigation = captureNativeNavigationTarget(),
+              nativeWatchlistTargetIsCurrent(navigation.owner),
+              let receipt = navigation.owner.facade.captureAcceptedNavigation(expected: navigation.owner.binding),
+              nativeWatchlistTargetIsCurrent(navigation.owner) else { return nil }
+        return .init(navigation: navigation, receipt: receipt, installation: installation)
+    }
+    private func nativeMetadataDispatchAdmissionIsCurrent(_ admission: NativeMetadataDispatchAdmission) -> Bool {
+        nativeWatchlistTargetIsCurrent(admission.navigation.owner)
+            && admission.navigation.owner.facade.acceptedNavigationIsCurrent(admission.receipt)
+    }
+    /// Read-only presentation ownership. Do not use this weaker busy-queue fence for a mutation
+    /// or pending playback admission: those still require PlaybackMutationTarget.
+    struct NativeAcceptedNavigationTarget: Sendable {
+        fileprivate let navigation: NativeNavigationTarget
+        fileprivate let receipt: VortxNativeCoreFacade.AcceptedNavigationReceipt
+    }
+    @MainActor func captureNativeAcceptedNavigationTarget() -> NativeAcceptedNavigationTarget? {
+        // Capture outside the non-recursive bridge lock, then recheck under that lock before
+        // the facade atomically captures its acknowledged owner and resource registry.
+        guard let navigation = captureNativeNavigationTarget() else { return nil }
+        return nativeFacadeLock.withLock {
+            guard acceptedNavigationOwnerIsCurrent(navigation),
+                  let receipt = navigation.owner.facade.captureAcceptedNavigation(expected: navigation.owner.binding) else { return nil }
+            return .init(navigation: navigation, receipt: receipt)
+        }
+    }
+    @MainActor func nativeAcceptedNavigationTargetIsCurrent(_ target: NativeAcceptedNavigationTarget) -> Bool {
+        nativeFacadeLock.withLock {
+            acceptedNavigationOwnerIsCurrent(target.navigation)
+                && target.navigation.owner.facade.acceptedNavigationIsCurrent(target.receipt)
+        }
+    }
+    /// Called only under nativeFacadeLock; never recapture or substitute a current facade here.
+    @MainActor private func acceptedNavigationOwnerIsCurrent(_ navigation: NativeNavigationTarget) -> Bool {
+        let captured = navigation.owner
+        return nativeFacadeStorage === captured.facade
+            && nativeCredentialCapture == captured.owner.credential
+            && CredentialScopeRegistry.shared.isCurrent(captured.owner.credential)
+            && nativeInstallGeneration == captured.owner.sessionGeneration
+            && ProfileStore.shared.activeID == captured.owner.profileID
+            && nativePublishedAccountGeneration == captured.binding.accountGeneration
+            && captured.owner.accountGeneration == captured.binding.accountGeneration
     }
     @MainActor func captureNativeWatchlistActionAdmission() -> NativeWatchlistActionAdmission {
         let target = captureNativeWatchlistTarget()
@@ -796,7 +978,11 @@ final class CoreBridge: ObservableObject {
               facade.registryBinding?.scope.ownerProfileID != id.uuidString else { throw VortxNativeError.closed }
         try await facade.mutateProfiles([.object(["type": .string("delete_profile"), "id": .string(id.uuidString)])], hostEdits: [], expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
         guard CredentialScopeRegistry.shared.isCurrent(binding.credential), nativeFacade === facade else { throw VortxNativeError.superseded }
-        nativeFacadeLock.withLock { nativeInstallGeneration = UUID() }
+        nativeFacadeLock.withLock {
+            nativePlaybackReadLifetime.retire()
+            nativeMetadataAdmissionFence.retireInstallation()
+            nativeInstallGeneration = UUID()
+        }
         try refreshNativeProfiles()
         loadBoard(); loadLibrary()
     }
@@ -810,12 +996,27 @@ final class CoreBridge: ObservableObject {
         try await facade.mutateProfiles([action], hostEdits: [], expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
         guard CredentialScopeRegistry.shared.isCurrent(binding.credential),
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeInstallGeneration == binding.sessionGeneration }) else { throw VortxNativeError.superseded }
-        nativeFacadeLock.withLock { nativeInstallGeneration = UUID() }
-        invalidatePublicationEpoch(); clearNativePublishedState()
+        nativeFacadeLock.withLock {
+            nativePlaybackReadLifetime.retire()
+            nativeMetadataAdmissionFence.retireInstallation()
+            nativeInstallGeneration = UUID()
+        }
+        guard let beforeClear = invalidatePublicationEpoch(), originalMetadataClearAuthorityIsCurrent(beforeClear),
+              let cleared = clearNativePublishedState(authority: beforeClear),
+              let expectedAccount = cleared.owner.binding?.accountGeneration else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()
+        guard let clear = advanceOriginalMetadataClearPublishedAccount(cleared, expected: expectedAccount)
+            else { throw VortxNativeError.superseded }
         refreshAddons(capturedPublicationToken: capturePublicationToken())
+        guard originalMetadataClearAuthorityIsCurrent(clear) else { throw VortxNativeError.superseded }
         rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
-        loadBoard(); loadLibrary()
+        guard originalMetadataClearAuthorityIsCurrent(clear) else { throw VortxNativeError.superseded }
+        loadBoard()
+        guard originalMetadataClearAuthorityIsCurrent(clear) else { throw VortxNativeError.superseded }
+        loadLibrary()
+        // This guards the METADATA boundary and following caller effects. It is
+        // not a claim that every unrelated profile/roster write inside the
+        // existing refreshNativeProfiles implementation has become guarded.
     }
 
     @MainActor
@@ -833,45 +1034,27 @@ final class CoreBridge: ObservableObject {
                               capture: CredentialScopeRegistry.Capture, hostProfiles: [UserProfile] = [],
                               initialProfileID: UUID? = nil,
                               initialProfileSource: (any VortxMutationAuthority)? = nil) async throws {
+        let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: nativeSubtitleDomain)
+        defer { CredentialPublicationOutbox.finishSubtitleRetirement(subtitleRetirement) }
+        await CredentialPublicationOutbox.waitForSubtitleRetirement(subtitleRetirement)
+        try Task.checkCancellation()
+        _ = ProfileStore.shared
+        activateNativePresentationBoundary()
         let installGeneration = UUID()
         nativeFacadeLock.withLock {
+            nativePlaybackReadLifetime.retire()
+            nativeMetadataAdmissionFence.retireInstallation()
             nativeInstallGeneration = installGeneration
             nativeCallbackGeneration = installGeneration
+            nativeCallbackLifetime.prepare(installGeneration)
         }
         NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
             session.revoke(); throw VortxNativeError.invalidSnapshot
         }
-        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry, mutationAccepted: { [weak self] in
-            Task { @MainActor in
-                guard let self, CredentialScopeRegistry.shared.isCurrent(capture),
-                      self.nativeFacadeLock.withLock({
-                          self.nativeCallbackGeneration == installGeneration && self.nativeCredentialCapture == capture
-                            && self.nativeFacadeStorage?.ownsSession(session) == true
-                      }) else { return }
-                VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture)
-            }
-        }, progressAccepted: { [weak self] in
-            Task { @MainActor in
-                guard let self, CredentialScopeRegistry.shared.isCurrent(capture),
-                      self.nativeFacadeLock.withLock({
-                          self.nativeCallbackGeneration == installGeneration && self.nativeCredentialCapture == capture
-                            && self.nativeFacadeStorage?.ownsSession(session) == true
-                      }) else { return }
-                VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture, progressOnly: true)
-            }
-        }) { [weak self] fields in
-            guard let self, CredentialScopeRegistry.shared.isCurrent(capture),
-                  self.nativeFacadeLock.withLock({
-                      self.nativeCallbackGeneration == installGeneration && self.nativeCredentialCapture == capture
-                        && self.nativeFacadeStorage?.ownsSession(session) == true
-                  }),
-                  let data = try? JSONSerialization.data(withJSONObject: ["name": "NewState", "args": fields]) else { return }
-            self.handleEvent(data)
-            if !Set(fields).isDisjoint(with: ["ctx", "native_state", "native_host_preferences"]) {
-                NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
-            }
-        }
+        let callback = makeNativeSourceCallback(installation: installGeneration, credential: capture)
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry,
+            progressAccepted: {}, sourceEvent: callback, changed: { _ in })
         do {
             if let requested = initialProfileID {
                 guard let saved = facade.watchlistBinding else { throw VortxNativeError.unavailable }
@@ -897,75 +1080,243 @@ final class CoreBridge: ObservableObject {
         } catch { facade.close(); throw error }
         let result = nativeFacadeLock.withLock { () -> (Bool, VortxNativeCoreFacade?) in
             guard CredentialScopeRegistry.shared.isCurrent(capture), nativeInstallGeneration == installGeneration else { return (false, nil) }
-            let old = nativeFacadeStorage; nativeFacadeStorage = facade; nativeCredentialCapture = capture; return (true, old)
+            nativePlaybackReadLifetime.retire()
+            nativeMetadataAdmissionFence.retireInstallation()
+            let old = nativeFacadeStorage; nativeFacadeStorage = facade; nativeCredentialCapture = capture
+            nativeCallbackLifetime.bind(installGeneration, credential: capture, sourceID: facade.sourceID)
+            return (true, old)
         }
         guard result.0 else { facade.close(); throw VortxNativeError.superseded }
+        guard let installOrigin = nativeInstalledSourceOrigin(producer: facade,
+            installation: installGeneration, credential: capture) else {
+            facade.close(); throw VortxNativeError.superseded
+        }
         result.1?.close()
+        guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
         nativeAccountEditRequests.removeAll()
         nativePublishedCredentialSlot = nil
-        nativeFacadeLock.withLock { nativePublishedAccountGeneration = nil }
+        nativeFacadeLock.withLock {
+            if nativePublishedAccountGeneration != nil {
+                nativePlaybackReadLifetime.retire()
+                nativeMetadataAdmissionFence.retireInstallation()
+            }
+            nativePublishedAccountGeneration = nil
+        }
         nativeProfileBaseline = hostProfiles
         try refreshNativeProfiles()
         // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
-        refreshAddons(capturedPublicationToken: capturePublicationToken())
-        rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
-        loadBoard(); loadLibrary()
+        guard seedNativeInstalledSource(installOrigin) else { throw VortxNativeError.superseded }
+        loadBoard()
+        guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
+        loadLibrary()
     }
     @MainActor
     func closeNativeSession() async {
         let old = nativeFacadeLock.withLock { nativeFacadeStorage }
-        revokeNativeSession()
+        let retirement = revokeNativeSession()
+        await CredentialPublicationOutbox.waitForSubtitleRetirement(retirement.subtitle)
+        CredentialPublicationOutbox.finishSubtitleRetirement(retirement.subtitle)
         await old?.shutdown()
     }
-    private func revokeNativeSession() {
-        // Owner/profile selection is published on main. Complete the revoke and UI clear in
-        // that same turn, before any cloud/bootstrap suspension can expose the new owner.
-        if !Thread.isMainThread { DispatchQueue.main.sync { self.revokeNativeSession() }; return }
-        VortxNativeSession.revokeAllForOwnerBoundary()
+    @MainActor @discardableResult
+    private func revokeNativeSession() -> NativeMetadataBoundaryRetirement {
+        let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: nativeSubtitleDomain)
+        // Capture the desired stored profile on its MainActor owner. Unlike UI
+        // clear, the later async bootstrap requires a settled matching mirror.
+        let originalProfileID = ProfileStore.shared.activeID
+        let originalRequest = metaLoadTargetLock.withLock { nativeMetaRequestGeneration }
         let old = nativeFacadeLock.withLock {
-            nativeInstallGeneration = UUID()
-            nativeCallbackGeneration = UUID()
-            let old = nativeFacadeStorage; nativeFacadeStorage = nil; nativeCredentialCapture = nil; return old
+            nativePlaybackReadLifetime.retire()
+            nativeMetadataAdmissionFence.retireInstallation()
+            nativeInstallGeneration = UUID(); nativeCallbackGeneration = UUID()
+            nativeCallbackLifetime.retire() // checked intake mirror; under B BEFORE source release
+            let old = nativeFacadeStorage
+            nativeFacadeStorage = nil; nativeCredentialCapture = nil; nativePublishedAccountGeneration = nil
+            return old
         }
-        old?.close()
-        nativeAccountEditRequests.removeAll()
-        nativePublishedCredentialSlot = nil
-        nativeFacadeLock.withLock { nativePublishedAccountGeneration = nil }
-        invalidatePublicationEpoch()
-        clearNativePublishedState()
-        NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
+        nativeAccountEditRequests.removeAll(); nativePublishedCredentialSlot = nil
+        let cancelEpoch = detachPublicationEpochStorage()
+        let cancelLegacy = detachLegacyMetadataPublicationWork()
+        let lifecycle = NativeMetadataLifecycleAuthority(owner: captureNativeMetadataClearOwner(),
+                                                         profileID: originalProfileID)
+        let clear = captureOriginalMetadataClearAuthority(expectedMetadataRequest: originalRequest)
+        let retirementIdentity = clear?.identity ?? metadataPresentation.beginClear()
+        let cancelEffects = detachNativeMetadataClearEffects(preservingClear: retirementIdentity)
+        // Capture finished before ANY cancellation/close/global revoke callback.
+        // This mandatory note is not conditional on original UI-clear success.
+        defer { NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil) }
+        VortxNativeSession.revokeAllForOwnerBoundary()
+        cancelEpoch(); cancelLegacy(); cancelEffects()
+        old?.close() // ORIGINAL source only; no late storage/sequence/task reset
+        let completedClear = clear.flatMap { original -> NativeMetadataClearAuthority? in
+            guard originalMetadataClearAuthorityIsCurrent(original) else { return nil }
+            return clearNativePublishedState(authority: original)
+        }
+        return .init(lifecycle: lifecycle, clear: completedClear, subtitle: subtitleRetirement)
     }
-    private func clearNativePublishedState() {
-        dispatchPrecondition(condition: .onQueue(.main))
-        boardRebuildWork?.cancel(); boardRebuildWork = nil
-        metaDetailsWork?.cancel(); metaDetailsWork = nil
-        continueWatching = []; boardRows = []; library = nil; metaDetails = nil; discover = nil
-        discoverPublishedFingerprint = nil; resetDiscoverPagination()
-        searchResults = []; searchSuggestions = []; searchIsLoading = false
-        searchLoaded = false
-        addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]
-        AddonMetaGate.publish(false)
+    @MainActor private struct NativeMetadataClearOwner {
+        let credential: CredentialScopeRegistry.Capture
+        let publicationEpoch: UInt64
+        let installation: UUID
+        let callbacks: UUID
+        let facade: VortxNativeCoreFacade?
+        let installedCredential: CredentialScopeRegistry.Capture?
+        let publishedAccount: UUID?
+        let binding: VortxNativeCoreFacade.WatchlistBinding?
+    }
+    @MainActor private struct NativeMetadataClearAuthority {
+        let identity: UUID
+        let owner: NativeMetadataClearOwner
+        let request: UUID
+        let proposals: NativeMetadataPresentationProposal
+    }
+    /// Source reconstruction is NOT UI-clear permission. A legitimate pending
+    /// metadata request between close/install must not veto its own bootstrap.
+    @MainActor private struct NativeMetadataLifecycleAuthority {
+        let owner: NativeMetadataClearOwner
+        let profileID: UUID?
+    }
+    @MainActor private struct NativeMetadataBoundaryRetirement {
+        let lifecycle: NativeMetadataLifecycleAuthority
+        let clear: NativeMetadataClearAuthority?
+        let subtitle: CredentialPublicationOutbox.SubtitleRetirement
+    }
+    @MainActor private func captureNativeMetadataClearOwner() -> NativeMetadataClearOwner {
+        let credential = CredentialScopeRegistry.shared.capture(), epoch = capturePublicationToken().epoch
+        return nativeFacadeLock.withLock {
+            .init(credential: credential, publicationEpoch: epoch,
+                installation: nativeInstallGeneration, callbacks: nativeCallbackGeneration,
+                facade: nativeFacadeStorage, installedCredential: nativeCredentialCapture,
+                publishedAccount: nativePublishedAccountGeneration, binding: nativeFacadeStorage?.watchlistBinding)
+        }
+    }
+    @MainActor private func nativeMetadataClearOwnerIsCurrent(_ original: NativeMetadataClearOwner) -> Bool {
+        guard CredentialScopeRegistry.shared.isCurrent(original.credential),
+              capturePublicationToken().epoch == original.publicationEpoch else { return false }
+        return nativeFacadeLock.withLock {
+            nativeInstallGeneration == original.installation && nativeCallbackGeneration == original.callbacks
+                && nativeFacadeStorage === original.facade && nativeCredentialCapture == original.installedCredential
+                && nativePublishedAccountGeneration == original.publishedAccount
+                && original.facade?.watchlistBinding == original.binding
+        }
+    }
+    /// Call before ANY old.close/cancel/first publisher. A caller that already
+    /// has this value must carry it, never recapture after a callout/queue hop.
+    @MainActor private func captureOriginalMetadataClearAuthority(
+        expectedMetadataRequest: UUID? = nil
+    ) -> NativeMetadataClearAuthority? {
+        let owner = captureNativeMetadataClearOwner()
+        let request = metaLoadTargetLock.withLock { nativeMetaRequestGeneration }
+        guard expectedMetadataRequest == nil || expectedMetadataRequest == request,
+              nativeMetadataClearOwnerIsCurrent(owner),
+              metaLoadTargetLock.withLock({ nativeMetaRequestGeneration == request }) else { return nil }
+        let identity = metadataPresentation.beginClear()
+        return .init(identity: identity, owner: owner, request: request,
+                     proposals: captureNativeMetadataPresentationProposal())
+    }
+    @MainActor private func originalMetadataClearAuthorityIsCurrent(_ original: NativeMetadataClearAuthority) -> Bool {
+        metadataPresentation.ownsClear(original.identity)
+            && nativeMetadataClearOwnerIsCurrent(original.owner)
+            && metaLoadTargetLock.withLock { nativeMetaRequestGeneration == original.request }
+    }
+    @MainActor private func originalMetadataLifecycleIsCurrent(_ original: NativeMetadataLifecycleAuthority) -> Bool {
+        guard nativeMetadataClearOwnerIsCurrent(original.owner),
+              let selection = ProfileSelectionRead.snapshot(), selection.activeID == original.profileID else { return false }
+        return true // deliberately NO M/request/proposal/clearIdentity comparison
+    }
+    /// Only the known ACK projection may change publishedAccount in this tail.
+    /// expected is read from the ORIGINAL accepted binding BEFORE refresh's first
+    /// publisher, never from whichever profile/account exists after it returns.
+    @MainActor private func advanceOriginalMetadataClearPublishedAccount(
+        _ original: NativeMetadataClearAuthority, expected: UUID
+    ) -> NativeMetadataClearAuthority? {
+        let held = original.owner
+        let owner = NativeMetadataClearOwner(credential: held.credential,
+            publicationEpoch: held.publicationEpoch, installation: held.installation,
+            callbacks: held.callbacks, facade: held.facade, installedCredential: held.installedCredential,
+            publishedAccount: expected, binding: held.binding)
+        let advanced = NativeMetadataClearAuthority(identity: original.identity, owner: owner,
+            request: original.request, proposals: original.proposals)
+        return originalMetadataClearAuthorityIsCurrent(advanced) ? advanced : nil
+    }
+    /// Deterministic plain transition, NOT recapture: only the matching original
+    /// request is cleared, then the SAME authority carries its known successor UUID.
+    @MainActor private func retireOriginalMetadataRequest(_ original: NativeMetadataClearAuthority)
+        -> NativeMetadataClearAuthority? {
+        guard originalMetadataClearAuthorityIsCurrent(original) else { return nil }
+        let next = UUID()
+        let retired = metaLoadTargetLock.withLock {
+            guard nativeMetaRequestGeneration == original.request else { return false }
+            requestedMetaLoadTarget = nil; nativeMetaRequestAction = nil
+            nativeMetaRequestGeneration = next
+            nativeMetadataAdmissionFence.replaceRequest(next)
+            return true
+        }
+        guard retired else { return nil }
+        return .init(identity: original.identity, owner: original.owner, request: next,
+                     proposals: original.proposals) // original scope intentionally retained
+    }
+    @MainActor private func detachLegacyMetadataPublicationWork() -> @MainActor () -> Void {
+        let oldBoard = boardRebuildWork, oldMetadata = metaDetailsWork
+        boardRebuildWork = nil; metaDetailsWork = nil
+        return { oldBoard?.cancel(); oldMetadata?.cancel() } // ORIGINAL handles only
+    }
+    @MainActor @discardableResult
+    private func commitOriginalMetadataClear(_ clear: NativeMetadataClearAuthority,
+                                              bumpStreams: Bool) -> Bool {
+        let owns: @MainActor @Sendable () -> Bool = { self.originalMetadataClearAuthorityIsCurrent(clear) }
+        guard commitOwnedMetadataClear(bumpStreams: bumpStreams, preservingClear: clear.identity,
+            expectedProposal: clear.proposals.metadata, isCurrent: owns,
+            finalAdmission: .localOriginal) else { return false }
+        return owns()
+    }
+    @MainActor @discardableResult
+    private func clearNativePublishedState(authority original: NativeMetadataClearAuthority,
+        beforeNotifications: @MainActor () -> Void = {}) -> NativeMetadataClearAuthority? {
+        guard let clear = retireOriginalMetadataRequest(original) else { return nil }
+        let owns = { self.originalMetadataClearAuthorityIsCurrent(clear) }
+        let cancelLegacy = detachLegacyMetadataPublicationWork()
+        // REQUIRED MAIN JOIN: pure retirement/detachment of ORIGINAL typed/decode/
+        // direct tasks,CW/refind/load arms,NZB/watched state; no callback here.
+        let cancelEffects = detachNativeMetadataClearEffects(preservingClear: clear.identity)
+        // Existing nonmetadata plain resets finish BEFORE the first callout.
+        discoverPublishedFingerprint = nil; resetDiscoverPagination(); searchLoaded = false
+        rawAddonsByUrl = [:]; manifestPreviewCache = [:]
         boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
         deferredBoardRowPages = []; deferredBoardRangeDepth = nil
-        metaLoadTargetLock.withLock {
-            requestedMetaLoadTarget = nil
-            nativeMetaRequestAction = nil
-        }
-        pendingEpisodeWatched = [:]; refindRequest = nil; cancelAppleCWMetaRefresh()
-        invalidateNZBIndexerResults(); streamsEpoch &+= 1
+        beforeNotifications() // synchronous,nonescaping; only original detached handles
+        cancelLegacy(); cancelEffects()
+        guard owns() else { return nil }
+        // Legacy nonmetadata slots intentionally retain their existing semantics.
+        // Check after EACH setter/callout, not just after the pending-M clear.
+        continueWatching = []; guard owns() else { return nil }
+        boardRows = []; guard owns() else { return nil }
+        library = nil; guard owns() else { return nil }
+        discover = nil; guard owns() else { return nil }
+        searchResults = []; guard owns() else { return nil }
+        searchSuggestions = []; guard owns() else { return nil }
+        searchIsLoading = false; guard owns() else { return nil }
+        addons = []; guard owns() else { return nil }
+        AddonMetaGate.publish(false); guard owns() else { return nil }
+        // Metadata comes after legacy notifications. A nested new metadata turn
+        // retires clearIdentity and/or original proposals, so no old nil can land.
+        guard commitOriginalMetadataClear(clear, bumpStreams: true) else { return nil }
         changedFields = ["native_state", "ctx", "library", "continue_watching_preview", "board", "search", "discover", "meta_details"]
         revision &+= 1
+        return owns() ? clear : nil // carry the KNOWN post-retirement request; no recapture
     }
 
     /// Bumped on every `RuntimeEvent::NewState`; SwiftUI observes this to refresh. `changedFields`
     /// holds the field names that changed since the last bump (e.g. ["board", "ctx"]).
-    @Published private(set) var revision = 0
-    private(set) var changedFields: Set<String> = []
+    @MainActor @Published private(set) var revision = 0
+    @MainActor private(set) var changedFields: Set<String> = []
 
     /// Decoded screen state, refreshed on the main queue as the engine emits field changes.
     @Published private(set) var continueWatching: [CoreCWItem] = []
     @Published private(set) var boardRows: [CoreBoardRow] = []
-    @Published private(set) var metaDetails: CoreMetaDetails?
+    @MainActor private lazy var metadataPresentation =
+        MetadataPresentation(objectWillChange: self.objectWillChange)
+    @MainActor var metaDetails: CoreMetaDetails? { metadataPresentation.metaDetails }
     private let metaLoadTargetLock = NSLock()
     private var requestedMetaLoadTarget: MetaLoadTarget?
     private var nativeMetaRequestAction: Data?
@@ -979,24 +1330,26 @@ final class CoreBridge: ObservableObject {
     /// by the exact two-phase Apple CW refresh that invalidated the resident meta and then settled its own
     /// Load generation. This is a request-completion receipt, not a full-series completeness proof.
     /// Main-queue writes only.
-    private(set) var appleCWMetaRefreshReceipt: AppleCWMetaRefreshReceipt?
+    @MainActor private(set) var appleCWMetaRefreshReceipt: AppleCWMetaRefreshReceipt?
     /// The exact settled payload paired with `appleCWMetaRefreshReceipt`. Players consume this snapshot,
     /// not a later global `metaDetails` re-emit that might belong to another source/progress event.
-    private(set) var appleCWMetaRefreshDetails: CoreMetaDetails?
+    @MainActor private(set) var appleCWMetaRefreshDetails: CoreMetaDetails?
     /// Monotonic epoch of the READY-STREAM SET for the loaded meta. Bumps ONLY when the coalesced
     /// `meta_details` republish actually changed the loaded meta id or the per-group ready-stream
     /// signature (or on an explicit load/unload that cleared it), never on a library/progress-only
     /// republish and never on the raw `revision` storm. `SourceListModel` keys its O(1) rebuild
     /// signature on this instead of hashing every stream, so a source-search burst costs the source
     /// list nothing until streams really changed. Main-queue writes only.
-    @Published private(set) var streamsEpoch = 0
+    @MainActor var streamsEpoch: Int { metadataPresentation.streamsEpoch }
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
     /// The last account-owned history payload that was actually accepted for the currently settled
     /// engine binding. `changedFields` is only the newest engine event and can be overwritten by a
     /// board/meta receipt before Home first appears; this durable, owner-tagged receipt is the
     /// recommendation admission proof. Main-queue writes only.
+    @MainActor
     private(set) var lastAcceptedHistoryReceipt: BecauseYouWatchedHistoryPolicy.Snapshot?
+    @MainActor
     private var acceptedHistoryReceiptRevision = 0
     private struct LocalHistoryHydrationContext: Equatable {
         let profileID: UUID
@@ -1034,12 +1387,17 @@ final class CoreBridge: ObservableObject {
         let credentialCapture: CredentialScopeRegistry.Capture
         let publicationToken: PublicationToken
     }
+    @MainActor
     private var localHistoryAuthority: LocalHistoryAuthority?
     /// Imported-away recovery is intentionally fail-closed until signed-out engine state has been confirmed,
     /// the local library has been loaded, and account-owned add-ons/library hydration has completed.
+    @MainActor
     private var localHistoryRecoveryInFlight = false
+    @MainActor
     private var localHistoryHydrationContext: LocalHistoryHydrationContext?
+    @MainActor
     private var localHistoryHydrationReceipt: LocalHistoryHydrationReceipt?
+    @MainActor
     private var localRecommendationHistoryState: LocalRecommendationHistoryState?
     /// A signed-out device is a valid explicit local owner on first launch, but must not inherit the
     /// previous VortX account's resident arrays after account -> guest.  Persist this non-secret boundary
@@ -1061,6 +1419,7 @@ final class CoreBridge: ObservableObject {
         let hydration: LocalHistoryHydrationContext
         let credentialFingerprint: String
     }
+    @MainActor
     private var localHistoryAuthorityGeneration: UInt64 = 0
     @Published private(set) var searchResults: [CoreMeta] = []
     @Published private(set) var searchIsLoading = false
@@ -1083,11 +1442,13 @@ final class CoreBridge: ObservableObject {
     /// JSON decode + a `boardRows` republish + a hero reseed, which was a real main-thread stall on open. This
     /// timer collapses a burst into a single trailing rebuild ~80 ms after the last event, so the board still
     /// updates but only once per burst. Touched only on the main actor.
-    private var boardRebuildWork: DispatchWorkItem?
+    @MainActor private var boardRebuildWork: DispatchWorkItem?
     private static let boardRebuildDebounce: TimeInterval = 0.08
     /// One current-context repair timer.  Auth/profile boundaries cancel it; settlement or an
     /// explicitly signed-out context arms a fresh one with that context's publication token.
-    private var sessionRepairWork: DispatchWorkItem?
+    @MainActor
+    private var sessionRepairWork: Task<Void, Never>?
+    @MainActor
     private var sessionRepairGeneration = 0
     /// Raw catalog count from the engine board. Hidden, disabled, empty, and failed rows are filtered
     /// out of `boardRows`, so their visible count cannot decide whether vertical pagination is finished.
@@ -1099,7 +1460,7 @@ final class CoreBridge: ObservableObject {
     /// trailing decode ~90 ms after the last emit, and the decode then DIFFS against the stored value so an
     /// identical re-emit republishes nothing. An episode switch still lands within one debounce window (well
     /// inside the in-player 20s / 250ms poll), so next-episode / binge is unaffected. Touched only on main.
-    private var metaDetailsWork: DispatchWorkItem?
+    @MainActor private var metaDetailsWork: DispatchWorkItem?
     private static let metaDetailsDebounce: TimeInterval = 0.09
     private struct AppleCWMetaRefreshRequest {
         enum Phase {
@@ -1115,16 +1476,17 @@ final class CoreBridge: ObservableObject {
         let navigationOnly: Bool
         var phase: Phase
     }
-    private var appleCWMetaRefreshGeneration = 0
-    private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
+    @MainActor private var appleCWMetaRefreshGeneration = 0
+    @MainActor private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
     private struct PendingEpisodeWatched {
+        let identity = UUID()
         let meta: PlaybackMeta
         let target: PlaybackMutationTarget
         let expiresAt: Date
     }
     /// A direct-resume metadata refresh temporarily unloads the model that accepts episode watched marks.
     /// Retain the exact mutation until that model is ready, without ever marking the entire series.
-    private var pendingEpisodeWatched: [String: PendingEpisodeWatched] = [:]
+    @MainActor private var pendingEpisodeWatched: [String: PendingEpisodeWatched] = [:]
     /// `rebuildContinueWatching` decodes on whichever engine worker delivered the event, then publishes on main.
     /// Fence those asynchronous publications so a slower, older snapshot cannot overwrite a newer rebuild.
     private let continueWatchingRebuildLock = NSLock()
@@ -1144,27 +1506,31 @@ final class CoreBridge: ObservableObject {
         let streamID: String?
         var awaitingInvalidation: Bool
     }
-    private var refindGeneration = 0
-    private var refindRequest: RefindRequest?
+    @MainActor private var refindGeneration = 0
+    @MainActor private var refindRequest: RefindRequest?
     // Direct Newznab results are deliberately separate from engine state: they contain short-lived NZB
     // enclosure links and must never be serialized into an add-on, diagnostic, or sync payload.
-    private struct NZBIndexerResultKey: Hashable {
+    private struct NZBIndexerResultKey: Hashable, Sendable {
         let owner: String; let profileID: UUID; let revision: Int; let titleID: String; let streamID: String?
     }
-    private var nzbIndexerResults: [NZBIndexerResultKey: [CoreStreamSourceGroup]] = [:]
-    private var nzbIndexerTasks: [NZBIndexerResultKey: Task<Void, Never>] = [:]
-    private var nzbIndexerTerminal: Set<NZBIndexerResultKey> = []
+    @MainActor private var nzbIndexerResults: [NZBIndexerResultKey: [CoreStreamSourceGroup]] = [:]
+    @MainActor private var nzbIndexerTasks: [NZBIndexerResultKey: Task<Void, Never>] = [:]
+    @MainActor private var nzbIndexerTerminal: Set<NZBIndexerResultKey> = []
     /// Render getters consult this in-memory snapshot only; no Keychain access occurs while SwiftUI builds.
-    private var activeNZBIndexerKey: NZBIndexerResultKey?
-    private var activeNZBIndexerCount = 0
-    private var nzbIndexerGeneration = 0
+    @MainActor private var activeNZBIndexerKey: NZBIndexerResultKey?
+    @MainActor private var activeNZBIndexerCount = 0
+    @MainActor private var nzbIndexerGeneration = 0
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
+    @MainActor
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
+    @MainActor
     private var switchInFlight = false
+    @MainActor
     private var switchFromUID: String?
     /// One-shot authority for an explicit user-requested Stremio import. Background settlement must not
     /// overwrite a mirror-off VortX projection with PullAddonsFromAPI.
+    @MainActor
     private var explicitAddonImportPending = false
     /// Authentication is asynchronous. This token-to-engine binding is cleared before every
     /// profile auth and created only after an authenticated token identity agrees with engine ctx,
@@ -1176,36 +1542,49 @@ final class CoreBridge: ObservableObject {
         let generation: UInt64
         var verifiedUID: String?
     }
+    @MainActor
     private var pendingAccountBinding: PendingAccountBinding?
+    @MainActor
     private var settledAccountBinding: PlaybackMutationOwnershipPolicy.SettledAccountBinding?
+    @MainActor
     private var authBindingGeneration: UInt64 = 0
+    @MainActor
     private var accountBindingVerificationTask: Task<Void, Never>?
+    @MainActor
     private var rejectedAccountBindingGeneration: UInt64?
     /// Same-slot sign-in replaces the Keychain credential while `isSignedIn` stays true. The account
     /// boundary notification is non-secret and this monotonic latch makes the rebind exactly-once even
     /// when a UI observer also refreshes Home in the same turn.
     private var credentialBoundaryObserver: NSObjectProtocol?
-    private var credentialScopeObserver: NSObjectProtocol?
+    @MainActor private var credentialScopeObserver: NSObjectProtocol?
     private var lastCredentialBoundaryGeneration: UInt64 = 0
     /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
     /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
     /// immediately before a decoded snapshot is published or used for a deferred engine mutation.
-    private struct PublicationToken: Equatable { let epoch: UInt64 }
-    private let publicationEpochLock = NSLock()
-    private var publicationEpoch: UInt64 = 0
+    private struct PublicationToken: Equatable, Sendable { let epoch: UInt64 }
+    private let publicationEpochState = OSAllocatedUnfairLock(initialState: UInt64(0))
     /// Explicit logout carries a unique identity into both its bounded poll and its later ctx receipt.
     /// A rapid reconnect or a newer logout retires the old request, closing the Bool ABA race.
-    private struct SignedOutRepairRequest: Equatable {
+    private struct SignedOutRepairRequest: Equatable, Sendable {
         let generation: UInt64
         let publicationToken: PublicationToken
         /// Imported-away recovery has its own fenced path, but still needs the logout
         /// publication gate until the engine positively acknowledges signed-out state.
         let rearmSessionRepair: Bool
     }
+    @MainActor
     private var signedOutRepairGeneration: UInt64 = 0
-    private var signedOutRepairRequest: SignedOutRepairRequest?
+    // One checked value store serves owner mutations and the synchronous native progress guard.
+    // It has no observers, callbacks or duplicate mirror whose writeback could lag a reentrant owner.
+    private let signedOutRepairRequestState = OSAllocatedUnfairLock<SignedOutRepairRequest?>(initialState: nil)
+    @MainActor
+    private var signedOutRepairRequest: SignedOutRepairRequest? {
+        get { signedOutRepairRequestState.withLock { $0 } }
+        set { signedOutRepairRequestState.withLock { $0 = newValue } }
+    }
     /// Set only by the token-matched signed-out ctx path.  Imported-away recovery uses this
     /// receipt rather than treating an unrelated request retirement as a completed logout.
+    @MainActor
     private var confirmedSignedOutRepairRequest: SignedOutRepairRequest?
     /// Imported-away logout runs through awaits, so it retains the exact profile/token identity
     /// that authorized it rather than re-reading the active profile after suspension.
@@ -1244,18 +1623,13 @@ final class CoreBridge: ObservableObject {
     /// The Rust event callback must not read the SwiftUI-published `playerActive` directly. Keep a
     /// lock-backed copy that is updated in the same main-queue transition and can be safely captured
     /// once for a complete worker-thread library receipt.
-    private let playerActiveSnapshotLock = NSLock()
-    private var playerActiveSnapshotValue = false
+    private let playerActiveSnapshotState = OSAllocatedUnfairLock(initialState: false)
 
-    private func playerActiveSnapshot() -> Bool {
-        playerActiveSnapshotLock.lock()
-        defer { playerActiveSnapshotLock.unlock() }
-        return playerActiveSnapshotValue
-    }
 
     /// The native session writes playback position ticks at most every 30 s. Write a held-back position now:
     /// on pause, when the player closes, and when the app goes to the background or quits. `waitUpTo` blocks
     /// for at most that long, for quitting, where nothing runs after the notification returns.
+    @MainActor
     func flushNativeProgress(waitUpTo timeout: TimeInterval? = nil) {
         guard let facade = nativeFacade else { return }
         guard let timeout else { facade.flushPendingProgress(); return }
@@ -1267,22 +1641,10 @@ final class CoreBridge: ObservableObject {
     /// Increment/decrement the player-active depth on the MAIN actor and publish `playerActive`.
     /// Balanced calls from each player host's onAppear (+1) and onDisappear (-1); the depth counter
     /// keeps it true across a nested trailer→player mount and a teardown straddle.
-    func setPlayerActive(_ on: Bool) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.playerActiveDepth = max(0, self.playerActiveDepth + (on ? 1 : -1))
-            let active = self.playerActiveDepth > 0
-            // The last player closed: write the position the native session may still be holding back.
-            if !active, self.playerActive { self.flushNativeProgress() }
-            if self.playerActive != active { self.playerActive = active }
-            self.playerActiveSnapshotLock.lock()
-            self.playerActiveSnapshotValue = active
-            self.playerActiveSnapshotLock.unlock()
-        }
-    }
 
     /// The Keychain slot holding the ACTIVE profile's session key (shared profiles use the primary
     /// slot, own-account profiles their own). Resolved per read so a profile switch re-points it.
+    @MainActor
     private var activeTokenAccount: String { ProfileStore.shared.activeKeychainAccount }
 
     /// Wave 4: this device has imported its Stremio-owned library into the VortX account AND is not opted into
@@ -1292,30 +1654,21 @@ final class CoreBridge: ObservableObject {
     /// Computed from the Keychain token + the per-account import flag + the opt-in. After the post-import Logout
     /// the (now server-dead) token is cleared, so there is no token and this reads false: the device is then
     /// simply signed out of Stremio and takes the signed-out recovery path.
+    @MainActor
     private var importedAwayFromStremio: Bool {
         guard let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return false }
         return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
     }
 
-    private init() {
-        credentialScopeObserver = NotificationCenter.default.addObserver(
-            forName: VortXSyncManager.credentialScopeDidChangeNote, object: nil, queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            let capture = CredentialScopeRegistry.shared.capture()
-            let previous = self.nativeFacade
-            self.revokeNativeSession()
-            Task { @MainActor in
-                await previous?.shutdown()
-                guard CredentialScopeRegistry.shared.isCurrent(capture) else { return }
-                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(credentialCapture: capture)
-            }
-        }
-    }
+    private init() {} // main activates its actor receiver before start/install exposure
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
     @MainActor
     func start() {
+        // App environment injection happens after start(). Finish the same synchronous profile/defaults
+        // projection before a native bootstrap task can attempt to capture a worker selection.
+        _ = ProfileStore.shared
+        activateNativePresentationBoundary()
         guard !started else { return }
         started = true
         // The usenet anime retry reads the resident title's episode numbers through this provider.
@@ -1326,9 +1679,10 @@ final class CoreBridge: ObservableObject {
         }
         #if os(macOS)
         // Quitting does not background the Mac app first: write held-back playback progress on the way out.
+        let receiver = nativeCallbackReceiver
         quitProgressObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.flushNativeProgress(waitUpTo: 2) }
+        ) { _ in MainActor.assumeIsolated { receiver.flushOnQuit() } }
         #endif
         // A compiled native lane cannot initialize Stremio, even when migration is not yet bound.
         Task {
@@ -1340,23 +1694,6 @@ final class CoreBridge: ObservableObject {
 
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
-    private func seedInitialState() {
-        let publicationToken = capturePublicationToken()
-        let rows = buildBoardRows()
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            guard self.publicationStillCurrent(publicationToken) else { return }
-            if !rows.isEmpty { self.boardRows = rows }
-        }
-        // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
-        // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
-        // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
-        // A cold local-owner engine can have real persisted CW without emitting a new event. The shared
-        // rebuild path records this accepted seed exactly like the event path so recommendations do not
-        // wait forever for a second engine tick.
-        rebuildContinueWatching(capturedPublicationToken: publicationToken)
-        refreshAddons(capturedPublicationToken: publicationToken)
-    }
 
     /// Refresh the installed-addons list (and the raw descriptors for uninstall) from ctx.profile.
     ///
@@ -1376,10 +1713,12 @@ final class CoreBridge: ObservableObject {
     /// (#205), so the URL has already left the set when this function sees the new ctx and the add-on is
     /// NOT suppressed here. The same holds for an explicit Stremio reconnect (`signedInWithLegacyAuthKey`
     /// clears the removal set before the account import).
+    @MainActor
     private func refreshAddons() {
         refreshAddons(capturedPublicationToken: capturePublicationToken())
     }
 
+    @MainActor
     private func refreshAddons(capturedPublicationToken publicationToken: PublicationToken) {
         // Typed and raw descriptors must describe ONE engine receipt. Reading ctx twice can pair an old
         // visible roster with a new raw map during a pull/install. A decode failure is not an empty roster.
@@ -1433,6 +1772,7 @@ final class CoreBridge: ObservableObject {
     /// through the store clears it via `AddonTombstones.forget`. Change URL does not use this uninstall path:
     /// it atomically replaces the descriptor, then tombstones the old identity only after the new one is
     /// owner-fenced and confirmed, so peers cannot resurrect the obsolete URL.
+    @MainActor
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         let mutationToken = capturePublicationToken()
         // A logout, unresolved binding, or rejected credential still belongs to the previous
@@ -1861,6 +2201,7 @@ final class CoreBridge: ObservableObject {
     /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
     /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
     /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
+    @MainActor
     func hydrateAddonsFromAccount(_ owned: [VortXOwnedAddon]) {
         let mutationToken = capturePublicationToken()
         guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }
@@ -1888,6 +2229,7 @@ final class CoreBridge: ObservableObject {
     ///  - Engine already has a session (hydrated from its own storage on a later launch) → refresh.
     ///  - Else migrate the legacy authKey: fetch the real User (PullUserFromAPI builds profile.auth),
     ///    then, once the `ctx` event confirms we're logged in, pull addons + sync the library.
+    @MainActor
     private func bootstrapAuth() {
         // Wave 4 (VortX owns the library + Continue Watching): once THIS Stremio account's library has been
         // imported into the VortX account doc, the engine runs on its purely-LOCAL library bucket (already
@@ -2073,18 +2415,27 @@ final class CoreBridge: ObservableObject {
     /// If, a while after launch, the stored token says we're signed in but the engine has no account
     /// data OR no stream add-on, re-establish the session from the token; the engine then pulls
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
+    @MainActor
     private func scheduleSessionRepair() {
         let publicationToken = capturePublicationToken()
         let credentialCapture = CredentialScopeRegistry.shared.capture()
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self,
+                  self.publicationStillCurrent(publicationToken),
+                  CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
             self.sessionRepairWork?.cancel()
             self.sessionRepairGeneration &+= 1
             let repairGeneration = self.sessionRepairGeneration
-            let work = DispatchWorkItem { [weak self] in
-                guard let self,
+            let work = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: 14_000_000_000)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, let self,
                       repairGeneration == self.sessionRepairGeneration,
                       self.publicationStillCurrent(publicationToken),
+                      CredentialScopeRegistry.shared.isCurrent(credentialCapture),
                       !self.switchInFlight,
                       !self.awaitingAuthMigration,
                       !self.enginePublicationBlocked else { return }
@@ -2129,12 +2480,12 @@ final class CoreBridge: ObservableObject {
                 }
             }
             self.sessionRepairWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 14, execute: work)
         }
     }
 
     /// Refresh the library from api.strem.io and pull its add-on collection only when two-way mirroring
     /// is enabled or the current account settlement carries an explicit user import request.
+    @MainActor
     private func refreshFromAPI(explicitAddonImport: Bool = false) {
         guard !enginePublicationBlocked else { return }
         let shouldPullAddons = !importedAwayFromStremio
@@ -2154,7 +2505,7 @@ final class CoreBridge: ObservableObject {
     /// Called by the player's exit path AFTER its final save has landed on the API, so the pull can
     /// never race the write it exists to fetch. The sync re-emits `continue_watching_preview`, which
     /// republishes the rail. No-op for overlay profiles (their history never touches the engine).
-    func syncLibraryNow() {
+    @MainActor func syncLibraryNow() {
         guard ProfileStore.shared.activeUsesEngineHistory else { return }
         // Signed-out (and anonymous) engines have no authenticated session for SyncLibraryWithAPI to
         // pull from, so the dispatch was dead weight on every player exit. Skip it.
@@ -2163,6 +2514,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Refresh the published screens after an acknowledged native account import.
+    @MainActor
     func signedInWithLegacyAuthKey() {
         // The native sign-in coordinator already committed the verified source and binding.
         // Never forward its token into the retired Stremio engine or erase native addon intent.
@@ -2170,12 +2522,14 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Refresh after the native coordinator has acknowledged the selected account binding.
+    @MainActor
     func switchAccount(token: String, explicitAddonImport: Bool = false) {
         // Profile selection and account binding are separate acknowledged native transactions.
         loadBoard(); loadLibrary()
     }
 
     /// Refresh after credential disconnection; native coordinators own account/session transitions.
+    @MainActor
     func logOut(rearmSignedOutRepair: Bool = true) {
         // Credential disconnection does not rebind or delete an acknowledged native account slot.
         loadBoard(); loadLibrary()
@@ -2184,6 +2538,7 @@ final class CoreBridge: ObservableObject {
     /// A matching signed-out `ctx` is the only receipt allowed to release the logout publication
     /// gate.  Polling `isLoggedIn()` is not enough: it can observe a transitional engine state
     /// while old board/library events are still queued behind it.
+    @MainActor
     private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest,
                                               receiptPublicationToken: PublicationToken) {
         guard receiptPublicationToken == request.publicationToken,
@@ -2198,28 +2553,34 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Clear the published per-account UI state (rails, library, details).
-    private func clearUserState() {
+    @MainActor @discardableResult private func clearUserState() -> NativeMetadataClearAuthority? {
+        guard let captured = captureOriginalMetadataClearAuthority(),
+              let clear = retireOriginalMetadataRequest(captured) else { return nil }
+        let cancelLegacy = detachLegacyMetadataPublicationWork()
+        let cancelEffects = detachNativeMetadataClearEffects(preservingClear: clear.identity)
+        // Plain matching sidecars retire NOW, not after a queued publisher.
+        discoverPublishedFingerprint = nil
+        localHistoryAuthority = nil; localHistoryHydrationContext = nil; localHistoryHydrationReceipt = nil
+        localRecommendationHistoryState = nil; lastAcceptedHistoryReceipt = nil; acceptedHistoryReceiptRevision = 0
+        // Original handles may be cancelled even if a queued clear later retires.
+        cancelLegacy(); cancelEffects()
+        guard originalMetadataClearAuthorityIsCurrent(clear) else { return nil }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.continueWatching = []
-            self.boardRows = []
-            self.discover = nil
-            // Drop the no-op-suppression fingerprint alongside the state it guards: a fresh discover load
-            // after this clear must never be suppressed by a stale fingerprint from the previous account.
-            self.discoverPublishedFingerprint = nil
-            self.library = nil
-            self.metaDetails = nil
-            self.localHistoryAuthority = nil
-            self.localHistoryHydrationContext = nil
-            self.localHistoryHydrationReceipt = nil
-            self.localRecommendationHistoryState = nil
-            self.lastAcceptedHistoryReceipt = nil
-            self.acceptedHistoryReceiptRevision = 0
+            let owns = { self.originalMetadataClearAuthorityIsCurrent(clear) }
+            guard owns() else { return }
+            self.continueWatching = []; guard owns() else { return }
+            self.boardRows = []; guard owns() else { return }
+            self.discover = nil; guard owns() else { return }
+            self.library = nil; guard owns() else { return }
+            _ = self.commitOriginalMetadataClear(clear, bumpStreams: false)
         }
+        return clear
     }
 
     /// Load the Home board: every catalog of every installed addon, then fetch the first `rows`.
     /// (Targets the `board` field specifically, `search` is also a CatalogsWithExtra.)
+    @MainActor
     func loadBoard(rows: Int = 30) {
         guard !enginePublicationBlocked else { return }
         let installedCatalogTotal = installedCatalogs(
@@ -2268,6 +2629,7 @@ final class CoreBridge: ObservableObject {
     /// True while the requested range has not covered the engine's raw catalog count. The visible
     /// `boardRows` count is intentionally irrelevant: hidden, disabled, empty, and failed rows are
     /// filtered out but still occupy engine board indices.
+    @MainActor
     var boardHasNextPage: Bool {
         HomeCatalogLoadPolicy.hasNextPage(
             loaded: boardRowsLoaded,
@@ -2278,6 +2640,7 @@ final class CoreBridge: ObservableObject {
     /// Load the next page of Home catalogs (the vertical infinite scroll). Re-dispatches a wider LoadRange
     /// so more catalog rows hydrate; no-op at the end or while a page is already in flight. Without this
     /// Home was permanently capped at its first 30 catalogs.
+    @MainActor
     func loadBoardNextPage(step: Int = 30) {
         guard boardHasNextPage, !boardPageInFlight else { return }
         widenBoardRange(to: boardRowsLoaded + step)
@@ -2285,6 +2648,7 @@ final class CoreBridge: ObservableObject {
 
     /// Every non-restart widening shares the row-page fence, including late order hydration
     /// and the Live tab. Keep an absolute maximum so coalesced requests cannot lose depth.
+    @MainActor
     private func widenBoardRange(to needed: Int) {
         guard needed > boardRowsLoaded else { return }
         if !boardRowPageInFlight.isEmpty {
@@ -2301,6 +2665,7 @@ final class CoreBridge: ObservableObject {
     /// engine appends to `board.catalogs[engineIndex]` and re-emits `board`, so the row grows in place.
     /// No-op while a page is already in flight for this row, or once the row is exhausted (a settled load
     /// added no new items). Call from the row's last-card `onAppear`. Main-queue only (mirrors the others).
+    @MainActor
     func loadBoardRowNextPage(engineIndex: Int) {
         guard !boardRowExhausted.contains(engineIndex), boardRowPageInFlight[engineIndex] == nil else { return }
         guard let board = decode(CoreBoardState.self, field: "board"), engineIndex < board.catalogs.count else { return }
@@ -2323,6 +2688,7 @@ final class CoreBridge: ObservableObject {
     /// longer loading) that GREW the row clears the in-flight gate so the next page can load; a settled
     /// load that added nothing marks the row exhausted so it stops (a finite catalog never loops on no-op
     /// loads, mirroring `discoverExhausted`). Main-queue only; takes the board decoded off-main by the caller.
+    @MainActor
     private func reconcileBoardRowPagination(_ board: CoreBoardState?) {
         guard let board else { return }
         for (index, request) in boardRowPageInFlight {
@@ -2352,6 +2718,7 @@ final class CoreBridge: ObservableObject {
     /// the engine board is decoded; it does not change engine indices. A catalog moved to the top can still
     /// sit at raw index 121, so hydrate the full raw range before rebuilding the visible order. This covers
     /// local moves/grouping and a synced or backup-restored order through `CatalogPreferences`.
+    @MainActor
     func catalogOrderDidChange() {
         guard !CatalogPrefsStore.order().isEmpty else {
             rebuildBoardRows()
@@ -2367,6 +2734,7 @@ final class CoreBridge: ObservableObject {
 
     /// Widen, but never restart, the board model. Kept separate so a late ctx hydrate can finish an order
     /// restoration that ran against an interim add-on roster.
+    @MainActor
     private func ensureCatalogOrderRangeLoaded(installedCatalogTotal: Int) {
         let needed = HomeCatalogLoadPolicy.fullLoadDepth(
             current: boardRowsLoaded,
@@ -2386,6 +2754,7 @@ final class CoreBridge: ObservableObject {
     /// provide so those rows hydrate wherever they sit. Idempotent: a no-op once the window covers them.
     /// (Engine-lane follow-up: a dedicated typed live-catalog load would avoid hydrating the whole Home
     /// board here, see [[vortx-engine-needs]] #7 IPTV + the source-registry.)
+    @MainActor
     func ensureLiveCatalogsLoaded() {
         // RAW count (tombstoned AND per-profile disabled add-ons included): both kinds of catalog
         // still occupy engine board indices, so the widen bound must cover them or trailing live
@@ -2402,6 +2771,7 @@ final class CoreBridge: ObservableObject {
     // MARK: Discover / Library
 
     /// Load Discover's default catalog (the engine picks the first selectable type).
+    @MainActor
     func loadDiscover() {
         resetDiscoverPagination()
         dispatch(action: ["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]],
@@ -2409,6 +2779,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Switch Discover's type / catalog / genre, pass the chip's own `request` back verbatim.
+    @MainActor
     func selectDiscover(_ request: CoreRequest) {
         guard let requestDict = Self.encodeToDict(request) else { return }
         resetDiscoverPagination()
@@ -2433,6 +2804,7 @@ final class CoreBridge: ObservableObject {
     /// most ONE extra no-op `LoadNextPage` (the engine ignores it when there is truly no next page) and then
     /// `discoverExhausted` stops it -- additive, and it does not loop. A healthy catalog that still has its
     /// cursor returns early on the first line and is unaffected.
+    @MainActor
     var discoverHasNextPage: Bool {
         if discover?.selectable.nextPage != nil { return true }
         return !discoverExhausted && (discover?.items.count ?? 0) > 0   // count-driven fallback (#95)
@@ -2465,6 +2837,7 @@ final class CoreBridge: ObservableObject {
     /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
     /// is already in flight. Previously missing entirely, the catalog stopped at its first page, which
     /// add-on authors saw as "next page / next catalog not loading."
+    @MainActor
     func loadDiscoverNextPage() {
         guard discoverHasNextPage, !discoverPageInFlight else { return }
         discoverPageInFlight = true
@@ -2474,6 +2847,7 @@ final class CoreBridge: ObservableObject {
 
     /// Reset the cursorless-pagination tracking on every catalog change (new type / catalog / genre), so
     /// the next catalog starts fresh and the previous one's exhausted/cursor state never leaks across.
+    @MainActor
     private func resetDiscoverPagination() {
         discoverPageInFlight = false
         discoverExhausted = false
@@ -2481,6 +2855,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Load the Library (all types, most-recent first). Auto-refreshes on library changes.
+    @MainActor
     func loadLibrary() {
         dispatch(action: ["action": "Load",
                           "args": ["model": "LibraryWithFilters",
@@ -2505,6 +2880,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Switch the Library's type / sort, pass the chip's own `request` back verbatim.
+    @MainActor
     func selectLibrary(_ request: CoreLibraryRequest) {
         guard let requestDict = Self.encodeToDict(request) else { return }
         dispatch(action: ["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": requestDict]]],
@@ -2535,6 +2911,7 @@ final class CoreBridge: ObservableObject {
     /// search catalogs; a `Bool` is word-atomic on 64-bit, so the cross-thread read is benign (a stale
     /// read at worst skips one re-dispatch that the next ctx change catches, or fires one harmless no-op
     /// `LoadRange`), matching the file's `playerActive` convention.
+    @MainActor
     private var searchLoaded = false
     private let searchPublication = CoreSearchPublicationFence()
     private struct SearchQueryEnvelope: Decodable {
@@ -2544,13 +2921,14 @@ final class CoreBridge: ObservableObject {
 
     /// Call synchronously when the text changes, before starting a debounce. This retires the old
     /// query immediately; search(_:) still calls it for direct submissions and existing callers.
+    @MainActor
     func prepareSearch(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let prepared = searchPublication.prepare(trimmed)
         guard prepared.changed else { return }
         searchLoaded = false
         dispatch(action: ["action": "Unload"], field: "search")
-        let clear = { [weak self] in
+        let clear: @MainActor @Sendable () -> Void = { [weak self] in
             guard let self, self.searchPublication.accepts(prepared.token) else { return }
             self.searchResults = []; self.searchSuggestions = []
             self.searchIsLoading = trimmed.count >= 2
@@ -2564,6 +2942,7 @@ final class CoreBridge: ObservableObject {
     /// has content untouched and only issues a fetch for the in-range indices still parked at a nil
     /// content, so a re-dispatch is idempotent: it fills the re-seeded holes without re-loading settled
     /// results.
+    @MainActor
     private func loadSearchRange() {
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange",
@@ -2573,6 +2952,7 @@ final class CoreBridge: ObservableObject {
 
     /// Search across the installed addons (engine `search` field = CatalogsWithExtra with a search
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
+    @MainActor
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         nativeFacadeLock.withLock {
@@ -2605,6 +2985,7 @@ final class CoreBridge: ObservableObject {
         loadSearchRange()
     }
 
+    @MainActor
     private func setSearchLoading(_ loading: Bool, token: UUID) {
         if Thread.isMainThread {
             if searchPublication.accepts(token) { searchIsLoading = loading }
@@ -2617,10 +2998,12 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Load Cinemeta's local-search index and ask it for autocomplete suggestions as the user types.
+    @MainActor
     func loadSearchSuggestions() {
         dispatch(action: ["action": "Load", "args": ["model": "LocalSearch"]], field: "local_search")
     }
 
+    @MainActor
     func suggestSearch(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         DispatchQueue.main.async { [weak self] in self?.searchSuggestions = [] }
@@ -2659,35 +3042,6 @@ final class CoreBridge: ObservableObject {
     /// issue this request's exact Load. The returned generation is the only generation whose later terminal
     /// receipt can certify completion for this exact stream request; full-series/finality authority remains
     /// a separate policy decision.
-    func beginAppleCWAuthoritativeMetaRefresh(type: String, id: String,
-                                               streamType: String?, streamId: String,
-                                               navigationOnly: Bool = false) -> Int {
-        refindRequest = nil
-        refindGeneration &+= 1
-        appleCWMetaRefreshGeneration &+= 1
-        let generation = appleCWMetaRefreshGeneration
-        appleCWMetaRefreshRequest = AppleCWMetaRefreshRequest(
-            generation: generation,
-            type: type,
-            libraryID: id,
-            streamType: streamType,
-            streamID: streamId,
-            navigationOnly: navigationOnly,
-            phase: .awaitingInvalidation
-        )
-        appleCWMetaRefreshReceipt = nil
-        appleCWMetaRefreshDetails = nil
-        metaDetailsWork?.cancel()
-        metaDetailsWork = nil
-        let hadDetails = metaDetails != nil
-        metaDetails = nil
-        if hadDetails { streamsEpoch &+= 1 }
-        dispatch(action: ["action": "Unload"], field: "meta_details")
-        // Unload of an already-unloaded model is an engine no-op: explicitly inspect its receipt rather
-        // than waiting forever for an event that will not fire. The same generation/phase fences apply.
-        scheduleMetaDetailsRepublish()
-        return generation
-    }
 
     /// Re-find sources: force a FRESH add-on re-query for this exact title/episode so expired sources are
     /// replaced. Modeled on `beginAppleCWAuthoritativeMetaRefresh` but with an OPTIONAL `streamId` (so
@@ -2697,65 +3051,24 @@ final class CoreBridge: ObservableObject {
     /// receipt (see the `refindRequest` arm in `scheduleMetaDetailsRepublish`). The source list empties and
     /// repaints to its loading state, then refills as the fresh sources land. Main-actor only (called from
     /// SwiftUI actions), mirroring `beginAppleCWAuthoritativeMetaRefresh`'s synchronous mutation style.
-    func refindSources(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
-        cancelAppleCWMetaRefresh()
-        invalidateNZBIndexerResults()
-        refindGeneration &+= 1
-        refindRequest = RefindRequest(
-            generation: refindGeneration,
-            type: type,
-            id: id,
-            streamType: streamType,
-            streamID: streamId,
-            awaitingInvalidation: true
-        )
-        metaDetailsWork?.cancel()
-        metaDetailsWork = nil
-        let hadDetails = metaDetails != nil
-        metaDetails = nil
-        // Clearing the resident streams IS a ready-stream-set change: bump the source-list epoch so the
-        // model empties, then repaints as the re-queried title lands.
-        if hadDetails { streamsEpoch &+= 1 }
-        dispatch(action: ["action": "Unload"], field: "meta_details")
-        scheduleMetaDetailsRepublish()
-    }
 
     /// Cancel a pending Apple terminal refresh when ordinary navigation or player teardown takes ownership
     /// of the shared meta slot. A stale polling Task may return harmlessly, but its bridge request must also
     /// be unable to dispatch a late Load into the newer target.
-    func cancelAppleCWMetaRefresh() {
-        guard let generation = appleCWMetaRefreshRequest?.generation else {
-            appleCWMetaRefreshReceipt = nil
-            appleCWMetaRefreshDetails = nil
-            return
-        }
-        _ = cancelAppleCWMetaRefresh(generation: generation)
-    }
 
     /// Cancel only the request owned by one player generation. A view replacement can call this after its
     /// successor has already started a same-title refresh, so a mismatched generation must be a no-op and
     /// must not cancel the replacement's pending coalesced republish or exact Load.
-    @discardableResult
-    func cancelAppleCWMetaRefresh(generation: Int) -> Bool {
-        guard AppleCWMetaRefreshGenerationFence.owns(
-            capturedGeneration: generation,
-            activeGeneration: appleCWMetaRefreshRequest?.generation
-        ) else { return false }
-        metaDetailsWork?.cancel()
-        metaDetailsWork = nil
-        appleCWMetaRefreshRequest = nil
-        appleCWMetaRefreshReceipt = nil
-        appleCWMetaRefreshDetails = nil
-        return true
-    }
 
     /// Scoped observations for detail recovery. Keeping these behind the bridge preserves the detail
     /// screens' one-read identity contract while still fencing terminal and canonical-ready state to
     /// the engine selection that owns it.
+    @MainActor
     func detailMetaResolution(for requestedID: String) -> DetailMetaRecoveryPolicy.Resolution? {
         metaDetails?.metaResolution(for: requestedID)
     }
 
+    @MainActor
     func canonicalReadyMetaTarget(for requestedID: String) -> (id: String, type: String)? {
         guard let details = metaDetails,
               details.selectedMetaID == requestedID,
@@ -2768,41 +3081,7 @@ final class CoreBridge: ObservableObject {
 
     /// Load a title's meta + streams. For a series episode, pass the episode's video id as the stream
     /// path so the engine fetches that episode's streams.
-    func loadMeta(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
-        cancelAppleCWMetaRefresh()
-        // A navigation/load takes ownership of the meta slot: drop any pending re-find so its Unload's nil
-        // receipt cannot re-dispatch a stale Load into this new target.
-        refindRequest = nil
-        invalidateNZBIndexerResults()
-        dispatch(action: metaLoadAction(type: type, id: id, streamType: streamType, streamId: streamId),
-                 field: "meta_details")
-        // If the engine already had this exact meta loaded, ActionLoad is a no-op (eq_update) and no
-        // meta_details NewState fires, so the page would stick on the spinner. Read the current state:
-        // keep it when the requested meta is already ready, otherwise clear to the spinner until it loads.
-        let current = decode(CoreMetaDetails.self, field: "meta_details")
-        let alreadyLoaded = current?.meta?.id == id
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let hadDetails = self.metaDetails != nil
-            self.metaDetails = alreadyLoaded ? current : nil
-            // A fresh load clears the resident streams: that IS a ready-stream-set change, so the
-            // source-list epoch must bump (the model empties, then repaints as the new title lands).
-            if !alreadyLoaded, hadDetails { self.streamsEpoch &+= 1 }
-            if alreadyLoaded, let current { self.startNZBIndexerSearchIfNeeded(details: current) }
-        }
-    }
 
-    func unloadMeta() {
-        cancelAppleCWMetaRefresh()
-        refindRequest = nil
-        invalidateNZBIndexerResults()
-        dispatch(action: ["action": "Unload"], field: "meta_details")
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.metaDetails != nil { self.streamsEpoch &+= 1 }
-            self.metaDetails = nil
-        }
-    }
 
     /// Loaded streams grouped by their source addon (for the per-addon filter + source labels).
     ///
@@ -2818,10 +3097,6 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Re-rank already-loaded sources when the account's order changes; never wait for an engine rehydrate.
-    @MainActor
-    func addonOrderDidChange() {
-        streamsEpoch &+= 1
-    }
 
     /// Shared assembly for both `streamGroups` overloads: walk the meta-embedded stream groups
     /// (`metaStreams`) FIRST, then the stream-resource responses, mirroring the engine's own
@@ -2868,66 +3143,6 @@ final class CoreBridge: ObservableObject {
     /// Launch once from the metadata publication lifecycle, rather than from a source-list getter.
     /// The identity fences owner, configuration generation, title and episode so a late response can
     /// never bleed into a subsequent title or auto-next episode.
-    @MainActor
-    private func startNZBIndexerSearchIfNeeded(details: CoreMetaDetails) {
-        let scope = NZBIndexerStore.captureScope()
-        let owner = scope.identity
-        let document = NZBIndexerStore.load(scope: scope)
-        guard !document.enabled.isEmpty, let meta = details.meta else { return }
-        let profileID = scope.profileID
-        let streamID = details.selected?.streamPath?.id
-        let key = NZBIndexerResultKey(owner: owner, profileID: profileID, revision: document.revision, titleID: meta.id, streamID: streamID)
-        guard !nzbIndexerTerminal.contains(key), nzbIndexerResults[key] == nil, nzbIndexerTasks[key] == nil else { return }
-        // The bridge has one resident meta slot. Cancel any prior title/episode request before this
-        // selection can launch, including an episode switch that arrives without a new navigation call.
-        let staleTasks = nzbIndexerTasks.filter { $0.key != key }
-        for (oldKey, task) in staleTasks { task.cancel(); nzbIndexerTasks.removeValue(forKey: oldKey) }
-        let video = streamID.flatMap { requested in meta.videos?.first(where: { $0.id == requested }) }
-        let query = NZBIndexerClient.Search(title: meta.name, imdbID: meta.id.hasPrefix("tt") ? meta.id : nil,
-                                             season: video?.season, episode: video?.episode, isSeries: meta.type == "series")
-        // Metadata may precede the episode inventory. Do not terminalize an invalid episode query;
-        // the late-inventory publication will launch it with real coordinates.
-        if query.isSeries, query.season == nil || query.episode == nil { return }
-        let configs = document.enabled.compactMap { config -> (NZBIndexerConfig, String)? in
-            NZBIndexerStore.apiKey(for: config.id, scope: scope).map { (config, $0) }
-        }
-        guard !configs.isEmpty else { return }
-        nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll()
-        activeNZBIndexerKey = key; activeNZBIndexerCount = configs.count
-        streamsEpoch &+= 1
-        nzbIndexerGeneration &+= 1; let generation = nzbIndexerGeneration
-        nzbIndexerTasks[key] = Task { [weak self] in
-            defer {
-                // Every terminal route (cancellation, transport failure, stale fence, or success)
-                // releases the launch latch. A later lifecycle/refind can therefore retry instead of
-                // being permanently represented as an empty completed group.
-                if let self, self.nzbIndexerGeneration == generation { self.nzbIndexerTasks[key] = nil }
-            }
-            var output: [(Int, CoreStreamSourceGroup)] = []
-            await withTaskGroup(of: (Int, CoreStreamSourceGroup)?.self) { group in
-                for (index, pair) in configs.enumerated() { let (config, apiKey) = pair; group.addTask {
-                    guard !Task.isCancelled,
-                          let releases = try? await NZBIndexerClient.search(config: config, apiKey: apiKey, search: query) else { return nil }
-                    let streams = releases.compactMap { Self.nzbIndexerStream($0, indexerName: config.name) }
-                    return streams.isEmpty ? nil : (index, CoreStreamSourceGroup(id: "nzbindexer:" + config.id, addon: config.name, streams: streams))
-                } }
-                for await result in group { if let result { output.append(result) } }
-            }
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard let self, self.nzbIndexerGeneration == generation,
-                      NZBIndexerStore.isCurrent(scope),
-                      NZBIndexerStore.load(scope: scope).revision == key.revision,
-                      scope.profileID == key.profileID,
-                      self.metaDetails?.meta?.id == key.titleID,
-                      self.metaDetails?.selected?.streamPath?.id == key.streamID else { return }
-                let ordered = output.sorted { $0.0 < $1.0 }.map(\.1)
-                self.nzbIndexerResults[key] = ordered
-                self.nzbIndexerTerminal.insert(key)
-                self.streamsEpoch &+= 1
-            }
-        }
-    }
 
     @MainActor private func indexerGroups(for details: CoreMetaDetails, streamID: String?) -> [CoreStreamSourceGroup] {
         guard let key = activeNZBIndexerKey, key.owner == NZBIndexerStore.captureScope().identity,
@@ -2950,25 +3165,16 @@ final class CoreBridge: ObservableObject {
         return nzbIndexerTerminal.contains(key) ? (activeNZBIndexerCount, activeNZBIndexerCount) : (0, activeNZBIndexerCount)
     }
 
-    private func invalidateNZBIndexerResults() {
-        nzbIndexerGeneration &+= 1; nzbIndexerTasks.values.forEach { $0.cancel() }
-        nzbIndexerTasks.removeAll(); nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll(); activeNZBIndexerKey = nil; activeNZBIndexerCount = 0
-    }
 
     /// Settings writes are synchronous and revisioned. Re-run the normal lifecycle for the resident
     /// title immediately, so an enabled/disabled indexer cannot leave old rows on screen.
-    @MainActor func nzbIndexerConfigurationDidChange() {
-        invalidateNZBIndexerResults()
-        streamsEpoch &+= 1
-        if let metaDetails { startNZBIndexerSearchIfNeeded(details: metaDetails) }
-    }
 
     private static func nzbIndexerStream(_ release: NZBIndexerClient.Release, indexerName: String) -> CoreStream? {
         let object: [String: Any] = ["name": "📰 " + indexerName, "description": release.title,
                                      "nzbUrl": release.enclosureURL.absoluteString,
                                      "behaviorHints": ["filename": release.title]]
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
-        return try? decoder.decode(CoreStream.self, from: data)
+        return try? JSONDecoder().decode(CoreStream.self, from: data)
     }
 
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
@@ -3065,57 +3271,67 @@ final class CoreBridge: ObservableObject {
         var id: String { base }
     }
 
-    /// Memo for `streamAddonStates`, keyed per stream id on `streamsEpoch`: every fact it surfaces
-    /// (per-group ready count, loading flag, error transition) changes exactly when the ready-stream
-    /// signature changes, which is when `streamsEpoch` bumps. Without this, the three iOS source-list
-    /// call sites pulled the FULL raw meta_details JSON across the FFI and re-parsed it with
-    /// JSONSerialization on EVERY SwiftUI body eval (6-7x/sec during source search on a 1200+ stream
-    /// title), a main-thread saturator of its own alongside the old per-eval assembly.
-    private var addonStatesCache: [String: (epoch: Int, value: [StreamAddonState])] = [:]
+    /// Error payloads are not part of CoreLoadable.err or the source epoch. Keep only normalized
+    /// presentation from the same admitted metadata buffer, never a separate live state read.
+    private struct StreamAddonStatusRow: Equatable, Sendable {
+        let request: CoreResourceRequest
+        let ready: Int
+        let loading: Bool
+        let error: String?
+    }
+    private struct StreamAddonStatusProjection: Equatable, Sendable {
+        let selected: CoreMetaSelection?
+        let rows: [StreamAddonStatusRow]
+    }
+    // Status admission/payload/wakeup storage now lives only in MetadataPresentation.
+
+    // The new same-file begin/accept forwarding implementations are in02.
 
     @MainActor
     func streamAddonStates(forStreamId streamId: String? = nil) -> [StreamAddonState] {
-        let cacheKey = streamId ?? ""
-        if let hit = addonStatesCache[cacheKey], hit.epoch == streamsEpoch { return hit.value }
-        var out: [StreamAddonState] = []
-        if let data = stateData("meta_details"),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let streams = object["streams"] as? [[String: Any]] {
-            let names = addonNamesByBase()
-            for group in streams {
-                let request = group["request"] as? [String: Any]
-                if let streamId,
-                   let path = request?["path"] as? [String: Any],
-                   path["id"] as? String != streamId { continue }
-                let base = request?["base"] as? String ?? ""
-                let name = names[base] ?? "Add-on"
-                let content = group["content"] as? [String: Any]
-                switch content?["type"] as? String {
-                case "Ready":
-                    // Decode this exact current request, not a possibly stale publication for
-                    // another episode. A typed-payload failure is terminal, never a false Ready.
-                    if let count = Self.currentReadyStreamCount(group) {
-                        out.append(.init(base: base, name: name, ready: count, loading: false, error: nil))
-                    } else {
-                        out.append(.init(base: base, name: name, ready: 0, loading: false, error: "Unreadable add-on response"))
-                    }
-                case "Err":
-                    let msg = Self.describeResourceError(content?["content"])
-                    out.append(.init(base: base, name: name, ready: 0, loading: false, error: msg))
-                default:
-                    out.append(.init(base: base, name: name, ready: 0, loading: true, error: nil))
-                }
-            }
+        guard let details = metaDetails, let projection = metadataPresentation.acceptedStatus,
+              projection.selected == details.selected else { return [] }
+        let names = addonNamesByBase()
+        return projection.rows.compactMap { row in
+            if let streamId, row.request.path.id != streamId { return nil }
+            return StreamAddonState(base: row.request.base, name: names[row.request.base] ?? "Add-on",
+                ready: row.ready, loading: row.loading, error: row.error)
         }
-        // Bounded: a long episode-hopping session accumulates one slot per episode id; reset on overflow
-        // (worst case one extra parse). Failures cache too, so a broken payload cannot re-parse per eval.
-        if addonStatesCache.count > 8 { addonStatesCache.removeAll(keepingCapacity: true) }
-        addonStatesCache[cacheKey] = (streamsEpoch, out)
-        return out
     }
 
-    /// Runs only on the existing epoch-cache miss; no extra engine read or per-body work.
-    private static func currentReadyStreamCount(_ group: [String: Any]) -> Int? {
+    /// Normalize only the stream-resource rows this UI already exposes, preserving order and exact
+    /// request identity. Ready counts reuse the typed decode from the same buffer, not another
+    /// per-stream parse. Unknown fields remain raw-owned and do not invalidate presentation.
+    private static func streamAddonStatusProjection(data: Data, details: CoreMetaDetails?) throws -> StreamAddonStatusProjection? {
+        guard let details else { return nil }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let groups = object["streams"] as? [[String: Any]], groups.count == details.streams.count else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Inconsistent metadata status rows"))
+        }
+        var rows: [StreamAddonStatusRow] = []
+        rows.reserveCapacity(groups.count)
+        for (raw, decoded) in zip(groups, details.streams) {
+            let content = raw["content"] as? [String: Any]
+            let ready: Int, loading: Bool, error: String?
+            switch content?["type"] as? String {
+            case "Ready":
+                let count = Self.currentReadyStreamCount(raw, decoded: decoded)
+                ready = count ?? 0; loading = false
+                error = count == nil ? "Unreadable add-on response" : nil
+            case "Err":
+                ready = 0; loading = false; error = Self.describeResourceError(content?["content"])
+            default:
+                ready = 0; loading = true; error = nil
+            }
+            rows.append(.init(request: decoded.request, ready: ready, loading: loading, error: error))
+        }
+        return .init(selected: details.selected, rows: rows)
+    }
+
+    /// The accepted projection passes its already-decoded exact current row. The raw default
+    /// remains available without borrowing a previous episode's Ready value.
+    private static func currentReadyStreamCount(_ group: [String: Any], decoded: CoreStreamGroup? = nil) -> Int? {
+        if let decoded { return decoded.content?.ready?.count }
         guard let data = try? JSONSerialization.data(withJSONObject: group),
               let current = try? JSONDecoder().decode(CoreStreamGroup.self, from: data),
               let streams = current.content?.ready else { return nil }
@@ -3167,7 +3383,7 @@ final class CoreBridge: ObservableObject {
     // MARK: Mark watched / unwatched (updates the library + syncs; markers refresh live)
 
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
-    func markWatched(_ isWatched: Bool, expected: LibraryWatchedMutationPolicy.DetailTarget) {
+    @MainActor func markWatched(_ isWatched: Bool, expected: LibraryWatchedMutationPolicy.DetailTarget) {
         // Snapshot one resident detail identity before constructing actions. A stale menu closure may
         // outlive a detail replacement; never let it dispatch through whichever meta_details happens
         // to be resident now.
@@ -3228,7 +3444,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Mark every episode of a season watched/unwatched.
-    func markSeasonWatched(_ season: Int, _ isWatched: Bool,
+    @MainActor func markSeasonWatched(_ season: Int, _ isWatched: Bool,
                            expected: LibraryWatchedMutationPolicy.DetailTarget) {
         guard let residentMeta = metaDetails?.meta,
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
@@ -3258,7 +3474,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Mark a single episode watched/unwatched. The engine's `Video` only needs `id`.
-    func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool,
+    @MainActor func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool,
                           expected: LibraryWatchedMutationPolicy.DetailTarget) {
         guard let residentMeta = metaDetails?.meta,
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
@@ -3284,7 +3500,7 @@ final class CoreBridge: ObservableObject {
     /// Route a detail-page watched toggle into the overlay when the active profile keeps
     /// its own history, so a non-owner profile can never touch the account's library.
     /// Returns false for engine profiles, which then dispatch as before.
-    private func overlayMarkWatched(_ isWatched: Bool, videoIds: (CoreMetaItem) -> [String]) -> Bool {
+    @MainActor private func overlayMarkWatched(_ isWatched: Bool, videoIds: (CoreMetaItem) -> [String]) -> Bool {
         guard !ProfileStore.shared.activeUsesEngineHistory else { return false }
         guard let meta = metaDetails?.meta else { return true }   // no detail context: drop, never mutate the account
         let ids = videoIds(meta)
@@ -3297,21 +3513,20 @@ final class CoreBridge: ObservableObject {
     /// Persist only an accepted owner mutation. The resident-detail and playback-target fences at
     /// each caller prove the active profile/account still owns the action; this extra owner check
     /// prevents any delayed callback from writing a secondary profile's account carrier.
-    private func recordOwnerWatchedIntent(titleID: String, videoIDs: [String], watched: Bool) {
-        guard Thread.isMainThread, ProfileStore.shared.active?.isOwner == true else { return }
-        let changed = MainActor.assumeIsolated {
-            OwnerWatchedIntentStore.record(titleID: titleID, videoIDs: videoIDs.filter { !$0.isEmpty }, watched: watched)
-        }
+    @MainActor private func recordOwnerWatchedIntent(titleID: String, videoIDs: [String], watched: Bool) {
+        guard ProfileStore.shared.active?.isOwner == true else { return }
+        let changed = OwnerWatchedIntentStore.record(
+            titleID: titleID, videoIDs: videoIDs.filter { !$0.isEmpty }, watched: watched)
         guard changed else { return }
         WatchedIndex.shared.ownerIntentsDidChange()
-        MainActor.assumeIsolated { VortXSyncManager.shared.requestSyncSoon() }
+        VortXSyncManager.shared.requestSyncSoon()
     }
 
     /// Display info for an overlay watch entry when a toggle arrives by bare id (the
     /// Library tab and poster menus). Resolved from whatever state already holds the
     /// title; nil means nothing knows it and the toggle is dropped rather than creating
     /// a nameless Continue Watching card.
-    private func overlayDisplayInfo(forId id: String,
+    @MainActor private func overlayDisplayInfo(forId id: String,
                                     fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) -> (name: String, type: String, poster: String?)? {
         if let meta = metaDetails?.meta, meta.id == id { return (meta.name, meta.type, meta.poster) }
         if let item = continueWatching.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
@@ -3334,7 +3549,7 @@ final class CoreBridge: ObservableObject {
 
     /// Id-only watched toggle into the overlay. Without an episode list the id itself is
     /// the marker (exactly how movies are tracked); unwatch clears everything recorded.
-    private func overlaySetWatchedById(_ id: String, _ isWatched: Bool,
+    @MainActor private func overlaySetWatchedById(_ id: String, _ isWatched: Bool,
                                        fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) {
         if isWatched {
             guard let info = overlayDisplayInfo(forId: id, fallbackPreview: fallbackPreview) else { return }
@@ -3351,7 +3566,7 @@ final class CoreBridge: ObservableObject {
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
     /// flips live instead of waiting for a library sync. CW launches and refreshes can temporarily
     /// unload meta_details; retain the exact episode mark until matching metadata becomes available.
-    func markPlaybackWatched(_ meta: PlaybackMeta, target: PlaybackMutationTarget? = nil,
+    @MainActor func markPlaybackWatched(_ meta: PlaybackMeta, target: PlaybackMutationTarget? = nil,
                              allowEngineWrite: Bool = true) {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
         guard target.stillOwnsCurrentContext(core: self) else {
@@ -3421,34 +3636,8 @@ final class CoreBridge: ObservableObject {
 
     /// Called only on main after a real metadata publication. Alias-aware navigation matching still
     /// requires the exact selected request and episode; an unrelated detail can never consume this queue.
-    private func replayPendingEpisodeWatched() {
-        let now = Date()
-        for key in Array(pendingEpisodeWatched.keys) {
-            guard let pending = pendingEpisodeWatched[key] else { continue }
-            switch LibraryWatchedMutationPolicy.deferredDecision(
-                expiresAt: pending.expiresAt, now: now,
-                ownsContext: pending.target.stillOwnsCurrentContext(core: self),
-                logoutPending: logoutAccountMutationPending,
-                metadataMatches: episodeWatchedMetadataMatches(pending.meta)) {
-            case .discard:
-                pendingEpisodeWatched.removeValue(forKey: key)
-                continue
-            case .wait:
-                continue
-            case .dispatch:
-                break
-            }
-            var payload: [String: Any] = ["id": pending.meta.videoId]
-            if let season = pending.meta.season { payload["season"] = season }
-            if let episode = pending.meta.episode { payload["episode"] = episode }
-            if dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]]) {
-                pendingEpisodeWatched.removeValue(forKey: key)
-                VXProbe.log("playback", "deferred episode watched mark dispatched to exact metadata")
-            }
-        }
-    }
 
-    private func episodeWatchedMetadataMatches(_ meta: PlaybackMeta) -> Bool {
+    @MainActor private func episodeWatchedMetadataMatches(_ meta: PlaybackMeta) -> Bool {
         LibraryWatchedMutationPolicy.residentMatches(
             .init(id: meta.libraryId, type: meta.type),
             residentID: metaDetails?.meta?.id, residentType: metaDetails?.meta?.type)
@@ -3457,7 +3646,7 @@ final class CoreBridge: ObservableObject {
 
     /// Owner-only effective detail ticks. Kept out of CoreModels so model decoding has no mutable
     /// account-store dependency; an explicit remote false intent removes stale engine bits here.
-    func effectiveWatchedVideoIDs(for details: CoreMetaDetails) -> Set<String> {
+    @MainActor func effectiveWatchedVideoIDs(for details: CoreMetaDetails) -> Set<String> {
         let engine = details.watchedIds
         guard ProfileStore.shared.active?.isOwner == true, let titleID = details.meta?.id else { return engine }
         return OwnerWatchedIntentStore.effectiveVideoIDs(forTitle: titleID, engine: engine,
@@ -3499,7 +3688,6 @@ final class CoreBridge: ObservableObject {
         // The by-id resolver carries the causal owner-cache comparison; use it even when this
         // title is currently loaded, so a detail-open stale positive cannot hide newer remote state.
         if let resolved = engineResumeSecondsByLibraryId(for: meta) { return resolved }
-        let engine = max(0, item.state.timeOffset / 1000.0)
         // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
         // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
@@ -3573,7 +3761,7 @@ final class CoreBridge: ObservableObject {
     /// device re-adds owner titles at time 0 because stremio-core exposes no action to inject a saved offset,
     /// so this cache is what restores cross-device resume. Series: only when the cached episode matches. Returns
     /// nil (not 0) when there is no positive cached offset, so a genuine "start from 0" is never overridden.
-    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
+    @MainActor private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
         guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
         if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
@@ -3592,7 +3780,7 @@ final class CoreBridge: ObservableObject {
     /// no live Stremio session (the default and every VortX-only device), a locally-finished title, an overlay
     /// profile, or no cached VortX position that is actually ahead. `vortxOwnedResumeSeconds` does the owner
     /// gate and the episode-identity match, so a series never resumes another episode's position through here.
-    private func flooredResumeSeconds(engine: Double, for meta: PlaybackMeta) -> Double {
+    @MainActor private func flooredResumeSeconds(engine: Double, for meta: PlaybackMeta) -> Double {
         guard !MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn()),
               !LocalRewindLog.contains(meta.libraryId),
               let owned = vortxOwnedResumeSeconds(for: meta), owned > engine else { return engine }
@@ -3605,7 +3793,7 @@ final class CoreBridge: ObservableObject {
     /// "Remove from Library", and on the legacy engine also the Continue Watching dismiss (Stremio auto-adds
     /// to the library on play, so dismissing there is a library removal). The engine re-emits
     /// `continue_watching_preview` + `library`, so both rails update on their own.
-    func removeFromLibrary(id: String) {
+    @MainActor func removeFromLibrary(id: String) {
         if usesNativeProfileState {
             // Native profiles keep the saved Library, Continue Watching and watch history separate, so a
             // Library removal never dismisses Continue Watching (and the reverse, below).
@@ -3644,7 +3832,7 @@ final class CoreBridge: ObservableObject {
     /// Dismiss a title from Continue Watching only. Native profiles record a Continue Watching dismissal
     /// (a later resume or watch revives it) and never delete the saved Library entry. The legacy engine has
     /// no separate rail: its Continue Watching membership is library membership, so it keeps the removal.
-    func removeFromContinueWatching(id: String) {
+    @MainActor func removeFromContinueWatching(id: String) {
         if usesNativeProfileState {
             DiagnosticsLog.log("library", "action=dismiss_continue_watching surface=menu")
             nativeDismissContinueWatching(id: id); return
@@ -3659,7 +3847,7 @@ final class CoreBridge: ObservableObject {
     /// touches only its private history via ProfileStore. One immediate push at the end for the whole batch
     /// (not one per title, unlike the single-item path) so the tombstones land promptly without N round
     /// trips. Never "just delete locally": a bare local clear would be resurrected by the next union pull.
-    func clearContinueWatching() {
+    @MainActor func clearContinueWatching() {
         if usesNativeProfileState {
             for item in continueWatching {
                 nativeDismissContinueWatching(id: item.id)
@@ -3691,7 +3879,7 @@ final class CoreBridge: ObservableObject {
     /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
     /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
     /// entries rather than full catalog previews. A no-op if the id isn't in the library.
-    func setLibraryItemWatched(id: String, _ isWatched: Bool) {
+    @MainActor func setLibraryItemWatched(id: String, _ isWatched: Bool) {
         if usesNativeProfileState {
             guard let item = library?.catalog.first(where: { $0.id == id }) else { return }
             if EpisodePlaybackIdentity.usesSeriesLifecycle(type: item.type) {
@@ -3740,17 +3928,20 @@ final class CoreBridge: ObservableObject {
     /// or network round trip settles, which also fixes the #147 "CW slower / flashes then disappears" report.
     ///
     /// Owner-profile only: an overlay profile rides `profiles.cwItems` and ignores this published value, so for
-    /// a non-owner profile this stays EXACTLY `pruneFinished(engine preview)` (unchanged behaviour). Decodes off
-    /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
-    /// synthesizes + publishes on main.
+    /// a non-owner profile this stays EXACTLY `pruneFinished(engine preview)` (unchanged behaviour). This
+    /// direct owner refresh reads the owner's snapshot; native source callbacks use the separate immutable
+    /// worker-decode path and do not enter this helper.
+    @MainActor
     func rebuildContinueWatching() {
         rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
     }
 
+    @MainActor
     private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken) {
         rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true)
     }
 
+    @MainActor
     private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken,
                                          recordsHistoryReceipt: Bool,
                                          capturedCredentialCapture: CredentialScopeRegistry.Capture? = nil) {
@@ -3761,7 +3952,7 @@ final class CoreBridge: ObservableObject {
         continueWatchingRebuildLock.unlock()
         // "Mirror Continue Watching from Stremio": with a live Stremio session and the toggle OFF, a
         // Stremio-sourced position must not drag the RAIL backwards either, not just the account doc. Resolved
-        // here off-main (a UserDefaults read plus the ctx auth probe, both thread-safe) and applied BEFORE
+        // in this owner refresh and applied BEFORE
         // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
         // the floor could restore VortX's own in-progress position.
         let decodedPreview = decode(CoreCWPreview.self, field: "continue_watching_preview")
@@ -3790,6 +3981,7 @@ final class CoreBridge: ObservableObject {
     /// The remote binding/local-authority check is deliberately repeated here: an old worker completion
     /// can arrive after the publication epoch is still unchanged but before a newer auth/profile
     /// transition schedules its next work item.
+    @MainActor
     private func recordAcceptedHistoryReceipt(
         fields: Set<String>,
         publicationToken: PublicationToken,
@@ -3929,7 +4121,7 @@ final class CoreBridge: ObservableObject {
     /// `CoreMetaDetails` has no completeness marker; engine/account state owns genuine final-series removal.
     /// `is_in_continue_watching()` is just `time_offset > 0`, so a movie at its end position would otherwise
     /// linger forever. Rewind keeps the library entry and its new-episode notifications, unlike full removal.
-    func finishedWatching(libraryId: String, target: PlaybackMutationTarget? = nil) {
+    @MainActor func finishedWatching(libraryId: String, target: PlaybackMutationTarget? = nil) {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
         guard target.stillOwnsCurrentContext(core: self) else {
             NSLog("[playback] dropped finish callback after profile/account ownership changed")
@@ -3957,7 +4149,7 @@ final class CoreBridge: ObservableObject {
 
     /// Whether the open detail page's title is saved to the library proper (present,
     /// not removed, not a temporary watched-marker entry). Drives the Library button.
-    var detailInLibrary: Bool {
+    @MainActor var detailInLibrary: Bool {
         guard !enginePublicationBlocked, let item = metaDetails?.libraryItem else { return false }
         return item.removed != true && item.temp != true
     }
@@ -3966,7 +4158,7 @@ final class CoreBridge: ObservableObject {
     /// `MetaItemPreview` found in a catalog, but a detail page reached from the
     /// Library tab or Continue Watching is in no catalog, so this hands the engine
     /// its own full meta JSON instead (a superset of the preview it expects).
-    func addDetailToLibrary() {
+    @MainActor func addDetailToLibrary() {
         if usesNativeProfileState {
             guard let meta = detailMetaPreview() else { return }
             dispatchCtx(["action": "AddToLibrary", "args": meta]); return
@@ -4011,7 +4203,7 @@ final class CoreBridge: ObservableObject {
     /// can briefly be unavailable even while `metaDetails` has already rendered the title. The engine's
     /// `MetaItemPreview` accepts id/type/name (optional poster), therefore the decoded detail is a safe
     /// final fallback rather than making a deliberate Library button tap a silent no-op.
-    private func detailMetaPreview() -> [String: Any]? {
+    @MainActor private func detailMetaPreview() -> [String: Any]? {
         let selectedID = metaDetails?.meta?.id
         var ready: [LibraryWatchedMutationPolicy.MetaPreview] = []
         if let data = stateData("meta_details"),
@@ -4048,7 +4240,7 @@ final class CoreBridge: ObservableObject {
     /// "remove from library" action, so the watchlist mirror stays out of `removeFromLibrary(id:)` itself
     /// (which is also the Continue-Watching dismiss, not a watchlist intent). Fail-soft + gated + a no-op
     /// with empty creds inside the coordinator.
-    func removeDetailFromLibrary() {
+    @MainActor func removeDetailFromLibrary() {
         guard let meta = metaDetails?.meta else { return }
         if ProfileStore.shared.activeUsesEngineHistory, logoutAccountMutationPending { return }
         ScrobbleCoordinator.shared.removedFromLibrary(
@@ -4060,7 +4252,7 @@ final class CoreBridge: ObservableObject {
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id
     /// in whichever catalog field holds it) so the shape is exactly what the engine expects back.
     @discardableResult
-    func addToLibrary(metaId: String, expectedType: String? = nil,
+    @MainActor func addToLibrary(metaId: String, expectedType: String? = nil,
                       fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil,
                       target: PlaybackMutationTarget? = nil) -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
@@ -4096,7 +4288,7 @@ final class CoreBridge: ObservableObject {
     /// Trakt/SIMKL watchlist mirror the detail page already does. Auto-add on play keeps calling
     /// `addToLibrary`, so playing a title never edits an external watchlist. A native profile saves through
     /// the acknowledged path, which mirrors only after the checkpoint persisted the add.
-    func addToLibraryFromMenu(_ card: LibraryWatchedMutationPolicy.MetaPreview) {
+    @MainActor func addToLibraryFromMenu(_ card: LibraryWatchedMutationPolicy.MetaPreview) {
         let target = PlaybackMutationTarget.capture(core: self)
         if usesNativeProfileState {
             guard target.stillOwnsCurrentContext(core: self) else { return }
@@ -4122,7 +4314,7 @@ final class CoreBridge: ObservableObject {
     /// A deliberate "Remove from Library" from a Library card's menu: removes the saved title and mirrors the
     /// removal to Trakt/SIMKL watchlists, like the detail page. Dismissing Continue Watching never comes
     /// through here, so it never edits a watchlist.
-    func removeFromLibraryFromMenu(_ card: LibraryWatchedMutationPolicy.MetaPreview) {
+    @MainActor func removeFromLibraryFromMenu(_ card: LibraryWatchedMutationPolicy.MetaPreview) {
         if usesNativeProfileState {
             guard let saved = library?.catalog.first(where: { $0.id == card.id }) else { return }
             // Watched-only: never saved, so no watchlist was written for it. Record the removal only.
@@ -4151,7 +4343,7 @@ final class CoreBridge: ObservableObject {
     /// Add a fully-formed meta object (e.g. a Cinemeta title resolved from a played magnet/link, #81) to
     /// the library, honouring the per-profile invariant. The dict must be a real catalog meta (a `tt…` /
     /// `tmdb…` id), never a synthetic magnet item, or it poisons official-client account sync.
-    func addRawMetaToLibrary(_ meta: [String: Any]) {
+    @MainActor func addRawMetaToLibrary(_ meta: [String: Any]) {
         guard let id = meta["id"] as? String, !id.isEmpty else { return }
         if usesNativeProfileState { dispatchCtx(["action": "AddToLibrary", "args": meta]); return }
         guard ProfileStore.shared.activeUsesEngineHistory else {
@@ -4244,6 +4436,7 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    @MainActor
     private func localOnlyRecoveryAllowed(_ credentialCapture: CredentialScopeRegistry.Capture) -> Bool {
         let profile = ProfileStore.shared.active
         return PlaybackMutationOwnershipPolicy.allowsLocalOnlyRecovery(
@@ -4256,7 +4449,7 @@ final class CoreBridge: ObservableObject {
 
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
-    func setCatalogWatched(metaId: String, _ isWatched: Bool,
+    @MainActor func setCatalogWatched(metaId: String, _ isWatched: Bool,
                            fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) {
         if usesNativeProfileState {
             let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
@@ -4285,6 +4478,7 @@ final class CoreBridge: ObservableObject {
     /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog field
     /// currently holds it (board / discover / search). `MetaItemPreview` deserializes through a legacy
     /// shape, so we hand the engine back its own serialization rather than reconstruct it.
+    @MainActor
     private func rawMetaPreview(forId metaId: String) -> [String: Any]? {
         for field in ["board", "discover", "search"] {
             guard let data = stateData(field),
@@ -4311,6 +4505,7 @@ final class CoreBridge: ObservableObject {
     /// Load the engine Player for the picked stream, so it records progress against the right library
     /// item. Built from the raw meta_details JSON (the engine wants back the exact Stream + the stream
     /// and meta requests it gave us). Best-effort: a shape mismatch is a silent no-op, never a crash.
+    @MainActor
     func loadEnginePlayer(for stream: CoreStream) {
         guard let data = stateData("meta_details"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -4384,6 +4579,7 @@ final class CoreBridge: ObservableObject {
     /// work is allowed to replace the resident metadata slot while an isolated binge request is resolving.
     /// Returns true when the Player was dispatched; the caller uses that to set its progress-attribution gate.
     @discardableResult
+    @MainActor
     func loadEnginePlayer(for stream: CoreStream, videoId: String, libraryId: String? = nil, base: String?,
                           resolvedURL: URL? = nil) -> Bool {
         let object = stateData("meta_details").flatMap {
@@ -4473,6 +4669,7 @@ final class CoreBridge: ObservableObject {
     /// Tear down the engine Player so a stale Player from a previous title cannot absorb the next title's
     /// TimeChanged ticks (downloads, paste-a-link, and direct CW resume play without loading their own
     /// Player). Call ONLY from a player cover's onClose, never a load path. Mirrors `unloadMeta`.
+    @MainActor
     func unloadEnginePlayer() {
         dispatch(action: ["action": "Unload"], field: "player")
         // A10-i: reset the probe's player fields at this definitive teardown. They otherwise freeze at their
@@ -4523,24 +4720,23 @@ final class CoreBridge: ObservableObject {
         let payload: [String: Any] = ["time": Int(timeSeconds * 1000),
                                       "duration": Int(durationSeconds * 1000),
                                       "device": device]
-        if usesNativeProfileState {
-            guard let (facade, _) = nativePlaybackBinding(target),
-                  case .native(let binding?) = target, let epoch = binding.accountGeneration,
-                  let data = try? JSONSerialization.data(withJSONObject: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]]) else { return }
-            _ = facade.dispatchCaptured(data: data, field: "player", expectedAccountGeneration: epoch)
-            return
-        }
-        dispatch(action: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]],
-                 field: "player")
+        // Every shipped target uses the native profile store. Do not revive the retired legacy
+        // dispatch path from a delayed player callback or hop it onto a newly selected owner.
+        guard usesNativeProfileState else { return }
+        guard let (facade, _) = nativePlaybackBinding(target),
+              case .native(let binding?) = target, let epoch = binding.accountGeneration,
+              let data = try? JSONSerialization.data(withJSONObject: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]]) else { return }
+        _ = facade.dispatchCaptured(data: data, field: "player", expectedAccountGeneration: epoch)
     }
 
     @discardableResult
+    @MainActor
     private func dispatchMetaDetails(_ action: [String: Any]) -> Bool {
         dispatch(action: ["action": "MetaDetails", "args": action], field: "meta_details")
     }
 
     /// Is `ctx.profile.auth` present? (auth serializes as an object when signed in, null otherwise.)
-    func isLoggedIn() -> Bool {
+    @MainActor func isLoggedIn() -> Bool {
         guard let data = stateData("ctx"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let profile = object["profile"] as? [String: Any] else { return false }
@@ -4552,7 +4748,7 @@ final class CoreBridge: ObservableObject {
     /// identity the engine stamps into its persisted library buckets (`LibraryBucket.uid` is
     /// `Profile::uid()`, the auth user id), so it is internal (not private): `WatchedIndex` gates
     /// its bucket-file reads on it (#111 review).
-    func currentUID() -> String? {
+    @MainActor func currentUID() -> String? {
         guard let data = stateData("ctx"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let profile = object["profile"] as? [String: Any],
@@ -4564,6 +4760,7 @@ final class CoreBridge: ObservableObject {
     /// The only authority ProfileStore may use to replay a remote owner-library mutation. A
     /// selected profile plus an engine uid is not enough because the engine can retain the uid
     /// from the profile that was active immediately before a switch.
+    @MainActor
     func settledActiveAccountBinding() -> PlaybackMutationOwnershipPolicy.SettledAccountBinding? {
         guard !importedAwayFromStremio,
               pendingAccountBinding == nil,
@@ -4583,6 +4780,7 @@ final class CoreBridge: ObservableObject {
     /// The explicit local-owner authority for engine history when no Stremio principal is loaded. A nil UID
     /// is meaningful here: the engine's signed-out on-disk library belongs to the selected owner profile,
     /// but it is never evidence that an unresolved remote account is safe to use.
+    @MainActor
     func settledLocalHistoryOwner() -> BecauseYouWatchedHistoryPolicy.Owner? {
         settledLocalHistoryOwner(credentialCapture: nil)
     }
@@ -4608,6 +4806,7 @@ final class CoreBridge: ObservableObject {
         return history.snapshot
     }
 
+    @MainActor
     private func settledLocalHistoryOwner(
         credentialCapture suppliedCredentialCapture: CredentialScopeRegistry.Capture? = nil
     ) -> BecauseYouWatchedHistoryPolicy.Owner? {
@@ -4728,6 +4927,7 @@ final class CoreBridge: ObservableObject {
         SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    @MainActor
     private func captureImportedAwayBootstrapContext() -> ImportedAwayBootstrapContext? {
         guard importedAwayFromStremio,
               let profile = ProfileStore.shared.active,
@@ -4743,6 +4943,7 @@ final class CoreBridge: ObservableObject {
         )
     }
 
+    @MainActor
     private func importedAwayBootstrapStillCurrent(_ context: ImportedAwayBootstrapContext) -> Bool {
         guard let profile = ProfileStore.shared.active,
               profile.id == context.profileID,
@@ -4757,6 +4958,7 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    @MainActor
     private func captureImportedAwayLocalRecoveryContext(profileID: UUID,
                                                          keychainAccount: String,
                                                          signedOutRequest: SignedOutRepairRequest) -> ImportedAwayLocalRecoveryContext? {
@@ -4780,6 +4982,7 @@ final class CoreBridge: ObservableObject {
         )
     }
 
+    @MainActor
     private func importedAwayLocalRecoveryStillCurrent(_ context: ImportedAwayLocalRecoveryContext) -> Bool {
         guard let profile = ProfileStore.shared.active,
               profile.id == context.profileID,
@@ -4796,6 +4999,7 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    @MainActor
     private func importedAwayLocalRecoveryReady(_ context: ImportedAwayLocalRecoveryContext) -> Bool {
         guard importedAwayLocalRecoveryStillCurrent(context),
               signedOutRepairRequest == nil,
@@ -4811,12 +5015,14 @@ final class CoreBridge: ObservableObject {
     /// arrives.  This boundary deliberately does not reset the resident engine: a failed or empty account
     /// document must preserve the existing never-zero local state, while the recommendation accessor stays
     /// closed until a source-owned snapshot is accepted.
+    @MainActor
     private func credentialScopeDidChange(
         _ capture: CredentialScopeRegistry.Capture,
         previousScope: CredentialScope?
     ) {
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return }
-        invalidatePublicationEpoch()
+        guard let clear = invalidatePublicationEpoch(),
+              originalMetadataClearAuthorityIsCurrent(clear) else { return }
         localHistoryHydrationContext = nil
         localHistoryHydrationReceipt = nil
 
@@ -4844,6 +5050,7 @@ final class CoreBridge: ObservableObject {
         localHistoryRecoveryInFlight = localHistoryHydrationContext != nil
     }
 
+    @MainActor
     private func captureLocalHistoryHydrationContext() -> LocalHistoryHydrationContext? {
         let credentialCapture = CredentialScopeRegistry.shared.capture()
         guard case .account = credentialCapture.scope,
@@ -4866,6 +5073,7 @@ final class CoreBridge: ObservableObject {
             publicationToken: capturePublicationToken())
     }
 
+    @MainActor
     private func beginLocalHistoryHydration() -> LocalHistoryHydrationContext? {
         if let current = localHistoryHydrationContext,
            localHistoryHydrationStillCurrent(current) {
@@ -4882,6 +5090,7 @@ final class CoreBridge: ObservableObject {
         return context
     }
 
+    @MainActor
     private func localHistoryHydrationStillCurrent(_ context: LocalHistoryHydrationContext) -> Bool {
         guard localHistoryHydrationContext == context,
               let profile = ProfileStore.shared.active,
@@ -4901,6 +5110,7 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    @MainActor
     private func localHistoryHydrationReceiptStillCurrent(_ context: LocalHistoryHydrationContext) -> Bool {
         guard let receipt = localHistoryHydrationReceipt,
               receipt.context == context,
@@ -4956,6 +5166,7 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    @MainActor
     private func captureImportedAwayColdLocalRecoveryContext() -> ImportedAwayColdLocalRecoveryContext? {
         guard importedAwayFromStremio,
               let context = beginLocalHistoryHydration(),
@@ -4965,6 +5176,7 @@ final class CoreBridge: ObservableObject {
             credentialFingerprint: Self.credentialFingerprint(token))
     }
 
+    @MainActor
     private func importedAwayColdLocalRecoveryStillCurrent(
         _ context: ImportedAwayColdLocalRecoveryContext
     ) -> Bool {
@@ -4975,6 +5187,7 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    @MainActor
     private func importedAwayColdLocalRecoveryReady(
         _ context: ImportedAwayColdLocalRecoveryContext
     ) -> Bool {
@@ -4986,10 +5199,14 @@ final class CoreBridge: ObservableObject {
 
     /// Clear the old binding before dispatching authentication. A missing active engine profile
     /// fails closed rather than borrowing whichever account happened to be resident.
+    @MainActor
     private func beginAccountBinding(for token: String) {
+        guard let beforeCancel = captureOriginalMetadataClearAuthority() else { return }
         cancelAccountBindingVerification()
+        guard originalMetadataClearAuthorityIsCurrent(beforeCancel) else { return }
         retireSignedOutRepairRequest()
-        invalidatePublicationEpoch()
+        guard let clear = invalidatePublicationEpoch(),
+              originalMetadataClearAuthorityIsCurrent(clear) else { return }
         settledAccountBinding = nil
         authBindingGeneration &+= 1
         rejectedAccountBindingGeneration = nil
@@ -5010,15 +5227,21 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    @MainActor
     private func cancelAccountBindingVerification() {
-        accountBindingVerificationTask?.cancel()
+        let original = accountBindingVerificationTask
         accountBindingVerificationTask = nil
+        original?.cancel()
     }
 
+    @MainActor
     private func invalidateAuthenticationGeneration() {
+        guard let beforeCancel = captureOriginalMetadataClearAuthority() else { return }
         cancelAccountBindingVerification()
+        guard originalMetadataClearAuthorityIsCurrent(beforeCancel) else { return }
         retireSignedOutRepairRequest()
-        invalidatePublicationEpoch()
+        guard let clear = invalidatePublicationEpoch(),
+              originalMetadataClearAuthorityIsCurrent(clear) else { return }
         // Any in-flight imported-away recovery belongs to the old profile/auth epoch. A later local
         // owner may become eligible only after its own recovery publication is observed.
         localHistoryRecoveryInFlight = false
@@ -5035,13 +5258,14 @@ final class CoreBridge: ObservableObject {
         explicitAddonImportPending = false
     }
 
+    @MainActor
     private func retireSignedOutRepairRequest() {
         signedOutRepairGeneration &+= 1
         signedOutRepairRequest = nil
         confirmedSignedOutRepairRequest = nil
     }
 
-    private var enginePublicationBlocked: Bool {
+    @MainActor private var enginePublicationBlocked: Bool {
         return nativeFacadeLock.withLock {
             guard nativeFacadeStorage?.isAvailable == true, let capture = nativeCredentialCapture else { return true }
             return !CredentialScopeRegistry.shared.isCurrent(capture)
@@ -5051,28 +5275,23 @@ final class CoreBridge: ObservableObject {
     /// Unlike the broader publication gate, this applies specifically to engine writes.  Local
     /// overlay history remains available while a prior owner account is completing Logout.
     private var logoutAccountMutationPending: Bool {
-        signedOutRepairRequest != nil
+        signedOutRepairRequestState.withLock { $0 != nil }
     }
 
     /// Add-on operations have local tombstone side effects, so they require the same immutable
     /// publication context as their eventual Ctx write, not only the central dispatch gate.
+    @MainActor
     private func addonMutationStillAllowed(_ token: PublicationToken) -> Bool {
         PlaybackMutationOwnershipPolicy.allowsAddonMutationEffects(
             contextCurrent: publicationStillCurrent(token),
             logoutPending: logoutAccountMutationPending)
     }
 
-    private func capturePublicationToken() -> PublicationToken {
-        publicationEpochLock.lock()
-        let token = PublicationToken(epoch: publicationEpoch)
-        publicationEpochLock.unlock()
-        return token
-    }
 
     /// Main-only validation for a worker-captured publication.  The lock provides the epoch race
     /// fence; the main-owned binding check prevents an unresolved or rejected credential from
     /// publishing resident engine state even when no epoch has changed.
-    private func publicationStillCurrent(_ token: PublicationToken) -> Bool {
+    @MainActor private func publicationStillCurrent(_ token: PublicationToken) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         return publicationEpochMatches(token) && !enginePublicationBlocked
     }
@@ -5080,13 +5299,8 @@ final class CoreBridge: ObservableObject {
     /// Control-plane receipts cannot use `publicationStillCurrent`: a matching signed-out ctx is
     /// what clears the logout publication gate.  This raw epoch comparison is intentionally kept
     /// separate and is only paired with an exact request identity below.
-    private func publicationEpochMatches(_ token: PublicationToken) -> Bool {
-        publicationEpochLock.lock()
-        let current = token.epoch == publicationEpoch
-        publicationEpochLock.unlock()
-        return current
-    }
 
+    @MainActor
     private func signedOutRepairRequestStillCurrent(_ request: SignedOutRepairRequest) -> Bool {
         signedOutRepairRequest == request && publicationEpochMatches(request.publicationToken)
     }
@@ -5094,11 +5308,11 @@ final class CoreBridge: ObservableObject {
     /// Invalidate every captured engine snapshot at the profile/auth boundary.  Coalesced work is
     /// cancelled as a latency optimisation, but the epoch guard remains the correctness fence for a
     /// closure already executing when cancellation arrives.
-    private func invalidatePublicationEpoch() {
+    @MainActor private func detachPublicationEpochStorage() -> @MainActor () -> Void {
         searchPublication.invalidate()
-        publicationEpochLock.lock()
-        publicationEpoch &+= 1
-        publicationEpochLock.unlock()
+        publicationEpochState.withLock { $0 &+= 1 }
+        metadataPresentation.retireClearAuthority()
+        metadataPresentation.retireStatusAdmission()
         // A new auth/profile/publication epoch cannot inherit the previous owner's history proof.
         // Clear synchronously on main so Home cannot render the old receipt during the transition.
         localHistoryAuthority = nil
@@ -5111,29 +5325,34 @@ final class CoreBridge: ObservableObject {
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         continueWatchingRebuildLock.unlock()
-        sessionRepairWork?.cancel()
+        let originalRepair = sessionRepairWork
         sessionRepairWork = nil
         sessionRepairGeneration &+= 1
-        DispatchQueue.main.async { [weak self] in
-            self?.boardRebuildWork?.cancel()
-            self?.boardRebuildWork = nil
-            self?.metaDetailsWork?.cancel()
-            self?.metaDetailsWork = nil
+        return { originalRepair?.cancel() }
+    }
+    @MainActor @discardableResult
+    private func invalidatePublicationEpoch() -> NativeMetadataClearAuthority? {
+        let cancelEpoch = detachPublicationEpochStorage()
+        let cancelLegacy = detachLegacyMetadataPublicationWork()
+        guard let clear = captureOriginalMetadataClearAuthority() else {
+            cancelEpoch(); cancelLegacy(); return nil
         }
+        let cancelEffects = detachNativeMetadataClearEffects(preservingClear: clear.identity)
+        cancelEpoch(); cancelLegacy(); cancelEffects()
+        return clear // may already be retired; caller MUST validate before its tail
     }
 
     /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
     /// the prior profile before a new account switch or a same-account revalidation can begin.
-    func activeProfileDidChange() {
+    @MainActor func activeProfileDidChange() {
         let previous = nativeFacade
-        revokeNativeSession()
-        Task { @MainActor in
-            await previous?.shutdown()
-            _ = await VortXSyncManager.shared.restoreNativeCheckpoint()
-        }
+        let retirement = revokeNativeSession()
+        let continuation = NativeMetadataBootstrapContinuation(self)
+        Task { @MainActor in await continuation.restore(previous: previous, original: retirement) }
         return
     }
 
+    @MainActor
     private func verifyAccountBinding(pending: PendingAccountBinding, token: String, attempt: Int) async {
         do {
             let identity = try await LinkAuthService.authenticatedIdentity(authKey: token)
@@ -5177,13 +5396,14 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    @MainActor
     private func startVerifiedAccountSwitch(pending: PendingAccountBinding, token: String) {
         guard !switchInFlight,
               self.pendingAccountBinding?.generation == pending.generation,
               !importedAwayFromStremio else { return }
         switchInFlight = true
         switchFromUID = currentUID()
-        clearUserState()
+        guard let clear = clearUserState(), originalMetadataClearAuthorityIsCurrent(clear) else { return }
         dispatchCtx(["action": "Authenticate", "args": ["type": "LoginWithToken", "token": token]])
     }
 
@@ -5192,6 +5412,7 @@ final class CoreBridge: ObservableObject {
     /// rejecting selected B while the engine still contains A. The UI's six-second refresh is not
     /// evidence and cannot settle this binding.
     @discardableResult
+    @MainActor
     private func settleAccountBindingIfProven() -> Bool {
         guard let pending = pendingAccountBinding,
               let verifiedUID = pending.verifiedUID,
@@ -5213,10 +5434,12 @@ final class CoreBridge: ObservableObject {
         // Pending-generation snapshots are intentionally blocked rather than discarded while this
         // ctx receipt proves the account.  Once proof clears the gate, advance the epoch so none of
         // those old-A / pending-B snapshots can become publishable under the newly settled B context.
-        invalidatePublicationEpoch()
+        guard let clear = invalidatePublicationEpoch(),
+              originalMetadataClearAuthorityIsCurrent(clear) else { return false }
         return true
     }
 
+    @MainActor
     private func finishSettledAccountBinding() {
         let explicitAddonImport = explicitAddonImportPending
         let completingLegacyMigration = awaitingAuthMigration
@@ -5252,6 +5475,7 @@ final class CoreBridge: ObservableObject {
 
     /// Dispatch an `Action::Ctx(...)` to the whole model (field = nil).
     @discardableResult
+    @MainActor
     private func dispatchCtx(_ ctxAction: [String: Any], beforeDispatch: (() -> Void)? = nil) -> Bool {
         dispatch(action: ["action": "Ctx", "args": ctxAction], beforeDispatch: beforeDispatch)
     }
@@ -5262,6 +5486,7 @@ final class CoreBridge: ObservableObject {
     /// `action` is the engine's `Action` JSON, e.g.
     /// `["action": "Load", "args": ["model": "CatalogsWithExtra", "args": ["type": NSNull(), "extra": []]]]`.
     @discardableResult
+    @MainActor
     func dispatch(action: [String: Any], field: String? = nil, beforeDispatch: (() -> Void)? = nil) -> Bool {
         let topLevelAction = action["action"] as? String
         let contextAction = (action["args"] as? [String: Any])?["action"] as? String
@@ -5275,26 +5500,20 @@ final class CoreBridge: ObservableObject {
         let payload: [String: Any] = ["field": field ?? NSNull(), "action": action]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8) else { return false }
-        beforeDispatch?()
-        // Track every metadata dispatch, including re-find and CW refresh, at the shared boundary.
-        // This is request ownership only: consumers still fence the published selection separately.
-        if field == "meta_details", topLevelAction == "Load",
-           let args = action["args"] as? [String: Any], args["model"] as? String == "MetaDetails",
-           let model = args["args"] as? [String: Any], let meta = model["metaPath"] as? [String: Any],
-           let id = meta["id"] as? String {
-            let streamID = (model["streamPath"] as? [String: Any])?["id"] as? String
-            metaLoadTargetLock.withLock {
-                requestedMetaLoadTarget = MetaLoadTarget(metaID: id, streamID: streamID)
-                nativeMetaRequestAction = try? JSONSerialization.data(withJSONObject: action)
-                nativeMetaRequestGeneration = UUID()
-                nativeMetaRequestScope = .init(credential: CredentialScopeRegistry.shared.capture(), profileID: ProfileStore.shared.activeID)
-            }
-        } else if topLevelAction == "Unload", field == "meta_details" || field == nil {
-            metaLoadTargetLock.withLock {
-                requestedMetaLoadTarget = nil
-                nativeMetaRequestAction = nil; nativeMetaRequestGeneration = UUID()
-            }
+        let isMetadataNavigation = field == "meta_details" &&
+            (topLevelAction == "Unload" || (topLevelAction == "Load"
+                && (action["args"] as? [String: Any])?["model"] as? String == "MetaDetails"))
+        if isMetadataNavigation {
+            return dispatchOwnedMetadataHostAction(action, beforeDispatch: beforeDispatch)
         }
+        let globalRetirement = topLevelAction == "Unload" && field == nil
+            ? prepareNativeGlobalMetadataRetirement() : nil
+        globalRetirement?.cancelOriginalWork()
+        if let globalRetirement,
+           !ownedMetadataHostRequestIsCurrent(globalRetirement.host) { return false }
+        beforeDispatch?()
+        if let globalRetirement,
+           !ownedMetadataHostRequestIsCurrent(globalRetirement.host) { return false }
         // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
         // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
         VXProbe.log("engine", "dispatch \(Self.actionName(action))\(field.map { " -> \($0)" } ?? "")")
@@ -5322,12 +5541,12 @@ final class CoreBridge: ObservableObject {
 
     /// Raw JSON bytes for a model field (e.g. "board", "continue_watching_preview"). Heavy fields
     /// (library, catalogs) serialize on the calling thread, prefer a background queue for those.
-    func stateData(_ field: String) -> Data? {
+    @MainActor func stateData(_ field: String) -> Data? {
         guard !enginePublicationBlocked else { return nil }; return nativeFacade?.stateData(field)
     }
 
     /// Decode a model field into a Codable type.
-    func decode<T: Decodable>(_ type: T.Type, field: String) -> T? {
+    @MainActor func decode<T: Decodable>(_ type: T.Type, field: String) -> T? {
         guard let data = stateData(field) else { return nil }
         do {
             return try Self.decoder.decode(T.self, from: data)
@@ -5337,7 +5556,7 @@ final class CoreBridge: ObservableObject {
         }
     }
 
-    static let decoder: JSONDecoder = {
+    @MainActor static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         return decoder
     }()
@@ -5357,275 +5576,415 @@ final class CoreBridge: ObservableObject {
 
     // MARK: Event callback (invoked from a Rust worker thread)
 
-    fileprivate func handleEvent(_ data: Data) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let name = object["name"] as? String else { return }
-        guard name == "NewState", let fields = object["args"] as? [String] else {
-            return // "CoreEvent" (auth results, errors, …) handled in a later step.
-        }
-        // Did ANY branch below actually republish (or schedule a republish)? `revision` is the coarse "the
-        // engine changed something" signal every screen observes, and it used to bump on every NewState even
-        // when each per-field guard had suppressed its own work: the engine re-announces `discover` (and
-        // friends) as changed on every library tick for free, so an idle device woke every `revision` observer
-        // several times a minute to re-render identical state. Bump only when something was really published.
-        var published = false
-        // This callback is on Rust's worker thread. Capture the lock-backed publication epoch and
-        // VortX credential namespace here; all main-owned checks happen in the eventual main closure.
-        let publicationToken = capturePublicationToken()
-        let credentialCapture = CredentialScopeRegistry.shared.capture()
+    /// The native callback lane never enters handleEvent(Data). Its original producer and
+    /// immutable ChangeReceipt travel together; no helper below reads live stateData.
+    private struct NativeLegacyWork: Sendable {
+        let receipt: VortxNativeCoreFacade.ChangeReceipt
+        let fields: Set<String>
+        let discoverFingerprint: Int?
+        let discoverPageInFlight: Bool
+        let includesContinueWatching: Bool
+    }
+    private struct NativeLegacySearchSample: Sendable {
+        let isLoading: Bool
+        let items: [CoreMeta]
+    }
+    private struct NativeLegacyDiscoverSample: Sendable {
+        let fingerprint: Int
+        let value: CoreDiscover?
+    }
+    private struct NativeLegacySample: Sendable {
+        let context: CoreCtx?
+        let rawAddons: [String: VortxJSON]
+        let discover: NativeLegacyDiscoverSample?
+        let library: CoreLibrary?
+        let search: NativeLegacySearchSample?
+        let suggestions: [CoreSearchSuggestion]
+        let continueWatching: CoreCWPreview?
+    }
+    private struct NativeLegacyBoardPreferences: Sendable {
+        let disabled: Set<String>
+        let hidden: Set<String>
+        let order: CatalogOrderSnapshot
+    }
+    private struct NativeLegacyBoardSample: Sendable {
+        let state: CoreBoardState?
+        let rows: [CoreBoardRow]
+    }
 
-        // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
-        // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
-        // (bootstrapAuth / switchAccount + its 6s backstop), so read+write it on main here too rather than on
-        // this Rust worker thread, matching the decode branches below. Otherwise switchInFlight could latch
-        // stuck-true (the switched account never reloads) through an unsynchronized cross-thread write.
+    @MainActor
+    private func nativeLegacyReceiptIsCurrent(_ receipt: VortxNativeCoreFacade.ChangeReceipt,
+                                              origin: NativeCallbackOrigin, field: String) -> Bool {
+        nativeCallbackOriginIsCurrent(origin)
+            && receipt.sourceID == origin.producer.sourceID
+            && origin.producer.acceptsChange(receipt, field: field)
+    }
 
-        // Decode the changed screens off the main thread, then publish on main.
-        if fields.contains("continue_watching_preview") {
-            // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
-            // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
-            rebuildContinueWatching(
-                capturedPublicationToken: publicationToken,
-                recordsHistoryReceipt: true,
-                capturedCredentialCapture: credentialCapture)
-            published = true
+    /// Cheap query lookup from the original Sendable value. The actual search board parse,
+    /// per-catalog loading walk and result deduplication remain in the detached worker.
+    private static func nativeLegacySearchQuery(_ receipt: VortxNativeCoreFacade.ChangeReceipt) -> String? {
+        for entry in receipt.values["search"]?["selected"]?["extra"]?.array ?? [] {
+            guard let pair = entry.array, pair.count == 2, pair[0] == .string("search"),
+                  case .string(let query) = pair[1] else { continue }
+            return query
         }
-        // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
-        // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
-        // full decodes + republishes (the on-open lag). The rebuild itself still decodes off-main.
-        if fields.contains("board") || fields.contains("ctx") {
-            scheduleBoardRebuild(capturedPublicationToken: publicationToken)   // [engine] board row count is logged there (coalesced, one per burst)
-            published = true
+        return nil
+    }
+
+    @MainActor
+    private func receiveNativeLegacyEvent(_ event: VortxNativeCoreFacade.SourceEvent,
+                                          origin: NativeCallbackOrigin) {
+        guard nativeCallbackOriginIsCurrent(origin), event.producer === origin.producer,
+              event.sourceID == origin.producer.sourceID,
+              case .changed(let legacyFields, let receipt?) = event.kind,
+              receipt.sourceID == event.sourceID else { return }
+        admitNativeLegacyChange(legacyFields: legacyFields, receipt: receipt,
+            origin: origin, recordsCoarseEvent: true)
+    }
+
+    /// An explicit HOST receipt is distinct from a source callback. Initial native
+    /// installation supplies the original captured origin and receipt without making
+    /// a fake SourceEvent or acquiring a newer source/metadata selection after a hop.
+    @MainActor
+    private func receiveNativeLegacyHostSeed(_ receipt: VortxNativeCoreFacade.ChangeReceipt,
+                                              origin: NativeCallbackOrigin) {
+        admitNativeLegacyChange(legacyFields: receipt.fields, receipt: receipt,
+            origin: origin, recordsCoarseEvent: false)
+    }
+
+    @MainActor
+    private func admitNativeLegacyChange(legacyFields: [String],
+        receipt: VortxNativeCoreFacade.ChangeReceipt, origin: NativeCallbackOrigin,
+        recordsCoarseEvent: Bool) {
+        guard nativeCallbackOriginIsCurrent(origin),
+              receipt.sourceID == origin.producer.sourceID else { return }
+        // Owned metadata scheduling, direct routes, library overlays, watched clears and
+        // refresh state machines have exactly one owner in the metadata pipeline.
+        let fields = Set(legacyFields).subtracting(["meta_details"]).filter {
+            nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: $0)
         }
-        if fields.contains("ctx") {
-            VXProbe.log("engine", "ctx/settings changed addons=\(decode(CoreCtx.self, field: "ctx")?.profile.addons.count ?? 0)")
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                self.addonNamesCache = nil
-            }   // addon set changed → rebuild name map
-            refreshAddons(capturedPublicationToken: publicationToken)
-            published = true
-            // MID-SEARCH RE-PLAN. A profile/addon change mid-search runs `Internal::ProfileChanged`, which
-            // in `catalogs_with_extra.rs` calls `catalogs_update(..., range: None, ...)`: every planned
-            // catalog still parked at a nil content is re-seeded to a nil content again WITH NO fetch
-            // effect. A newly planned catalog at an in-range index then sits at nil forever and holds the
-            // search spinner (`hasLoadingPages` counts an in-range nil content as loading) until the next
-            // user keystroke. Re-dispatch the SAME `LoadRange` search() uses so those re-seeded catalogs
-            // get fetched. `catalogs_update` reuses any catalog that already has content untouched, so this
-            // only fills the holes: no re-load of settled results, no flicker. Gated on `searchLoaded` so
-            // it never fires with no search loaded, and idempotent (a settled range emits nothing via the
-            // engine's `eq_update`). The app is re-issuing its OWN query, not mirroring engine state.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }
-                self.loadSearchRange()
+        let fieldSet = Set(fields)
+        let legacyMetadata = legacyFields.contains("meta_details")
+            && nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "meta_details")
+        guard !fieldSet.isEmpty else {
+            if recordsCoarseEvent && legacyMetadata {
+                recordNativeLegacyCoarseEvent(legacyFields: legacyFields, receipt: receipt,
+                    origin: origin, admittedFields: [])
+            }
+            return
+        }
+        let searchToken = fieldSet.contains("search")
+            ? searchPublication.capture(query: Self.nativeLegacySearchQuery(receipt)) : nil
+        let rebuildCW = fieldSet.contains("continue_watching_preview")
+            || (fieldSet.contains("library") && !origin.playerWasActive)
+        var cwGeneration: Int?
+        if rebuildCW {
+            continueWatchingRebuildLock.lock()
+            continueWatchingRebuildGeneration &+= 1
+            cwGeneration = continueWatchingRebuildGeneration
+            continueWatchingRebuildLock.unlock()
+        }
+        if fieldSet.contains("board") || fieldSet.contains("ctx") {
+            scheduleNativeLegacyBoard(receipt: receipt, origin: origin)
+        }
+        if fieldSet.contains("ctx"),
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") {
+            addonNamesCache = nil
+            if searchLoaded { loadSearchRange() }
+        }
+        let work = NativeLegacyWork(receipt: receipt, fields: fieldSet,
+            discoverFingerprint: discoverPublishedFingerprint,
+            discoverPageInFlight: discoverPageInFlight, includesContinueWatching: rebuildCW)
+        let capturedCWGeneration = cwGeneration
+        let publish: @MainActor @Sendable (NativeLegacySample) -> Void = { [weak self] sample in
+            self?.publishNativeLegacySample(sample, work: work, origin: origin,
+                searchToken: searchToken, cwGeneration: capturedCWGeneration)
+        }
+        Task.detached(priority: .userInitiated) {
+            let sample = Self.prepareNativeLegacySample(work)
+            await publish(sample)
+        }
+        if recordsCoarseEvent {
+            recordNativeLegacyCoarseEvent(legacyFields: legacyFields, receipt: receipt,
+                origin: origin, admittedFields: fieldSet)
+        }
+    }
+
+    /// One actual source event, including metadata-only legacy events, gets at most
+    /// one coarse bump. An owned-only equal callback or explicit HOST seed is silent.
+    @MainActor
+    private func recordNativeLegacyCoarseEvent(legacyFields: [String],
+        receipt: VortxNativeCoreFacade.ChangeReceipt, origin: NativeCallbackOrigin,
+        admittedFields: Set<String>) {
+        guard nativeCallbackOriginIsCurrent(origin) else { return }
+        let fields = admittedFields.filter {
+            nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: $0)
+        }
+        let legacyMetadata = legacyFields.contains("meta_details")
+            && nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "meta_details")
+        guard !fields.isEmpty || legacyMetadata else { return }
+        changedFields = Set(legacyFields)
+        let published = legacyMetadata || !Set(fields).intersection(["ctx", "board", "library", "search",
+            "local_search", "continue_watching_preview"]).isEmpty
+            || (fields.contains("discover") && receipt.values["discover"] != nil)
+        if published { revision &+= 1 }
+    }
+
+    /// A fresh decoder per field avoids sharing CoreBridge.decoder between concurrent jobs.
+    private static func nativeLegacyDecode<T: Decodable>(_ type: T.Type,
+                                                         value: VortxJSON?) -> T? {
+        guard let value else { return nil }
+        do { return try value.decode(type) }
+        catch {
+            NSLog("%@", "[CoreBridge] native presentation decode failed; field omitted")
+            return nil
+        }
+    }
+
+    private static func prepareNativeLegacySample(_ work: NativeLegacyWork) -> NativeLegacySample {
+        let values = work.receipt.values
+        let context = work.fields.contains("ctx")
+            ? nativeLegacyDecode(CoreCtx.self, value: values["ctx"]) : nil
+        var rawAddons: [String: VortxJSON] = [:]
+        if context != nil {
+            for descriptor in values["ctx"]?["profile"]?["addons"]?.array ?? [] {
+                if let rawURL = descriptor["transportUrl"], case .string(let url) = rawURL { rawAddons[url] = descriptor }
             }
         }
-        if fields.contains("meta_details") {
-            // Coalesce a source-search burst into one trailing decode+diff (see metaDetailsWork). The heavy
-            // 1757-stream decode used to run on this worker thread on every re-emit; now it runs once per
-            // burst, and the diff drops the republish when nothing the UI / streamGroups needs has changed.
-            scheduleMetaDetailsRepublish(capturedPublicationToken: publicationToken)
-            published = true
-        }
-        if fields.contains("discover") {
-            // NO-OP SUPPRESSION. The engine re-announces `discover` as changed on every LibraryChanged for
-            // free (`catalog_with_filters.rs`: `LibraryChanged(_) => Effects::none()`, changed-but-nothing-
-            // different), so this branch fires on every ~20-90s library tick. Unlike `meta_details` (which
-            // decodes then diffs) and `library` (eq-guarded after decode), `discover` had NO guard: it
-            // re-decoded its full catalog and re-wrote the `@Published` var every tick, changing nothing.
-            // Fingerprint the RAW field bytes and skip the decode + republish when they are byte-identical
-            // to the last publish. `get_state` has already paid the serde serialize (unavoidable, the bytes
-            // are the comparison input), but the large-payload JSONDecoder pass and the main-queue write
-            // are pure waste on a no-op. The fingerprint covers `selected` and every catalog item, so a
-            // genuine change always re-publishes; it is a change-detection fingerprint, not a cached copy
-            // of engine state. `stateData` is called once and the decode reads that same buffer, so a real
-            // change still costs exactly one `get_state`, same as before.
-            if let data = stateData("discover") {
-                let fingerprint = Self.fieldFingerprint(data)
-                // NEVER suppress while a next-page load is in flight. The settle that clears
-                // `discoverPageInFlight` (and latches `discoverExhausted` for a cursorless catalog) can
-                // arrive with bytes byte-identical to the last publish and WITHOUT an intervening
-                // isLoadingPage=true emit; swallowing it would wedge `discoverPageInFlight` true (further
-                // paging blocked) and never latch exhausted.  The fingerprint belongs to the published
-                // snapshot, so decide and record it on main under the same token gate, never on Rust's
-                // worker.  That prevents an old-A callback from suppressing B's first Discover payload.
-                published = true
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                    guard fingerprint != self.discoverPublishedFingerprint || self.discoverPageInFlight else { return }
-                    self.discoverPublishedFingerprint = fingerprint
-                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                        guard let self else { return }
-                        let value: CoreDiscover?
-                        do { value = try Self.decoder.decode(CoreDiscover.self, from: data) }
-                        catch { NSLog("%@", "[CoreBridge] decode discover failed: \(error)"); value = nil }
-                        VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                            // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
-                            // without growing the list means there are no more pages, whether the catalog was
-                            // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
-                            // interim "Loading" emit (same count, more coming) never latches exhausted early.
-                            if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
-                                self.discoverExhausted = true
-                            }
-                            self.discover = value
-                            // Clear the in-flight flag only once the load has settled, so onAppear bursts during
-                            // the page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
-                            if value?.isLoadingPage != true { self.discoverPageInFlight = false }
-                        }
-                        // A null first load derives the default catalog before the selectable is refreshed from
-                        // addons, so it can land with catalogs available but nothing selected (Discover stuck on
-                        // the spinner). If so, load the first catalog to unstick it.
-                        if let value, value.items.isEmpty,
-                           !value.selectable.types.contains(where: { $0.selected }),
-                           let first = value.selectable.types.first {
-                            DispatchQueue.main.async { [weak self] in
-                                guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                                self.selectDiscover(first.request)
-                            }
-                        }
-                    }
-                }
+        var discover: NativeLegacyDiscoverSample?
+        if work.fields.contains("discover"), let value = values["discover"],
+           let data = try? JSONEncoder().encode(value) {
+            let fingerprint = fieldFingerprint(data)
+            // A byte-identical final page must still settle an existing page request.
+            if fingerprint != work.discoverFingerprint || work.discoverPageInFlight {
+                let decoded = try? JSONDecoder().decode(CoreDiscover.self, from: data)
+                discover = .init(fingerprint: fingerprint, value: decoded)
             }
         }
-        if fields.contains("library") {
-            // Capture once on the worker thread. Both library-derived refresh gates must make the
-            // same decision for this receipt, and this snapshot is lock-backed rather than reading
-            // the main-owned @Published playerActive value across threads.
-            let playerWasActive = playerActiveSnapshot()
-            let value = decode(CoreLibrary.self, field: "library")
-            VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
-            DispatchQueue.main.async { [weak self] in
-                guard let self,
-                      self.publicationStillCurrent(publicationToken),
-                      CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
-                self.library = value
-                if value != nil {
-                    self.recordAcceptedHistoryReceipt(
-                        fields: ["library"],
-                        publicationToken: publicationToken,
-                        credentialCapture: credentialCapture)
-                }
-            }
-            published = true
-            // A library change can change which owner titles belong in Continue Watching: the cold-recovery
-            // re-add lands at time 0 and NEVER fires a continue_watching_preview event, and a newly-synced
-            // offset (refreshOwnerResumeCache) can qualify a title. Rebuild the rail from the engine preview
-            // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
-            // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
-            // while sparing the ~20s progress-save churn (#147).
-            if !playerWasActive { rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true, capturedCredentialCapture: credentialCapture) }
-            // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
-            // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
-            // button state) reflects the change immediately without waiting for a page reload.
-            // Decoded unconditionally: reading the @Published var on this Rust worker thread
-            // would race main-thread writes; the main-queue guard below decides alone, and it
-            // republishes only when the library-derived bits actually changed, because `library`
-            // also fires on every ~20s progress save and re-ranking a detail page that often
-            // was its own performance bug.
-            //
-            // Skip only this expensive detail refresh while a player is up: the In-Library button this feeds is not visible during
-            // playback, and the full 1757-stream decode on every ~20s progress save was the main-thread
-            // saturation that stalled the video. The detail page re-derives In-Library state from the
-            // coalesced meta_details republish when the player closes, so nothing is lost. The
-            // lock-backed receipt snapshot may be briefly old but cannot race SwiftUI state, and a
-            // later library/meta receipt catches any deferred refresh. Do not return from handleEvent here:
-            // the common tail must still publish changedFields/revision so WatchedIndex receives this
-            // library receipt while a player is active.
-            if !playerWasActive {
-                let details = decode(CoreMetaDetails.self, field: "meta_details")
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.publicationStillCurrent(publicationToken), let current = self.metaDetails else { return }
-                    let changed = current.libraryItem?.id != details?.libraryItem?.id
-                        || current.libraryItem?.removed != details?.libraryItem?.removed
-                        || current.libraryItem?.temp != details?.libraryItem?.temp
-                        // An account/sync refresh can exchange one episode id for another while
-                        // preserving the count. Comparing the count made the open detail page retain
-                        // its old tick set until a reload, falsely appearing to undo a successful mark.
-                        || LibraryWatchedMutationPolicy.watchedMembershipChanged(current.watchedVideoIds, details?.watchedVideoIds)
-                    if changed { self.metaDetails = details }
-                }
-            }
-        }
-        if fields.contains("search") {
-            // Decode the query and catalog rows from one buffer, never two racing state reads.
-            let data = stateData("search")
-            let board = data.flatMap { try? JSONDecoder().decode(CoreBoardState.self, from: $0) }
-            let wire = data.flatMap { try? JSONDecoder().decode(SearchQueryEnvelope.self, from: $0) }
-            let extra = wire?.selected?.extra
-            let query = extra?.first { $0.count == 2 && $0[0] == "search" }?[1]
-            let searchToken = searchPublication.capture(query: query)
+        let library = work.fields.contains("library")
+            ? nativeLegacyDecode(CoreLibrary.self, value: values["library"]) : nil
+        var search: NativeLegacySearchSample?
+        if work.fields.contains("search") {
+            let board = nativeLegacyDecode(CoreBoardState.self, value: values["search"])
             let catalogs = board?.catalogs ?? []
-            let pages = catalogs.flatMap { $0 }
-            // GATE ON `selected` FIRST. The engine re-announces `search` as changed on every
-            // LibraryChanged whether or not anything ever searched, and a field with NO search loaded
-            // (never searched, or Unloaded by the clear path in `search`) decodes to zero catalogs.
-            // Without this gate an emptiness test reads that idle field as "loading". That is the
-            // permanent `results=0 loading=true` line in the log, and it is sticky: every later
-            // re-announce re-asserts it, so a 1-character query, which deliberately never dispatches a
-            // Load, parked the screens on "Searching..." with nothing whatsoever in flight.
-            //
-            // ITERATE CATALOGS, NOT FLATTENED PAGES. `catalogs` is one inner array per PLANNED catalog,
-            // so the outer index is the catalog index the engine's LoadRange range-checks; flattening
-            // throws that index away. Two things ride on keeping it:
-            //
-            //   * Zero planned catalogs (no installed add-on offers a searchable catalog) is SETTLED, not
-            //     in flight. The engine plans `selected` and `catalogs` inside the SAME `Load` update, so
-            //     a non-nil `selected` with an empty plan can never be a half-built one: there is nothing
-            //     to search and the UI must be allowed to say "No results" instead of spinning forever.
-            //   * A catalog past `searchLoadRangeEnd` was planned but deliberately never requested (see
-            //     the constant), so the engine parks it at a nil content for the life of the search. In
-            //     range, a nil content means "seeded by Load, fetch still pending" and IS loading; past
-            //     the range it means "will never be fetched" and is not. `wasRequested` is that
-            //     distinction, and it is the app's own knowledge of what it dispatched, not a cached copy
-            //     of engine state. A past-range page that somehow carries an explicit `Loading` is still
-            //     counted, so the engine widening its own fetching cannot make us report settled early.
-            //
-            // The `selected` gate and the per-catalog walk are only correct together: `selected` stays
-            // non-nil for the WHOLE in-flight window (set by the same `Load` that seeds the pages, before
-            // the LoadRange that fetches them), so the seeded-but-unfetched instant still reports loading
-            // and no "No results" flashes.
-            let hasLoadingPages = board?.selected != nil && catalogs.indices.contains { index in
-                let wasRequested = index <= Self.searchLoadRangeEnd
+            let isLoading = board?.selected != nil && catalogs.indices.contains { index in
+                let wasRequested = index <= searchLoadRangeEnd
                 return catalogs[index].contains { page in
                     guard let content = page.content else { return wasRequested }
                     return content.isLoading
                 }
             }
-            let items = pages.compactMap { $0.content?.ready }.flatMap { $0 }
-            var seen = Set<String>(); var unique: [CoreMeta] = []
-            for item in items where seen.insert(item.id).inserted { unique.append(item) }
-            VXProbe.log("engine", "search changed results=\(unique.count) loading=\(hasLoadingPages)")
-            published = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken), let searchToken,
-                      self.searchPublication.accepts(searchToken) else { return }
-                self.searchIsLoading = hasLoadingPages
-                if !hasLoadingPages || !unique.isEmpty {
-                    self.searchResults = unique
+            var seen = Set<String>()
+            var unique: [CoreMeta] = []
+            for item in catalogs.flatMap({ $0 }).compactMap({ $0.content?.ready }).flatMap({ $0 })
+                where seen.insert(item.id).inserted { unique.append(item) }
+            search = .init(isLoading: isLoading, items: unique)
+        }
+        let local = work.fields.contains("local_search")
+            ? nativeLegacyDecode(CoreLocalSearchState.self, value: values["local_search"]) : nil
+        let preview = work.includesContinueWatching
+            ? nativeLegacyDecode(CoreCWPreview.self, value: values["continue_watching_preview"]) : nil
+        return .init(context: context, rawAddons: rawAddons, discover: discover,
+            library: library, search: search, suggestions: local?.searchResults ?? [],
+            continueWatching: preview)
+    }
+
+    @MainActor
+    private func publishNativeLegacySample(_ sample: NativeLegacySample, work: NativeLegacyWork,
+                                           origin: NativeCallbackOrigin, searchToken: UUID?,
+                                           cwGeneration: Int?) {
+        let receipt = work.receipt
+        guard nativeCallbackOriginIsCurrent(origin) else { return }
+        if work.fields.contains("ctx"), let context = sample.context,
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") {
+            publishNativeLegacyContext(context, rawAddons: sample.rawAddons,
+                receipt: receipt, origin: origin)
+        }
+        if let next = sample.discover,
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "discover"),
+           next.fingerprint != discoverPublishedFingerprint || discoverPageInFlight {
+            discoverPublishedFingerprint = next.fingerprint
+            if discoverPageInFlight, let value = next.value, !value.isLoadingPage,
+               value.items.count <= discoverCountAtLoad { discoverExhausted = true }
+            discover = next.value
+            if nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "discover"),
+               next.value?.isLoadingPage != true { discoverPageInFlight = false }
+            if nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "discover"),
+               let value = next.value, value.items.isEmpty,
+               !value.selectable.types.contains(where: { $0.selected }),
+               let first = value.selectable.types.first {
+                selectDiscover(first.request)
+            }
+        }
+        publishNativeLegacyHistory(library: sample.library, continueWatching: sample.continueWatching,
+            fields: work.fields, receipt: receipt, origin: origin, cwGeneration: cwGeneration)
+        if let search = sample.search, let searchToken,
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "search"),
+           searchPublication.accepts(searchToken) {
+            searchIsLoading = search.isLoading
+            if nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "search"),
+               searchPublication.accepts(searchToken),
+               !search.isLoading || !search.items.isEmpty { searchResults = search.items }
+        }
+        if work.fields.contains("local_search"),
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "local_search") {
+            searchSuggestions = sample.suggestions
+        }
+    }
+
+    @MainActor
+    private func publishNativeLegacyContext(_ context: CoreCtx, rawAddons: [String: VortxJSON],
+        receipt: VortxNativeCoreFacade.ChangeReceipt, origin: NativeCallbackOrigin) {
+        let owns = { self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") }
+        guard owns() else { return }
+        let typed = context.profile.addons
+        if !CatalogPrefsStore.order().isEmpty {
+            ensureCatalogOrderRangeLoaded(installedCatalogTotal:
+                typed.reduce(0) { $0 + $1.manifest.catalogs.count })
+            guard owns() else { return }
+        }
+        // Any is constructed only in actor-local legacy storage; no JSON parse runs here.
+        var raw: [String: [String: Any]] = [:]
+        for (url, value) in rawAddons {
+            if let descriptor = Self.nativeLegacyFoundationValue(value) as? [String: Any] {
+                raw[url] = descriptor
+            }
+        }
+        guard owns() else { return }
+        AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
+        guard owns() else { return }
+        rawAddonsByUrl = raw
+        guard owns() else { return }
+        addons = typed // no old-context state-write tail follows this synchronous setter
+    }
+
+    /// Real shared publication seam for source callbacks and explicit HOST seed workers.
+    /// It carries the original Facade receipt through both setters and actual history proof.
+    @MainActor
+    private func publishNativeLegacyHistory(library value: CoreLibrary?, continueWatching preview: CoreCWPreview?,
+        fields: Set<String>, receipt: VortxNativeCoreFacade.ChangeReceipt,
+        origin: NativeCallbackOrigin, cwGeneration: Int?) {
+        if fields.contains("library"),
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "library"),
+           CredentialScopeRegistry.shared.isCurrent(origin.credential) {
+            library = value
+            if value != nil,
+               nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "library"),
+               CredentialScopeRegistry.shared.isCurrent(origin.credential) {
+                recordAcceptedHistoryReceipt(fields: ["library"],
+                    publicationToken: origin.publication, credentialCapture: origin.credential)
+            }
+        }
+        if let cwGeneration,
+           (fields.contains("continue_watching_preview")
+                || (fields.contains("library") && !origin.playerWasActive)),
+           nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "continue_watching_preview"),
+           CredentialScopeRegistry.shared.isCurrent(origin.credential) {
+            continueWatchingRebuildLock.lock()
+            let isLatest = cwGeneration == continueWatchingRebuildGeneration
+            continueWatchingRebuildLock.unlock()
+            if isLatest {
+                continueWatching = preview?.items ?? []
+                continueWatchingRebuildLock.lock()
+                let stillLatest = cwGeneration == continueWatchingRebuildGeneration
+                continueWatchingRebuildLock.unlock()
+                if preview != nil, stillLatest,
+                   nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "continue_watching_preview"),
+                   CredentialScopeRegistry.shared.isCurrent(origin.credential) {
+                    recordAcceptedHistoryReceipt(fields: ["continue_watching_preview"],
+                        publicationToken: origin.publication, credentialCapture: origin.credential)
                 }
             }
         }
-        if fields.contains("local_search") {
-            let value = decode(CoreLocalSearchState.self, field: "local_search")
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                self.searchSuggestions = value?.searchResults ?? []
-            }
-            published = true
-        }
+    }
 
-        // `changedFields` is written unconditionally (it describes the newest event, and it is not
-        // @Published so writing it invalidates nothing); only the bump is gated. Observers read the set in
-        // reaction to the bump, so the two stay consistent: a suppressed event published nothing for anyone
-        // to read. WatchedIndex's fields (ctx / library / continue_watching_preview) all mark published.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.publicationStillCurrent(publicationToken) else { return }
-            self.changedFields = Set(fields)
-            if published { self.revision &+= 1 }
+    @MainActor
+    private static func nativeLegacyFoundationValue(_ value: VortxJSON) -> Any {
+        switch value {
+        case .object(let fields): return fields.mapValues { nativeLegacyFoundationValue($0) }
+        case .array(let values): return values.map { nativeLegacyFoundationValue($0) }
+        case .string(let value): return value
+        case .integer(let value): return value
+        case .unsigned(let value): return value
+        case .number(let value): return value
+        case .bool(let value): return value
+        case .null: return NSNull()
         }
     }
+
+    @MainActor
+    private func scheduleNativeLegacyBoard(receipt: VortxNativeCoreFacade.ChangeReceipt,
+                                            origin: NativeCallbackOrigin) {
+        guard nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+              nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+        let originalWork = boardRebuildWork
+        boardRebuildWork = nil
+        originalWork?.cancel()
+        guard nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+              nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+        let preferences = NativeLegacyBoardPreferences(disabled: ProfileStore.activeDisabledAddons(),
+            hidden: CatalogPrefsStore.hidden(), order: CatalogOrderSnapshot(CatalogPrefsStore.order()))
+        let publish: @MainActor @Sendable (NativeLegacyBoardSample) -> Void = { [weak self] sample in
+            guard let self,
+                  self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+                  self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+            self.reconcileBoardRowPagination(sample.state)
+            guard self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+                  self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+            self.boardCatalogTotal = sample.state?.catalogs.count ?? 0
+            self.boardRows = sample.rows
+            guard self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+                  self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+            self.boardPageInFlight = false
+            if !CatalogPrefsStore.order().isEmpty {
+                self.ensureCatalogOrderRangeLoaded(installedCatalogTotal: 0)
+                guard self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+                      self.nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+            }
+        }
+        let work = DispatchWorkItem {
+            Task.detached(priority: .userInitiated) {
+                let sample = Self.prepareNativeLegacyBoard(receipt: receipt, preferences: preferences)
+                await publish(sample)
+            }
+        }
+        guard nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "board"),
+              nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: "ctx") else { return }
+        boardRebuildWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.boardRebuildDebounce, execute: work)
+    }
+
+    private static func prepareNativeLegacyBoard(receipt: VortxNativeCoreFacade.ChangeReceipt,
+                                                  preferences: NativeLegacyBoardPreferences) -> NativeLegacyBoardSample {
+        let board = nativeLegacyDecode(CoreBoardState.self, value: receipt.values["board"])
+        let context = nativeLegacyDecode(CoreCtx.self, value: receipt.values["ctx"])
+        var titles: [String: String] = [:]
+        for addon in context?.profile.addons ?? [] {
+            for catalog in addon.manifest.catalogs {
+                let key = catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)
+                titles[key] = displayCatalogTitle(name: catalog.name ?? catalog.id, type: catalog.type)
+            }
+        }
+        let ghostBases = tombstonedBases(in: context?.profile.addons ?? [])
+        var rows: [CoreBoardRow] = []
+        for (engineIndex, catalog) in (board?.catalogs ?? []).enumerated() {
+            guard let request = catalog.first?.request,
+                  !preferences.disabled.contains(ProfileAddonPreferencesPolicy.identity(request.base)),
+                  !ghostBases.contains(AddonTombstones.normalize(request.base)) else { continue }
+            let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
+            guard !items.isEmpty else { continue }
+            let key = catalogKey(base: request.base, type: request.path.type, id: request.path.id)
+            guard !preferences.hidden.contains(key) else { continue }
+            rows.append(.init(id: key, title: titles[key] ?? request.path.id,
+                type: request.path.type, items: items, engineIndex: engineIndex))
+        }
+        let ordered = rows.enumerated().sorted { lhs, rhs in
+            let left = preferences.order.rank(lhs.element.id), right = preferences.order.rank(rhs.element.id)
+            return left != right ? left < right : lhs.offset < rhs.offset
+        }.map(\.element)
+        return .init(state: board, rows: ordered)
+    }
+
 
     // MARK: meta_details coalesce + diff
 
@@ -5637,172 +5996,30 @@ final class CoreBridge: ObservableObject {
     /// identical re-emit of the same 1757-row payload during source search republishes nothing. An
     /// episode switch or a fresh Load changes the meta id / stream set, so its republish always lands
     /// within one debounce window, keeping in-player next-episode / binge auto-advance intact.
-    private func scheduleMetaDetailsRepublish() {
-        scheduleMetaDetailsRepublish(capturedPublicationToken: capturePublicationToken())
-    }
 
-    private func scheduleMetaDetailsRepublish(capturedPublicationToken publicationToken: PublicationToken) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.publicationStillCurrent(publicationToken) else { return }
-            self.metaDetailsWork?.cancel()
-            let refreshGenerationAtSchedule = self.appleCWMetaRefreshRequest?.generation
-            let refindGenerationAtSchedule = self.refindGeneration
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self else { return }
-                    let details: CoreMetaDetails?
-                    do {
-                        guard let data = self.stateData("meta_details") else { return }
-                        // A valid JSON null is an unload receipt. A decoding/read failure is not:
-                        // preserve the current UI and never use a malformed snapshot to authorize Load.
-                        details = try Self.decoder.decode(CoreMetaDetails?.self, from: data)
-                    } catch {
-                        VXProbe.log("engine", "metadata receipt decode failed; retaining last valid snapshot")
-                        return
-                    }
-                    if VXProbe.enabled {
-                        // Count ready streams across every source group so the log shows when streams
-                        // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
-                        // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
-                        let readyStreams = (details?.allStreamGroups ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                        VXProbe.log("engine", "metaDetails changed meta=\(VXProbeRedaction.identityToken(details?.meta?.id)) streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
-                        if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
-                    }
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                        // The decoded payload belongs to the request generation that was active when this
-                        // debounce work was scheduled. If teardown cancelled that generation, or a
-                        // replacement player installed another one, discard the stale work before it can
-                        // republish meta or drive the replacement's invalidation/load state.
-                        guard self.appleCWMetaRefreshRequest?.generation == refreshGenerationAtSchedule,
-                              self.refindGeneration == refindGenerationAtSchedule else {
-                            return
-                        }
-                        if Self.metaDetailsNeedsRepublish(current: self.metaDetails, next: details) {
-                            // Compute the streams-only diff BEFORE the assignment, then bump the
-                            // source-list epoch only when the ready-stream set (or the loaded meta)
-                            // really changed, so a library/progress-only republish never triggers a
-                            // source-list rebuild.
-                            let streamsChanged = Self.metaDetailsStreamsChanged(current: self.metaDetails, next: details)
-                            self.metaDetails = details
-                            if streamsChanged { self.streamsEpoch &+= 1 }
-                            if let details { self.startNZBIndexerSearchIfNeeded(details: details) }
-                        }
-                        self.replayPendingEpisodeWatched()
-                        // Re-find sources: the minimal Unload -> nil -> Load arm, independent of the Apple CW
-                        // authoritative refresh. The Unload's nil meta_details receipt is the only thing that
-                        // opens the exact Load (a same-ID ready re-emit is NOT invalidation). One-shot: clear
-                        // the request as the Load is dispatched, then the ordinary republish above refills the
-                        // source list from the fresh sources as they land.
-                        let invalidated = AppleCWMetaInvalidationPolicy.isUnloaded(
-                            hasSelection: details?.selected != nil,
-                            hasMetaProviders: !(details?.metaItems.isEmpty ?? true),
-                            hasStreamRequests: !(details?.allStreamGroups.isEmpty ?? true))
-                        if let refind = self.refindRequest, refind.awaitingInvalidation, invalidated {
-                            self.refindRequest = nil
-                            self.dispatch(
-                                action: self.metaLoadAction(
-                                    type: refind.type, id: refind.id,
-                                    streamType: refind.streamType, streamId: refind.streamID
-                                ),
-                                field: "meta_details"
-                            )
-                        }
-                        guard let request = self.appleCWMetaRefreshRequest,
-                              let refreshGenerationAtSchedule,
-                              AppleCWMetaRefreshGenerationFence.owns(
-                                  capturedGeneration: refreshGenerationAtSchedule,
-                                  activeGeneration: request.generation
-                              ) else { return }
-                        let settledForRequest = request.navigationOnly
-                            ? details?.appleCWNavigationMeta(for: request.libraryID, streamID: request.streamID) != nil
-                            : Self.appleCWMetaRefreshIsSettled(
-                                details, libraryID: request.libraryID, streamID: request.streamID)
-                        switch request.phase {
-                        case .awaitingInvalidation:
-                            // A same-ID ready re-emit is explicitly NOT invalidation. Leave the request
-                            // pending so an unrelated event cannot turn a Load no-op into proof. Only the
-                            // explicit Unload's nil meta_details receipt opens the exact Load phase.
-                            guard invalidated else { return }
-                            self.appleCWMetaRefreshRequest?.phase = .awaitingLoadSettlement
-                            self.dispatch(
-                                action: self.metaLoadAction(
-                                    type: request.type, id: request.libraryID,
-                                    streamType: request.streamType, streamId: request.streamID
-                                ),
-                                field: "meta_details"
-                            )
-                        case .awaitingLoadSettlement:
-                            guard settledForRequest else { return }
-                            self.appleCWMetaRefreshReceipt = AppleCWMetaRefreshReceipt(
-                                requestGeneration: request.generation,
-                                selectedMetaID: details?.selectedMetaID,
-                                loadedMetaID: details?.meta?.id,
-                                settled: true,
-                                requestedStreamID: request.streamID
-                            )
-                            self.appleCWMetaRefreshDetails = details
-                            self.appleCWMetaRefreshRequest = nil
-                        }
-                    }
-                }
-            }
-            self.metaDetailsWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.metaDetailsDebounce, execute: work)
-        }
-    }
 
     private static func appleCWMetaRefreshIsSettled(_ details: CoreMetaDetails?,
                                                     libraryID: String, streamID: String) -> Bool {
         details?.appleCWTerminalFullMeta(for: libraryID, streamID: streamID) != nil
     }
 
-    /// True when the newly decoded meta_details differs from the stored one in a way the UI or the
-    /// in-player episode-switch path (which reads `streamGroups(forStreamId:)` off the stored value)
-    /// would observe: the selected request id, metadata resolution, loaded meta id, per-group
-    /// ready-stream signature (so a new episode's streams or newly landed sources always republish),
-    /// or the library/watched bits behind the In-Library button and watched dots. A pure re-emit of
-    /// the identical loaded payload returns false, which drops the redundant source-search republishes.
+    /// Compare the complete decoded projection, not only its preferred Ready item.
+    /// Decoder-equivalent byte counts and unordered watched membership remain quiet;
+    /// provider/request/retained/loading/library changes cannot hide behind one ID.
     private static func metaDetailsNeedsRepublish(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
-        // Presence flips always republish (spinner -> loaded, or unload).
-        guard let current, let next else { return (current != nil) != (next != nil) }
-        // `meta` is nil while an add-on is loading and after every add-on has failed. Publish both
-        // the selection change and pending-to-unresolved transition so detail recovery sees the
-        // terminal state even when the ready meta and stream signatures remain empty.
-        if current.selectedMetaID != next.selectedMetaID || current.selected?.streamPath?.id != next.selected?.streamPath?.id { return true }
-        if current.metaResolution != next.metaResolution { return true }
-        if current.meta?.id != next.meta?.id { return true }
-        if let currentMeta = current.meta, let nextMeta = next.meta,
-           !currentMeta.hasSamePresentation(as: nextMeta) { return true }
-        if current.libraryItem?.id != next.libraryItem?.id
-            || current.libraryItem?.removed != next.libraryItem?.removed
-            || current.libraryItem?.temp != next.libraryItem?.temp
-            // Playback-state progress MUST re-publish: engineResumeSeconds reads libraryItem.state.timeOffset +
-            // videoId at player open, so without these the resume position latched at the open-time value (~10s)
-            // no matter how long you watched, and only a back-to-Home re-entry re-seeded it (0.3.11 regression).
-            // This only re-publishes the already-decoded value (no extra decode); the ~90s engine library push
-            // cadence keeps it cheap, and during source search timeOffset does not change so the search-churn
-            // suppression this predicate exists for is unaffected.
-            || current.libraryItem?.state.timeOffset != next.libraryItem?.state.timeOffset
-            || current.libraryItem?.state.videoId != next.libraryItem?.state.videoId
-            || current.libraryItem?.state.duration != next.libraryItem?.state.duration
-            // A manual "Mark as Watched" on a movie (or one whose position never advanced, e.g. flagged
-            // watched with no active offset) flips ONLY flaggedWatched/timesWatched: timeOffset, duration,
-            // videoId, libraryItem.id/removed/temp and watchedVideoIds.count all stay exactly as they were.
-            // Without comparing these two fields, that mark landed on the engine (Library tab / Continue
-            // Watching, which decode fresh every event) but `core.metaDetails` never republished, so the
-            // open detail page's own watched checkmark (state.timesWatched > 0) stayed stuck on the stale
-            // value until an unrelated field changed or the page reloaded.
-            || current.libraryItem?.state.flaggedWatched != next.libraryItem?.state.flaggedWatched
-            || current.libraryItem?.state.timesWatched != next.libraryItem?.state.timesWatched
-            || WatchedMembershipPolicy.changed(current.watchedVideoIds, next.watchedVideoIds) {
-            return true
-        }
-        // Signature over BOTH stream surfaces: the meta-embedded groups (metaStreams, the HTTP/HLS
-        // add-on shape, #122) land on the meta republish, and without them in the diff that arrival
-        // looked like "nothing changed" and the source list never rebuilt.
-        return !streamSetsEqual(current.allStreamGroups, next.allStreamGroups)
+        current != next
+    }
+
+    /// A library event carries library/watch facts, not authority to replace a newer provider or
+    /// source payload. Missing/malformed/unloaded metadata cannot clear a resident detail. Compare
+    /// the entire library value (including resume and display fields), retaining watched-set semantics.
+    private static func libraryMetaDetailsUpdate(current: CoreMetaDetails?, next: CoreMetaDetails?) -> CoreMetaDetails? {
+        guard let current, let next, let selection = current.selected,
+              selection == next.selected,
+              current.libraryItem != next.libraryItem || current.watchedIds != next.watchedIds else { return nil }
+        return CoreMetaDetails(selected: current.selected, metaItems: current.metaItems,
+            streams: current.streams, metaStreams: current.metaStreams,
+            libraryItem: next.libraryItem, watchedVideoIds: next.watchedVideoIds)
     }
 
     /// True when a republish changed something the SOURCE LIST derives from: presence, the loaded
@@ -5811,7 +6028,7 @@ final class CoreBridge: ObservableObject {
     /// save while the stream set is unchanged.
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
-        if current.selectedMetaID != next.selectedMetaID || current.selected?.streamPath?.id != next.selected?.streamPath?.id { return true }
+        if current.selected != next.selected { return true }
         if current.meta?.id != next.meta?.id { return true }
         // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
         return !streamSetsEqual(current.allStreamGroups, next.allStreamGroups)
@@ -5848,49 +6065,17 @@ final class CoreBridge: ObservableObject {
     /// schedules a single trailing one ~80 ms after the last emit. The rebuild's heavy JSON decode
     /// (`buildBoardRows`) runs off the main thread; only the `boardRows` assignment lands on main. Net effect:
     /// the launch/page-land storm that used to fire N full decodes + N republishes now fires exactly one.
-    private func scheduleBoardRebuild() {
-        scheduleBoardRebuild(capturedPublicationToken: capturePublicationToken())
-    }
 
-    private func scheduleBoardRebuild(capturedPublicationToken publicationToken: PublicationToken) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.publicationStillCurrent(publicationToken) else { return }
-            self.boardRebuildWork?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                // Decode + assemble off the main thread (same as the old inline path, which also ran off-main).
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self else { return }
-                    let boardState = self.decode(CoreBoardState.self, field: "board")
-                    let rows = boardState.map { self.buildBoardRows($0) } ?? []
-                    // [engine] one board line per coalesced rebuild (catalogs the engine holds -> visible rows).
-                    VXProbe.log("engine", "board changed catalogs=\(boardState?.catalogs.count ?? 0) rows=\(rows.count)")
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                        self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
-                        self.boardCatalogTotal = boardState?.catalogs.count ?? 0
-                        self.boardRows = rows
-                        self.boardPageInFlight = false
-                        // The board emit is the authoritative raw total. If an explicit order is
-                        // already stored, close any gap left by an interim ctx manifest count.
-                        if !CatalogPrefsStore.order().isEmpty {
-                            self.ensureCatalogOrderRangeLoaded(installedCatalogTotal: 0)
-                        }
-                    }
-                }
-            }
-            self.boardRebuildWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.boardRebuildDebounce, execute: work)
-        }
-    }
 
     /// Build titled board rows: merge each catalog's ready pages into one item list and resolve a
     /// human title from the installed-addon manifests. Rows with no loaded items are skipped, so they
     /// appear as their content arrives (no empty placeholders).
+    @MainActor
     private func buildBoardRows() -> [CoreBoardRow] {
         guard let board = decode(CoreBoardState.self, field: "board") else { return [] }
         return buildBoardRows(board)
     }
+    @MainActor
     private func buildBoardRows(_ board: CoreBoardState) -> [CoreBoardRow] {
         let titles = catalogTitleMap()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
@@ -5931,6 +6116,7 @@ final class CoreBridge: ObservableObject {
     /// Every catalog the installed add-ons provide (deduped by key), titled the same way the board is.
     /// Excludes the catalogs of REMOVED add-ons the engine still holds (see `tombstonedBases`), so the
     /// catalog manager never lists a ghost entry for an add-on the user uninstalled (#121).
+    @MainActor
     var allCatalogs: [CatalogInfo] {
         installedCatalogs(includeTombstoned: false, includeDisabled: false)
     }
@@ -5953,6 +6139,7 @@ final class CoreBridge: ObservableObject {
     /// active profile disabled: `ensureLiveCatalogsLoaded` needs that RAW count because both kinds of
     /// catalog still occupy engine board indices, so widening the board by a filtered count could
     /// leave trailing live catalogs outside the range-loaded window.
+    @MainActor
     private func installedCatalogs(includeTombstoned: Bool, includeDisabled: Bool) -> [CatalogInfo] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
         var out: [CatalogInfo] = []
@@ -5974,6 +6161,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Rebuild the board (e.g. after a catalog-preference change) and republish on the main queue.
+    @MainActor
     func rebuildBoardRows() {
         let publicationToken = capturePublicationToken()
         let rows = buildBoardRows()
@@ -5986,6 +6174,7 @@ final class CoreBridge: ObservableObject {
     /// The Home board rows whose content type is Live TV (tv / channel / events), for the Live
     /// surface. Derived from the already-published `boardRows`, so it tracks the engine's catalog
     /// state live without a second decode and stays correct as add-ons are installed/removed.
+    @MainActor
     var liveBoardRows: [CoreBoardRow] {
         boardRows.filter { LiveTypes.contains($0.type) }
     }
@@ -5993,6 +6182,7 @@ final class CoreBridge: ObservableObject {
     /// `{base|type|id → "Catalog name"}` from the installed addons' manifests. The addon's own catalog
     /// name is already descriptive (e.g. "Debridio TMDB - Trending Movies"), so we don't prefix the
     /// addon name.
+    @MainActor
     private func catalogTitleMap() -> [String: String] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [:] }
         var map: [String: String] = [:]
@@ -6074,6 +6264,7 @@ extension CoreBridge {
     /// All sources are filtered to titles that contain `query` as a case/diacritic-insensitive
     /// substring. The engine's suggestion API does fuzzy/related matching and can return unrelated
     /// titles; the substring guard drops them client-side. Results are capped at 10.
+    @MainActor
     func searchSuggestionTitles(for query: String) -> [String] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -6108,15 +6299,6 @@ extension CoreBridge {
     }
 }
 
-/// Top-level C callback (no captures allowed). `ctx` is deliberately unused: resolving the
-/// process-lifetime singleton directly is always safe, while dereferencing an unretained
-/// pointer from a Rust worker thread would be a use-after-free if the bridge were ever
-/// deallocated.
-private func coreEventCallback(ctx: UnsafeMutableRawPointer?, data: UnsafePointer<UInt8>?, len: Int) {
-    guard let data, len > 0 else { return }
-    let bytes = Data(bytes: data, count: len) // copy synchronously, `data` is only valid during this call
-    CoreBridge.shared.handleEvent(bytes)
-}
 
 // MARK: - Captured Xperience host-profile adapter
 extension CoreBridge {
@@ -6378,5 +6560,1420 @@ extension CoreBridge {
                 try operation()
             }
         }
+    }
+}
+extension CoreBridge {
+    @MainActor private final class NativeMetadataBootstrapContinuation {
+        private weak var core: CoreBridge?
+        init(_ core: CoreBridge) { self.core = core }
+        func restore(previous: VortxNativeCoreFacade?, original: NativeMetadataBoundaryRetirement) async {
+            await CredentialPublicationOutbox.waitForSubtitleRetirement(original.subtitle)
+            CredentialPublicationOutbox.finishSubtitleRetirement(original.subtitle)
+            await previous?.shutdown()
+            guard let core, core.originalMetadataLifecycleIsCurrent(original.lifecycle) else { return }
+            _ = await VortXSyncManager.shared.restoreNativeCheckpoint(credentialCapture: original.lifecycle.owner.credential)
+        }
+        func hydrate(previous: VortxNativeCoreFacade?, capture: CredentialScopeRegistry.Capture,
+                     original: NativeMetadataBoundaryRetirement) async {
+            await CredentialPublicationOutbox.waitForSubtitleRetirement(original.subtitle)
+            CredentialPublicationOutbox.finishSubtitleRetirement(original.subtitle)
+            await previous?.shutdown()
+            guard let core, CredentialScopeRegistry.shared.isCurrent(capture),
+                  capture == original.lifecycle.owner.credential, core.originalMetadataLifecycleIsCurrent(original.lifecycle) else { return }
+            await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(credentialCapture: capture)
+        }
+    }
+    @MainActor private func receiveNativeCredentialBoundary() {
+        let capture = CredentialScopeRegistry.shared.capture(), previous = nativeFacade
+        let retirement = revokeNativeSession()
+        let continuation = NativeMetadataBootstrapContinuation(self)
+        Task { @MainActor in
+            await continuation.hydrate(previous: previous, capture: capture, original: retirement)
+        }
+    }
+}
+
+// MARK: - Source-owned metadata presentation
+
+private struct NativeMetadataSlotProposal: Equatable, Sendable {
+    fileprivate let identity: UUID
+}
+
+private struct NativeMetadataEmissionIdentity: Sendable {
+    private let state: OSAllocatedUnfairLock<UUID>
+    init(_ identity: UUID) { state = .init(initialState: identity) }
+    func replace(_ identity: UUID) { state.withLock { $0 = identity } }
+    func accepts(_ identity: UUID) -> Bool { state.withLock { $0 == identity } }
+}
+
+extension CoreBridge {
+    private struct NativeMetadataPresentationProposal: Sendable {
+        let metadata: NativeMetadataSlotProposal
+        let streams: NativeMetadataSlotProposal
+    }
+
+    /// This is policy at the real Bridge/Facade seam, NOT a mockable source
+    /// receipt and NOT a property of the SDK-free presentation primitive.
+    private enum NativeMetadataFrameAdmission: Sendable {
+        case source(facade: VortxNativeCoreFacade, change: VortxNativeCoreFacade.ChangeReceipt,
+                    selection: VortxNativeCoreFacade.MetadataSelectionReceipt, libraryOverlay: Bool)
+        case host(facade: VortxNativeCoreFacade, selection: VortxNativeCoreFacade.MetadataSelectionReceipt)
+        case localOriginal
+
+        @MainActor
+        func storePreparedFrame(_ store: @MainActor () -> Void) -> Bool {
+            switch self {
+            case let .source(facade, change, selection, libraryOverlay):
+                return facade.storeOriginalMetadataPresentationFrame(change, selection: selection,
+                    libraryOverlay: libraryOverlay, storePreparedFrame: store)
+            case let .host(facade, selection):
+                return facade.storeOriginalMetadataHostFrame(selection: selection, storePreparedFrame: store)
+            case .localOriginal:
+                store()
+                return true
+            }
+        }
+    }
+
+    private struct NativeMetadataPresentationFrame: Sendable {
+        let details: CoreMetaDetails?
+        let streamsEpoch: Int
+        let status: StreamAddonStatusProjection?
+    }
+
+    /// Immutable eagerly allocated reference. Proposal IDs are separate from
+    /// equality revisions: an accepted equal source can supersede an old pending
+    /// attempt without creating an observable metadata/status change.
+    private final class NativeMetadataFrameBox: Sendable {
+        let frame: NativeMetadataPresentationFrame
+        let metadataProposal: UUID
+        let streamsProposal: UUID
+        let statusProposal: UUID
+        let metadataRevision: UUID
+        let statusRevision: UUID
+        let emission: UUID
+        init(frame: NativeMetadataPresentationFrame, metadataProposal: UUID,
+             streamsProposal: UUID, statusProposal: UUID,
+             metadataRevision: UUID, statusRevision: UUID, emission: UUID) {
+            self.frame = frame
+            self.metadataProposal = metadataProposal
+            self.streamsProposal = streamsProposal
+            self.statusProposal = statusProposal
+            self.metadataRevision = metadataRevision
+            self.statusRevision = statusRevision
+            self.emission = emission
+        }
+    }
+
+    /// The exact owner is SDK-free apart from the actual app model types and
+    /// comparators. trustedStore is NONESCAPING and is invoked only with the
+    /// literal plain backing-reference swap below. Production forwarding uses
+    /// NativeMetadataFrameAdmission; a RAM primitive lane proves no Facade policy.
+    @MainActor private final class MetadataPresentation {
+        private enum Mutation {
+            case primary(CoreMetaDetails?, StreamAddonStatusProjection?)
+            case overlay(CoreMetaDetails)
+            case clear(bumpStreams: Bool)
+            case counter
+
+            var touchesMetadata: Bool {
+                if case .counter = self { return false }
+                return true
+            }
+            var touchesStatus: Bool {
+                switch self { case .primary, .clear: return true; case .overlay, .counter: return false }
+            }
+        }
+        private struct Change {
+            let frame: NativeMetadataPresentationFrame
+            let metadataChanged: Bool
+            let statusChanged: Bool
+            let counterChanged: Bool
+            var observable: Bool { metadataChanged || statusChanged || counterChanged }
+        }
+
+        private let objectWillChange: ObservableObjectPublisher
+        private var backing: NativeMetadataFrameBox // eager plain storage: NO observer/lazy accessor
+        private let committed: NativeMetadataEmissionIdentity
+        private let values: CurrentValueSubject<NativeMetadataFrameBox, Never>
+
+        // Pending component reservations must exist OUTSIDE the committed box:
+        // reserve BEFORE willChange, but do not store an unadmitted UI payload.
+        // Counter-only attempts never rotate metadata/status reservations. Their
+        // immutable copies retain these current reservations, including an outer
+        // metadata attempt that has not reached final storage yet.
+        private var metadataProposal: UUID
+        private var streamsProposal: UUID
+        private var statusProposal: UUID
+        private var clearIdentity = UUID()
+
+        init(objectWillChange: ObservableObjectPublisher) {
+            self.objectWillChange = objectWillChange
+            let metadata = UUID(), streams = UUID(), status = UUID(), emission = UUID()
+            let initial = NativeMetadataFrameBox(frame: .init(details: nil, streamsEpoch: 0, status: nil),
+                metadataProposal: metadata, streamsProposal: streams, statusProposal: status,
+                metadataRevision: UUID(), statusRevision: UUID(), emission: emission)
+            backing = initial
+            metadataProposal = metadata; streamsProposal = streams; statusProposal = status
+            committed = .init(emission)
+            values = .init(initial)
+        }
+
+        var metaDetails: CoreMetaDetails? { backing.frame.details }
+        var streamsEpoch: Int { backing.frame.streamsEpoch }
+        var acceptedStatus: StreamAddonStatusProjection? { backing.frame.status }
+        var proposal: NativeMetadataPresentationProposal {
+            .init(metadata: .init(identity: metadataProposal), streams: .init(identity: streamsProposal))
+        }
+        var metaDetailsPublisher: AnyPublisher<CoreMetaDetails?, Never> {
+            let committed = committed
+            return values.filter { committed.accepts($0.emission) }
+                .removeDuplicates { $0.metadataRevision == $1.metadataRevision }
+                .map { $0.frame.details }.eraseToAnyPublisher()
+        }
+        var streamsEpochPublisher: AnyPublisher<Int, Never> {
+            let committed = committed
+            return values.filter { committed.accepts($0.emission) }
+                .map { $0.frame.streamsEpoch }.removeDuplicates().eraseToAnyPublisher()
+        }
+        var statusPublisher: AnyPublisher<UUID, Never> {
+            let committed = committed
+            return values.filter { committed.accepts($0.emission) }
+                .map(\.statusRevision).removeDuplicates().eraseToAnyPublisher()
+        }
+
+        func retireClearAuthority() { clearIdentity = UUID() }
+        func beginClear() -> UUID {
+            clearIdentity = UUID()
+            retireStatusAdmission()
+            return clearIdentity
+        }
+        func ownsClear(_ identity: UUID) -> Bool { clearIdentity == identity }
+        /// Plain retirement only. Resident status remains paired with resident
+        /// metadata until a whole-frame clear; no stale wakeup can write it later.
+        func retireStatusAdmission() { statusProposal = UUID() }
+
+        private func change(_ mutation: Mutation, from current: NativeMetadataPresentationFrame) -> Change {
+            let next: CoreMetaDetails?, status: StreamAddonStatusProjection?, bump: Bool
+            switch mutation {
+            case let .primary(details, projection):
+                next = details
+                status = details == nil ? nil : projection
+                bump = CoreBridge.metaDetailsStreamsChanged(current: current.details, next: details)
+            case let .overlay(details):
+                next = details; status = current.status; bump = false
+            case let .clear(bumpStreams):
+                next = nil; status = nil; bump = bumpStreams
+            case .counter:
+                next = current.details; status = current.status; bump = true
+            }
+            let metadataChanged = CoreBridge.metaDetailsNeedsRepublish(current: current.details, next: next)
+            let statusChanged = current.status != status
+            return .init(frame: .init(details: metadataChanged ? next : current.details,
+                    streamsEpoch: bump ? current.streamsEpoch &+ 1 : current.streamsEpoch,
+                    status: statusChanged ? status : current.status),
+                metadataChanged: metadataChanged, statusChanged: statusChanged, counterChanged: bump)
+        }
+
+        @discardableResult
+        private func commit(_ mutation: Mutation, expectedProposal: NativeMetadataSlotProposal,
+            preservingClear clear: UUID?, isCurrent: @MainActor () -> Bool,
+            trustedStore: @MainActor (_ store: @MainActor () -> Void) -> Bool) -> Bool {
+            guard isCurrent() else { return false }
+            if mutation.touchesMetadata {
+                guard metadataProposal == expectedProposal.identity else { return false }
+                if let clear { guard ownsClear(clear) else { return false } }
+                else { retireClearAuthority() }
+            } else {
+                guard streamsProposal == expectedProposal.identity else { return false }
+            }
+
+            let attempt = UUID()
+            if mutation.touchesMetadata { metadataProposal = attempt }
+            else { streamsProposal = attempt }
+            if mutation.touchesStatus { statusProposal = attempt }
+            let expectedStatus = statusProposal
+            let needsNotification = change(mutation, from: backing.frame).observable
+            if needsNotification { objectWillChange.send() }
+
+            // A counter-only reentry preserves these metadata/status IDs. A
+            // metadata/clear/overlay reentry rotates metadata and vetoes old A.
+            guard isCurrent(),
+                  (mutation.touchesMetadata ? metadataProposal : streamsProposal) == attempt,
+                  !mutation.touchesStatus || statusProposal == expectedStatus else { return false }
+            if let clear { guard ownsClear(clear) else { return false } }
+
+            // Reassemble AFTER willChange from the latest eager frame. A nested
+            // counter is data to preserve, not a newly acquired source authority.
+            // Comparisons, UUIDs, allocations and old graph retention stay OUTSIDE F.
+            let previous = backing
+            defer { withExtendedLifetime(previous) {} }
+            let changed = change(mutation, from: previous.frame)
+            let previousStreamsProposal = streamsProposal
+            let rotatesStreamsAtFinal = mutation.touchesMetadata && changed.counterChanged
+            if rotatesStreamsAtFinal { streamsProposal = UUID() }
+            let prepared = NativeMetadataFrameBox(frame: changed.frame,
+                metadataProposal: metadataProposal, streamsProposal: streamsProposal,
+                statusProposal: statusProposal,
+                metadataRevision: changed.metadataChanged ? UUID() : previous.metadataRevision,
+                statusRevision: changed.statusChanged ? UUID() : previous.statusRevision,
+                emission: UUID())
+
+            // THE ONLY OPERATION INSIDE01c'S F: eager plain strong-ref swap.
+            // previous remains strongly retained through this method's defer,
+            // so replacing backing cannot release the last old model reference.
+            let admitted = trustedStore { self.backing = prepared }
+            guard admitted else {
+                // A failed final source gate must not retire an otherwise live
+                // earlier counter proposal. Never roll back a nested successor.
+                if rotatesStreamsAtFinal, backing === previous,
+                   streamsProposal == prepared.streamsProposal {
+                    streamsProposal = previousStreamsProposal
+                }
+                return false
+            }
+
+            // F has unlocked before either the checked scalar gate or Combine.
+            // A recursively committed successor (if a forwarding gate were ever
+            // to drain one) owns its own fanout; do not resurrect this envelope.
+            if backing === prepared {
+                committed.replace(prepared.emission)
+                // Send even an equality-quiet frame: per-subscription revisions
+                // suppress unchanged values, while later subscribers in a nested
+                // older send can still receive the current frame exactly once.
+                values.send(prepared)
+            }
+            // Counter-only replacement after metadata fanout does not cancel a
+            // valid original metadata tail. Original owner/source may still veto.
+            guard isCurrent(),
+                  (mutation.touchesMetadata ? metadataProposal : streamsProposal) == attempt,
+                  !mutation.touchesStatus || statusProposal == expectedStatus else { return false }
+            if let clear { return ownsClear(clear) }
+            return true
+        }
+
+        @discardableResult
+        func commitFrame(details: CoreMetaDetails?, status: StreamAddonStatusProjection?,
+            expectedProposal: NativeMetadataSlotProposal, isCurrent: @MainActor () -> Bool,
+            trustedStore: @MainActor (_ store: @MainActor () -> Void) -> Bool) -> Bool {
+            commit(.primary(details, status), expectedProposal: expectedProposal,
+                preservingClear: nil, isCurrent: isCurrent, trustedStore: trustedStore)
+        }
+        @discardableResult
+        func commitOverlay(_ details: CoreMetaDetails, expectedProposal: NativeMetadataSlotProposal,
+            isCurrent: @MainActor () -> Bool,
+            trustedStore: @MainActor (_ store: @MainActor () -> Void) -> Bool) -> Bool {
+            commit(.overlay(details), expectedProposal: expectedProposal,
+                preservingClear: nil, isCurrent: isCurrent, trustedStore: trustedStore)
+        }
+        @discardableResult
+        func clear(bumpStreams: Bool, preservingClear: UUID?, expectedProposal: NativeMetadataSlotProposal,
+            isCurrent: @MainActor () -> Bool,
+            trustedStore: @MainActor (_ store: @MainActor () -> Void) -> Bool) -> Bool {
+            commit(.clear(bumpStreams: bumpStreams), expectedProposal: expectedProposal,
+                preservingClear: preservingClear, isCurrent: isCurrent, trustedStore: trustedStore)
+        }
+        @discardableResult
+        func advanceStreamsEpoch(expectedProposal: NativeMetadataSlotProposal,
+            isCurrent: @MainActor () -> Bool,
+            trustedStore: @MainActor (_ store: @MainActor () -> Void) -> Bool) -> Bool {
+            commit(.counter, expectedProposal: expectedProposal,
+                preservingClear: nil, isCurrent: isCurrent, trustedStore: trustedStore)
+        }
+    }
+
+    @MainActor var metaDetailsPublisher: AnyPublisher<CoreMetaDetails?, Never> {
+        metadataPresentation.metaDetailsPublisher
+    }
+    @MainActor var streamsEpochPublisher: AnyPublisher<Int, Never> {
+        metadataPresentation.streamsEpochPublisher
+    }
+    @MainActor var statusPublisher: AnyPublisher<UUID, Never> { metadataPresentation.statusPublisher }
+    @MainActor private func captureNativeMetadataPresentationProposal() -> NativeMetadataPresentationProposal {
+        metadataPresentation.proposal
+    }
+
+    @MainActor @discardableResult
+    private func commitOwnedMetadataFrame(details: CoreMetaDetails?, status: StreamAddonStatusProjection?,
+        expectedProposal: NativeMetadataSlotProposal, isCurrent: @MainActor () -> Bool,
+        finalAdmission: NativeMetadataFrameAdmission) -> Bool {
+        guard case .source(_, _, _, false) = finalAdmission else { return false }
+        return metadataPresentation.commitFrame(details: details, status: status,
+            expectedProposal: expectedProposal, isCurrent: isCurrent,
+            trustedStore: { finalAdmission.storePreparedFrame($0) })
+    }
+    @MainActor @discardableResult
+    private func commitOwnedMetadataOverlay(_ details: CoreMetaDetails,
+        expectedProposal: NativeMetadataSlotProposal, isCurrent: @MainActor () -> Bool,
+        finalAdmission: NativeMetadataFrameAdmission) -> Bool {
+        guard case .source(_, _, _, true) = finalAdmission else { return false }
+        return metadataPresentation.commitOverlay(details, expectedProposal: expectedProposal,
+            isCurrent: isCurrent, trustedStore: { finalAdmission.storePreparedFrame($0) })
+    }
+    @MainActor @discardableResult
+    private func commitOwnedMetadataClear(bumpStreams: Bool, preservingClear: UUID?,
+        expectedProposal: NativeMetadataSlotProposal, isCurrent: @MainActor () -> Bool,
+        finalAdmission: NativeMetadataFrameAdmission) -> Bool {
+        if case .source = finalAdmission { return false }
+        return metadataPresentation.clear(bumpStreams: bumpStreams, preservingClear: preservingClear,
+            expectedProposal: expectedProposal, isCurrent: isCurrent,
+            trustedStore: { finalAdmission.storePreparedFrame($0) })
+    }
+    @MainActor @discardableResult
+    private func advanceNativeStreamsEpoch(expectedProposal: NativeMetadataSlotProposal,
+        isCurrent: @MainActor () -> Bool, finalAdmission: NativeMetadataFrameAdmission) -> Bool {
+        if case .source = finalAdmission { return false }
+        return metadataPresentation.advanceStreamsEpoch(expectedProposal: expectedProposal,
+            isCurrent: isCurrent, trustedStore: { finalAdmission.storePreparedFrame($0) })
+    }
+}
+
+private struct NativeCallbackLifetime: Sendable {
+    private struct State: Sendable {
+        var installation: UUID?
+        var credential: CredentialScopeRegistry.Capture?
+        var sourceID: UUID?
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    func prepare(_ installation: UUID) {
+        state.withLock { $0 = .init(installation: installation) }
+    }
+    func bind(_ installation: UUID, credential: CredentialScopeRegistry.Capture, sourceID: UUID) {
+        state.withLock { value in
+            guard value.installation == installation else { return }
+            value.credential = credential; value.sourceID = sourceID
+        }
+    }
+    func retire() { state.withLock { $0 = .init() } }
+    func accepts(_ installation: UUID, credential: CredentialScopeRegistry.Capture, sourceID: UUID) -> Bool {
+        state.withLock { $0.installation == installation && $0.credential == credential && $0.sourceID == sourceID }
+    }
+}
+
+extension CoreBridge {
+    private struct NativeCallbackOrigin: Sendable {
+        let producer: VortxNativeCoreFacade
+        let installation: UUID
+        let credential: CredentialScopeRegistry.Capture
+        let publication: PublicationToken
+        let playerWasActive: Bool
+    }
+    /// Preserve synchronous source callback append order across the actor hop.
+    /// Independent Task creation is NOT a FIFO guarantee for changed versus ACK.
+    /// This is per installation, not a fabricated global order of all producers.
+    private struct NativeSourceMailbox: Sendable {
+        struct Envelope: Sendable {
+            let event: VortxNativeCoreFacade.SourceEvent
+            let origin: NativeCallbackOrigin
+        }
+        private struct State: Sendable {
+            var pending: [Envelope] = []
+            var draining = false
+        }
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        func append(_ envelope: Envelope) -> Bool {
+            state.withLock { value in
+                value.pending.append(envelope)
+                guard !value.draining else { return false }
+                value.draining = true
+                return true
+            }
+        }
+        func takeBatch() -> [Envelope]? {
+            state.withLock { value in
+                guard !value.pending.isEmpty else { value.draining = false; return nil }
+                var batch: [Envelope] = []
+                swap(&batch, &value.pending)
+                return batch // retain the whole batch before releasing the lock
+            }
+        }
+    }
+
+    /// The only object crossing the callback executor boundary is a real
+    /// MainActor receiver. It owns its weak Bridge reference on that executor;
+    /// this is not a neutral relay asserting that mixed Bridge is Sendable.
+    @MainActor private final class NativeCallbackReceiver {
+        private weak var core: CoreBridge?
+        init(core: CoreBridge) { self.core = core }
+        func receive(_ event: VortxNativeCoreFacade.SourceEvent, origin: NativeCallbackOrigin) {
+            guard let core, event.producer === origin.producer,
+                  event.sourceID == origin.producer.sourceID,
+                  core.nativeCallbackSourceIsCurrent(origin) else { return }
+            switch event.kind {
+            case .mutationAccepted:
+                VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential)
+            case .progressAccepted:
+                VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential, progressOnly: true)
+            case .changed:
+                guard core.nativeCallbackOriginIsCurrent(origin) else { return }
+                core.receiveOwnedMetadata(event, origin: origin)
+                // The metadata sink may synchronously retire the source via an
+                // observer. The legacy adapter repeats the original source guard.
+                core.receiveNativeLegacyEvent(event, origin: origin)
+            }
+        }
+        func credentialBoundary() { core?.receiveNativeCredentialBoundary() }
+        func flushOnQuit() { core?.flushNativeProgress(waitUpTo: 2) }
+        func applyPlayerActive(_ on: Bool) { core?.applyPlayerActiveOnOwner(on) }
+    }
+
+    @MainActor private func nativeCallbackSourceIsCurrent(_ origin: NativeCallbackOrigin) -> Bool {
+        guard CredentialScopeRegistry.shared.isCurrent(origin.credential),
+              nativeCallbackLifetime.accepts(origin.installation, credential: origin.credential,
+                  sourceID: origin.producer.sourceID) else { return false }
+        return nativeFacadeLock.withLock {
+            nativeFacadeStorage === origin.producer && nativeCallbackGeneration == origin.installation
+                && nativeCredentialCapture == origin.credential
+        }
+    }
+    @MainActor private func nativeCallbackOriginIsCurrent(_ origin: NativeCallbackOrigin) -> Bool {
+        nativeCallbackSourceIsCurrent(origin) && publicationStillCurrent(origin.publication)
+    }
+
+    @MainActor private func makeNativeSourceCallback(installation: UUID,
+        credential: CredentialScopeRegistry.Capture)
+        -> @Sendable (VortxNativeCoreFacade.SourceEvent) -> Void {
+        let receiver = nativeCallbackReceiver
+        let lifetime = nativeCallbackLifetime
+        let epoch = publicationEpochState
+        let player = playerActiveSnapshotState
+        let contextNote = Self.xperienceContextChangedNote
+        let mailbox = NativeSourceMailbox()
+        return { event in
+            // These are original scalar checks, never a recapture of a newer
+            // producer/selection/task. Pre-install callbacks remain rejected.
+            guard event.sourceID == event.producer.sourceID,
+                  CredentialScopeRegistry.shared.isCurrent(credential),
+                  lifetime.accepts(installation, credential: credential, sourceID: event.sourceID) else { return }
+            let origin = NativeCallbackOrigin(producer: event.producer, installation: installation,
+                credential: credential, publication: epoch.withLock { PublicationToken(epoch: $0) },
+                playerWasActive: player.withLock { $0 })
+            if case .changed(let fields, _) = event.kind,
+               !Set(fields).isDisjoint(with: ["ctx", "native_state", "native_host_preferences"]) {
+                // Existing control condition/count, synchronously on the producer
+                // before post returns; F/B/lifetime are ALL released. Observers can
+                // invalidate Xperience reads now, without main.sync lock inversion.
+                NotificationCenter.default.post(name: contextNote, object: nil)
+            }
+            guard mailbox.append(.init(event: event, origin: origin)) else { return }
+            Task { @MainActor in
+                while let batch = mailbox.takeBatch() {
+                    // Every current source Changed admission is called before
+                    // its later ACK admission; detached decode still remains
+                    // asynchronous and is NOT promised to finish before ACK.
+                    for envelope in batch { receiver.receive(envelope.event, origin: envelope.origin) }
+                }
+            }
+        }
+    }
+
+    /// Source-owned activation closes the unisolated singleton initializer seam.
+    /// start() and installNativeSession() call this BEFORE any source/session or
+    /// owner UI state is exposed. The queue is an actual Foundation main-queue
+    /// delivery boundary; the block captures only the MainActor receiver.
+    @MainActor private func activateNativePresentationBoundary() {
+        guard credentialScopeObserver == nil else { return }
+        let receiver = nativeCallbackReceiver
+        credentialScopeObserver = NotificationCenter.default.addObserver(
+            forName: VortXSyncManager.credentialScopeDidChangeNote, object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { receiver.credentialBoundary() } }
+    }
+
+    /// Explicit HOST initialization, never a source callback upgrade. The source
+    /// and installation are the originals just accepted by install, passed in
+    /// before old.close can call out. No metadata/task is seeded by this path.
+    @MainActor private func nativeInstalledSourceOrigin(producer: VortxNativeCoreFacade,
+        installation: UUID, credential: CredentialScopeRegistry.Capture) -> NativeCallbackOrigin? {
+        let origin = NativeCallbackOrigin(producer: producer, installation: installation,
+            credential: credential, publication: capturePublicationToken(),
+            playerWasActive: playerActiveSnapshot())
+        return nativeCallbackOriginIsCurrent(origin) ? origin : nil
+    }
+    @MainActor private func seedNativeInstalledSource(_ origin: NativeCallbackOrigin) -> Bool {
+        guard nativeCallbackOriginIsCurrent(origin),
+              let receipt = origin.producer.captureHostChange(fields:
+                ["ctx", "board", "library", "continue_watching_preview"]),
+              nativeCallbackOriginIsCurrent(origin) else { return false }
+        receiveNativeLegacyHostSeed(receipt, origin: origin)
+        return nativeCallbackOriginIsCurrent(origin)
+    }
+
+    /// Preserve the existing queued player-depth transition, including nested
+    /// public calls from observers, without sending a mixed weak Bridge capture.
+    @MainActor func setPlayerActive(_ on: Bool) {
+        let receiver = nativeCallbackReceiver
+        DispatchQueue.main.async { MainActor.assumeIsolated { receiver.applyPlayerActive(on) } }
+    }
+    @MainActor private func applyPlayerActiveOnOwner(_ on: Bool) {
+        playerActiveDepth = max(0, playerActiveDepth + (on ? 1 : -1))
+        let active = playerActiveDepth > 0
+        if !active, playerActive { flushNativeProgress() }
+        if playerActive != active { playerActive = active }
+        playerActiveSnapshotState.withLock { $0 = active }
+    }
+
+    private func capturePublicationToken() -> PublicationToken {
+        publicationEpochState.withLock { .init(epoch: $0) }
+    }
+    private func publicationEpochMatches(_ token: PublicationToken) -> Bool {
+        publicationEpochState.withLock { $0 == token.epoch }
+    }
+    private func playerActiveSnapshot() -> Bool { playerActiveSnapshotState.withLock { $0 } }
+}
+
+extension CoreBridge {
+    @MainActor private struct NativeMetadataDirectEntry {
+        let host: NativeMetadataHostRequest
+        let owner: NativeMetadataOwner?
+        let publication: PublicationToken
+        let installation: UUID
+        let proposals: NativeMetadataPresentationProposal
+        let cancelOriginalWork: @MainActor () -> Void
+    }
+
+    /// This is an explicit HOST entry only. Capture the original owner/scope before
+    /// detaching old work, and publish the replacement request identity before ANY
+    /// cancellation. A missing facade still leaves the original pending scope in M.
+    @MainActor
+    private func prepareNativeMetadataDirectEntry(action: VortxJSON,
+        originalScope: NativeResourceIntentScope? = nil) -> NativeMetadataDirectEntry? {
+        guard Self.nativeMetadataNavigationIsValid(action) else { return nil }
+        metadataPresentation.retireClearAuthority()
+        let scope = originalScope ?? NativeResourceIntentScope(
+            credential: CredentialScopeRegistry.shared.capture(),
+            profileID: ProfileSelectionRead.snapshot()?.activeID)
+        let owner = captureNativeMetadataOwner()
+        let publication = capturePublicationToken()
+        let installation = nativeMetadataAdmissionFence.captureInstallation()
+        let identity = UUID()
+        ownedMetadataHostIdentity = identity
+        guard let host = prepareOwnedMetadataRequest(action: action, scope: scope,
+            identity: identity) else { return nil }
+        let proposals = captureNativeMetadataPresentationProposal()
+        let cancelOwned = detachOwnedMetadataWork()
+        let oldLegacyMetadata = metaDetailsWork
+        metaDetailsWork = nil
+        return .init(host: host, owner: owner, publication: publication,
+            installation: installation, proposals: proposals,
+            cancelOriginalWork: {
+                cancelOwned()
+                oldLegacyMetadata?.cancel()
+            })
+    }
+
+    /// The small wire action is constructed without decoding resident metadata.
+    /// Invalid/incomplete stream arguments preserve the current null-stream-path policy.
+    private static func nativeDirectMetadataLoadAction(type: String, id: String,
+        streamType: String?, streamID: String?) -> VortxJSON {
+        let stream: VortxJSON
+        if let streamType, let streamID {
+            stream = .object(["resource": .string("stream"), "type": .string(streamType),
+                "id": .string(streamID), "extra": .array([])])
+        } else { stream = .null }
+        return .object(["action": .string("Load"), "args": .object([
+            "model": .string("MetaDetails"), "args": .object([
+                "metaPath": .object(["resource": .string("meta"), "type": .string(type),
+                    "id": .string(id), "extra": .array([])]),
+                "guessStream": .bool(true), "streamPath": stream])])])
+    }
+
+    /// Route bookkeeping must already describe the new intent before this calls old
+    /// cancellation handlers. Reentry may retire this exact host, never upgrade it.
+    @MainActor @discardableResult
+    private func startNativeMetadataDirectEntry(_ entry: NativeMetadataDirectEntry,
+        refresh: Int? = nil, refind: Int, invalidateIndexer: Bool,
+        cancelOriginalWork: Bool = true) -> Bool {
+        if cancelOriginalWork { entry.cancelOriginalWork() }
+        guard ownedMetadataHostRequestIsCurrent(entry.host) else { return false }
+        if invalidateIndexer {
+            invalidateNZBIndexerResults()
+            guard ownedMetadataHostRequestIsCurrent(entry.host) else { return false }
+        }
+        guard let owner = entry.owner else {
+            _ = clearNativeMetadataForPendingEntry(entry)
+            return false
+        }
+        return startOwnedMetadataIntent(entry.host, owner: owner, refresh: refresh, refind: refind)
+    }
+
+    /// An unavailable source cannot publish metadata. Its explicit original HOST
+    /// boundary may still clear stale resident UI while preserving the pending Load.
+    /// W/epoch retirement rejects a new install without acquiring a replacement owner.
+    @MainActor @discardableResult
+    private func clearNativeMetadataForPendingEntry(_ entry: NativeMetadataDirectEntry) -> Bool {
+        let owns: @MainActor @Sendable () -> Bool = {
+            self.ownedMetadataHostRequestIsCurrent(entry.host)
+                && self.publicationEpochMatches(entry.publication)
+                && self.nativeMetadataAdmissionFence.captureInstallation() == entry.installation
+        }
+        guard entry.owner == nil, owns() else { return false }
+        let hadDetails = metaDetails != nil
+        guard commitOwnedMetadataClear(bumpStreams: hadDetails, preservingClear: nil,
+            expectedProposal: entry.proposals.metadata, isCurrent: owns,
+            finalAdmission: .localOriginal) else { return false }
+        return owns()
+    }
+
+    /// Exact guarded direct clear; the final slot veto and all post-publisher tails
+    /// use the SAME retained host and accepted intent. No clear authority is recaptured.
+    @MainActor @discardableResult
+    private func clearNativeMetadataForDirectEntry(_ entry: NativeMetadataDirectEntry) -> Bool {
+        guard let intent = ownedMetadataIntent,
+              intent.identity == entry.host.identity,
+              let selection = ownedMetadataSelection else { return false }
+        let owns: @MainActor @Sendable () -> Bool = {
+            self.ownedMetadataHostRequestIsCurrent(entry.host)
+                && self.nativeMetadataIntentIsCurrent(intent)
+        }
+        guard owns() else { return false }
+        let hadDetails = metaDetails != nil
+        guard commitOwnedMetadataClear(bumpStreams: hadDetails, preservingClear: nil,
+            expectedProposal: entry.proposals.metadata, isCurrent: owns,
+            finalAdmission: .host(facade: intent.owner.facade, selection: selection)) else { return false }
+        return owns()
+    }
+
+    /// Replace actual loadMeta. The primitive dispatches using the original host M/W
+    /// request and owner F selection, then schedules its immutable explicit host seed.
+    @MainActor
+    func loadMeta(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
+        let action = Self.nativeDirectMetadataLoadAction(type: type, id: id,
+            streamType: streamType, streamID: streamId)
+        guard let entry = prepareNativeMetadataDirectEntry(action: action) else { return }
+        // Plain replacement state is established BEFORE cancelling either old task.
+        appleCWMetaRefreshRequest = nil
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        refindRequest = nil
+        guard startNativeMetadataDirectEntry(entry, refind: refindGeneration,
+            invalidateIndexer: true) else { return }
+        let selected = metaDetails?.selected
+        let sameMeta = selected?.metaPath.resource == "meta"
+            && selected?.metaPath.type == type && selected?.metaPath.id == id
+        let sameStream: Bool
+        if let streamType, let streamId {
+            sameStream = selected?.streamPath?.resource == "stream"
+                && selected?.streamPath?.type == streamType && selected?.streamPath?.id == streamId
+        } else { sameStream = selected?.streamPath == nil }
+        // Preserve a ready same-route presentation without a second live Facade read.
+        // The source-owned host seed handles same-load no-op and subsequent resources.
+        if !(sameMeta && sameStream && metaDetails?.meta != nil) {
+            _ = clearNativeMetadataForDirectEntry(entry)
+        }
+    }
+
+    /// Replace actual unloadMeta. Failed native admission cannot clear a successor.
+    @MainActor
+    func unloadMeta() {
+        let action: VortxJSON = .object(["action": .string("Unload")])
+        guard let entry = prepareNativeMetadataDirectEntry(action: action) else { return }
+        appleCWMetaRefreshRequest = nil
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        refindRequest = nil
+        guard startNativeMetadataDirectEntry(entry, refind: refindGeneration,
+            invalidateIndexer: true) else { return }
+        _ = clearNativeMetadataForDirectEntry(entry)
+    }
+
+    /// Replace actual two-phase CW start. The initial phase is merely pending until
+    /// its exact Unload is accepted. Only the parent's original-selection receipt
+    /// continuation may dispatch Load and advance to awaitingLoadSettlement.
+    @MainActor
+    func beginAppleCWAuthoritativeMetaRefresh(type: String, id: String,
+        streamType: String?, streamId: String, navigationOnly: Bool = false) -> Int {
+        let action: VortxJSON = .object(["action": .string("Unload")])
+        guard let entry = prepareNativeMetadataDirectEntry(action: action) else {
+            return appleCWMetaRefreshGeneration
+        }
+        refindRequest = nil
+        refindGeneration &+= 1
+        appleCWMetaRefreshGeneration &+= 1
+        let generation = appleCWMetaRefreshGeneration
+        appleCWMetaRefreshRequest = .init(generation: generation, type: type,
+            libraryID: id, streamType: streamType, streamID: streamId,
+            navigationOnly: navigationOnly, phase: .awaitingInvalidation)
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        guard startNativeMetadataDirectEntry(entry, refresh: generation,
+            refind: refindGeneration, invalidateIndexer: false) else { return generation }
+        _ = clearNativeMetadataForDirectEntry(entry)
+        // The primitive's explicit HOST seed covers an already-null Unload. There
+        // is no legacy metadata scheduler and no recapture from a delayed callback.
+        return generation
+    }
+
+    /// Replace actual refindSources. Optional movie stream paths are preserved.
+    @MainActor
+    func refindSources(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
+        let action: VortxJSON = .object(["action": .string("Unload")])
+        guard let entry = prepareNativeMetadataDirectEntry(action: action) else { return }
+        appleCWMetaRefreshRequest = nil
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        refindGeneration &+= 1
+        let generation = refindGeneration
+        refindRequest = .init(generation: generation, type: type, id: id,
+            streamType: streamType, streamID: streamId, awaitingInvalidation: true)
+        guard startNativeMetadataDirectEntry(entry, refind: generation,
+            invalidateIndexer: true) else { return }
+        _ = clearNativeMetadataForDirectEntry(entry)
+    }
+
+    /// Replace actual no-argument cancellation. No facade or source is captured.
+    @MainActor
+    func cancelAppleCWMetaRefresh() {
+        guard let generation = appleCWMetaRefreshRequest?.generation else {
+            appleCWMetaRefreshReceipt = nil
+            appleCWMetaRefreshDetails = nil
+            return
+        }
+        _ = cancelAppleCWMetaRefresh(generation: generation)
+    }
+
+    /// Replace actual generation-scoped cancellation. A stale player generation is
+    /// a complete no-op. For the matching generation, preserve original ordinary
+    /// resource ownership while removing only refresh-phase authority BEFORE cancel.
+    @MainActor @discardableResult
+    func cancelAppleCWMetaRefresh(generation: Int) -> Bool {
+        guard AppleCWMetaRefreshGenerationFence.owns(capturedGeneration: generation,
+            activeGeneration: appleCWMetaRefreshRequest?.generation) else { return false }
+        metadataPresentation.retireClearAuthority()
+        let originalIntent = ownedMetadataIntent
+        let originalSelection = ownedMetadataSelection
+        var cancelOwned: (@MainActor () -> Void)?
+        if let intent = originalIntent, intent.refresh == generation {
+            cancelOwned = detachOwnedMetadataWork()
+            ownedMetadataIntent = .init(host: intent.host, owner: intent.owner,
+                refresh: nil, refind: intent.refind)
+            ownedMetadataSelection = originalSelection
+        }
+        let oldLegacyMetadata = metaDetailsWork
+        metaDetailsWork = nil
+        appleCWMetaRefreshRequest = nil
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        cancelOwned?()
+        oldLegacyMetadata?.cancel()
+        return true // NO state writes after either cancellation callout
+    }
+
+    /// Replace actual replayNativeResourceRestore. The metadata pending action,
+    /// scope, owner and request are fixed BEFORE replaying search can call out.
+    @MainActor
+    func replayNativeResourceRestore(_ receipt: NativeResourceRestoreReceipt?, target: PlaybackMutationTarget) {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
+              PlaybackMutationOwnershipPolicy.allowsNative(target, binding: binding) else { return }
+        let scope = NativeResourceIntentScope(credential: binding.credential, profileID: binding.profileID)
+        let oldIntent = receipt.flatMap {
+            $0.credential == binding.credential && $0.profileID == binding.profileID ? $0.intent : nil
+        } ?? .init(searchQuery: nil, metadataAction: nil, metadataGeneration: UUID())
+        let searchScope = nativeFacadeLock.withLock { nativeSearchRequestScope }
+        let query = oldIntent.searchToReplay(currentQuery: searchPublication.activeQuery,
+            hasPendingSearch: searchLoaded, pendingScopeIsCurrent: searchScope == scope)
+        let searchToken = query.flatMap { searchPublication.capture(query: $0) }
+        let metadata = metaLoadTargetLock.withLock {
+            (nativeMetaRequestAction, nativeMetaRequestGeneration, nativeMetaRequestScope)
+        }
+        let actionData = oldIntent.metadataToReplay(currentAction: metadata.0,
+            currentGeneration: metadata.1, pendingScopeIsCurrent: metadata.2 == scope)
+        let action = actionData.flatMap { try? JSONDecoder().decode(VortxJSON.self, from: $0) }
+        let entry = action.flatMap { prepareNativeMetadataDirectEntry(action: $0, originalScope: scope) }
+        let refindAtReplay = refindGeneration
+        // Detach installed the replacement before this original cancellation. Even
+        // if search reenters and retires it next, original tasks are already cancelled.
+        if let entry {
+            appleCWMetaRefreshRequest = nil
+            appleCWMetaRefreshReceipt = nil
+            appleCWMetaRefreshDetails = nil
+            refindRequest = nil
+            entry.cancelOriginalWork()
+        }
+        if let query, let searchToken, searchPublication.accepts(searchToken),
+           nativePlaybackTargetIsCurrent(target) { search(query) }
+        guard let entry, nativePlaybackTargetIsCurrent(target),
+              ownedMetadataHostRequestIsCurrent(entry.host) else { return }
+        // Replay is a new explicit host action under the restored owner's original
+        // scope. It cannot inherit an old CW completion claim from a retired owner.
+        _ = startNativeMetadataDirectEntry(entry, refind: refindAtReplay,
+            invalidateIndexer: false, cancelOriginalWork: false)
+    }
+}
+
+extension CoreBridge {
+    private struct NativeMetadataOwner: Sendable {
+        let accepted: NativeAcceptedNavigationTarget
+        let callbackInstallation: UUID
+        let installation: UUID
+        let publication: PublicationToken
+        var facade: VortxNativeCoreFacade { accepted.navigation.owner.facade }
+        var credential: CredentialScopeRegistry.Capture { accepted.navigation.owner.owner.credential }
+        var navigation: VortxNativeCoreFacade.AcceptedNavigationReceipt { accepted.receipt }
+    }
+    private struct NativeMetadataHostRequest: Sendable {
+        let identity: UUID
+        let action: VortxJSON
+        let request: UUID
+        let scope: NativeResourceIntentScope
+    }
+    private struct NativeMetadataIntent: Sendable {
+        let host: NativeMetadataHostRequest
+        let owner: NativeMetadataOwner
+        let refresh: Int?
+        let refind: Int
+        var identity: UUID { host.identity }
+    }
+    private struct NativeMetadataOperation: Sendable {
+        enum Kind: Sendable { case resource, hostSeed, libraryOverlay }
+        let kind: Kind
+        let intent: NativeMetadataIntent
+        let selection: VortxNativeCoreFacade.MetadataSelectionReceipt
+        let source: VortxNativeCoreFacade.ChangeReceipt
+        let decode: UUID
+    }
+    private struct NativeMetadataSample: Sendable {
+        let details: CoreMetaDetails?
+        let status: StreamAddonStatusProjection?
+    }
+    @MainActor private final class NativeMetadataDecodeReceiver {
+        private weak var core: CoreBridge?
+        init(core: CoreBridge) { self.core = core }
+        func publish(_ sample: NativeMetadataSample, operation: NativeMetadataOperation) {
+            core?.publishOwnedMetadata(sample, operation: operation)
+        }
+    }
+
+    @MainActor private func captureNativeMetadataOwner() -> NativeMetadataOwner? {
+        let publication = capturePublicationToken()
+        let installation = nativeMetadataAdmissionFence.captureInstallation()
+        guard let accepted = captureNativeAcceptedNavigationTarget() else { return nil }
+        let callback = nativeFacadeLock.withLock { nativeCallbackGeneration }
+        let owner = NativeMetadataOwner(accepted: accepted, callbackInstallation: callback,
+            installation: installation, publication: publication)
+        return nativeMetadataOwnerIsCurrent(owner) ? owner : nil
+    }
+    @MainActor private func nativeMetadataOwnerIsCurrent(_ owner: NativeMetadataOwner) -> Bool {
+        guard publicationStillCurrent(owner.publication),
+              CredentialScopeRegistry.shared.isCurrent(owner.credential),
+              nativeMetadataAdmissionFence.captureInstallation() == owner.installation,
+              nativeAcceptedNavigationTargetIsCurrent(owner.accepted),
+              nativeCallbackLifetime.accepts(owner.callbackInstallation,
+                  credential: owner.credential, sourceID: owner.facade.sourceID) else { return false }
+        return nativeFacadeLock.withLock {
+            nativeFacadeStorage === owner.facade && nativeCallbackGeneration == owner.callbackInstallation
+                && nativeCredentialCapture == owner.credential
+        } && owner.facade.acceptedNavigationIsCurrent(owner.navigation)
+    }
+
+    /// Pure request installation under M -> W. Preserves original request-between-
+    /// close/install scope, including Unload's old scope, without fabricating an
+    /// admitted intent. The request is recorded BEFORE cancellation or hooks.
+    @MainActor private func prepareOwnedMetadataRequest(action: VortxJSON,
+        scope: NativeResourceIntentScope, identity: UUID) -> NativeMetadataHostRequest? {
+        let load = action["action"] == .string("Load")
+        guard Self.nativeMetadataNavigationIsValid(action),
+              let data = try? JSONEncoder().encode(action) else {
+            NSLog("[CoreBridge] native action rejected: %@", "invalid_meta_path")
+            return nil
+        }
+        guard ownedMetadataHostIdentity == identity,
+              CredentialScopeRegistry.shared.isCurrent(scope.credential),
+              ProfileSelectionRead.snapshot()?.activeID == scope.profileID else { return nil }
+        let request = UUID()
+        metaLoadTargetLock.withLock {
+            if load, case .string(let id) = action["args"]?["args"]?["metaPath"]?["id"] {
+                let streamID: String?
+                if case .string(let value) = action["args"]?["args"]?["streamPath"]?["id"] { streamID = value }
+                else { streamID = nil }
+                requestedMetaLoadTarget = .init(metaID: id, streamID: streamID)
+                nativeMetaRequestAction = data
+                nativeMetaRequestScope = scope
+            } else {
+                requestedMetaLoadTarget = nil; nativeMetaRequestAction = nil
+                // DO NOT clear/recapture scope for Unload: preserve restoration policy.
+            }
+            nativeMetaRequestGeneration = request
+            nativeMetadataAdmissionFence.replaceRequest(request)
+        }
+        VXProbe.log("engine", "dispatch \(load ? "Load MetaDetails" : "Unload") -> meta_details")
+        return .init(identity: identity, action: action, request: request, scope: scope)
+    }
+    @MainActor private func ownedMetadataHostRequestIsCurrent(_ host: NativeMetadataHostRequest) -> Bool {
+        ownedMetadataHostIdentity == host.identity
+            && CredentialScopeRegistry.shared.isCurrent(host.scope.credential)
+            && ProfileSelectionRead.snapshot()?.activeID == host.scope.profileID
+            && metaLoadTargetLock.withLock { nativeMetaRequestGeneration == host.request }
+    }
+    @MainActor private func nativeMetadataIntentIsCurrent(_ intent: NativeMetadataIntent) -> Bool {
+        ownedMetadataIntent?.identity == intent.identity
+            && ownedMetadataIntent?.host.request == intent.host.request
+            && ownedMetadataIntent?.refresh == intent.refresh
+            && ownedMetadataIntent?.refind == intent.refind
+            && ownedMetadataHostRequestIsCurrent(intent.host)
+            && nativeMetadataOwnerIsCurrent(intent.owner)
+            && appleCWMetaRefreshRequest?.generation == intent.refresh
+            && refindGeneration == intent.refind
+    }
+    /// Stable selected-resource lifetime for independent NZB work. Completing or
+    /// cancelling a CW phase may change refresh bookkeeping without replacing
+    /// its original host/M request, owner or producing selection/task.
+    @MainActor private func nativeMetadataSelectionLifecycleIsCurrent(_ intent: NativeMetadataIntent,
+        selection: VortxNativeCoreFacade.MetadataSelectionReceipt) -> Bool {
+        ownedMetadataIntent?.identity == intent.identity
+            && ownedMetadataIntent?.host.request == intent.host.request
+            && ownedMetadataHostRequestIsCurrent(intent.host)
+            && nativeMetadataOwnerIsCurrent(intent.owner)
+            && ownedMetadataSelection == selection
+            && intent.owner.facade.metadataSelectionIsCurrent(selection)
+    }
+    @MainActor private func nativeMetadataOperationIsCurrent(_ operation: NativeMetadataOperation) -> Bool {
+        let activeDecode = operation.kind == .libraryOverlay ? ownedMetadataOverlayDecode : ownedMetadataDecode
+        guard nativeMetadataIntentIsCurrent(operation.intent), activeDecode == operation.decode,
+              ownedMetadataSelection == operation.selection,
+              operation.intent.owner.facade.metadataSelectionIsCurrent(operation.selection) else { return false }
+        let facade = operation.intent.owner.facade
+        if operation.kind == .libraryOverlay {
+            // A retained library snapshot may overlay membership/watch only. It
+            // carries BOTH original field sequence and actual current producer.
+            return operation.source.fields.contains("library")
+                && facade.acceptsChange(operation.source, field: "library")
+                && facade.acceptsChange(operation.source, field: "meta_details", settlingResource: false)
+                && facade.metadataSelection(for: operation.source, expected: operation.intent.owner.navigation,
+                    settlingResource: false) == operation.selection
+        }
+        return operation.source.fields.contains("meta_details")
+            && facade.acceptsChange(operation.source, field: "meta_details", settlingResource: true)
+            && facade.metadataSelection(for: operation.source, expected: operation.intent.owner.navigation)
+                == operation.selection
+    }
+
+    /// Detach originals before either cancellation can synchronously reenter.
+    /// Caller installs its new host/M request first; this helper changes no host ID.
+    @MainActor private func detachOwnedMetadataWork() -> @MainActor () -> Void {
+        let primary = ownedMetadataTask, overlay = ownedMetadataOverlayTask
+        ownedMetadataTask = nil; ownedMetadataOverlayTask = nil
+        ownedMetadataDecode = UUID(); ownedMetadataOverlayDecode = UUID()
+        ownedMetadataIntent = nil; ownedMetadataSelection = nil
+        return { primary?.cancel(); overlay?.cancel() }
+    }
+
+    @MainActor @discardableResult
+    private func startOwnedMetadataIntent(_ host: NativeMetadataHostRequest, owner: NativeMetadataOwner,
+        refresh: Int? = nil, refind: Int) -> Bool {
+        guard ownedMetadataHostRequestIsCurrent(host), nativeMetadataOwnerIsCurrent(owner),
+              host.scope.credential == owner.credential,
+              host.scope.profileID?.uuidString == owner.navigation.owner.profileID else { return false }
+        let intent = NativeMetadataIntent(host: host, owner: owner, refresh: refresh, refind: refind)
+        ownedMetadataIntent = intent
+        return dispatchOwnedMetadataIntent(intent)
+    }
+    @MainActor private func dispatchOwnedMetadataIntent(_ intent: NativeMetadataIntent) -> Bool {
+        guard nativeMetadataIntentIsCurrent(intent) else { return false }
+        let original = VortxNativeMetadataAdmissionFence.Stamp(
+            installation: intent.owner.installation, request: intent.host.request)
+        // NO B or M held across F dispatch/drain; F -> W insertion remains actual
+        // committed admission. Synchronous notification may retire this intent.
+        guard let selection = intent.owner.facade.dispatchMetadata(intent.host.action,
+            expected: intent.owner.navigation, admissionFence: nativeMetadataAdmissionFence, original: original) else {
+            NSLog("[CoreBridge] native action rejected: %@", intent.owner.facade.lastFailure ?? "unbound")
+            return false
+        }
+        guard nativeMetadataIntentIsCurrent(intent),
+              intent.owner.facade.metadataSelectionIsCurrent(selection) else { return false }
+        ownedMetadataSelection = selection
+        // HOST no-op seed has explicit original host authority. It never upgrades
+        // a callback into a newer task, and must join its retained producing ticket.
+        if let seed = intent.owner.facade.captureHostChange(fields: ["meta_details"]),
+           intent.owner.facade.metadataSelection(for: seed, expected: intent.owner.navigation) == selection,
+           let value = seed.values["meta_details"] {
+            scheduleOwnedMetadata(value, intent: intent, selection: selection, source: seed,
+                kind: .hostSeed, debounce: false)
+        }
+        return nativeMetadataIntentIsCurrent(intent) && ownedMetadataSelection == selection
+            && intent.owner.facade.metadataSelectionIsCurrent(selection)
+    }
+    @MainActor private func continueOwnedMetadataIntent(_ intent: NativeMetadataIntent,
+        action: VortxJSON) -> NativeMetadataIntent? {
+        guard nativeMetadataIntentIsCurrent(intent),
+              let host = prepareOwnedMetadataRequest(action: action, scope: intent.host.scope,
+                  identity: intent.identity) else { return nil }
+        // A NEW phase has a new immutable M request, retaining exactly the old
+        // navigation/source/credential. No captureNativeMetadataOwner after hop.
+        let successor = NativeMetadataIntent(host: host, owner: intent.owner,
+            refresh: intent.refresh, refind: intent.refind)
+        ownedMetadataIntent = successor
+        ownedMetadataSelection = nil
+        ownedMetadataDecode = UUID(); ownedMetadataOverlayDecode = UUID()
+        let primary = ownedMetadataTask, overlay = ownedMetadataOverlayTask
+        ownedMetadataTask = nil; ownedMetadataOverlayTask = nil
+        primary?.cancel(); overlay?.cancel()
+        guard nativeMetadataIntentIsCurrent(successor), dispatchOwnedMetadataIntent(successor) else { return nil }
+        return nativeMetadataIntentIsCurrent(successor) ? successor : nil
+    }
+
+    @MainActor private func receiveOwnedMetadata(_ event: VortxNativeCoreFacade.SourceEvent,
+        origin: NativeCallbackOrigin) {
+        guard nativeCallbackOriginIsCurrent(origin), event.producer === origin.producer,
+              case .changed(_, let change?) = event.kind,
+              let intent = ownedMetadataIntent, nativeMetadataIntentIsCurrent(intent),
+              intent.owner.facade === event.producer,
+              intent.owner.callbackInstallation == origin.installation,
+              intent.owner.credential == origin.credential,
+              change.sourceID == event.sourceID else { return }
+        let resource = change.fields.contains("meta_details")
+        guard resource || (change.fields.contains("library") && !origin.playerWasActive),
+              let selection = event.producer.metadataSelection(for: change,
+                  expected: intent.owner.navigation, settlingResource: resource),
+              selection == ownedMetadataSelection,
+              let value = change.values["meta_details"] else { return }
+        // The ACTUAL producing ticket came from the callback transaction. Do not
+        // use captureMetadataSelection/stateData/metadataSnapshot to mend rejection.
+        scheduleOwnedMetadata(value, intent: intent, selection: selection, source: change,
+            kind: resource ? .resource : .libraryOverlay, debounce: resource)
+    }
+    @MainActor private func scheduleOwnedMetadata(_ value: VortxJSON,
+        intent: NativeMetadataIntent, selection: VortxNativeCoreFacade.MetadataSelectionReceipt,
+        source: VortxNativeCoreFacade.ChangeReceipt, kind: NativeMetadataOperation.Kind, debounce: Bool) {
+        guard nativeMetadataIntentIsCurrent(intent), ownedMetadataSelection == selection else { return }
+        let decode = UUID(), previous: Task<Void, Never>?
+        if kind == .libraryOverlay {
+            previous = ownedMetadataOverlayTask; ownedMetadataOverlayTask = nil; ownedMetadataOverlayDecode = decode
+        } else {
+            previous = ownedMetadataTask; ownedMetadataTask = nil; ownedMetadataDecode = decode
+        }
+        let operation = NativeMetadataOperation(kind: kind, intent: intent, selection: selection,
+            source: source, decode: decode)
+        let receiver = metadataDecodeReceiver, delay = debounce ? Self.metaDetailsDebounce : 0
+        previous?.cancel()
+        guard nativeMetadataOperationIsCurrent(operation) else { return }
+        let task = Task.detached(priority: .userInitiated) {
+            do {
+                if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
+                try Task.checkCancellation()
+                let data = try JSONEncoder().encode(value)
+                let details = try JSONDecoder().decode(CoreMetaDetails?.self, from: data)
+                let status = try Self.streamAddonStatusProjection(data: data, details: details)
+                try Task.checkCancellation()
+                await receiver.publish(.init(details: details, status: status), operation: operation)
+            } catch is CancellationError { return }
+            catch { VXProbe.log("engine", "owned metadata decode failed; retaining last valid snapshot") }
+        }
+        // Task creation cannot synchronously execute MainActor receiver on this
+        // stack. Still do not leave an old handle if an invariant ever changes.
+        if kind == .libraryOverlay { ownedMetadataOverlayTask = task }
+        else { ownedMetadataTask = task }
+    }
+    @MainActor private func publishOwnedMetadata(_ sample: NativeMetadataSample,
+        operation: NativeMetadataOperation) {
+        let owns: @MainActor @Sendable () -> Bool = { self.nativeMetadataOperationIsCurrent(operation) }
+        guard owns() else { return }
+        let proposal = captureNativeMetadataPresentationProposal()
+        let sourceAdmission = NativeMetadataFrameAdmission.source(facade: operation.intent.owner.facade,
+            change: operation.source, selection: operation.selection,
+            libraryOverlay: operation.kind == .libraryOverlay)
+        if operation.kind == .libraryOverlay {
+            guard let merged = Self.libraryMetaDetailsUpdate(current: metaDetails, next: sample.details) else { return }
+            _ = commitOwnedMetadataOverlay(merged, expectedProposal: proposal.metadata,
+                isCurrent: owns, finalAdmission: sourceAdmission)
+            return // no sources/status/epoch/phase settlement from a library marker
+        }
+        let details = sample.details
+        // One immutable frame commits metadata, ready-set epoch and normalized
+        // same-buffer status BEFORE any fanout, under original source F admission.
+        // This cannot lose an epoch if native B retires A during its later fanout.
+        guard commitOwnedMetadataFrame(details: details, status: sample.status,
+            expectedProposal: proposal.metadata, isCurrent: owns,
+            finalAdmission: sourceAdmission), owns() else { return }
+        // Ordinary same-route Load deliberately invalidates indexers but may keep
+        // a decoded-equivalent ready presentation. Its seed must relaunch the
+        // independent lifecycle even when no metadata setter is needed.
+        if let details {
+            startNZBIndexerSearchIfNeeded(details: details, isCurrent: owns, lifecycleIsCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.nativeMetadataSelectionLifecycleIsCurrent(operation.intent, selection: operation.selection)
+            }, finalAdmission: .host(facade: operation.intent.owner.facade, selection: operation.selection))
+        }
+        guard owns() else { return }
+        replayPendingEpisodeWatched(isCurrent: owns)
+        guard owns() else { return }
+        advanceOwnedMetadataPhase(details, operation: operation)
+    }
+
+    @MainActor private func advanceOwnedMetadataPhase(_ details: CoreMetaDetails?,
+        operation: NativeMetadataOperation) {
+        guard operation.kind != .libraryOverlay, nativeMetadataOperationIsCurrent(operation) else { return }
+        let invalidated = AppleCWMetaInvalidationPolicy.isUnloaded(hasSelection: details?.selected != nil,
+            hasMetaProviders: !(details?.metaItems.isEmpty ?? true),
+            hasStreamRequests: !(details?.allStreamGroups.isEmpty ?? true))
+        if let request = refindRequest, request.awaitingInvalidation, invalidated {
+            guard let action = ownedMetadataLoadAction(type: request.type, id: request.id,
+                    streamType: request.streamType, streamId: request.streamID),
+                  let next = continueOwnedMetadataIntent(operation.intent, action: action),
+                  nativeMetadataIntentIsCurrent(next), refindRequest?.generation == request.generation else { return }
+            refindRequest = nil
+            return
+        }
+        guard let request = appleCWMetaRefreshRequest,
+              operation.intent.refresh == request.generation else { return }
+        let settled = request.navigationOnly
+            ? details?.appleCWNavigationMeta(for: request.libraryID, streamID: request.streamID) != nil
+            : Self.appleCWMetaRefreshIsSettled(details, libraryID: request.libraryID, streamID: request.streamID)
+        switch request.phase {
+        case .awaitingInvalidation:
+            guard invalidated, let action = ownedMetadataLoadAction(type: request.type, id: request.libraryID,
+                streamType: request.streamType, streamId: request.streamID),
+                  let next = continueOwnedMetadataIntent(operation.intent, action: action),
+                  nativeMetadataIntentIsCurrent(next), appleCWMetaRefreshRequest?.generation == request.generation else { return }
+            appleCWMetaRefreshRequest?.phase = .awaitingLoadSettlement
+        case .awaitingLoadSettlement:
+            guard settled, nativeMetadataOperationIsCurrent(operation) else { return }
+            appleCWMetaRefreshReceipt = .init(requestGeneration: request.generation,
+                selectedMetaID: details?.selectedMetaID, loadedMetaID: details?.meta?.id,
+                settled: true, requestedStreamID: request.streamID)
+            appleCWMetaRefreshDetails = details
+            appleCWMetaRefreshRequest = nil
+            // The original host remains, but the completed phase no longer owns
+            // subsequent ordinary arrivals. Old tagged operations become stale.
+            ownedMetadataIntent = .init(host: operation.intent.host, owner: operation.intent.owner,
+                refresh: nil, refind: operation.intent.refind)
+        }
+    }
+
+    @MainActor private func ownedMetadataLoadAction(type: String, id: String,
+        streamType: String?, streamId: String?) -> VortxJSON? {
+        guard let data = try? JSONSerialization.data(withJSONObject:
+            metaLoadAction(type: type, id: id, streamType: streamType, streamId: streamId)) else { return nil }
+        return try? JSONDecoder().decode(VortxJSON.self, from: data)
+    }
+
+    /// Malformed navigation is rejected BEFORE changing clear/host/M/worker
+    /// identity. This preserves committed00d's no-side-effect rejection contract.
+    private static func nativeMetadataNavigationIsValid(_ action: VortxJSON) -> Bool {
+        if action["action"] == .string("Unload") { return true }
+        guard action["action"] == .string("Load"),
+              action["args"]?["model"] == .string("MetaDetails"),
+              case .string = action["args"]?["args"]?["metaPath"]?["id"] else { return false }
+        return true
+    }
+}
+
+extension CoreBridge {
+    @MainActor private func dispatchOwnedMetadataHostAction(_ action: [String: Any],
+        beforeDispatch: (() -> Void)?) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: action),
+              let value = try? JSONDecoder().decode(VortxJSON.self, from: data) else { return false }
+        guard Self.nativeMetadataNavigationIsValid(value) else {
+            VXProbe.log("engine", "dispatch \(Self.actionName(action)) -> meta_details")
+            NSLog("[CoreBridge] native action rejected: %@", "invalid_meta_path")
+            return false
+        }
+        let scope = NativeResourceIntentScope(credential: CredentialScopeRegistry.shared.capture(),
+            profileID: ProfileSelectionRead.snapshot()?.activeID)
+        let owner = captureNativeMetadataOwner(), identity = UUID()
+        metadataPresentation.retireClearAuthority()
+        ownedMetadataHostIdentity = identity
+        guard let host = prepareOwnedMetadataRequest(action: value, scope: scope, identity: identity) else { return false }
+        let cancel = detachOwnedMetadataWork()
+        let oldLegacy = metaDetailsWork; metaDetailsWork = nil
+        // Generic explicit host dispatch replaces the old CW/refind metadata
+        // owner too; only continueOwnedMetadataIntent may preserve its phase.
+        appleCWMetaRefreshRequest = nil; appleCWMetaRefreshReceipt = nil; appleCWMetaRefreshDetails = nil
+        refindRequest = nil; refindGeneration &+= 1
+        cancel(); oldLegacy?.cancel()
+        // The old cancellation handler can install a successor before the
+        // optional caller hook. It must not receive an already-retired turn.
+        guard ownedMetadataHostRequestIsCurrent(host) else { return false }
+        beforeDispatch?()
+        guard ownedMetadataHostRequestIsCurrent(host), let owner else { return false }
+        return startOwnedMetadataIntent(host, owner: owner, refind: refindGeneration)
+    }
+}
+
+extension CoreBridge {
+    /// Called ONLY by03 while its original clearIdentity is owned. Pure plain
+    /// retirement precedes all callouts. Returned closure holds captured old
+    /// handles, not a lookup of whatever work a callback installs afterwards.
+    @MainActor private func detachNativeMetadataClearEffects(preservingClear clear: UUID)
+        -> @MainActor () -> Void {
+        precondition(metadataPresentation.ownsClear(clear))
+        ownedMetadataHostIdentity = UUID()
+        let cancelOwned = detachOwnedMetadataWork()
+        appleCWMetaRefreshGeneration &+= 1
+        appleCWMetaRefreshRequest = nil; appleCWMetaRefreshReceipt = nil; appleCWMetaRefreshDetails = nil
+        refindGeneration &+= 1; refindRequest = nil
+        pendingEpisodeWatched.removeAll()
+        let cancelIndexer = detachNZBIndexerResults()
+        return { cancelOwned(); cancelIndexer() }
+    }
+    @MainActor private func detachNZBIndexerResults() -> @MainActor () -> Void {
+        let old = Array(nzbIndexerTasks.values)
+        nzbIndexerGeneration &+= 1
+        nzbIndexerTasks.removeAll(); nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll()
+        activeNZBIndexerKey = nil; activeNZBIndexerCount = 0
+        return { for task in old { task.cancel() } }
+    }
+    @MainActor private func invalidateNZBIndexerResults() { detachNZBIndexerResults()() }
+
+    @MainActor private func startNZBIndexerSearchIfNeeded(details: CoreMetaDetails,
+        isCurrent: @escaping @MainActor @Sendable () -> Bool,
+        lifecycleIsCurrent: @escaping @MainActor @Sendable () -> Bool,
+        finalAdmission: NativeMetadataFrameAdmission) {
+        guard isCurrent(), lifecycleIsCurrent() else { return }
+        let scope = NZBIndexerStore.captureScope()
+        let document = NZBIndexerStore.load(scope: scope)
+        guard !document.enabled.isEmpty, let meta = details.meta else { return }
+        let streamID = details.selected?.streamPath?.id
+        let key = NZBIndexerResultKey(owner: scope.identity, profileID: scope.profileID,
+            revision: document.revision, titleID: meta.id, streamID: streamID)
+        guard !nzbIndexerTerminal.contains(key), nzbIndexerResults[key] == nil,
+              nzbIndexerTasks[key] == nil else { return }
+        let beforeCancellation = nzbIndexerGeneration
+        let stale = nzbIndexerTasks.filter { $0.key != key }
+        for oldKey in stale.keys { nzbIndexerTasks.removeValue(forKey: oldKey) }
+        for task in stale.values { task.cancel() }
+        guard isCurrent(), lifecycleIsCurrent(), nzbIndexerGeneration == beforeCancellation else { return }
+        let video = streamID.flatMap { id in meta.videos?.first { $0.id == id } }
+        let query = NZBIndexerClient.Search(title: meta.name,
+            imdbID: meta.id.hasPrefix("tt") ? meta.id : nil, season: video?.season,
+            episode: video?.episode, isSeries: meta.type == "series")
+        // Do not terminalize an episode whose inventory has not arrived yet.
+        if query.isSeries, query.season == nil || query.episode == nil { return }
+        let configs = document.enabled.compactMap { config -> (NZBIndexerConfig, String)? in
+            NZBIndexerStore.apiKey(for: config.id, scope: scope).map { (config, $0) }
+        }
+        guard !configs.isEmpty, isCurrent(), lifecycleIsCurrent(),
+              nzbIndexerGeneration == beforeCancellation else { return }
+        nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll()
+        activeNZBIndexerKey = key; activeNZBIndexerCount = configs.count
+        nzbIndexerGeneration &+= 1
+        let generation = nzbIndexerGeneration
+        let ownsIndexer: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return lifecycleIsCurrent() && self.nzbIndexerGeneration == generation
+        }
+        let proposal = captureNativeMetadataPresentationProposal()
+        _ = advanceNativeStreamsEpoch(expectedProposal: proposal.streams,
+            isCurrent: { isCurrent() && ownsIndexer() }, finalAdmission: finalAdmission)
+        guard ownsIndexer() else {
+            // A nested successor has a different generation. Never clear it.
+            if nzbIndexerGeneration == generation, activeNZBIndexerKey == key {
+                activeNZBIndexerKey = nil; activeNZBIndexerCount = 0
+            }
+            return
+        }
+        nzbIndexerTasks[key] = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.nzbIndexerGeneration == generation { self.nzbIndexerTasks[key] = nil }
+            }
+            var output: [(Int, CoreStreamSourceGroup)] = []
+            await withTaskGroup(of: (Int, CoreStreamSourceGroup)?.self) { group in
+                for (index, pair) in configs.enumerated() {
+                    let (config, apiKey) = pair
+                    group.addTask {
+                        guard !Task.isCancelled,
+                              let releases = try? await NZBIndexerClient.search(config: config,
+                                  apiKey: apiKey, search: query) else { return nil }
+                        let streams = releases.compactMap { Self.nzbIndexerStream($0, indexerName: config.name) }
+                        return streams.isEmpty ? nil : (index, CoreStreamSourceGroup(
+                            id: "nzbindexer:" + config.id, addon: config.name, streams: streams))
+                    }
+                }
+                for await result in group { if let result { output.append(result) } }
+            }
+            guard !Task.isCancelled, let self, ownsIndexer(), NZBIndexerStore.isCurrent(scope),
+                  NZBIndexerStore.load(scope: scope).revision == key.revision,
+                  scope.profileID == key.profileID,
+                  self.metaDetails?.meta?.id == key.titleID,
+                  self.metaDetails?.selected?.streamPath?.id == key.streamID else { return }
+            // lifecycleIsCurrent retains the ORIGINAL selected resource/task,
+            // not only these user-facing ID checks. Later same-selection batches
+            // need not discard this already-authorized independent indexer job.
+            self.nzbIndexerResults[key] = output.sorted { $0.0 < $1.0 }.map(\.1)
+            self.nzbIndexerTerminal.insert(key)
+            let finalProposal = self.captureNativeMetadataPresentationProposal()
+            _ = self.advanceNativeStreamsEpoch(expectedProposal: finalProposal.streams,
+                isCurrent: ownsIndexer, finalAdmission: finalAdmission)
+        }
+    }
+
+    @MainActor func addonOrderDidChange() {
+        let host = ownedMetadataHostIdentity, publication = capturePublicationToken()
+        let installation = nativeMetadataAdmissionFence.captureInstallation()
+        let proposal = captureNativeMetadataPresentationProposal()
+        _ = advanceNativeStreamsEpoch(expectedProposal: proposal.streams, isCurrent: {
+            self.ownedMetadataHostIdentity == host && self.publicationEpochMatches(publication)
+                && self.nativeMetadataAdmissionFence.captureInstallation() == installation
+        }, finalAdmission: .localOriginal)
+    }
+    @MainActor func nzbIndexerConfigurationDidChange() {
+        let originalIntent = ownedMetadataIntent, selection = ownedMetadataSelection
+        let host = ownedMetadataHostIdentity, publication = capturePublicationToken()
+        let installation = nativeMetadataAdmissionFence.captureInstallation()
+        let proposal = captureNativeMetadataPresentationProposal()
+        let ownsHost: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.ownedMetadataHostIdentity == host && self.publicationEpochMatches(publication)
+                && self.nativeMetadataAdmissionFence.captureInstallation() == installation
+        }
+        let cancel = detachNZBIndexerResults()
+        cancel()
+        guard ownsHost() else { return }
+        _ = advanceNativeStreamsEpoch(expectedProposal: proposal.streams,
+            isCurrent: ownsHost, finalAdmission: .localOriginal)
+        guard ownsHost(), let intent = originalIntent, let selection,
+              nativeMetadataSelectionLifecycleIsCurrent(intent, selection: selection),
+              let details = metaDetails else { return }
+        let owns: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return ownsHost() && self.nativeMetadataSelectionLifecycleIsCurrent(intent, selection: selection)
+        }
+        startNZBIndexerSearchIfNeeded(details: details, isCurrent: owns, lifecycleIsCurrent: owns,
+            finalAdmission: .host(facade: intent.owner.facade, selection: selection))
+    }
+
+    @MainActor private func replayPendingEpisodeWatched(isCurrent: @MainActor () -> Bool) {
+        let now = Date()
+        for key in Array(pendingEpisodeWatched.keys) {
+            guard isCurrent() else { return }
+            guard let pending = pendingEpisodeWatched[key] else { continue }
+            switch LibraryWatchedMutationPolicy.deferredDecision(
+                expiresAt: pending.expiresAt, now: now,
+                ownsContext: pending.target.stillOwnsCurrentContext(core: self),
+                logoutPending: logoutAccountMutationPending,
+                metadataMatches: episodeWatchedMetadataMatches(pending.meta)) {
+            case .discard:
+                guard isCurrent() else { return }
+                if pendingEpisodeWatched[key]?.identity == pending.identity {
+                    pendingEpisodeWatched.removeValue(forKey: key)
+                }
+                continue
+            case .wait: continue
+            case .dispatch: break
+            }
+            guard isCurrent(), pendingEpisodeWatched[key]?.identity == pending.identity else { return }
+            var payload: [String: Any] = ["id": pending.meta.videoId]
+            if let season = pending.meta.season { payload["season"] = season }
+            if let episode = pending.meta.episode { payload["episode"] = episode }
+            let admitted = dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]])
+            // Dispatch may synchronously call user observers. Preserve a new
+            // same-key gesture instead of deleting it using only a string key.
+            guard isCurrent() else { return }
+            if admitted, pendingEpisodeWatched[key]?.identity == pending.identity {
+                pendingEpisodeWatched.removeValue(forKey: key)
+                VXProbe.log("playback", "deferred episode watched mark dispatched to exact metadata")
+            }
+        }
+    }
+
+    /// Actual field-nil Unload is rejected by the native ctx adapter, but its
+    /// existing Bridge contract retires pending metadata before authentication
+    /// callers proceed. Carry that ORIGINAL retirement through the hook; never
+    /// clear a newer request installed by the hook after it returns.
+    @MainActor private func prepareNativeGlobalMetadataRetirement() -> NativeMetadataDirectEntry? {
+        guard let entry = prepareNativeMetadataDirectEntry(
+            action: .object(["action": .string("Unload")])) else { return nil }
+        appleCWMetaRefreshRequest = nil; appleCWMetaRefreshReceipt = nil; appleCWMetaRefreshDetails = nil
+        refindRequest = nil; refindGeneration &+= 1
+        return entry
     }
 }

@@ -8,6 +8,7 @@ require 'pathname'
 require 'fileutils'
 require 'json'
 require 'open3'
+require_relative 'native-apple-swift6-policy'
 
 options = {}
 OptionParser.new do |parser|
@@ -30,6 +31,7 @@ mpvkit = File.realpath(options[:mpvkit])
 abort 'MPVKit Package.swift is missing' unless File.file?(File.join(mpvkit, 'Package.swift'))
 
 spec = YAML.safe_load(File.read(File.join(app, 'project.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+NativeAppleSwift6Policy.validate!(spec)
 native_targets = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
 retained_targets = native_targets + ['VortXTopShelf']
 abort 'native release target roster changed; review the generator' unless (retained_targets - spec.fetch('targets').keys).empty?

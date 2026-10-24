@@ -1,26 +1,20 @@
 package com.vortx.android.player.subtitles
 
-import android.content.Context
-import com.vortx.android.player.SubtitleOffsetMemory
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
 /**
- * Automatic subtitle sync alignment layered on top of the existing manual [SubtitleOffsetMemory]. The Kotlin
- * port of the auto-resync half of Apple's player integration (`restoreSubtitleTimingOffsetIfReady` + the pool
- * seed in `fetchPooledSubtitles` + `captureSubOffset` in PlayerScreen.swift / TVPlayerView.swift).
+ * Pure resolution/capture policy for a community-learned constant offset of the playing rip. The shared
+ * Android PlayerScreen owns fetching the pool result, current source/account/profile admission, and the
+ * one-shot SubtitleTimingSession which applies it to libmpv's live sub-delay. Media3 does not advertise
+ * that capability and therefore never claims to apply an offset. This is not speech, cue or FPS/drift alignment.
  *
- * Apple has no separate local audio-alignment pass: the "auto-resync" IS the community-learned per-rip offset
- * from the subtitle pool ([SubtitlePoolClient.fetchPooled]'s `offsetMs`), applied AUTOMATICALLY when the viewer
- * has not already dialled in their own manual offset, and the viewer's own manual nudges are contributed back
- * ([SubtitlePoolClient.postOffset]) so the pool learns. This module is the pure, deterministic resolution +
- * capture policy behind that behaviour; the engine still owns applying the resolved delay (libmpv `sub-delay`;
- * ExoPlayer has no live sub-delay knob and documents its apply as a no-op).
+ * A valid saved manual decision wins over the community offset, and a manual adjustment (including zero
+ * reset) holds the current source session against a late pool response. The existing device-local memory
+ * deliberately removes a zero reset rather than persisting a new account/profile preference format.
  *
- * PRECEDENCE (mirrors Apple exactly): the viewer's own manual offset always wins. It is restored FIRST and
- * marks the session seeded, which blocks the community offset from overriding it. The community offset is only
- * applied when there is no manual offset AND nothing has seeded the session yet. Once seeded, neither re-applies
- * (idempotent) so a late pool response never yanks subtitles the viewer already positioned.
+ * The capture helpers validate values only. The current Android host does not post manual adjustments
+ * back to the pool; contributing them requires a separately wired consent/eligibility path.
  */
 object SubtitleAutoResync {
 
@@ -31,7 +25,7 @@ object SubtitleAutoResync {
      * The outcome of one resolution pass.
      *
      * @param seconds the subtitle delay to apply, in seconds, rounded to 0.1 s (matching Apple).
-     * @param seeded  whether the session is now seeded (a nonzero offset was chosen, or one already was).
+     * @param seeded  whether a valid offset decision, including explicit zero, was chosen or already existed.
      * @param source  which layer supplied [seconds]; [OffsetSource.NONE] when nothing applied.
      */
     data class Resolution(val seconds: Double, val seeded: Boolean, val source: OffsetSource)
@@ -42,7 +36,7 @@ object SubtitleAutoResync {
     /**
      * Resolve the subtitle delay to apply, layering the manual offset over the community-learned one.
      *
-     * @param manualOffsetSeconds the viewer's own saved offset for this scope (from [SubtitleOffsetMemory]), or
+     * @param manualOffsetSeconds the viewer's own saved offset from device-local subtitle memory, or
      *        null when they never set one.
      * @param poolOffsetMs        the community-learned offset (ms) from the pool, or null when the pool has none.
      * @param alreadySeeded       whether a prior pass already seeded this session (Apple's `pooledSeededOffset`).
@@ -59,33 +53,19 @@ object SubtitleAutoResync {
         if (alreadySeeded) return Resolution(0.0, seeded = true, source = OffsetSource.NONE)
 
         val manual = sanitizedSeconds(manualOffsetSeconds)
-        if (manual != null && manual != 0.0) {
+        // Zero is an explicit viewer decision, not permission to replace it with a pool value.
+        if (manual != null) {
             return Resolution(manual, seeded = true, source = OffsetSource.MANUAL)
         }
 
-        val community = poolOffsetMs?.let { sanitizedSeconds(secondsFromMs(it)) }
-        if (community != null && community != 0.0) {
+        // Validate the original value before rounding: 120001ms is outside the 120s bound.
+        val community = poolOffsetMs?.let { sanitizedSeconds(it / 1000.0) }
+        if (community != null) {
             return Resolution(community, seeded = true, source = OffsetSource.COMMUNITY)
         }
 
-        // A manual offset that sanitizes to exactly zero (an explicit reset) still counts as the viewer having
-        // decided: mark seeded so the community offset does not later override the reset.
-        val seededByManualZero = manualOffsetSeconds != null
-        return Resolution(0.0, seeded = seededByManualZero, source = OffsetSource.NONE)
-    }
-
-    /**
-     * Convenience one-shot for the player: read the manual offset for [contentKey] from [SubtitleOffsetMemory]
-     * and layer the community [poolOffsetMs] over it. Returns the same [Resolution] as [resolve].
-     */
-    fun resolveForPlayback(
-        context: Context,
-        contentKey: String?,
-        poolOffsetMs: Int?,
-        alreadySeeded: Boolean,
-    ): Resolution {
-        val manual = SubtitleOffsetMemory.savedOffset(context, contentKey)
-        return resolve(manualOffsetSeconds = manual, poolOffsetMs = poolOffsetMs, alreadySeeded = alreadySeeded)
+        // Invalid/non-finite manual input is not a decision and cannot poison later seeding.
+        return Resolution(0.0, seeded = false, source = OffsetSource.NONE)
     }
 
     /**
@@ -99,9 +79,6 @@ object SubtitleAutoResync {
         if (!captureIsValid(seconds)) return null
         return (seconds * 1000.0).roundToLong().toInt()
     }
-
-    /** A pool offset in ms as seconds, rounded to 0.1 s exactly as Apple rounds it. */
-    private fun secondsFromMs(ms: Int): Double = (ms / 1000.0 * 10.0).roundToLong() / 10.0
 
     /** Reject a non-finite or out-of-bounds offset; otherwise round to 0.1 s like the memory + pool paths. */
     private fun sanitizedSeconds(seconds: Double?): Double? {

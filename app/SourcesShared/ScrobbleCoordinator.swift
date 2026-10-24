@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The single fan-out point from the players + library actions to every external sync provider (Trakt,
 /// SIMKL). Fire-and-forget and fully fail-soft, mirroring `WatchSignalClient`'s shape: each entry point
@@ -30,7 +31,7 @@ import Foundation
 /// libraryItem POISON invariant: nothing here touches any engine `libraryItem` field. External state
 /// lives only on the providers' own HTTP endpoints; the watch record is a provider history/scrobble call,
 /// never an engine watched-mark dispatch.
-final class ScrobbleCoordinator {
+final class ScrobbleCoordinator: Sendable {
     static let shared = ScrobbleCoordinator()
     private init() {
         TraktAuthBoundary.observe(key: "scrobble-coordinator") { [weak self] _ in
@@ -46,17 +47,18 @@ final class ScrobbleCoordinator {
     /// 100 so a provider that keys off the stop percentage records unambiguously.
     private static let completionThreshold = 90.0
 
-    // MARK: - Session latch state (guarded by `lock`)
+    // MARK: - Session latch state (one checked lock-owned value)
 
-    private let lock = NSLock()
-    /// The exact provider sessions captured when this item+player-token lifecycle began. Boundaries clear
-    /// only the affected owner, so a later event from an account-A playback can never adopt account B.
-    private var sessionOwnership =
-        PlaybackScrobbleSessionOwnership<TraktSessionID, SIMKLSessionID>()
-    private var startSent = false
-    private var stopSent = false
-    private var traktCompleted = false
-    private var simklCompleted = false
+    private struct State: Sendable {
+        /// The exact provider sessions captured when this item+player-token lifecycle began. Boundaries clear
+        /// only the affected owner, so a later event from an account-A playback can never adopt account B.
+        var sessionOwnership = PlaybackScrobbleSessionOwnership<TraktSessionID, SIMKLSessionID>()
+        var startSent = false
+        var stopSent = false
+        var traktCompleted = false
+        var simklCompleted = false
+    }
+    private let storage = OSAllocatedUnfairLock(initialState: State())
     /// One network lane for Trakt's stateful start/pause/stop lifecycle. In particular, a slow initial
     /// start must finish before a later pause/stop, or its late arrival would erase the saved pause point.
     private let lifecycleQueue = TraktScrobbleLifecycleQueue()
@@ -75,26 +77,26 @@ final class ScrobbleCoordinator {
     /// is not re-sent. `token` is the player's per-playback id (a genuine rewatch supplies a fresh one).
     /// When duration is not known yet, progress is 0 and the real percentage is deferred to a later
     /// pause/resume/stop transition. Routine progress ticks never emit `start`.
-    func playbackStarted(_ meta: PlaybackMeta, position: Double, duration: Double, sessionToken token: String) {
+    @MainActor func playbackStarted(_ meta: PlaybackMeta, position: Double, duration: Double, sessionToken token: String) {
         guard passesOwnerGate() else { return }
         let currentTraktSessionID = TraktAuth.storedSessionID
         let currentSIMKLSessionID = SIMKLAuth.storedSessionID
-        lock.lock()
         let key = sessionKey(meta)
-        let isFreshPlayback = sessionOwnership.beginPlayback(
-            itemKey: key,
-            playbackToken: token,
-            traktSessionID: currentTraktSessionID,
-            simklSessionID: currentSIMKLSessionID
-        )
-        if isFreshPlayback {
-            startSent = false; stopSent = false
-            traktCompleted = false; simklCompleted = false
+        let (sendStart, providerSessions) = storage.withLock { state in
+            let isFreshPlayback = state.sessionOwnership.beginPlayback(
+                itemKey: key,
+                playbackToken: token,
+                traktSessionID: currentTraktSessionID,
+                simklSessionID: currentSIMKLSessionID
+            )
+            if isFreshPlayback {
+                state.startSent = false; state.stopSent = false
+                state.traktCompleted = false; state.simklCompleted = false
+            }
+            let sendStart = !state.startSent
+            state.startSent = true
+            return (sendStart, state.sessionOwnership.snapshot)
         }
-        let sendStart = !startSent
-        startSent = true
-        let providerSessions = sessionOwnership.snapshot
-        lock.unlock()
         guard sendStart else { return }   // same-session re-entry: the start already fired, do not repeat it
         dispatchLifecycle(
             meta,
@@ -108,7 +110,7 @@ final class ScrobbleCoordinator {
 
     /// Playback paused. Live scrobble only; providers without it (SIMKL) are skipped by the capability
     /// guard, so a pause never reaches a history endpoint.
-    func playbackPaused(_ meta: PlaybackMeta, position: Double, duration: Double) {
+    @MainActor func playbackPaused(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
         let providerSessions = attachSession(meta)
         dispatchLifecycle(
@@ -122,7 +124,7 @@ final class ScrobbleCoordinator {
     }
 
     /// Playback resumed from pause. In Trakt's model a resume is a fresh scrobble start.
-    func playbackResumed(_ meta: PlaybackMeta, position: Double, duration: Double) {
+    @MainActor func playbackResumed(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
         let providerSessions = attachSession(meta)
         dispatchLifecycle(
@@ -139,7 +141,7 @@ final class ScrobbleCoordinator {
     /// once (shared `completed` latch with `watched`); below it, a one-time live scrobble stop saves the
     /// resume/pause point. Duration unknown => percentage deferred (treated as sub-completion, resume-save
     /// only), never a bogus completion.
-    func playbackStopped(_ meta: PlaybackMeta, position: Double, duration: Double) {
+    @MainActor func playbackStopped(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
         let providerSessions = attachSession(meta)
         let progress = percent(position, duration)
@@ -148,10 +150,11 @@ final class ScrobbleCoordinator {
             return
         }
         // Sub-completion exit: save a resume/pause point once (live scrobble only).
-        lock.lock()
-        let alreadyStopped = stopSent
-        stopSent = true
-        lock.unlock()
+        let alreadyStopped = storage.withLock { state in
+            let alreadyStopped = state.stopSent
+            state.stopSent = true
+            return alreadyStopped
+        }
         guard !alreadyStopped else { return }
         dispatchLifecycle(
             meta,
@@ -165,7 +168,7 @@ final class ScrobbleCoordinator {
 
     /// The shared watched chokepoint (`CoreBridge.markPlaybackWatched`): the 90% marker, the EOF path, or
     /// a manual in-player mark. Records the definitive watch exactly once per session.
-    func watched(_ meta: PlaybackMeta) {
+    @MainActor func watched(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
         let providerSessions = attachSession(meta)
         recordCompletion(meta, providerSessions: providerSessions)
@@ -175,7 +178,7 @@ final class ScrobbleCoordinator {
 
     /// A title was added to the library from a detail page: mirror it to each connected provider's
     /// watchlist. Whole-title intent (movie or show), gated on the watchlist toggle.
-    func addedToLibrary(_ meta: PlaybackMeta) {
+    @MainActor func addedToLibrary(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
         dispatch(meta, progress: 0) { ref, provider, session in
             guard provider.capabilities.watchlist, provider.watchlistEnabled else { return }
@@ -184,7 +187,7 @@ final class ScrobbleCoordinator {
     }
 
     /// A title was removed from the library from a detail page: remove it from each provider's watchlist.
-    func removedFromLibrary(_ meta: PlaybackMeta) {
+    @MainActor func removedFromLibrary(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
         dispatch(meta, progress: 0) { ref, provider, session in
             guard provider.capabilities.watchlist, provider.watchlistEnabled else { return }
@@ -196,7 +199,7 @@ final class ScrobbleCoordinator {
 
     /// The OWNER/MAIN-profile gate. Read synchronously on the caller (main) thread, the same read
     /// `markPlaybackWatched` already does at these call sites. An overlay/guest profile pushes nothing.
-    private func passesOwnerGate() -> Bool { ProfileStore.shared.activeUsesEngineHistory }
+    @MainActor private func passesOwnerGate() -> Bool { ProfileStore.shared.activeUsesEngineHistory }
 
     /// Ensure a session exists for `meta` without resetting a matching one. If the key differs from the
     /// active session (an entry arriving with no prior start), open a fresh session so its latches apply.
@@ -204,28 +207,23 @@ final class ScrobbleCoordinator {
         _ meta: PlaybackMeta
     ) -> PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID> {
         let key = sessionKey(meta)
-        lock.lock()
-        if sessionOwnership.attach(itemKey: key) {
-            startSent = false; stopSent = false
-            traktCompleted = false; simklCompleted = false
+        return storage.withLock { state in
+            if state.sessionOwnership.attach(itemKey: key) {
+                state.startSent = false; state.stopSent = false
+                state.traktCompleted = false; state.simklCompleted = false
+            }
+            return state.sessionOwnership.snapshot
         }
-        let providerSessions = sessionOwnership.snapshot
-        lock.unlock()
-        return providerSessions
     }
 
     /// Boundaries invalidate only that provider's owner. Latches and the item+token identity survive, so
     /// same-player recovery cannot rebind to the replacement account or duplicate the unaffected provider.
     private func invalidateTraktSession() {
-        lock.lock()
-        sessionOwnership.invalidateTrakt()
-        lock.unlock()
+        storage.withLock { $0.sessionOwnership.invalidateTrakt() }
     }
 
     private func invalidateSIMKLSession() {
-        lock.lock()
-        sessionOwnership.invalidateSIMKL()
-        lock.unlock()
+        storage.withLock { $0.sessionOwnership.invalidateSIMKL() }
     }
 
     /// Claim the completion latch and, if won, fan out the definitive watch record at 100% progress.
@@ -233,12 +231,13 @@ final class ScrobbleCoordinator {
         _ meta: PlaybackMeta,
         providerSessions: PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID>
     ) {
-        lock.lock()
-        let sendTrakt = !traktCompleted
-        let sendSIMKL = !simklCompleted
-        traktCompleted = true
-        simklCompleted = true
-        lock.unlock()
+        let (sendTrakt, sendSIMKL) = storage.withLock { state in
+            let sendTrakt = !state.traktCompleted
+            let sendSIMKL = !state.simklCompleted
+            state.traktCompleted = true
+            state.simklCompleted = true
+            return (sendTrakt, sendSIMKL)
+        }
         guard sendTrakt || sendSIMKL else { return }
         dispatchLifecycle(
             meta,

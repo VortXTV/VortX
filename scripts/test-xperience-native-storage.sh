@@ -27,11 +27,14 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
   sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
 } > "$storage_test_dir/Discovery.swift"
 shasum -a 256 scripts/native-owner-history-fixture-inputs.sh test/xperience-harness-inputs.cjs \
+  app/SourcesShared/LegacyWatchOwnership.swift \
   app/SourcesShared/VortXSyncManager.swift > "$storage_test_dir/carrier-sources.sha256"
 node test/xperience-harness-inputs.cjs --owner-history-carriers "$storage_test_dir"
+node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-shell "$storage_test_dir/NativeSubtitleProofHosts.swift" > "$storage_test_dir/native-subtitle-proof-hosts.json"
 shasum -a 256 --check "$storage_test_dir/carrier-sources.sha256"
 inputs=(
   "${native_owner_history_fixture_swift_inputs[@]}" "$storage_test_dir/OwnerHistoryFixtureCarriers.swift"
+  "$storage_test_dir/NativeSubtitleProofHosts.swift"
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift
   app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift
   app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}"
@@ -61,7 +64,9 @@ inputs=("${storage_owner_unique[@]}")
 shasum -a 256 app/SourcesShared/Profiles.swift app/SourcesShared/ProfileDiscoveryPreferences.swift \
   scripts/native-watched-swift-inputs.sh scripts/native-owner-history-fixture-inputs.sh \
   scripts/xperience-observation-swift-inputs.sh test/xperience-harness-inputs.cjs \
-  app/SourcesShared/VortXSyncManager.swift "$storage_test_dir/owner-history-carriers.json" "$0" "$header" "$library" > "$storage_test_dir/input-sha256.txt"
+  scripts/extract-subtitle-proof-hosts.cjs app/SourcesShared/CoreBridge.swift \
+  app/SourcesShared/LegacyWatchOwnership.swift \
+  app/SourcesShared/VortXSyncManager.swift "$storage_test_dir/owner-history-carriers.json" "$storage_test_dir/native-subtitle-proof-hosts.json" "$0" "$header" "$library" > "$storage_test_dir/input-sha256.txt"
 for input in "${inputs[@]}"; do
   [[ "$input" == -lz ]] || shasum -a 256 "$input" >> "$storage_test_dir/input-sha256.txt"
 done

@@ -95,6 +95,12 @@ export TVOS_DEPLOYMENT_TARGET=18.0
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
 export MACOSX_DEPLOYMENT_TARGET=14.0
 
+# Bundled rust-objcopy may have an RPATH relative to its nested rustlib/bin
+# directory, while LLVM lives in the toolchain root's lib. Fail before builds
+# if the installed pinned tools cannot load, and keep the lookup command-scoped.
+source "$REPO_ROOT/scripts/native-rust-toolchain-env.sh"
+NATIVE_RUST_LLVM_PATH="$(native_rust_llvm_library_path nightly-2026-07-19)"
+
 # Tier-2 targets install prebuilt components; the tier-3 tvOS triples have none to install
 # (build-std compiles std from rust-src), so they are deliberately absent here.
 rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
@@ -114,6 +120,8 @@ build_slice() { # <triple> <sdk> <kernel|server>
     echo "- vortx-ffi $1 ($3)"
     # --locked: the engine workspace tracks Cargo.lock, so a drifted dependency resolution FAILS
     # the build here instead of silently linking a different graph than CI proved.
+    CARGO_PROFILE_RELEASE_PANIC=abort \
+    DYLD_LIBRARY_PATH="$NATIVE_RUST_LLVM_PATH" \
     SDKROOT="$(xcrun --sdk "$2" --show-sdk-path)" \
         cargo +nightly-2026-07-19 build --locked $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
         -p vortx-ffi $features --release --target "$1"

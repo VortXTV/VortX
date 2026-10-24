@@ -27,3 +27,8 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 "$recovery_test_dir/tracks"
 # Local article-stream buffering and repeated-starvation recovery use the same Apple source gate.
 bash scripts/test-local-nntp-playback.sh
+bash scripts/test-player-first-frame-artwork.sh
+bash scripts/test-random-pick.sh
+bash scripts/test-player-session-audio-presets.sh
+bash scripts/test-source-quick-filters.sh
+bash scripts/test-ranking-cache-concurrency.sh

@@ -92,3 +92,44 @@ enum VortxResourceProjection {
         return .array(try snapshot.groups.map { try entry($0, request: snapshot.request, registry: registry) })
     }
 }
+
+/// One admitted detail request may retain its preceding metadata while that same resource loads.
+/// Only presentation metadata is carried; streams and embedded stream groups stay with the new load.
+enum VortxMetaLoadingProjection {
+    static func retainingReadyMetadata(previous: VortxJSON?, incoming: VortxJSON,
+                                       ownerIsCurrent: Bool) -> VortxJSON {
+        guard ownerIsCurrent, let previous,
+              previous["nativeError"] == nil, incoming["nativeError"] == nil,
+              let metaPath = incoming["selected"]?["metaPath"],
+              metaPath["resource"] == .string("meta"),
+              case .string(let id) = metaPath["id"], !id.isEmpty,
+              case .string(let type) = metaPath["type"], !type.isEmpty,
+              previous["selected"]?["metaPath"] == metaPath,
+              let priorRows = previous["metaItems"]?.array,
+              let incomingRows = incoming["metaItems"]?.array,
+              case .object(var fields) = incoming else { return incoming }
+        fields["metaItems"] = .array(incomingRows.map { row in
+            guard row["content"]?["type"] == .string("Loading"),
+                  let request = row["request"], request["path"] == metaPath,
+                  case .string(let base) = request["base"], !base.isEmpty,
+                  case .object(var fields) = row else { return row }
+            // Duplicate provider receipts are ambiguous; never choose one by incidental order.
+            let matching = priorRows.filter { $0["request"] == request }
+            guard matching.count == 1 else { return row }
+            let prior = matching[0], retained: VortxJSON?
+            switch prior["content"]?["type"] {
+            case .string("Ready"): retained = prior["content"]
+            case .string("Loading"): retained = prior["retainedWhileLoading"]
+            default: retained = nil
+            }
+            guard retained?["type"] == .string("Ready"),
+                  retained?["content"]?["id"] == .string(id),
+                  retained?["content"]?["type"] == .string(type) else { return row }
+            // Actual content remains Loading for every freshness/terminal consumer. Only the
+            // display accessor reads this raw envelope; fresh Ready/Err rows replace it normally.
+            fields["retainedWhileLoading"] = retained
+            return .object(fields)
+        })
+        return .object(fields)
+    }
+}

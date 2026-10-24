@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 extension LiveGuideChannel {
     /// The guide's channels: every live catalog row's items, unique, in row order. A row id is

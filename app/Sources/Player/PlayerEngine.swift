@@ -100,6 +100,11 @@ protocol PlayerEngine: AnyObject {
     /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
     /// every selected subtitle; AVPlayer supports it only while the VortX external-cue overlay is active.
     var subtitleDelayAvailable: Bool { get }
+    /// Opaque revision for the current subtitle selection/timing intent, not a download cancellation token.
+    /// Capture it with the original load/track/owner before preparing alignment; any intervening selection,
+    /// timing edit or load transition retires that preparation. nil means this engine cannot provide it.
+    /// Equality alone does not authorize applying a result: final load, track and owner admission is required.
+    var subtitleAlignmentRevision: UInt64? { get }
     func setSubDelay(_ seconds: Double)
     func setAudioDelay(_ seconds: Double)
     func applySubtitleStyle()
@@ -155,6 +160,9 @@ extension PlayerEngine {
     /// libmpv is the established full-capability path. The AVPlayer conformer overrides this with its
     /// current-track external-overlay state, so adding the capability does not widen every concrete engine.
     var subtitleDelayAvailable: Bool { true }
+
+    /// Unsupported conformers must not accidentally grant automatic-alignment authority with a fixed zero.
+    var subtitleAlignmentRevision: UInt64? { nil }
 
     /// The chrome calls `addExternalSubtitle(url:title:lang:)` (the rest defaulted). Protocol requirements
     /// can't carry default values, so this convenience forwards to the full requirement, needed once the

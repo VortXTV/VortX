@@ -47,7 +47,7 @@ struct MoveSeedingNagView: View {
         .sheet(isPresented: $showSignIn) { iOSSignInView() }
         .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                       contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { _ in }
-        .onChange(of: sync.accountRestoreState) { state in
+        .onValueChange(of: sync.accountRestoreState) { state in
             // A real applied backup, not just successful authentication, completes this handoff.
             if state == .ready, sync.hasCompletedFirstSync { dismiss() }
         }

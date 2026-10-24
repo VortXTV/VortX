@@ -69,6 +69,9 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.randompick.RandomLibraryFilter
+import com.vortx.android.ui.randompick.RandomLibraryPickModel
+import com.vortx.android.ui.randompick.RandomLibraryPickProfile
 import com.vortx.android.ui.search.isSearchQueryEligible
 import com.vortx.android.ui.search.searchSuggestionTitles
 import kotlinx.coroutines.CancellationException
@@ -1164,6 +1167,17 @@ class DiscoverViewModel(
 class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     private val _state = MutableStateFlow<UiState<LibraryResult>>(UiState.Loading)
     val state: StateFlow<UiState<LibraryResult>> = _state.asStateFlow()
+    private val randomPicker = RandomLibraryPickModel(
+        scope = viewModelScope,
+        captureOwner = repo::continueWatchingOwner,
+        captureProfile = {
+            ProfileStore.sharedOrNull()?.let { store ->
+                store.active?.let { RandomLibraryPickProfile(it, selectionReady = !store.needsPicker) }
+            }
+        },
+        readLibrary = { repo.library(null) },
+    )
+    internal val randomPickState = randomPicker.state
 
     private var currentRequestJson: String? = null
     private var everLoaded = false
@@ -1177,9 +1191,23 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// normal entry-point load, replacing the old `init { load(null) }`.
     init {
         viewModelScope.launch {
-            repo.ctxUpdates().collect { load(currentRequestJson, showLoading = !everLoaded) }
+            repo.ctxUpdates().collect {
+                randomPicker.clear()
+                load(currentRequestJson, showLoading = !everLoaded)
+            }
+        }
+        viewModelScope.launch {
+            // A locked/pending profile handoff can intentionally suppress repository ctx emission.
+            ProfileStore.sharedOrNull()?.activeProfile?.collect { randomPicker.clear() }
         }
     }
+
+    internal fun pickRandom(filter: RandomLibraryFilter = randomPickState.value.filter) = randomPicker.pick(filter)
+
+    internal fun clearRandomPick() = randomPicker.clear()
+
+    /** Explicit UI Open/Play only; the model re-reads local membership before accepting navigation. */
+    internal fun randomPickForAction(onAccepted: (MetaItem) -> Unit) = randomPicker.openPreview(onAccepted)
 
     fun load(requestJson: String?, showLoading: Boolean = true) {
         currentRequestJson = requestJson

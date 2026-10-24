@@ -1,8 +1,8 @@
 // Compile the REAL shared settings view at the oldest supported iOS deployment target:
-// xcrun swiftc -typecheck -swift-version 5 -target arm64-apple-ios16.0 \
+// xcrun swiftc -typecheck -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 -target arm64-apple-ios16.0 \
 //   -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
-//   app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ServerConfigView.swift
-// Only app-wide styling/server dependencies are stubs. SwiftUI, the complete view body and its lifecycle
+//   app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ValueChangeObservation.swift app/SourcesShared/ServerConfigView.swift
+// Only app-wide styling/server dependencies are stubs. SwiftUI, the real availability helper, complete view body and its lifecycle
 // handlers are real, so accidentally choosing the iOS-17-only two-argument onChange fails compilation.
 import SwiftUI
 

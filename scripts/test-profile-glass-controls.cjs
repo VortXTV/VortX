@@ -40,7 +40,7 @@ const generated = `import SwiftUI\nimport AppKit\n
 private func themeRGB(_ r: Double, _ g: Double, _ b: Double) -> Color { Color(.sRGB, red:r, green:g, blue:b, opacity:1) }
 ${block(manager, 'struct AccentOption:')}
 // Inert RAM-only ObservableObject palette compatibility; actual production color members follow.
-final class ThemeManager: ObservableObject, @unchecked Sendable {
+@MainActor final class ThemeManager: ObservableObject {
   static let shared = ThemeManager()
   @Published var accentID = "vortx"
   @Published var oled = true
@@ -48,7 +48,7 @@ final class ThemeManager: ObservableObject, @unchecked Sendable {
   ${accents}
   ${members}
 }
-enum Theme { ${['enum Palette', 'enum Space', 'enum Radius', 'enum Typography', 'enum Motion'].map(x => block(theme,x)).join('\n')} }
+enum Theme { ${['enum Palette', 'enum Space', 'enum Radius', '@MainActor enum Typography', 'enum Motion'].map(x => block(theme,x)).join('\n')} }
 ${shell}
 ${block(root, 'struct CinemaTabBarChrome<')}
 ${block(root, 'struct CinemaCompactTabLabel:')}

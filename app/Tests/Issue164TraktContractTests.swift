@@ -89,17 +89,38 @@ struct Issue164TraktContractTests {
                 "iOS direct resume must prefer the displayed card offset")
 
         // Blocker 3: generation validation covers the disk commit, not only the memory assignment.
+        let playbackCommit = segment(in: shadow, from: "private func commitPlayback(", to: "/// Gate on")
+        let playbackPull = segment(in: shadow, from: "private func pullPlayback(", to: "/// Fold one")
         require(appearsInOrder(
-            in: shadow,
+            in: playbackCommit,
             [
+                "guard context.isCurrent(owner: owner) else { return false }",
+                "return storage.withLock { state in",
                 "guard TraktPlaybackSnapshotPolicy.canCommit(",
-                "Self.saveCache(",
-                "guard context.isCurrent(core: .shared, profiles: .shared), TraktPlaybackSnapshotPolicy.canCommit(",
-                "lastActivityStamps = activity",
-                "lock.unlock()",
-                "Self.postChanged(context: context)",
+                "guard context.isCurrent(owner: owner), Self.saveCache(",
+                "guard context.isCurrent(owner: owner), TraktPlaybackSnapshotPolicy.canCommit(",
+                "_ = Self.resetCache()",
+                "state.lastActivityStamps = activity",
+                "return true",
             ]
-        ), "old-account cache persistence must happen under the generation lock")
+        ) && appearsInOrder(in: playbackPull, [
+            "guard commitPlayback(",
+            "context: context,",
+            "owner: owner",
+            "Self.postChanged(context: context, owner: owner)",
+        ]), "cache save and post-save validation share the checked generation lock before original-owner notification")
+
+        // These are real production class declarations, not a parallel unchecked fixture owner.
+        require(shadow.contains("final class TraktPlaybackShadow: Sendable")
+                    && shadow.contains("private struct State: Sendable")
+                    && shadow.contains("private let storage: OSAllocatedUnfairLock<State>")
+                    && coordinator.contains("final class ScrobbleCoordinator: Sendable")
+                    && coordinator.contains("private struct State: Sendable")
+                    && coordinator.contains("private let storage = OSAllocatedUnfairLock(initialState: State())")
+                    && !shadow.contains("@unchecked Sendable")
+                    && !coordinator.contains("@unchecked Sendable")
+                    && !shadow.contains("NSLock()") && !coordinator.contains("NSLock()"),
+                "singleton mutation belongs to checked state; neither class adds an unchecked conformance")
 
         // Blocker 4: Trakt rows never route their dismiss into the local engine.
         require(tvHome.contains("menu: renderedContinueWatching.selection.source.isPrivate")
@@ -166,7 +187,7 @@ struct Issue164TraktContractTests {
             in: ratingsStore,
             [
                 "let sessionID = TraktAuth.storedSessionID",
-                "persistLocked()",
+                "Self.persistLocked(state)",
                 "mirror(entry, gen: gen, sessionID: sessionID)",
             ]
         )
@@ -296,16 +317,59 @@ struct Issue164TraktContractTests {
                     && simklRatings.contains("SIMKLService.shared.ratings(")
                     && simklRatings.contains("expectedSession: sessionID"),
                 "SIMKL ratings state and durable unpushed edits must share one exact session")
+        let watchedPull = segment(
+            in: syncEngine,
+            from: "private func pullWatched(",
+            to: "/// Synchronous fence usable before/after every network/token suspension"
+        )
+        let watchedCommit = segment(
+            in: watchedPull,
+            from: "let committed = cache.withLock { state in",
+            to: "guard committed else { return }"
+        )
+        let watchedPullFailure = segment(
+            in: watchedPull,
+            from: "} catch {",
+            to: "// Evaluate external intent outside the engine lock"
+        )
         require(syncEngine.contains("TraktAuthBoundary.observe(key: \"trakt-sync-engine\")")
                     && syncEngine.contains("snapshot.sessionID == sessionID")
                     && syncEngine.contains("stateSessionID == expectedSession")
-                    && syncEngine.contains("guard moviesOK, showsOK else { return }")
-                    && syncEngine.contains("watchedIDs = next"),
+                    && watchedPull.contains("let complete = try await TraktWatchedSnapshotReader.read(")
+                    && watchedPull.contains("snapshot = complete")
+                    && watchedPullFailure.contains("return")
+                    && !watchedPullFailure.contains("state.")
+                    && appearsInOrder(in: watchedCommit, [
+                        "state.generation == gen, state.stateSessionID == expectedSession",
+                        "state.watchedReadFlight == flight, state.pendingPushes == prepared.candidate.pendingPushes",
+                        "TraktAuth.storedSessionID == expectedSession",
+                        "try storage.save(prepared.data)",
+                        "} catch {",
+                        "return false",
+                        "state.watchedIDs = snapshot.watchedIDs",
+                        "state.watchedEpisodeKeys = snapshot.episodeKeys",
+                        "state.lastActivityFingerprint = snapshot.activityFingerprint",
+                        "state.watchedReadVersion = TraktWatchedSnapshotReader.readVersion",
+                        "state.watchedShowInventory = snapshot.shows",
+                        "state.watchedInventoryRevision = prepared.candidate.watchedInventoryRevision",
+                    ])
+                    && !watchedCommit.contains("!snapshot.watchedIDs.isEmpty")
+                    && !watchedCommit.contains("!snapshot.episodeKeys.isEmpty"),
                 "Trakt watched state must reject stale sessions and accept truthful empty replacements")
         require(simklWatched.contains("SIMKLAuthBoundary.observe(key: \"simkl-watched-shadow\")")
                     && simklWatched.contains("snapshot.sessionID == sessionID")
-                    && simklWatched.contains("guard allOK else { return }")
-                    && simklWatched.contains("let changed = core.replace(with: next)"),
+                    && appearsInOrder(in: simklWatched, [
+                        "guard allOK else { return }",
+                        "let watchedIDs = next",
+                        "let changed = lock.withLock { state in",
+                        "state.generation == gen",
+                        "state.stateSessionID == expectedSession",
+                        "SIMKLAuth.storedSessionID == expectedSession",
+                        "let changed = state.core.replace(with: watchedIDs)",
+                        "if changed { Self.persistLocked(state) }",
+                    ])
+                    && !simklWatched.contains("guard !next.isEmpty")
+                    && !simklWatched.contains("guard !watchedIDs.isEmpty"),
                 "SIMKL watched state must reject stale sessions and accept truthful empty replacements")
         require(appearsInOrder(
             in: traktRails,
@@ -335,11 +399,39 @@ struct Issue164TraktContractTests {
                 "SIMKL rail auth/session gates must precede throttle and fence response publication")
 
         // Every private durable class uses the protected, backup-excluded storage authority.
-        require(privateStorage.contains("values.isExcludedFromBackup = true")
-                    && privateStorage.contains(".protectionKey: FileProtectionType.complete")
-                    && privateStorage.contains(".posixPermissions: isDirectory ? 0o700 : 0o600")
-                    && occurrences(of: "try excludeFromBackup(fileURL)", in: privateStorage) == 2,
-                "private storage must assert backup exclusion and platform protection on save and load")
+        require(hasProtectedPrivateStorage(privateStorage),
+                "private storage must protect and exclude loaded files and the staged save namespace/payload before writing")
+        // Source mutants pin the real protected paths; none is compiled or used for private I/O.
+        for (needle, boundary) in [
+            ("try protect(fileURL)", "loaded file protection"),
+            ("try excludeFromBackup(fileURL)", "loaded file backup exclusion"),
+            ("try protect(directory, isDirectory: true)", "parent directory protection"),
+            ("try excludeFromBackup(directory)", "parent directory backup exclusion"),
+            ("Darwin.fchmod(namespaceFD, mode_t(0o700))", "owner-only staging namespace"),
+            ("try protect(namespace.url, isDirectory: true)", "staging namespace protection"),
+            ("try excludeFromBackup(namespace.url)", "staging namespace backup exclusion"),
+            ("Darwin.fchmod(descriptor, mode_t(0o600))", "owner-only staged payload"),
+            ("try protect(namespace.payloadURL)", "staged payload protection"),
+            ("try excludeFromBackup(namespace.payloadURL)", "staged payload backup exclusion"),
+            ("values.isExcludedFromBackup = true", "backup exclusion resource flag"),
+            (".protectionKey: FileProtectionType.complete", "Apple complete file protection"),
+            (".posixPermissions: isDirectory ? 0o700 : 0o600", "desktop owner-only permissions"),
+        ] {
+            require(occurrences(of: needle, in: privateStorage) == 1,
+                    "private storage negative control has one actual anchor for \(boundary)")
+            require(!hasProtectedPrivateStorage(privateStorage.replacingOccurrences(of: needle, with: "")),
+                    "private storage source guard rejects removal of \(boundary)")
+        }
+        require(occurrences(of: "try barrier?(.fileSync, namespace.payloadURL)", in: privateStorage) == 1,
+                "private storage delayed-exclusion control has one actual post-write anchor")
+        let latePayloadExclusion = privateStorage
+            .replacingOccurrences(of: "try excludeFromBackup(namespace.payloadURL)", with: "")
+            .replacingOccurrences(of: "try barrier?(.fileSync, namespace.payloadURL)",
+                with: "try excludeFromBackup(namespace.payloadURL)\n        try barrier?(.fileSync, namespace.payloadURL)")
+        require(occurrences(of: "try excludeFromBackup(namespace.payloadURL)", in: latePayloadExclusion) == 1,
+                "private storage delayed-exclusion control retains the exclusion call")
+        require(!hasProtectedPrivateStorage(latePayloadExclusion),
+                "private storage source guard rejects payload backup exclusion delayed until after bytes are written")
         require(syncEngine.contains("file: \"sync-state.json\"")
                     && syncEngine.contains("watchedIDs:")
                     && syncEngine.contains("pendingPushes:")
@@ -348,12 +440,43 @@ struct Issue164TraktContractTests {
                     && simklRatings.contains("file: \"ratings.json\"")
                     && simklWatched.contains("file: \"watched.json\""),
                 "watched, ratings, queue, and activity-fingerprint persistence must use protected snapshots")
-        require(occurrences(of: "persistLocked()", in: syncEngine) >= 4
+        let queueEnqueue = segment(in: syncEngine, from: "func enqueue(_ push: PendingPush)", to: "/// Re-attempt every queued push")
+        let queueDrain = segment(in: syncEngine, from: "private func drainQueue(", to: "/// Send one queued push")
+        require(queueEnqueue.contains("Self.persistLocked(state)")
+                    && appearsInOrder(in: queueDrain, [
+                        "if await send(push, expectedSession: expectedSession) == false",
+                        "let failedSnapshot = stillFailing",
+                        "cache.withLock { state in",
+                        "state.generation == gen",
+                        "state.stateSessionID == expectedSession",
+                        "let appendedDuringDrain = state.pendingPushes.filter { !queue.contains($0) }",
+                        "var merged = failedSnapshot",
+                        "state.pendingPushes = merged",
+                        "Self.persistLocked(state)",
+                    ])
+                    && watchedCommit.contains("try storage.save(prepared.data)")
                     && syncEngine.contains("try? Self.storage?.reset()")
                     && ratingsStore.contains("try? Self.storage?.reset()")
                     && simklRatings.contains("try? Self.storage?.reset()")
                     && simklWatched.contains("try? Self.storage?.reset()"),
                 "private saves and resets must share each store's generation/lock fence")
+        for (source, owner, lockName) in [
+            (ratingsStore, "TraktRatingsStore", "cache"),
+            (syncEngine, "TraktSyncEngine", "cache"),
+            (simklRatings, "SIMKLRatingsStore", "lock"),
+            (simklWatched, "SIMKLWatchedShadow", "lock"),
+        ] {
+            require(source.contains("final class \(owner): Sendable")
+                        && source.contains("private struct State: Sendable")
+                        && source.contains("private let \(lockName): OSAllocatedUnfairLock<State>")
+                        && source.contains("private static func persistLocked(_ state: State)")
+                        && !source.contains("NSLock()")
+                        && !source.contains("@unchecked")
+                        && !source.contains("@preconcurrency")
+                        && !source.contains("nonisolated(unsafe)")
+                        && !source.contains("assumeIsolated"),
+                    "\(owner) must keep every mutable admission/cache field in a checked lock-owned State")
+        }
 
         // Connection-scoped imported catalogs disappear on automatic as well as manual boundaries.
         require(catalogs.contains("var connectionSessionID: TraktSessionID?")
@@ -597,6 +720,46 @@ struct Issue164TraktContractTests {
             fputs("FAIL: \(message)\n", stderr)
             exit(1)
         }
+    }
+
+    /// Pin privacy at the actual load and staged-save boundaries. Counting exclusions on fileURL would
+    /// miss that save protects its owner-only namespace and empty payload before rename publishes it.
+    private static func hasProtectedPrivateStorage(_ source: String) -> Bool {
+        let load = segment(in: source, from: "func load() throws -> Data? {",
+                           to: "func save(_ data: Data) throws {")
+        let save = segment(in: source, from: "func save(_ data: Data, barrier: SaveBarrier?) throws {",
+                           to: "private struct SaveNamespace")
+        let directory = segment(in: source, from: "private func prepareDirectory() throws {",
+                                to: "private func excludeFromBackup(")
+        let exclusion = segment(in: source, from: "private func excludeFromBackup(",
+                                to: "private func protect(")
+        let protection = segment(in: source, from: "private func protect(",
+                                 to: "private func deleteLegacy(")
+        return appearsInOrder(in: load, [
+            "try prepareDirectory()", "try protect(fileURL)", "try excludeFromBackup(fileURL)",
+            "return try Data(contentsOf: fileURL)",
+        ]) && appearsInOrder(in: directory, [
+            "try manager.createDirectory(", "attributes: [.posixPermissions: 0o700]",
+            "try excludeFromBackup(directory)", "try protect(directory, isDirectory: true)",
+        ]) && appearsInOrder(in: save, [
+            "Darwin.mkdirat(directoryFD, namespaceName, mode_t(0o700))",
+            "let namespaceFD = Darwin.openat(",
+            "Darwin.fchmod(namespaceFD, mode_t(0o700))",
+            "descriptor = Darwin.openat(",
+            "O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600)",
+            "try protect(namespace.url, isDirectory: true)", "try excludeFromBackup(namespace.url)",
+            "Darwin.fchmod(descriptor, mode_t(0o600))",
+            "try protect(namespace.payloadURL)", "try excludeFromBackup(namespace.payloadURL)",
+            "Darwin.write(descriptor,", "try sync(descriptor, error: .write)",
+            "Darwin.renameat(namespaceFD, SaveNamespace.payloadName, directoryFD, fileURL.lastPathComponent)",
+            "try sync(namespaceFD, error: .uncertainCommit)", "try sync(directoryFD, error: .uncertainCommit)",
+        ]) && appearsInOrder(in: exclusion, [
+            "values.isExcludedFromBackup = true", "try mutableURL.setResourceValues(values)",
+            "throw PrivateExternalSyncStorageError.backupExclusion",
+        ]) && protection.contains("#if os(iOS) || os(tvOS)")
+            && protection.contains(".protectionKey: FileProtectionType.complete")
+            && protection.contains(".posixPermissions: isDirectory ? 0o700 : 0o600")
+            && occurrences(of: "throw PrivateExternalSyncStorageError.protection", in: protection) == 2
     }
 
     private static func occurrences(of needle: String, in source: String) -> Int {

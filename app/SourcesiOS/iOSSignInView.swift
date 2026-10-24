@@ -86,10 +86,10 @@ struct iOSSignInView: View {
         // Both sign-in entry points
         // (signIn / signInWithAuthKey) already load add-ons + set the email, so reloadForActiveProfile()
         // is redundant here, and it was the second `isSignedIn = true` write that armed the loop.
-        .onChange(of: account.isSignedIn) { signedIn in
+        .onValueChange(of: account.isSignedIn) { signedIn in
             handleStremioSignIn(signedIn: signedIn)
         }
-        .onChange(of: account.credentialBoundaryGeneration) { _ in
+        .onValueChange(of: account.credentialBoundaryGeneration) { _ in
             handleStremioSignIn(signedIn: account.isSignedIn)
         }
         // VortX typed-path success: SyncSettingsView signs the VortX account in and adopt() has already
@@ -97,11 +97,12 @@ struct iOSSignInView: View {
         // only close the sheet. Scoped to showVortXEmail so the QR joiner's own checkmark-then-dismiss is
         // never preempted. .onChange fires only on a real transition, so an already-signed-in open (someone
         // who opened this sheet just to add Stremio) never spuriously dismisses.
-        .onChange(of: vortxSync.isSignedIn) { signedIn in
+        .onValueChange(of: vortxSync.isSignedIn) { signedIn in
             if signedIn && showVortXEmail { dismiss() }
         }
     }
 
+    @MainActor
     private func handleStremioSignIn(signedIn: Bool) {
         guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
         didHandleSignIn = true

@@ -477,14 +477,16 @@ private struct EpisodePlaybackIdentityTests {
                && !tvDetail.contains(".onChange(of: videos.count)"),
                "TV cached rows and watched rollup refresh on episode content, not only count")
         let phoneDetail = source("SourcesiOS/iOSDetailView.swift")
-        expect(phoneDetail.contains(".onChange(of: videos) { _ in")
-               && !phoneDetail.contains(".onChange(of: videos.count)"),
+        expect(phoneDetail.contains(".onValueChange(of: videos) { _ in")
+               && !phoneDetail.contains(".onChange(of: videos.count)")
+               && !phoneDetail.contains(".onValueChange(of: videos.count)"),
                "phone and Mac season validity and watched rollup observe episode content")
         expect(!blankAnime.hasSamePresentation(as: metadata(["videos": []])), "changed episode inventory republishes")
         expect(!blankAnime.hasSamePresentation(as: metadata(["trailerStreams": [["ytId": "abcdefghijk"]]])),
                "late trailer stream republishes")
-        expect(source("SourcesShared/CoreBridge.swift").contains("!currentMeta.hasSamePresentation(as: nextMeta)"),
-               "bridge consumes production metadata presentation comparison")
+        expect(source("SourcesShared/CoreBridge.swift").contains("current != next")
+               && source("SourcesShared/CoreModels.swift").contains("extension CoreMetaDetails: Equatable"),
+               "bridge consumes complete decoded metadata value comparison")
 
         let hash = "0123456789abcdef0123456789abcdef01234567"
         let e2 = stream(hash: hash, fileIdx: 1)

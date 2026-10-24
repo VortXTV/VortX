@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The small, deliberately independent Newznab RSS client.  It never returns a credential-bearing
 /// request URL: callers receive only parsed release metadata and the short-lived enclosure URL.
@@ -151,16 +152,16 @@ enum NZBIndexerClient {
 
 private final class SameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate {
     let scheme: String?; let host: String?; let port: Int?
-    private let lock = NSLock()
-    private var rejected = false
-    var rejectedRedirect: Bool { lock.lock(); defer { lock.unlock() }; return rejected }
+    private let rejected = OSAllocatedUnfairLock(initialState: false)
+    var rejectedRedirect: Bool { rejected.withLock { $0 } }
     init(origin: URL) { scheme = origin.scheme?.lowercased(); host = origin.host?.lowercased(); port = origin.port ?? (scheme == "https" ? 443 : 80) }
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         let next = request.url; let nextPort = next?.port ?? (next?.scheme?.lowercased() == "https" ? 443 : 80)
         guard next?.scheme?.lowercased() == scheme, next?.host?.lowercased() == host, nextPort == port,
               next?.user == nil, next?.password == nil else {
-            lock.lock(); rejected = true; lock.unlock(); completionHandler(nil); return
+            rejected.withLock { $0 = true }
+            completionHandler(nil); return
         }
         completionHandler(request)
     }

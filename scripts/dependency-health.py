@@ -649,13 +649,26 @@ def releases(ecosystem, name):
     return {"versions": sorted(set(versions)), "latest_stable": latest, "source": source}
 
 
-def compare(inventory_result, prior, workers, checkpoint=None, reuse=None):
+def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, identity_conflicts=None):
     identities = sorted(set((entry["ecosystem"], entry["name"]) for entry in inventory_result["entries"]))
     # A temporarily missing source is not explicit component retirement. Preserve its cursor.
     result, errors, changes, enrolled, observations = dict(prior.get("releases", {})), [], [], [], []
+    # This is the compare-level freshness boundary.  ``result`` intentionally
+    # starts with the prior ledger so an inactive identity can be retained, but
+    # only identities completed by this invocation are recorded here.  Native
+    # projections must consume this map rather than treating a retained
+    # ``releases`` entry as a fresh observation.
+    successful_observations = {}
+    conflict_records = {}
+    for item in identity_conflicts or ():
+        if isinstance(item, dict) and isinstance(item.get("component"), str):
+            conflict_records.setdefault(item["component"], []).append(dict(item))
+    blocked = set(conflict_records)
     def fetch(identity):
         ecosystem, name = identity; key = f"{ecosystem}:{name}"
         try:
+            if key in blocked:
+                return key, None, "IdentityConflict"
             metadata = dict(reuse[key]) if reuse and key in reuse else releases(ecosystem, name)
             if ecosystem == "github":
                 validate_github_observations(metadata)
@@ -670,7 +683,11 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None):
             previous = prior.get("releases", {}).get(key)
             history_enrolled, events = False, []
             if not error and previous is not None and key.startswith("github:"):
-                try: data, events, history_enrolled = merge_github_observations(previous, data)
+                try:
+                    data, events, history_enrolled = merge_github_observations(
+                        previous, data
+                    )
+                    data = _merge_github_alias_provenance(previous, data)
                 except Exception as failure: error = type(failure).__name__
             if checkpoint is not None: checkpoint(key, fetched if not error else None, error)
             if error:
@@ -696,15 +713,34 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None):
                     new = sorted(set(data["versions"]) - set(previous["versions"]))
                 if new: changes.append({"component": key, "new_versions": new, "source": data["source"]})
                 observations.extend({"component":key, **event} for event in events)
+                if not key.startswith("github:"):
+                    previous_versions = previous.get("versions") if isinstance(previous, dict) else None
+                    current_versions = data.get("versions") if isinstance(data, dict) else None
+                    if isinstance(previous_versions, list) and isinstance(current_versions, list):
+                        missing_versions = sorted(set(previous_versions) - set(current_versions))
+                        if missing_versions:
+                            retained_missing = data.get("absent_versions", [])
+                            if not isinstance(retained_missing, list):
+                                retained_missing = []
+                            data = {**data, "absent_versions": sorted(
+                                set(retained_missing) | set(missing_versions)
+                            )}
                 data = {**data, "versions": sorted(set(previous["versions"]) | set(data["versions"]))}
             elif prior:
                 enrolled.append({"component": key, "latest_stable": data["latest_stable"], "source": data["source"]})
             result[key] = data
+            successful_observations[key] = {
+                "observed_at": data.get("observed_at"),
+                "source": data.get("source"),
+                "kind": "reused" if reuse and key in reuse else "fresh",
+            }
     contractions = [{"component":key, "missing_observations":metadata.get("absent_observations", []),
                      "missing_versions":metadata.get("absent_versions", [])}
-                    for key,metadata in sorted(result.items()) if metadata.get("absent_observations") or metadata.get("absent_versions")]
+                    for key, metadata in sorted(result.items())
+                    if isinstance(metadata, dict) and (metadata.get("absent_observations") or metadata.get("absent_versions"))]
     for entry in inventory_result["entries"]:
-        key = f"{entry['ecosystem']}:{entry['name']}"; metadata = result.get(key, {})
+        key = f"{entry['ecosystem']}:{entry['name']}"; raw_metadata = result.get(key, {})
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         entry["latest_stable"] = metadata.get("latest_stable")
         declared = entry.get("kind") in {"dependencies", "devDependencies", "optionalDependencies",
                                              "peerDependencies", "build-dependencies", "workspace", "target"}
@@ -724,7 +760,31 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None):
             "releases": result, "registry_errors": errors, "new_releases": changes, "newly_tracked": enrolled,
             "baseline": not bool(prior), "unresolved_entries": unresolved,
             "github_observation_changes": observations, "history_contractions": contractions,
+            "successful_observations": successful_observations,
+            "identity_conflicts": sorted((item for values in conflict_records.values() for item in values),
+                                          key=lambda item: (item["component"], item.get("scope", ""), item.get("keys", []))),
             "complete": not errors and not contractions and not inventory_result["coverage_gaps"] and unresolved == 0}
+
+
+def _merge_github_alias_provenance(previous, current):
+    """Retain reconciled alias metadata after a fresh GitHub fetch."""
+    merged = dict(current)
+    aliases = set()
+    for source in (previous, current):
+        values = source.get("vortx_identity_aliases", [])
+        if isinstance(values, list):
+            aliases.update(value for value in values if isinstance(value, str))
+    if aliases:
+        merged["vortx_identity_aliases"] = sorted(aliases)
+    timestamps = {}
+    for source in (previous, current):
+        values = source.get("vortx_alias_observed_at", {})
+        if isinstance(values, dict):
+            timestamps.update({key: value for key, value in values.items()
+                               if isinstance(key, str) and isinstance(value, str)})
+    if timestamps:
+        merged["vortx_alias_observed_at"] = dict(sorted(timestamps.items()))
+    return merged
 
 
 def main():
@@ -732,6 +792,8 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--previous", type=Path)
+    parser.add_argument("--native-manifest", type=Path,
+                        help="Reviewed native operator manifest; enrolls public GitHub groups and records unsupported groups as UNVERIFIED")
     parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--journal", type=Path, help="New append-only per-component evidence; never overwrites prior evidence")
     parser.add_argument("--reuse-journal", type=Path, help="Resume only successful observations less than two hours old; not for normal daily refresh")
@@ -755,9 +817,31 @@ def main():
                     parser.error("Malformed retained release observation")
                 metadata = dict(metadata); metadata["observed_at"] = stamp
                 reused[record["component"]] = metadata
+    prior_report = json.loads(args.previous.read_text()) if args.previous else {}
     data = inventory(json.loads(args.config.read_text()))
+    native_manifest = None
+    native_adapter = None
+    identity_conflicts = []
+    if args.native_manifest:
+        try:
+            import dependency_native_adapter as native_adapter
+        except ModuleNotFoundError:
+            import importlib.util
+            module_path = Path(__file__).with_name("dependency_native_adapter.py")
+            spec = importlib.util.spec_from_file_location("dependency_native_adapter", module_path)
+            if spec is None or spec.loader is None:
+                parser.error("Native dependency adapter is unavailable")
+            native_adapter = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native_adapter)
+        native_manifest = native_adapter.load_manifest(args.native_manifest)
+        data = native_adapter.augment_inventory(data, native_manifest,
+                                                prior_report.get("native_monitor"))
+        prior_report, reused, identity_conflicts = native_adapter.reconcile_github_state(
+            prior_report, reused)
     data["monitor_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     data["config_sha256"] = hashlib.sha256(args.config.read_bytes()).hexdigest()
+    if native_manifest is not None:
+        data["native_manifest_sha256"] = native_adapter.manifest_sha256(native_manifest)
     if not args.inventory_only:
         journal = args.journal.open("x") if args.journal else None
         completed = 0
@@ -770,9 +854,47 @@ def main():
                 journal.flush()
             if completed % 100 == 0: print(f"Checked {completed} distinct registry components", flush=True)
         try:
-            data = compare(data, json.loads(args.previous.read_text()) if args.previous else {}, args.workers, record, reused)
+            data = compare(data, prior_report, args.workers, record, reused,
+                           identity_conflicts=identity_conflicts)
+            if native_manifest is not None:
+                data["native_monitor"] = native_adapter.coverage_after_compare(
+                    native_manifest, prior_report.get("native_monitor"), data)
+                data["coverage_gaps"] = native_adapter.reconcile_top_level_coverage_gaps(
+                    data.get("coverage_gaps", []), data["native_monitor"])
+                data["complete"] = (not data.get("registry_errors")
+                                     and not data.get("history_contractions")
+                                     and not data.get("coverage_gaps")
+                                     and data.get("unresolved_entries", 0) == 0)
         finally:
             if journal: journal.close()
+    if args.inventory_only and native_manifest is not None:
+        data["native_monitor"] = native_adapter.build_native_coverage(
+            native_manifest, prior_native=prior_report.get("native_monitor"))
+        data["coverage_gaps"] = native_adapter.reconcile_top_level_coverage_gaps(
+            data.get("coverage_gaps", []), data["native_monitor"])
+        if identity_conflicts:
+            data["identity_conflicts"] = identity_conflicts
+            data["complete"] = False
+    if native_manifest is None and prior_report.get("native_monitor"):
+        data["native_monitor"] = prior_report["native_monitor"]
+        generic_complete = bool(data.get("complete", False))
+        native_groups = prior_report["native_monitor"].get("groups", {})
+        unresolved_groups = sorted(
+            group for group, record in native_groups.items()
+            if not isinstance(record, dict) or record.get("status") != "observed"
+        )
+        native_gaps = prior_report["native_monitor"].get("coverage_gaps", [])
+        data["generic_complete"] = generic_complete
+        data["native_complete"] = False
+        data["native_monitor_refresh"] = {
+            "status": "not-refreshed",
+            "fresh": False,
+            "reason": "native-manifest-not-supplied",
+            "retained_observation": True,
+            "unresolved_groups": unresolved_groups,
+            "coverage_gap_count": len(native_gaps) if isinstance(native_gaps, list) else None,
+        }
+        data["complete"] = False
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("x") as output: json.dump(data, output, indent=2); output.write("\n")
     print(json.dumps({"entries": len(data["entries"]), "manifests": len(data["manifests"]),

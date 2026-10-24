@@ -451,7 +451,7 @@ private struct XperienceCatalogPage: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { if items.isEmpty { startLoad(next: false) } }
         .onDisappear { cancelLoad() }
-        .onChange(of: model.generation) { _ in
+        .onValueChange(of: model.generation) { _ in
             if !model.accepts(routeGeneration) { cancelLoad(clear: true) }
         }
         .onReceive(model.store.revisionEvents) { _ in

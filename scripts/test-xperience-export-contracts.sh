@@ -147,7 +147,7 @@ printf 'compiler_deadline_seconds=240\ncontract_runtime_deadline_seconds=60\nlif
 shasum -a 256 "$swift_bin" "$node_bin" >> "$run_dir/toolchain.txt"
 run_component compiler-version 30 "$swift_bin" --version
 inputs=(
- "$run_dir/ExactProductionDeclarations.swift" "$run_dir/CredentialScope.swift"
+ "$run_dir/ExactProductionDeclarations.swift" "$run_dir/CredentialScope.swift" "$run_dir/NativeSubtitleProofHosts.swift"
  "$run_dir/ForYouInterests.swift" "$run_dir/VortxNativeHostFieldMutation.swift"
  "$run_dir/VortxNativeBootstrapArchive.swift" "$run_dir/AddonURLGuard.swift"
  "$run_dir/AddonPairingProtocol.swift" "$run_dir/VortXEdgeAuth.swift" "$run_dir/CurationCollection.swift"

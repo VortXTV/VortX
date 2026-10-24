@@ -75,6 +75,7 @@ swiftc -strict-concurrency=complete -warnings-as-errors \
 "$build_dir/native-subtitle-background"
 swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/DVPlaybackPolicy.swift app/Sources/Player/VortXRemuxBuffer.swift \
+  app/Sources/Player/VortXHostedResponse.swift \
   app/Sources/Player/PlayerStallPolicy.swift app/Sources/Player/VortXHLSSeekAnchorState.swift \
   app/Sources/Player/AudioLanguagePolicy.swift app/Sources/Player/MultiAudioPolicy.swift \
   app/Sources/Player/SubtitleRenditionPolicy.swift app/Tests/PlayerLiveContractTests.swift \

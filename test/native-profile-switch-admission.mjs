@@ -64,9 +64,13 @@ function sourceFor(ref, path) {
 }
 
 function replaceJournalRoot(member) {
-  const pattern = /let root = try FileManager\.default\.url[\s\S]*?\.appendingPathComponent\("VortX\/native-preference-intents", isDirectory: true\)/;
-  if (!pattern.test(member)) throw new Error("nativePreferenceStore production root expression not found");
-  return member.replace(pattern, "let root = NativeProfileSwitchAdmissionEnvironment.journalRoot");
+  const patterns = [
+    /let root = try FileManager\.default\.url[\s\S]*?\.appendingPathComponent\("VortX\/native-preference-intents", isDirectory: true\)/,
+    /let root = try VortxNativeStorage\.root\(\)\s*\.appendingPathComponent\("VortX\/native-preference-intents", isDirectory: true\)/,
+  ];
+  const matched = patterns.filter(pattern => pattern.test(member));
+  if (matched.length !== 1) throw new Error("nativePreferenceStore production root expression missing or ambiguous");
+  return member.replace(matched[0], "let root = NativeProfileSwitchAdmissionEnvironment.journalRoot");
 }
 
 async function extract(outDir, baselineRef) {
@@ -79,6 +83,12 @@ async function extract(outDir, baselineRef) {
     readFile(swiftFixture, "utf8"),
   ]);
 
+  // --baseline-ref preserves every historical profile/core body above. The current mirror
+  // and scalar projection are fixture dependencies, separately hashed in the receipt below.
+  const selectionProfiles = baselineRef
+    ? await readFile(resolve(repo, "app/SourcesShared/Profiles.swift"), "utf8") : profiles;
+  const selectionRead = balancedMember(selectionProfiles, "enum ProfileSelectionRead {");
+  const selectionSnapshot = balancedMember(selectionProfiles, "private func selectionReadSnapshot()");
   const userProfile = balancedMember(profiles, "struct UserProfile");
   const profileMembers = [
     balancedMember(profiles, "func applyNativeProfiles("),
@@ -149,6 +159,9 @@ async function extract(outDir, baselineRef) {
   const combined = [
     "import Foundation",
     "import CryptoKit",
+    "import os",
+    "",
+    selectionRead,
     "",
     userProfile,
     "",
@@ -157,6 +170,7 @@ async function extract(outDir, baselineRef) {
     fixtureWithCaptureShell,
     "",
     "extension ProfileStore {",
+    selectionSnapshot,
     ...(nativeSwitchPreferenceCapture ? [nativeSwitchPreferenceCapture] : []),
     ...profileMembers,
     "}",
@@ -186,7 +200,10 @@ async function extract(outDir, baselineRef) {
       : await readFile(resolve(repo, path));
     sourceHashes[path] = sha256(selected);
   }
+  sourceHashes["working-tree:app/SourcesShared/Profiles.swift#selectionDependency"] = sha256(selectionProfiles);
   const bodyHashes = {
+    "ProfileSelectionRead": sha256(selectionRead),
+    "ProfileStore.selectionReadSnapshot": sha256(selectionSnapshot),
     "ProfileStore.applyNativeProfiles": sha256(profileMembers[0]),
     "ProfileStore.prepareNativeAction": sha256(profileMembers[1]),
     "ProfileStore.saveNative(admission)": sha256(profileMembers[2]),
@@ -227,11 +244,20 @@ async function extract(outDir, baselineRef) {
       moduleSHA256: process.env.VORTX_PROFILE_SWITCH_MODULE_SHA256 || "unprovided",
       verifiedByWrapper: process.env.VORTX_PROFILE_SWITCH_SDK_VERIFIED === "1",
     },
+    fixtureDependencies: {
+      profileSelectionRead: {
+        sourceRef: "working-tree", sourceSHA256: sha256(selectionProfiles),
+        namespaceSHA256: sha256(selectionRead), projectionSHA256: sha256(selectionSnapshot),
+        publisher: "RAM ProfileStore singleton initializes once; both stored properties bracket mutation with real mirror writers",
+        boundary: "This is not historical mirror/startup behavior or real Combine publication coverage",
+      },
+    },
     sourceHashes,
     bodyHashes,
     combinedSHA256: sha256(combined),
     boundary: {
       productionBodies: [
+        "ProfileSelectionRead", "ProfileStore.selectionReadSnapshot",
         "ProfileStore.applyNativeProfiles", "ProfileStore.prepareNativeAction", "ProfileStore.selectNative",
         "ProfileStore.saveNative", "ProfileStore.applyPlayback", "ProfileStore.applyDiscovery",
         "ProfileStore.activeSharesMainAddons", "ProfileStore.addonPreferences", "ProfileStore.effectiveAddonRanking",

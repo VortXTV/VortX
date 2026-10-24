@@ -37,7 +37,7 @@ private func violations(in source: String) -> [String] {
     if executable.contains(".onReceive(account.$isSignedIn)") {
         found.append("replaying account publisher is subscribed with onReceive")
     }
-    if !executable.contains(".onChange(of: account.isSignedIn)") {
+    if !executable.contains(".onValueChange(of: account.isSignedIn)") {
         found.append("real account sign-in transition is not observed with onChange")
     }
     return found

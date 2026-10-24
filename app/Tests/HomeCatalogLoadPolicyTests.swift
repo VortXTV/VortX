@@ -103,8 +103,13 @@ enum HomeCatalogLoadPolicyTests {
         )
         let boardRebuild = section(
             bridge,
-            from: "private func scheduleBoardRebuild()",
-            until: "private func buildBoardRows()"
+            from: "private func scheduleNativeLegacyBoard(receipt:",
+            until: "private static func prepareNativeLegacyBoard"
+        )
+        let boardPreparation = section(
+            bridge,
+            from: "private static func prepareNativeLegacyBoard(receipt:",
+            until: "\n    }\n"
         )
         let reload = section(
             preferences,
@@ -146,9 +151,17 @@ enum HomeCatalogLoadPolicyTests {
               refreshAddons.contains("if !CatalogPrefsStore.order().isEmpty")
                 && refreshAddons.contains("ensureCatalogOrderRangeLoaded"))
         check("the authoritative board total closes any interim manifest-count gap",
-              boardRebuild.contains("self.boardCatalogTotal = boardState?.catalogs.count ?? 0")
+              boardRebuild.contains("self.boardCatalogTotal = sample.state?.catalogs.count ?? 0")
                 && boardRebuild.contains("if !CatalogPrefsStore.order().isEmpty")
                 && boardRebuild.contains("ensureCatalogOrderRangeLoaded(installedCatalogTotal: 0)"))
+        check("native legacy board work stays detached and preparation stays value-only",
+              boardRebuild.contains("Task.detached(priority: .userInitiated)")
+                && boardRebuild.contains("prepareNativeLegacyBoard(receipt: receipt, preferences: preferences)")
+                && boardRebuild.contains("DispatchQueue.main.asyncAfter")
+                && boardPreparation.contains("nativeLegacyDecode(CoreBoardState.self")
+                && boardPreparation.contains("nativeLegacyDecode(CoreCtx.self")
+                && !boardPreparation.contains("JSONEncoder")
+                && !boardPreparation.contains("JSONSerialization"))
         check("a local visibility-only change remains a row rebuild",
               hidden.contains("CoreBridge.shared.rebuildBoardRows()")
                 && !hidden.contains("catalogOrderDidChange"))

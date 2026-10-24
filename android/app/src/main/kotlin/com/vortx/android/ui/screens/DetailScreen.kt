@@ -93,6 +93,9 @@ import com.vortx.android.catalog.WatchAvailability
 import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.sources.SourceQuickFilterIndex
+import com.vortx.android.sources.SourceQuickFilters
+import com.vortx.android.ui.components.SourceQuickFilterControls
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
@@ -122,6 +125,7 @@ import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.randompick.RandomEpisodePickControls
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.episodeRailTargetIndex
 import com.vortx.android.ui.components.episodeRailPageIndex
@@ -188,7 +192,9 @@ fun DetailScreen(
     modifier: Modifier = Modifier,
     /** A one-shot request from Cinema Quick View; normal detail visits retain manual playback. */
     autoWatch: Boolean = false,
-    onAutoWatchConsumed: () -> Unit = {},
+    onAutoWatchConsumed: () -> Boolean = { true },
+    autoWatchAdmission: () -> Boolean = { true },
+    onAutoWatchCancelled: () -> Boolean = { true },
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -201,7 +207,9 @@ fun DetailScreen(
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
     val sourceAudioLanguageHint by viewModel.sourceAudioLanguageHint.collectAsStateWithLifecycle()
+    val cacheDisplayRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
+    val randomEpisodePick by viewModel.randomEpisodePickState.collectAsStateWithLifecycle()
     // DET meta recovery: a non-`tt` catalog id nothing could resolve shows the terminal "Details
     // unavailable" page (with a working Try Again) instead of the old back-navigating error.
     val metaUnavailable by viewModel.metaUnavailable.collectAsStateWithLifecycle()
@@ -281,10 +289,20 @@ fun DetailScreen(
             viewModel = personVm,
             seed = seed,
             onBack = { personTarget = null },
-            onOpenTitle = { titleTarget = it },
+            onOpenTitle = { item ->
+                if (onAutoWatchCancelled()) {
+                    viewModel.clearRandomEpisodePick()
+                    titleTarget = item
+                }
+            },
             modifier = modifier,
         )
         return
+    }
+
+    // Only the uncovered Detail owns pending local picks. Disposal does not close an accepted player lease.
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.clearRandomEpisodePick() }
     }
 
     // Returning from a player route, or a failed source resolve, must return the viewer to the episode they
@@ -436,11 +454,14 @@ fun DetailScreen(
         onDispose { relatedLookupFence.invalidate() }
     }
     val openRelated: (MetaItem) -> Unit = { item ->
-        val generation = relatedLookupFence.begin()
-        relatedLookupJob?.cancel()
-        relatedLookupJob = scope.launch {
-            val resolved = resolveRelatedDetailTitle(item)
-            if (relatedLookupFence.accepts(generation)) titleTarget = resolved
+        if (onAutoWatchCancelled()) {
+            viewModel.clearRandomEpisodePick()
+            val generation = relatedLookupFence.begin()
+            relatedLookupJob?.cancel()
+            relatedLookupJob = scope.launch {
+                val resolved = resolveRelatedDetailTitle(item)
+                if (relatedLookupFence.accepts(generation)) titleTarget = resolved
+            }
         }
     }
 
@@ -456,15 +477,29 @@ fun DetailScreen(
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
+    val beginManualPlayback: (() -> Unit) -> Unit = { action ->
+        if (onAutoWatchCancelled()) beginPlayback(action)
+    }
     val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
-        pendingLaunchEnginePreference = engine
-        action()
+        if (onAutoWatchCancelled()) {
+            pendingLaunchEnginePreference = engine
+            action()
+        }
     }
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
     LaunchedEffect(playback, metaState) {
+        val ready = playback as? Playback.Ready
+        if (ready != null && !ready.isAdmitted()) {
+            if (viewModel.playback.value === ready) {
+                ready.playable.playbackLease?.close()
+                viewModel.clearPlayback()
+            }
+            return@LaunchedEffect
+        }
         val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        if (viewModel.playback.value !== playback) return@LaunchedEffect
         onPlay(resolved.playable, resolved.metadata, pendingLaunchEnginePreference)
         viewModel.clearPlayback()
     }
@@ -494,8 +529,8 @@ fun DetailScreen(
     // dispatch so recomposition, an arriving source group, or returning from the player cannot launch twice.
     LaunchedEffect(autoWatch, metaState, streamsState, resolving) {
         if (!autoWatch || resolving || metaState !is UiState.Success || viewModel.bestSource() == null) return@LaunchedEffect
-        onAutoWatchConsumed()
-        beginPlayback { viewModel.playBest() }
+        if (!onAutoWatchConsumed()) return@LaunchedEffect
+        beginPlayback { viewModel.playBestWhen(autoWatchAdmission) }
     }
 
     // Tablet (and any wide window): season posters and a grid of episode cards, the approved detail design.
@@ -532,6 +567,7 @@ fun DetailScreen(
             ) {
                 item { Backdrop(m.data) }
                 item {
+                    Column {
                     ActionsCluster(
                         m = m.data,
                         primaryEpisode = viewModel.primaryEpisode(),
@@ -541,23 +577,43 @@ fun DetailScreen(
                         launchPlayerChoices = launchPlayerChoices,
                         launchEnginePreference = launchEnginePreference,
                         onSelectLaunchEngine = { launchEnginePreference = it },
-                        onWatch = { beginPlayback { viewModel.playBest() } },
+                        onWatch = { beginManualPlayback { viewModel.playBest() } },
                         playFromStartEnabled = viewModel.resumeAvailable() && !resolving,
-                        onPlayFromStart = { beginPlayback { viewModel.playBest(fromStart = true) } },
-                        onToggleSources = { sourcesOpen = !sourcesOpen },
+                        onPlayFromStart = { beginManualPlayback { viewModel.playBest(fromStart = true) } },
+                        onToggleSources = { if (onAutoWatchCancelled()) sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         watchlisted = watchlisted,
                         onToggleWatchlist = viewModel::toggleWatchlist,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
-                        onTrailer = { beginPlayback { viewModel.playTrailer() } },
+                        onTrailer = { beginManualPlayback { viewModel.playTrailer() } },
                         trailerLanguageChips = trailerLanguageChips,
                         onTrailerLanguage = { language ->
                             // Queue the override, then use the exact same ViewModel entry point as Trailer.
                             TrailerCoordinator.forceNextAudioLanguage(m.data.trailerYouTubeId.orEmpty(), language)
-                            beginPlayback { viewModel.playTrailer() }
+                            beginManualPlayback { viewModel.playTrailer() }
                         },
                     )
+                    if (m.data.type == MediaType.SERIES) {
+                        RandomEpisodePickControls(
+                            state = randomEpisodePick,
+                            onPick = {
+                                if (onAutoWatchCancelled()) viewModel.pickRandomEpisode()
+                            },
+                            onOpen = {
+                                if (onAutoWatchCancelled()) {
+                                    viewModel.openRandomEpisode { episode ->
+                                        sourcesOpen = true
+                                        restoreEpisodeFocusId = episode.id
+                                    }
+                                }
+                            },
+                            onPlay = { beginManualPlayback { viewModel.playRandomEpisode() } },
+                            playEnabled = !resolving,
+                            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+                        )
+                    }
+                    }
                 }
                 // DET-8: the one-line rationale for the auto-picked source (#16), shown once under the hero
                 // actions when the ranker chose the best stream for a decisive reason (instant-from-cache,
@@ -598,19 +654,21 @@ fun DetailScreen(
                         SurfaceCard(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
                             SourcesSection(
                                 state = streamsState,
+                                quickFilterScope = viewModel to selectedEpisodeId,
+                                currentCacheRevision = maxOf(cacheDisplayRevision, DebridKeys.credentialRevision.value),
                                 resolving = resolving,
                                 failure = (playback as? Playback.Failed)?.message,
                                 downloadNotice = downloadNotice,
                                 sort = sourceSort,
                                 onSortChange = viewModel::setSourceSort,
                                 audioLanguageHint = sourceAudioLanguageHint,
-                                onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
-                                onRefresh = viewModel::refreshSources,
+                                onAudioLanguageHintChange = { language -> if (onAutoWatchCancelled()) viewModel.setSourceAudioLanguageHint(language) },
+                                onRefresh = { if (onAutoWatchCancelled()) viewModel.refreshSources() },
                                 pin = pinUi,
                                 entryNoun = viewModel.pinEntryNoun,
                                 onPin = viewModel::pinSource,
                                 onUnpin = viewModel::unpinSource,
-                                onPlay = { source -> beginPlayback { viewModel.play(source) } },
+                                onPlay = { source -> beginManualPlayback { viewModel.play(source) } },
                                 onPlayWithEngine = { source, engine ->
                                     beginPlaybackWithEngine(engine) { viewModel.play(source) }
                                 },
@@ -648,7 +706,12 @@ fun DetailScreen(
                         CreditsSection(
                             m = m.data,
                             castMembers = castMembers,
-                            onPersonTap = { personTarget = it },
+                            onPersonTap = { person ->
+                                if (onAutoWatchCancelled()) {
+                                    viewModel.clearRandomEpisodePick()
+                                    personTarget = person
+                                }
+                            },
                         )
                     }
                 }
@@ -658,7 +721,7 @@ fun DetailScreen(
                             detail = m.data,
                             wide = wideDetail,
                             selectedSeason = selectedSeason ?: m.data.videos.first().season,
-                            onSelectSeason = viewModel::selectSeason,
+                            onSelectSeason = { season -> if (onAutoWatchCancelled()) viewModel.selectSeason(season) },
                             onMarkSeasonWatched = viewModel::setSeasonWatched,
                             onMarkSeriesWatched = viewModel::setWatched,
                         )
@@ -690,8 +753,10 @@ fun DetailScreen(
                                 if (veiled) {
                                     revealedEpisodeIds = revealedEpisodeIds + episode.id
                                 } else {
-                                    if (viewModel.autoPickEnabled) sourcesOpen = true
-                                    viewModel.selectEpisode(episode.id)
+                                    if (onAutoWatchCancelled()) {
+                                        if (viewModel.autoPickEnabled) sourcesOpen = true
+                                        viewModel.selectEpisode(episode.id)
+                                    }
                                 }
                             },
                             onToggleWatched = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
@@ -2024,6 +2089,8 @@ private val sourceSortOptions: List<Pair<String, String>> = listOf(
 @Composable
 private fun SourcesSection(
     state: UiState<List<StreamGroup>>,
+    quickFilterScope: Any,
+    currentCacheRevision: Long,
     resolving: Boolean,
     failure: String?,
     downloadNotice: String?,
@@ -2052,6 +2119,7 @@ private fun SourcesSection(
     var qualityOpen by remember { mutableStateOf(false) }
     var qualityTier by remember { mutableStateOf<String?>(null) }
     var audioOpen by remember { mutableStateOf(false) }
+    var quickFilters by remember(quickFilterScope) { mutableStateOf(SourceQuickFilters()) }
     val clipboard = LocalClipboardManager.current
     // Compact source rows (SET-10, Apple `vortx.streams.compactLabels`). Read live off SharedPreferences so
     // returning from the Sources settings screen recomposes this and reflects the new density immediately;
@@ -2069,6 +2137,11 @@ private fun SourcesSection(
                 val total = groups.sumOf { it.streams.size }
                 val effectiveSourceFilter = sourceFilter?.takeIf { addon -> groups.any { it.addon == addon } }
                 val filteredGroups = groups.filter { effectiveSourceFilter == null || it.addon == effectiveSourceFilter }
+                val facetIndex = remember(filteredGroups) { SourceQuickFilterIndex(filteredGroups) }
+                val facetGroups = remember(facetIndex, quickFilters, currentCacheRevision) {
+                    facetIndex.matchingGroups(quickFilters, currentCacheRevision)
+                }
+                val facetCount = facetGroups.sumOf { it.streams.size }
                 val sourceAnchors = remember(groups.map { it.addon }) {
                     groups.associate { it.addon to BringIntoViewRequester() }
                 }
@@ -2219,7 +2292,22 @@ private fun SourcesSection(
                                 onClick = { clipboard.setText(AnnotatedString(links.joinToString("\n"))) },
                             )
                         }
+                        SourceQuickFilterControls(
+                            filters = quickFilters,
+                            onChange = {
+                                quickFilters = it
+                                pinMenuFor = null
+                                renderLimit = SOURCE_WINDOW_INITIAL
+                            },
+                            button = { label, selected, click -> Chip(label = label, selected = selected, onClick = click) },
+                        )
                     }
+                    Text(
+                        "List filters · $facetCount of ${filteredGroups.sumOf { it.streams.size }} sources. " +
+                            "Range/codec are provider-reported; cache Unknown means not confirmed. " +
+                            "Quality, Audio and Watch Now stay unchanged.",
+                        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
+                    )
                 }
                 failure?.let {
                     Text(text = it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.danger))
@@ -2231,13 +2319,15 @@ private fun SourcesSection(
                 }
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
+                } else if (facetCount == 0) {
+                    Text("No sources match these list filters. Choose All or Reset list filters.", style = VortXTheme.type.body)
                 }
                 // DET-2 grouped, collapsible, windowed list. One tappable header per add-on (name + count +
                 // chevron, remembered collapsed set) with its rows beneath, filtered by the active chip. The
                 // window caps how many rows are built at once (a popular title returns thousands); "Show more"
                 // grows it. Collapsed groups emit a header only and spend no budget (Apple's `windowedPlan`).
                 // Groups + streams are already ranked best-first by the assembly; sort reorders WITHIN a group.
-                val filtered = filteredGroups
+                val filtered = facetGroups
                 var budget = renderLimit
                 var shownRows = 0
                 val anchoredAddons = HashSet<String>()

@@ -44,6 +44,27 @@ private func appearsBefore(_ needle: String, _ other: String, in source: String)
 }
 
 let bridge = source("SourcesShared/CoreBridge.swift")
+// Select the native/legacy lane from the production declaration itself.  Do not
+// infer a lane from a helper's presence or absence: an incomplete extraction is
+// a hard failure, never permission to run the legacy assertions.
+let nativeModeDeclaration = member(bridge, "var usesNativeProfileState: Bool {")
+let normalizedNativeModeDeclaration = nativeModeDeclaration.trimmingCharacters(in: .whitespacesAndNewlines)
+let guardedMetadata: Bool
+if normalizedNativeModeDeclaration == "var usesNativeProfileState: Bool {\n        true\n    }" {
+    guardedMetadata = true
+} else if normalizedNativeModeDeclaration == "var usesNativeProfileState: Bool {\n        false\n    }" {
+    guardedMetadata = false
+} else {
+    fatalError("Cannot classify explicit usesNativeProfileState mode")
+}
+// Narrow current-source contract selection, NOT a compiler/extraction/runtime proof.
+private func member(_ source: String, _ marker: String) -> String {
+    guard source.components(separatedBy: marker).count == 2,
+          let start = source.range(of: marker),
+          let end = source.range(of: "\n    }\n", range: start.upperBound..<source.endIndex) else { return "" }
+    return String(source[start.lowerBound..<end.upperBound])
+}
+
 let stremioCard = source("SourcesShared/StremioConnectCard.swift")
 let accountSource = source("SourcesShared/StremioAccount.swift")
 let syncSource = source("SourcesShared/VortXSyncManager.swift")
@@ -56,13 +77,24 @@ let nativeCredentialResolver = section(bridge, from: "func nativeCredentialSlot"
 let ownerConnection = section(bridge, from: "private func authenticateNativeOwnerAccount", until: "private static func readNativeCredential")
 let profileCredentialResolver = section(profileSource, from: "var activeKeychainAccount", until: "static func legacyKeychainAccount")
 let legacyTokenMigration = section(accountSource, from: "private func migrateTokenToKeychain", until: "func signIn(email")
-check(nativeCredentialResolver.contains("selectedOwnerSlot(scope: capture.namespace, ownerProfileID: ownerID")
-      && nativeCredentialResolver.contains(".string(\"shared\")")
-      && !nativeCredentialResolver.contains("primaryTokenAccount")
-      && profileCredentialResolver.contains("vortx.native.streaming.unavailable.no-profile")
-      && profileCredentialResolver.contains("#else\n        return Self.legacyKeychainAccount")
-      && legacyTokenMigration.contains("#if !VORTX_NATIVE_DATA_ENGINE"),
-      "native owner/shared credentials never borrow global legacy primary or migrate unqualified defaults")
+if guardedMetadata {
+    check(nativeCredentialResolver.contains("selectedOwnerSlot(scope: capture.namespace, ownerProfileID: ownerID")
+          && nativeCredentialResolver.contains(".string(\"shared\")")
+          && !nativeCredentialResolver.contains("primaryTokenAccount")
+          && profileCredentialResolver.contains("vortx.native.streaming.unavailable.no-profile")
+          && profileCredentialResolver.contains("return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)")
+          && !profileCredentialResolver.contains("primaryTokenAccount")
+          && !accountSource.contains("private func migrateTokenToKeychain"),
+          "native owner/shared credentials never borrow global legacy primary or migrate unqualified defaults")
+} else {
+    check(nativeCredentialResolver.contains("selectedOwnerSlot(scope: capture.namespace, ownerProfileID: ownerID")
+          && nativeCredentialResolver.contains(".string(\"shared\")")
+          && !nativeCredentialResolver.contains("primaryTokenAccount")
+          && profileCredentialResolver.contains("vortx.native.streaming.unavailable.no-profile")
+          && profileCredentialResolver.contains("#else\n        return Self.legacyKeychainAccount")
+          && legacyTokenMigration.contains("#if !VORTX_NATIVE_DATA_ENGINE"),
+          "legacy owner/shared credentials retain explicit migration/default isolation")
+}
 check(appearsBefore("authenticatedIdentity(authKey: token)", "connectOwner(token: token", in: ownerConnection)
       && ownerConnection.contains("expectedSelection: target.expectedOwnerSelection")
       && ownerConnection.contains("generations: [generation]")
@@ -77,24 +109,32 @@ let autoAddSource = source("SourcesShared/LibraryAutoAdd.swift")
 let seed = section(bridge, from: "private func seedInitialState()", until: "/// Refresh the installed-addons")
 let refresh = section(bridge, from: "private func refreshAddons()", until: "/// Remove an installed addon")
 let continueWatching = section(bridge, from: "func rebuildContinueWatching()", until: "/// FLOOR each engine")
-let event = section(bridge, from: "fileprivate func handleEvent", until: "// MARK: meta_details coalesce")
-let libraryEvent = section(event, from: "if fields.contains(\"library\")", until: "if fields.contains(\"search\")")
+let event = guardedMetadata
+    ? member(bridge, "private func admitNativeLegacyChange(") + member(bridge, "private func publishNativeLegacySample(")
+    : section(bridge, from: "fileprivate func handleEvent", until: "// MARK: meta_details coalesce")
+let libraryEvent = guardedMetadata ? member(bridge, "private func publishNativeLegacyHistory(")
+    : section(event, from: "if fields.contains(\"library\")", until: "if fields.contains(\"search\")")
 let catalogAdd = section(bridge, from: "func addToLibrary(metaId:", until: "func addToLibraryFromMenu(")
 let catalogWatched = section(bridge, from: "func setCatalogWatched(metaId:", until: "/// The raw `MetaItemPreview`")
 let menuAdd = section(bridge, from: "func addToLibraryFromMenu(", until: "func removeFromLibraryFromMenu(")
 let menuRemove = section(bridge, from: "func removeFromLibraryFromMenu(", until: "/// Add a fully-formed meta object")
 let tvCards = source("SourcesTV/SharedUI.swift")
 let iosCards = source("SourcesiOS/iOSRootView.swift")
-let meta = section(bridge, from: "private func scheduleMetaDetailsRepublish()", until: "private static func appleCWMetaRefreshIsSettled")
-let board = section(bridge, from: "private func scheduleBoardRebuild()", until: "private func buildBoardRows()")
+let meta = guardedMetadata ? member(bridge, "private func scheduleOwnedMetadata(") + member(bridge, "private func publishOwnedMetadata(")
+    : section(bridge, from: "private func scheduleMetaDetailsRepublish()", until: "private static func appleCWMetaRefreshIsSettled")
+let board = guardedMetadata ? member(bridge, "private func scheduleNativeLegacyBoard(")
+    : section(bridge, from: "private func scheduleBoardRebuild()", until: "private func buildBoardRows()")
 let rebuild = section(bridge, from: "func rebuildBoardRows()", until: "/// The Home board rows")
 let repair = section(bridge, from: "private func scheduleSessionRepair()", until: "/// Refresh the library")
 let settlement = section(bridge, from: "private func settleAccountBindingIfProven()", until: "private func finishSettledAccountBinding()")
 let finishSettlement = section(bridge, from: "private func finishSettledAccountBinding()", until: "/// Dispatch an `Action::Ctx")
-let invalidation = section(bridge, from: "private func invalidatePublicationEpoch()", until: "/// ProfileStore calls")
+let invalidation = guardedMetadata ? member(bridge, "private func detachPublicationEpochStorage(")
+    : section(bridge, from: "private func invalidatePublicationEpoch()", until: "/// ProfileStore calls")
 let profileChange = section(bridge, from: "func activeProfileDidChange()", until: "private func verifyAccountBinding")
 let bootstrap = section(bridge, from: "private func bootstrapAuth()", until: "/// Self-heal a stale")
-let logout = section(bridge, from: "func logOut(rearmSignedOutRepair", until: "/// Clear the published")
+let logout = member(bridge, "func logOut(rearmSignedOutRepair")
+let disconnect = member(stremioCard, "private func disconnect()")
+let accountSignOut = member(accountSource, "func signOut()")
 let beginBinding = section(bridge, from: "private func beginAccountBinding", until: "private func cancelAccountBindingVerification")
 let invalidateAuth = section(bridge, from: "private func invalidateAuthenticationGeneration()", until: "private func retireSignedOutRepairRequest()")
 let signedOutRearm = section(bridge, from: "private func rearmSignedOutRepairWhenSafe", until: "/// Clear the published")
@@ -104,10 +144,23 @@ let localRecovery = section(bridge, from: "private func captureImportedAwayLocal
 let dispatch = section(bridge, from: "func dispatch(action:", until: "/// Compact human name")
 let uninstallAddon = section(bridge, from: "func uninstallAddon(_ descriptor:", until: "/// Normalize a pasted")
 let installAddon = section(bridge, from: "func installAddonConfirmed", until: "struct AddonManifestPreview")
-let hydrateAddons = section(bridge, from: "func hydrateAddonsFromAccount", until: "/// stremio-core")
-let nativeRevoke = section(bridge, from: "private func revokeNativeSession()", until: "private func clearNativePublishedState()")
-let nativeClear = section(bridge, from: "private func clearNativePublishedState()", until: "/// Bumped on every")
+let hydrateAddons = section(bridge, from: "func hydrateAddonsFromAccount", until: "/// The native host presentation schema version.")
+let nativeRevoke = guardedMetadata ? member(bridge, "private func revokeNativeSession(")
+    : section(bridge, from: "private func revokeNativeSession()", until: "private func clearNativePublishedState()")
+let nativeClear = guardedMetadata ? member(bridge, "private func clearNativePublishedState(")
+    : section(bridge, from: "private func clearNativePublishedState()", until: "/// Bumped on every")
 
+if guardedMetadata {
+    let commit = member(bridge, "private func commitOriginalMetadataClear(")
+    check(!nativeRevoke.isEmpty && !nativeClear.isEmpty && !nativeRevoke.contains("DispatchQueue.main.sync")
+        && nativeRevoke.contains("nativeCallbackLifetime.retire()")
+        && nativeClear.contains("let owns = { self.originalMetadataClearAuthorityIsCurrent(clear) }")
+        && nativeClear.contains("continueWatching = []; guard owns() else { return nil }")
+        && nativeClear.contains("addons = []; guard owns() else { return nil }")
+        && commit.contains("guard commitOwnedMetadataClear(bumpStreams: bumpStreams, preservingClear: clear.identity,")
+        && commit.contains("finalAdmission: .localOriginal) else { return false }"),
+        "native owner clear uses actor entry, original authority and guarded final nil frame without main.sync")
+} else {
 check(nativeRevoke.contains("DispatchQueue.main.sync")
                 && appearsBefore("invalidatePublicationEpoch()", "clearNativePublishedState()", in: nativeRevoke)
                 && !nativeClear.contains("DispatchQueue.main.async")
@@ -117,6 +170,7 @@ check(nativeRevoke.contains("DispatchQueue.main.sync")
                 && nativeClear.contains("AddonMetaGate.publish(false)")
                 && appearsBefore("revokeNativeSession()", "restoreNativeCheckpoint()", in: profileChange),
               "native owner/profile revoke clears all published rows and capabilities synchronously before reopen")
+}
 let nativeTarget = section(accountSource, from: "static func capture(core:", until: "func stillOwnsOwnerHistoryContext")
 let nativeSave = section(accountSource, from: "func saveProgress(for", until: "/// Fetch a single library item")
 let nativeResume = section(accountSource, from: "func resumeOffset(for", until: "/// Upsert the library item")
@@ -129,8 +183,14 @@ check(watchedInventoryIntent.contains("let epoch = binding.accountGeneration")
 check(appearsBefore("let epoch = binding.accountGeneration", "Task {", in: watchedInventoryResolution)
       && watchedInventoryResolution.contains("expectedAccountGeneration: epoch"),
       "deferred watched inventory captures account epoch before scheduling its task")
-for start in ["func add(_ profile:", "func update(_ profile:", "func remove(_ profile:", "func select(_ profile:"] {
-    let admission = section(profileSource, from: start, until: "#endif")
+let profileWrapperBoundaries: [(String, String)] = [
+    ("func add(_ profile:", "func update(_ profile:"),
+    ("func update(_ profile:", "/// Flip an add-on"),
+    ("func remove(_ profile:", "/// Apply web-authored"),
+    ("func select(_ profile:", "func add(_ profile:")
+]
+for (start, end) in profileWrapperBoundaries {
+    let admission = section(profileSource, from: start, until: end)
     check(appearsBefore("let target = CoreBridge.shared.captureNativePlaybackTarget()", "Task { @MainActor", in: admission)
           && admission.contains("target: target"), "profile wrapper captures immutable account/session before queued Task: \(start)")
 }
@@ -145,10 +205,19 @@ check(nativeTarget.contains("core.captureNativePlaybackTarget()")
                 && appearsBefore("nativeResumeSeconds", "ProfileStore.shared.resumeOffset", in: nativeResume),
               "native player callbacks carry account capture and bypass legacy overlay/network resume/progress")
 let selectedProgress = section(bridge, from: "func reportProgress(timeSeconds:", until: "private func dispatchMetaDetails")
+let signedOutRepairRequest = section(bridge, from: "@MainActor\n    private var signedOutRepairRequest: SignedOutRepairRequest? {", until: "/// Set only by the token-matched")
+let logoutPendingGate = section(bridge, from: "private var logoutAccountMutationPending: Bool {", until: "/// Add-on operations")
 check(selectedProgress.contains("let (facade, _) = nativePlaybackBinding(target)")
                 && selectedProgress.contains("facade.dispatchCaptured(data: data, field: \"player\", expectedAccountGeneration: epoch)")
-                && appearsBefore("timeSeconds * 1000 < Double(Int.max)", "Int(timeSeconds * 1000)", in: selectedProgress),
-              "selected native progress keeps the captured facade and bounds millisecond conversion")
+                && appearsBefore("timeSeconds * 1000 < Double(Int.max)", "Int(timeSeconds * 1000)", in: selectedProgress)
+                && selectedProgress.contains("guard usesNativeProfileState else { return }")
+                && !selectedProgress.contains("if usesNativeProfileState {")
+                && !selectedProgress.contains("dispatch(action: [\"action\": \"Player\"")
+                && bridge.contains("private let signedOutRepairRequestState = OSAllocatedUnfairLock<SignedOutRepairRequest?>(initialState: nil)")
+                && signedOutRepairRequest.contains("get { signedOutRepairRequestState.withLock { $0 } }")
+                && signedOutRepairRequest.contains("set { signedOutRepairRequestState.withLock { $0 = newValue } }")
+                && logoutPendingGate.contains("signedOutRepairRequestState.withLock { $0 != nil }"),
+              "selected native progress retains every actual guard, removes the retired legacy Player tail, and shares one checked optional logout store with the actor-owned property")
 let nativeAutoAdd = section(bridge, from: "func addCatalogItemToAccount", until: "/// VortX-owned cold recovery")
 check(appearsBefore("facade.addCatalogItem", "let binding = settledActiveAccountBinding()", in: nativeAutoAdd)
                 && nativeAutoAdd.contains("nativePlaybackBinding(target)?.0 === facade")
@@ -200,7 +269,12 @@ check(detachedSeed.contains("VortxNativeSession.detachedLegacySync")
       && appearsBefore("pushSyncDocAt(candidate, version: 0", "pullDocVersionedResult", in: detachedSeed)
       && !detachedSeed.contains("rememberAuthenticatedScope") && !detachedSeed.contains("installNativeSession"),
       "proven-empty seed is detached until create-only PUT and authenticated winner readback")
-let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "// Read-merge the pulled doc's tombstone stamps")
+let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "private func foldDocTombstones(")
+let nativeExportReturn = guardedMetadata
+    ? nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n    }")
+    : nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n#else")
 check(nativePush.contains("let conversion = nativeLegacyConversionDecision(doc, capture: capture)")
                 && nativePush.contains("var prepared: NativeLegacyPreparation?")
                 && nativePush.contains("if conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }")
@@ -212,20 +286,52 @@ check(nativePush.contains("let conversion = nativeLegacyConversionDecision(doc, 
                 && nativePush.contains("hasDirtySettings: (try? nativeGlobalEdits()) == nil")
                 && nativePush.contains("doc[\"nativeHostPreferences\"]")
                 && nativePush.contains("orderIntent != nil || pendingAddonOrderIntent != nil")
-                && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
-                    + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n#else"),
+                && nativeExportReturn,
               "native export checks the legacy receipt and returns unchanged sibling carriers without legacy mirror rewrites")
 
+if guardedMetadata {
+    check(bridge.contains("private let publicationEpochState = OSAllocatedUnfairLock")
+        && member(bridge, "private func capturePublicationToken(").contains("publicationEpochState.withLock")
+        && invalidation.contains("publicationEpochState.withLock { $0 &+= 1 }"),
+        "production owns checked scalar worker-safe epoch capture and actor-owned retirement")
+} else {
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
                 && bridge.contains("private func invalidatePublicationEpoch()"),
               "production owns a lock-backed worker-safe publication epoch")
+}
+if guardedMetadata {
+    let callback = member(bridge, "private func makeNativeSourceCallback(")
+    let mailbox = member(bridge, "private struct NativeSourceMailbox:")
+    check(callback.contains("let epoch = publicationEpochState")
+        && callback.contains("publication: epoch.withLock { PublicationToken(epoch: $0) }")
+        && callback.contains("lifetime.accepts(installation, credential: credential, sourceID: event.sourceID)")
+        && callback.contains("let mailbox = NativeSourceMailbox()")
+        && appearsBefore("guard mailbox.append(.init(event: event, origin: origin)) else { return }",
+                         "Task { @MainActor in", in: callback)
+        && callback.contains("while let batch = mailbox.takeBatch() {")
+        && callback.contains("for envelope in batch { receiver.receive(envelope.event, origin: envelope.origin) }")
+        && mailbox.contains("value.pending.append(envelope)")
+        && mailbox.contains("swap(&batch, &value.pending)")
+        && !callback.contains("authBindingGeneration")
+        && !callback.contains("[weak self]") && !callback.contains("self."),
+        "real typed source callback retains original scalars and per-install append/drain order without mixed Bridge capture")
+} else {
 check(!event.contains("let publicationGeneration = authBindingGeneration")
                 && event.contains("let publicationToken = capturePublicationToken()"),
               "Rust NewState worker never reads main-owned auth generation")
+}
+if guardedMetadata {
+    let receiver = member(bridge, "private final class NativeCallbackReceiver")
+    check(receiver.contains("core.nativeCallbackOriginIsCurrent(origin)")
+        && appearsBefore("core.receiveOwnedMetadata(event, origin: origin)", "core.receiveNativeLegacyEvent(event, origin: origin)", in: receiver)
+        && event.contains("guard nativeCallbackOriginIsCurrent(origin),"),
+        "typed native source validates original context before metadata and separate legacy delivery")
+} else {
 check(appearsBefore("let bindingSettled = self.settleAccountBindingIfProven()", "guard !self.enginePublicationBlocked", in: event)
                 && !event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                // `ctx` is control-plane"),
               "pending-B ctx receipt reaches identity settlement before data publication is gated")
+}
 check(settlement.contains("invalidatePublicationEpoch()")
                 && invalidation.contains("continueWatchingRebuildGeneration &+= 1"),
               "settlement advances epoch and invalidates stale Continue Watching rebuilds")
@@ -236,28 +342,76 @@ check(finishSettlement.contains("let completingLegacyMigration = awaitingAuthMig
               "early PullUser ctx plus a late matching proof completes legacy migration exactly at settlement")
 check(repair.contains("self.sessionRepairWork?.cancel()")
                 && repair.contains("repairGeneration == self.sessionRepairGeneration")
-                && repair.contains("DispatchQueue.main.asyncAfter")
-                && invalidation.contains("sessionRepairWork?.cancel()")
+                && repair.contains("Task { @MainActor [weak self] in")
+                && repair.contains("try await Task.sleep(nanoseconds: 14_000_000_000)")
+                && repair.contains("guard !Task.isCancelled, let self,")
+                && repair.contains("CredentialScopeRegistry.shared.isCurrent(credentialCapture)")
+                && invalidation.contains("let originalRepair = sessionRepairWork")
+                && invalidation.contains("sessionRepairWork = nil")
+                && invalidation.contains("originalRepair?.cancel()")
                 && invalidation.contains("sessionRepairGeneration &+= 1"),
               "stale launch repair is cancelled and only the newest context-bound timer may fire")
-check(finishSettlement.contains("scheduleSessionRepair()")
-                && profileChange.contains("scheduleSessionRepair()")
-                && bootstrap.contains("Keychain.set(nil, for: importedAwayContext.keychainAccount)")
-                && bootstrap.contains("self.scheduleSessionRepair()"),
-              "settled, no-token, and imported-away logout contexts each rearm one valid repair timer")
+check(appearsBefore("let publicationToken = capturePublicationToken()", "DispatchQueue.main.async", in: repair)
+                && appearsBefore("let credentialCapture = CredentialScopeRegistry.shared.capture()", "DispatchQueue.main.async", in: repair)
+                && appearsBefore("CredentialScopeRegistry.shared.isCurrent(credentialCapture)", "self.sessionRepairWork?.cancel()", in: repair)
+                && !repair.contains("DispatchWorkItem"),
+              "repair carries its original owner evidence through arming and does not erase timer isolation")
+for signature in [
+    "private var activeTokenAccount:", "private var importedAwayFromStremio:",
+    "private func bootstrapAuth()", "private func refreshFromAPI(",
+    "func settledActiveAccountBinding()", "func settledLocalHistoryOwner()",
+    "private func settledLocalHistoryOwner(", "private func localOnlyRecoveryAllowed(",
+    "private func captureLocalHistoryHydrationContext()", "private func beginLocalHistoryHydration()",
+    "private func localHistoryHydrationStillCurrent(", "private func localHistoryHydrationReceiptStillCurrent(",
+    "private func recordAcceptedHistoryReceipt(", "private func verifyAccountBinding(",
+    "private func startVerifiedAccountSwitch(", "private func settleAccountBindingIfProven()",
+    "private func finishSettledAccountBinding()"
+] {
+    check(bridge.contains("    @MainActor\n    " + signature), "legacy owner isolation: " + signature)
+}
+let profileRearmPath = guardedMetadata
+    ? profileChange.contains("revokeNativeSession()")
+        && profileChange.contains("NativeMetadataBootstrapContinuation")
+    : profileChange.contains("scheduleSessionRepair()")
+if guardedMetadata {
+    check(finishSettlement.contains("scheduleSessionRepair()")
+                    && profileRearmPath,
+                  "native settlement and profile-change paths rearm only through the native session owner")
+} else {
+    check(finishSettlement.contains("scheduleSessionRepair()")
+                    && profileRearmPath
+                    && bootstrap.contains("Keychain.set(nil, for: importedAwayContext.keychainAccount)")
+                    && bootstrap.contains("self.scheduleSessionRepair()"),
+                  "settled, no-token, and imported-away legacy logout contexts each rearm one valid repair timer")
+}
 check(finishSettlement.contains("if switchInFlight {")
                 && finishSettlement.contains("switchInFlight = false")
                 && finishSettlement.contains("switchFromUID = nil")
                 && appearsBefore("switchInFlight = false", "scheduleSessionRepair()", in: finishSettlement),
               "proof-first legacy switch retires its gate before binding replay or repair")
-check(bridge.contains("private struct SignedOutRepairRequest: Equatable")
-                && logout.contains("SignedOutRepairRequest(")
-                && logout.contains("publicationToken: capturePublicationToken()")
-                && signedOutRearm.contains("signedOutRepairRequestStillCurrent(request)")
-                && signedOutRearm.contains("signedOutRepairRequest = nil")
-                && stremioCard.contains("account.signOut()")
-                && stremioCard.contains("core.logOut()"),
-              "explicit Stremio disconnect rearms exactly one local repair after safe engine logout")
+if guardedMetadata {
+    check(disconnect.contains("account.signOut()")
+        && disconnect.contains("core.logOut()")
+        && logout.contains("loadBoard(); loadLibrary()")
+        && !logout.contains("dispatchCtx(")
+        && !logout.contains("nativeFacade")
+        && !logout.contains("SignedOutRepairRequest")
+        && accountSignOut.contains("LegacyWatchOwnership.invalidateSession()")
+        && accountSignOut.contains("VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)")
+        && accountSignOut.contains("authOperationGeneration &+= 1")
+        && accountSignOut.contains("authKey = nil; isSignedIn = false; streamSources = []; addons = []")
+        && accountSignOut.contains("setEmail(nil)"),
+        "native disconnect signs out the account-owned credential, while declaration-local CoreBridge logout only refreshes native UI")
+} else {
+    check(bridge.contains("private struct SignedOutRepairRequest: Equatable")
+        && logout.contains("SignedOutRepairRequest(")
+        && logout.contains("publicationToken: capturePublicationToken()")
+        && signedOutRearm.contains("signedOutRepairRequestStillCurrent(request)")
+        && signedOutRearm.contains("signedOutRepairRequest = nil")
+        && disconnect.contains("account.signOut()")
+        && disconnect.contains("core.logOut()"),
+        "explicit Stremio disconnect rearms exactly one local repair after safe engine logout")
+}
 check(beginBinding.contains("retireSignedOutRepairRequest()")
                 && invalidateAuth.contains("retireSignedOutRepairRequest()")
                 && invalidateAuth.contains("awaitingAuthMigration = false")
@@ -280,6 +434,15 @@ check(importedCapture.contains("profileID: profile.id")
                 && importedCapture.contains("publicationToken: capturePublicationToken()")
                 && importedCapture.contains("importedAway: importedAwayFromStremio"),
               "imported-away bootstrap captures exact account identity before its await")
+if guardedMetadata {
+    check(publicationGate.contains("logoutAccountMutationPending: Bool")
+        && publicationGate.contains("signedOutRepairRequestState.withLock { $0 != nil }")
+        && signedOutRearm.contains("signedOutRepairRequestStillCurrent(request)")
+        && signedOutRearm.contains("receiptPublicationToken == request.publicationToken")
+        && signedOutRearm.contains("!isLoggedIn(), currentUID() == nil")
+        && member(bridge, "private func nativeCallbackOriginIsCurrent(").contains("publicationStillCurrent(origin.publication)"),
+        "logout gate and original typed source epoch prevent old account data publication; legacy signed-out proof stays exact")
+} else {
 check(publicationGate.contains("signedOutRepairPending: signedOutRepairRequest != nil")
                 && signedOutRearm.contains("signedOutRepairRequestStillCurrent(request)")
                 && signedOutRearm.contains("receiptPublicationToken == request.publicationToken")
@@ -289,17 +452,22 @@ check(publicationGate.contains("signedOutRepairPending: signedOutRepairRequest !
                 && event.contains("if let signedOutRepairRequest = self.signedOutRepairRequest, !self.isLoggedIn()")
                 && event.contains("receiptPublicationToken: publicationToken"),
               "old account data stays gated during logout until only the exact signed-out control receipt clears it")
+}
 check(localRecovery.contains("signedOutRequest: SignedOutRepairRequest")
                 && localRecovery.contains("signedOutRepairRequestStillCurrent(signedOutRequest)")
                 && localRecovery.contains("signedOutRepairRequest == nil")
                 && localRecovery.contains("confirmedSignedOutRepairRequest == context.signedOutRequest")
                 && localRecovery.contains("!isLoggedIn(), currentUID() == nil"),
               "imported-away recovery times out unless the exact logout receipt is cleared and engine identity is blank")
+let dispatchSuccess = guardedMetadata
+    ? dispatch.contains("let accepted = nativeFacade.dispatch(data: nativeAction, field: field)")
+        && dispatch.contains("return accepted")
+    : dispatch.contains("return true")
 check(dispatch.contains("blocksAccountMutationDuringSignedOutRepair")
                 && dispatch.contains("dropped account mutation pending signed-out receipt")
                 && dispatch.contains("beforeDispatch?()")
                 && dispatch.contains("return false")
-                && dispatch.contains("return true"),
+                && dispatchSuccess,
               "central engine dispatch gate rejects pending-logout account mutations while leaving overlay state local")
 check(uninstallAddon.contains("let mutationToken = capturePublicationToken()")
                 && uninstallAddon.contains("guard addonMutationStillAllowed(mutationToken) else { return }")
@@ -319,24 +487,56 @@ check(hydrateAddons.contains("guard !owned.isEmpty, addonMutationStillAllowed(mu
                 && hydrateAddons.contains("if dispatchCtx([\"action\": \"InstallAddonLocal\", \"args\": addon.installDescriptor])")
                 && hydrateAddons.contains("installedCount += 1"),
               "account hydration reports only local installs accepted by the dispatch gate")
+if guardedMetadata {
+    let seed = member(bridge, "private func receiveNativeLegacyHostSeed(")
+    check(seed.contains("origin: origin, recordsCoarseEvent: false)")
+        && seed.contains("legacyFields: receipt.fields, receipt: receipt")
+        && event.contains("receipt.sourceID == origin.producer.sourceID"),
+        "explicit host seed retains original receipt/origin and cannot invent a source callback/coarse event")
+} else {
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")
                 && seed.contains("refreshAddons(capturedPublicationToken: publicationToken)"),
               "initial board, addon, and Continue Watching seeds retain one immutable context")
-check(refresh.contains("Task { @MainActor")
+}
+let refreshPublishHop = guardedMetadata
+    ? refresh.contains("DispatchQueue.main.async { [weak self] in")
+        && refresh.contains("self.rawAddonsByUrl = raw")
+    : refresh.contains("Task { @MainActor")
+        && refresh.contains("rawAddonsByUrl = publishedRaw")
+check(refreshPublishHop
                 && refresh.contains("publicationStillCurrent(publicationToken)")
-                && refresh.contains("AddonMetaGate.publish")
-                && refresh.contains("rawAddonsByUrl = publishedRaw"),
+                && refresh.contains("AddonMetaGate.publish"),
               "ctx addon publish and delayed tombstone uninstall validate before mutation")
 check(continueWatching.contains("publicationStillCurrent(publicationToken)"),
               "Continue Watching final assignment rejects a stale snapshot")
+if guardedMetadata {
+    check(event.contains("let work = NativeLegacyWork(receipt: receipt, fields: fieldSet,")
+        && event.contains("self?.publishNativeLegacySample(sample, work: work, origin: origin,")
+        && event.contains("publishNativeLegacyHistory(library: sample.library, continueWatching: sample.continueWatching,")
+        && member(bridge, "private func nativeLegacyReceiptIsCurrent(").contains("origin.producer.acceptsChange(receipt, field: field)"),
+        "account event branches retain original immutable source receipt and actor sink origin")
+} else {
 check(event.contains("scheduleBoardRebuild(capturedPublicationToken: publicationToken)")
                 && event.contains("scheduleMetaDetailsRepublish(capturedPublicationToken: publicationToken)")
                 && event.contains("refreshAddons(capturedPublicationToken: publicationToken)")
                 && event.contains("self.library = value")
                 && event.contains("self.discover = value"),
               "account-scoped event branches pass one token into each downstream publisher")
+}
+if guardedMetadata {
+    let callback = member(bridge, "private func makeNativeSourceCallback(")
+    let owned = member(bridge, "private func receiveOwnedMetadata(")
+    let coarse = member(bridge, "private func recordNativeLegacyCoarseEvent(")
+    check(callback.contains("playerWasActive: player.withLock { $0 }")
+        && owned.contains("change.fields.contains(\"library\") && !origin.playerWasActive")
+        && libraryEvent.contains("fields.contains(\"library\") && !origin.playerWasActive")
+        && event.contains("if recordsCoarseEvent {")
+        && coarse.contains("changedFields = Set(legacyFields)")
+        && coarse.contains("if published { revision &+= 1 }"),
+        "original player scalar gates only library detail overlay/CW policy; real coarse receipt remains separate")
+} else {
 check(bridge.contains("private let playerActiveSnapshotLock = NSLock()")
                 && bridge.contains("private func playerActiveSnapshot() -> Bool")
                 && bridge.contains("self.playerActiveSnapshotValue = active")
@@ -348,6 +548,7 @@ check(bridge.contains("private let playerActiveSnapshotLock = NSLock()")
                 && event.contains("self.changedFields = Set(fields)")
                 && event.contains("if published { self.revision &+= 1 }"),
               "a playback-time library event captures one lock-backed state snapshot, skips only detail decoding, and still publishes its revision receipt")
+}
 check(catalogAdd.contains("rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary")
                 && catalogAdd.contains("canDispatchCatalogAdd")
                 && catalogWatched.contains("rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary")
@@ -368,15 +569,31 @@ check(menuAdd.contains("guard addToLibrary(metaId: card.id")
                 && !catalogAdd.contains("ScrobbleCoordinator")
                 && !autoAddSource.contains("FromMenu"),
               "card-menu library adds and removes mirror to Trakt/SIMKL only after the save, while auto-add on play never does")
+if guardedMetadata {
+    check(event.contains("nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: \"ctx\")")
+        && event.contains("if searchLoaded { loadSearchRange() }"),
+        "ctx search-range redispatch checks original receipt before actor-local dispatch")
+} else {
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }")
                 && event.contains("self.loadSearchRange()"),
               "ctx search-range redispatch is dropped for stale or blocked account context")
-let searchPublication = section(event, from: "if fields.contains(\"search\")", until: "if fields.contains(\"local_search\")")
+}
+let searchPublication = guardedMetadata ? event
+    : section(event, from: "if fields.contains(\"search\")", until: "if fields.contains(\"local_search\")")
+if guardedMetadata {
+    let worker = member(bridge, "private static func prepareNativeLegacySample(")
+    check(worker.contains("value: values[\"search\"]")
+        && searchPublication.contains("searchPublication.capture(query: Self.nativeLegacySearchQuery(receipt))")
+        && searchPublication.contains("nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: \"search\")")
+        && searchPublication.contains("searchPublication.accepts(searchToken)"),
+        "search decodes original immutable receipt and keeps actor query generation at final sink")
+} else {
 check(searchPublication.contains("let data = stateData(\"search\")")
         && searchPublication.contains("searchPublication.capture(query: query)")
         && searchPublication.contains("self.publicationStillCurrent(publicationToken), let searchToken")
         && searchPublication.contains("self.searchPublication.accepts(searchToken)"),
       "search decodes one buffer and checks owner plus expected query generation at final publication")
+}
 let watchlistTarget = section(bridge, from: "private func captureNativeWatchlistTarget()", until: "/// Never fall back to an unrelated legacy profile token")
 check(watchlistTarget.contains("CredentialScopeRegistry.shared.isCurrent(capture)")
         && watchlistTarget.contains("facade.watchlistBinding")
@@ -404,16 +621,43 @@ check(widening.contains("deferredBoardRangeDepth = max(deferredBoardRangeDepth ?
         && widening.components(separatedBy: "widenBoardRange(to: needed)").count == 3
         && widening.contains("if depth > boardRowsLoaded { widenBoardRange(to: depth); return }"),
       "native order and Live widening coalesce absolute depth behind the same active row page fence")
+if guardedMetadata {
+    check(event.contains("nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: \"discover\")")
+        && event.contains("discoverPublishedFingerprint = next.fingerprint"),
+        "Discover fingerprint mutates only behind original source field receipt")
+} else {
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                    guard fingerprint != self.discoverPublishedFingerprint")
                 && event.contains("self.discoverPublishedFingerprint = fingerprint"),
               "Discover fingerprint mutation is main-gated by the captured publication token")
+}
+if guardedMetadata {
+    check(meta.contains("let operation = NativeMetadataOperation(kind: kind, intent: intent, selection: selection,")
+        && meta.contains("source: source, decode: decode)")
+        && meta.contains("await receiver.publish(.init(details: details, status: status), operation: operation)")
+        && meta.contains("let owns: @MainActor @Sendable () -> Bool = { self.nativeMetadataOperationIsCurrent(operation) }")
+        && meta.contains("commitOwnedMetadataFrame(details: details, status: sample.status,")
+        && meta.contains("finalAdmission: sourceAdmission), owns() else { return }")
+        && !bridge.contains("private func scheduleMetaDetailsRepublish(")
+        && !bridge.contains("fileprivate func handleEvent("),
+        "owned metadata carries original task/source/selection to final immutable frame; removed legacy scheduler cannot be re-entered")
+} else {
 check(meta.contains("publicationStillCurrent(publicationToken)")
                 && meta.contains("self.metaDetailsWork?.cancel()"),
               "meta-details coalescer checks the token at schedule and final publication")
+}
+if guardedMetadata {
+    check(board.contains("nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: \"board\")")
+        && board.contains("nativeLegacyReceiptIsCurrent(receipt, origin: origin, field: \"ctx\")")
+        && board.contains("Task.detached(priority: .userInitiated)")
+        && board.contains("Self.prepareNativeLegacyBoard(receipt: receipt, preferences: preferences)")
+        && board.contains("self.boardRows = sample.rows"),
+        "board debounce/background/final assignment carries original source fields and immutable preferences")
+} else {
 check(board.contains("publicationStillCurrent(publicationToken)")
                 && board.contains("self.boardRebuildWork?.cancel()")
                 && board.contains("self.boardRows = rows"),
               "board debounce/background/final assignment cannot publish after replacement")
+}
 check(rebuild.contains("capturePublicationToken()")
                 && rebuild.contains("publicationStillCurrent(publicationToken)"),
               "direct library-derived board rebuild validates its captured context")

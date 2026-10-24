@@ -9,14 +9,16 @@ import Foundation
 /// primary button (mirrors the webapp's `formatTime`). Returns nil for non-positive input so callers
 /// can cleanly omit the badge / suffix when there is nothing to resume.
 func resumeTimecode(_ seconds: Double) -> String? {
-    guard seconds.isFinite, seconds >= 1 else { return nil }
+    // Provider/persisted durations can be finite yet outside Int's range. The upper bound must be
+    // strict because Double(Int.max) rounds up on 64-bit platforms; converting that value traps.
+    guard seconds.isFinite, seconds >= 1, seconds < Double(Int.max) else { return nil }
     let total = Int(seconds)
     let h = total / 3600
     let m = (total % 3600) / 60
     let s = total % 60
     return h > 0
-        ? String(format: "%d:%02d:%02d", h, m, s)
-        : String(format: "%d:%02d", m, s)
+        ? String(format: "%lld:%02lld:%02lld", Int64(h), Int64(m), Int64(s))
+        : String(format: "%lld:%02lld", Int64(m), Int64(s))
 }
 
 // MARK: continue_watching_preview
@@ -25,7 +27,7 @@ struct CoreCWPreview: Decodable {
     let items: [CoreCWItem]
 }
 
-struct CoreCWItem: Decodable, Identifiable {
+struct CoreCWItem: Decodable, Identifiable, Sendable {
     let id: String
     let type: String
     let name: String
@@ -93,7 +95,7 @@ struct CoreCWItem: Decodable, Identifiable {
     var isWatched: Bool { state.timesWatched > 0 }
 }
 
-struct CoreLibState: Decodable {
+struct CoreLibState: Decodable, Sendable {
     let timeOffset: Double
     let duration: Double
     let videoId: String?
@@ -250,12 +252,12 @@ struct CoreCatalogPage: Decodable {
     let content: CoreLoadable<[CoreMeta]>?
 }
 
-struct CoreResourceRequest: Decodable {
+struct CoreResourceRequest: Decodable, Sendable {
     let base: String
     let path: CoreResourcePath
 }
 
-struct CoreResourcePath: Decodable {
+struct CoreResourcePath: Decodable, Sendable {
     let resource: String
     let type: String
     let id: String
@@ -300,6 +302,8 @@ enum CoreLoadable<T: Decodable>: Decodable {
     var isLoading: Bool { if case .loading = self { return true } else { return false } }
 }
 
+extension CoreLoadable: Sendable where T: Sendable {}
+
 struct CoreMeta: Decodable, Identifiable, Sendable {
     let id: String
     let type: String
@@ -334,6 +338,38 @@ struct CoreMeta: Decodable, Identifiable, Sendable {
 struct CoreLocalSearchState: Decodable {
     let searchResults: [CoreSearchSuggestion]
 }
+
+// Checked value graph for native callback worker samples. All stored members are
+// scalars, immutable value models, or standard Sendable collections; Any stays UI-local.
+extension CoreCWPreview: Sendable {}
+extension CoreBoardState: Sendable {}
+extension CoreSearchSelected: Sendable {}
+extension CoreCatalogPage: Sendable {}
+extension CoreLocalSearchState: Sendable {}
+extension CoreSearchSuggestion: Sendable {}
+extension CoreCtx: Sendable {}
+extension CoreProfile: Sendable {}
+extension CoreDescriptor: Sendable {}
+extension CoreManifest: Sendable {}
+extension CoreManifestBehaviorHints: Sendable {}
+extension CoreManifestResource: Sendable {}
+extension CoreDescriptorFlags: Sendable {}
+extension CoreManifestCatalog: Sendable {}
+extension CoreBoardRow: Sendable {}
+extension CoreDiscover: Sendable {}
+extension CoreDiscoverSelectable: Sendable {}
+extension CoreSelectablePage: Sendable {}
+extension CoreSelectableType: Sendable {}
+extension CoreSelectableCatalog: Sendable {}
+extension CoreSelectableExtra: Sendable {}
+extension CoreSelectableExtraOption: Sendable {}
+extension CoreLibrary: Sendable {}
+extension CoreLibrarySelectable: Sendable {}
+extension CoreLibType: Sendable {}
+extension CoreLibSort: Sendable {}
+extension CoreRequest: Sendable {}
+extension CoreRequestPath: Sendable {}
+extension CoreLibraryRequest: Sendable {}
 
 struct CoreSearchSuggestion: Decodable, Identifiable {
     let id: String
@@ -516,13 +552,13 @@ enum LiveTypes {
 /// The engine selection that owns the current `metaItems` payload. A detail page must fence terminal
 /// empty/error state to this ID, just as it already fences ready metadata, or title A can trigger
 /// title B's fallback while the shared bridge slot is changing pages.
-struct CoreMetaSelection: Decodable {
+struct CoreMetaSelection: Decodable, Sendable {
     let metaPath: CoreResourcePath
     /// The exact episode stream request selected by the engine. Optional for movie/meta-only loads.
     let streamPath: CoreResourcePath?
 }
 
-struct CoreMetaDetails: Decodable {
+struct CoreMetaDetails: Decodable, Sendable {
     let selected: CoreMetaSelection?
     let metaItems: [CoreMetaEntry]
     let streams: [CoreStreamGroup]
@@ -558,7 +594,9 @@ struct CoreMetaDetails: Decodable {
         var ready: [(base: String, meta: CoreMetaItem)] = []
         let disabled = ProfileStore.activeDisabledAddons()
         for entry in metaItems where !disabled.contains(ProfileAddonPreferencesPolicy.identity(entry.request.base)) {
-            if let m = entry.content?.ready { ready.append((entry.request.base, m)) }
+            let display = entry.content?.ready
+                ?? (entry.content?.isLoading == true ? entry.retainedWhileLoading?.ready : nil)
+            if let m = display { ready.append((entry.request.base, m)) }
         }
         guard let first = ready.first else { return nil }
         let order = ProfileStore.activeAddonOrder(accountOrder: VortXSyncManager.appliedAddonOrder)
@@ -660,12 +698,14 @@ struct CoreMetaDetails: Decodable {
 }
 
 /// `ResourceLoadable<MetaItem>`, one addon's meta response ({request, content}).
-struct CoreMetaEntry: Decodable {
+struct CoreMetaEntry: Decodable, Sendable {
     let request: CoreResourceRequest
     let content: CoreLoadable<CoreMetaItem>?
+    /// Same-owner display continuity only. `content` retains the actual request's freshness state.
+    let retainedWhileLoading: CoreLoadable<CoreMetaItem>?
 }
 
-struct CoreMetaItem: Decodable {
+struct CoreMetaItem: Decodable, Sendable {
     let id: String
     let type: String
     let name: String
@@ -829,7 +869,7 @@ struct CoreMetaItem: Decodable {
 /// Meta-level `behaviorHints` (NOT the per-stream `CoreStreamBehaviorHints`). All fields optional so
 /// sparse add-ons decode. `hasScheduledVideos` marks a live channel whose `videos[]` is a now/next
 /// EPG schedule; `featuredVideoId` (when present) names the currently-airing program directly.
-struct CoreMetaBehaviorHints: Decodable, Equatable {
+struct CoreMetaBehaviorHints: Decodable, Equatable, Sendable {
     let hasScheduledVideos: Bool?
     let featuredVideoId: String?
     /// The canonical video id for a single-video title (a movie). For a title from a TMDB/Kitsu catalog
@@ -875,7 +915,7 @@ struct CoreLink: Decodable, Equatable, Sendable {
     }
 }
 
-struct CoreVideo: Decodable, Identifiable, Equatable {
+struct CoreVideo: Decodable, Identifiable, Equatable, Sendable {
     let id: String
     let title: String?
     let released: String?
@@ -922,18 +962,41 @@ extension Array where Element == CoreVideo {
 }
 
 extension ISO8601DateFormatter {
-    /// Shared formatters for parsing `CoreVideo.released`, `static let` so the EPG now/next pass
-    /// reuses one instance per form instead of allocating a formatter per video (they're costly).
-    static let epg = ISO8601DateFormatter()
-    static let epgFractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
+    /// Immutable parser handles: no cross-thread formatter sharing, actor hop or per-video allocation.
+    /// Keep the existing `.epg.date(from:)` API for episode, watched and Trakt readers.
+    struct EPGParser: Sendable {
+        private let includingFractionalSeconds: Bool
+
+        init(includingFractionalSeconds: Bool) {
+            self.includingFractionalSeconds = includingFractionalSeconds
+        }
+
+        func date(from value: String) -> Date? {
+            // Preserve the existing formatter's precision and leniency. Each thread owns at most
+            // these two fixed-key instances; no formatter escapes this synchronous parsing call.
+            let key = includingFractionalSeconds ? "tv.vortx.epg.fractional.v1" : "tv.vortx.epg.plain.v1"
+            let storage = Thread.current.threadDictionary
+            let formatter: ISO8601DateFormatter
+            if let cached = storage[key] as? ISO8601DateFormatter {
+                formatter = cached
+            } else {
+                let created = ISO8601DateFormatter()
+                if includingFractionalSeconds {
+                    created.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                }
+                storage[key] = created
+                formatter = created
+            }
+            return formatter.date(from: value)
+        }
+    }
+
+    static let epg = EPGParser(includingFractionalSeconds: false)
+    static let epgFractional = EPGParser(includingFractionalSeconds: true)
 }
 
 /// One addon's stream response for the selected meta/episode (`ResourceLoadable<Vec<Stream>>`).
-struct CoreStreamGroup: Decodable {
+struct CoreStreamGroup: Decodable, Sendable {
     let request: CoreResourceRequest
     let content: CoreLoadable<[CoreStream]>?
 }
@@ -973,7 +1036,7 @@ struct PlayerTimePositionEvent: Sendable {
 
 /// Pure callback-provenance state used by the libmpv bridge and its standalone regressions. The controller
 /// serializes mutations with its own lock; this value only defines the fail-closed state transitions.
-struct PlayerLoadProvenanceState {
+struct PlayerLoadProvenanceState: Sendable {
     struct CommandResultField: Equatable {
         let key: String
         let int64Value: Int64?
@@ -1791,6 +1854,33 @@ struct VortXOwnedAddon {
         var d: [String: Any] = ["transportUrl": transportUrl, "manifest": manifest]
         d["flags"] = flags ?? ["official": false, "protected": false]
         return d
+    }
+}
+
+// MARK: - Complete decoded metadata value equivalence
+
+// Same-file synthesis keeps decoder/extraction declarations unchanged. These
+// are value comparisons only: no Sendable or executor claim is introduced.
+extension CoreCWItem: Equatable {}
+extension CoreLibState: Equatable {}
+extension CoreResourcePath: Equatable {}
+extension CoreResourceRequest: Equatable {}
+extension CoreLoadable: Equatable where T: Equatable {}
+extension CoreMetaSelection: Equatable {}
+extension CoreMetaEntry: Equatable {}
+extension CoreMetaItem: Equatable {}
+extension CoreStreamGroup: Equatable {}
+
+extension CoreMetaDetails: Equatable {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.selected == rhs.selected
+            && lhs.metaItems == rhs.metaItems
+            && lhs.streams == rhs.streams
+            && (lhs.metaStreams ?? []) == (rhs.metaStreams ?? [])
+            && lhs.libraryItem == rhs.libraryItem
+            // Watched IDs are membership, not presentation order. Preserve
+            // nil/empty, order and duplicate equivalence used by the old gate.
+            && lhs.watchedIds == rhs.watchedIds
     }
 }
 

@@ -386,7 +386,7 @@ struct CinemaWatchlist: View {
         #endif
         .macBackAffordance()
         .onAppear { entries = LibraryAutoAdd.watchlist() }
-        .onChange(of: profiles.activeID) { _ in entries = LibraryAutoAdd.watchlist() }
+        .onValueChange(of: profiles.activeID) { _ in entries = LibraryAutoAdd.watchlist() }
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
             entries = LibraryAutoAdd.watchlist()
         }

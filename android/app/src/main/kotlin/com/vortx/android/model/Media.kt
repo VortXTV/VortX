@@ -512,6 +512,12 @@ data class StreamSource(
     /** Ordered addon NZB mirrors and NNTP URLs. Transient only; may contain configured credentials. */
     val nzbUrls: List<String> = emptyList(),
     val usenetServers: List<String> = emptyList(),
+    /**
+     * Transient list-only cache evidence, stamped with the process-monotonic provider event revision after
+     * real current-owner torrent hits. Consumers require the SAME current event revision (not the secure
+     * vault revision). Never provider-decoded, persisted, inferred from text, or used as play authority.
+     */
+    @Transient val accountConfirmedCacheRevision: Long? = null,
 ) {
     override fun toString(): String =
         "StreamSource(id=${if (isUsenet) "<usenet>" else id}, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +

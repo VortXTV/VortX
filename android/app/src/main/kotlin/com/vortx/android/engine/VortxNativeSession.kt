@@ -649,8 +649,12 @@ internal class VortxNativeSession private constructor(
 
     /** The original raw account and authority are supplied by the authenticated gateway. */
     @Synchronized fun receiveOwnerHistory(account: NativeOwnerHistoryAccount, authority: NativeOwnerHistoryAuthority,
-                                          historyBindings: NativeOwnerHistoryBindings, remoteHost: JSONObject?): Unit = owned(read().owner) {
+                                          historyBindings: NativeOwnerHistoryBindings, remoteHost: JSONObject?): Unit {
+        val originalPlaybackRead = read()
+        owned(originalPlaybackRead.owner) {
         val oldRuntime = runtime
+        val originalPlaybackState = originalPlaybackRead.state
+        var changesPlaybackOwner = false
         var next = ownerHistory
         var newOwner = false
         if (next == null) {
@@ -672,6 +676,7 @@ internal class VortxNativeSession private constructor(
             next = try { NativeOwnerHistorySessionAdapter.open(scope, checkpoint, original, historyBindings, store,
                 requireNotNull(ownerHistoryAuthority) { "Original mounted account authority unavailable" }, authority) }
             catch (failure: NativeOwnerHistoryCoordinator.Uncertain) {
+                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
                 checkpointUncertain = true; unconfirmedHistoryRetirement = true
                 slots.values.forEach { it.close() }; slots.clear()
                 throw failure
@@ -687,12 +692,16 @@ internal class VortxNativeSession private constructor(
                 val profiles = NativeHostPreferences.projectProfiles(host, hostProfilePreferences,
                     state.getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(profiles)
+                changesPlaybackOwner = nativePlaybackOwnerChanged(originalPlaybackState, state)
                 projected = profiles
                 state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
                     .put("nativeHostPreferenceState", host)
                     .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
                     .put("websiteAddonEditPending", websiteAddonEditPending).toString().toByteArray(Charsets.UTF_8)
             }, beforePersist = {
+                // This Session monitor excludes new authenticated owner captures until receive
+                // and its visible projection complete. Revoke BEFORE native/checkpoint acceptance.
+                if (changesPlaybackOwner) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
                 // The generic engine is retired before typed persistence/native acceptance. No
                 // second live writer can later overwrite the transferred checkpoint.
                 if (newOwner) {
@@ -705,6 +714,7 @@ internal class VortxNativeSession private constructor(
             nativeHostPreferenceState = host
             invalidate(); changes.value += 1
         } catch (failure: Throwable) {
+            if (newOwner || adapter.requiresRecovery()) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             if (newOwner) {
                 checkpointUncertain = true
                 // Retain the reservation even if native retirement is uncertain.
@@ -713,6 +723,7 @@ internal class VortxNativeSession private constructor(
             }
             slots.values.forEach { it.close() }; slots.clear()
             throw failure
+        }
         }
     }
     @Synchronized fun resolve(request: JSONObject, owner: VortxNativeOwner = read().owner): JSONObject = owned(owner) {
@@ -749,8 +760,10 @@ internal class VortxNativeSession private constructor(
         applyWebsiteProfileEdit(event, event, owner)
     @Synchronized private fun applyWebsiteProfileEdit(event: JSONObject, retainedSource: JSONObject, owner: VortxNativeOwner): Boolean = owned(owner) {
         scope.rejectCredentials(event)
-        val before = runtime.stateJson()
-        val candidate = runtime.fork()
+        val originalRuntime = runtime
+        val originalRevision = revision
+        val before = originalRuntime.stateJson()
+        val candidate = originalRuntime.fork()
         var installed = false
         try {
             val applied = try {
@@ -782,9 +795,10 @@ internal class VortxNativeSession private constructor(
             val updated = checkpoint(candidate.stateJson(), preferences, hostProfileSyncPending, applied.host,
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, applied.certificates)
             val state = validatePresentation(updated)
-            commitCheckpoint(updated, candidate)
-            check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
+            val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
+            commitCheckpoint(updated, candidate, playbackState = playbackState)
+            check(isAccountCurrent()) { "Native account changed" }
             val profileChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
@@ -831,8 +845,10 @@ internal class VortxNativeSession private constructor(
     @Synchronized private fun applyWebsiteAddonEditOnce(event: JSONObject, owner: VortxNativeOwner,
                                                        beforeCommit: () -> Unit): Boolean = owned(owner) {
         NativeWebsiteAddonEdits.validate(scope, event)
-        val before = runtime.stateJson()
-        val candidate = runtime.fork()
+        val originalRuntime = runtime
+        val originalRevision = revision
+        val before = originalRuntime.stateJson()
+        val candidate = originalRuntime.fork()
         var installed = false
         try {
             val receipt = try {
@@ -857,9 +873,11 @@ internal class VortxNativeSession private constructor(
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, websiteProfileEditPending,
                 websiteProfileEditCertificates, pending)
             val state = validatePresentation(updated)
-            beforeCommit(); commitCheckpoint(updated, candidate)
+            val prior = JSONObject(before)
+            val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
+            beforeCommit(); commitCheckpoint(updated, candidate, playbackState = playbackState)
             check(isAccountCurrent()) { "Native account changed" }
-            val registryChanged = !NativeHostPreferences.equal(JSONObject(before).getJSONObject("nativeSync").getJSONObject("addons"),
+            val registryChanged = !NativeHostPreferences.equal(prior.getJSONObject("nativeSync").getJSONObject("addons"),
                 state.getJSONObject("nativeSync").getJSONObject("addons"))
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             websiteAddonEditPending = pending
@@ -897,8 +915,10 @@ internal class VortxNativeSession private constructor(
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
-        val before = runtime.stateJson()
-        val candidate = runtime.fork()
+        val originalRuntime = runtime
+        val originalRevision = revision
+        val before = originalRuntime.stateJson()
+        val candidate = originalRuntime.fork()
         var installed = false
         try {
             var heldAction: JSONObject? = null
@@ -942,10 +962,11 @@ internal class VortxNativeSession private constructor(
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
                 .put("websiteAddonEditPending", websiteAddonEditPending).toString()
             val state = validatePresentation(updated)
-            beforeCommit()
-            commitCheckpoint(updated, candidate, hostArchive)
-            check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
+            val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
+            beforeCommit()
+            commitCheckpoint(updated, candidate, hostArchive, playbackState)
+            check(isAccountCurrent()) { "Native account changed" }
             val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
                 prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString() ||
                 !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
@@ -978,11 +999,36 @@ internal class VortxNativeSession private constructor(
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.close() }; slots.clear()
     }
+    /** Only this Session creates it from its actual original runtime and validated candidate.
+     * JSON values are caller-owned locals, never exposed to callbacks or stored as a fresh owner oracle. */
+    private class PlaybackCheckpointState(
+        val originalRuntime: VortxNativeRuntime,
+        val originalRevision: Long,
+        val candidate: VortxNativeRuntime,
+        val serialized: String,
+        val original: JSONObject,
+        val validated: JSONObject,
+    )
     /** Rename may have succeeded before fsync/readback failed. Keep the previously published view
      * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
      * In particular, old runtime A must never overwrite a possibly installed binding B. */
-    private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null) {
+    private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null,
+                                 playbackState: PlaybackCheckpointState? = null) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
+        // Resource revisions, ordinary progress/settings, unrelated roster edits and dormant
+        // slots are not playback ownership. The active exact binding transaction is.
+        val changesPlaybackOwner = if (playbackState == null) {
+            // Cold/private carrier-only callers have no previously decoded state pair.
+            nativePlaybackOwnerChanged(JSONObject(runtime.stateJson()), JSONObject(snapshot))
+        } else {
+            check(playbackState.originalRuntime === runtime && playbackState.originalRevision == revision &&
+                playbackState.candidate === candidate &&
+                playbackState.serialized === snapshot) { "Original playback checkpoint candidate changed" }
+            nativePlaybackOwnerChanged(playbackState.original, playbackState.validated)
+        }
+        if (changesPlaybackOwner) {
+            com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+        }
         try {
             val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
             if (!candidate.commitTypedCheckpoint(snapshot, archiveChanges)) {
@@ -993,6 +1039,7 @@ internal class VortxNativeSession private constructor(
                 }
             }
         } catch (error: Throwable) {
+            com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             checkpointUncertain = true
             slots.values.forEach { it.close() }; slots.clear()
             changes.value += 1

@@ -270,7 +270,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// the whole process. Nullable + fail-soft: sync is OFF the critical launch path (VortX works fully
     /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
     var syncManager: VortXSyncManager? = null
-        private set
+        private set(value) {
+            if (field !== value) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
+        }
 
     /**
      * Wire the give-to-get MOAT groundwork, kept DORMANT exactly like Apple ships it gated. The Singularity

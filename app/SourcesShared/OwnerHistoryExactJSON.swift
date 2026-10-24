@@ -208,8 +208,185 @@ enum OwnerHistoryExactJSON {
                 witnessID: witnessID, fence: fence)
         }
 
-        func applying(checkpoint: Data) throws -> Self {
+        // Reconstruct only an immutable candidate. The current runtime, original source lease
+        // and complete-envelope durable path remain the authority; no receipt is minted here.
+
+        private static func unsigned(_ bytes: Data) throws -> UInt64 {
+            guard let text = String(data: bytes, encoding: .utf8),
+                  let value = UInt64(text), String(value) == text else { throw Failure.malformed }
+            return value
+        }
+        private static func generation(_ fence: Object) throws -> UInt64 {
+            try unsigned(Data(fence.text("mutationGeneration").utf8))
+        }
+        private static func arrayBytes(_ values: [Data]) throws -> Data {
+            var result = Data([91])
+            for (index, value) in values.enumerated() {
+                if index != 0 { result.append(44) }; result.append(value)
+                guard result.count < maximumBytes else { throw Failure.excessive }
+            }
+            result.append(93); return result
+        }
+        private static func mapEdit(_ edits: Data, prior: Data) throws -> Object {
+            var result = try Object(prior)
+            for (key, raw) in try Object(edits).fields {
+                // Swift Dictionary equates canonically equivalent Unicode spellings. Do not
+                // let an operation aimed at different UTF-8 bytes replace/remove another key.
+                if let index = result.fields.index(forKey: key),
+                   !sameText(result.fields[index].key, key) { throw Failure.contradictory }
+                let edit = try Object(raw)
+                switch try edit.text("op") {
+                case "put":
+                    guard Set(edit.fields.keys) == ["op", "value"] else { throw Failure.malformed }
+                    result.set(key, try edit.required("value"))
+                case "remove":
+                    guard Set(edit.fields.keys) == ["op"], result[key] != nil else { throw Failure.contradictory }
+                    result.remove(key)
+                default: throw Failure.malformed
+                }
+            }
+            return result
+        }
+        private static func exactMember(_ object: Object, _ key: String) throws -> Data {
+            guard let index = object.fields.index(forKey: key), sameText(object.fields[index].key, key) else {
+                throw Failure.contradictory
+            }
+            return try object.required(object.fields[index].key)
+        }
+        private static func spanEdit(_ bytes: Data, prior: Data) throws -> [Data] {
+            let edit = try Object(bytes)
+            guard Set(edit.fields.keys) == ["at", "remove", "insert"] else { throw Failure.malformed }
+            var values = try array(prior)
+            let start = try unsigned(edit.required("at")), count = try unsigned(edit.required("remove"))
+            guard start <= UInt64(values.count), count <= UInt64(values.count) - start else {
+                throw Failure.contradictory
+            }
+            values.replaceSubrange(Int(start)..<Int(start + count), with: try array(edit.required("insert")))
+            return values
+        }
+        private static func libraryEdit(_ raw: Data, prior: Data) throws -> Data {
+            let edits = try Object(raw)
+            let maps: Set<String> = ["resume", "watched", "watchLog", "watchContexts"]
+            let spans: Set<String> = ["items", "history", "continueWatching", "searchHistory", "cwBoard"]
+            guard Set(edits.fields.keys).isSubset(of: maps.union(spans).union(["aliases", "entries"])) else {
+                throw Failure.contradictory
+            }
+            var library = try Object(prior)
+            for key in maps {
+                guard let edit = edits[key] else { continue }
+                let value = try mapEdit(edit, prior: library[key] ?? Data("{}".utf8))
+                if ["watchLog", "watchContexts"].contains(key) && value.fields.isEmpty { library.remove(key) }
+                else { library.set(key, try value.encoded()) }
+            }
+            for key in spans {
+                guard let edit = edits[key] else { continue }
+                let value = try spanEdit(edit, prior: library[key] ?? Data("[]".utf8))
+                if key == "cwBoard" && value.isEmpty { library.remove(key) }
+                else { library.set(key, try arrayBytes(value)) }
+            }
+            if edits["aliases"] != nil || edits["entries"] != nil {
+                var vault = try Object(library["resumeVault"] ?? Data("{}".utf8))
+                for key in ["aliases", "entries"] {
+                    guard let edit = edits[key] else { continue }
+                    let value = try mapEdit(edit, prior: vault[key] ?? Data("{}".utf8))
+                    if value.fields.isEmpty { vault.remove(key) } else { vault.set(key, try value.encoded()) }
+                }
+                if vault.fields.isEmpty { library.remove("resumeVault") }
+                else { library.set("resumeVault", try vault.encoded()) }
+            }
+            return try library.encoded()
+        }
+        private static func watchEdit(_ raw: Data, prior: Data) throws -> Data {
+            let edits = try Object(raw)
+            guard Set(edits.fields.keys).isSubset(of: ["log", "contexts", "identityLinks"]) else {
+                throw Failure.contradictory
+            }
+            var watch = try Object(prior)
+            for key in ["log", "contexts"] {
+                if let edit = edits[key] { watch.set(key, try mapEdit(edit, prior: watch.required(key)).encoded()) }
+            }
+            if let edit = edits["identityLinks"] {
+                let value = try spanEdit(edit, prior: watch["identityLinks"] ?? Data("[]".utf8))
+                if value.isEmpty { watch.remove("identityLinks") } else { watch.set("identityLinks", try arrayBytes(value)) }
+            }
+            return try watch.encoded()
+        }
+        private func applyingKeyed(_ reply: Object) throws -> Self {
+            guard Set(reply.fields.keys) == ["kind", "fence", "preparedAgainst", "deltaEncoding",
+                "keyedStateSteps", "reuseExactOwnerHistoryFromWitness", "requiresCompleteArchiveEnvelope", "durableAck"],
+                  try reply.text("kind") == "checkpoint_delta", try reply.text("deltaEncoding") == "keyed_rows/1",
+                  try reply.required("durableAck") == Data("false".utf8),
+                  try reply.required("requiresCompleteArchiveEnvelope") == Data("true".utf8),
+                  try sameText(reply.text("reuseExactOwnerHistoryFromWitness"), witnessID),
+                  try canonical(reply.required("preparedAgainst")) == canonical(fence) else { throw Failure.contradictory }
+            let nextFence = try reply.required("fence")
+            var previous = try Object(fence), current = try Object(nextFence)
+            var revision = try Self.generation(previous)
+            let finalRevision = try Self.generation(current)
+            guard try !current.text("instanceId").isEmpty,
+                  try sameText(current.text("sourceSetWitnessId"), witnessID) else { throw Failure.contradictory }
+            // Only generation/instance may differ in a supported journal. Profile/binding,
+            // authenticated UID, scope, owner and source witness must still match ORIGINAL base.
+            for key in ["instanceId", "mutationGeneration"] { previous.remove(key); current.remove(key) }
+            guard try canonical(previous.encoded()) == canonical(current.encoded()) else { throw Failure.contradictory }
+            let steps = try array(reply.required("keyedStateSteps"))
+            guard steps.count <= 512 else { throw Failure.excessive }
+            var nextLibraries = libraries, nextNative = native
+            for raw in steps {
+                let step = try Object(raw)
+                guard Set(step.fields.keys) == ["baseGeneration", "revision", "edits"],
+                      try Self.unsigned(Data(step.text("baseGeneration").utf8)) == revision,
+                      revision != UInt64.max,
+                      try Self.unsigned(Data(step.text("revision").utf8)) == revision + 1 else { throw Failure.contradictory }
+                let edits = try Object(step.required("edits"))
+                guard Set(edits.fields.keys) == ["libraries", "nativeWatches", "slotWatches"] else { throw Failure.contradictory }
+                for (id, edit) in try Object(edits.required("libraries")).fields {
+                    nextLibraries.set(id, try Self.libraryEdit(edit, prior: Self.exactMember(nextLibraries, id)))
+                }
+                let watches = try Object(edits.required("nativeWatches"))
+                if !watches.fields.isEmpty {
+                    var values = try Object(nextNative.required("watches"))
+                    for (id, edit) in watches.fields { values.set(id, try Self.watchEdit(edit, prior: Self.exactMember(values, id))) }
+                    nextNative.set("watches", try values.encoded())
+                }
+                let profiles = try Object(edits.required("slotWatches"))
+                if !profiles.fields.isEmpty {
+                    var states = try Object(nextNative.required("accountSlots"))
+                    for (id, raw) in profiles.fields {
+                        var state = try Object(Self.exactMember(states, id)), slots = try Object(state.required("slots"))
+                        for (key, edit) in try Object(raw).fields {
+                            var slot = try Object(Self.exactMember(slots, key))
+                            slot.set("watch", try Self.watchEdit(edit, prior: slot.required("watch")))
+                            slots.set(key, try slot.encoded())
+                        }
+                        state.set("slots", try slots.encoded()); states.set(id, try state.encoded())
+                    }
+                    nextNative.set("accountSlots", try states.encoded())
+                }
+                revision += 1
+            }
+            guard revision == finalRevision else { throw Failure.contradictory }
+            var complete = root
+            complete.set("libraries", try nextLibraries.encoded())
+            complete.set("nativeSync", try nextNative.encoded())
+            // Serialization still copies full checkpoint bytes; encryption/readback remains
+            // complete-envelope. Immutable source/unknown values are not numerically decoded
+            // or replaced; parsing an edited accountSlots ancestor still traverses its history.
+            return try Self(bytes: complete.encoded(), root: complete, roster: roster,
+                profiles: profiles, libraries: nextLibraries, native: nextNative, source: source,
+                witnessID: witnessID, fence: nextFence)
+        }
+        func applying(checkpoint: Data, allowKeyed: Bool = false, expectedFence: Data? = nil) throws -> Self {
             let reply = try Object(checkpoint)
+            if let expectedFence {
+                guard try canonical(reply.required("fence")) == canonical(expectedFence) else {
+                    throw Failure.contradictory
+                }
+            }
+            if reply["deltaEncoding"] != nil {
+                guard allowKeyed else { throw Failure.contradictory }
+                return try applyingKeyed(reply)
+            }
             guard try reply.text("kind") == "checkpoint_delta",
                   try reply.required("durableAck") == Data("false".utf8),
                   try reply.required("requiresCompleteArchiveEnvelope") == Data("true".utf8),

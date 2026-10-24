@@ -3,8 +3,7 @@
 extension TraktSyncEngine {
     static func fixtureNew() -> TraktSyncEngine { TraktSyncEngine() }
     private func fixtureGeneration() -> Int {
-        lock.lock(); defer { lock.unlock() }
-        return generation
+        cache.withLock { $0.generation }
     }
     func fixturePull(_ session: TraktSessionID) async {
         await pullWatched(expectedSession: session, gen: fixtureGeneration())
@@ -13,7 +12,9 @@ extension TraktSyncEngine {
         await drainQueue(expectedSession: session, gen: fixtureGeneration())
     }
     func fixtureState() -> (Set<String>, Set<String>, String?, Int?, [PendingPush]) {
-        lock.lock(); defer { lock.unlock() }
-        return (watchedIDs, watchedEpisodeKeys, lastActivityFingerprint, watchedReadVersion, pendingPushes)
+        cache.withLock { state in
+            (state.watchedIDs, state.watchedEpisodeKeys, state.lastActivityFingerprint,
+             state.watchedReadVersion, state.pendingPushes)
+        }
     }
 }

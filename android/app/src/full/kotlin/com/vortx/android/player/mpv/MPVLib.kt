@@ -61,6 +61,9 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
 
     fun init() = delegate.init()
 
+    fun bindOriginalOwner(liveness: java.util.concurrent.atomic.AtomicBoolean): Boolean =
+        delegate.bindOriginalOwner(liveness)
+
     fun destroy() {
         delegate.removeObserver(delegateObserver)
         synchronized(observers) { observers.clear() }
@@ -78,6 +81,10 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
     fun command(cmd: Array<String>) = delegate.command(cmd)
 
     fun loadFileWithEntryID(url: String): Long? = delegate.loadFileWithEntryID(url)
+
+    /** Enum-only, checked owned-label transaction under one native handle lease. */
+    fun setSessionAudioPreset(preset: Int, expectedEntryID: Long): IntArray =
+        delegate.setSessionAudioPreset(preset, expectedEntryID)
 
     /// Set an mpv OPTION before [init] (the pre-`mpv_initialize` window). Returns mpv's status code
     /// (< 0 on error). This is how [MpvConfig.baseOptions] is applied. After [init], prefer

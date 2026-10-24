@@ -601,6 +601,7 @@ final class OwnerHistorySessionCoordinator {
             validation: validation, journal: local.journal, preservedOwnerUID: preservedOwnerUID, mode: .fork(capture.fence))
         var fence = try Self.capture(candidate, target: verifier.boundTarget, verifier: verifier)
         var array = Data("[".utf8)
+        try Self.beginKeyedCheckpoint(candidate, fence: fence, parent: capture.fence, verifier: verifier)
         for (i, action) in actions.enumerated() {
             _ = try Exact.Object(action)
             if i != 0 { array.append(44) }; array.append(action)
@@ -625,8 +626,9 @@ final class OwnerHistorySessionCoordinator {
             complete = try snapshot.replacingNativeState(full,
                 witnessID: Exact.Object(fence).text("sourceSetWitnessId"), fence: fence)
         } else {
-            let delta = try candidate.request(Self.request("checkpoint_delta", fence: fence), verify: verifier.callback)
-            complete = try snapshot.applying(checkpoint: delta)
+            let delta = try candidate.request(Self.checkpointDeltaRequest(fence: fence, verifier: verifier), verify: verifier.callback)
+            complete = try snapshot.retargeting(fence: capture.fence).applying(checkpoint: delta,
+                allowKeyed: verifier.keyedCheckpoints, expectedFence: fence)
         }
         _ = try persistAndAccept(candidate, snapshot: complete, local: local, capture: capture,
             localBytes: localBytes, wireSources: localWireSources, hostPreferences: hostPreferences,
@@ -757,6 +759,8 @@ final class OwnerHistorySessionCoordinator {
                 validation: owner.validation, journal: nextLocal.journal, preservedOwnerUID: owner.preservedOwnerUID, mode: .fork(capture.fence), peer: peer)
             do {
                 fence = try OwnerHistorySessionCoordinator.capture(native, target: verifier.boundTarget, verifier: verifier)
+                try OwnerHistorySessionCoordinator.beginKeyedCheckpoint(native, fence: fence,
+                    parent: capture.fence, verifier: verifier)
             } catch {
                 guard owner.retireOwnedRuntime(native) else { throw VortxNativeError.checkpointUncertain }
                 throw error
@@ -839,9 +843,9 @@ final class OwnerHistorySessionCoordinator {
                 snapshot = try base.replacingNativeState(full.required("state"),
                     witnessID: Exact.Object(fence).text("sourceSetWitnessId"), fence: fence)
             } else {
-                let delta = try native.request(OwnerHistorySessionCoordinator.request("checkpoint_delta",
-                    fence: fence), verify: verifier.callback)
-                snapshot = try base.applying(checkpoint: delta)
+                let delta = try native.request(OwnerHistorySessionCoordinator.checkpointDeltaRequest(
+                    fence: fence, verifier: verifier), verify: verifier.callback)
+                snapshot = try base.applying(checkpoint: delta, allowKeyed: verifier.keyedCheckpoints, expectedFence: fence)
             }
             actions.append((action, now))
             var response = try Exact.Object(Data("{}".utf8))
@@ -1022,7 +1026,28 @@ final class OwnerHistorySessionCoordinator {
         let fence = try reply.required("fence")
         guard try reply.text("kind") == "capture", try reply.required("advertise") == Data("false".utf8),
               let bound = verifier.boundFence, try equal(bound, fence) else { throw VortxNativeError.invalidResponse }
+        // Old SDK captures omit this extension and continue using the exact legacy request.
+        // Capability is scoped to this actual runtime/verifier, never a global SDK guess.
+        try verifier.negotiateCheckpointFormats(reply["checkpointDeltaFormats"])
         return fence
+    }
+    private static func checkpointDeltaRequest(fence: Data, verifier: Verifier) throws -> Data {
+        try request("checkpoint_delta", fence: fence,
+            extra: verifier.keyedCheckpoints ? ["format": Exact.string("keyed_rows/1")] : [:])
+    }
+    private static func beginKeyedCheckpoint(_ runtime: OwnerHistorySessionRuntime, fence: Data,
+        parent: Data, verifier: Verifier) throws {
+        guard verifier.keyedCheckpoints else { return }
+        // Same existing request family: arm the journal before ANY dispatch publication.
+        // This empty checkpoint is not persisted or accepted. Mutation invalidates eligibility.
+        let reply = try Exact.Object(runtime.request(checkpointDeltaRequest(fence: fence, verifier: verifier),
+            verify: verifier.callback))
+        guard try reply.text("kind") == "checkpoint_delta", try reply.text("deltaEncoding") == "keyed_rows/1",
+              try equal(reply.required("fence"), fence), try equal(reply.required("preparedAgainst"), parent),
+              try reply.required("durableAck") == Data("false".utf8),
+              try reply.required("requiresCompleteArchiveEnvelope") == Data("true".utf8),
+              try Exact.sameText(reply.text("reuseExactOwnerHistoryFromWitness"), Exact.Object(parent).text("sourceSetWitnessId")),
+              try Exact.array(reply.required("keyedStateSteps")).isEmpty else { throw VortxNativeError.invalidResponse }
     }
     private static func request(_ kind: String, fence: Data? = nil, extra: [String: Data] = [:]) throws -> Data {
         var object = try Exact.Object(Data("{}".utf8))
@@ -1069,6 +1094,7 @@ final class OwnerHistorySessionCoordinator {
         private var parent: Data?
         private var full: Data?
         private var fullCount = 0
+        private var supportsKeyedCheckpoints = false
         init(scope: VortxAccountScope, target: Target, authority: any VortxMutationAuthority,
              validation: OwnerHistoryExactSourceValidation, journal: VortxNativeOwnerHistoryJournal,
              preservedOwnerUID: String? = nil, mode: Mode, peer: Peer? = nil, openingNative: Data? = nil) {
@@ -1081,6 +1107,15 @@ final class OwnerHistorySessionCoordinator {
         var callback: OwnerHistorySessionRuntime.Verify { { [self] in try verify($0) } }
         var normalized: Data? { lock.withLock { full } }
         var fullVersion: Int { lock.withLock { fullCount } }
+        var keyedCheckpoints: Bool { lock.withLock { supportsKeyedCheckpoints } }
+        func negotiateCheckpointFormats(_ bytes: Data?) throws {
+            let formats = try bytes.map { try JSONDecoder().decode([String].self, from: $0) } ?? []
+            guard formats.count <= 16, Set(formats).count == formats.count else {
+                throw VortxNativeError.invalidResponse
+            }
+            let supported = formats.contains { Exact.sameText($0, "keyed_rows/1") }
+            lock.withLock { supportsKeyedCheckpoints = supported }
+        }
         var boundFence: Data? { lock.withLock { current } }
         var boundTarget: Target { lock.withLock { target } }
         private func verify(_ bytes: Data) throws {

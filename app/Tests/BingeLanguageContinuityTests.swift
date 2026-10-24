@@ -1,10 +1,6 @@
 import Foundation
 
-final class ProfileStore {
-    static let shared = ProfileStore()
-    var activeID: UUID?
-}
-enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} }
+// SeriesStickyFixtureSupport supplies the explicit MainActor/RAM collaborators.
 
 @main enum BingeLanguageContinuityTests {
     @MainActor static func main() async throws {
@@ -49,7 +45,7 @@ enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} 
             }
         }
 
-        // Isolated randomly named profiles; no real viewer's preferences are read or modified.
+        // Randomly named RAM profiles; UserDefaults is the shared in-memory fixture, not Foundation's store.
         let profileA = UUID(), profileB = UUID(), series = "fixture-series"
         defer {
             for profile in [profileA, profileB] {
@@ -61,12 +57,24 @@ enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} 
         SeriesSourceSticky.recordAudio(seriesKey: series, language: "eng")
         let first = SeriesSourceSticky.snapshot(for: series)
         precondition(first.addon == "Actual source group" && first.audioLanguage == "en")
+        // Live capture belongs to the owner, but the immutable value and TaskLocal transport must
+        // remain usable by a detached worker without touching ProfileStore or hopping to main.
+        let transported = await Task.detached { [first] in
+            SeriesSourceSticky.$resolvingChoice.withValue(first) {
+                SeriesSourceSticky.resolvingChoice
+            }
+        }.value
+        precondition(transported == first, "detached work receives only the checked immutable choice")
         let warm = await SeriesSourceSticky.$resolvingChoice.withValue(first) {
             await Task.yield()
             return SeriesSourceSticky.snapshot(for: series)
         }
         precondition(warm == first, "prepare and admission share frozen choice")
         SeriesSourceSticky.recordAudio(seriesKey: series, language: "jpn")
+        // Persistence must finish in this owner turn; no deferred writer may race a profile switch.
+        let savedA = try JSONDecoder().decode([String: SeriesSourceSticky.Choice].self,
+            from: UserDefaults.standard.data(forKey: "stremiox.seriesSourceSticky.\(profileA.uuidString)")!)
+        precondition(savedA[series]?.audioLanguage == "ja" && savedA[series]?.addon == first.addon)
         precondition(SeriesSourceSticky.snapshot(for: series) != warm, "manual audio change retires prepared source")
         precondition(SeriesSourceSticky.preference(for: series)?.addon == first.addon,
                      "audio change must not learn automatic source provenance")
@@ -77,8 +85,15 @@ enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} 
         }
         precondition(otherProfile.profile == profileB.uuidString && otherProfile.addon == nil,
                      "frozen choice cannot cross profiles")
+        SeriesSourceSticky.record(seriesKey: series, addon: "Profile B source", bingeGroup: "profile-b-pack")
+        let savedB = try JSONDecoder().decode([String: SeriesSourceSticky.Choice].self,
+            from: UserDefaults.standard.data(forKey: "stremiox.seriesSourceSticky.\(profileB.uuidString)")!)
+        precondition(savedB[series]?.addon == "Profile B source" && savedB[series]?.audioLanguage == nil,
+                     "same-turn profile edit persists only in its own namespace")
         ProfileStore.shared.activeID = profileA
         precondition(SeriesSourceSticky.snapshot(for: series).audioLanguage == "ja")
+        precondition(SeriesSourceSticky.preference(for: series)?.addon == first.addon,
+                     "another profile's synchronous write must not change this profile's cached choice")
         let old = Data(#"{"addon":"legacy","bingeGroup":"old-pack","ts":0}"#.utf8)
         let decoded = try JSONDecoder().decode(SeriesSourceSticky.Choice.self, from: old)
         precondition(decoded.addon == "legacy" && decoded.audioLanguage == nil,

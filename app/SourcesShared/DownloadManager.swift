@@ -905,8 +905,8 @@ final class DownloadManager: NSObject, ObservableObject {
             byteSession.getAllTasks { tasks in
                 let downloadTasks = tasks.compactMap { $0 as? URLSessionDownloadTask }
                 Task { @MainActor [self] in
-                    defer { finishReconciliationCallback(barrier: barrier) }
-                    reconcileByteTasks(downloadTasks)
+                    defer { self.finishReconciliationCallback(barrier: barrier) }
+                    self.reconcileByteTasks(downloadTasks)
                 }
             }
         case .hlsAsset:
@@ -916,8 +916,8 @@ final class DownloadManager: NSObject, ObservableObject {
             assetSession.getAllTasks { tasks in
                 let assetTasks = tasks.compactMap { $0 as? AVAssetDownloadTask }
                 Task { @MainActor [self] in
-                    defer { finishReconciliationCallback(barrier: barrier) }
-                    reconcileAssetTasks(assetTasks)
+                    defer { self.finishReconciliationCallback(barrier: barrier) }
+                    self.reconcileAssetTasks(assetTasks)
                 }
             }
             #else

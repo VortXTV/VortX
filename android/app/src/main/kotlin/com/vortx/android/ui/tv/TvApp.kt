@@ -49,10 +49,12 @@ import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.detailEpisodeRouteKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.randompick.RandomTitlePlayRequest
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
@@ -111,6 +113,7 @@ fun TvApp(
                 confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
+        var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
@@ -132,9 +135,70 @@ fun TvApp(
             )
         }
 
+        fun isLibraryPlayCurrent(request: RandomTitlePlayRequest): Boolean {
+            val store = profileStore ?: return false
+            val owner = repo.continueWatchingOwner()
+            // Use the actual roster selection, never activeProfileId's owner fallback.
+            val profile = store.active
+            return request.isCurrent(
+                currentOwner = owner,
+                currentProfile = profile,
+                needsPicker = store.needsPicker,
+                currentType = detail?.type,
+                currentId = detail?.id,
+                currentDetailGeneration = detailGeneration,
+            ) && repo.continueWatchingOwner() == owner && store.active == profile && !store.needsPicker
+        }
+        fun retireLibraryPlayRoute() {
+            if (pendingLibraryPlay == null) return
+            // Revoke callbacks synchronously, before the bounded ViewModel owner is forgotten.
+            pendingLibraryPlay = null
+            detailGeneration += 1
+            detail = null
+            playing = null
+            playingMeta = null
+        }
+        fun openLibraryPlay(item: MetaItem) {
+            retireLibraryPlayRoute()
+            val store = profileStore ?: return
+            val profile = store.active ?: return
+            if (store.needsPicker || item.continueWatchingAdmission?.isCurrent() == false) return
+            item.continueWatchingUnavailableMessage?.let { message ->
+                unavailableContinueWatching = "${item.name}\n\n$message"
+                return
+            }
+            val request = RandomTitlePlayRequest(
+                type = item.type,
+                id = item.id,
+                owner = repo.continueWatchingOwner(),
+                profile = profile,
+                detailGeneration = detailGeneration + 1,
+            )
+            if (!request.isCurrent(
+                    currentOwner = repo.continueWatchingOwner(),
+                    currentProfile = store.active,
+                    needsPicker = store.needsPicker,
+                    currentType = item.type,
+                    currentId = item.id,
+                    currentDetailGeneration = request.detailGeneration,
+                )) return
+            detailGeneration = request.detailGeneration
+            detail = item
+            pendingLibraryPlay = request
+        }
+        LaunchedEffect(repo, profileStore, activeProfile) {
+            fun retireIfChanged() {
+                val request = pendingLibraryPlay ?: return
+                if (!isLibraryPlayCurrent(request)) retireLibraryPlayRoute()
+            }
+            retireIfChanged()
+            repo.ctxUpdates().collect { retireIfChanged() }
+        }
+
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
+            retireLibraryPlayRoute()
             playing = null
             playingMeta = null
             autoAdvanceStreak[0] = 0
@@ -158,7 +222,7 @@ fun TvApp(
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let {
-                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
+                "$detailGeneration:${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
             } ?: "no-detail:$detailSourceEpoch",
         )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
@@ -431,9 +495,11 @@ fun TvApp(
             UpdatePromptHost()
             val current = detail
             if (current != null) {
+                val routeGeneration = detailGeneration
+                val libraryPlayRequest = pendingLibraryPlay
                 key(current.type, current.id, detailGeneration) {
-                    // The Compose generation resets the local screen tree, while this Activity-scoped
-                    // ViewModel key remains bounded by target and owner so repeat visits do not leak VMs.
+                    // The bounded owner also includes this visit's generation: a fresh Library Play
+                    // cannot inherit an older selection, pending source or consumed auto-watch intent.
                     val detailVm: DetailViewModel = viewModel(
                         viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
@@ -460,10 +526,16 @@ fun TvApp(
                         title = current.name,
                         onBack = {
                             detailVm.abandonPlaybackRoute()
+                            retireLibraryPlayRoute()
+                            detailGeneration += 1
                             detail = null
                         },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
-                            if (detailVm.isRouteAdmissionCurrent()) {
+                            val request = pendingLibraryPlay
+                            val currentRoute = detailGeneration == routeGeneration &&
+                                detail?.type == current.type && detail?.id == current.id &&
+                                (request == null || isLibraryPlayCurrent(request))
+                            if (currentRoute && detailVm.isRouteAdmissionCurrent()) {
                                 autoAdvanceStreak[0] = 0
                                 playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
                                     requested = requestedEngine,
@@ -472,12 +544,53 @@ fun TvApp(
                                 )
                                 playingMeta = loadedMeta
                                 playing = resolved
+                                pendingLibraryPlay = null
                             } else resolved.playbackLease?.close()
+                        },
+                        autoWatch = pendingLibraryPlay?.let { request ->
+                            !request.consumed && isLibraryPlayCurrent(request)
+                        } == true,
+                        autoWatchAdmission = {
+                            libraryPlayRequest != null && libraryPlayRequest.sameIntent(pendingLibraryPlay) &&
+                                isLibraryPlayCurrent(libraryPlayRequest)
+                        },
+                        onAutoWatchConsumed = {
+                            val request = libraryPlayRequest
+                            val ownsRoute = request != null && request.sameIntent(pendingLibraryPlay) &&
+                                routeGeneration == detailGeneration &&
+                                detail?.type == current.type && detail?.id == current.id
+                            if (!ownsRoute || request == null || pendingLibraryPlay?.consumed != false) {
+                                // An old composition must not consume or retire a replacement intent.
+                                false
+                            } else {
+                                val admitted = isLibraryPlayCurrent(request)
+                                if (admitted) {
+                                    // Consumption changes only the one-shot flag, not its resolve witness.
+                                    pendingLibraryPlay = request.copy(consumed = true)
+                                } else {
+                                    retireLibraryPlayRoute()
+                                    detailVm.abandonPlaybackRoute()
+                                }
+                                admitted
+                            }
+                        },
+                        onAutoWatchCancelled = {
+                            val request = libraryPlayRequest
+                            val admitted = detailGeneration == routeGeneration &&
+                                detail?.type == current.type && detail?.id == current.id &&
+                                (request == null || (request.sameIntent(pendingLibraryPlay) && isLibraryPlayCurrent(request)))
+                            if (request != null && request.sameIntent(pendingLibraryPlay)) {
+                                pendingLibraryPlay = null
+                                detailVm.abandonPlaybackRoute()
+                            }
+                            // A deliberate manual action owns the existing Detail; do not replace it.
+                            admitted
                         },
                         // A Person-page filmography tile (opened from the detail's cast rail) resolves a
                         // title and opens it as a fresh detail, reusing the SAME detail slot the browse wall
                         // uses -- the couch analogue of the phone actor -> film walk.
                         onOpenTitle = {
+                            retireLibraryPlayRoute()
                             detailGeneration += 1
                             detail = it
                         },
@@ -489,14 +602,21 @@ fun TvApp(
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
                 TvShell(
-                    onProfileSelected = { profileSelection = it },
+                    onProfileSelected = {
+                        retireLibraryPlayRoute()
+                        profileSelection = it
+                    },
                     repo = repo,
                     auth = auth,
                     destination = shellDestination,
-                    onDestinationChange = { shellDestination = it },
+                    onDestinationChange = {
+                        retireLibraryPlayRoute()
+                        shellDestination = it
+                    },
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
                     onItem = {
+                        retireLibraryPlayRoute()
                         if (it.continueWatchingAdmission?.isCurrent() != false) {
                             if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
                             else {
@@ -505,10 +625,12 @@ fun TvApp(
                             }
                         }
                     },
+                    onDirectResume = ::openLibraryPlay,
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
                     onPlayLocal = {
+                        retireLibraryPlayRoute()
                         autoAdvanceStreak[0] = 0
                         playingEngineOverride = automaticEngineFor(it)
                         playingMeta = null

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The user's 1...10 title ratings: a LOCAL shadow store (Application Support JSON) that the app reads
 /// from, mirrored out to Trakt over `POST /sync/ratings` and converged with `GET /sync/ratings/{type}`.
@@ -37,10 +38,10 @@ import Foundation
 ///
 /// # Threading
 ///
-/// `final class` + `NSLock` + a change notification, matching `TraktSyncEngine`: the read is synchronous
+/// One checked lock-owned value + a change notification, matching `TraktSyncEngine`: the read is synchronous
 /// so a SwiftUI body can call it inline, and the offline-drain callback can run off the main thread.
 /// Fully fail-soft: every network path is `try?`-shaped and a failure only ever leaves the local value.
-final class TraktRatingsStore {
+final class TraktRatingsStore: Sendable {
     static let shared = TraktRatingsStore()
 
     /// Posted when the shadow changes (a user rating, or an adopted read-back row) so every mounted
@@ -55,18 +56,20 @@ final class TraktRatingsStore {
     /// own data and is never auto-dropped, and an unpushed entry still owes Trakt a write.
     private static let entryCap = 5_000
 
-    private let lock = NSLock()
-    /// Entries by an opaque, stable primary key. The key never changes once assigned (a later read-back
-    /// may enrich an entry's ids, but re-keying would orphan it), so all lookup goes through `aliases`.
-    private var entries: [String: RatingEntry]
-    /// Every id form an entry can be found by ("tt123…", "tmdb:456") -> its primary key. Rebuilt on any
-    /// mutation. Lets a title rated under a `tmdb:` catalog id still resolve once its tt id is known.
-    private var aliases: [String: String] = [:]
-    /// Bumped by `reset()`. An in-flight pull/push captures it before its awaits and refuses to write back
-    /// if it changed, so a disconnect can never resurrect the wiped store into the next account.
-    private var generation = 0
-    /// Session that owns every entry currently in memory and on disk.
-    private var stateSessionID: TraktSessionID?
+    private struct State: Sendable {
+        /// Entries by an opaque, stable primary key. The key never changes once assigned (a later read-back
+        /// may enrich an entry's ids, but re-keying would orphan it), so all lookup goes through `aliases`.
+        var entries: [String: RatingEntry]
+        /// Every id form an entry can be found by ("tt123…", "tmdb:456") -> its primary key. Rebuilt on any
+        /// mutation. Lets a title rated under a `tmdb:` catalog id still resolve once its tt id is known.
+        var aliases: [String: String] = [:]
+        /// Bumped by `reset()`. An in-flight pull/push captures it before its awaits and refuses to write back
+        /// if it changed, so a disconnect can never resurrect the wiped store into the next account.
+        var generation = 0
+        /// Session that owns every entry currently in memory and on disk.
+        var stateSessionID: TraktSessionID?
+    }
+    private let cache: OSAllocatedUnfairLock<State>
 
     private struct PersistedSnapshot: Codable {
         let sessionID: TraktSessionID
@@ -81,8 +84,8 @@ final class TraktRatingsStore {
 
     private init() {
         let initialSession = TraktAuth.storedSessionID
-        stateSessionID = initialSession
-        entries = initialSession.map(Self.load(for:)) ?? [:]
+        cache = OSAllocatedUnfairLock(initialState: State(
+            entries: initialSession.map(Self.load(for:)) ?? [:], stateSessionID: initialSession))
         rebuildAliases()
         TraktAuthBoundary.observe(key: "trakt-ratings-store") { [weak self] sessionID in
             self?.reset(to: sessionID)
@@ -114,11 +117,12 @@ final class TraktRatingsStore {
     /// lock-guarded so a detail-page body can read it inline. Never touches the network.
     func rating(imdb: String?, tmdb: Int?) -> Int? {
         guard let currentSession = TraktAuth.storedSessionID else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              TraktAuth.storedSessionID == currentSession else { return nil }
-        guard let key = primaryKeyLocked(imdb: imdb, tmdb: tmdb) else { return nil }
-        return entries[key]?.rating
+        return cache.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  TraktAuth.storedSessionID == currentSession else { return nil }
+            guard let key = Self.primaryKeyLocked(state, imdb: imdb, tmdb: tmdb) else { return nil }
+            return state.entries[key]?.rating
+        }
     }
 
     // MARK: - Write side (user action)
@@ -144,29 +148,31 @@ final class TraktRatingsStore {
         guard let sessionID = TraktAuth.storedSessionID else { return }
         let cleanIMDb = (imdb?.isEmpty == false) ? imdb : nil
         guard cleanIMDb != nil || tmdb != nil else { return }   // no usable identity: nothing to key on
-        lock.lock()
-        guard stateSessionID == sessionID,
-              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        // Re-file an existing entry under its ORIGINAL key (a title first rated under a `tmdb:` id keeps
-        // that key even once its tt id is known); only a title we have never seen mints a new one.
-        guard let key = primaryKeyLocked(imdb: cleanIMDb, tmdb: tmdb)
-                ?? Self.makeKey(imdb: cleanIMDb, tmdb: tmdb) else { lock.unlock(); return }
-        // UNION this page's ids with the ones the entry already carries; never store this call's ids
-        // wholesale. A detail page only knows the ids ITS catalog carries, and a tmdb-keyed page has no tt
-        // id at all until its meta loads, so a re-rate from there would otherwise DROP an imdb id the entry
-        // already had. That id is what the alias index finds the entry by, so the rating would stop
-        // resolving on any imdb-keyed page: the user's own score silently reads as unrated, and rating it
-        // again there would mint a SECOND entry for one title. Ids only ever accumulate, exactly as
-        // `merge`'s enrichment does; a value is replaced, an identity never is.
-        let known = entries[key]
-        let entry = RatingEntry(imdb: cleanIMDb ?? known?.imdb, tmdb: tmdb ?? known?.tmdb,
-                                isSeries: isSeries, rating: rating, ratedAt: Date(), pushed: false)
-        entries[key] = entry
-        rebuildAliasesLocked()
-        pruneLocked()
-        let gen = generation
-        persistLocked()
-        lock.unlock()
+        let accepted: (entry: RatingEntry, generation: Int)? = cache.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID else { return nil }
+            // Re-file an existing entry under its ORIGINAL key (a title first rated under a `tmdb:` id keeps
+            // that key even once its tt id is known); only a title we have never seen mints a new one.
+            guard let key = Self.primaryKeyLocked(state, imdb: cleanIMDb, tmdb: tmdb)
+                    ?? Self.makeKey(imdb: cleanIMDb, tmdb: tmdb) else { return nil }
+            // UNION this page's ids with the ones the entry already carries; never store this call's ids
+            // wholesale. A detail page only knows the ids ITS catalog carries, and a tmdb-keyed page has no tt
+            // id at all until its meta loads, so a re-rate from there would otherwise DROP an imdb id the entry
+            // already had. That id is what the alias index finds the entry by, so the rating would stop
+            // resolving on any imdb-keyed page: the user's own score silently reads as unrated, and rating it
+            // again there would mint a SECOND entry for one title. Ids only ever accumulate, exactly as
+            // `merge`'s enrichment does; a value is replaced, an identity never is.
+            let known = state.entries[key]
+            let entry = RatingEntry(imdb: cleanIMDb ?? known?.imdb, tmdb: tmdb ?? known?.tmdb,
+                                    isSeries: isSeries, rating: rating, ratedAt: Date(), pushed: false)
+            state.entries[key] = entry
+            Self.rebuildAliasesLocked(&state)
+            Self.pruneLocked(&state)
+            let gen = state.generation
+            Self.persistLocked(state)
+            return (entry, gen)
+        }
+        guard let (entry, gen) = accepted else { return }
         notifyChanged()
         mirror(entry, gen: gen, sessionID: sessionID)
     }
@@ -229,22 +235,22 @@ final class TraktRatingsStore {
         gen: Int? = nil,
         sessionID: TraktSessionID
     ) {
-        lock.lock()
-        guard stateSessionID == sessionID,
-              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        if let gen, gen != generation { lock.unlock(); return }
-        guard let key = primaryKeyLocked(imdb: pushed.imdb, tmdb: pushed.tmdb),
-              var current = entries[key],
-              current.rating == pushed.rating,
-              // Dates round-trip through epoch seconds in the push queue, so compare at that resolution
-              // rather than requiring bit-equal Date values.
-              Int(current.ratedAt.timeIntervalSince1970) == Int(pushed.ratedAt.timeIntervalSince1970)
-        else { lock.unlock(); return }
-        guard !current.pushed else { lock.unlock(); return }
-        current.pushed = true
-        entries[key] = current
-        persistLocked()
-        lock.unlock()
+        cache.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID else { return }
+            if let gen, gen != state.generation { return }
+            guard let key = Self.primaryKeyLocked(state, imdb: pushed.imdb, tmdb: pushed.tmdb),
+                  var current = state.entries[key],
+                  current.rating == pushed.rating,
+                  // Dates round-trip through epoch seconds in the push queue, so compare at that resolution
+                  // rather than requiring bit-equal Date values.
+                  Int(current.ratedAt.timeIntervalSince1970) == Int(pushed.ratedAt.timeIntervalSince1970)
+            else { return }
+            guard !current.pushed else { return }
+            current.pushed = true
+            state.entries[key] = current
+            Self.persistLocked(state)
+        }
     }
 
     /// Drain-side twin of `markPushed`, taking the queue's flat fields.
@@ -275,71 +281,70 @@ final class TraktRatingsStore {
         sessionID: TraktSessionID
     ) -> Bool {
         guard !rows.isEmpty else { return false }
-        lock.lock()
-        guard generation == gen,
-              stateSessionID == sessionID,
-              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return false }
-        // Two flags, deliberately: `valueChanged` is what the USER would see (a rating appeared or moved)
-        // and drives the repaint; `dirty` is anything that must reach the alias index and disk, INCLUDING a
-        // pure id enrichment that changes no value. Collapsing them would let an enrichment mutate `entries`
-        // while `aliases` and the file kept the old shape, so the newly-learned id would not resolve until
-        // some later write happened to rebuild them, and would be lost entirely on relaunch.
-        var valueChanged = false
-        var dirty = false
-        for row in rows {
-            let container = isSeries ? row.show?.ids : row.movie?.ids
-            guard let ids = container else { continue }
-            let imdb = (ids.imdb?.isEmpty == false) ? ids.imdb : nil
-            let tmdb = ids.tmdb
-            guard imdb != nil || tmdb != nil else { continue }
-            // A row whose rated_at will not parse gets no timestamp, so it can never win rule 4 against a
-            // known local entry. It may still FILL a title we have never seen (that is not a conflict).
-            let remoteAt = row.ratedAt.flatMap(TraktRatedAt.date(from:))
-            guard Self.validRange.contains(row.rating) else { continue }
+        return cache.withLock { state in
+            guard state.generation == gen,
+                  state.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID else { return false }
+            // Two flags, deliberately: `valueChanged` is what the USER would see (a rating appeared or moved)
+            // and drives the repaint; `dirty` is anything that must reach the alias index and disk, INCLUDING a
+            // pure id enrichment that changes no value. Collapsing them would let an enrichment mutate `entries`
+            // while `aliases` and the file kept the old shape, so the newly-learned id would not resolve until
+            // some later write happened to rebuild them, and would be lost entirely on relaunch.
+            var valueChanged = false
+            var dirty = false
+            for row in rows {
+                let container = isSeries ? row.show?.ids : row.movie?.ids
+                guard let ids = container else { continue }
+                let imdb = (ids.imdb?.isEmpty == false) ? ids.imdb : nil
+                let tmdb = ids.tmdb
+                guard imdb != nil || tmdb != nil else { continue }
+                // A row whose rated_at will not parse gets no timestamp, so it can never win rule 4 against a
+                // known local entry. It may still FILL a title we have never seen (that is not a conflict).
+                let remoteAt = row.ratedAt.flatMap(TraktRatedAt.date(from:))
+                guard Self.validRange.contains(row.rating) else { continue }
 
-            guard let key = primaryKeyLocked(imdb: imdb, tmdb: tmdb) else {
-                // Rule 4 (fill): a title the shadow has never heard of. Insert it as already-pushed;
-                // it came FROM Trakt, so it owes Trakt nothing.
-                guard let newKey = Self.makeKey(imdb: imdb, tmdb: tmdb) else { continue }
-                entries[newKey] = RatingEntry(imdb: imdb, tmdb: tmdb, isSeries: isSeries,
-                                              rating: row.rating, ratedAt: remoteAt ?? Date(), pushed: true)
+                guard let key = Self.primaryKeyLocked(state, imdb: imdb, tmdb: tmdb) else {
+                    // Rule 4 (fill): a title the shadow has never heard of. Insert it as already-pushed;
+                    // it came FROM Trakt, so it owes Trakt nothing.
+                    guard let newKey = Self.makeKey(imdb: imdb, tmdb: tmdb) else { continue }
+                    state.entries[newKey] = RatingEntry(imdb: imdb, tmdb: tmdb, isSeries: isSeries,
+                                                  rating: row.rating, ratedAt: remoteAt ?? Date(), pushed: true)
+                    valueChanged = true
+                    dirty = true
+                    continue
+                }
+                guard var local = state.entries[key] else { continue }
+                // Enrich ids either way: learning a title's tt id from Trakt is not a value change, it just
+                // makes the entry findable from a tt-keyed page later. Dirty (it must be indexed + saved), but
+                // never a repaint on its own.
+                if local.imdb == nil, let imdb { local.imdb = imdb; state.entries[key] = local; dirty = true }
+                if local.tmdb == nil, let tmdb { local.tmdb = tmdb; state.entries[key] = local; dirty = true }
+
+                // Rule 3: an unpushed local edit is immune. Trakt cannot know about it yet by construction.
+                guard local.pushed else { continue }
+                // Rule 4: adopt ONLY on a strictly newer remote stamp. Equal or older changes nothing, so a
+                // routine re-pull is idempotent and can never flap a value back and forth.
+                guard let remoteAt, remoteAt > local.ratedAt else { continue }
+                guard local.rating != row.rating else { continue }
+                local.rating = row.rating
+                local.ratedAt = remoteAt
+                local.pushed = true
+                state.entries[key] = local
                 valueChanged = true
                 dirty = true
-                continue
             }
-            guard var local = entries[key] else { continue }
-            // Enrich ids either way: learning a title's tt id from Trakt is not a value change, it just
-            // makes the entry findable from a tt-keyed page later. Dirty (it must be indexed + saved), but
-            // never a repaint on its own.
-            if local.imdb == nil, let imdb { local.imdb = imdb; entries[key] = local; dirty = true }
-            if local.tmdb == nil, let tmdb { local.tmdb = tmdb; entries[key] = local; dirty = true }
-
-            // Rule 3: an unpushed local edit is immune. Trakt cannot know about it yet by construction.
-            guard local.pushed else { continue }
-            // Rule 4: adopt ONLY on a strictly newer remote stamp. Equal or older changes nothing, so a
-            // routine re-pull is idempotent and can never flap a value back and forth.
-            guard let remoteAt, remoteAt > local.ratedAt else { continue }
-            guard local.rating != row.rating else { continue }
-            local.rating = row.rating
-            local.ratedAt = remoteAt
-            local.pushed = true
-            entries[key] = local
-            valueChanged = true
-            dirty = true
+            // Rule 1 is enforced by absence of code: nothing above removes an entry for not being in `rows`.
+            guard dirty else { return false }
+            Self.rebuildAliasesLocked(&state)
+            Self.pruneLocked(&state)
+            Self.persistLocked(state)
+            return valueChanged
         }
-        // Rule 1 is enforced by absence of code: nothing above removes an entry for not being in `rows`.
-        guard dirty else { lock.unlock(); return false }
-        rebuildAliasesLocked()
-        pruneLocked()
-        persistLocked()
-        lock.unlock()
-        return valueChanged
     }
 
     /// The generation an in-flight pull must present to `merge`, so a disconnect mid-pull discards it.
     var currentContext: (generation: Int, sessionID: TraktSessionID?) {
-        lock.lock(); defer { lock.unlock() }
-        return (generation, stateSessionID)
+        cache.withLock { ($0.generation, $0.stateSessionID) }
     }
 
     // MARK: - Disconnect
@@ -351,13 +356,13 @@ final class TraktRatingsStore {
     }
 
     private func reset(to sessionID: TraktSessionID?) {
-        lock.lock()
-        entries = [:]
-        aliases = [:]
-        stateSessionID = sessionID
-        generation &+= 1
-        try? Self.storage?.reset()
-        lock.unlock()
+        cache.withLock { state in
+            state.entries = [:]
+            state.aliases = [:]
+            state.stateSessionID = sessionID
+            state.generation &+= 1
+            try? Self.storage?.reset()
+        }
         notifyChanged()
     }
 
@@ -365,9 +370,9 @@ final class TraktRatingsStore {
 
     /// The primary key an id pair resolves to, via the alias index. IMDb is tried first so a title known
     /// by both ids resolves deterministically.
-    private func primaryKeyLocked(imdb: String?, tmdb: Int?) -> String? {
-        if let imdb, !imdb.isEmpty, let key = aliases[imdb] { return key }
-        if let tmdb, let key = aliases["tmdb:\(tmdb)"] { return key }
+    private static func primaryKeyLocked(_ state: State, imdb: String?, tmdb: Int?) -> String? {
+        if let imdb, !imdb.isEmpty, let key = state.aliases[imdb] { return key }
+        if let tmdb, let key = state.aliases["tmdb:\(tmdb)"] { return key }
         return nil
     }
 
@@ -378,9 +383,9 @@ final class TraktRatingsStore {
         return nil
     }
 
-    private func rebuildAliases() { lock.lock(); rebuildAliasesLocked(); lock.unlock() }
+    private func rebuildAliases() { cache.withLock { Self.rebuildAliasesLocked(&$0) } }
 
-    private func rebuildAliasesLocked() {
+    private static func rebuildAliasesLocked(_ state: inout State) {
         var next: [String: String] = [:]
         // TWO entries can legitimately claim ONE alias. Rating a title from a tmdb-keyed catalog before its
         // meta resolves an tt id makes a `tmdb:` entry; rating the same title from an imdb-keyed catalog
@@ -390,26 +395,26 @@ final class TraktRatingsStore {
         // the way `merge` resolves every other conflict: the NEWER edit wins.
         func claim(_ alias: String, _ key: String) {
             guard let held = next[alias] else { next[alias] = key; return }
-            guard let candidate = entries[key], let incumbent = entries[held] else { return }
+            guard let candidate = state.entries[key], let incumbent = state.entries[held] else { return }
             // The key breaks an exact timestamp tie, so the result never depends on iteration order.
             if (candidate.ratedAt, key) > (incumbent.ratedAt, held) { next[alias] = key }
         }
-        for (key, entry) in entries {
+        for (key, entry) in state.entries {
             if let imdb = entry.imdb, !imdb.isEmpty { claim(imdb, key) }
             if let tmdb = entry.tmdb { claim("tmdb:\(tmdb)", key) }
         }
-        aliases = next
+        state.aliases = next
     }
 
     /// Keep the file bounded by dropping the OLDEST PUSHED TOMBSTONES only. A real rating is never
     /// auto-dropped (that would be silent data loss), and an unpushed entry still owes Trakt a write.
-    private func pruneLocked() {
-        guard entries.count > Self.entryCap else { return }
-        let droppable = entries
+    private static func pruneLocked(_ state: inout State) {
+        guard state.entries.count > Self.entryCap else { return }
+        let droppable = state.entries
             .filter { $0.value.rating == nil && $0.value.pushed }
             .sorted { $0.value.ratedAt < $1.value.ratedAt }
-        for (key, _) in droppable.prefix(entries.count - Self.entryCap) { entries.removeValue(forKey: key) }
-        rebuildAliasesLocked()
+        for (key, _) in droppable.prefix(state.entries.count - Self.entryCap) { state.entries.removeValue(forKey: key) }
+        rebuildAliasesLocked(&state)
     }
 
     private func notifyChanged() {
@@ -436,13 +441,13 @@ final class TraktRatingsStore {
         return snapshot.entries
     }
 
-    /// Called only with `lock` held, fencing every save against a concurrent reset.
-    private func persistLocked() {
-        guard let storage = Self.storage, let stateSessionID else {
+    /// Called only with the checked cache lock held, fencing every save against a concurrent reset.
+    private static func persistLocked(_ state: State) {
+        guard let storage = Self.storage, let stateSessionID = state.stateSessionID else {
             try? Self.storage?.reset()
             return
         }
-        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: entries)
+        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: state.entries)
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? storage.save(data)
     }

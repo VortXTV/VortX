@@ -24,7 +24,7 @@ import SwiftUI
             }
         }
         .onAppear { lifetime.renew() }
-        .onChange(of: store.profileID) { _ in lifetime.renew() }
+        .onValueChange(of: store.profileID) { _ in lifetime.renew() }
         .task { await defaults.loadIfNeeded() }
     }
 }

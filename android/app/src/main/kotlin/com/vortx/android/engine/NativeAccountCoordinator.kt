@@ -259,6 +259,7 @@ internal class NativeAccountCoordinator(
         pendingImport = null
         val old = synchronized(lifecycleLock) {
             onAuthorityChanged()
+            if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
         }
         changes.value += 1
@@ -377,7 +378,13 @@ internal class NativeAccountCoordinator(
         val next = Mounted(account, candidate)
         // Authentication may take its own lock; never invoke it while holding lifecycleLock.
         val current = isCurrent() && accountCurrent(account)
-        val installed = current && synchronized(lifecycleLock) { onAuthorityChanged(); mounted.compareAndSet(null, next) }
+        val installed = current && synchronized(lifecycleLock) {
+            onAuthorityChanged()
+            if (mounted.get() != null) false else {
+                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                mounted.compareAndSet(null, next)
+            }
+        }
         if (!installed) {
             retireUnpublished(account, candidate); error("Native account changed")
         }
@@ -387,7 +394,12 @@ internal class NativeAccountCoordinator(
             changes.value += 1
             return true
         } catch (error: Throwable) {
-            val removed = synchronized(lifecycleLock) { mounted.compareAndSet(next, null) }
+            val removed = synchronized(lifecycleLock) {
+                if (mounted.get() !== next) false else {
+                    com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                    mounted.compareAndSet(next, null)
+                }
+            }
             if (removed) retireUnpublished(account, candidate)
             throw error
         }

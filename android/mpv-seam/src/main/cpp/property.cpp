@@ -3,6 +3,7 @@
 // change vs upstream.
 #include <jni.h>
 #include <cstdlib>
+#include <cstring>
 
 #include <mpv/client.h>
 
@@ -26,16 +27,31 @@ extern "C" {
 }
 
 jni_func(jint, nativeSetOptionString, jlong instance, jstring joption, jstring jvalue) {
+    if (!joption || !jvalue)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (env->ExceptionCheck())
+        return MPV_ERROR_NOMEM;
     auto mpv_instance = reinterpret_cast<MPVInstance*>(instance);
-    if (!mpv_instance->mpv) {
+    if (!mpv_instance || !mpv_instance->mpv) {
         die(env, "mpv is not initialized");
-        return 0;
+        return MPV_ERROR_UNINITIALIZED;
     }
 
     const char *option = env->GetStringUTFChars(joption, nullptr);
+    if (!option || env->ExceptionCheck()) {
+        if (option) env->ReleaseStringUTFChars(joption, option);
+        return MPV_ERROR_NOMEM; // Keep the pending JNI exception; no native option call.
+    }
     const char *value = env->GetStringUTFChars(jvalue, nullptr);
+    if (!value || env->ExceptionCheck()) {
+        if (value) env->ReleaseStringUTFChars(jvalue, value);
+        env->ReleaseStringUTFChars(joption, option);
+        return MPV_ERROR_NOMEM;
+    }
 
     int result = mpv_set_option_string(mpv_instance->mpv, option, value);
+    if (result >= 0 && std::strcmp(option, "af") == 0)
+        mpv_instance->session_audio_preset_owned = 0;
 
     env->ReleaseStringUTFChars(joption, option);
     env->ReleaseStringUTFChars(jvalue, value);
@@ -65,6 +81,13 @@ static int common_set_property(JNIEnv *env, mpv_handle* mpv, jstring jproperty, 
     }
 
     const char *prop = env->GetStringUTFChars(jproperty, nullptr);
+    // Scalar setters cannot represent a typed AF chain. Never allow an AF alias to bypass ownership.
+    if (!prop) return MPV_ERROR_PROPERTY_FORMAT;
+    if (std::strcmp(prop, "af") == 0 || std::strcmp(prop, "options/af") == 0 ||
+        std::strcmp(prop, "file-local-options/af") == 0) {
+        env->ReleaseStringUTFChars(jproperty, prop);
+        return MPV_ERROR_PROPERTY_FORMAT;
+    }
     int result = mpv_set_property(mpv, prop, format, value);
     if (result < 0)
         ALOGE("mpv_set_property(%s, %p) format %d returned error %s", prop, value, format, mpv_error_string(result));
@@ -126,10 +149,24 @@ jni_func(void, nativeSetPropertyBoolean, jlong instance, jstring jproperty, jboo
 }
 
 jni_func(void, nativeSetPropertyString, jlong instance, jstring jproperty, jstring jvalue) {
-    auto mpv_instance = reinterpret_cast<MPVInstance*>(instance);
+    auto *mpv_instance = reinterpret_cast<MPVInstance *>(instance);
+    if (!mpv_instance || !mpv_instance->mpv || !jproperty || !jvalue)
+        return;
+    const char *property = env->GetStringUTFChars(jproperty, nullptr);
+    if (!property)
+        return;
     const char *value = env->GetStringUTFChars(jvalue, nullptr);
-    common_set_property(env, mpv_instance->mpv, jproperty, MPV_FORMAT_STRING, &value);
+    if (!value) {
+        env->ReleaseStringUTFChars(jproperty, property);
+        return;
+    }
+    const int status = mpv_set_property(mpv_instance->mpv, property, MPV_FORMAT_STRING, &value);
+    if (status >= 0 && (std::strcmp(property, "af") == 0 ||
+                       std::strcmp(property, "options/af") == 0 ||
+                       std::strcmp(property, "file-local-options/af") == 0))
+        mpv_instance->session_audio_preset_owned = 0;
     env->ReleaseStringUTFChars(jvalue, value);
+    env->ReleaseStringUTFChars(jproperty, property);
 }
 
 jni_func(void, nativeObserveProperty, jlong instance, jstring jproperty, jint jformat) {

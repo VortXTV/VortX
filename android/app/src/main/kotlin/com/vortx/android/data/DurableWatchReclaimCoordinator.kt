@@ -56,6 +56,7 @@ private fun WatchedDownloadReclaimRequest.matches(context: PlaybackContext): Boo
 internal class PlayerResourceReleaseGate {
     private val lock = Any()
     private var boundDecoders = 0
+    private var pendingConstructions = 0
     private var boundLeases = 0
     private var sessionDisposed = false
     private var fired = false
@@ -66,7 +67,25 @@ internal class PlayerResourceReleaseGate {
         releaseCallbacks.putIfAbsent(generation, onReleased)
     }
 
-    fun decoderBound() = synchronized(lock) { boundDecoders += 1 }
+    /** Called on main BEFORE dispatch/factory; a disposed mount cannot start a new decoder. */
+    fun beginConstruction(): Boolean = synchronized(lock) {
+        if (sessionDisposed || fired) false else {
+            pendingConstructions += 1
+            true
+        }
+    }
+    fun endConstruction() = synchronized(lock) {
+        check(pendingConstructions > 0) { "Player construction closed without admission" }
+        pendingConstructions -= 1
+        releaseIfReady()
+    }
+    /** Count before publishing a holder; delayed constructors remain protected by their reservation. */
+    fun decoderBound(): Boolean = synchronized(lock) {
+        if (fired) false else {
+            boundDecoders += 1
+            true
+        }
+    }
     fun decoderReleased() = synchronized(lock) {
         if (boundDecoders > 0) boundDecoders -= 1
         releaseIfReady()
@@ -82,7 +101,7 @@ internal class PlayerResourceReleaseGate {
     }
 
     private fun releaseIfReady() {
-        if (!fired && sessionDisposed && boundLeases == 0 && boundDecoders == 0) {
+        if (!fired && sessionDisposed && boundLeases == 0 && boundDecoders == 0 && pendingConstructions == 0) {
             fired = true
             releaseCallbacks.values.forEach { it() }
         }

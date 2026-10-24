@@ -1,8 +1,9 @@
 import Foundation
+import os
 
 /// The source categories the ranking system recognises. `mediaServer` is FIRST so `allCases` (the fresh-install
 /// default order) puts your own servers at the top, which is what a person who connects one expects.
-enum SourceType: String, CaseIterable, Codable {
+enum SourceType: String, CaseIterable, Codable, Sendable {
     case mediaServer = "mediaServer"
     case debrid  = "debrid"
     case usenet  = "usenet"
@@ -35,7 +36,7 @@ enum SourceType: String, CaseIterable, Codable {
 /// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and every
 /// knob it sets is captured per-profile by the Settings `onChange(of: rankingSignature)` trigger exactly like a
 /// manual edit. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
-enum SourcePreset: String, CaseIterable, Identifiable {
+enum SourcePreset: String, CaseIterable, Identifiable, Sendable {
     case bestQuality, balanced, dataSaver
     var id: String { rawValue }
     var label: String {
@@ -54,9 +55,9 @@ enum SourcePreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// The read surface `StreamRanking` needs from source preferences at score / filter time. Both the live
-/// singleton and an immutable `Snapshot` conform, so the ranker can run on a captured snapshot instead of
-/// reading (and racing) the mutable singleton across threads. Keep it in lockstep with what the ranker reads.
+/// The read surface `StreamRanking` needs from source preferences at score / filter time. Immutable
+/// `Snapshot` values conform; the main-actor UI singleton does not cross this boundary. Task-local
+/// worker captures and the checked owner publication avoid mutable UI reads. Keep it in lockstep.
 protocol SourcePrefsReading {
     var useAddonOrder: Bool { get }
     var typeOrder: [SourceType] { get }
@@ -88,43 +89,44 @@ protocol SourcePrefsReading {
 
 /// Persisted source-ranking preferences.
 /// Observed by SettingsView and read by StreamRanking at score time.
-final class SourcePreferences: ObservableObject, SourcePrefsReading {
+@MainActor
+final class SourcePreferences: ObservableObject {
     static let shared = SourcePreferences()
 
     // Internal (not private) so ProfileStore.applyPlayback writes the same flat keys the singleton reads,
     // instead of re-typing the literal strings (they were the last two duplicated literals in that path).
-    static let orderKey              = "stremiox.streaming.sourceTypeOrder"
-    static let addonOrderKey         = "stremiox.streaming.useAddonOrder"
-    static let excludeKey            = "stremiox.streaming.excludeKeywords"
-    static let includeKey            = "stremiox.streaming.includeKeywords"
-    static let safetyKey             = "stremiox.streaming.safetyMode"
-    static let hideDeadKey           = "stremiox.streaming.hideDeadTorrents"
-    static let instantOnlyKey        = "stremiox.streaming.instantOnly"
-    static let maxResolutionKey      = "stremiox.streaming.maxResolution"
-    static let minResolutionKey      = "stremiox.streaming.minResolution"
-    static let hideUnknownResKey     = "stremiox.streaming.hideUnknownResolution"
-    static let preferredAudioKey     = "stremiox.streaming.preferredAudioOnly"
-    static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
-    static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
-    static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
-    static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
-    static let regexKey              = "stremiox.streaming.keywordsAreRegex"
+    nonisolated static let orderKey              = "stremiox.streaming.sourceTypeOrder"
+    nonisolated static let addonOrderKey         = "stremiox.streaming.useAddonOrder"
+    nonisolated static let excludeKey            = "stremiox.streaming.excludeKeywords"
+    nonisolated static let includeKey            = "stremiox.streaming.includeKeywords"
+    nonisolated static let safetyKey             = "stremiox.streaming.safetyMode"
+    nonisolated static let hideDeadKey           = "stremiox.streaming.hideDeadTorrents"
+    nonisolated static let instantOnlyKey        = "stremiox.streaming.instantOnly"
+    nonisolated static let maxResolutionKey      = "stremiox.streaming.maxResolution"
+    nonisolated static let minResolutionKey      = "stremiox.streaming.minResolution"
+    nonisolated static let hideUnknownResKey     = "stremiox.streaming.hideUnknownResolution"
+    nonisolated static let preferredAudioKey     = "stremiox.streaming.preferredAudioOnly"
+    nonisolated static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
+    nonisolated static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
+    nonisolated static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
+    nonisolated static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
+    nonisolated static let regexKey              = "stremiox.streaming.keywordsAreRegex"
     // Smart Source Selection (Lane A). NEW keys use the vortx.* namespace (the 0.4 rename lands the older
     // stremiox.* keys via a separate dual-read directive; these fresh keys are born vortx.* directly, no
     // migration). Per-profile: they ARE part of Profiles.PlaybackPrefs (folded in exactly like the 13
     // sibling stream-filter knobs), so ProfileStore.applyPlayback captures-before-switch and writes these
     // keys, reload() re-syncs the singleton on a switch, and a Kids profile keeps its own parent-set
     // Avoid words + Avoid behavior instead of a global setting leaking across profiles.
-    static let preferKey             = "vortx.streaming.preferKeywords"
-    static let avoidBehaviorKey      = "vortx.streaming.avoidBehavior"
-    static let autoPickBestKey       = "vortx.streaming.autoPickBest"
+    nonisolated static let preferKey             = "vortx.streaming.preferKeywords"
+    nonisolated static let avoidBehaviorKey      = "vortx.streaming.avoidBehavior"
+    nonisolated static let autoPickBestKey       = "vortx.streaming.autoPickBest"
     // Spoiler-safe mode (detail-page DISPLAY preference, not a ranking/filter knob). When on, an UNWATCHED
     // series episode shows its thumbnail blurred and its synopsis withheld behind a reveal affordance on the
     // detail episode list, so upcoming-episode art and descriptions do not spoil the show; a per-episode tap
     // (iOS/Mac) or focus (tvOS) reveals just that one episode. Global (NOT per-profile, like the existing
     // thumbnail-blur setting) and READ-ONLY against the watch state, so it never touches ranking or watch
     // writes and is deliberately absent from rankingSignature / the ranker Snapshot / reload().
-    static let spoilerSafeKey        = "vortx.detail.spoilerSafe"
+    nonisolated static let spoilerSafeKey        = "vortx.detail.spoilerSafe"
 
     /// Documented per-profile stream-filter defaults, in ONE place. `init()` / `reload()` seed the
     /// string-valued props from these (an absent flat key already reads as the same intrinsic zero /
@@ -132,50 +134,51 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// flat keys when a profile SWITCH lands on a profile that never recorded a field, so the new
     /// profile no longer INHERITS the previously active profile's value (b176 / #117). Change a default
     /// here and both the seed and the switch-reset move together, so the two can never drift.
-    static let defaultSafetyMode            = "off"
+    nonisolated static let defaultSafetyMode            = "off"
     /// Every id the Safety filter may hold, in Picker order (SourcesiOS/iOSSettingsView + SourcesTV/SettingsView
     /// render these tags). Named here, next to the default, because the ids used to exist ONLY as Picker tags:
     /// with no list to validate against, a synced doc could carry any string, `safetyMode != "off"` would read
     /// it as safety-ON, and the Picker had no matching tag to show it with (the webapp shipped "moderate" for
     /// exactly this reason). ProfileStore gates incoming values against this.
-    static let safetyModes: [String]        = ["off", "balanced", "strict"]
-    static let defaultInstantOnly           = false
-    static let defaultHideDeadTorrents      = false
-    static let defaultHDROnly               = false
-    static let defaultExcludeAV1            = false
-    static let defaultExcludeKeywords       = ""
-    static let defaultIncludeKeywords       = ""
-    static let defaultKeywordsAreRegex      = false
-    static let defaultMaxResolution         = 0
-    static let defaultMaxFileSizeGB         = 0.0
-    static let defaultMinResolution         = 0
-    static let defaultHideUnknownResolution = false
-    static let defaultPreferredAudioOnly    = false
-    static let defaultUseAddonOrder         = false
+    nonisolated static let safetyModes: [String]        = ["off", "balanced", "strict"]
+    nonisolated static let defaultInstantOnly           = false
+    nonisolated static let defaultHideDeadTorrents      = false
+    nonisolated static let defaultHDROnly               = false
+    nonisolated static let defaultExcludeAV1            = false
+    nonisolated static let defaultExcludeKeywords       = ""
+    nonisolated static let defaultIncludeKeywords       = ""
+    nonisolated static let defaultKeywordsAreRegex      = false
+    nonisolated static let defaultMaxResolution         = 0
+    nonisolated static let defaultMaxFileSizeGB         = 0.0
+    nonisolated static let defaultMinResolution         = 0
+    nonisolated static let defaultHideUnknownResolution = false
+    nonisolated static let defaultPreferredAudioOnly    = false
+    nonisolated static let defaultUseAddonOrder         = false
     // Smart Source Selection (Lane A) defaults. `avoidBehavior` defaults to "hide" so out of the box the
     // Avoid words behave EXACTLY as today's exclude-keyword drop; the viewer opts into "rank" to keep
     // avoided sources visible but demoted. Prefer is empty and auto-pick is off by default.
-    static let defaultPreferKeywords        = ""
-    static let defaultAvoidBehavior         = "hide"
-    static let defaultAutoPickBest          = false
+    nonisolated static let defaultPreferKeywords        = ""
+    nonisolated static let defaultAvoidBehavior         = "hide"
+    nonisolated static let defaultAutoPickBest          = false
     /// Spoiler-safe mode defaults ON, so a fresh install protects upcoming-episode art + synopses out of the
     /// box. An absent flat key reads as this default (no migration needed).
-    static let defaultSpoilerSafe           = true
+    nonisolated static let defaultSpoilerSafe           = true
     /// A fresh install's source-type priority: the declared `SourceType` order (Debrid, Usenet,
     /// Torrent, Direct), which is exactly the order `readOrder()` fills in for any missing type.
-    static let defaultTypeOrder: [SourceType] = SourceType.allCases
+    nonisolated static let defaultTypeOrder: [SourceType] = SourceType.allCases
     /// The default type order as the comma-joined raw string the flat key stores.
-    static var defaultTypeOrderCSV: String { defaultTypeOrder.map(\.rawValue).joined(separator: ",") }
+    nonisolated static var defaultTypeOrderCSV: String { defaultTypeOrder.map(\.rawValue).joined(separator: ",") }
 
     // Max possible quality score is ~13,800 (4K + cached + remux + HDR + atmos + file-size cap).
     // A 15,000-point tier gap means the preferred type ALWAYS beats a lower type regardless of quality.
     // FIVE slots now (media servers is the added top tier): the 15k step is preserved, so the ladder
     // invariant (cache +8000 clears the ~5,800 quality spread but stays under the step; junk -100,000 sinks
     // below the ~73.8k legit ceiling) still holds. See architecture.md "StreamRanking weight relationships".
-    fileprivate static let tierWeights = [60_000, 45_000, 30_000, 15_000, 0]
+    fileprivate nonisolated static let tierWeights = [60_000, 45_000, 30_000, 15_000, 0]
 
     @Published var typeOrder: [SourceType] {
         didSet {
+            publishReadingSnapshot()
             UserDefaults.standard.set(
                 typeOrder.map(\.rawValue).joined(separator: ","),
                 forKey: Self.orderKey
@@ -185,17 +188,17 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     }
 
     @Published var useAddonOrder: Bool {
-        didSet { UserDefaults.standard.set(useAddonOrder, forKey: Self.addonOrderKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(useAddonOrder, forKey: Self.addonOrderKey) }
     }
 
     /// Comma-separated words to hide from the stream list (matched in the lowercased name+description+
     /// filename). Empty = no filtering. e.g. "cam, ts, hindi".
     @Published var excludeKeywords: String {
-        didSet { UserDefaults.standard.set(excludeKeywords, forKey: Self.excludeKey); rebuildKeywordRegexes() }
+        didSet { rebuildKeywordRegexes(); UserDefaults.standard.set(excludeKeywords, forKey: Self.excludeKey) }
     }
     /// Comma-separated words a stream MUST contain to be shown. Empty = no allow-list. e.g. "remux, atmos".
     @Published var includeKeywords: String {
-        didSet { UserDefaults.standard.set(includeKeywords, forKey: Self.includeKey); rebuildKeywordRegexes() }
+        didSet { rebuildKeywordRegexes(); UserDefaults.standard.set(includeKeywords, forKey: Self.includeKey) }
     }
     /// Treat Hide / Require words as full case-insensitive REGEX patterns instead of comma-separated
     /// substrings, for power users (e.g. require `2160p.*(remux|bluray)`, hide `\b(cam|ts|hdts)\b`). Off by
@@ -203,7 +206,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// typo can never hide every source. The two fields keep their own meaning: Hide = drop on match,
     /// Require = drop on no-match.
     @Published var keywordsAreRegex: Bool {
-        didSet { UserDefaults.standard.set(keywordsAreRegex, forKey: Self.regexKey); rebuildKeywordRegexes() }
+        didSet { rebuildKeywordRegexes(); UserDefaults.standard.set(keywordsAreRegex, forKey: Self.regexKey) }
     }
     /// Compiled forms of the keyword fields when `keywordsAreRegex` is on; nil when off, empty, or the
     /// pattern is invalid. Rebuilt whenever a field or the toggle changes, so the per-stream filter never
@@ -214,53 +217,53 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// within its tier (a ranking nudge, never a filter, so it can never empty a list). Always matched as
     /// substrings (comma-separated), independent of the Hide/Require regex toggle. Empty = no boost.
     @Published var preferKeywords: String {
-        didSet { UserDefaults.standard.set(preferKeywords, forKey: Self.preferKey); StreamRanking.invalidateCaches() }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(preferKeywords, forKey: Self.preferKey); StreamRanking.invalidateCaches() }
     }
     /// Smart Source Selection (Lane A) - what "Avoid" (the Hide words / exclude terms) does. "hide" (default)
     /// DROPS a matching source exactly as today's exclude-keyword filter; "rank" keeps it VISIBLE but sinks
     /// its score far below the tier spread. CAM/TS and other junkClass sources stay HARD-hidden by the Safety
     /// filter in BOTH modes regardless of this setting.
     @Published var avoidBehavior: String {
-        didSet { UserDefaults.standard.set(avoidBehavior, forKey: Self.avoidBehaviorKey); StreamRanking.invalidateCaches() }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(avoidBehavior, forKey: Self.avoidBehaviorKey); StreamRanking.invalidateCaches() }
     }
     /// Smart Source Selection (Lane A) - Auto-pick my best source: when on, the detail Play action plays the
     /// single best ranked source straight away (the existing settle + `StreamRanking.best` auto-pick) instead
     /// of surfacing the source list; a secondary/long-press still opens the full list. Off by default.
     @Published var autoPickBest: Bool {
-        didSet { UserDefaults.standard.set(autoPickBest, forKey: Self.autoPickBestKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(autoPickBest, forKey: Self.autoPickBestKey) }
     }
     /// "off" (default), "balanced" (drop CAM/TS/SCR junk), or "strict" (also drop implausible-for-resolution
     /// fakes). Reuses the existing junk classifiers.
     @Published var safetyMode: String {
-        didSet { UserDefaults.standard.set(safetyMode, forKey: Self.safetyKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(safetyMode, forKey: Self.safetyKey) }
     }
     /// Drop torrents an add-on EXPLICITLY reports as 0-seeders (dead swarms). Off by default. Torrents
     /// with no reported seeder count are kept (unknown is not the same as dead).
     @Published var hideDeadTorrents: Bool {
-        didSet { UserDefaults.standard.set(hideDeadTorrents, forKey: Self.hideDeadKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(hideDeadTorrents, forKey: Self.hideDeadKey) }
     }
     /// Show only sources that play instantly: cached debrid and plain direct links, never an uncached
     /// debrid result or a raw torrent that has to download first. Off by default.
     @Published var instantOnly: Bool {
-        didSet { UserDefaults.standard.set(instantOnly, forKey: Self.instantOnlyKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(instantOnly, forKey: Self.instantOnlyKey) }
     }
     /// Cap the resolution of shown sources (0 = unlimited, else 4000 / 1080 / 720). Only drops a source
     /// whose KNOWN resolution exceeds the cap, so unlabelled sources are kept. Off (0) by default.
     @Published var maxResolution: Int {
-        didSet { UserDefaults.standard.set(maxResolution, forKey: Self.maxResolutionKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(maxResolution, forKey: Self.maxResolutionKey) }
     }
     /// Floor the resolution of shown sources (0 = off, else 720 / 1080 / 2160): "hide everything below
     /// 1080p" (#117). The inverse of `maxResolution`, with the SAME unknown-keeps rule mirrored: it only
     /// drops a source whose KNOWN resolution sits below the floor, so an unlabelled source is never
     /// mistaken for a low one. Off (0) by default.
     @Published var minResolution: Int {
-        didSet { UserDefaults.standard.set(minResolution, forKey: Self.minResolutionKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(minResolution, forKey: Self.minResolutionKey) }
     }
     /// Hide sources with no recognizable resolution token at all (#117). The resolution cap and floor
     /// both deliberately KEEP unlabelled sources; this is the separate opt-in for viewers who want only
     /// sources that state their quality. Off by default.
     @Published var hideUnknownResolution: Bool {
-        didSet { UserDefaults.standard.set(hideUnknownResolution, forKey: Self.hideUnknownResKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(hideUnknownResolution, forKey: Self.hideUnknownResKey) }
     }
     /// Best-effort audio-language filter (#117): hide a source only when its parsed language signals
     /// POSITIVELY identify a foreign-audio release (the same conservative detection as the ranking's
@@ -268,21 +271,21 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// the viewer's language, or is multi-language is ALWAYS kept, so this can never empty a list just
     /// because add-ons do not tag languages. Off by default.
     @Published var preferredAudioOnly: Bool {
-        didSet { UserDefaults.standard.set(preferredAudioOnly, forKey: Self.preferredAudioKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(preferredAudioOnly, forKey: Self.preferredAudioKey) }
     }
     /// Cap the file size of shown sources in GB (0 = unlimited). Only drops a source whose ADVERTISED
     /// size exceeds the cap, so sources with no stated size (many cached / debrid links) are kept.
     /// Off (0) by default. Pairs with `maxResolution` for "1080p but not a 20 GB file".
     @Published var maxFileSizeGB: Double {
-        didSet { UserDefaults.standard.set(maxFileSizeGB, forKey: Self.maxFileSizeKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(maxFileSizeGB, forKey: Self.maxFileSizeKey) }
     }
     /// Show only HDR / Dolby Vision sources. Off by default (aggressive, hides most SDR releases).
     @Published var hdrOnly: Bool {
-        didSet { UserDefaults.standard.set(hdrOnly, forKey: Self.hdrOnlyKey) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(hdrOnly, forKey: Self.hdrOnlyKey) }
     }
     /// Hide AV1 sources (Apple devices have no AV1 hardware decode, so 4K AV1 struggles). Off by default.
     @Published var excludeAV1: Bool {
-        didSet { UserDefaults.standard.set(excludeAV1, forKey: Self.excludeAV1Key) }
+        didSet { publishReadingSnapshot(); UserDefaults.standard.set(excludeAV1, forKey: Self.excludeAV1Key) }
     }
     /// The remembered Sources-list sort ("best" / "size" / "seeders"), so the list opens the way the user
     /// last left it. "best" (the engine ranking) by default.
@@ -352,7 +355,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// Parsed, lowercased, non-empty Prefer terms (Lane A). Always substring mode (the Prefer boost never
     /// uses regex), so it mirrors excludeTerms/includeTerms exactly.
     var preferTerms: [String] { Self.terms(preferKeywords) }
-    private static func terms(_ csv: String) -> [String] {
+    private nonisolated static func terms(_ csv: String) -> [String] {
         csv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
     }
 
@@ -364,11 +367,12 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     private func rebuildKeywordRegexes() {
         excludeRegex = Self.compilePattern(excludeKeywords, enabled: keywordsAreRegex)
         includeRegex = Self.compilePattern(includeKeywords, enabled: keywordsAreRegex)
+        publishReadingSnapshot()
     }
 
     /// Compile a user pattern case-insensitively, or nil when regex mode is off, the field is blank, or the
     /// pattern is invalid (fail-open: a bad regex applies no filter rather than hiding everything).
-    private static func compilePattern(_ pattern: String, enabled: Bool) -> NSRegularExpression? {
+    private nonisolated static func compilePattern(_ pattern: String, enabled: Bool) -> NSRegularExpression? {
         let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
         guard enabled, !trimmed.isEmpty else { return nil }
         return try? NSRegularExpression(pattern: trimmed, options: [.caseInsensitive])
@@ -402,7 +406,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         rebuildKeywordRegexes()   // didSet does not fire for initial assignment, so seed the compiled forms
     }
 
-    private static func readOrder() -> [SourceType] {
+    private nonisolated static func readOrder() -> [SourceType] {
         let saved = UserDefaults.standard.string(forKey: orderKey) ?? ""
         var order = saved.split(separator: ",").compactMap { SourceType(rawValue: String($0)) }
         // Media servers migrate to the FRONT when a stored order predates the tier (your own copy outranks
@@ -510,7 +514,7 @@ extension SourcePreferences {
     /// so moving it into `Task.detached` made this the first off-main reader. Carrying the compiled regex
     /// references is safe: `NSRegularExpression` is documented immutable + thread-safe for matching, so only
     /// the singleton's concurrent REASSIGNMENT was the race, and a snapshot freezes that out.
-    struct Snapshot: SourcePrefsReading, @unchecked Sendable {   // @unchecked: NSRegularExpression is thread-safe for matching but not Sendable-marked
+    struct Snapshot: SourcePrefsReading, Sendable {
         let useAddonOrder: Bool
         let typeOrder: [SourceType]
         let noFiltersActive: Bool
@@ -557,13 +561,75 @@ extension SourcePreferences {
                  maxFileSizeGB: maxFileSizeGB)
     }
 
+    private nonisolated static let readingState = OSAllocatedUnfairLock<Snapshot?>(initialState: nil)
+
+    /// Called only by the UI owner after its complete value (including both regexes) changes.
+    /// Never persist defaults, notify observers or invalidate ranking while holding the mirror lock.
+    private func publishReadingSnapshot() {
+        let current = snapshot()
+        Self.readingState.withLock { $0 = current }
+    }
+
+    /// Before the UI singleton exists, reproduce its read-only initialization exactly. This path
+    /// writes no defaults and creates no UI owner; after the first owner publication, in-memory
+    /// edits win even if an external defaults writer has not yet called reload().
+    private nonisolated static func initialReadingSnapshot() -> Snapshot {
+        let defaults = UserDefaults.standard
+        let exclude = defaults.string(forKey: excludeKey) ?? defaultExcludeKeywords
+        let include = defaults.string(forKey: includeKey) ?? defaultIncludeKeywords
+        let prefer = defaults.string(forKey: preferKey) ?? defaultPreferKeywords
+        let regex = defaults.bool(forKey: regexKey)
+        let excludeRegex = compilePattern(exclude, enabled: regex)
+        let includeRegex = compilePattern(include, enabled: regex)
+        let excludeTerms = terms(exclude)
+        let includeTerms = terms(include)
+        let preferTerms = terms(prefer)
+        let safetyMode = defaults.string(forKey: safetyKey) ?? defaultSafetyMode
+        let hideDead = defaults.bool(forKey: hideDeadKey)
+        let instant = defaults.bool(forKey: instantOnlyKey)
+        let hdr = defaults.bool(forKey: hdrOnlyKey)
+        let av1 = defaults.bool(forKey: excludeAV1Key)
+        let maxResolution = defaults.integer(forKey: maxResolutionKey)
+        let minResolution = defaults.integer(forKey: minResolutionKey)
+        let hideUnknown = defaults.bool(forKey: hideUnknownResKey)
+        let preferredAudio = defaults.bool(forKey: preferredAudioKey)
+        let maxFileSize = defaults.double(forKey: maxFileSizeKey)
+        let keywordFilterActive = regex ? (excludeRegex != nil || includeRegex != nil)
+            : (!excludeTerms.isEmpty || !includeTerms.isEmpty)
+        let noFiltersActive = !keywordFilterActive && preferTerms.isEmpty && safetyMode == "off"
+            && !hideDead && !instant && !hdr && !av1 && maxResolution == 0
+            && minResolution == 0 && !hideUnknown && !preferredAudio && maxFileSize == 0
+        return Snapshot(
+            useAddonOrder: defaults.bool(forKey: addonOrderKey), typeOrder: readOrder(),
+            noFiltersActive: noFiltersActive, keywordsAreRegex: regex,
+            excludeRegex: excludeRegex, includeRegex: includeRegex,
+            excludeTerms: excludeTerms, includeTerms: includeTerms, preferTerms: preferTerms,
+            avoidBehavior: defaults.string(forKey: avoidBehaviorKey) ?? defaultAvoidBehavior,
+            autoPickBest: defaults.object(forKey: autoPickBestKey) as? Bool ?? defaultAutoPickBest,
+            safetyMode: safetyMode, instantOnly: instant, hideDeadTorrents: hideDead,
+            excludeAV1: av1, hdrOnly: hdr, maxResolution: maxResolution, minResolution: minResolution,
+            hideUnknownResolution: hideUnknown, preferredAudioOnly: preferredAudio,
+            maxFileSizeGB: maxFileSize)
+    }
+
     /// The off-main override for the ranker. When installed (by `SourceListModel`'s detached rank via
     /// `$readingOverride.withValue(...)`), `reading` returns this frozen snapshot instead of the live
     /// singleton, so the off-main rank cannot race the main-thread mutation. `Task.detached` does NOT
     /// inherit task-locals, so the `withValue` MUST wrap the rank inside the detached task.
-    @TaskLocal static var readingOverride: Snapshot?
+    @TaskLocal nonisolated static var readingOverride: Snapshot?
 
-    /// What the ranker reads: the installed off-main snapshot if present, else the live singleton. Main-actor
-    /// callers install nothing, so they read `shared` exactly as before (identical behavior, zero allocation).
-    static var reading: SourcePrefsReading { readingOverride ?? shared }
+    /// Worker work keeps its captured task-local preferences. Synchronous callers otherwise read the
+    /// latest immutable owner publication without hopping to MainActor or touching Published storage.
+    nonisolated static var reading: SourcePrefsReading {
+        if let readingOverride { return readingOverride }
+        if let current = readingState.withLock({ $0 }) { return current }
+        let initial = initialReadingSnapshot()
+        return readingState.withLock { current -> Snapshot in
+            // A main-actor edit/initialization can finish while defaults are being read. Never
+            // overwrite that newer in-memory intent with the delayed startup defaults snapshot.
+            if let current { return current }
+            current = initial
+            return initial
+        }
+    }
 }

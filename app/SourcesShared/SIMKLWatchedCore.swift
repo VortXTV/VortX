@@ -13,7 +13,7 @@ import Foundation
 /// rows, so unlike Trakt's `/sync/watched/shows` (which carries a per-season / per-episode breakdown) there
 /// is no episode grain to harvest here. A completed show badges its cover; that is the whole of #143's
 /// cover-badge goal for SIMKL.
-struct SIMKLWatchedCore: Equatable {
+struct SIMKLWatchedCore: Equatable, Sendable {
     /// The watched id set (imdb + tmdb identity forms), unioned into `WatchedIndex` when import is on.
     private(set) var watchedIDs: Set<String> = []
 

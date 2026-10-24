@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import os
 
 private final class PreferenceCheckpointGate: VortxCheckpointStore, @unchecked Sendable {
     let backing: VortxEncryptedCheckpointStore
@@ -289,10 +290,19 @@ final class SourcePinStore: @unchecked Sendable {
 }
 enum StreamRanking { static func invalidateCaches() {} }
 
-final class ProfileStore: @unchecked Sendable {
+@MainActor final class ProfileStore {
     static let shared = ProfileStore()
-    var profiles: [UserProfile] = []
-    var activeID: UUID?
+    var profiles: [UserProfile] = [] {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    var activeID: UUID? {
+        willSet { ProfileSelectionRead.beginMutation() }
+        didSet { ProfileSelectionRead.endMutation(selectionReadSnapshot()) }
+    }
+    // The only instance is shared, first used by @MainActor setup. The extractor puts the
+    // current real namespace and scalar projector in this file; no mirror predicate is copied.
+    private init() { ProfileSelectionRead.publishInitial(selectionReadSnapshot()) }
     var nativeProfileError: String?
     var pickedThisLaunch = false
 
@@ -320,11 +330,11 @@ final class ProfileStore: @unchecked Sendable {
     var continueWatchingMigrationInFlight = false
     let continueWatchingLegacyAccount = CredentialScopeRegistry.shared.capture()
 
-    static let activeDisabledAddonsKey = "stremiox.profile.disabledAddons"
-    static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
-    static let activeKidsKey = "stremiox.profile.isKids"
+    nonisolated static let activeDisabledAddonsKey = "stremiox.profile.disabledAddons"
+    nonisolated static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
+    nonisolated static let activeKidsKey = "stremiox.profile.isKids"
 
-    static var nativePlaybackProjectionKeys: Set<String> {
+    nonisolated static var nativePlaybackProjectionKeys: Set<String> {
         [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle, TrackPreferences.Key.forced,
          SubtitleStyle.Key.font, SubtitleStyle.Key.size, SubtitleStyle.Key.color, SubtitleStyle.Key.background,
          SubtitleStyle.Key.sizeScale, SubtitleStyle.Key.brightness, SourcePreferences.orderKey,
@@ -335,7 +345,7 @@ final class ProfileStore: @unchecked Sendable {
          SourcePreferences.excludeAV1Key, SourcePreferences.regexKey, SourcePreferences.preferKey,
          SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
     }
-    static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
+    nonisolated static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
 
     func persist(touch: Bool) {
         guard let data = try? JSONEncoder().encode(profiles) else { return }

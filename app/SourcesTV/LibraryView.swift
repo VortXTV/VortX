@@ -84,6 +84,13 @@ struct LibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+
+    // BEGIN RANDOM PICK LIBRARY STATE
+    @State private var randomLibrarySession = RandomPickPolicy.Session()
+    @State private var randomLibraryPreview: RandomPickPolicy.Ticket?
+    @State private var randomLibraryAccess: RandomPickUIAccess?
+    @State private var randomLibraryRoute: RandomPickLibraryRoute?
+    // END RANDOM PICK LIBRARY STATE
     /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
@@ -101,6 +108,11 @@ struct LibraryView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Library tab -> scroll here
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                        Button(action: selectRandomLibraryItem) {
+                            Label("Random pick", systemImage: "shuffle")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                        .padding(.horizontal, Theme.Space.screenEdge)
                         // Watchlist is the profile's watch-later ledger, separate from saved Library titles.
                         // Smart collections are the profile's own rule-built rows (synced like the watchlist).
                         HStack(spacing: Theme.Space.sm) {
@@ -169,13 +181,152 @@ struct LibraryView: View {
                 .scrollToTopOnBump(TabScrollKeys.library)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationDestination(isPresented: randomLibraryPresented) { randomLibraryDestination }
         }
+
+        // BEGIN RANDOM PICK LIBRARY LIFECYCLE
+        .sheet(isPresented: randomLibraryPreviewPresented) {
+            if let ticket = randomLibraryPreview {
+                RandomPickPreviewCard(ticket: ticket,
+                    onOpen: { openRandomLibraryItem(ticket, autoPlay: false) },
+                    onPlay: { openRandomLibraryItem(ticket, autoPlay: true) },
+                    onPickAgain: { pickRandomLibraryAgain(ticket) })
+                    .id(ticket.id)
+            }
+        }
+        .onReceive(profiles.$activeID) { profileID in
+            if let ticket = randomLibrarySession.ticket, ticket.profileID != profileID { clearRandomLibraryPick() }
+        }
+        .onReceive(profiles.$profiles) { incoming in
+            if let route = randomLibraryRoute {
+                if !(route.intent?.matchesPublishedProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch)
+                    ?? route.access.matchesPublishedNavigationProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch)) { clearRandomLibraryPick() }
+            } else if let access = randomLibraryAccess,
+               !access.matchesPublishedProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch) { clearRandomLibraryPick() }
+        }
+        .onReceive(profiles.$pickedThisLaunch) { picked in
+            if !picked, profiles.profiles.count > 1 { clearRandomLibraryPick() }
+        }
+        .onChange(of: account.credentialBoundaryGeneration) { clearRandomLibraryPick() }
+        .onChange(of: segment) { clearRandomLibraryPick() }
+        .onChange(of: activeFilters) { clearRandomLibraryPick() }
+        .onReceive(core.$revision) { _ in
+            if let route = randomLibraryRoute {
+                if !(route.intent?.routeIsCurrent(core: core, profiles: profiles)
+                    ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) { clearRandomLibraryPick() }
+            } else if let access = randomLibraryAccess, !access.isCurrent(profiles: profiles, core: core) { clearRandomLibraryPick() }
+        }
+        .onReceive(core.$library) { library in
+            if core.usesNativeProfileState || profiles.activeUsesEngineHistory {
+                invalidateRandomLibraryRecord(in: library?.catalog ?? [])
+            }
+        }
+        .onReceive(profiles.$watch) { _ in
+            // Overlay watch publishes before its value changes. Revoke its preview immediately;
+            // an already-admitted detail destination owns its metadata/source lifecycle.
+            if !core.usesNativeProfileState, !profiles.activeUsesEngineHistory,
+               randomLibraryPreview != nil { clearRandomLibraryPick() }
+        }
+        .onDisappear { if randomLibraryRoute == nil { clearRandomLibraryPick() } }
+        // END RANDOM PICK LIBRARY LIFECYCLE
         // Reload while empty: the library syncs from the API asynchronously after sign-in, so the
         // first load can land before ctx.library is populated. Revisiting the tab refills it.
         .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
         .onChange(of: core.library?.catalog.first?.id) { seed() }
         .onChange(of: profiles.activeID) { seed() }
     }
+
+
+    // BEGIN RANDOM PICK LIBRARY HELPERS
+    private var randomLibraryScope: String {
+        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ","))"
+    }
+
+    /// Runs on an explicit pick/revalidation, never as a body signature.
+    private func randomLibraryCandidates() -> [CoreCWItem] {
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+            ? (core.library?.catalog ?? []) : profiles.libraryItems
+        return RandomPickPolicy.eligibleLibraryItems(smartFiltered(segmented(source)))
+    }
+
+    private func selectRandomLibraryItem() {
+        guard let access = RandomPickUIAccess.capture(profiles: profiles, core: core) else { clearRandomLibraryPick(); return }
+        let records = randomLibraryCandidates().map(RandomPickPolicy.libraryRecord)
+        var generator = SystemRandomNumberGenerator()
+        randomLibraryAccess = access
+        randomLibraryPreview = randomLibrarySession.select(records, profileID: profiles.activeID,
+                                                           scope: randomLibraryScope, using: &generator)
+        if randomLibraryPreview == nil { clearRandomLibraryPick() }
+    }
+
+    private func currentRandomLibraryItem(_ origin: RandomPickPolicy.Ticket) -> CoreCWItem? {
+        // An old sheet closure may not revoke or borrow the newer sheet's ticket.
+        guard randomLibrarySession.ticket == origin else { return nil }
+        let current = randomLibraryCandidates().first {
+            $0.id == origin.record.identity.id && $0.type == origin.record.identity.type
+        }
+        guard randomLibrarySession.accepts(origin, profileID: profiles.activeID, scope: randomLibraryScope,
+                ownerIsCurrent: randomLibraryAccess?.isCurrent(profiles: profiles, core: core) == true,
+                currentRecord: current.map(RandomPickPolicy.libraryRecord)) else {
+            clearRandomLibraryPick(); return nil
+        }
+        return current
+    }
+
+    private func pickRandomLibraryAgain(_ origin: RandomPickPolicy.Ticket) {
+        guard currentRandomLibraryItem(origin) != nil else { return }
+        selectRandomLibraryItem()
+    }
+
+    private func openRandomLibraryItem(_ origin: RandomPickPolicy.Ticket, autoPlay: Bool) {
+        guard let current = currentRandomLibraryItem(origin), let access = randomLibraryAccess else { return }
+        randomLibraryRoute?.intent?.revoke()
+        let intent = autoPlay ? RandomPickPlayIntent(ticketID: origin.id, access: access) {
+            randomLibraryRoute?.ticket == origin && currentRandomLibraryItem(origin) != nil
+        } : nil
+        randomLibraryRoute = RandomPickLibraryRoute(ticket: origin, item: current, access: access, autoPlay: autoPlay, intent: intent)
+        randomLibraryPreview = nil
+    }
+
+    private func invalidateRandomLibraryRecord(in items: [CoreCWItem]) {
+        // Inventory owns the pending preview, not the normal Detail route it already admitted.
+        guard randomLibraryPreview != nil, randomLibraryRoute == nil,
+              let ticket = randomLibrarySession.ticket else { return }
+        let current = items.first { $0.id == ticket.record.identity.id && $0.type == ticket.record.identity.type }
+        guard let current, !RandomPickPolicy.eligibleLibraryItems([current]).isEmpty,
+              RandomPickPolicy.libraryRecord(current) == ticket.record else { clearRandomLibraryPick(); return }
+    }
+
+    private var randomLibraryPreviewPresented: Binding<Bool> {
+        Binding(get: { randomLibraryPreview != nil }, set: { presented in
+            guard !presented else { return }
+            if randomLibraryRoute == nil { clearRandomLibraryPick() }
+            else { randomLibraryPreview = nil }
+        })
+    }
+
+    private var randomLibraryPresented: Binding<Bool> {
+        Binding(get: { randomLibraryRoute != nil }, set: { if !$0 { clearRandomLibraryPick() } })
+    }
+
+    @ViewBuilder private var randomLibraryDestination: some View {
+        if let route = randomLibraryRoute,
+           randomLibrarySession.ticket == route.ticket, profiles.activeID == route.ticket.profileID,
+           (route.intent?.routeIsCurrent(core: core, profiles: profiles)
+            ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) {
+            DetailView(type: route.item.type, id: route.item.id,
+                       autoPlayOnAppear: route.autoPlay, randomPlayIntent: route.intent)
+        }
+    }
+
+    private func clearRandomLibraryPick() {
+        randomLibraryRoute?.intent?.revoke()
+        randomLibraryPreview = nil
+        randomLibraryRoute = nil
+        randomLibraryAccess = nil
+        randomLibrarySession.clear()
+    }
+    // END RANDOM PICK LIBRARY HELPERS
 
     private func seed() {
         let first = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.library?.catalog.first : profiles.libraryItems.first

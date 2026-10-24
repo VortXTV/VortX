@@ -686,6 +686,7 @@ struct RootTabView: View {
 /// tab change forced a real layout pass. The heal uses the SUPPORTED visibility API (frame surgery
 /// on the private container gets stomped by the next layout pass) and logs what it saw, so a
 /// failed heal explains itself in the log.
+@MainActor
 enum TabBarHealer {
     private static let log = Logger(subsystem: "com.stremiox.app", category: "tabbar")
 
@@ -696,14 +697,17 @@ enum TabBarHealer {
                 let bar = tabs.tabBar
                 let container = bar.superview
                 let containerY = container?.frame.origin.y ?? .nan
+                // Logger interpolation retains value reads, never UIKit references.
+                let barHidden = bar.isHidden
                 if #available(tvOS 18.0, *) {
-                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden) controllerHidden=\(tabs.isTabBarHidden)")
+                    let controllerHidden = tabs.isTabBarHidden
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(barHidden) controllerHidden=\(controllerHidden)")
                     if tabs.isTabBarHidden {
                         tabs.setTabBarHidden(false, animated: false)
                         log.info("heal: setTabBarHidden(false) applied")
                     }
                 } else {
-                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden)")
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(barHidden)")
                 }
                 // Re-home a parked container as well; harmless if the layout pass recomputes it.
                 if let container, container.frame.origin.y < -(max(container.frame.height, 68) * 3) {

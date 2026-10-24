@@ -4,13 +4,13 @@ import Foundation
 /// Uses that Facade's lock so read consumption and task installation are one transaction.
 /// No identity, credential, native receipt or durable success is manufactured here.
 final class VortxNativeFIFOAdmission: @unchecked Sendable {
-    private let lock: NSRecursiveLock
+    private let lock: any NSLocking & Sendable
     private var generation = UUID()
     private var pending: [UUID] = []
     private var running: UUID?
     private var closed = false
     private var uncertain = false
-    init(lock: NSRecursiveLock) { self.lock = lock }
+    init(lock: any NSLocking & Sendable) { self.lock = lock }
 
     final class ReadCapability: VortxMutationAuthority, @unchecked Sendable {
         fileprivate enum Phase { case reading(UUID), admitted(UUID), finished }

@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
+import android.view.SurfaceView
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -94,6 +95,18 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     private val _state = MutableStateFlow(PlayerState())
     private val metadataInputs = ExoMetadataInputs()
+    private val sidecarIdentities = SubtitleSidecarIdentity()
+    private val subtitleSelections = SubtitleSelectionAuthority()
+    private class PendingSidecar(val formatId: String, val original: PlayerSubtitleSelection)
+    private var pendingSidecar: PendingSidecar? = null
+    private var subtitleReleased = false
+    private var originalPlaybackOwner: PlaybackOwnerToken? = null
+
+    override fun bindPlaybackOwner(original: PlaybackOwnerToken): Boolean {
+        if (subtitleReleased || originalPlaybackOwner != null || Looper.myLooper() !== player.applicationLooper) return false
+        originalPlaybackOwner = original
+        return original.isActive
+    }
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
     override val audioOutputModeAvailable: Boolean = false
 
@@ -108,14 +121,19 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) = publish()
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = publish()
-        override fun onTracksChanged(tracks: Tracks) = publish(tracks = tracks)
+        override fun onTracksChanged(tracks: Tracks) {
+            selectPendingSidecar()
+            // An override can notify reentrantly. Publish the actual current selection, never the
+            // outgoing callback's selection flags after an inner callback selected the exact file.
+            publish(tracks = player.currentTracks)
+        }
         override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) = publish()
 
         // Surface an unrecoverable decode/network error so the chrome can fall back to the ranked source
         // list instead of leaving a dead black frame (error-to-sources fallback).
         override fun onPlayerError(error: PlaybackException) {
             metadataInputs.fail()
-            _state.value = _state.value.withPlaybackError()
+            _state.value = _state.value.withPlaybackError().copy(startupEvidence = PlaybackStartupEvidence.UNAVAILABLE)
         }
 
         // In-stream ID3 chapter frames (`CHAP`), accumulated so [chapters] can offer a chapter picker on
@@ -137,6 +155,21 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // Media3's format getters may still describe the previous source during replacement. Only
     // attributed decoder-input events can supply facts; ordinary callbacks never revive them.
     private val metadataListener = object : AnalyticsListener {
+        override fun onRenderedFirstFrame(eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long) {
+            val surface = (playerView?.videoSurfaceView as? SurfaceView)?.holder?.surface
+            // Dummy, detached and outgoing outputs cannot settle the currently hosted video surface.
+            if (surface == null || !surface.isValid || output !== surface || !acceptsStartupEvent(eventTime)) return
+            acceptStartupEvidence(PlaybackStartupEvidence.MEDIA3_RENDERED_FIRST_FRAME)
+        }
+        override fun onAudioPositionAdvancing(eventTime: AnalyticsListener.EventTime, playoutStartSystemTimeMs: Long) {
+            if (!acceptsStartupEvent(eventTime)) return
+            val groups = player.currentTracks.groups
+            // No video FORMAT yet is not audio-only: require the actual current discovered inventory.
+            val audio = groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }
+            val video = groups.any { it.type == C.TRACK_TYPE_VIDEO }
+            if (audio && !video && activeMetadata().audioSelected)
+                acceptStartupEvidence(PlaybackStartupEvidence.AUDIO_ONLY)
+        }
         override fun onVideoInputFormatChanged(eventTime: AnalyticsListener.EventTime,
             format: Format, decoderReuseEvaluation: DecoderReuseEvaluation?) {
             metadataInputs.observeCurrent(exoMetadataCurrentContext(eventTime))
@@ -242,6 +275,24 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             audioCodec = audio?.sampleMimeType, audioChannels = audio?.channelCount ?: 0)
     }
 
+    private fun acceptsStartupEvent(time: AnalyticsListener.EventTime): Boolean {
+        if (metadataInputs.isReleased) return false
+        val playing = exoMetadataCurrentContext(time)
+        metadataInputs.observeCurrent(playing)
+        val timeline = player.currentTimeline
+        val index = player.currentPeriodIndex
+        if (player.isPlayingAd || index !in 0 until timeline.periodCount) return false
+        val period = timeline.getPeriod(index, Timeline.Period(), true)
+        if (period.windowIndex !in 0 until timeline.windowCount) return false
+        val tag = timeline.getWindow(period.windowIndex, Timeline.Window()).mediaItem.localConfiguration?.tag
+        return metadataInputs.acceptsPresentation(exoMetadataEventContext(time), playing, tag, period.uid)
+    }
+
+    private fun acceptStartupEvidence(evidence: PlaybackStartupEvidence) {
+        if (metadataInputs.isReleased) return
+        _state.value = _state.value.copy(startupEvidence = settledStartupEvidence(_state.value.startupEvidence, evidence))
+    }
+
     /// Map Media3 [Tracks] to the chrome's [PlayerTrack] lists. The engine-native id is the group index
     /// encoded with the track index inside it, so [selectAudioTrack] / [selectSubtitleTrack] can rebuild
     /// the override. Kept simple: one entry per selectable format.
@@ -280,12 +331,21 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
+        if (subtitleReleased || originalPlaybackOwner?.isActive != true || Looper.myLooper() !== player.applicationLooper ||
+            subtitleSelections.beginSource() == null) return
+        pendingSidecar = null
+        sidecarIdentities.reset()
         load(playable, playWhenReady = true)
     }
 
     private fun load(playable: Playable, playWhenReady: Boolean, remountPositionMs: Long? = null) {
+        if (subtitleReleased || originalPlaybackOwner?.isActive != true) return
+        val priorPresentation = _state.value.startupEvidence
         val metadataLoad = metadataInputs.begin()
-        _state.value = freshPlayerStateForLoad().copy(isPaused = !playWhenReady)
+        val presentation = if (remountPositionMs != null && priorPresentation != PlaybackStartupEvidence.AWAITING &&
+            priorPresentation != PlaybackStartupEvidence.UNAVAILABLE) PlaybackStartupEvidence.SAME_MEDIA_REMOUNT
+            else PlaybackStartupEvidence.AWAITING
+        _state.value = freshPlayerStateForLoad().copy(isPaused = !playWhenReady, startupEvidence = presentation)
         lastPlayable = playable
         // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
         chapterStore.clear()
@@ -309,6 +369,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 return@mapIndexedNotNull null
             }
             MediaItem.SubtitleConfiguration.Builder(Uri.parse(subUrl))
+                .setId(sidecarIdentities.idFor(subUrl))
                 .setMimeType(mime)
                 .setLanguage(subtitle.language)
                 .setLabel(subtitle.name)
@@ -420,10 +481,10 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         )
     }
 
-    override fun play() { player.play() }
-    override fun pause() { player.pause() }
-    override fun togglePause() { if (player.isPlaying) player.pause() else player.play() }
-    override fun seekTo(positionMs: Long) { player.seekTo(positionMs.coerceAtLeast(0L)) }
+    override fun play() { if (originalPlaybackOwner?.isActive == true) player.play() }
+    override fun pause() { if (originalPlaybackOwner?.isActive == true) player.pause() }
+    override fun togglePause() { if (originalPlaybackOwner?.isActive == true) { if (player.isPlaying) player.pause() else player.play() } }
+    override fun seekTo(positionMs: Long) { if (originalPlaybackOwner?.isActive == true) player.seekTo(positionMs.coerceAtLeast(0L)) }
 
     override fun seekBy(deltaMs: Long) {
         // Native relative seek off the player's OWN currentPosition (the sampled state can lag a poll
@@ -436,6 +497,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun selectAudioTrack(id: Int) = selectTrack(id, C.TRACK_TYPE_AUDIO)
 
     override fun selectSubtitleTrack(id: Int?) {
+        if (beginSubtitleSelection() == null) return
+        applySubtitleTrack(id)
+    }
+
+    private fun applySubtitleTrack(id: Int?) {
+        pendingSidecar = null
         if (id == null) {
             // Disable text rendering entirely (subtitles off).
             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
@@ -471,13 +538,80 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private var muteState = ExoMuteState()
 
     override fun addExternalSubtitle(url: String) {
-        val base = lastPlayable ?: return
-        if (normalizedExternalSubtitles(base).any { it.url == url }) return
-        val updated = base.copy(externalSubtitles = base.externalSubtitles + url)
+        val original = beginSubtitleSelection() ?: return
+        addExternalSubtitle(url, original)
+    }
+
+    override fun beginSubtitleSelection(): PlayerSubtitleSelection? {
+        if (subtitleReleased || originalPlaybackOwner?.isActive != true || Looper.myLooper() !== player.applicationLooper) return null
+        pendingSidecar = null
+        return subtitleSelections.beginChoice()
+    }
+    override fun captureSubtitleSelection(): PlayerSubtitleSelection? =
+        if (!subtitleReleased && originalPlaybackOwner?.isActive == true && Looper.myLooper() === player.applicationLooper) subtitleSelections.capture() else null
+    override fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean =
+        !subtitleReleased && originalPlaybackOwner?.isActive == true && Looper.myLooper() === player.applicationLooper && subtitleSelections.isCurrent(request)
+
+    override fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean {
+        if (!isSubtitleSelectionCurrent(request)) return false
+        applySubtitleTrack(id)
+        return true
+    }
+
+    override fun addExternalSubtitle(url: String, request: PlayerSubtitleSelection): Boolean {
+        // Player commands and listeners share the application looper. Do not publish a pending
+        // selection from another thread or adopt anything after retirement.
+        if (!isSubtitleSelectionCurrent(request)) return false
+        pendingSidecar = null
+        val base = lastPlayable ?: return false
+        if (externalSubtitleMimeDecision(url).mimeType == null) return false
+        val existing = normalizedExternalSubtitles(base).count { it.url == url }
+        if (existing > 1) return false // Ambiguous source configuration is not an exact file identity.
+        pendingSidecar = PendingSidecar(sidecarIdentities.idFor(url), request)
+        if (existing == 1) {
+            // Off -> the same mounted URI is a selection, not a second download/remount. Inventory
+            // need not grow, and an unrelated late sidecar cannot be selected in its place.
+            selectPendingSidecar()
+            publish(tracks = player.currentTracks)
+            return true
+        }
+        val updated = withAdditionalExternalSubtitle(base, url)
         // Sidecars replace the Media3 item, not the viewer's intent. Capture before setMediaSource resets
         // state; preserve even a zero/sub-five-second position instead of replaying the old resume target.
         val intent = ExoSubtitleRemountIntent(player.currentPosition.coerceAtLeast(0L), player.playWhenReady)
         load(updated, playWhenReady = intent.playWhenReady, remountPositionMs = intent.positionMs)
+        return true
+    }
+
+    private fun selectPendingSidecar() {
+        if (subtitleReleased || Looper.myLooper() !== player.applicationLooper) return
+        val pending = pendingSidecar ?: return
+        if (!isSubtitleSelectionCurrent(pending.original)) {
+            pendingSidecar = null
+            return
+        }
+        val groups = player.currentTracks.groups
+        if (groups.size > 4096) return
+        val candidates = mutableListOf<OwnedSubtitleTrack>()
+        groups.forEachIndexed { groupIndex, group ->
+            if (group.type == C.TRACK_TYPE_TEXT) {
+                for (trackIndex in 0 until group.length) {
+                    if (candidates.size == 4096) return
+                    candidates.add(OwnedSubtitleTrack(groupIndex, trackIndex,
+                        group.getTrackFormat(trackIndex).id))
+                }
+            }
+        }
+        val exact = uniqueOwnedSubtitleTrack(pending.formatId, candidates) ?: return
+        // This method never suspends. Clear before applying the override, which may deliver a
+        // reentrant track callback; that callback must not select the request a second time.
+        if (pendingSidecar !== pending) return
+        pendingSidecar = null
+        val group = groups[exact.group]
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, exact.track))
+            .build()
     }
 
     internal data class ExoSubtitleRemountIntent(val positionMs: Long, val playWhenReady: Boolean)
@@ -601,8 +735,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun onEnterForeground() { /* resume is the chrome's choice; keep paused-on-return conservative */ }
 
     override fun release() {
+        subtitleReleased = true
+        subtitleSelections.retire()
+        pendingSidecar = null
+        sidecarIdentities.reset()
         metadataInputs.release()
-        _state.value = _state.value.copy(metadata = PlaybackMetadata())
+        _state.value = _state.value.copy(metadata = PlaybackMetadata(), startupEvidence = PlaybackStartupEvidence.UNAVAILABLE)
         mainHandler.removeCallbacks(ticker)
         player.removeListener(listener)
         player.removeAnalyticsListener(metadataListener)
@@ -761,6 +899,11 @@ internal fun normalizedExternalSubtitles(playable: Playable): List<com.vortx.and
     playable.externalSubtitleTracks.ifEmpty {
         playable.externalSubtitles.map { com.vortx.android.model.ExternalSubtitle(url = it) }
     }
+
+/** Preserve typed credentials and legacy sidecars; appending only the ignored legacy field loses tracks. */
+internal fun withAdditionalExternalSubtitle(playable: Playable, url: String): Playable =
+    playable.copy(externalSubtitles = emptyList(),
+        externalSubtitleTracks = normalizedExternalSubtitles(playable) + com.vortx.android.model.ExternalSubtitle(url = url))
 
 internal data class ExternalSubtitleMimeDecision(
     val mimeType: String? = null,

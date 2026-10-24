@@ -11,7 +11,7 @@ readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly ANDROID_RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
-readonly REVIEWED_NATIVE_SHA='0c30f4782aee544a2b7e33169ad60d03630d4097'
+readonly REVIEWED_NATIVE_SHA='2ea2e0f27dd2e53b7b28228435ca35a70f92831f'
 readonly APP_SOURCE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/VortXApplication.kt"
 readonly KOTLIN_ROOT="$REPO_ROOT/android/app/src/main/kotlin"
 readonly RESOURCE_BRIDGE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/engine/VortxResourceBridge.kt"
@@ -74,6 +74,8 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" \
         "test \"\$vortx_sha\" = \"$REVIEWED_NATIVE_SHA\"" "$workflow"
     require_literal "$(basename "$workflow") records the exact fetched Vortx source SHA" 'VORTX_ENGINE_SOURCE_SHA=$vortx_sha' "$workflow"
+    require_literal "$(basename "$workflow") admits host JNI only for the reviewed native source" \
+        "test \"\$VORTX_ENGINE_SOURCE_SHA\" = $REVIEWED_NATIVE_SHA" "$workflow"
     require_literal "$(basename "$workflow") verifies artifacts against the source SHA" '--source-sha "$VORTX_ENGINE_SOURCE_SHA"' "$workflow"
     # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
     # private source, not only the branch, so updating engine code cannot restore older targets.
@@ -89,6 +91,11 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") delegates all-ABI checks to the shared verifier" 'scripts/verify-native-android-artifacts.sh' "$workflow"
 done
 
+for hosted_init in owner-history-hosted.init.gradle native-sync-hosted.init.gradle; do
+    require_literal "$hosted_init binds real JNI receipts to the reviewed native source" \
+        "receipt.engineSource != \"$REVIEWED_NATIVE_SHA\"" "$REPO_ROOT/android/$hosted_init"
+done
+
 candidate_artifact_gate="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
     active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"
 require_regex "candidate signed APK/AAB verification uses native-only package comparison" \
@@ -100,7 +107,9 @@ require_literal "artifact verifier checks the resource-host JNI ABI" 'verify-nat
 require_literal "artifact verifier compares staged and packaged bytes after strip normalization" '"$strip" --strip-debug --strip-unneeded "$normalized_package"' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_literal "artifact verifier records normalized packaged hashes with exact source and features" 'native-engine source=%s features=jni,server,resource-host' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_literal "resource-host ABI helper requires the native host surface" 'nativeResourceHostAbiVersion' "$REPO_ROOT/scripts/verify-native-engine-abi.sh"
-require_literal "normal Android source selects owner-history ABI" '0c30f4782aee544a2b7e33169ad60d03630d4097) abi_mode=owner-history ;;' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "normal Android source selects owner-history ABI" "$REVIEWED_NATIVE_SHA) abi_mode=owner-history ;;" "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "previous D2 source retains its explicit ABI admission" 'd2ca37b89556c732da6edc1e5ca1f5908cf5d508) abi_mode=owner-history ;;' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "historical owner-history source retains its explicit ABI admission" '0c30f4782aee544a2b7e33169ad60d03630d4097) abi_mode=owner-history ;;' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_literal "historical beta2 keeps resource-host ABI" 'af29b22e4c45740a1f5b6cb415b81f8430f55b9f) abi_mode=resource-host ;;' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_literal "unadmitted Android source fails closed" 'native-only ABI mode has no admitted source revision' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_literal "all shipped ABI checks invoke the source-selected mode" 'android "$file" "$abi_mode"' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"

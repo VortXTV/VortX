@@ -101,7 +101,7 @@ final class iOSNextEpisodePreparer: ObservableObject {
         let sticky = choice.source
         let sourceOwner = EpisodeSourceOwner(legacySources: context.sources,
                                             legacyAddons: context.legacyAddons,
-                                            legacyIsCurrent: context.isCurrent)
+                                            legacyIsCurrent: { context.isCurrent() })
         func admitted() -> Bool {
             !Task.isCancelled && attemptOwner.isCurrent(attemptID)
                 && sourceOwner.isCurrent && context.isCurrent() && SeriesSourceSticky.admits(choice)
@@ -179,7 +179,12 @@ final class iOSNextEpisodePreparer: ObservableObject {
         guard admitted(), !(rawTorrent && warm == nil) else { return nil }
         let playbackMeta = PlaybackMeta(libraryId: context.seriesID, videoId: video.id, type: "series",
             name: context.seriesName, poster: video.thumbnail ?? context.poster, season: video.season, episode: video.episode)
-        let resume = await BoundedPreloadWorkPool.valueBeforeDeadline(request.deadline) { await context.resumeOffset(playbackMeta) } ?? 0
+        // The deadline worker receives only this original owner-isolated callback. Its non-Sendable
+        // stored function is read and invoked on MainActor, never transferred to the worker executor.
+        let resumeOffset: @MainActor @Sendable (PlaybackMeta) async -> Double = { meta in
+            await context.resumeOffset(meta)
+        }
+        let resume = await BoundedPreloadWorkPool.valueBeforeDeadline(request.deadline) { await resumeOffset(playbackMeta) } ?? 0
         guard admitted() else { return nil }
         var attachment: VortXPreparedRemuxAttachment?
         if let remuxMode {

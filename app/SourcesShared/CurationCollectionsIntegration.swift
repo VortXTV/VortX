@@ -271,7 +271,7 @@ enum CurationImportProjection {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { reload() }
         .task { await defaults.loadIfNeeded() }
-        .onChange(of: store.profileID) { _ in reload() }
+        .onValueChange(of: store.profileID) { _ in reload() }
         .onReceive(imports.store.revisionEvents) { _ in
             lifetime.revalidate()
             imports.retireIfStale()
@@ -361,7 +361,7 @@ enum CurationImportProjection {
         }
         }
         .onAppear { reloadReadContext() }
-        .onChange(of: store.profileID) { _ in reloadReadContext() }
+        .onValueChange(of: store.profileID) { _ in reloadReadContext() }
         .onReceive(imports.store.revisionEvents) { _ in
             lifetime.revalidate()
             imports.retireIfStale()

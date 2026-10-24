@@ -28,6 +28,9 @@ struct MPVInstance {
     jobject javaObject;
     jobject appCtx;
     jobject surface;
+
+    // Under audioFilterLock and a live handle lease. 0 = no ownership witness; 1/2 = checked recipe.
+    int session_audio_preset_owned = 0;
 };
 
 // Release the mpv handle, every owned GlobalRef, and the instance itself on a thread with a valid

@@ -65,9 +65,17 @@ class ProfileStore private constructor(context: Context) {
     // ---- Observable-ish state (plain fields; callers on the main thread, mirroring Apple's @Published) ----
 
     var profiles: List<UserProfile> = emptyList()
-        private set
+        private set(value) {
+            // Compare only the selected identity/binding, never the whole preference/roster DTO.
+            val changesOwner = captureActiveProfileBinding(field, activeID) != captureActiveProfileBinding(value, activeID)
+            if (changesOwner) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
+            else field = value
+        }
     var activeID: String? = null
-        private set
+        private set(value) {
+            if (field != value) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
+            else field = value
+        }
 
     private val _activeProfile = MutableStateFlow<UserProfile?>(null)
     val activeProfile = _activeProfile.asStateFlow()
@@ -207,6 +215,44 @@ class ProfileStore private constructor(context: Context) {
         }
     }
 
+    /** State-only capture in the established CW -> native Session -> account admission order. */
+    internal fun capturePlaybackOwner(
+        original: com.vortx.android.player.PlaybackOwnerToken,
+        expectedRevision: Long,
+        allowLocalOnly: Boolean,
+        accountRequired: Boolean,
+        accountAdmission: ((() -> Boolean) -> Boolean)?,
+    ): com.vortx.android.player.PlaybackOwnerToken? = ContinueWatchingOwnerGate.serialized { revision ->
+        if (revision != expectedRevision || !original.isActive) return@serialized null
+        var captured: com.vortx.android.player.PlaybackOwnerToken? = null
+        val captureOnly: () -> Boolean = {
+            captured = original.takeIf { com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(it) }
+            captured != null
+        }
+        val captureAccount: () -> Unit = {
+            if (accountRequired) {
+                if (accountAdmission?.invoke(captureOnly) != true) captured = null
+            } else captureOnly()
+            Unit
+        }
+        if (allowLocalOnly && activeID == null) {
+            captureAccount()
+        } else {
+            val gateway = nativeGateway ?: return@serialized null
+            try {
+                val projection = gateway.read()
+                // A native profile publication may precede the host projection. Never authorize
+                // a new player against that stale host profile, even if its epoch is fresh.
+                if (profiles != projection.profiles || activeID != projection.activeID) return@serialized null
+                gateway.withProjection(projection) { captureAccount() }
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                return@serialized null
+            }
+        }
+        captured?.takeIf { it.isActive }
+    }
+
     /** The token slot the rest of the app reads the session from right now. Mirrors Apple `activeKeychainAccount`. */
     val activeKeychainAccount: String get() = active?.let { keychainAccount(it) } ?: PRIMARY_TOKEN_ACCOUNT
 
@@ -222,10 +268,11 @@ class ProfileStore private constructor(context: Context) {
         val usesEngineHistory: Boolean,
     )
 
-    private fun captureActiveProfileBinding(): ActiveProfileBinding {
-        val profile = active
+    private fun captureActiveProfileBinding(): ActiveProfileBinding = captureActiveProfileBinding(profiles, activeID)
+    private fun captureActiveProfileBinding(sourceProfiles: List<UserProfile>, selectedID: String?): ActiveProfileBinding {
+        val profile = sourceProfiles.firstOrNull { it.id == selectedID }
         return ActiveProfileBinding(
-            selectedID = activeID,
+            selectedID = selectedID,
             profileID = profile?.id,
             accountSlot = profile?.let(::keychainAccount) ?: PRIMARY_TOKEN_ACCOUNT,
             usesEngineHistory = profile?.usesEngineHistory ?: true,

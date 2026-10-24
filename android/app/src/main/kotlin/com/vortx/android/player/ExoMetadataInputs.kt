@@ -50,6 +50,10 @@ internal class ExoMetadataInputs {
     fun disableAudio(context: Context?) {
         if (context == null || accepts(context)) audio = null
     }
+    /** Event, playing period and actual tagged item must all identify this exact physical load. */
+    fun acceptsPresentation(event: Context?, playing: Context?, actualTag: Any?, actualPeriodUID: Any?): Boolean =
+        accepts(event) && event == playing && event == current && actualTag === load &&
+            actualPeriodUID != null && event?.period?.periodUid == actualPeriodUID
     fun snapshot(actualTag: Any?, actualPeriodUID: Any?): Pair<Format?, Format?> {
         val active = current
         if (!accepts(active) || actualTag !== load || actualPeriodUID == null ||
