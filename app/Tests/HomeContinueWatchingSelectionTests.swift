@@ -1,10 +1,11 @@
 import Foundation
 
 @main
+@MainActor
 struct HomeContinueWatchingSelectionTests {
     private static var checks = 0
     private static var failures: [String] = []
-    private static let profileA = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+    nonisolated private static let profileA = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
     private static let profileB = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
     private static let sessionA = TraktSessionID(rawValue: "fixture-trakt-A")
     private static let sessionB = TraktSessionID(rawValue: "fixture-trakt-B")
@@ -23,6 +24,7 @@ struct HomeContinueWatchingSelectionTests {
         remoteFallbacksAndEmptyTruth()
         unavailableNativeNeverBorrowsLegacy()
         nativeContextRetirement()
+        nativeReadOwnerRetirement()
         selectionRetiresDuringProjection()
         traktSessionRetirement()
         legacySharedProfileKeepsOverlay()
@@ -48,6 +50,8 @@ struct HomeContinueWatchingSelectionTests {
         core.beforeNativeCurrentCheck = nil
         core.usesNativeProfileState = native
         core.nativeBinding = binding()
+        CredentialScopeRegistry.shared.namespace = "fixture-account-A"
+        CredentialScopeRegistry.shared.generation = 1
         core.continueWatching = [item("native-local")]
         core.library = CoreLibrary(catalog: [item("tmdb:movie:42", poster: "https://catalog.invalid/cached.jpg")])
         ProfileStore.shared.activeID = profileA
@@ -149,6 +153,36 @@ struct HomeContinueWatchingSelectionTests {
         require(!context.isCurrent(core: core, profiles: .shared), "native session reopen retires captured selection")
         core.nativeBinding = binding(accountGeneration: UUID())
         require(!context.isCurrent(core: core, profiles: .shared), "native account generation retires captured selection")
+    }
+
+    private static func nativeReadOwnerRetirement() {
+        let core = configure()
+        let context = selected(core, shadow()).context
+        guard let binding = core.nativeBinding,
+              let original = core.captureNativePlaybackReadCapability(.native(binding)) else {
+            require(false, "fixture captures the original native read owner")
+            return
+        }
+        require(original.owns(context.nativeTarget) && context.isCurrent(owner: original),
+                "exact production read capability admits its original selected context")
+        core.nativeBinding = nil
+        core.nativeBinding = binding
+        require(!original.isCurrent() && !context.isCurrent(owner: original),
+                "restoring identical binding values cannot revive a retired native read owner")
+        guard let replacement = core.captureNativePlaybackReadCapability(.native(binding)) else {
+            require(false, "fixture captures a fresh owner after native reopen")
+            return
+        }
+        require(context.isCurrent(owner: replacement), "fresh capture can read the restored native context")
+        core.usesNativeProfileState = false
+        core.usesNativeProfileState = true
+        require(!replacement.isCurrent(), "native-lane ABA retires its original worker owner")
+        guard let current = core.captureNativePlaybackReadCapability(.native(binding)) else {
+            require(false, "fixture captures the final native read owner")
+            return
+        }
+        CredentialScopeRegistry.shared.generation &+= 1
+        require(!current.isCurrent(), "credential epoch retirement rejects the captured native read owner")
     }
 
     private static func selectionRetiresDuringProjection() {

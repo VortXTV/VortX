@@ -79,7 +79,7 @@ internal fun mutateSubtitleOffsetJson(
     if (contentKey.isBlank() || !updated.isFinite()) return raw ?: "{}"
     val entries = decodeSubtitleOffsets(raw)
     val rounded = round(seconds * 10.0) / 10.0
-    if (rounded == 0.0 || !rounded.isFinite() || abs(rounded) > SubtitleOffsetMemory.MAX_ABS_SECONDS) {
+    if (rounded == 0.0 || !seconds.isFinite() || abs(seconds) > SubtitleOffsetMemory.MAX_ABS_SECONDS) {
         entries.remove(contentKey)
     } else {
         entries[contentKey] = SubtitleOffsetEntry(seconds = rounded, updated = updated)

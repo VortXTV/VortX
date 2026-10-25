@@ -321,7 +321,7 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
     private let gates: [String: DispatchSemaphore]
     private let holdFirstOnly: Bool
     private var requests: [String] = []
-    private var budgets: [UInt64] = []
+    private var budgets: [(resource: VortxResourceRequest.Resource, milliseconds: UInt64)] = []
     private var bodyLimits: [UInt64] = []
     private var totalLimits: [UInt64] = []
     private var active = 0
@@ -332,7 +332,7 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         self.holdFirstOnly = holdFirstOnly
     }
     var started: [String] { lock.withLock { requests } }
-    var requestBudgets: [UInt64] { lock.withLock { budgets } }
+    var requestBudgets: [(resource: VortxResourceRequest.Resource, milliseconds: UInt64)] { lock.withLock { budgets } }
     var requestBodyLimits: [UInt64] { lock.withLock { bodyLimits } }
     var requestTotalLimits: [UInt64] { lock.withLock { totalLimits } }
     var maximumActive: Int { lock.withLock { peak } }
@@ -351,7 +351,7 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let bodyLimit = try input["maxResponseBytes"]!.decode(UInt64.self)
         let totalLimit = try input["maxTotalResponseBytes"]!.decode(UInt64.self)
         let attempt = lock.withLock {
-            requests.append(key); budgets.append(budget); bodyLimits.append(bodyLimit); totalLimits.append(totalLimit)
+            requests.append(key); budgets.append((request.resource, budget)); bodyLimits.append(bodyLimit); totalLimits.append(totalLimit)
             active += 1; peak = max(peak, active)
             if request.resource == .meta { metaActive += 1; metaPeak = max(metaPeak, metaActive) }
             else { streamActive += 1; streamPeak = max(streamPeak, streamActive) }
@@ -671,6 +671,10 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         try load(facade, "title")
         try await eventually { transport.started.count == 6 && transport.started.filter { $0.contains("/stream/") }.count == 4 }
         check(transport.maximumActive == 6 && transport.started.count == 6)
+        let initialBudgets = transport.requestBudgets
+        check(initialBudgets.filter { $0.resource == .meta }.count == 2)
+        check(initialBudgets.filter { $0.resource == .stream }.count == 4)
+        check(initialBudgets.allSatisfy { $0.milliseconds == ($0.resource == .stream ? 40_000 : 20_000) })
         check(!transport.started.contains("title:1:1/stream/source4"))
         check(state(facade)?["streams"]?.array?.count == 22)
         // Profile/sync admission needs only native FIFO settlement, never these held resources.
@@ -684,7 +688,9 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(state(facade)?["streams"]?.array?[0]["content"]?["type"] == .string("Loading"))
         try await eventually { transport.started.contains("title:1:1/stream/source4") }
         check(!transport.started.contains("title/meta/source2")) // slow metadata cannot occupy stream slots
-        check(transport.requestBudgets.allSatisfy { $0 == 20_000 }) // fifth starts with a fresh full budget
+        check(transport.requestBudgets.allSatisfy {
+            $0.milliseconds == ($0.resource == .stream ? 40_000 : 20_000)
+        }) // the fifth stream receives its own full 40-second budget after queue admission
         for index in [0, 1, 3] { transport.release(blocked[index]) }
         try await eventually { transport.started.filter { $0.contains("/stream/") }.count == 22 }
         check(state(facade)?["metaItems"]?.array?[0]["content"]?["type"] == .string("Loading"))
@@ -768,7 +774,7 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
             }
             await scoped.close()
         }
-        print("Native detail fanout: all22 providers, singleton20s budgets, meta2/stream4 bounds,32MiB aggregate/resource, early partial/order/failure/empty rows and latest-request/owner cancellation passed")
+        print("Native detail fanout: all22 providers, singleton stream40s/meta20s budgets, meta2/stream4 bounds,32MiB aggregate/resource, early partial/order/failure/empty rows and latest-request/owner cancellation passed")
     }
     static func catalogFanoutTests() async throws {
         let ids = ["slow", "failure", "fast", "fourth", "fifth", "sixth", "unrequested"]

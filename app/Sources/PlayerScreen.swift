@@ -184,7 +184,7 @@ private struct PlayerStyledSeekSlider: View {
                 onScrubChanged(target)
             }
             .onEnded { _ in finishDrag() })
-        .onChange(of: gestureActive) { active in
+        .onValueChange(of: gestureActive) { active in
             // SwiftUI also resets GestureState when a drag is cancelled by the system.
             if !active { finishDrag() }
         }
@@ -1142,7 +1142,7 @@ private struct PlayerTouchOptionsButton: View {
                 content()
                 #endif
             }
-            .onChange(of: presented, perform: onVisibilityChanged)
+            .onValueChange(of: presented, perform: onVisibilityChanged)
     }
 }
 
@@ -1325,6 +1325,7 @@ struct PlayerScreen: View {
     var initialEnginePlayerVideoId: String? = nil
     /// Session-only engine route chosen on the detail/source surface. nil keeps the persisted automatic route.
     var initialEnginePreference: PlayerEngineRouter.Override? = nil
+    var playbackQueueToken: PlaybackTitleQueue.Token? = nil
     var isTrailer: Bool = false                             // a trailer preview: always plays in-app, never auto-routes external
     /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
     /// false for an auto-pick (Watch Now / a Continue-Watching resume). An explicit pick is HONORED on a
@@ -1461,6 +1462,7 @@ struct PlayerScreen: View {
 
     private enum Panel: Identifiable, Equatable {
         case speed, subtitles, subtitleSettings, secondarySubtitles, subtitleLanguage(code: String, label: String), audio, audioSettings, video, sources, sourceAudio, episodes, info, playerSettings, sleep, quality, chapters, engine
+        case queue, queueItem(UUID)
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
@@ -1468,6 +1470,7 @@ struct PlayerScreen: View {
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
             case .chapters: 12; case .engine: 13; case .secondarySubtitles: 14
             case .subtitleLanguage: 15; case .sourceAudio: 16
+            case .queue: 17; case .queueItem: 18
             }
         }
         var title: String {
@@ -1480,6 +1483,7 @@ struct PlayerScreen: View {
             case .sources: "Sources"; case .sourceAudio: "Audio"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
             case .chapters: "Chapters"; case .engine: "Player Engine"
+            case .queue, .queueItem: "Playback Queue"
             }
         }
         /// Panels where picking a row is an unambiguous one-shot choice (a track, quality, source, or
@@ -1624,6 +1628,8 @@ struct PlayerScreen: View {
     @State private var macIsFullScreen = false
     /// Observers for the fullscreen-state notifications, torn down on disappear.
     @State private var macFullScreenObservers: [NSObjectProtocol] = []
+    /// Revokes already-enqueued native callbacks before observers are removed or a new presentation starts.
+    @State private var macFullScreenObservationID: UUID?
     /// Whether the player's window was ALREADY in native fullscreen when the player opened. If so the app
     /// was fullscreen for browsing (the user's own choice) and we leave it that way on teardown; if not, a
     /// fullscreen the PLAYER itself entered is dropped on close so the viewer lands back in windowed browse.
@@ -1661,6 +1667,7 @@ struct PlayerScreen: View {
     @State private var idleWatchTask: Task<Void, Never>?    // single poll loop; started on open, cancelled on teardown
     @State private var consecutiveAutoAdvances = 0          // back-to-back auto-advances with no interaction between them
     @State private var pendingStillWatchingEpisodeId: String?  // next episode to roll to when Continue is chosen at a binge boundary
+    @State private var pendingStillWatchingQueue = false
     private static let idleWatchTimeout: TimeInterval = 4 * 60 * 60   // 4h of no interaction -> "Still watching?"
     private static let idleAutoAdvanceLimit = 4                       // 4 back-to-back auto-advances, zero input -> same
     @State private var showExternalChooser = false   // "Play in another app" sheet
@@ -1684,8 +1691,11 @@ struct PlayerScreen: View {
     @ObservedObject private var apiKeys = ApiKeys.shared
     #endif
     @State private var externalLinkDead = false      // pre-flight probe found the stream URL dead before handoff
+    @State private var subtitleAlignmentNotice: String?
     @State private var subtitleLoadFailed = false    // an add-on subtitle download timed out / failed
     @State private var subtitleLoadingURL: String?   // an add-on subtitle is downloading (shows Loading… on its row)
+    @State private var subtitleAlignmentPresentation: SubtitleAlignmentPresentationRequest?
+    @State private var subtitlePresentationEpoch = UUID()
     // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
     // the preferred language chain but an add-on does). Reset with appliedAutoTracks so a source hop /
     // episode switch re-evaluates cleanly; latched after one attempt so a failure never loops.
@@ -1989,6 +1999,7 @@ struct PlayerScreen: View {
     /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    @State private var firstFrameCover = PlayerFirstFrameCoverPolicy<PlayerLoadToken>()
     /// Wall-clock uptime of the genuine first-frame event (set only alongside the true `hasStartedPlaying =
     /// true` transition below, never at the "foreground re-mount was not issued, restore the playing state"
     /// site - that one never actually stopped presentation, so resetting this there would wrongly reopen the
@@ -2164,21 +2175,21 @@ struct PlayerScreen: View {
         // whole movie (micro stutter + audio crackle on every stream).
         .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(playbackGateToken); LoopbackPlaybackAssertion.begin(for: url) }
         // Panels and the failure screen list sources, so they follow every engine change.
-        .onChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
+        .onValueChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
         // A first frame, remote resume or dismissed dialog re-arms a visible bar. The original
         // one-shot timer could expire during loading/pausing and never run again until another tap.
-        .onChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }
-        .onChange(of: core.streamsEpoch) { _ in
+        .onValueChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }
+        .onValueChange(of: core.streamsEpoch) { _ in
             establishSubtitleTimingScopeIfAvailable()
             if appliedAutoTracks {
                 restoreSubtitleTimingOffsetIfReady()
                 applyCurrentSubtitleDelayIfReady(force: false)
             }
         }
-        .onChange(of: allEpisodeRefs) { _ in
+        .onValueChange(of: allEpisodeRefs) { _ in
             consumePendingManualEpisodeNavigationIfReady()
         }
-        .onChange(of: sourceSwitchGeneration) { _ in
+        .onValueChange(of: sourceSwitchGeneration) { _ in
             fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
@@ -2369,11 +2380,32 @@ struct PlayerScreen: View {
             .ignoresSafeArea()
     }
 
+    private var firstFrameCoverMetadata: PlaybackMeta? {
+        pendingAdvance?.issued == true ? pendingAdvance?.meta : curMeta
+    }
+
+    private var firstFrameCoverMedia: PlayerFirstFrameMedia {
+        .init(libraryID: firstFrameCoverMetadata?.libraryId, videoID: firstFrameCoverMetadata?.videoId)
+    }
+
+    private var firstFrameCoverLayer: some View {
+        let metadata = firstFrameCoverMetadata
+        let displayTitle = pendingAdvance?.issued == true ? (pendingAdvance?.title ?? title) : curTitle
+        return PlayerFirstFrameArtwork(
+            visible: firstFrameCover.showsArtwork(media: firstFrameCoverMedia, failed: loadFailed,
+                exited: playbackExited, contextCurrent: playbackMutationTarget.stillOwnsCurrentContext(core: core)),
+            id: metadata?.libraryId, type: metadata?.type ?? "movie", title: displayTitle, poster: metadata?.poster
+        )
+        .id(firstFrameCoverMedia)
+    }
+
     private var mpvBody: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             playerSurface
+
+            firstFrameCoverLayer
 
             // A dedicated transparent surface owns one-finger taps independently of pinch. Actual
             // buttons/panels remain above it; decorative buffering must not steal its hit tests.
@@ -2533,6 +2565,7 @@ struct PlayerScreen: View {
         .onAppear {
             refreshAutoSkipSettings()
             playbackExited = false
+            firstFrameCover.beginPresentation()
             persistenceBlockedForExit = false
             // Diagnostic-only: this is the player surface, so the heartbeat reports the player route.
             VXProbeState.shared.setRoute("player")
@@ -2621,14 +2654,22 @@ struct PlayerScreen: View {
             observeMacFullScreen()
             #endif
         }
-        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+        .onValueChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             refreshAutoSkipSettings()
         }
+        .onReceive(PlaybackTitleQueue.shared.$change) { _ in
+            guard let open = panel else { return }
+            switch open {
+            case .queue, .queueItem, .playerSettings: panelRows = rows(for: open)
+            default: break
+            }
+        }
         .onDisappear {
+            invalidateSubtitleAlignmentPresentation()
             let assetSanityAccepted =
                 assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken)
             invalidateEpisodeWorkForExit()
@@ -2791,9 +2832,9 @@ struct PlayerScreen: View {
             Text("That link is not responding right now. Try a different source.")
         }
         .alert("Subtitle unavailable", isPresented: $subtitleLoadFailed) {
-            Button("OK", role: .cancel) { scheduleHide() }
+            Button("OK", role: .cancel) { subtitleAlignmentNotice = nil; scheduleHide() }
         } message: {
-            Text("That subtitle source did not respond in time. Try another one.")
+            Text(subtitleAlignmentNotice ?? String(localized: "That subtitle source did not respond in time. Try another one."))
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
         .sheet(item: $grabbedFrame) { ShareSheet(items: [$0.url]) }
@@ -2883,12 +2924,23 @@ struct PlayerScreen: View {
         loadToken: PlayerLoadToken,
         position: Double
     ) {
+        // The deferred-start token exists only after the exact existing start/audio transaction.
+        // Delayed acceptance must also reveal; keep this before the existing one-shot effects latch.
+        if pendingAdvance == nil, assetSanityDeferredStartToken == loadToken,
+           assetSanityAttempt.isAccepted(owner: loadToken) {
+            firstFrameCover.acceptStart(callbackOwner: loadToken,
+                activeOwner: coordinator.player?.activeLoadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia, accepted: true,
+                contextCurrent: !playbackExited && playbackMutationTarget.stillOwnsCurrentContext(core: core))
+        }
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
         if let meta = curMeta, pendingAdvance == nil,
            assetSanityDeferredStartToken == loadToken,
            coordinator.player?.activeLoadToken == loadToken {
+            _ = PlaybackTitleQueue.shared.acceptStarted(playbackQueueToken, meta: meta)
             onPlaybackIdentityCommitted(meta)
         }
         rememberAcceptedSeriesChoice()
@@ -3136,6 +3188,9 @@ struct PlayerScreen: View {
         }
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
             adoptResumeSurfaceIfCurrent(loadToken: loadToken)
+            firstFrameCover.bind(owner: loadToken,
+                mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: firstFrameCoverMedia)
             // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
             completionEvidence.begin(owner: loadToken,
                                      mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0)
@@ -3590,6 +3645,10 @@ struct PlayerScreen: View {
             // may still release deferred foreground work even if an intermediate pause was not observed.
             if let b = data as? Bool, !b { resumeDeferredForegroundMountRevalidation() }
             #endif
+        case "vortx-owned-subtitle-state":
+            guard callbackBelongsToCommittedMedia(loadToken) else { return }
+            refreshTracks()
+            if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }
         case MPVProperty.trackList:
             refreshTracks()
             if let loadToken, callbackBelongsToCommittedMedia(loadToken) {
@@ -3783,6 +3842,16 @@ struct PlayerScreen: View {
                 exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
                 invalidateEpisodeWorkForExit()
                 onClose()
+            } else if !skipEditActive, let meta = curMeta,
+                      PlaybackTitleQueue.shared.ownsActive(playbackQueueToken, meta: meta) {
+                if stillWatchingPromptEnabled,
+                   PlaybackTitleQueue.shared.shouldConfirmAdvance(playbackQueueToken, meta: meta,
+                                                                 after: stillWatchingAfterEpisodes) {
+                    pendingStillWatchingQueue = true
+                    presentStillWatching()
+                } else if PlaybackTitleQueue.shared.completed(playbackQueueToken, meta: meta) {
+                    leavePlayback()
+                }
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
                 // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
                 // Suppressed while the skip editor is open so an end-of-credits edit isn't yanked away.
@@ -4151,14 +4220,31 @@ struct PlayerScreen: View {
     /// higher maxWidth), write it to a temp JPEG, and present the share sheet so the still can be saved or
     /// sent anywhere. iOS / Mac only - tvOS has no share sheet.
     private func grabFrame() {
-        coordinator.player?.captureFrameJPEGData(maxWidth: 2560) { data in
+        guard let player = coordinator.player, let originalLoad = player.activeLoadToken else { return }
+        let originalEngine = ObjectIdentifier(player)
+        let originalSource = sourceSwitchGeneration
+        let raw = recordMeta?.name ?? "VortX"
+        let base = raw.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined()
+        let name = "VortX-\(base.isEmpty ? "frame" : base)-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString).jpg"
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        player.captureFrameJPEGData(maxWidth: 2560) { data in
             guard let data else { return }
-            let raw = recordMeta?.name ?? "VortX"
-            let base = raw.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined()
-            let name = "VortX-\(base.isEmpty ? "frame" : base)-\(Int(Date().timeIntervalSince1970)).jpg"
-            let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-            guard (try? data.write(to: target)) != nil else { return }
-            DispatchQueue.main.async { self.grabbedFrame = GrabbedFrame(url: target) }
+            // Both engines deliver their legacy completion on the UI owner. File I/O
+            // belongs on utility, and a delayed capture must not present on another load.
+            DispatchQueue.global(qos: .utility).async {
+                guard (try? data.write(to: target, options: .atomic)) != nil else { return }
+                DispatchQueue.main.async {
+                    guard !playbackExited, sourceSwitchGeneration == originalSource,
+                          let current = coordinator.player,
+                          ObjectIdentifier(current) == originalEngine,
+                          current.activeLoadToken == originalLoad else {
+                        // Only this capture's unique, generated temporary file is retired.
+                        DispatchQueue.global(qos: .utility).async { try? FileManager.default.removeItem(at: target) }
+                        return
+                    }
+                    self.grabbedFrame = GrabbedFrame(url: target)
+                }
+            }
         }
     }
 
@@ -4396,6 +4482,10 @@ struct PlayerScreen: View {
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            let coverMetadata = pendingAdvance?.meta ?? curMeta
+            firstFrameCover.bind(owner: issuedToken,
+                mountGeneration: (player as? AVPlayerEngineController)?.currentItemGeneration ?? 0,
+                media: .init(libraryID: coverMetadata?.libraryId, videoID: coverMetadata?.videoId))
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
@@ -4977,6 +5067,7 @@ struct PlayerScreen: View {
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
+        invalidateSubtitlePresentationForReplacement()
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         srcProbeLoadStart = Date()   // [src-probe] a reload is a fresh attempt: re-anchor the elapsed clock
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
@@ -6130,6 +6221,7 @@ struct PlayerScreen: View {
             buffering = true; loadFailed = false; loadErrorMsg = ""
             firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil
             cancelPostFrameResumeSeekWatchdog()
+            invalidateSubtitlePresentationForReplacement()
             subtitleLoadingURL = nil
             srcProbeLoadStart = Date()
             bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
@@ -6281,6 +6373,7 @@ struct PlayerScreen: View {
         // subtitles yet, so drop the added-set tracking so the picker is honest and reapply can re-add cleanly.
         appliedSize = false; appliedVolume = false; appliedAutoTracks = false
         addedSubURLs = []; addedPooledIDs = []
+        invalidateSubtitlePresentationForReplacement()
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the old engine; a stranded latch would gate every later pick
         hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
@@ -6936,6 +7029,7 @@ struct PlayerScreen: View {
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
+        invalidateSubtitlePresentationForReplacement()
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
         addedPooledIDs = []; embeddedUploadDone = false
         langContributeDone = false
@@ -7928,6 +8022,7 @@ struct PlayerScreen: View {
         episodeSourceHydrationGeneration = UUID()
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
+        firstFrameCover.retire()
         invalidateEpisodeResolution()
         episodeSwitchGeneration &+= 1
         episodeResolveGeneration = nil
@@ -9682,10 +9777,11 @@ struct PlayerScreen: View {
             guard let player = coordinator.player else { return }
             autoAddonSubTried = true
             subtitleLoadingURL = sub.url
+            let subtitlePresentationID = subtitlePresentationEpoch
             let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
             player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
-                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
+                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID) else { return }
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
@@ -9803,10 +9899,81 @@ struct PlayerScreen: View {
         subtitleDelayAppliedLoadToken = loadToken
     }
 
+    /// Retire only the pending alignment's UI and original engine. Ordinary downloads keep
+    /// their existing latch when no alignment owns it; same-URL successor work is never cleared.
+    private func invalidateSubtitleAlignmentPresentation() {
+        guard let original = subtitleAlignmentPresentation else { return }
+        subtitleAlignmentPresentation = nil
+        subtitlePresentationEpoch = UUID()
+        if subtitleLoadingURL == original.url { subtitleLoadingURL = nil }
+        if let request = original.requestGeneration {
+            (original.player as? MPVMetalViewController)?.cancelAutomaticSubtitleAlignment(ifRequestGeneration: request)
+        }
+    }
+
+    private func invalidateSubtitlePresentationForReplacement() {
+        invalidateSubtitleAlignmentPresentation()
+        subtitlePresentationEpoch = UUID()
+        subtitlePoolRequests.invalidate()
+        subtitleLoadingURL = nil
+    }
+
     /// A subtitle request may finish after an episode load or same-episode reload replaced the player item.
     /// Require both its opaque load token and its content identity before publishing completion state.
-    private func permitsSubtitlePublication(loadToken: PlayerLoadToken?, videoID: String?) -> Bool {
-        guard let loadToken, coordinator.player?.activeLoadToken == loadToken else { return false }
+    /// Keep ordinary subtitle selection separate from this explicit automatic timing request.
+    /// Its mounted owner is captured before the first asynchronous operation, never on completion.
+    private func alignAddonSubtitle(_ sub: AddonSubtitle) {
+        invalidateSubtitleAlignmentPresentation()
+        guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
+        guard let load = player.activeLoadToken else {
+            subtitleAlignmentNotice = PlayerSubtitleAlignmentResult.unavailable.failureMessage
+            subtitleLoadFailed = true
+            return
+        }
+        guard let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget) else {
+            subtitleAlignmentNotice = PlayerSubtitleAlignmentResult.superseded.failureMessage
+            subtitleLoadFailed = true
+            return
+        }
+        let video = curMeta?.videoId
+        userPickedSubtitle = true
+        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: sub.url)
+        subtitlePresentationEpoch = presentation.id
+        subtitleAlignmentPresentation = presentation
+        subtitlePoolRequests.invalidate()
+        subtitleLoadingURL = sub.url
+        if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }
+        let requestGeneration = player.alignExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang, owner: owner) { result in
+            guard subtitleAlignmentPresentation?.id == presentation.id,
+                  player === coordinator.player,
+                  permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
+                  subtitleLoadingURL == sub.url else { return }
+            subtitleAlignmentPresentation = nil
+            subtitleLoadingURL = nil
+            guard playbackMutationTarget.stillOwnsCurrentContext(core: core),
+                  LegacyWatchOwnership.applicationEpochIsCurrent(owner.applicationEpoch) else { return }
+            if let message = result.failureMessage {
+                subtitleAlignmentNotice = message; subtitleLoadFailed = true
+            }
+            if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }
+        }
+        // The callee returns its original request, never a later sampled generation.
+        // A synchronous rejection may already have completed and cleared this presentation.
+        if subtitleAlignmentPresentation?.id == presentation.id {
+            if let requestGeneration {
+                subtitleAlignmentPresentation?.requestGeneration = requestGeneration
+            } else {
+                subtitleAlignmentPresentation = nil
+                if subtitleLoadingURL == sub.url { subtitleLoadingURL = nil }
+                if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }
+            }
+        }
+    }
+
+    private func permitsSubtitlePublication(loadToken: PlayerLoadToken?, videoID: String?,
+                                            presentationID: UUID) -> Bool {
+        guard subtitlePresentationEpoch == presentationID,
+              let loadToken, coordinator.player?.activeLoadToken == loadToken else { return false }
         return curMeta?.videoId == videoID
     }
 
@@ -9902,19 +10069,27 @@ struct PlayerScreen: View {
     /// `auto`: a background language-chain pick (autoSelectAddonSubtitleIfNeeded tier 2), which suppresses the
     /// subtitleLoadFailed alert on failure, matching the add-on auto path and tvOS (the user did not ask).
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
+        if !auto { invalidateSubtitleAlignmentPresentation() }
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume,
               VortXSyncManager.shared.isSignedIn else { return }
         let marker = sub.url.absoluteString
         let downloadID = subtitlePoolRequests.beginDownload()
+        let subtitlePresentationID = subtitlePresentationEpoch
         subtitleLoadingURL = marker
         VXProbe.log("subs", "community subtitle selected lang=\(sub.lang)")
         if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
         Task { @MainActor in
+            guard subtitlePresentationEpoch == subtitlePresentationID,
+                  subtitlePoolRequests.ownsDownload(downloadID) else { return }
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
             let signedIn = VortXSyncManager.shared.isSignedIn
             let publicationFence = SubtitlePoolClient.PublicationFence(contentKey: sub.contentKey)
             let downloaded = await SubtitlePoolClient.download(sub, isSignedIn: signedIn)
+            guard subtitlePresentationEpoch == subtitlePresentationID else {
+                _ = subtitlePoolRequests.finishDownload(downloadID)
+                return
+            }
             let mayPublishDownload = publicationFence.permits(
                 currentContentKey: communityContentKey,
                 isSignedIn: VortXSyncManager.shared.isSignedIn
@@ -9954,7 +10129,7 @@ struct PlayerScreen: View {
                     isSignedIn: VortXSyncManager.shared.isSignedIn
                 )
                 let loadStillCurrent = permitsSubtitlePublication(
-                    loadToken: subtitleLoadToken, videoID: subtitleVideoID
+                    loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID
                 )
                 guard mayPublishExternal, loadStillCurrent else {
                     if subtitlePoolRequests.finishExternal(externalID) {
@@ -10213,8 +10388,43 @@ struct PlayerScreen: View {
         }
     }
 
+    /// Both Apple player surfaces use the same session policy/recipes; no track/volume/sync writes.
+    private var audioPresetRows: [Row] {
+        let engine = coordinator.player as? MPVMetalViewController
+        var rows = [Row(label: String(localized: "Audio preset · this session"), isHeader: true)]
+        for preset in PlayerSessionAudioPreset.allCases {
+            let unavailable = engine?.sessionAudioPresetUnavailableReason(for: preset)
+                ?? (engine == nil ? PlayerSessionAudioPresetState.avPlayerUnavailable : nil)
+            rows.append(Row(
+                label: Self.l10n(preset.label),
+                detail: Self.l10n(unavailable ?? preset.detail),
+                selected: engine?.sessionAudioPreset.selected == preset,
+                isEnabled: unavailable == nil,
+                accessibilityHint: String(localized: "Applies only to this player session")
+            ) {
+                // Resolve the current controller at activation, not the engine captured by an old row.
+                (coordinator.player as? MPVMetalViewController)?.setSessionAudioPreset(preset)
+            })
+        }
+        if let message = engine?.sessionAudioPreset.message {
+            rows.append(Row(label: Self.l10n(message), wraps: true, isEnabled: false))
+        }
+        return rows
+    }
     private func rows(for p: Panel) -> [Row] {
         switch p {
+        case .queue:
+            return playbackQueueRows
+        case .queueItem(let id):
+            guard let entry = PlaybackTitleQueue.shared.upcoming.first(where: { $0.id == id }) else {
+                return [Row(label: "This queued item is no longer available", isHeader: true)]
+            }
+            return [
+                Row(label: entry.candidate.title, detail: entry.candidate.episodeLabel ?? "", isHeader: true),
+                Row(label: "Move up") { PlaybackTitleQueue.shared.move(id, by: -1) },
+                Row(label: "Move down") { PlaybackTitleQueue.shared.move(id, by: 1) },
+                Row(label: "Remove") { PlaybackTitleQueue.shared.remove(id); openPanel(.queue) }
+            ]
         case .video:
             return sizeModes.map { m in Row(label: m.label, detail: m.detail, selected: (coordinator.player?.videoSizeMode ?? videoSize) == m.raw) {
                 applyVideoSize(m.raw)
@@ -10253,6 +10463,7 @@ struct PlayerScreen: View {
             }
             return rs
         case .subtitles:
+            let aligned = coordinator.player?.alignedExternalSubtitle
             // Settings FIRST (the primary in-session action), then Off, then one row per language. Each
             // language row drills into `.subtitleLanguage`, which lists every sub in that language across
             // embedded + add-on + community sources, so a title with dozens of subs no longer forces one
@@ -10261,11 +10472,12 @@ struct PlayerScreen: View {
             let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
             let dualActive = secondaryID >= 0
             let primaryID = mpvEngine?.primarySubtitleID ?? -1
-            let primaryOff = dualActive
+            let primaryOff = aligned == nil && (dualActive
                 ? (primaryID < 0)
-                : subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable }
+                : subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable })
             var rs: [Row] = [Row(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) }]
             rs.append(Row(label: String(localized: "Off"), selected: primaryOff) {
+                invalidateSubtitleAlignmentPresentation()
                 userPickedSubtitle = true
                 VXProbe.log("subs", "selected track off")
                 coordinator.player?.setSubtitleTrack(-1)
@@ -10287,10 +10499,11 @@ struct PlayerScreen: View {
             for s in availablePooled { languageCounts[subtitleLanguageKey(s.lang), default: 0] += 1 }
             for code in languageCounts.keys.sorted(by: { langName($0) < langName($1) }) {
                 let count = languageCounts[code] ?? 0
-                let hasSelection = subtitleTracks.contains {
-                    let tSel = dualActive ? $0.id == primaryID : $0.selected
-                    return $0.isSelectable && tSel && subtitleLanguageKey($0.lang) == code
-                }
+                let hasSelection = aligned.map { subtitleLanguageKey($0.lang) == code }
+                    ?? subtitleTracks.contains {
+                        let tSel = dualActive ? $0.id == primaryID : $0.selected
+                        return $0.isSelectable && tSel && subtitleLanguageKey($0.lang) == code
+                    }
                 rs.append(Row(label: langName(code), detail: "\(count) ›", selected: hasSelection) {
                     openPanel(.subtitleLanguage(code: code, label: langName(code)))
                 })
@@ -10314,6 +10527,8 @@ struct PlayerScreen: View {
             return rs
         case .subtitleLanguage(let code, _):
             // One language's complete sub list: embedded tracks first, then add-on, then community.
+            let aligned = coordinator.player?.alignedExternalSubtitle
+            let alignmentAvailable = coordinator.player?.automaticSubtitleAlignmentAvailable == true
             let mpvEngine = coordinator.player as? MPVMetalViewController
             let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
             let dualActive = secondaryID >= 0
@@ -10327,10 +10542,11 @@ struct PlayerScreen: View {
                     rs.append(Row(
                         label: t.title.isEmpty ? "Track \(i + 1)" : t.title,
                         detail: t.unavailableReason ?? "",
-                        selected: t.isSelectable && (primarySel?(t) ?? t.selected),
+                        selected: aligned == nil && t.isSelectable && (primarySel?(t) ?? t.selected),
                         isEnabled: t.isSelectable
                     ) {
                         guard t.isSelectable else { return }
+                        invalidateSubtitleAlignmentPresentation()
                         userPickedSubtitle = true
                         VXProbe.log("subs", "selected embedded track \(t.id)")
                         coordinator.player?.setSubtitleTrack(t.id)
@@ -10353,16 +10569,18 @@ struct PlayerScreen: View {
                         // reference that is nil in the engine demote/switch render gap, and an optional-chained
                         // call there would swallow the completion, stranding the latch so EVERY later subtitle
                         // pick is silently dead for the session (the "stuck on Loading…" report).
+                        invalidateSubtitleAlignmentPresentation()
                         guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
                         userPickedSubtitle = true
                         subtitleLoadingURL = sub.url
                         VXProbe.log("subs", "add-on subtitle selected lang=\(sub.lang) src=\(sub.addonName)")
                         if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }   // reflect Loading… in place
+                        let subtitlePresentationID = subtitlePresentationEpoch
                         let subtitleLoadToken = player.activeLoadToken
                         let subtitleVideoID = curMeta?.videoId
                         player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
                             guard permitsSubtitlePublication(
-                                loadToken: subtitleLoadToken, videoID: subtitleVideoID
+                                loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID
                             ) else { return }
                             subtitleLoadingURL = nil
                             VXProbe.log("subs", "add-on subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
@@ -10377,6 +10595,14 @@ struct PlayerScreen: View {
                             if panelShowsSubtitleList { panelRows = rows(for: panel ?? .subtitles) }
                         }
                     })
+                    if URL(string: sub.url)?.pathExtension.lowercased() == "srt",
+                       alignmentAvailable {
+                        rs.append(Row(label: String(localized: "Auto-align") + " · " + sub.displayTitle,
+                            detail: String(localized: "Match timing to embedded subtitles"),
+                            selected: aligned?.url == sub.url) {
+                            alignAddonSubtitle(sub)
+                        })
+                    }
                 }
             }
             let languagePooled = TrackSelector.keepingPreferredSubtitleLanguages(
@@ -10387,6 +10613,7 @@ struct PlayerScreen: View {
                 for sub in languagePooled.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
+                        invalidateSubtitleAlignmentPresentation()
                         userPickedSubtitle = true
                         selectPooledSubtitle(sub)
                     })
@@ -10403,11 +10630,13 @@ struct PlayerScreen: View {
             let primaryID = mpvEngine?.primarySubtitleID ?? -1
             var rs: [Row] = [Row(label: String(localized: "Off"), selected: secondaryID < 0) {
                 VXProbe.log("subs", "secondary subtitle off")
+                invalidateSubtitleAlignmentPresentation()
                 mpvEngine?.setSecondarySubtitleTrack(-1)
             }]
             let secondaryOptions = subtitleTracks.filter { primaryID < 0 || $0.id != primaryID }
             rs += groupedTrackRows(secondaryOptions, isSelected: { $0.id == secondaryID }) { id in
                 VXProbe.log("subs", "selected secondary subtitle track \(id)")
+                invalidateSubtitleAlignmentPresentation()
                 mpvEngine?.setSecondarySubtitleTrack(id)
             }
             return rs
@@ -10448,10 +10677,10 @@ struct PlayerScreen: View {
             rs.append(Row(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rs
         case .audioSettings:
-            // AVPlayer manages audio delay + output routing itself: setAudioDelay / setAudioOutputMode are
-            // no-ops on that engine, so hide the inert controls rather than show rows that do nothing (#76).
+            // AVPlayer retains system-managed delay/output. Show the explicit DSP limitation, not
+            // inert controls or an AVPlayer volume change pretending to be a processing preset.
             if isAVPlayerActive {
-                return [Row(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)]
+                return [Row(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)] + audioPresetRows
             }
             let now = String(format: "%+.1fs", audioDelay)
             var rs = [Row(label: String(localized: "Sync"), isHeader: true),
@@ -10467,6 +10696,7 @@ struct PlayerScreen: View {
                     coordinator.player?.setAudioOutputMode(m)
                 })
             }
+            rs.append(contentsOf: audioPresetRows)
             return rs
         case .quality:
             // Best stream per resolution (4K / 1080p / 720p / …); picking one hot-swaps the source at the
@@ -10533,6 +10763,9 @@ struct PlayerScreen: View {
             }
         case .playerSettings:
             var rows: [Row] = []
+            if !isTrailer {
+                rows.append(Row(label: "Playback queue", detail: "\(PlaybackTitleQueue.shared.count)  ›") { openPanel(.queue) })
+            }
             // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
             // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
             if !isAVPlayerActive {
@@ -10893,6 +11126,7 @@ struct PlayerScreen: View {
 
     private func adjustSubDelay(_ delta: Double) {
         guard coordinator.player?.subtitleDelayAvailable == true else { return }
+        invalidateSubtitleAlignmentPresentation()
         subDelay = ((subDelay + delta) * 10).rounded() / 10
         pooledSeededOffset = true
         applyCurrentSubtitleDelayIfReady(force: true)
@@ -10960,6 +11194,7 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        invalidateSubtitlePresentationForReplacement()
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
         curDebridRef?.nativeUsenetLease?.close()
         // Preview time is temporary editor state, not the viewer's watch progress.
@@ -11096,36 +11331,35 @@ struct PlayerScreen: View {
         let alreadyFullScreen = window?.styleMask.contains(.fullScreen) ?? false
         macIsFullScreen = alreadyFullScreen
         macWasFullScreenAtOpen = alreadyFullScreen
+        let observationID = UUID()
+        macFullScreenObservationID = observationID
+        let windowID = window.map(ObjectIdentifier.init)
+        let receive: @MainActor @Sendable (Bool) -> Void = { fullScreen in
+            guard macFullScreenObservationID == observationID, !playbackExited else { return }
+            macIsFullScreen = fullScreen
+            // AppKit fullscreen re-hosts the backing on entry AND exit. Re-assert the current player's
+            // EDR tags only while this original window observation is still installed; no second hop
+            // can outlive the accepted observation and act on a replacement presentation.
+            (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
+        }
         let nc = NotificationCenter.default
-        // Scope the observers to the player's own window via `object:` so an auxiliary window's fullscreen
-        // transition (a Settings or About window) does not flip the player glyph. When the window is not yet
-        // resolvable (object nil observes all windows), the closure's identity check is the fallback guard.
+        // Keep the original window filter. Only scalar identity and the owned receiver cross the
+        // nonisolated NotificationCenter callback; no NSWindow/Notification is transferred to the turn.
         let enter = nc.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { note in
-            guard window == nil || (note.object as? NSWindow) === window else { return }
-            macIsFullScreen = true
-            // HDR/DV EDR survives fullscreen: AppKit native fullscreen re-hosts the content in a NEW
-            // fullscreen window/backing, which drops the mpv Metal layer's EDR activation + colorspace
-            // association, so PQ/HLG pixels presented as SDR (washed out) until a new file/gamma change.
-            // These notifications fire AFTER the window/backing swap completes, the correct moment to
-            // re-tag the colorspace and re-assert wantsExtendedDynamicRangeContent on the new backing.
-            // mpv lane only; AVPlayerLayer is EDR-native and needs nothing.
-            Task { @MainActor in
-                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
-            }
+            let eventWindowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
+            guard windowID == nil || eventWindowID == windowID else { return }
+            DispatchQueue.main.async { receive(true) }
         }
         let exit = nc.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { note in
-            guard window == nil || (note.object as? NSWindow) === window else { return }
-            macIsFullScreen = false
-            // Same re-sync on the way OUT: exiting fullscreen swaps back to the original window/backing,
-            // which loses the EDR activation the same way (see the enter handler above).
-            Task { @MainActor in
-                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
-            }
+            let eventWindowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
+            guard windowID == nil || eventWindowID == windowID else { return }
+            DispatchQueue.main.async { receive(false) }
         }
         macFullScreenObservers = [enter, exit]
     }
 
     private func unobserveMacFullScreen() {
+        macFullScreenObservationID = nil
         for token in macFullScreenObservers { NotificationCenter.default.removeObserver(token) }
         macFullScreenObservers = []
     }
@@ -11300,6 +11534,9 @@ struct PlayerScreen: View {
     /// (mandated check 8). Off when no track is selected; otherwise an add-on / pooled external sub (matched
     /// back by language against the added set) or an embedded track (by lang/title).
     private func captureSubtitleChoice() -> SubtitleChoice {
+        if let aligned = coordinator.player?.alignedExternalSubtitle {
+            return .external(url: aligned.url, title: aligned.title, lang: aligned.lang)
+        }
         guard let sel = subtitleTracks.first(where: {
             $0.selected && $0.isSelectable
         }) else { return .off }
@@ -11337,10 +11574,11 @@ struct PlayerScreen: View {
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
             guard let player = coordinator.player else { return }
+            let subtitlePresentationID = subtitlePresentationEpoch
             let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
             player.addExternalSubtitle(url: urlStr, title: title, lang: lang) { ok in
-                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
+                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID) else { return }
                 if ok, player === coordinator.player {
                     addedSubURLs.insert(urlStr)
                     applyCurrentSubtitleDelayIfReady(force: false)
@@ -11513,6 +11751,7 @@ struct PlayerScreen: View {
     private func noteInteraction() {
         idleDeadline = Date().addingTimeInterval(Self.idleWatchTimeout)
         consecutiveAutoAdvances = 0
+        PlaybackTitleQueue.shared.noteInteraction(playbackQueueToken)
     }
 
     /// Start the single idle-watch poll. One long-lived loop (not a per-interaction Task) re-checks the
@@ -11559,6 +11798,13 @@ struct PlayerScreen: View {
         let next = pendingStillWatchingEpisodeId
         pendingStillWatchingEpisodeId = nil
         noteInteraction()
+        if pendingStillWatchingQueue {
+            pendingStillWatchingQueue = false
+            if let meta = curMeta, PlaybackTitleQueue.shared.completed(playbackQueueToken, meta: meta) {
+                leavePlayback()
+            }
+            return
+        }
         if let next {
             goToEpisode(next, autoAdvance: true)
         } else {
@@ -11571,10 +11817,41 @@ struct PlayerScreen: View {
     private func stopStillWatching() {
         stillWatchingPrompt = false
         pendingStillWatchingEpisodeId = nil
+        pendingStillWatchingQueue = false
         leavePlayback()
     }
 
     private func speedLabel(_ s: Double) -> String { s == s.rounded() ? "\(Int(s))×" : String(format: "%g×", s) }
+
+    private var playbackQueueRows: [Row] {
+        let queue = PlaybackTitleQueue.shared
+        var rows: [Row] = []
+        if let meta = curMeta, let candidate = PlaybackTitleQueuePolicy.Candidate(
+            contentID: meta.libraryId, type: meta.type, title: meta.name,
+            videoIDHint: meta.type == "series" ? meta.videoId : nil,
+            episodeLabel: meta.season.flatMap { season in meta.episode.map { "S\(season)E\($0)" } }
+        ) {
+            rows.append(Row(label: "Play this item next") { _ = queue.enqueue(candidate, placement: .next) })
+            rows.append(Row(label: "Add this item to end") { _ = queue.enqueue(candidate, placement: .last) })
+        }
+        if let meta = curMeta, queue.ownsActive(playbackQueueToken, meta: meta), !queue.upcoming.isEmpty {
+            rows.append(Row(label: "Play next queued title now") {
+                if queue.nextManually(playbackQueueToken) { leavePlayback() }
+            })
+        } else if queue.canStart {
+            rows.append(Row(label: "Start queued titles now") {
+                if queue.requestNext() { leavePlayback() }
+            })
+        }
+        rows.append(Row(label: "Up next · \(queue.upcoming.count)", isHeader: true))
+        rows += queue.upcoming.map { entry in
+            Row(label: entry.candidate.title, detail: entry.candidate.episodeLabel ?? "›") {
+                openPanel(.queueItem(entry.id))
+            }
+        }
+        if !queue.upcoming.isEmpty { rows.append(Row(label: "Clear upcoming titles") { queue.clearUpcoming() }) }
+        return rows
+    }
 
     private func timeString(_ t: Double) -> String {
         guard t.isFinite, t >= 0 else { return "0:00" }

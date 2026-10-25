@@ -18,6 +18,16 @@ fi
   # only actual old begin/attach/invalidate methods are swapped, isolating missing production transitions.
   sed -n '/    var nativeStartupPhase:/,/^    }/p' app/Sources/Player/AVPlayerEngine.swift \
     | sed 's/var nativeStartupPhase:/var phase:/'
+  # Current invalidation calls this actual pure counter retirement before other teardown.
+  # Historical engine inputs without that helper retain their original behavior.
+  if grep -Fq '    private func retireSubtitleAlignment() {' "$preflight_test_dir/engine.swift"; then
+    grep -Fq '    private var subtitleAlignmentGeneration: UInt64 = 0' "$preflight_test_dir/engine.swift" || {
+      printf '%s\n' 'Missing current AV alignment retirement state' >&2
+      exit 1
+    }
+    sed -n '/    private func retireSubtitleAlignment() {/,/^    }/p' "$preflight_test_dir/engine.swift" \
+      | sed 's/private func /func /'
+  fi
   sed -n '/    func invalidateLoadToken() {/,/^    }/p' "$preflight_test_dir/engine.swift" \
     | sed '/^[[:space:]]*#if os(tvOS)/d; /^[[:space:]]*#endif/d'
   sed -n '/    private func pendingLoadIsCurrent(/,/    \/\/ MARK: - External engine mode/p' \

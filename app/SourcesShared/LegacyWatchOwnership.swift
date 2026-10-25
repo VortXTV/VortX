@@ -15,41 +15,84 @@ enum LegacyWatchOwnership {
         case transitioning
         case stale
     }
+    struct SubtitleRendererEpochObservation: Sendable {
+        fileprivate let id: UUID
+        fileprivate init(id: UUID) { self.id = id }
+    }
+    private struct SubtitleRendererObserver: Sendable {
+        let originalEpoch: UUID
+        let retire: @Sendable () -> Void
+    }
     private struct Epoch: Sendable {
         var value = UUID()
         var profileMutationDepth = 0
         var notifyWhenSettled = false
         var waiters: [CheckedContinuation<Void, Never>] = []
+        var subtitleRenderers: [UUID: SubtitleRendererObserver] = [:]
     }
     private static let epoch = OSAllocatedUnfairLock(initialState: Epoch())
     static let sessionDidChange = Notification.Name("vortx.legacyWatchSessionDidChange")
     static func session() -> UUID { epoch.withLock { $0.value } }
 
+    @MainActor
     static func invalidateSession() {
-        let publish = epoch.withLock { state in
+        let retired = epoch.withLock { state in
+            let original = state.value
             state.value = UUID()
+            let callbacks = detachSubtitleRenderers(&state, originalEpoch: original)
             if state.profileMutationDepth > 0 {
                 state.notifyWhenSettled = true
-                return false
+                return (callbacks, false)
             }
-            return true
+            return (callbacks, true)
         }
-        if publish { publishSessionChange() }
+        for retire in retired.0 { retire() }
+        if retired.1 { publishSessionChange() }
     }
 
     /// Every roster/selection assignment must bracket its entire publication and mutation.
     /// Only a material id/isOwner/usesOwnAccount change retires an existing playback witness.
     /// Equal/name/theme-only changes still block transient reentrant capture, without retiring it.
+    @MainActor
     static func beginProfileMutation(retire: Bool) {
-        epoch.withLock { state in
+        let callbacks = epoch.withLock { state -> [@Sendable () -> Void] in
             state.profileMutationDepth += 1
             if retire {
+                let original = state.value
                 state.value = UUID()
                 state.notifyWhenSettled = true
+                return detachSubtitleRenderers(&state, originalEpoch: original)
             }
+            return []
+        }
+        for callback in callbacks { callback() }
+    }
+
+    /// Installs only against the ORIGINAL settled epoch. A material assignment detaches and
+    /// invokes this exact callback after E unlock, before that assignment's caller can proceed.
+    static func observeSubtitleRendererRetirement(ifCurrent original: UUID,
+        retire: @escaping @Sendable () -> Void) -> SubtitleRendererEpochObservation? {
+        epoch.withLock { state in
+            guard state.value == original, state.profileMutationDepth == 0,
+                  state.subtitleRenderers.count < 16 else { return nil }
+            let id = UUID()
+            state.subtitleRenderers[id] = .init(originalEpoch: original, retire: retire)
+            return .init(id: id)
         }
     }
 
+    static func removeSubtitleRendererRetirement(_ observation: SubtitleRendererEpochObservation) {
+        epoch.withLock { _ = $0.subtitleRenderers.removeValue(forKey: observation.id) }
+    }
+
+    private static func detachSubtitleRenderers(_ state: inout Epoch,
+        originalEpoch: UUID) -> [@Sendable () -> Void] {
+        let retiring = state.subtitleRenderers.filter { $0.value.originalEpoch == originalEpoch }
+        for id in retiring.keys { state.subtitleRenderers.removeValue(forKey: id) }
+        return retiring.values.map(\.retire)
+    }
+
+    @MainActor
     static func endProfileMutation() {
         let settled = epoch.withLock { state -> (Bool, [CheckedContinuation<Void, Never>]) in
             precondition(state.profileMutationDepth > 0)

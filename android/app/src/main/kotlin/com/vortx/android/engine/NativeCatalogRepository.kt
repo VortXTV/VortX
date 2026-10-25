@@ -6,6 +6,7 @@ import com.vortx.android.model.*
 import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -63,6 +64,10 @@ internal class NativeCatalogRepository(
     /** Mirrors a deliberate save or removal to Trakt/SIMKL watchlists once the native checkpoint persisted it
      *  (Apple `ScrobbleCoordinator.addedToLibrary` / `removedFromLibrary`): added, type, id. */
     private val mirrorLibrary: (Boolean, MediaType, String) -> Unit = { _, _, _ -> },
+    /** Capture on the IO read lane; publication later enters only authenticated/lifecycle metadata
+     * admission, never sessionProvider/native serialization on Main. Null rejects a retired mount. */
+    private val captureAddonPublication: ((VortxNativeSession, Long) -> ((() -> Unit) -> Boolean)?)? = null,
+    private val addonVisibilityDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val sessionProvider: () -> VortxNativeSession,
 ) : CatalogRepository, AuthRepository {
     private data class CatalogSpec(val addon: VortxResourceAddon, val catalog: JSONObject) {
@@ -202,7 +207,7 @@ internal class NativeCatalogRepository(
     fun publishAuthentication(state: AuthState) { nativeAuth.value = state }
     private val unavailableOwner = ContinueWatchingOwner("native-unavailable", "native-unavailable", "native-unavailable", true, 0)
 
-    private suspend fun <T> attempt(action: suspend () -> T): Result<T> = withContext(Dispatchers.IO) {
+    private suspend fun <T> attempt(dispatcher: CoroutineDispatcher = Dispatchers.IO, action: suspend () -> T): Result<T> = withContext(dispatcher) {
         try { Result.success(action()) } catch (error: CancellationException) { throw error }
         catch (error: Exception) { Result.failure(error) }
         catch (_: LinkageError) { Result.failure(IllegalStateException("Native artifact is missing or incompatible")) }
@@ -859,12 +864,70 @@ internal class NativeCatalogRepository(
         })
     }
 
-    override suspend fun installedAddons() = attempt {
-        val session = session(); val read = session.read()
+    private fun installedAddonRows(read: VortxNativeRead): List<InstalledAddon> {
         val disabled = NativeAddonPreferences.disabled(read)
         val ctx = JSONObject().put("profile", JSONObject().put("addons", JSONArray(addonDescriptors(read))))
-        session.owned(read.owner) { EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = AddonOrder.normalize(it.transportUrl) in disabled) } }
+        return EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = AddonOrder.normalize(it.transportUrl) in disabled) }
     }
+    override suspend fun installedAddons() = attempt {
+        val session = session()
+        session.withCurrentRead { installedAddonRows(it) }
+    }
+    private class AddonManagementOwner(
+        val issuer: NativeCatalogRepository,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val update: Long,
+    )
+    /** Called only while the captured Session is held. A successful local mutation may issue its
+     * own successor here, but a caller cannot replace the original token with a fresh active owner. */
+    private fun addonManagementSnapshot(session: VortxNativeSession, read: VortxNativeRead): AddonManagementSnapshot {
+        val update = session.updates.value
+        val authority = AddonManagementOwner(this, session, read.owner, update)
+        val publication: (() -> Unit) -> Boolean = if (captureAddonPublication != null) {
+            captureAddonPublication.invoke(session, update) ?: { _ -> false }
+        } else { action ->
+            // Deterministic repository fixtures have no account host. Production always injects the
+            // same authenticated/mounted publication admission used by native profile metadata.
+            if (runCatching { sessionProvider() === session }.getOrDefault(false) && session.updates.value == update) {
+                action(); true
+            } else false
+        }
+        return AddonManagementSnapshot(installedAddonRows(read), authority, publication)
+    }
+    override suspend fun addonManagementSnapshot() = attempt {
+        val session = session()
+        session.withCurrentRead { read -> addonManagementSnapshot(session, read) }
+    }
+    override suspend fun setAddonVisibility(snapshot: AddonManagementSnapshot, addon: InstalledAddon, disabled: Boolean) =
+        attempt(addonVisibilityDispatcher) {
+            val authority = snapshot.visibilityOwner as? AddonManagementOwner
+            check(authority != null && authority.issuer === this) { "Add-on management owner expired" }
+            val session = authority.session
+            check(sessionProvider() === session) { "Native account changed" }
+            session.withCurrentRead { read ->
+                check(read.owner == authority.owner && session.updates.value == authority.update) { "Add-on management owner changed" }
+                var successor: AddonManagementSnapshot? = null
+                // Session -> original authenticated account -> original mounted lifecycle. Retirement
+                // cannot clear/replace the mount between row validation and the durable checkpoint.
+                // The existing descriptor helper also stays inside this original mounted admission.
+                check(snapshot.publishIfCurrent {
+                    check(snapshot.addons.singleOrNull { it.transportUrl == addon.transportUrl } == addon &&
+                        installedAddonRows(read).singleOrNull { it.transportUrl == addon.transportUrl } == addon) {
+                        "Add-on changed; reload installed add-ons"
+                    }
+                    check(!addon.isProtected || !disabled) { "Protected add-ons cannot be turned off" }
+                    applyAddonDisabled(session, read, addon.transportUrl, disabled)
+                    val acknowledged = session.read()
+                    check(acknowledged.owner.scope == authority.owner.scope && acknowledged.owner.profileID == authority.owner.profileID &&
+                        installedAddonRows(acknowledged).single { it.transportUrl == addon.transportUrl }.isDisabled == disabled) {
+                        "Add-on visibility was not acknowledged"
+                    }
+                    successor = addonManagementSnapshot(session, acknowledged)
+                }) { "Native add-on account changed before commit" }
+                checkNotNull(successor)
+            }
+        }
     override fun normalizedAddonUrl(raw: String): String? = runCatching {
         val uri = URI(raw.trim()); require(uri.scheme in setOf("https", "http") && !uri.host.isNullOrEmpty() && uri.userInfo == null && uri.fragment == null && uri.query == null)
         val path = uri.rawPath.trimEnd('/').let { if (it.endsWith("/manifest.json")) it else "$it/manifest.json" }
@@ -941,7 +1004,11 @@ internal class NativeCatalogRepository(
         }; Unit
     }
     override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean) = attempt {
-        val session = session(); val read = session.read(); val values = NativeAddonPreferences.disabled(read).toMutableSet()
+        val session = session()
+        session.withCurrentRead { read -> applyAddonDisabled(session, read, transportUrl, disabled) }
+    }
+    private fun applyAddonDisabled(session: VortxNativeSession, read: VortxNativeRead, transportUrl: String, disabled: Boolean) {
+        val values = NativeAddonPreferences.disabled(read).toMutableSet()
         if (disabled) values.add(AddonOrder.normalize(transportUrl)) else values.remove(AddonOrder.normalize(transportUrl))
         val host = read.state.getJSONObject("hostProfilePreferences")
         val raw = host.optJSONObject(read.owner.profileID) ?: NativeProfileAccess.projection(read).profiles.single { it.id == read.owner.profileID }.encode()
@@ -949,7 +1016,7 @@ internal class NativeCatalogRepository(
         prefs.put("disabledAddonURLsOverride", JSONArray(values.toList()))
         raw.put("disabledAddons", JSONArray(values.toList()))
         host.put(read.owner.profileID, raw).put("modifiedSeconds", maxOf(System.currentTimeMillis() / 1000.0, host.optDouble("modifiedSeconds", 0.0) + 0.001))
-        session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner, host); Unit
+        session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner, host)
     }
     override suspend fun applyAddonOrder(transportUrls: List<String>) = attempt {
         val session = session(); val read = session.read()

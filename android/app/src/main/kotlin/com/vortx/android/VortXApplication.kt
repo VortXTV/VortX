@@ -75,6 +75,13 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// Process-owned recovery work. A failed cleanup cannot cancel another startup child, and IO keeps
     /// encrypted preference reads, engine add-on inspection, and Worker revocation off the main thread.
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val playbackQueueDelegate = lazy {
+        com.vortx.android.player.queue.PlaybackQueueStore(this, applicationScope) {
+            catalogRepository.continueWatchingOwner()
+        }
+    }
+    internal val playbackQueue: com.vortx.android.player.queue.PlaybackQueueStore
+        get() = playbackQueueDelegate.value
 
     private val nativeAccounts: NativeAccountCoordinator by lazy { NativeAccountCoordinator(VortxJniBindings,
         VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
@@ -100,7 +107,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
             } }
             gate
-        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() },
+        } }, onAuthorityChanged = {
+            com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority()
+            if (playbackQueueDelegate.isInitialized()) playbackQueue.invalidate()
+        },
         onProgressMutation = { origin -> applicationScope.launch { syncManager?.onLocalNativeMutation(origin, progressOnly = true) }; Unit }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator = nativeAccounts
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess(
@@ -121,6 +131,15 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 manager::captureLocalLibraryMutationAdmission) }
         },
         withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) },
+        captureAddonPublication = { session, update ->
+            nativeAccounts.accountFor(session)?.let { account ->
+                { action: () -> Unit ->
+                    nativeAccounts.withProfileMutation(session, account) {
+                        if (session.updates.value == update) { action(); true } else false
+                    }
+                }
+            }
+        },
         mirrorLibrary = { added, type, id ->
             if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, type, id)
             else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, id, type)
@@ -270,7 +289,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// the whole process. Nullable + fail-soft: sync is OFF the critical launch path (VortX works fully
     /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
     var syncManager: VortXSyncManager? = null
-        private set
+        private set(value) {
+            if (field !== value) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
+        }
 
     /**
      * Wire the give-to-get MOAT groundwork, kept DORMANT exactly like Apple ships it gated. The Singularity

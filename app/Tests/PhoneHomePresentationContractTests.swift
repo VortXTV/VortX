@@ -65,7 +65,7 @@ expect(!home.contains("averageColor") && !home.contains("CGImage") && !home.cont
        "Home tint does not introduce repeated full-size artwork analysis")
 
 expect(library.contains("private var heroCandidateSignature: [String]")
-       && library.contains(".onChange(of: heroCandidateSignature)"),
+       && library.contains(".onValueChange(of: heroCandidateSignature)"),
        "Library reseeding observes its bounded candidate identity signature")
 expect(libraryHero.contains("return overlayHeroCandidates")
        && libraryHero.contains("(core.library?.catalog ?? []).prefix(5)")
@@ -74,12 +74,12 @@ expect(libraryHero.contains("return overlayHeroCandidates")
 expect(library.contains(".onReceive(profiles.$watch)")
        && library.contains("refreshOverlayHeroCandidates()"),
        "overlay hero candidates refresh from the published watch mutation signal")
-expect(!library.contains(".onChange(of: core.revision)"),
+expect(!library.contains(".onChange(of: core.revision)") && !library.contains(".onValueChange(of: core.revision)"),
        "Library no longer reseeds its full candidate pool for every core revision")
 expect(discover.contains("private var heroCandidateSignature: [String]")
-       && discover.contains(".onChange(of: heroCandidateSignature)"),
+       && discover.contains(".onValueChange(of: heroCandidateSignature)"),
        "Discover reseeding observes its bounded candidate identity signature")
-expect(!discover.contains(".onChange(of: core.revision)"),
+expect(!discover.contains(".onChange(of: core.revision)") && !discover.contains(".onValueChange(of: core.revision)"),
        "Discover no longer reseeds its full candidate pool for every core revision")
 
 print("PhoneHomePresentationContractTests: \(checks) checks passed")

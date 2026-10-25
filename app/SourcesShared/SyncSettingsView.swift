@@ -63,7 +63,7 @@ struct SyncSettingsView: View {
             syncing = false
             showConflict = false
         }
-        .onChange(of: sync.lastSyncAt) { stamp in
+        .onValueChange(of: sync.lastSyncAt) { stamp in
             // A new durable receipt can retire a previous manual-action failure;
             // an old successful stamp must not hide a newer failed attempt.
             if stamp != nil, sync.synchronizationIsComplete { syncNote = nil }

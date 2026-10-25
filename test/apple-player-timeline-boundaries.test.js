@@ -116,7 +116,8 @@ test("executable probe extracts production factories and editor bodies with actu
     const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-timeline.sh"), "utf8");
     for (const productionInput of ["private var skipEditorTimelineValues:", "private func skipDBEditBar(",
         "private var touchOptionsActions:", "app/SourcesShared/SeekBarStyle.swift", "app/SourcesShared/SkipEditPolicy.swift",
-        "app/SourcesShared/GlassStyle.swift", "app/SourcesShared/Theme.swift", "app/SourcesShared/ThemeManager.swift"]) {
+        "app/SourcesShared/GlassStyle.swift", "app/SourcesShared/Theme.swift", "app/SourcesShared/ThemeManager.swift",
+        "app/SourcesShared/ValueChangeObservation.swift"]) {
         assert(runner.includes(productionInput), `runtime probe must compile ${productionInput}`);
     }
 });

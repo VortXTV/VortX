@@ -121,6 +121,22 @@ private final class CaptureDelivery: @unchecked Sendable {
     }
 }
 
+#if os(iOS) || os(macOS)
+/// Transfers only a weak layer reference to the main actor; it never exposes the layer to the
+/// submitting VO thread. The reference is assigned once, and all layer access stays on MainActor.
+private final class MetalLayerEDRUpdate: @unchecked Sendable {
+    private weak var layer: MetalLayer?
+
+    init(layer: MetalLayer) {
+        self.layer = layer
+    }
+
+    @MainActor func apply(_ enabled: Bool) {
+        layer?.wantsExtendedDynamicRangeContent = enabled
+    }
+}
+#endif
+
 class MetalLayer: CAMetalLayer {
 
     #if os(tvOS)
@@ -402,8 +418,9 @@ class MetalLayer: CAMetalLayer {
                 // even Quit dead). Hop to main ASYNC so the vo thread returns immediately and releases
                 // the layer lock; EDR activating one runloop later is imperceptible. Re-entering the
                 // setter on the main thread takes the `isMainThread` branch above (no recursion).
-                DispatchQueue.main.async { [weak self] in
-                    self?.wantsExtendedDynamicRangeContent = newValue
+                let update = MetalLayerEDRUpdate(layer: self)
+                DispatchQueue.main.async {
+                    update.apply(newValue)
                 }
             }
         }

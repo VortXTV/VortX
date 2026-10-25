@@ -22,7 +22,7 @@ class TvDetailSourcesActionContractTest {
         val sourceList = readSourceList()
 
         assertTrue(detail.contains("sourceAudioLanguageHint"))
-        assertTrue(detail.contains("onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint"))
+        assertTrue(detail.contains("onAudioLanguageHintChange = { language -> if (onManualAction()) viewModel.setSourceAudioLanguageHint(language) }"))
         assertTrue(sourceList.contains("label = audioLanguageHint"))
         assertTrue(sourceList.contains("onAudioLanguageHintChange(null)"))
         assertTrue(sourceList.contains("detailAudioLanguageOptions(groups)"))

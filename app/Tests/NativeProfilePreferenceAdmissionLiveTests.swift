@@ -63,21 +63,23 @@ private final class PreferenceCheckpointGate: VortxCheckpointStore, @unchecked S
                                       hostEdits: [.init(profileID: owner, fields: ["playback": localValue])])
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: session.resourceRegistry(), changed: { _ in })
         let epoch = facade.accountGeneration
-        let credential = CredentialScopeRegistry.Capture(generation: 1)
+        let credential = CredentialScopeRegistry.shared.capture()
         let authorityCore = CoreBridge(facade, credential)
         let installAuthority = authorityCore.captureAuthority()
         try check(installAuthority(), "exact Bridge authority did not accept its installation")
         authorityCore.rotateInstallation()
         try check(!installAuthority(), "exact Bridge authority accepted a superseding installation")
         let credentialAuthority = authorityCore.captureAuthority()
-        CredentialScopeRegistry.shared.rotate()
+        guard let freshCapture = CredentialScopeRegistry.shared.tryBind(.signedOutDevice) else {
+            throw Failure.assertion("actual in-memory credential boundary refused its synthetic generation advance")
+        }
         try check(!credentialAuthority(), "exact Bridge authority accepted stale credential generation")
-        let newCore = CoreBridge(facade, .init(generation: 2))
+        let newCore = CoreBridge(facade, freshCapture)
         let facadeAuthority = newCore.captureAuthority()
         try check(facadeAuthority(), "fresh synthetic authority did not accept")
         newCore.retireFacade()
         try check(!facadeAuthority(), "exact Bridge authority accepted retired facade")
-        print("Exact Bridge admission authority strict Swift6 proof: synthetic credential/install/facade fences; no actual credential access")
+        print("Exact Bridge admission authority strict Swift6 proof: actual in-memory credential registry and synthetic install/facade fences; no account or Keychain access")
         let originalHost = try host(facade)
         let savedRegister = originalHost["profiles"]?[owner]?["fields"]?["playback"]
         try check(savedRegister != nil, "missing saved preference revision")

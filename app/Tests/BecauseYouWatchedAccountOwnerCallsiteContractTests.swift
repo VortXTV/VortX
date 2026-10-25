@@ -49,7 +49,10 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
                   "\(name) Home uses only the settled principal and authority generation")
             check(!source.contains("principal: binding?.uid ?? core.currentUID()"),
                   "\(name) Home never falls back to the resident engine UID for recommendation ownership")
-            check(source.contains(".onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }"),
+            let ownerRefresh = name == "tvOS"
+                ? ".onChange(of: becauseYouWatchedOwnerKey) { refreshTopPicks() }"
+                : ".onValueChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }"
+            check(source.contains(ownerRefresh),
                   "\(name) Home refreshes when the settled owner key changes")
             check(source.contains(".onReceive(account.$email) { _ in refreshTopPicks() }"),
                   "\(name) Home observes the published same-slot account event")

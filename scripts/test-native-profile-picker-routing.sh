@@ -34,7 +34,7 @@ methods = '    private func pick(_ profile: UserProfile) {' + between(picker,
 preparing = '    private var profilesArePreparing: Bool {' + between(picker,
   '    private var profilesArePreparing: Bool {', "\n    }\n") + "\n    }"
 restore_event = between(picker,
-  '.onChange(of: nativeSync.accountRestoreState) { state in', "\n        }\n")
+  '.onValueChange(of: nativeSync.accountRestoreState) { state in', "\n        }\n")
 credential_event = between(picker,
   '.onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in', "\n        }\n")
 disappear_event = between(picker, '.onDisappear {', "\n        }\n")
@@ -43,7 +43,7 @@ add_action = between(picker,
 edit_start = picker.index('ProfilePickerActionTile(title: isEditing ? "Done" : "Edit"') or raise 'Missing Edit'
 edit_action = between(picker[edit_start..-1], 'nameTextSize: nameTextSize) {', "\n            }\n")
 recovery_action = between(picker, 'Button("Account settings") {', ' }')
-signin_event = between(picker, '.onChange(of: signInNeeded) { presented in', " }\n")
+signin_event = between(picker, '.onValueChange(of: signInNeeded) { presented in', " }\n")
 
 replacements = {
   '/* ACTUAL_METHODS */' => methods,

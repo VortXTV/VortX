@@ -5,9 +5,7 @@ import Foundation
 final class UsenetAdmissionEnvironment: @unchecked Sendable {
     static let shared = UsenetAdmissionEnvironment()
     struct State {
-        var nativeSelected = true
         var nativeSupported = true
-        var legacyEndpointAvailable = true
         var savedProvider = false
         var endpoint: UsenetNodeClient.Endpoint?
     }
@@ -31,15 +29,6 @@ enum VortxNativeServerFlag {
     static var isSupported: Bool { UsenetAdmissionEnvironment.shared.state.nativeSupported }
 }
 enum StremioServer {
-    static var nativeTransportSelected: Bool { UsenetAdmissionEnvironment.shared.state.nativeSelected }
-    static var usenetNodeBase: String? {
-        let state = UsenetAdmissionEnvironment.shared.state
-        #if VORTX_NO_EMBEDDED_SERVER
-        return nil
-        #else
-        return !state.nativeSelected && state.legacyEndpointAvailable ? "http://127.0.0.1:11470" : nil
-        #endif
-    }
     static var usenetEndpoint: UsenetNodeClient.Endpoint? { UsenetAdmissionEnvironment.shared.state.endpoint }
     static let trailerResolverBase = "https://trailer.invalid"
     static let base = "http://127.0.0.1:11470"
@@ -48,6 +37,11 @@ enum UsenetProviderStore {
     static var isConfigured: Bool { UsenetAdmissionEnvironment.shared.readSavedProvider() }
 }
 enum PlaybackSettings { static let torrentsDisabled = false }
+// Environment values for the actual extracted iOSEpisodeStreams admission methods. These supply no
+// provider request/response or fake admission policy; the methods and CoreModels policies stay production.
+struct CoreVideo { let season: Int?; let episode: Int? }
+typealias DebridEpisode = UsenetNodeClient.Selection.Episode
+struct WatchAdmissionDebridKeys { let hasAnyKey: Bool }
 struct CommunityStreamGateway: Sendable {
     static let shared = CommunityStreamGateway()
     func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { nil }
@@ -119,12 +113,16 @@ extension StreamRanking {
         check("\(label) validated add-on eligibility does not read saved secrets",
               UsenetAdmissionEnvironment.shared.providerReads == readsBeforeAddon)
         assertAdmission("\(label) no credentials", stream: saved, expected: false)
+        check("\(label) a torrent key cannot unlock an unavailable NZB route",
+              watchDisabled(loading: false, preparing: false, best: saved, ownTorrentKeyConfigured: true))
 
         environment.nativeSupported = false
         environment.savedProvider = true
+        // A foreign or stale listener is not capability to run this build's native engine.
+        environment.endpoint = .init(base: "http://127.0.0.1:11470")
         UsenetAdmissionEnvironment.shared.set(environment)
         let readsBeforeUnavailable = UsenetAdmissionEnvironment.shared.providerReads
-        assertAdmission("\(label) unavailable native cannot borrow legacy listener", stream: saved, expected: false)
+        assertAdmission("\(label) unavailable native cannot borrow an unrelated listener", stream: saved, expected: false)
         check("\(label) unavailable local runtime does not read saved secrets during ranking",
               UsenetAdmissionEnvironment.shared.providerReads == readsBeforeUnavailable)
         DebridPlaybackAvailability.shared.publish(torBoxConfigured: true)
@@ -133,25 +131,37 @@ extension StreamRanking {
         check("\(label) remote eligibility retains short-circuit secret-read behavior",
               UsenetAdmissionEnvironment.shared.providerReads == readsBeforeRemote)
         DebridPlaybackAvailability.shared.publish(torBoxConfigured: false)
-        environment.nativeSelected = false
+        assertAdmission("\(label) unrelated listener cannot admit add-on NNTP without native capability", stream: addon, expected: false)
+        environment.endpoint = nil
         UsenetAdmissionEnvironment.shared.set(environment)
-        assertAdmission("\(label) legacy endpoint retains saved-provider behavior", stream: saved, expected: localExpected)
-        environment.legacyEndpointAvailable = false
-        UsenetAdmissionEnvironment.shared.set(environment)
-        assertAdmission("\(label) missing legacy endpoint stays unavailable", stream: addon, expected: false)
+        assertAdmission("\(label) absent native capability and endpoint stay unavailable", stream: addon, expected: false)
 
         let direct = try stream(["url": "https://fixture.invalid/video.mp4"])
         assertAdmission("\(label) direct playback unchanged", stream: direct, expected: true)
         let torrent = try stream(["infoHash": String(repeating: "a", count: 40), "fileIdx": 2])
         check("\(label) explicit torrent file unchanged", torrent.playableURL(isEpisode: true)?.lastPathComponent == "2")
+        let hashOnlyEpisode = try stream(["infoHash": String(repeating: "b", count: 40)])
+        check("\(label) hash-only episode keeps its raw media URL closed",
+              hashOnlyEpisode.playableURL(isEpisode: true) == nil)
+        check("\(label) actual Watch methods admit an own-provider semantic episode attempt",
+              !watchDisabled(loading: false, preparing: false, best: hashOnlyEpisode,
+                             ownTorrentKeyConfigured: true, hasSemanticEpisode: true))
+        check("\(label) own-provider Watch attempt still needs a semantic episode",
+              watchDisabled(loading: false, preparing: false, best: hashOnlyEpisode,
+                            ownTorrentKeyConfigured: true, hasSemanticEpisode: false))
+        check("\(label) hash-only Watch without an own key remains disabled",
+              watchDisabled(loading: false, preparing: false, best: hashOnlyEpisode))
+        check("\(label) resolver-only Watch retains loading and preparation gates",
+              watchDisabled(loading: true, preparing: false, best: hashOnlyEpisode, ownTorrentKeyConfigured: true)
+                && watchDisabled(loading: false, preparing: true, best: hashOnlyEpisode, ownTorrentKeyConfigured: true))
         check("\(label) Watch loading/preparing gates remain intact",
               watchDisabled(loading: true, preparing: false, best: direct)
                 && watchDisabled(loading: false, preparing: true, best: direct))
 
         // Capability is not readiness: execute the actual bounded resolver with no endpoint published.
-        environment.nativeSelected = true
         environment.nativeSupported = true
         environment.savedProvider = true
+        environment.endpoint = nil
         UsenetAdmissionEnvironment.shared.set(environment)
         let started = ProcessInfo.processInfo.systemUptime
         do {

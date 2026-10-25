@@ -22,6 +22,7 @@ struct BackupExportView: View {
     @State private var qrImage: CGImage?
     @State private var status: Status = .starting
     @State private var poller: Task<Void, Never>?
+    @State private var pollGeneration = UUID()
     @State private var showConflict = false
 
     private enum Status: Equatable { case starting, waiting, saving, backedUp, pending, failed }
@@ -88,7 +89,7 @@ struct BackupExportView: View {
         .padding(Theme.Space.xl)
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { start() }
-        .onDisappear { poller?.cancel() }
+        .onDisappear { stop() }
         .alert("This account already has data", isPresented: $showConflict) {
             Button("Merge both (keep all profiles)") { resolve { await $0.mergeBoth() ? .completed : .failed } }
             Button("Use account's data") { resolve { await $0.useAccountData() } }
@@ -98,24 +99,39 @@ struct BackupExportView: View {
     }
 
     private func start() {
-        poller?.cancel()
+        stop()
+        let generation = pollGeneration
         status = .starting
         poller = Task { @MainActor in
-            guard let s = await VortXSyncManager.shared.qrStart() else { status = .failed; return }
+            let result = await VortXSyncManager.shared.qrStart()
+            guard !Task.isCancelled, pollGeneration == generation else {
+                if let result { VortXSyncManager.shared.qrCancel(result) }
+                return
+            }
+            guard let s = result else { status = .failed; return }
             session = s
             // The QR opens vortx.tv/approve carrying the code plus this TV's ephemeral public key, so the
             // approving device can wrap the data key to us. Both values are URL-safe (base64url / A-Z2-9).
             qrImage = QRCodeImage.make("\(Self.approveBase)?c=\(s.code)&k=\(s.devicePublicKey)")
             status = .waiting
-            await pollLoop(s)
+            await pollLoop(s, generation: generation)
         }
     }
 
-    private func pollLoop(_ s: VortXSyncManager.QrJoinSession) async {
-        while !Task.isCancelled {
+    private func stop() {
+        pollGeneration = UUID()
+        poller?.cancel(); poller = nil
+        if let session { VortXSyncManager.shared.qrCancel(session) }
+        session = nil; qrImage = nil
+    }
+
+    private func pollLoop(_ s: VortXSyncManager.QrJoinSession, generation: UUID) async {
+        while !Task.isCancelled, pollGeneration == generation {
             try? await Task.sleep(nanoseconds: Self.pollInterval)
-            if Task.isCancelled { return }
-            switch await VortXSyncManager.shared.qrPoll(s) {
+            if Task.isCancelled || pollGeneration != generation { return }
+            let result = await VortXSyncManager.shared.qrPoll(s)
+            if Task.isCancelled || pollGeneration != generation { return }
+            switch result {
             case .pending, .transportError:
                 continue                             // reachable-but-idle, or a retriable relay blip; keep polling
             case .expired:

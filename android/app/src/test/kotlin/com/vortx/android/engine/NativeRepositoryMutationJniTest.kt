@@ -5,6 +5,10 @@ import com.vortx.android.model.MetaItem
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -44,6 +48,8 @@ class NativeRepositoryMutationJniTest {
         var release: CountDownLatch? = null
         var delayedId: String? = null
         var calls = 0
+        private val requestedAddonIds = mutableMapOf<String, MutableSet<String>>()
+        fun addonIdsFor(id: String): Set<String> = synchronized(this) { requestedAddonIds[id]?.toSet().orEmpty() }
         override fun makeCancellation() = object : VortxResourceCancellation { override fun cancel() {}; override fun close() {} }
         override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
             val input = JSONObject(requestJson); val request = input.getJSONObject("request")
@@ -51,6 +57,10 @@ class NativeRepositoryMutationJniTest {
             if (request.getString("id") == delayedId) { entered!!.countDown(); check(release!!.await(10, TimeUnit.SECONDS)) }
             val content = payload(request)
             val addons = input.getJSONArray("addons")
+            synchronized(this) {
+                requestedAddonIds.getOrPut(request.getString("id")) { linkedSetOf() }
+                    .addAll((0 until addons.length()).map { addons.getJSONObject(it).getString("id") })
+            }
             return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId")).put("generation", input.getLong("generation"))
                 .put("request", request).put("cancelled", false).put("groups", JSONArray((0 until addons.length()).map {
                     JSONObject().put("addonId", addons.getJSONObject(it).getString("id")).put("status", "ready").put("content", content)
@@ -205,6 +215,132 @@ class NativeRepositoryMutationJniTest {
             transport.release!!.countDown()
             assertTrue(pending.await().isFailure); assertEquals(removedState, store.value)
             assertTrue(repository.installedAddons().getOrThrow().none { it.transportUrl.contains("new.invalid") })
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `queued visibility action rejects switched and ABA profile before any mutation`() = runBlocking {
+        for (returnToOriginal in listOf(false, true)) {
+            val store = Store(); val transport = Transport()
+            open(store, transport).use { session ->
+                install(session)
+                session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}""")))
+                val scheduler = TestCoroutineScheduler()
+                val repository = NativeCatalogRepository(addonVisibilityDispatcher = StandardTestDispatcher(scheduler)) { session }
+                val original = repository.addonManagementSnapshot().getOrThrow()
+                val row = original.addons.single()
+                // UNDISPATCHED reaches the actual repository's dispatcher hop, then leaves the native
+                // action queued. A fake repository cannot prove the original-owner check below.
+                val pending = async(start = CoroutineStart.UNDISPATCHED) { repository.setAddonVisibility(original, row, true) }
+                assertFalse(pending.isCompleted)
+                session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+                if (returnToOriginal) session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"owner"}""")))
+                val before = store.value; val commits = store.commits
+                scheduler.runCurrent()
+                assertTrue(pending.await().isFailure)
+                assertEquals(before, store.value); assertEquals(commits, store.commits)
+                assertFalse(original.publishIfCurrent { fail("Old profile publication accepted") })
+                val profiles = session.read().state.getJSONObject("roster").getJSONObject("profiles")
+                for (id in listOf("owner", "guest")) assertEquals(0, profiles.getJSONObject(id).getJSONObject("settings").getJSONArray("disabledAddons").length())
+            }
+        }
+    }
+
+    @Test fun `visibility acknowledges full installed list and retained row can turn back on`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session, "https://first.invalid/manifest.json"); install(session); install(session, "https://last.invalid/manifest.json")
+            val repository = NativeCatalogRepository { session }
+            val original = repository.addonManagementSnapshot().getOrThrow()
+            val row = original.addons.single { it.transportUrl.contains("old.invalid") }
+            val commits = store.commits
+            val hidden = repository.setAddonVisibility(original, row, true).getOrThrow()
+            assertEquals(commits + 1, store.commits)
+            assertEquals(original.addons.map { it.transportUrl }, hidden.addons.map { it.transportUrl })
+            assertEquals(original.addons.map { it.rawDescriptorJson }, hidden.addons.map { it.rawDescriptorJson })
+            assertTrue(hidden.addons.single { it.transportUrl == row.transportUrl }.isDisabled)
+            assertEquals(original.addons.filterNot { it.transportUrl == row.transportUrl }, hidden.addons.filterNot { it.transportUrl == row.transportUrl })
+            assertFalse(original.publishIfCurrent { fail("Pre-mutation list accepted") })
+            assertTrue(hidden.publishIfCurrent {})
+            // Empty ready metadata cannot win meta().first() and cancel unobserved peers. Wait for
+            // terminal failure so every eligible real provider leg is recorded, including batches >2.
+            transport.payload = { JSONObject().put("meta", JSONObject.NULL) }
+            assertTrue(repository.meta(MediaType.SERIES, "visibility-disabled").isFailure)
+            assertEquals(original.addons.filterNot { it.transportUrl == row.transportUrl }.map { it.transportUrl }.toSet(), transport.addonIdsFor("visibility-disabled"))
+            val before = store.value
+            assertTrue(repository.setAddonVisibility(original, row, false).isFailure)
+            assertEquals(before, store.value)
+            val restored = repository.setAddonVisibility(hidden, hidden.addons.single { it.transportUrl == row.transportUrl }, false).getOrThrow()
+            assertEquals(original.addons, restored.addons)
+            assertTrue(restored.publishIfCurrent {})
+            assertTrue(repository.meta(MediaType.SERIES, "visibility-restored").isFailure)
+            assertEquals(original.addons.map { it.transportUrl }.toSet(), transport.addonIdsFor("visibility-restored"))
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun `queued visibility cannot use a replaced same-scope session or a copied stale row`() = runBlocking {
+        val firstStore = Store(); val firstTransport = Transport()
+        open(firstStore, firstTransport).use { originalSession ->
+            install(originalSession)
+            val secondStore = Store().also { it.value = firstStore.value }; val secondTransport = Transport()
+            open(secondStore, secondTransport).use { replacement ->
+                var mounted = originalSession
+                val scheduler = TestCoroutineScheduler()
+                val repository = NativeCatalogRepository(addonVisibilityDispatcher = StandardTestDispatcher(scheduler)) { mounted }
+                val snapshot = repository.addonManagementSnapshot().getOrThrow(); val row = snapshot.addons.single()
+                val pending = async(start = CoroutineStart.UNDISPATCHED) { repository.setAddonVisibility(snapshot, row, true) }
+                mounted = replacement
+                val beforeFirst = firstStore.value; val beforeSecond = secondStore.value
+                scheduler.runCurrent()
+                assertTrue(pending.await().isFailure)
+                assertEquals(beforeFirst, firstStore.value); assertEquals(beforeSecond, secondStore.value)
+                assertFalse(snapshot.publishIfCurrent { fail("Replaced Session publication accepted") })
+                val fresh = repository.addonManagementSnapshot().getOrThrow()
+                val invalid = async(start = CoroutineStart.UNDISPATCHED) {
+                    repository.setAddonVisibility(fresh, fresh.addons.single().copy(rawDescriptorJson = "{}"), true)
+                }
+                scheduler.runCurrent()
+                assertTrue(invalid.await().isFailure)
+                assertEquals(beforeSecond, secondStore.value)
+            }
+        }
+    }
+
+    @Test fun `mount retirement after provider lookup but before admission never writes either checkpoint`() = runBlocking {
+        val originalStore = Store(); val originalTransport = Transport()
+        open(originalStore, originalTransport).use { original ->
+            install(original)
+            val replacementStore = Store().also { it.value = originalStore.value }
+            open(replacementStore, Transport()).use { replacement ->
+                val mountLock = Any()
+                var mounted = original
+                var retireAfterLookup = false
+                var initialLookupPassed = false
+                var retiredAdmissionRejected = false
+                val repository = NativeCatalogRepository(captureAddonPublication = { captured, stamp ->
+                    { action -> synchronized(mountLock) {
+                        if (mounted === captured && captured.updates.value == stamp) { action(); true }
+                        else { retiredAdmissionRejected = true; false }
+                    } }
+                }) {
+                    synchronized(mountLock) {
+                        val result = mounted
+                        if (retireAfterLookup) {
+                            retireAfterLookup = false; initialLookupPassed = true; mounted = replacement
+                        }
+                        result
+                    }
+                }
+                val snapshot = repository.addonManagementSnapshot().getOrThrow(); val row = snapshot.addons.single()
+                val first = originalStore.value; val second = replacementStore.value
+                val commits = originalStore.commits to replacementStore.commits
+                retireAfterLookup = true
+                assertTrue(repository.setAddonVisibility(snapshot, row, true).isFailure)
+                assertTrue(initialLookupPassed); assertTrue(retiredAdmissionRejected)
+                assertEquals(first, originalStore.value); assertEquals(second, replacementStore.value)
+                assertEquals(commits, originalStore.commits to replacementStore.commits)
+            }
         }
     }
 

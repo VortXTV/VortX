@@ -44,7 +44,7 @@ enum DiscoverList: String, CaseIterable, Hashable {
     }
     /// Warm-neutral surface gradient: the four cards are distinguished by their symbol + an accent STEP, not
     /// by hue, so the hub reads as VortX's own dark-ember identity rather than the rainbow-card reference.
-    var gradient: [Color] { [Theme.Palette.surface2, Theme.Palette.surface1] }
+    @MainActor var gradient: [Color] { [Theme.Palette.surface2, Theme.Palette.surface1] }
     /// Accent intensity that separates the four cards without colour (trending strongest -> upcoming softest).
     var accentOpacity: Double {
         switch self {
@@ -85,7 +85,7 @@ struct GenreSpec: Hashable {
         self.movieGenreID = movie; self.tvGenreID = tv; self.keyword = keyword; self.originLang = lang
     }
 
-    var tint: Color { Theme.Palette.accent }   // ember accent, not a per-genre rainbow hue (VortX identity)
+    @MainActor var tint: Color { Theme.Palette.accent }   // ember accent, not a per-genre rainbow hue (VortX identity)
 }
 
 /// A browse-by-decade tile: a release-year window. Kept a plain value (like GenreSpec) so `HubTarget` stays
@@ -95,7 +95,7 @@ struct DecadeSpec: Hashable {
     let symbol: String
     let startYear: Int
     let endYear: Int
-    var tint: Color { Theme.Palette.accent }
+    @MainActor var tint: Color { Theme.Palette.accent }
 }
 
 // MARK: - Hub target (what a tile points at)

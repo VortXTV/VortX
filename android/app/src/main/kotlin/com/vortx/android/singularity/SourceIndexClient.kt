@@ -22,7 +22,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -304,47 +304,98 @@ object SourceIndexClient {
         moat: String?,
     ): List<PooledSource> {
         return withContext(Dispatchers.IO) {
-            var conn: HttpURLConnection? = null
+            val collected = ArrayList<PooledSource>()
+            val identities = HashSet<String>()
+            val cursors = HashSet<String>()
+            var totalBytes = 0
+            val traversalStarted = System.nanoTime()
+            var pageUrl = url
+            var requiresVersionedPage = false
+            var cursor: String?
             try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = HTTP_TIMEOUT_MS
-                    readTimeout = HTTP_TIMEOUT_MS
-                    useCaches = false
-                    instanceFollowRedirects = false
-                    setRequestProperty("accept", "application/json")
-                }
-                VortXEdgeAuth.sign(conn)
-                // Moat token: the SERVE gate is login-only AND moat-token-gated. Stamp X-VX-Moat after the edge
-                // signature when a provider is wired. Fail-soft: no token -> no header -> the worker returns
-                // empty, the correct signed-out / cold-start SERVE result.
-                if (moat != null) conn.setRequestProperty(MOAT_HEADER, moat)
-                val code = conn.responseCode
-                if (code !in 200..299) {
-                    Log.d(TAG, "fetchPooled HTTP non-2xx contentId=$contentId status=$code -> []")
-                    return@withContext emptyList()
-                }
-                // This reader remains unreachable while isEnabled is the compile-time false gate. Before any
-                // re-enable, replace it with the separately reviewed bounded streamed transport (surface five).
-                val text = conn.inputStream.bufferedReader().use(BufferedReader::readText)
-                val sources = parsePooled(text)
-                Log.d(TAG, "fetchPooled HTTP OK contentId=$contentId status=$code corroboratedSources=${sources.size}")
-                sources
-            } catch (io: IOException) {
-                Log.d(TAG, "fetchPooled HTTP ERROR contentId=$contentId error=${io.message} -> []")
+                do {
+                    if (System.nanoTime() - traversalStarted >= 30_000_000_000L) throw IOException("source traversal timed out")
+                    if (!isActive || !isEnabled || !serveEnabled) return@withContext emptyList()
+                    val bytes = fetchPooledPage(pageUrl, moat, traversalStarted)
+                    if (System.nanoTime() - traversalStarted >= 30_000_000_000L) throw IOException("source traversal timed out")
+                    if (bytes.size > MAX_ASSEMBLED_BYTES - totalBytes) throw IOException("source budget exceeded")
+                    totalBytes += bytes.size
+                    val body = bytes.toString(Charsets.UTF_8)
+                    val root = JSONObject(body)
+                    val page = parsePooled(body)
+                    val paged = root.has("paginationVersion")
+                    if (paged) {
+                        if (root.opt("paginationVersion") != 1 || root.opt("sources") !is JSONArray
+                            || root.getJSONArray("sources").length() > MAX_SERVE_RESULTS
+                            || root.opt("hasMore") !is Boolean) throw IOException("invalid source page")
+                        cursor = when (val next = root.opt("nextCursor")) {
+                            null, JSONObject.NULL -> null
+                            is String -> next
+                            else -> throw IOException("invalid continuation")
+                        }
+                        if (root.getBoolean("hasMore") != (cursor != null)) throw IOException("invalid continuation")
+                        requiresVersionedPage = true
+                    } else {
+                        if (requiresVersionedPage || root.has("nextCursor") || root.has("hasMore")) throw IOException("unversioned continuation")
+                        cursor = null
+                    }
+                    for (source in page) {
+                        val key = source.kind?.let { kind -> source.id?.let { id -> "$kind\n$id" } }
+                        if (key == null || identities.add(key)) collected.add(source)
+                    }
+                    if (cursor != null) {
+                        if (!validServeCursor(cursor) || !cursors.add(cursor)) throw IOException("invalid continuation")
+                        pageUrl = serveUrl(contentId, cursor) ?: throw IOException("invalid source identity")
+                    }
+                } while (cursor != null)
+                if (!isActive || !isEnabled || !serveEnabled) return@withContext emptyList()
+                if (System.nanoTime() - traversalStarted >= 30_000_000_000L) throw IOException("source traversal timed out")
+                Log.d(TAG, "fetchPooled HTTP OK corroboratedSources=${collected.size}")
+                collected
+            } catch (_: IOException) {
+                Log.d(TAG, "fetchPooled HTTP ERROR -> []")
                 emptyList()
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 emptyList()
-            } finally {
-                conn?.disconnect()
             }
+        }
+    }
+
+    /** Bounded same-origin pages only; never follow a server-provided URL or any redirect. */
+    private fun fetchPooledPage(url: String, moat: String?, traversalStarted: Long): ByteArray {
+        val conn = (URL(url).openConnection() as HttpURLConnection)
+        try {
+            conn.requestMethod = "GET"
+            conn.connectTimeout = HTTP_TIMEOUT_MS
+            conn.readTimeout = HTTP_TIMEOUT_MS
+            conn.useCaches = false
+            conn.instanceFollowRedirects = false
+            conn.setRequestProperty("accept", "application/json")
+            VortXEdgeAuth.sign(conn)
+            if (moat != null) conn.setRequestProperty(MOAT_HEADER, moat)
+            if (conn.responseCode !in 200..299) throw IOException("source HTTP error")
+            if (conn.contentLengthLong > MAX_PAGE_BYTES) throw IOException("source page exceeds budget")
+            return conn.inputStream.use { input ->
+                val result = ByteArrayOutputStream()
+                val chunk = ByteArray(8 * 1024)
+                while (true) {
+                    if (System.nanoTime() - traversalStarted >= 30_000_000_000L) throw IOException("source traversal timed out")
+                    val count = input.read(chunk)
+                    if (count < 0) break
+                    if (count > MAX_PAGE_BYTES - result.size()) throw IOException("source page exceeds budget")
+                    result.write(chunk, 0, count)
+                }
+                result.toByteArray()
+            }
+        } finally {
+            conn.disconnect()
         }
     }
 
     internal fun parsePooled(body: String): List<PooledSource> {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         val arr = root.optJSONArray("sources") ?: return emptyList()
-        val acceptedCount = minOf(arr.length(), MAX_SERVE_RESULTS)
+        val acceptedCount = arr.length()
         val out = ArrayList<PooledSource>(acceptedCount)
         for (i in 0 until acceptedCount) {
             val o = arr.optJSONObject(i) ?: continue
@@ -365,7 +416,7 @@ object SourceIndexClient {
     /// Turn canonical pooled torrent infohashes into playable [StreamSource]s. Every non-torrent or malformed
     /// row is dropped before it can enter the user's debrid pipeline. Mirrors Apple `streams(from:)`.
     fun streams(pooled: List<PooledSource>): List<StreamSource> {
-        val built = pooled.take(MAX_SERVE_RESULTS).mapNotNull { src ->
+        val built = pooled.mapNotNull { src ->
             val kind = src.kind ?: return@mapNotNull null
             val id = src.id
             if (id.isNullOrEmpty()) return@mapNotNull null
@@ -427,8 +478,12 @@ object SourceIndexClient {
     private const val MOAT_HEADER = "X-VX-Moat"
     private const val MAX_SAFE_SIZE_BYTES = 9_007_199_254_740_991L
     private const val MAX_SEEDERS = 1_000_000
-    internal const val MAX_SERVE_RESULTS = 100
-    private const val MIN_CORROBORATION = 2
+    internal const val MAX_SERVE_RESULTS = 100 // per page; never a total-result cap
+    private const val MAX_PAGE_BYTES = 64 * 1024
+    private const val MAX_ASSEMBLED_BYTES = 8 * 1024 * 1024
+    private const val MIN_CORROBORATION = 1 // torrent worker floor; do not re-tighten it on the client
+    internal fun validServeCursor(raw: String): Boolean =
+        raw.isNotEmpty() && raw.length <= 512 && raw.all { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }
 
     /// Known short debrid / usenet provider tags the descriptor's optional provider FACT may carry (SRC-10).
     /// Anything outside this set is dropped at the upload boundary so no arbitrary string reaches the wire.
@@ -439,9 +494,11 @@ object SourceIndexClient {
 
     /// Pure SERVE request builder. Keeping validation here makes the no-network-on-invalid-id guarantee
     /// deterministic in local tests and prevents future callers from interpolating an unchecked id.
-    internal fun serveUrl(contentId: String): String? {
+    internal fun serveUrl(contentId: String, cursor: String? = null): String? {
         val canonical = canonicalContentId(contentId) ?: return null
-        return "$BASE_URL/sources?content_id=${enc(canonical)}&kind=${Kind.TORRENT.wire}"
+        if (cursor != null && !validServeCursor(cursor)) return null
+        val suffix = cursor?.let { "&cursor=${enc(it)}" } ?: ""
+        return "$BASE_URL/sources?content_id=${enc(canonical)}&kind=${Kind.TORRENT.wire}&paged=1$suffix"
     }
 
     private fun normalizeInfoHash(raw: String?): String? {

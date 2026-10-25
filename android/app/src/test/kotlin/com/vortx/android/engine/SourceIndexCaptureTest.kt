@@ -124,20 +124,20 @@ class SourceIndexCaptureTest {
 
         val streams = SourceIndexClient.streams(pooled)
 
-        assertEquals(1, streams.size)
-        assertEquals(VALID_HASH, streams.single().infoHash)
-        assertTrue(streams.single().isTorrent)
-        assertEquals(null, streams.single().url)
-        assertEquals(null, streams.single().nzbUrl)
-        assertEquals("Other · Singularity", streams.single().title)
-        assertEquals("Singularity source", streams.single().description)
-        assertEquals("Other", streams.single().quality)
-        assertFalse(streams.single().id.contains(privateMetadata))
-        assertEquals(100, SourceIndexClient.streams(List(101) { pooled("torrent", VALID_HASH) }).size)
+        assertEquals(2, streams.size)
+        assertEquals(VALID_HASH, streams.first().infoHash)
+        assertTrue(streams.first().isTorrent)
+        assertEquals(null, streams.first().url)
+        assertEquals(null, streams.first().nzbUrl)
+        assertEquals("Other · Singularity", streams.first().title)
+        assertEquals("Singularity source", streams.first().description)
+        assertEquals("Other", streams.first().quality)
+        assertFalse(streams.first().id.contains(privateMetadata))
+        assertEquals(101, SourceIndexClient.streams(List(101) { pooled("torrent", VALID_HASH) }).size)
     }
 
     @Test
-    fun `pooled parser caps 101 rows and malformed JSON is empty`() {
+    fun `pooled parser retains 101 rows and malformed JSON is empty`() {
         val rows = JSONArray()
         repeat(101) {
             rows.put(
@@ -151,7 +151,7 @@ class SourceIndexCaptureTest {
             )
         }
         val parsed = SourceIndexClient.parsePooled(JSONObject().put("sources", rows).toString())
-        assertEquals(100, parsed.size)
+        assertEquals(101, parsed.size)
         assertTrue(SourceIndexClient.parsePooled("{not-json").isEmpty())
     }
 
@@ -269,7 +269,7 @@ class SourceIndexCaptureTest {
         assertEquals(null, SourceIndexClient.serveUrl("tmdb:123:1"))
         assertEquals(null, SourceIndexClient.serveUrl("TMDB:123"))
         assertEquals(
-            "https://sources.vortx.tv/sources?content_id=tmdb%3A123%3A1%3A2&kind=torrent",
+            "https://sources.vortx.tv/sources?content_id=tmdb%3A123%3A1%3A2&kind=torrent&paged=1",
             SourceIndexClient.serveUrl("tmdb:123:1:2"),
         )
     }

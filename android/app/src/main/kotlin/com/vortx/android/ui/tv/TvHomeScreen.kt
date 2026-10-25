@@ -148,6 +148,7 @@ fun TvHomeScreen(
                     modifier = modifier,
                     forYouShowInvite = forYouUi.showInvite,
                     onTuneForYou = { interestsPicker = false },
+                    onSurprise = { viewModel.pickHomeSurprise()?.let { onItem(it); true } ?: false },
                 )
             }
     }
@@ -172,6 +173,7 @@ private fun TvHomeContent(
     modifier: Modifier,
     forYouShowInvite: Boolean = false,
     onTuneForYou: () -> Unit = {},
+    onSurprise: () -> Boolean = { false },
 ) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
@@ -255,6 +257,12 @@ private fun TvHomeContent(
         // Hook site: the living-backdrop cinematic hero (backdrop crossfade + Ken Burns + ambient trailer +
         // metadata overlay) lives in TvAmbientHero.kt. It follows the enriched focus-driven hero item.
         TvAmbientHero(enrichedHeroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
+        // Outside the lazy rail list: existing row indices and D-pad focus recovery stay unchanged.
+        com.vortx.android.ui.randompick.HomeSurpriseControl(
+            onPick = onSurprise,
+            tv = true,
+            modifier = Modifier.padding(horizontal = TvDimens.edge),
+        )
         if (catalogLayout == HomeCatalogLayout.WALL) {
             TvCatalogWall(
                 catalogs = visibleCatalogs,

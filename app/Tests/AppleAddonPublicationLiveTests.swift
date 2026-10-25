@@ -52,6 +52,10 @@ private final class AddonCheckpointGate: VortxCheckpointStore, @unchecked Sendab
         guard let data = facade.stateData("ctx") else { throw Failure.assertion("missing native ctx") }
         return try JSONDecoder().decode(CoreCtx.self, from: data)
     }
+    static func management(_ facade: VortxNativeCoreFacade) throws -> CoreCtx {
+        guard let data = facade.stateData("addon_management") else { throw Failure.assertion("missing management membership") }
+        return try JSONDecoder().decode(CoreCtx.self, from: data)
+    }
     static func reject(_ value: VortxJSON) throws {
         do {
             _ = try value.decode(CoreCtx.self)
@@ -172,8 +176,43 @@ private final class AddonCheckpointGate: VortxCheckpointStore, @unchecked Sendab
             .object(["field": .string("disabledAddons"), "value": .array([.string(order[0])])])])]))
         try await dispatch(.object(["type": .string("switch_profile"), "id": .string(shared)]))
         try check(try decode(facade).profile.addons.map(\.transportUrl) == Array(order.dropFirst()), "shared profile visibility or order wrong")
+        try check(try management(facade).profile.addons.map(\.transportUrl) == order,
+                  "disabled shared source vanished from management controls")
         try await dispatch(.object(["type": .string("switch_profile"), "id": .string(owner)]))
         try check(try decode(facade).profile.addons.map(\.transportUrl) == order, "owner roster inherited child filtering")
+        let beforeHidden = facade.captureHostChange(fields: ["ctx", "addon_management"])!
+        try await dispatch(.object(["type": .string("patch_profile"), "id": .string(owner), "edits": .array([
+            .object(["field": .string("disabledAddons"), "value": .array([.string(order[0])])])])]))
+        try check(try decode(facade).profile.addons.map(\.transportUrl) == Array(order.dropFirst()), "disabled owner source still admitted resource work")
+        try check(try await session.resourceRegistry().map(\.transportUrl) == Array(order.dropFirst()), "disabled owner source remains in actual worker registry")
+        try check(try management(facade).profile.addons.map(\.transportUrl) == order, "disabled owner source lost its management row")
+        try check(!facade.acceptsChange(beforeHidden, field: "addon_management"), "old management receipt crossed visibility generation")
+        let hiddenState = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("addon_management")!)
+        let hidden = hiddenState["profile"]!["addons"]!.array!.first { $0["transportUrl"] == .string(order[0]) }!
+        var hiddenManifest = hidden["manifest"]!.decodeObject()
+        hiddenManifest["name"] = .string("Synthetic Refreshed Hidden Add-on")
+        let refreshedHiddenManifest = VortxJSON.object(hiddenManifest)
+        let hiddenUpdate: VortxJSON = .object(["action": .string("Ctx"), "args": .object(["action": .string("ReplaceAddonLocal"), "args": .object([
+            "old": hidden, "new": .object(["transportUrl": .string(order[0]), "manifest": refreshedHiddenManifest])])])])
+        try check(facade.dispatch(data: try JSONEncoder().encode(hiddenUpdate), field: "ctx"), "disabled add-on refresh refused")
+        await facade.settled()
+        try check(facade.lastFailure == nil, "disabled add-on refresh failed")
+        try check(try management(facade).profile.addons.first { $0.transportUrl == order[0] }?.manifest.name == "Synthetic Refreshed Hidden Add-on",
+                  "disabled add-on manifest did not update in management membership")
+        try check(try decode(facade).profile.addons.map(\.transportUrl) == Array(order.dropFirst()), "manifest refresh re-enabled hidden resource work")
+        try check(try await session.resourceRegistry().map(\.transportUrl) == Array(order.dropFirst()), "hidden manifest refresh re-enabled actual worker registry")
+        let hiddenProbe = AddonConfirmationProbe(nativeFacade: facade)
+        try hiddenProbe.refresh()
+        let refreshedHiddenExpected = try JSONSerialization.jsonObject(with: JSONEncoder().encode(refreshedHiddenManifest)) as! [String: Any]
+        try check(hiddenProbe.confirmedInstalled(order[0], replacingManifest: [:], expectedManifest: refreshedHiddenExpected), "disabled manifest refresh did not acknowledge its management descriptor")
+        try check(hiddenProbe.rawAddonsByUrl[order[0]] != nil, "disabled raw descriptor unavailable for update/restore")
+        try await dispatch(.object(["type": .string("patch_profile"), "id": .string(owner), "edits": .array([
+            .object(["field": .string("disabledAddons"), "value": .array([])])])]))
+        try check(try decode(facade).profile.addons.map(\.transportUrl) == order, "eye re-enable did not restore resource membership")
+        try check(try await session.resourceRegistry().map(\.transportUrl) == order, "eye re-enable did not restore actual worker registry")
+        try check(try management(facade).profile.addons.map(\.transportUrl) == order, "eye re-enable changed installed order")
+        try check(!facade.acceptsChange(beforeHidden, field: "addon_management"), "management receipt survived hide/show ABA")
+        print("Management membership PASS: disabled rows editable; hidden refresh stays hidden; re-enable restores worker admission; old generation/ABA rejected")
         let tombstoned = order[1]
         try await dispatch(.object(["type": .string("remove_addon"), "profileId": .string(owner), "transportUrl": .string(tombstoned)]))
         try check(try decode(facade).profile.addons.map(\.transportUrl) == order.filter { $0 != tombstoned }, "native tombstone not honored by Apple roster")

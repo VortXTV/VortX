@@ -3,7 +3,7 @@ import Foundation
 /// Same-session retention for the existing private Trakt cache envelope. Unknown values retain their
 /// original JSON bytes at their original member/queue paths; they are not interpreted as actions.
 /// The raw range utility reuses the archive's existing lexical scanner without changing its policy.
-struct TraktSyncSnapshotEnvelope {
+struct TraktSyncSnapshotEnvelope: Sendable {
     enum Failure: Error { case malformed, wrongSession, excessive }
     static let maximumBytes = 32 * 1024 * 1024
     private static let maximumOpaqueBytes = 1024 * 1024
@@ -17,7 +17,7 @@ struct TraktSyncSnapshotEnvelope {
     ]
     private let sessionID: TraktSessionID
     private let unknown: [VortxNativeBootstrapArchive.RawJSONMember]
-    private enum QueueRow { case known(Data), opaque(Data) }
+    private enum QueueRow: Sendable { case known(Data), opaque(Data) }
     private let queueLayout: [QueueRow]
 
     /// Produces only the understood projection for the existing Codable decoder. Unknown queue

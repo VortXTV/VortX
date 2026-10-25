@@ -29,6 +29,7 @@ import Combine
 /// (no rail is visible then; the player-dismiss flip triggers a catch-up rebuild). The bucket JSON
 /// parse runs on a utility queue; a trailing resweep ~2s later catches the engine's bucket persist,
 /// which is an async effect that can land AFTER the NewState emit the first pass reacted to.
+@MainActor
 final class WatchedIndex: ObservableObject {
     static let shared = WatchedIndex()
 
@@ -159,7 +160,7 @@ final class WatchedIndex: ObservableObject {
     /// the on-disk bucket can still hold the previous account's entries for a window, so a file
     /// whose uid does not match `expectedUID` is skipped entirely (degrades to no badges from that
     /// file, the same fail-soft posture as missing/corrupt).
-    private static func bucketWatchedIDs(expectedUID: String?) -> Set<String> {
+    nonisolated private static func bucketWatchedIDs(expectedUID: String?) -> Set<String> {
         var found = Set<String>()
         let dir = CoreBridge.storageDirURL
         for name in ["library_recent.json", "library.json"] {

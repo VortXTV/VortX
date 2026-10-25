@@ -652,6 +652,48 @@ fileprivate func contractAuthorization(_ contentID: String) -> SourceIndexIdenti
     )
 }
 
+actor PooledPageFixture {
+    private let steps: [(body: Data, expectedCursor: String?)]
+    private var calls = 0
+    init(_ steps: [(Data, String?)]) { self.steps = steps }
+    func response(_ request: URLRequest) throws -> (Data, URLResponse) {
+        guard calls < steps.count, let url = request.url,
+              url.scheme == "https", url.host == "sources.vortx.tv", url.path == "/sources",
+              request.value(forHTTPHeaderField: "X-VX-Moat") == "synthetic-page-moat" else {
+            throw SequenceFetchError.failed
+        }
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let step = steps[calls]
+        guard query.first(where: { $0.name == "paged" })?.value == "1",
+              query.first(where: { $0.name == "cursor" })?.value == step.expectedCursor else {
+            throw SequenceFetchError.failed
+        }
+        calls += 1
+        return (step.body, HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+    func callCount() -> Int { calls }
+}
+
+
+/// Delays a chosen real gate evaluation without changing the production monotonic clock or policy.
+actor PooledDelayedGate {
+    private let delayedCall: Int
+    private let nanoseconds: UInt64
+    private var calls = 0
+    init(delayedCall: Int, nanoseconds: UInt64) {
+        self.delayedCall = delayedCall
+        self.nanoseconds = nanoseconds
+    }
+    func value() async -> Bool {
+        calls += 1
+        if calls == delayedCall {
+            try? await Task<Never, Never>.sleep(nanoseconds: nanoseconds)
+        }
+        return true
+    }
+    func callCount() -> Int { calls }
+}
+
 @main
 struct SourceIndexTorrentContractTests {
     @MainActor
@@ -1582,19 +1624,244 @@ struct SourceIndexTorrentContractTests {
                && !(served.first?.description ?? "").contains(privateURL)
                && (served.first?.description ?? "").contains("100000.00 GB"),
                "untrusted pooled quality is normalized away and an adversarial MAX size prints a bounded value")
-        expect(SourceIndexClient.streams(from: Array(repeating: trusted, count: 101)).count == 100,
-               "direct reconstruction cannot exceed the worker's 100-row serve maximum")
+        expect(SourceIndexClient.streams(from: Array(repeating: trusted, count: 101)).count == 101,
+               "assembled reconstruction retains rows beyond a single server page")
 
         let encodedRows = (0..<101).map { _ in
             ["kind": "torrent", "id": lower, "quality": "Other", "sizeBytes": 0,
              "seeders": 0, "corroboration": 2] as [String: Any]
         }
         let encodedResponse = try? JSONSerialization.data(withJSONObject: ["sources": encodedRows])
-        expect(encodedResponse.map(SourceIndexClient.pooledSources(fromResponseData:))?.count == 100,
-               "bounded response decoding caps accepted source rows at 100")
+        expect(encodedResponse.map(SourceIndexClient.pooledSources(fromResponseData:))?.count == 101,
+               "bounded response decoding does not impose a total row count")
         expect(encodedResponse.map {
             SourceIndexClient.pooledSources(statusCode: 503, fromResponseData: $0)
         }?.isEmpty == true, "GET 503 fails soft to local fallback without publishing pooled rows")
+
+        func sourcePage(_ indices: Range<Int>, next: String?) -> Data {
+            let rows = indices.map { n -> [String: Any] in
+                let hex = String(n, radix: 16)
+                return ["kind": "torrent", "id": String(repeating: "0", count: 40 - hex.count) + hex,
+                        "quality": "1080p", "corroboration": 1]
+            }
+            var object: [String: Any] = ["sources": rows, "paginationVersion": 1, "hasMore": next != nil]
+            if let next { object["nextCursor"] = next } else { object["nextCursor"] = NSNull() }
+            return try! JSONSerialization.data(withJSONObject: object)
+        }
+        let threePages = PooledPageFixture([
+            (sourcePage(1..<101, next: "page_2"), nil),
+            (sourcePage(101..<201, next: "page_3"), "page_2"),
+            (sourcePage(201..<258, next: nil), "page_3"),
+        ])
+        let assembled = await SourceIndexClient.fetchPooledUsing(
+            contentID: "tt1234567", isSignedIn: true, gate: { true },
+            moatProvider: { "synthetic-page-moat" }, transport: { try await threePages.response($0) }
+        )
+        let threePageCalls = await threePages.callCount()
+        expect(assembled.count == 257 && threePageCalls == 3,
+               "the real GET boundary assembles every row across 100/100/57 bounded pages")
+        expect(Set(assembled.compactMap(\.id)).count == 257,
+               "page assembly preserves distinct identities past the old total100 cap")
+        let repeatedCursor = PooledPageFixture([
+            (sourcePage(1..<2, next: "same_cursor"), nil),
+            (sourcePage(2..<3, next: "same_cursor"), "same_cursor"),
+        ])
+        let repeatedResult = await SourceIndexClient.fetchPooledUsing(
+            contentID: "tt1234567", isSignedIn: true, gate: { true },
+            moatProvider: { "synthetic-page-moat" }, transport: { try await repeatedCursor.response($0) }
+        )
+        let repeatedCalls = await repeatedCursor.callCount()
+        expect(repeatedResult.isEmpty && repeatedCalls == 2,
+               "a repeated continuation fails explicitly instead of looping or reporting a complete prefix")
+        expect(SourceIndexClient.serveURL(contentID: "tt1234567", cursor: "https://elsewhere.invalid") == nil,
+               "a continuation can never redirect signed credentials to another origin")
+
+        for invalidTail in [Data("{\"sources\":[]}".utf8),
+                            Data("{\"paginationVersion\":1,\"hasMore\":false,\"nextCursor\":null}".utf8)] {
+            let invalidTailFixture = PooledPageFixture([
+                (sourcePage(1..<2, next: "page_2"), nil), (invalidTail, "page_2"),
+            ])
+            let result = await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { true },
+                moatProvider: { "synthetic-page-moat" }, transport: { try await invalidTailFixture.response($0) }
+            )
+            expect(result.isEmpty, "a later legacy/failure or missing-array page cannot publish a complete prefix")
+        }
+
+
+        // The actual assembler admits exactly its cumulative byte budget, then fails the entire
+        // traversal on the next otherwise-valid page. Padding is an ignored JSON field; every body
+        // still passes through the unchanged production decoder and 64 KiB page boundary.
+        func paddedPages(_ total: Int) -> [(Data, String?)] {
+            (1...total).map { number in
+                let next = number < total ? "bulk_\(number + 1)" : nil
+                var object = try! JSONSerialization.jsonObject(
+                    with: sourcePage(number..<(number + 1), next: next)
+                ) as! [String: Any]
+                object["padding"] = ""
+                let fixed = try! JSONSerialization.data(withJSONObject: object)
+                object["padding"] = String(repeating: "x", count: SourceIndexContract.maxResponseBodyBytes - fixed.count)
+                let body = try! JSONSerialization.data(withJSONObject: object)
+                precondition(body.count == SourceIndexContract.maxResponseBodyBytes,
+                             "cumulative fixture must have an exact 64 KiB wire body")
+                return (body, number == 1 ? nil : "bulk_\(number)")
+            }
+        }
+        let budgetPageCount = SourceIndexContract.maxAssembledResponseBytes / SourceIndexContract.maxResponseBodyBytes
+        expect(budgetPageCount * SourceIndexContract.maxResponseBodyBytes == SourceIndexContract.maxAssembledResponseBytes,
+               "the exact cumulative boundary fixture spans whole production pages")
+        let exactBudgetFixture = PooledPageFixture(paddedPages(budgetPageCount))
+        let exactBudget = await SourceIndexClient.fetchPooledUsing(
+            contentID: "tt1234567", isSignedIn: true, gate: { true },
+            moatProvider: { "synthetic-page-moat" }, transport: { try await exactBudgetFixture.response($0) }
+        )
+        let exactBudgetCalls = await exactBudgetFixture.callCount()
+        expect(exactBudget.count == budgetPageCount && exactBudgetCalls == budgetPageCount,
+               "exactly 8 MiB assembles completely rather than clipping before the boundary")
+        let overBudgetFixture = PooledPageFixture(paddedPages(budgetPageCount + 1))
+        let overBudget = await SourceIndexClient.fetchPooledUsing(
+            contentID: "tt1234567", isSignedIn: true, gate: { true },
+            moatProvider: { "synthetic-page-moat" }, transport: { try await overBudgetFixture.response($0) }
+        )
+        let overBudgetCalls = await overBudgetFixture.callCount()
+        expect(overBudget.isEmpty && overBudgetCalls == budgetPageCount + 1,
+               "crossing 8 MiB discards the assembled prefix instead of publishing a clipped list")
+
+        let pageTwoGate = LockedGate(true)
+        let pageTwoGateFixture = PooledPageFixture([
+            (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+        ])
+        let gateClosedOnPageTwo = await SourceIndexClient.fetchPooledUsing(
+            contentID: "tt1234567", isSignedIn: true, gate: { pageTwoGate.value() },
+            moatProvider: { "synthetic-page-moat" }, transport: { request in
+                let response = try await pageTwoGateFixture.response(request)
+                if await pageTwoGateFixture.callCount() == 2 { pageTwoGate.close() }
+                return response
+            }
+        )
+        let pageTwoGateCalls = await pageTwoGateFixture.callCount()
+        expect(gateClosedOnPageTwo.isEmpty && pageTwoGateCalls == 2,
+               "a live gate closing while page two is in flight revokes the complete prefix")
+
+        let canceledPageFixture = PooledPageFixture([
+            (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+        ])
+        let canceledTraversal = Task {
+            await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { true },
+                moatProvider: { "synthetic-page-moat" }, transport: { request in
+                    let response = try await canceledPageFixture.response(request)
+                    if await canceledPageFixture.callCount() == 2 {
+                        withUnsafeCurrentTask { task in
+                            if let task { task.cancel() }
+                        }
+                    }
+                    return response
+                }
+            )
+        }
+        let canceledPageResult = await canceledTraversal.value
+        let canceledPageCalls = await canceledPageFixture.callCount()
+        expect(canceledPageResult.isEmpty && canceledPageCalls == 2,
+               "page-two task cancellation cannot publish rows already assembled on page one")
+
+        for failedTail in [
+            Data("{\"sources\":[],\"reason\":\"login_required\"}".utf8),
+            sourcePage(2..<27, next: nil),
+        ] {
+            // The restriction body is deliberately legacy, matching the real worker's restricted branch.
+            let tail: Data
+            if let object = try? JSONSerialization.jsonObject(with: failedTail) as? [String: Any],
+               object["paginationVersion"] != nil {
+                tail = try! JSONSerialization.data(withJSONObject: ["sources": object["sources"]!])
+            } else { tail = failedTail }
+            let failedTailFixture = PooledPageFixture([
+                (sourcePage(1..<2, next: "page_2"), nil), (tail, "page_2"),
+            ])
+            let failedTailResult = await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { true },
+                moatProvider: { "synthetic-page-moat" }, transport: { try await failedTailFixture.response($0) }
+            )
+            let failedTailCalls = await failedTailFixture.callCount()
+            expect(failedTailResult.isEmpty && failedTailCalls == 2,
+                   "page-two auth or legacy restriction cannot return an unrestricted assembled prefix")
+        }
+        for nonSuccessStatus in [false, true] {
+            let failureFixture = PooledPageFixture([
+                (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+            ])
+            let failureResult = await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { true },
+                moatProvider: { "synthetic-page-moat" }, transport: { request in
+                    let response = try await failureFixture.response(request)
+                    if await failureFixture.callCount() == 2 {
+                        if nonSuccessStatus {
+                            return (response.0, HTTPURLResponse(url: request.url!, statusCode: 503,
+                                                               httpVersion: nil, headerFields: nil)!)
+                        }
+                        throw SequenceFetchError.failed
+                    }
+                    return response
+                }
+            )
+            let failureCalls = await failureFixture.callCount()
+            expect(failureResult.isEmpty && failureCalls == 2,
+                   "page-two transport error or HTTP 503 discards the complete prefix")
+        }
+
+        // Real monotonic-time negatives run together in this one standalone process. They take about
+        // thirty-one seconds total and never modify the production deadline, use a fake clock, or
+        // perform network I/O. The explicit call counts make a removed boundary observable.
+        let deadlineDelay = UInt64((SourceIndexContract.maxServeTraversalSeconds + 1) * 1_000_000_000)
+        let delayedResponseFixture = PooledPageFixture([
+            (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+        ])
+        let responseDeadlineTask = Task {
+            await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { true },
+                moatProvider: { "synthetic-page-moat" }, transport: { request in
+                    let response = try await delayedResponseFixture.response(request)
+                    if await delayedResponseFixture.callCount() == 2 {
+                        try await Task<Never, Never>.sleep(nanoseconds: deadlineDelay)
+                    }
+                    return response
+                }
+            )
+        }
+        let delayedAdmissionGate = PooledDelayedGate(delayedCall: 5, nanoseconds: deadlineDelay)
+        let delayedAdmissionFixture = PooledPageFixture([
+            (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+        ])
+        let admissionDeadlineTask = Task {
+            await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { await delayedAdmissionGate.value() },
+                moatProvider: { "synthetic-page-moat" }, transport: { try await delayedAdmissionFixture.response($0) }
+            )
+        }
+        let delayedTerminalGate = PooledDelayedGate(delayedCall: 7, nanoseconds: deadlineDelay)
+        let delayedTerminalFixture = PooledPageFixture([
+            (sourcePage(1..<2, next: "page_2"), nil), (sourcePage(2..<3, next: nil), "page_2"),
+        ])
+        let terminalDeadlineTask = Task {
+            await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt1234567", isSignedIn: true, gate: { await delayedTerminalGate.value() },
+                moatProvider: { "synthetic-page-moat" }, transport: { try await delayedTerminalFixture.response($0) }
+            )
+        }
+        let responseDeadlineResult = await responseDeadlineTask.value
+        let admissionDeadlineResult = await admissionDeadlineTask.value
+        let terminalDeadlineResult = await terminalDeadlineTask.value
+        let delayedResponseCalls = await delayedResponseFixture.callCount()
+        let delayedAdmissionCalls = await delayedAdmissionFixture.callCount()
+        let delayedTerminalCalls = await delayedTerminalFixture.callCount()
+        let delayedAdmissionGateCalls = await delayedAdmissionGate.callCount()
+        let delayedTerminalGateCalls = await delayedTerminalGate.callCount()
+        expect(responseDeadlineResult.isEmpty && delayedResponseCalls == 2,
+               "a terminal page arriving after thirty seconds cannot publish an earlier prefix")
+        expect(admissionDeadlineResult.isEmpty && delayedAdmissionCalls == 1 && delayedAdmissionGateCalls == 5,
+               "a pre-page gate delayed beyond the deadline cannot admit the next request")
+        expect(terminalDeadlineResult.isEmpty && delayedTerminalCalls == 2 && delayedTerminalGateCalls == 7,
+               "a final gate delayed beyond the deadline cannot publish a completely assembled list")
 
         let tokenWaitGate = LockedGate(true)
         let tokenWaitTransport = AttemptProbe()
@@ -1805,13 +2072,13 @@ struct SourceIndexTorrentContractTests {
                                                           sizeBytes: 0, seeders: 0, corroboration: 2)
         let hundredAnonymous = SourceIndexClient.streams(from: Array(repeating: anonymousRow, count: 100),
                                                          capabilities: .torrentOnly)
-        expect(hundredAnonymous.count == SourceIndexContract.maxAnonymousServedSources,
-               "a metadata-poor pool is bounded to the anonymous-tail cap, not 100 undifferentiated rows")
+        expect(hundredAnonymous.count == 100,
+               "metadata-poor valid torrent rows remain available")
         let mixedTail = SourceIndexClient.streams(from: richPool + Array(repeating: anonymousRow, count: 100),
                                                   capabilities: .torrentOnly)
-        expect(mixedTail.count == 1 + SourceIndexContract.maxAnonymousServedSources
+        expect(mixedTail.count == 101
                && (mixedTail.first?.description ?? "").contains("1080p"),
-               "rich rows are kept in full; only the anonymous remainder is capped, and rich rows rank first")
+               "rich and metadata-poor rows are retained, and rich rows rank first")
 
         // Dedupe/merge against the add-on list: a pooled torrent whose infohash an add-on already surfaced (any
         // case) does NOT render a duplicate Singularity row; only add-on-unseen hashes become new rows.

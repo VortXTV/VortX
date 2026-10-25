@@ -27,6 +27,9 @@ interface PlayerEngine {
     /// (position 0, duration 0, paused false, no tracks) until the engine loads the file.
     val state: StateFlow<PlayerState>
 
+    /** Bind ONCE before any load. A retired original owner requires a NEW engine, never rebinding. */
+    fun bindPlaybackOwner(original: PlaybackOwnerToken): Boolean = false
+
     /** True only when this engine can shift subtitle presentation time while playback is live. */
     val subtitleDelayAvailable: Boolean get() = false
 
@@ -100,7 +103,17 @@ interface PlayerEngine {
     fun selectAudioTrack(id: Int)
     fun selectSubtitleTrack(id: Int?)
 
-    /// Mount an additional external subtitle file at runtime and offset its timing (seconds, +/-).
+    /// Capture a manual decision BEFORE asynchronous subtitle IO; do not adopt a newer source or
+    /// choice at completion. Unsupported engines fail closed. The concrete final mount rechecks it.
+    fun beginSubtitleSelection(): PlayerSubtitleSelection? = null
+    fun captureSubtitleSelection(): PlayerSubtitleSelection? = null
+    fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean = false
+    fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean = false
+    fun addExternalSubtitle(url: String, request: PlayerSubtitleSelection): Boolean = false
+    fun setSubtitleDelay(seconds: Double, request: PlayerSubtitleSelection): Boolean = false
+
+    /// Mount and select the exact additional external subtitle file. Re-selecting a mounted file
+    /// must not depend on inventory growth or its order. Subtitle timing is a separate command.
     fun addExternalSubtitle(url: String)
     fun setSubtitleDelay(seconds: Double)
 
@@ -125,6 +138,11 @@ interface PlayerEngine {
     /// that renders no subtitles. Mirrors Apple `applySubtitleStyle`.
     fun applySubtitleStyle() {}
 
+    /// Re-read the persisted [LoudnessNormalizationSetting] and apply it to the live engine. The
+    /// libmpv implementation refreshes its `af` property and re-runs the existing session-audio
+    /// reconciliation; unsupported engines (including stock Media3) deliberately no-op.
+    fun applyLoudnessNormalization() {}
+
     /// Re-read the persisted HDR tone-map policy (`stremiox.hdrToneMapMode`) and apply it to the live engine
     /// (libmpv `target-trc` / `target-prim`). A documented no-op on ExoPlayer, whose HDR/DV passthrough is
     /// hardware. Mirrors Apple applying the tone-map decision on the mpv lane.
@@ -134,6 +152,16 @@ interface PlayerEngine {
     /// its AO channel/passthrough policy; ExoPlayer's `DefaultAudioSink` self-negotiates and exposes no
     /// runtime force, so its implementation is a documented no-op. Mirrors Apple `setAudioOutputMode`.
     fun setAudioOutputMode(mode: AudioOutputMode) {}
+
+    /** Cleanup/admission receipt only, not proof of AO negotiation. Commit preferences after acceptance. */
+    fun trySetAudioOutputMode(mode: AudioOutputMode): Boolean {
+        if (!audioOutputModeAvailable) return false
+        setAudioOutputMode(mode)
+        return true
+    }
+
+    /** Unsupported engines (including stock Media3) deliberately do not pretend to apply DSP. */
+    fun setSessionAudioPreset(preset: SessionAudioPreset): Boolean = false
 
     /// Live audio volume, 0..100, and mute without losing the level. Both engines override (mpv `volume`/
     /// `mute`; ExoPlayer `player.volume` 0..1). Mirrors Apple `setVolume` / `setMuted`.
@@ -252,6 +280,9 @@ data class PlayerState(
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),
     val metadata: PlaybackMetadata = PlaybackMetadata(),
+    val sessionAudioPreset: SessionAudioPresetState = SessionAudioPresetState(),
+    /** Load-owned evidence; UNAVAILABLE is fail-open for unsupported/fake engines, never a first frame. */
+    val startupEvidence: PlaybackStartupEvidence = PlaybackStartupEvidence.UNAVAILABLE,
 )
 
 enum class EngineFallbackReason {

@@ -18,10 +18,9 @@ enum ServerDiagnostics {
 
 @main enum MacNativeTransportBootstrapTests {
     static func main() {
-        // This executable deliberately contains neither transport binary. Exercising the actual
-        // lifecycle entry points must return before spawning tools, reclaiming ports or starting Node.
-        precondition(NativeTransportPolicy.isRequired)
-        precondition(NodeServer.nativeServerEnabled)
+        // This executable deliberately contains no native server binary. Exercising the actual
+        // lifecycle entry points must return before spawning tools or reclaiming ports.
+        precondition(Bundle.main.path(forResource: "vortx-streaming-server", ofType: nil) == nil)
         NodeServer.startIfNeeded()
         precondition(DiagnosticsLog.missingBinary.wait(timeout: .now() + 5) == .success)
         let before = DispatchTime.now().uptimeNanoseconds
@@ -36,8 +35,7 @@ enum ServerDiagnostics {
         precondition(NodeServer.nativeBaseURL == nil)
         DiagnosticsLog.releaseLifecycle.signal()
         precondition(!NodeServer.started)
-        NodeServer.nativeServerEnabled = false
-        precondition(NodeServer.nativeServerEnabled)
-        print("PASS actual Mac bootstrap: required native fails closed without a binary and cannot downgrade")
+        precondition(NodeServer.statusDescription == "Native streaming server is missing from this build.")
+        print("PASS actual Mac bootstrap: native-only startup and restart fail closed without a binary; endpoint reads never join the lifecycle queue")
     }
 }

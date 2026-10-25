@@ -74,7 +74,7 @@ class SourceIndexPooledAdmissionBoundaryTest {
         assertEquals("https", url.scheme)
         assertEquals("sources.vortx.tv", url.host)
         assertEquals("/sources", url.path)
-        assertEquals(listOf("content_id=tt1234567", "kind=torrent"), url.rawQuery.split('&'))
+        assertEquals(listOf("content_id=tt1234567", "kind=torrent", "paged=1"), url.rawQuery.split('&'))
     }
 
     private fun pooled(kind: String, id: String) = SourceIndexClient.PooledSource(kind, id, "Other", 0L, null, 9)

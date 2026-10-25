@@ -5,7 +5,7 @@ cw_repo_root="$PWD"
 mkdir -p app/build
 cw_build_dir=$(mktemp -d app/build/home-cw-selection.XXXXXX)
 cw_inputs=(
-    app/Tests/HomeContinueWatchingFixtureStubs.swift
+    "$cw_build_dir/HomeContinueWatchingFixtureStubs.swift"
     app/SourcesShared/PlaybackMutationOwnershipPolicy.swift
     app/SourcesShared/ExternalSyncSessionPolicy.swift
     app/SourcesShared/TraktScrobbleProgressPolicy.swift
@@ -19,6 +19,8 @@ cw_inputs=(
     app/SourcesShared/HomeContinueWatchingSelection.swift
     app/Tests/HomeContinueWatchingSelectionTests.swift
 )
+
+node test/cw-profile-fixture.cjs "$cw_build_dir/HomeContinueWatchingFixtureStubs.swift"
 
 # RED uses the exact pre-fix TV and iOS selection property bodies, extracted from
 # the reviewed parent commit. The same production shadow and fixture snapshot run.
@@ -40,12 +42,12 @@ for (const [surface, path] of paths) {
         if (source[end] === '}') depth--;
     }
     if (depth) throw new Error(`Unterminated reviewed ${surface} selection`);
-    fixture += `struct Baseline${surface}HomeSelection {\nlet core: CoreBridge\nlet profiles: ProfileStore\nlet traktContinueWatchingRevision = 0\n`;
+    fixture += `@MainActor struct Baseline${surface}HomeSelection {\nlet core: CoreBridge\nlet profiles: ProfileStore\nlet traktContinueWatchingRevision = 0\n`;
     fixture += source.slice(start, end).replace('private var', 'var') + '\n}\n';
 }
 writeFileSync(output, fixture);
 NODE
-swiftc -parse-as-library -D CW_BASELINE "${cw_inputs[@]}" "$cw_build_dir/BaselineSelection.swift" -o "$cw_build_dir/baseline"
+nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -parse-as-library -D CW_BASELINE "${cw_inputs[@]}" "$cw_build_dir/BaselineSelection.swift" -o "$cw_build_dir/baseline"
 if "$cw_build_dir/baseline" > "$cw_build_dir/baseline.log" 2>&1; then
     printf '%s\n' 'FAIL: reviewed baseline unexpectedly retained native Trakt selection'
     exit 1
@@ -54,6 +56,6 @@ grep -F 'FAIL: native TV retains the selected Trakt source' "$cw_build_dir/basel
 grep -F 'FAIL: native iOS/macOS retains the selected Trakt source' "$cw_build_dir/baseline.log"
 printf '%s\n' "Verified RED baseline: $cw_baseline_ref"
 
-swiftc -parse-as-library "${cw_inputs[@]}" -o "$cw_build_dir/selection"
+nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -parse-as-library "${cw_inputs[@]}" -o "$cw_build_dir/selection"
 "$cw_build_dir/selection" "$cw_repo_root" | tee "$cw_build_dir/selection.log"
 printf '%s\n' "Retained offline receipts: $cw_build_dir"

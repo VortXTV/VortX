@@ -188,7 +188,10 @@ class DirectLinkDisplayGroupsTest {
         assertCallbackAbandonsBeforeRoute(phone, "// System Back closes the detail overlay", "BackHandler {", "DetailScreen(", "detailVm.abandonPlaybackRoute()")
         assertCallbackAbandonsBeforeRoute(phone, "DetailScreen(\n                    viewModel = detailVm,", "onBack = {", "// DetailScreen supplies", "detailVm.abandonPlaybackRoute()")
 
-        val routeRetirement = bracedBlock(viewModel, viewModel.indexOf("fun abandonPlaybackRoute()"))
+        val noArgumentRetirement = bracedBlock(viewModel, viewModel.indexOf("fun abandonPlaybackRoute()"))
+        assertTrue(noArgumentRetirement.content.contains("abandonPlaybackRoute(preserveRandomEpisodePick = false)"))
+        val routeRetirement = bracedBlock(viewModel,
+            viewModel.indexOf("internal fun abandonPlaybackRoute(preserveRandomEpisodePick: Boolean)"))
         assertTrue(routeRetirement.content.contains("pendingAutoPick = false"))
         assertTrue(routeRetirement.content.contains("pendingAdvanceHint = null"))
         // Leaving playback discards the warm next-episode source, directly or through the audio-intent reset.

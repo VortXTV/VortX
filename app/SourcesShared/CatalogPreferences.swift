@@ -187,7 +187,7 @@ enum CatalogPrefsStore {
     /// so the hub can filter off the main actor. Empty by default => every tile shows (today's behavior).
     static func hiddenCategories() -> Set<String> { Set(ProfileDiscoveryPreferencesStore.hiddenHubCategories()) }
     static func isCategoryHidden(_ key: String) -> Bool { hiddenCategories().contains(key) }
-    static func setCategoryHidden(_ key: String, _ value: Bool) {
+    @MainActor static func setCategoryHidden(_ key: String, _ value: Bool) {
         var h = hiddenCategories()
         if value { h.insert(key) } else { h.remove(key) }
         ProfileDiscoveryPreferencesStore.setHiddenHubCategories(Array(h))
@@ -199,7 +199,7 @@ enum CatalogPrefsStore {
     static func regionOverride() -> String? {
         ProfileDiscoveryPreferencesStore.regionOverride()
     }
-    static func setRegionOverride(_ code: String?) {
+    @MainActor static func setRegionOverride(_ code: String?) {
         ProfileDiscoveryPreferencesStore.setRegionOverride(code)
         ProfileStore.shared.captureDiscovery()
     }
@@ -213,7 +213,7 @@ enum CatalogPrefsStore {
         return decoded
     }
     /// Persist the filter set. An inactive (empty) set removes the key so a default install stores nothing.
-    static func setDiscoverFilters(_ filters: DiscoverFilters) {
+    @MainActor static func setDiscoverFilters(_ filters: DiscoverFilters) {
         guard filters.isActive, let data = try? JSONEncoder().encode(filters) else {
             ProfileDiscoveryPreferencesStore.setFiltersData(nil)
             ProfileStore.shared.captureDiscovery()
@@ -260,13 +260,13 @@ enum CatalogPrefsStore {
     /// Position in the user's order, or `.max` so unlisted catalogs keep the engine's relative order after the listed ones.
     static func rank(_ key: String) -> Int { order().firstIndex(of: key) ?? Int.max }
 
-    static func setHidden(_ key: String, _ value: Bool) {
+    @MainActor static func setHidden(_ key: String, _ value: Bool) {
         var h = hidden()
         if value { h.insert(key) } else { h.remove(key) }
         ProfileDiscoveryPreferencesStore.setHiddenCatalogs(Array(h))
         ProfileStore.shared.captureDiscovery()
     }
-    static func setOrder(_ keys: [String]) {
+    @MainActor static func setOrder(_ keys: [String]) {
         ProfileDiscoveryPreferencesStore.setCatalogOrder(keys)
         ProfileStore.shared.captureDiscovery()
     }

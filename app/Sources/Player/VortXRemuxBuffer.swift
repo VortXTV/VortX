@@ -4312,14 +4312,29 @@ final class VortXSpoolResponsePump: @unchecked Sendable {
         case readError
     }
 
-    typealias Send = (Data, @escaping (Bool) -> Void) -> Void
+    typealias Send = (Data, @escaping @Sendable (Bool) -> Void) -> Void
 
+    /// These original transport callbacks are never captured by an escaping worker block.
+    /// Registration and every use belong to ownerQueue; only checked ACK values enter it.
+    private struct Callbacks {
+        let cancelled: () -> Bool
+        let send: Send
+        let terminal: (Terminal) -> Void
+    }
+
+    // Existing unchecked conformance is backed by this per-response serial owner, not by
+    // Network callback affinity. No callback, lease read, or mutable field uses the main queue.
+    private let ownerQueue = DispatchQueue(label: "vortx.spool.response", qos: .utility)
+    private let ownerKey = DispatchSpecificKey<UUID>()
+    private let ownerIdentity = UUID()
     private let lease: VortXHLSSessionSpool.ResourceLease
     private let chunkSize: Int
     private var firstChunk: Data?
     private var remaining: Int
     private var started = false
     private var terminated = false
+    private var callbacks: Callbacks?
+    private var pendingSend: UUID?
 
     init?(lease: VortXHLSSessionSpool.ResourceLease, chunkSize: Int) {
         guard chunkSize > 0 else { lease.close(); return nil }
@@ -4334,26 +4349,53 @@ final class VortXSpoolResponsePump: @unchecked Sendable {
             lease.close()
             return nil
         }
+        ownerQueue.setSpecific(key: ownerKey, value: ownerIdentity)
     }
 
     func start(header: Data,
                cancelled: @escaping () -> Bool,
                send: @escaping Send,
                terminal: @escaping (Terminal) -> Void) {
-        guard !started, !terminated else { return }
-        started = true
-        guard !cancelled() else { finish(.cancelled, terminal: terminal); return }
-        send(header) { [self] succeeded in
-            guard succeeded else { finish(.sendError, terminal: terminal); return }
-            sendNext(cancelled: cancelled, send: send, terminal: terminal)
+        // sync is a nonescaping ownership handoff. A transport callback may reenter
+        // start synchronously; its original serial owner must not sync onto itself.
+        let register = {
+            dispatchPrecondition(condition: .onQueue(self.ownerQueue))
+            guard !self.started, !self.terminated else { return }
+            self.started = true
+            self.callbacks = .init(cancelled: cancelled, send: send, terminal: terminal)
+            guard !cancelled() else { self.finish(.cancelled); return }
+            self.sendOwned(header)
+        }
+        if DispatchQueue.getSpecific(key: ownerKey) == ownerIdentity { register() }
+        else { ownerQueue.sync(execute: register) }
+    }
+
+    private func sendOwned(_ data: Data) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, pendingSend == nil, let callbacks else { return }
+        let receipt = UUID()
+        pendingSend = receipt // Install BEFORE the transport can complete synchronously.
+        callbacks.send(data) { [self, receipt] succeeded in
+            // ALWAYS enqueue: a synchronous completion cannot start another send while
+            // the original sender is still on its stack. No transport closure crosses.
+            ownerQueue.async { [self, receipt, succeeded] in
+                acknowledge(receipt, succeeded: succeeded)
+            }
         }
     }
 
-    private func sendNext(cancelled: @escaping () -> Bool,
-                          send: @escaping Send,
-                          terminal: @escaping (Terminal) -> Void) {
-        guard !terminated else { return }
-        guard !cancelled() else { finish(.cancelled, terminal: terminal); return }
+    private func acknowledge(_ receipt: UUID, succeeded: Bool) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, pendingSend == receipt else { return }
+        pendingSend = nil // Consume exactly this ACK; duplicates/retired sends are inert.
+        guard succeeded else { finish(.sendError); return }
+        sendNext()
+    }
+
+    private func sendNext() {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
+        guard !terminated, let callbacks else { return }
+        guard !callbacks.cancelled() else { finish(.cancelled); return }
         let data: Data
         if let firstChunk {
             data = firstChunk
@@ -4362,27 +4404,30 @@ final class VortXSpoolResponsePump: @unchecked Sendable {
             do {
                 data = try lease.read(maxLength: min(chunkSize, remaining))
             } catch {
-                finish(.readError, terminal: terminal)
+                finish(.readError)
                 return
             }
-            guard !data.isEmpty else { finish(.readError, terminal: terminal); return }
+            guard !data.isEmpty else { finish(.readError); return }
             remaining -= data.count
         } else {
-            finish(.complete, terminal: terminal)
+            finish(.complete)
             return
         }
-        send(data) { [self] succeeded in
-            guard succeeded else { finish(.sendError, terminal: terminal); return }
-            sendNext(cancelled: cancelled, send: send, terminal: terminal)
-        }
+        sendOwned(data)
     }
 
-    private func finish(_ outcome: Terminal, terminal: (Terminal) -> Void) {
+    private func finish(_ outcome: Terminal) {
+        dispatchPrecondition(condition: .onQueue(ownerQueue))
         guard !terminated else { return }
         terminated = true
+        pendingSend = nil
         firstChunk = nil
+        let terminal = callbacks?.terminal
+        callbacks = nil
+        // Terminal state is committed before either external call. Reentry cannot
+        // install callbacks, close a successor lease, or send another chunk.
         lease.close()
-        terminal(outcome)
+        terminal?(outcome)
     }
 }
 

@@ -252,6 +252,25 @@ enum VortXEngineAdvertisement {
 
 // MARK: - Browsing (client side, every platform)
 
+/// Sole ARC lifetime for non-Sendable Network resources on iOS 16. This private object is held
+/// only by the main-actor browser below; no callback, Task, executor or public API receives it.
+/// Its ordinary exclusive deinit can release its own handles without borrowing actor state.
+/// There is intentionally NO Sendable conformance, lock box, unchecked assertion or floor bump.
+private final class VortXEngineDiscoveryResources {
+    struct Probe {
+        let id: UUID
+        let connection: NWConnection
+    }
+
+    var browser: NWBrowser?
+    var probes: [String: Probe] = [:]
+
+    deinit {
+        browser?.cancel()
+        probes.values.forEach { $0.connection.cancel() }
+    }
+}
+
 /// Watches the LAN for engine hosts and publishes what it sees.
 ///
 /// **IT ONLY REPORTS.** Nothing in this type writes a setting, picks a default, or starts a session, and no
@@ -259,318 +278,207 @@ enum VortXEngineAdvertisement {
 /// host, and the stored host must arrive from a human tapping a row. If discovery ever adopts, a household
 /// with two Macs silently reroutes a user's playback to whichever one answered mDNS first.
 ///
-/// **ISOLATION.** `@Published` is written on the main queue only, exactly as `ConnectivityMonitor` does, so a
-/// SwiftUI list can bind to `hosts` directly with no dispatch of its own. The discovery state behind it lives
-/// under `lock` because `NWBrowser` and every resolve `NWConnection` call back on `queue`.
+/// **ISOLATION.** One main-actor reducer owns both the published list and discovery state. Network
+/// callbacks may arrive on the utility queue: only checked Sendable values cross to the main queue.
+/// Original browse/probe UUIDs veto callbacks and deadlines from stopped or replaced operations.
 ///
 /// **NOT A SINGLETON**, unlike the advertiser. A browse is a screen-scoped activity: mDNS traffic while nobody
 /// is looking at a host list is waste, and on tvOS it is waste on a device with a small radio budget. Own one
 /// as `@StateObject` on the picker screen and let its lifetime end with the screen.
-final class VortXEngineBrowser: ObservableObject, @unchecked Sendable {
-
-    /// Every host currently visible, sorted for a stable list. Main queue only.
+@MainActor
+final class VortXEngineBrowser: ObservableObject {
     @Published private(set) var hosts: [VortXDiscoveredHost] = []
-
-    /// True between the browser reaching `.ready` and being cancelled or failing. Main queue only. Distinct
-    /// from `hosts.isEmpty`: "looking and found nothing" and "not looking" are different things to render, and
-    /// collapsing them produces a screen that says "no hosts found" when mDNS never started.
     @Published private(set) var isBrowsing = false
 
-    /// How long a resolve probe may take before it is abandoned. Generous enough for a sleeping Mac's radio to
-    /// wake, short enough that a stale mDNS record does not hold a row in "resolving" for a visible age. An
-    /// abandoned probe is not an error: the row stays, with `address` nil, and the endpoint still usable.
     static let resolveDeadline: TimeInterval = 4
-
     private let queue = DispatchQueue(label: "tv.vortx.engine.browse", qos: .utility)
-
-    private let lock = NSLock()
-    private var browser: NWBrowser?
-    /// Live browse results, keyed by `VortXDiscoveredHost.id`.
+    private let resources = VortXEngineDiscoveryResources()
+    private var browseGeneration: UUID?
     private var results: [String: NWBrowser.Result] = [:]
-    /// Addresses learned by probing, keyed the same way. Survives a metadata change, because a host that
-    /// renames itself has not moved.
     private var resolved: [String: ResolvedAddress] = [:]
-    /// Probes in flight, held so `stop()` can cancel them instead of leaking sockets.
-    private var probes: [String: NWConnection] = [:]
 
-    private struct ResolvedAddress: Equatable {
+    private struct ResolvedAddress: Equatable, Sendable {
         let host: String
         let port: Int
     }
 
     init() {}
 
-    deinit {
-        // A screen-scoped browser that is deallocated without an explicit stop must still release its mDNS
-        // registration and any in-flight probe. Touching the fields directly rather than calling `stop()`
-        // keeps this free of a main-queue hop that would outlive `self`.
-        browser?.cancel()
-        probes.values.forEach { $0.cancel() }
-    }
-
-    // MARK: Public contract
-
-    /// Begin browsing. Idempotent: a second call while already browsing does nothing at all.
+    /// Idempotent start. There is no settings write, pairing, default selection or implicit adoption.
     func start() {
-        lock.lock()
-        guard browser == nil else {
-            lock.unlock()
-            return
-        }
-        // `bonjourWithTXTRecord` rather than plain `bonjour`: the version, name and capability list arrive with
-        // the browse result, so a list renders complete without one connection per host. Without it every row
-        // would need its own resolve before it could even be labelled.
+        guard resources.browser == nil else { return }
+        let generation = UUID()
         let descriptor = NWBrowser.Descriptor.bonjourWithTXTRecord(
-            type: VortXEngineProtocol.bonjourServiceType,
-            domain: nil
+            type: VortXEngineProtocol.bonjourServiceType, domain: nil
         )
-        let parameters = NWParameters.tcp
-        // `includePeerToPeer` stays off (its default). An engine host is a Mac on the LAN, and turning it on
-        // would light up AWDL to look for hosts that by definition are not there, at a real cost to Wi-Fi.
-        let newBrowser = NWBrowser(for: descriptor, using: parameters)
-        browser = newBrowser
-        lock.unlock()
+        let newBrowser = NWBrowser(for: descriptor, using: .tcp)
+        browseGeneration = generation
+        resources.browser = newBrowser
 
+        // Network does not promise main-actor delivery. Its checked Sendable state/result values
+        // enter one serial main reducer; no unstructured Task ordering is assumed.
         newBrowser.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.setBrowsing(true)
-                DiagnosticsLog.log("engine", "browse: ready")
-            case .failed(let error):
-                // Terminal for an `NWBrowser`: it does not recover, it has to be recreated. Tearing down here
-                // means a caller's later `start()` builds a fresh one instead of no-oping on a dead object.
-                DiagnosticsLog.log("engine", "browse: failed: \(String(describing: error))")
-                self.stop()
-            case .waiting(let error):
-                // Typically no network path yet, or the local-network permission prompt. The browser retries on
-                // its own, so this stays informational and nothing is torn down.
-                DiagnosticsLog.log("engine", "browse: waiting: \(String(describing: error))")
-            case .cancelled:
-                self.setBrowsing(false)
-            default:
-                break
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.browseGeneration == generation else { return }
+                switch state {
+                case .ready:
+                    self.isBrowsing = true
+                    DiagnosticsLog.log("engine", "browse: ready")
+                case .failed(let error):
+                    DiagnosticsLog.log("engine", "browse: failed: \(String(describing: error))")
+                    self.stop()
+                case .waiting(let error):
+                    DiagnosticsLog.log("engine", "browse: waiting: \(String(describing: error))")
+                case .cancelled:
+                    self.isBrowsing = false
+                default:
+                    break
+                }
             }
         }
-
-        newBrowser.browseResultsChangedHandler = { [weak self] results, _ in
-            // The full result set is used and the change set is ignored on purpose. Reconciling adds, removes
-            // and metadata changes by hand is where duplicate and ghost rows come from; rebuilding from the
-            // authoritative set is the same work and cannot drift from it.
-            self?.apply(results)
+        newBrowser.browseResultsChangedHandler = { [weak self] incoming, _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.apply(incoming, generation: generation)
+            }
         }
-
         newBrowser.start(queue: queue)
     }
 
-    /// Stop browsing, drop everything found, and cancel every probe in flight. Idempotent.
+    /// Revoke the original browse BEFORE cancellation; old terminal callbacks cannot stop a new one.
     func stop() {
-        lock.lock()
-        let live = browser
-        browser = nil
-        let open = Array(probes.values)
-        probes.removeAll()
+        browseGeneration = nil
+        let live = resources.browser
+        resources.browser = nil
+        let open = Array(resources.probes.values)
+        resources.probes.removeAll()
         results.removeAll()
         resolved.removeAll()
-        lock.unlock()
-
-        guard live != nil || !open.isEmpty else { return }
+        hosts = []
+        isBrowsing = false
         live?.cancel()
-        open.forEach { $0.cancel() }
-        publish([])
-        setBrowsing(false)
-        DiagnosticsLog.log("engine", "browse: stopped")
+        open.forEach { $0.connection.cancel() }
+        if live != nil || !open.isEmpty {
+            DiagnosticsLog.log("engine", "browse: stopped")
+        }
     }
 
-    /// Re-run the resolve probe for one host. For a UI that offers a retry on a row whose `address` never
-    /// arrived; also the right call after a network change, since a host that moved keeps its identity and
-    /// would otherwise keep serving a stale address.
     func reresolve(_ host: VortXDiscoveredHost) {
-        lock.lock()
+        guard let generation = browseGeneration else { return }
         resolved[host.id] = nil
         let result = results[host.id]
-        let alreadyProbing = probes[host.id] != nil
-        let snapshot = buildLocked()
-        lock.unlock()
-        publish(snapshot)
+        let alreadyProbing = resources.probes[host.id] != nil
+        publishSnapshot()
         guard let result, !alreadyProbing else { return }
-        probe(key: host.id, result: result)
+        probe(key: host.id, result: result, generation: generation)
     }
 
-    // MARK: Result reconciliation
-
-    private func apply(_ incoming: Set<NWBrowser.Result>) {
+    private func apply(_ incoming: Set<NWBrowser.Result>, generation: UUID) {
+        guard browseGeneration == generation else { return }
         var byKey: [String: NWBrowser.Result] = [:]
         for result in incoming {
             guard let key = Self.identity(for: result.endpoint) else { continue }
             byKey[key] = result
         }
-
-        lock.lock()
         results = byKey
-        // A host that went away takes its address with it: keeping one would resurrect a dead row the moment
-        // the host reappeared under a different lease.
         resolved = resolved.filter { byKey[$0.key] != nil }
-        let orphaned = probes.filter { byKey[$0.key] == nil }
-        for (key, connection) in orphaned {
-            probes[key] = nil
-            connection.cancel()
-        }
-        let pending = byKey.filter { resolved[$0.key] == nil && probes[$0.key] == nil }
-        let snapshot = buildLocked()
-        lock.unlock()
-
-        publish(snapshot)
-        // Outside the lock: `probe` takes it, and an mDNS callback is not a place to discover a deadlock.
+        let orphaned = resources.probes.filter { byKey[$0.key] == nil }
+        for key in orphaned.keys { resources.probes[key] = nil }
+        let pending = byKey.filter { resolved[$0.key] == nil && resources.probes[$0.key] == nil }
+        publishSnapshot()
+        orphaned.values.forEach { $0.connection.cancel() }
         for (key, result) in pending {
-            probe(key: key, result: result)
+            probe(key: key, result: result, generation: generation)
         }
     }
 
-    /// Turn a service endpoint into the stable identity used everywhere else. The interface is dropped
-    /// deliberately, see `VortXDiscoveredHost.id`.
     private static func identity(for endpoint: NWEndpoint) -> String? {
         guard case let .service(name, type, domain, _) = endpoint else { return nil }
         return "\(name)|\(type)|\(domain)"
     }
 
-    /// Build the published snapshot. Caller must hold `lock`.
-    private func buildLocked() -> [VortXDiscoveredHost] {
-        results.compactMap { key, result -> VortXDiscoveredHost? in
+    private func publishSnapshot() {
+        let snapshot = results.compactMap { key, result -> VortXDiscoveredHost? in
             guard case let .service(instanceName, _, _, _) = result.endpoint else { return nil }
             var txt = NWTXTRecord()
             if case let .bonjour(record) = result.metadata { txt = record }
-
             var displayName = instanceName
             if let advertised = txt[VortXEngineProtocol.TXTKey.hostName]?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !advertised.isEmpty {
                 displayName = advertised
             }
             let address = resolved[key]
-
             return VortXDiscoveredHost(
-                id: key,
-                displayName: displayName,
-                endpoint: result.endpoint,
+                id: key, displayName: displayName, endpoint: result.endpoint,
                 protocolVersion: txt[VortXEngineProtocol.TXTKey.protocolVersion].flatMap { Int($0) },
                 capabilities: VortXEngineDiscovery.decodeCapabilities(txt[VortXEngineProtocol.TXTKey.capabilities]),
                 resolvedHost: address?.host,
                 txtControlPort: Self.port(from: txt[VortXEngineDiscovery.controlPortTXTKey]),
                 advertisedPort: address?.port
             )
-        }
-        // Name first so the list reads the way the owner thinks about their machines; identity second so two
-        // Macs with the same name still hold a fixed order instead of shuffling on every update.
-        .sorted { ($0.displayName.lowercased(), $0.id) < ($1.displayName.lowercased(), $1.id) }
+        }.sorted { ($0.displayName.lowercased(), $0.id) < ($1.displayName.lowercased(), $1.id) }
+        if hosts != snapshot { hosts = snapshot }
     }
 
-    /// Parse a TXT port. Anything out of range is treated as absent rather than clamped: a nonsense value is a
-    /// broken host, and falling back to the SRV port or the documented default is more likely to be right than
-    /// a number invented from a malformed one.
     private static func port(from raw: String?) -> Int? {
         guard let raw, let value = Int(raw.trimmingCharacters(in: .whitespaces)) else { return nil }
         guard value > 0, value <= 65535 else { return nil }
         return value
     }
 
-    // MARK: Address resolution
-
-    /// Turn a `.service` endpoint into an actual address.
-    ///
-    /// **THIS COSTS A TCP CONNECTION, AND THERE IS NO WAY AROUND IT.** `NWBrowser` reports
-    /// `NWEndpoint.service(name:type:domain:interface:)` and nothing else; Network.framework exposes no
-    /// resolve-only call (the deprecated `NetService.resolve(withTimeout:)` did, and is the only API that ever
-    /// did). The supported technique is to open an `NWConnection` to the service endpoint and read
-    /// `currentPath?.remoteEndpoint` once it reaches `.ready`, which is what happens below. The connection
-    /// sends no bytes and is cancelled the moment the address is in hand.
-    ///
-    /// The host end of this is the throwaway advertisement listener, which accepts and immediately closes, so
-    /// the handshake completes and `.ready` fires before the peer's FIN arrives. If it does not, the probe
-    /// simply fails and the row stays unresolved with its endpoint intact, which is why
-    /// `VortXDiscoveredHost.endpoint` is always populated and `address` is optional.
-    private func probe(key: String, result: NWBrowser.Result) {
+    /// A resolve probe sends no application data; it only learns the ready connection's host/port.
+    private func probe(key: String, result: NWBrowser.Result, generation: UUID) {
+        guard browseGeneration == generation, results[key] == result, resources.probes[key] == nil else { return }
         let parameters = NWParameters.tcp
-        // An engine host is never across a cellular link. Prohibiting it stops a probe from ever waking an
-        // iPhone's radio to chase a LAN service, and makes an unreachable host fail fast instead of waiting.
         parameters.prohibitedInterfaceTypes = [.cellular]
-
         let connection = NWConnection(to: result.endpoint, using: parameters)
-        lock.lock()
-        probes[key] = connection
-        lock.unlock()
+        let probeID = UUID()
+        resources.probes[key] = VortXEngineDiscoveryResources.Probe(id: probeID, connection: connection)
 
-        // `NWConnection` sits in `.waiting` and retries indefinitely when it cannot reach a peer, so it will
-        // never report failure on its own for a host that has gone quiet. The deadline is what makes this
-        // bounded, and it is the only reason a probe cannot leak a socket for the life of the process.
-        let deadline = DispatchWorkItem { [weak self] in
+        // A value-only deadline needs no non-Sendable work item captured by the Network callback.
+        // Early completion removes the original probe; its later deadline becomes an exact-ID no-op.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.resolveDeadline) { [weak self] in
+            guard let self, self.browseGeneration == generation, self.resources.probes[key]?.id == probeID else { return }
             DiagnosticsLog.log("engine", "browse: resolve timed out")
-            self?.finishProbe(key: key, address: nil)
+            self.finishProbe(key: key, probeID: probeID, generation: generation, address: nil)
         }
-        queue.asyncAfter(deadline: .now() + Self.resolveDeadline, execute: deadline)
-
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                deadline.cancel()
-                let address = connection.flatMap { Self.address(from: $0.currentPath?.remoteEndpoint) }
-                if address == nil {
-                    DiagnosticsLog.log("engine", "browse: connection ready but path had no host:port")
+        connection.stateUpdateHandler = { [weak self] state in
+            // State is Sendable at iOS 12. The raw connection is NOT captured or transferred:
+            // its Sendable conformance starts at iOS 17, above this app's iOS 16 floor.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.browseGeneration == generation,
+                      let originalProbe = self.resources.probes[key], originalProbe.id == probeID else { return }
+                switch state {
+                case .ready:
+                    // Read only the same original resource AFTER both generation checks, on its owner.
+                    let address = Self.address(from: originalProbe.connection.currentPath?.remoteEndpoint)
+                    if address == nil {
+                        DiagnosticsLog.log("engine", "browse: connection ready but path had no host:port")
+                    }
+                    self.finishProbe(key: key, probeID: probeID, generation: generation, address: address)
+                case .failed(let error):
+                    DiagnosticsLog.log("engine", "browse: resolve failed: \(String(describing: error))")
+                    self.finishProbe(key: key, probeID: probeID, generation: generation, address: nil)
+                case .cancelled:
+                    self.finishProbe(key: key, probeID: probeID, generation: generation, address: nil)
+                default:
+                    break
                 }
-                self.finishProbe(key: key, address: address)
-            case .failed(let error):
-                deadline.cancel()
-                DiagnosticsLog.log("engine", "browse: resolve failed: \(String(describing: error))")
-                self.finishProbe(key: key, address: nil)
-            case .cancelled:
-                deadline.cancel()
-            default:
-                break
             }
         }
         connection.start(queue: queue)
     }
 
-    /// Retire one probe and publish the result. Safe to call more than once for the same key: the second call
-    /// finds no connection and returns, which is what makes the deadline and the state handler racing each
-    /// other harmless.
-    private func finishProbe(key: String, address: ResolvedAddress?) {
-        lock.lock()
-        guard let connection = probes.removeValue(forKey: key) else {
-            lock.unlock()
-            return
-        }
-        // Only record an address for a host that is still being advertised. A probe that lands after the host
-        // vanished would otherwise write into a dictionary `apply` has already pruned.
-        if let address, results[key] != nil {
-            resolved[key] = address
-        }
-        let snapshot = buildLocked()
-        lock.unlock()
-
-        connection.cancel()
-        publish(snapshot)
+    private func finishProbe(key: String, probeID: UUID, generation: UUID, address: ResolvedAddress?) {
+        guard browseGeneration == generation, resources.probes[key]?.id == probeID,
+              let probe = resources.probes.removeValue(forKey: key) else { return }
+        if let address, results[key] != nil { resolved[key] = address }
+        probe.connection.cancel()
+        publishSnapshot()
     }
 
-    private static func address(from endpoint: NWEndpoint?) -> ResolvedAddress? {
+    private nonisolated static func address(from endpoint: NWEndpoint?) -> ResolvedAddress? {
         guard case let .hostPort(host, port)? = endpoint else { return nil }
         guard let text = VortXEngineDiscovery.hostText(host) else { return nil }
         return ResolvedAddress(host: text, port: Int(port.rawValue))
-    }
-
-    // MARK: Publishing
-
-    private func publish(_ snapshot: [VortXDiscoveredHost]) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.hosts != snapshot else { return }
-            self.hosts = snapshot
-        }
-    }
-
-    private func setBrowsing(_ value: Bool) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isBrowsing != value else { return }
-            self.isBrowsing = value
-        }
     }
 }

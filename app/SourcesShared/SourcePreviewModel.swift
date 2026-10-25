@@ -8,7 +8,7 @@ import Combine
 /// It reuses the EXACT off-main rank path `SourceListModel` uses: capture an immutable
 /// `SourcePreferences.Snapshot` on the main actor (the chips write the live singleton via the documented
 /// direct-singleton binding, so the snapshot already reflects the draft chip state), then run
-/// `StreamRanking.rankedGroups` / `best` inside `SourcePreferences.$readingOverride.withValue(snapshot)` on a
+/// `StreamRanking.rankedGroups` / `best` inside `SourcePreferences.readingOverride.withValue(snapshot)` on a
 /// detached task so the ranker never reads the mutable singleton across threads. Keystrokes are debounced so
 /// typing into the Prefer / Avoid fields does not thrash the rank.
 @MainActor
@@ -68,7 +68,7 @@ final class SourcePreviewModel: ObservableObject {
         let inputCount = groups.reduce(0) { $0 + $1.streams.count }
         let want = topN
         Task.detached(priority: .userInitiated) { [weak self] in
-            let (rows, keptCount): ([Row], Int) = SourcePreferences.$readingOverride.withValue(snapshot) {
+            let (rows, keptCount): ([Row], Int) = SourcePreferences.readingOverride.withValue(snapshot) {
                 let ranked = StreamRanking.rankedGroups(groups)
                 let best = StreamRanking.best(ranked)
                 let bestID = best?.id

@@ -25,6 +25,24 @@ enum CinemaRailLayoutTests {
             precondition(grid.columns == 1 || grid.cardWidth >= 260, "Cards never shrink below the readable minimum")
             precondition(grid.cardWidth < 260 * 2 + 20, "Another column is added before a card doubles")
         }
+        for size in [CGSize(width: 320, height: 568), CGSize(width: 393, height: 852),
+                     CGSize(width: 600, height: 400), CGSize(width: 768, height: 1024),
+                     CGSize(width: 1024, height: 600), CGSize(width: 1440, height: 900),
+                     CGSize(width: 2880, height: 1800)] {
+            let frame = CinemaRailLayout.quickViewFrame(viewport: size)
+            precondition(frame.width > 0 && frame.height > 0)
+            precondition(frame.width <= size.width && frame.height <= size.height,
+                         "Preview never escapes a small window or landscape phone")
+            precondition(frame.width <= 1180 && (size.width < 600 || frame.height <= 820),
+                         "A large desktop keeps an intentional floating panel")
+            if size.width < 600 {
+                precondition(frame.width == size.width && frame.height == size.height,
+                             "Phone content has the full available width and scrollable height")
+            } else {
+                precondition(frame.width < size.width && frame.height < size.height,
+                             "Desktop and tablet preserve a visible catalogue behind the popup")
+            }
+        }
         func source(_ path: String) throws -> String { try String(contentsOfFile: path, encoding: .utf8) }
         let detail = try source("app/SourcesiOS/iOSDetailView.swift")
         let mac = detail.components(separatedBy: "private func macDetailBody(")[1]

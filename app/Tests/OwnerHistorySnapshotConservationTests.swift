@@ -267,4 +267,88 @@ final class OwnerHistoryExactJSONAuthoredTests: XCTestCase {
         XCTAssertThrowsError(try base.replacingNativeState(bytes(#"{"roster":{"profiles":{}},"libraries":{}}"#),
             witnessID: "3", fence: bytes(child)))
     }
+    // Exercise the production raw consumer, not a numeric decoder/model substitute.
+    // These checks do not substitute for native-schema, encryption or live-ABI validation.
+    private func keyedEnvelope(_ edits: Data, revision: String = "3", finalFence: String? = nil) throws -> Data {
+        var step = try Exact.Object(bytes("{}"))
+        step.set("baseGeneration", try Exact.string("2")); step.set("revision", try Exact.string(revision))
+        step.set("edits", edits)
+        return bytes(#"{"kind":"checkpoint_delta","fence":\#(finalFence ?? child),"preparedAgainst":\#(parent),"deltaEncoding":"keyed_rows/1","keyedStateSteps":[\#(String(decoding: try step.encoded(), as: UTF8.self))],"reuseExactOwnerHistoryFromWitness":"3","requiresCompleteArchiveEnvelope":true,"durableAck":false}"#)
+    }
+    private func keyedFixture(rows: Int = 2) throws -> Exact.Snapshot {
+        var log = try Exact.Object(bytes("{}"))
+        for i in 0..<rows { log.set("raw:\(i)", bytes(#"{"offsetMs":0,"resumeAt":1,"finishedAt":1,"resetAt":0,"cwDismissedAt":0,"timesWatched":1}"#)) }
+        let library = bytes(#"{"items":[],"history":[],"continueWatching":[],"resume":{},"watched":{},"searchHistory":["dup","old","dup"],"watchLog":\#(String(decoding: try log.encoded(), as: UTF8.self)),"resumeVault":{"aliases":{"raw":"canonical"},"entries":{"canonical":{"offsetMs":1,"durationMs":0,"updatedAt":1}}},"cwBoard":[{"id":"raw","name":"Raw","progress":1,"lastPlayedAt":1}]}"#)
+        let watch = bytes(#"{"log":\#(String(decoding: try log.encoded(), as: UTF8.self)),"contexts":{},"identityLinks":[["raw","alias"]]}"#)
+        let slot = bytes(#"{"watch":\#(String(decoding: watch, as: UTF8.self)),"sourceHistory":{"original":{"raw":[-0.0,18446744073709551615,1e999]}}}"#)
+        return try .init(bytes: bytes(#"{"roster":{"profiles":{"owner":{"id":"owner"}}},"libraries":{"owner":\#(String(decoding: library, as: UTF8.self)),"inactive":\#(String(decoding: library, as: UTF8.self))},"activeProfileId":"owner","nativeSync":{"schemaVersion":6,"watches":{"owner":\#(String(decoding: watch, as: UTF8.self))},"accountSlots":{"inactive":{"slots":{"a":\#(String(decoding: slot, as: UTF8.self)),"b":\#(String(decoding: slot, as: UTF8.self))}}},"ownerHistory":{"raw":[-0.0,18446744073709551615,1e999]},"futureNative":{"keep":-0.0}},"unknownHost":{"keep":1e999}}"#), witnessID: "3", fence: bytes(parent))
+    }
+    func testKeyedLargeHistoryMatchesCompleteDeltaAndRetainsInactiveRawSources() throws {
+        let base = try keyedFixture(rows: 5000), original = base.bytes
+        let edits = bytes(#"{"libraries":{"owner":{"watchLog":{"raw:0":{"op":"remove"}},"searchHistory":{"at":1,"remove":1,"insert":["new","dup"]},"aliases":{"raw":{"op":"remove"}},"entries":{"canonical":{"op":"remove"}},"cwBoard":{"at":0,"remove":1,"insert":[]}}},"nativeWatches":{"owner":{"log":{"raw:0":{"op":"remove"}},"identityLinks":{"at":0,"remove":1,"insert":[]}}},"slotWatches":{"inactive":{"b":{"log":{"raw:0":{"op":"remove"}}}}}}"#)
+        let delta = try keyedEnvelope(edits)
+        let next = try base.applying(checkpoint: delta, allowKeyed: true, expectedFence: bytes(child))
+        var expectedRoot = try Exact.Object(base.bytes), libraries = try Exact.Object(expectedRoot.required("libraries"))
+        var library = try Exact.Object(libraries.required("owner")), log = try Exact.Object(library.required("watchLog"))
+        log.remove("raw:0"); library.set("watchLog", try log.encoded())
+        library.set("searchHistory", bytes(#"["dup","new","dup","dup"]"#)); library.remove("resumeVault"); library.remove("cwBoard")
+        libraries.set("owner", try library.encoded()); expectedRoot.set("libraries", try libraries.encoded())
+        var native = try Exact.Object(expectedRoot.required("nativeSync")), watches = try Exact.Object(native.required("watches"))
+        var watch = try Exact.Object(watches.required("owner")); watch.set("log", try log.encoded()); watch.remove("identityLinks")
+        watches.set("owner", try watch.encoded()); native.set("watches", try watches.encoded())
+        var states = try Exact.Object(native.required("accountSlots")), state = try Exact.Object(states.required("inactive"))
+        var slots = try Exact.Object(state.required("slots")), slot = try Exact.Object(slots.required("b"))
+        var slotWatch = try Exact.Object(slot.required("watch")); slotWatch.set("log", try log.encoded()); slot.set("watch", try slotWatch.encoded())
+        slots.set("b", try slot.encoded()); state.set("slots", try slots.encoded()); states.set("inactive", try state.encoded())
+        native.set("accountSlots", try states.encoded()); expectedRoot.set("nativeSync", try native.encoded())
+        XCTAssertEqual(try Exact.canonical(next.bytes), try Exact.canonical(expectedRoot.encoded()))
+        // Compare against the existing complete-delta application, not only handwritten output.
+        var nativePatch = native; nativePatch.remove("ownerHistory")
+        let coarse = bytes(#"{"kind":"checkpoint_delta","fence":\#(child),"preparedAgainst":\#(parent),"delta":{"libraries":{"owner":\#(String(decoding: try library.encoded(), as: UTF8.self))},"nativeSync":\#(String(decoding: try nativePatch.encoded(), as: UTF8.self))},"reuseExactOwnerHistoryFromWitness":"3","requiresCompleteArchiveEnvelope":true,"durableAck":false}"#)
+        XCTAssertEqual(try Exact.canonical(next.bytes), try Exact.canonical(base.applying(checkpoint: coarse, expectedFence: bytes(child)).bytes))
+        XCTAssertEqual(base.bytes, original)
+        XCTAssertLessThan(delta.count, base.bytes.count / 4)
+        XCTAssertEqual(try Exact.Object(next.nativeSyncBytes)["ownerHistory"], try Exact.Object(base.nativeSyncBytes)["ownerHistory"])
+    }
+    func testKeyedAbsentOptionalsCreatedAndRemovedWithoutLosingDuplicateOrder() throws {
+        let base = try keyedFixture()
+        let create = bytes(#"{"libraries":{"owner":{"watchContexts":{"new":{"op":"put","value":{"metaId":"new","name":"New","updatedAt":1}}}}},"nativeWatches":{},"slotWatches":{}}"#)
+        let next = try base.applying(checkpoint: keyedEnvelope(create), allowKeyed: true, expectedFence: bytes(child))
+        let library = try Exact.Object(Exact.Object(Exact.Object(next.bytes).required("libraries")).required("owner"))
+        XCTAssertNotNil(library["watchContexts"])
+        let remove = bytes(#"{"libraries":{"owner":{"watchContexts":{"new":{"op":"remove"}}}},"nativeWatches":{},"slotWatches":{}}"#)
+        var envelope = try Exact.Object(keyedEnvelope(remove, revision: "4"))
+        var currentFence = try Exact.Object(bytes(child)); currentFence.set("mutationGeneration", try Exact.string("4"))
+        envelope.set("fence", try currentFence.encoded()); envelope.set("preparedAgainst", bytes(child))
+        var step = try Exact.Object(Exact.array(envelope.required("keyedStateSteps"))[0]); step.set("baseGeneration", try Exact.string("3"))
+        envelope.set("keyedStateSteps", bytes("[") + (try step.encoded()) + bytes("]"))
+        let final = try next.applying(checkpoint: envelope.encoded(), allowKeyed: true, expectedFence: currentFence.encoded())
+        XCTAssertEqual(try Exact.canonical(final.bytes), try Exact.canonical(base.bytes))
+    }
+    func testKeyedWrongCurrentFenceRevisionAndMalformedSpliceRejectBeforePublication() throws {
+        let base = try keyedFixture(), original = base.bytes
+        let empty = bytes(#"{"libraries":{},"nativeWatches":{},"slotWatches":{}}"#)
+        XCTAssertThrowsError(try base.applying(checkpoint: keyedEnvelope(empty), expectedFence: bytes(child)))
+        var foreign = try Exact.Object(bytes(child)); foreign.set("instanceId", try Exact.string("wrong-instance"))
+        XCTAssertThrowsError(try base.applying(checkpoint: keyedEnvelope(empty, finalFence: String(decoding: try foreign.encoded(), as: UTF8.self)), allowKeyed: true, expectedFence: bytes(child)))
+        XCTAssertThrowsError(try base.applying(checkpoint: keyedEnvelope(empty, revision: "4"), allowKeyed: true, expectedFence: bytes(child)))
+        for bad in [#"{"at":18446744073709551615,"remove":1,"insert":[]}"#, #"{"at":1.0,"remove":0,"insert":[]}"#, #"{"at":0,"remove":99,"insert":[]}"#] {
+            let edit = bytes(#"{"libraries":{"owner":{"history":\#(bad)}},"nativeWatches":{},"slotWatches":{}}"#)
+            XCTAssertThrowsError(try base.applying(checkpoint: keyedEnvelope(edit), allowKeyed: true, expectedFence: bytes(child)))
+        }
+        XCTAssertEqual(base.bytes, original)
+    }
+    func testKeyedCrossObjectUnicodeAliasesAndUnknownMutationFieldsReject() throws {
+        let base = try keyedFixture()
+        var root = try Exact.Object(base.bytes), libraries = try Exact.Object(root.required("libraries"))
+        var owner = try Exact.Object(libraries.required("owner")); owner.set("watchContexts", bytes(#"{"é":{"metaId":"é"}}"#))
+        libraries.set("owner", try owner.encoded()); root.set("libraries", try libraries.encoded())
+        let unicode = try Exact.Snapshot(bytes: root.encoded(), witnessID: "3", fence: bytes(parent))
+        for operation in [#"{"op":"remove"}"#, #"{"op":"put","value":{}}"#] {
+            let edits = bytes(#"{"libraries":{"owner":{"watchContexts":{"e\u0301":\#(operation)}}},"nativeWatches":{},"slotWatches":{}}"#)
+            XCTAssertThrowsError(try unicode.applying(checkpoint: keyedEnvelope(edits), allowKeyed: true, expectedFence: bytes(child)))
+        }
+        let injected = bytes(#"{"libraries":{},"nativeWatches":{},"slotWatches":{},"ownerHistory":{}}"#)
+        XCTAssertThrowsError(try base.applying(checkpoint: keyedEnvelope(injected), allowKeyed: true, expectedFence: bytes(child)))
+    }
 }

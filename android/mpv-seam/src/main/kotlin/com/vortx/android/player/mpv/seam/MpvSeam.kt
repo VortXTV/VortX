@@ -22,6 +22,8 @@ class MpvSeam private constructor() {
     private var handleGate: MpvNativeHandleGate? = null
     private val destroyDispatcher = MpvNativeDestroyDispatcher()
     private val surfaceLock = Any()
+    // Lease outermost, filter monitor innermost; never acquire a player-generation monitor here.
+    private val audioFilterLock = Any()
     private val observers = MpvObserverRegistry<EventObserver>()
     private val logObservers = MpvObserverRegistry<LogObserver>()
 
@@ -64,6 +66,10 @@ class MpvSeam private constructor() {
     }
     private external fun nativeInit(instance: Long)
 
+    /** No callout: the existing handle gate reads this original one-way cell at each lease admission. */
+    fun bindOriginalOwner(liveness: java.util.concurrent.atomic.AtomicBoolean): Boolean =
+        handleGate?.bindOriginalOwner(liveness) == true
+
     fun destroy() {
         val gate = handleGate ?: return
         // Close admission synchronously so no observer/thread can race in after destroy. With no active
@@ -98,18 +104,32 @@ class MpvSeam private constructor() {
     private external fun nativeDetachSurface(instance: Long): Int
 
     fun command(cmd: Array<String>) {
-        handleGate?.withHandle(Unit) { instance -> nativeCommand(instance, cmd) }
+        handleGate?.withSerializedHandle(audioFilterLock, Unit) { instance -> nativeCommand(instance, cmd) }
     }
     private external fun nativeCommand(instance: Long, cmd: Array<String>)
 
     /** Actual loadfile result, not a later read of whichever entry is current. No retry on null. */
-    fun loadFileWithEntryID(url: String): Long? = handleGate?.withHandle(-1L) { instance ->
+    fun loadFileWithEntryID(url: String): Long? = handleGate?.withSerializedHandle(audioFilterLock, -1L) { instance ->
         nativeLoadFileWithEntryID(instance, url)
     }?.takeIf { it >= 0L }
     private external fun nativeLoadFileWithEntryID(instance: Long, url: String): Long
 
+    /** No arbitrary filter text: native owns the label, recipes, typed snapshot and exact rollback. */
+    fun setSessionAudioPreset(preset: Int, expectedEntryID: Long): IntArray {
+        if (preset !in 0..2 || expectedEntryID < 0L) return intArrayOf(4, -1)
+        return handleGate?.withSerializedHandle(audioFilterLock, intArrayOf(4, -1)) { instance ->
+            try {
+                nativeSetSessionAudioPreset(instance, preset, expectedEntryID)
+            } catch (_: UnsatisfiedLinkError) {
+                // Old packaged glue must be explicitly unavailable, never an optimistic selection.
+                intArrayOf(4, -1)
+            }
+        } ?: intArrayOf(4, -1)
+    }
+    private external fun nativeSetSessionAudioPreset(instance: Long, preset: Int, expectedEntryID: Long): IntArray
+
     fun setOptionString(name: String, value: String): Int {
-        return handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE) { instance ->
+        return handleGate?.withSerializedHandle(audioFilterLock, NATIVE_CALL_UNAVAILABLE) { instance ->
             nativeSetOptionString(instance, name, value)
         } ?: NATIVE_CALL_UNAVAILABLE
     }
@@ -151,7 +171,10 @@ class MpvSeam private constructor() {
     private external fun nativeGetPropertyString(instance: Long, property: String): String?
 
     fun setPropertyString(property: String, value: String) {
-        handleGate?.withHandle(Unit) { instance -> nativeSetPropertyString(instance, property, value) }
+        // Includes options/ and file-local-options/ aliases; one write order, no AF alias bypass.
+        handleGate?.withSerializedHandle(audioFilterLock, Unit) { instance ->
+            nativeSetPropertyString(instance, property, value)
+        }
     }
     private external fun nativeSetPropertyString(instance: Long, property: String, value: String)
 

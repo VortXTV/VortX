@@ -6,7 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { fork } = require('node:child_process');
+const { fork, spawnSync } = require('node:child_process');
 const xperienceInputs = require('../test/xperience-harness-inputs.cjs');
 const { extractDeclaration } = xperienceInputs;
 const root = path.resolve(__dirname, '..');
@@ -126,8 +126,8 @@ function extractDiscovery() {
 }
 
 function extractTraktNextInputs() {
-    // Same exact session-prefix and formatter-donor policy as the existing watched runner.
-    // No OAuth/Keychain runtime, whole CoreModels graph, formatter rewrite or source stub.
+    // Same exact session-prefix and actual parser policy as the existing watched runner.
+    // The historical fresh-instance donor is retained separately, never compiled instead of production.
     const policy = captured.get('app/SourcesShared/TraktScrobbleProgressPolicy.swift').toString('utf8');
     const marker = '/// FIFO for Trakt';
     const end = policy.indexOf(marker);
@@ -139,12 +139,12 @@ function extractTraktNextInputs() {
         'extension ISO8601DateFormatter {') + '\n';
     const donor = extractDeclaration(captured.get('app/Tests/TraktOAuthBrokerContractTests.swift').toString('utf8'),
         'extension ISO8601DateFormatter {') + '\n';
-    const formatter = 'import Foundation\n\n' + donor;
+    const formatter = 'import Foundation\n\n' + actual;
     const recipe = captured.get('scripts/test-trakt-watched-snapshot.sh').toString('utf8');
     const expected = [
-        ['CoreModelsEPGFormatter.actual.swift', actual, '5002dda6ea34769312bc0d85566f13a28595e9f011c818aa380987277d540a93'],
+        ['CoreModelsEPGFormatter.actual.swift', actual, 'b620fb48849415ca6bd2d888e7bc33ceea7fc03d1e141855c9976b791f48126e'],
         ['TraktEPGFormatter.donor.swift', donor, '6de164e822df8c8feebf9ac67d2d2ceeb6f6fceac414401ed8fb735afbe5d38a'],
-        ['TraktEPGFormatter.swift', formatter, 'ee82aaf6c2f5758e3efa73ad1141ba85eeb57feb3179b95c54a6a7dd706506bb']
+        ['TraktEPGFormatter.swift', formatter, '5a2b08a30e624f9bd1fabe438141113c930e7400840d7e906c77e8a19fcca9e3']
     ];
     for (const [name, bytes, sha256] of expected) {
         if (digest(Buffer.from(bytes)) !== sha256 || !recipe.includes(sha256)) throw new Error('Original Trakt formatter policy changed: ' + name);
@@ -157,7 +157,7 @@ function extractTraktNextInputs() {
         formatterPolicyOwner: 'scripts/test-trakt-watched-snapshot.sh',
         formatterPolicySHA256: digest(captured.get('scripts/test-trakt-watched-snapshot.sh')),
         formatterArtifacts: expected.map(([name, , sha256]) => ({ name, sha256 })),
-        declarationTransformations: [], excludes: ['OAuth/transport/persistence', 'CoreModels shared-formatter cache concurrency', 'Home/SwiftUI/native adapter']
+        declarationTransformations: [], excludes: ['OAuth/transport/persistence', 'Full application/thread-pool lifetime', 'Home/SwiftUI/native adapter']
     }, null, 2) + '\n');
     return [write('generated/TraktSessionBoundary.swift', boundary),
         path.join(directory, 'generated/TraktEPGFormatter.swift')];
@@ -295,8 +295,12 @@ async function main() {
         sources = ['app/SourcesShared/OwnerHistoryExactJSON.swift',
             'app/Tests/OwnerHistorySnapshotConservationTests.swift', 'app/Tests/OwnerHistorySnapshotConservationMain.swift'];
     } else if (fifo) {
-        sources = ['app/SourcesShared/VortxNativeRuntime.swift', 'app/SourcesShared/VortxResourceBridge.swift',
-            'app/SourcesShared/VortxNativeHostFieldMutation.swift', 'app/SourcesShared/VortxNativeFIFOAdmission.swift',
+        // Ownership-only lane: retain exact declaration provenance without importing the
+        // unrelated C ABI/runtime/resource implementation or requiring a packaged SDK.
+        capture('test/xperience-harness-inputs.cjs');
+        capture('app/SourcesShared/VortxNativeRuntime.swift');
+        capture('app/SourcesShared/VortxNativeHostFieldMutation.swift');
+        sources = ['app/SourcesShared/VortxNativeFIFOAdmission.swift',
             'app/Tests/VortxNativeFIFOAdmissionTests.swift', 'app/Tests/VortxNativeFIFOAdmissionMain.swift'];
     } else if (stage === 'publication') {
         sources = ['app/Tests/CoreBridgePublicationFenceContractTests.swift'];
@@ -355,6 +359,16 @@ async function main() {
     // exact source once; no old test entry or production input is removed.
     sources = [...new Set(sources)];
     sources.forEach(capture);
+    let subtitleProofMode;
+    if (sources.includes('app/SourcesShared/CredentialScope.swift')) {
+        ['app/SourcesShared/CoreBridge.swift', 'app/SourcesShared/VortxNativeCoreFacade.swift',
+            'app/SourcesShared/LegacyWatchOwnership.swift',
+            'scripts/extract-subtitle-proof-hosts.cjs'].forEach(capture);
+        const hasBridge = sources.includes('app/SourcesShared/CoreBridge.swift');
+        const hasFacade = sources.includes('app/SourcesShared/VortxNativeCoreFacade.swift');
+        if (!(hasBridge && hasFacade)) subtitleProofMode = hasBridge ? 'facade-shell'
+            : hasFacade ? 'bridge-shell' : 'full-shells';
+    }
     fs.mkdirSync(path.join(root, 'app/build'), { recursive: true });
     directory = fs.mkdtempSync(path.join(root, `app/build/native-migration-${stage}.`));
     process.stdout.write(`Retained ${stage} source-unit receipts: ${directory}\n`);
@@ -366,7 +380,23 @@ async function main() {
     const copies = new Map();
     for (const [file, bytes] of captured) copies.set(file, write(`source-evidence/${file}`, bytes));
     const inputs = sources.map(file => copies.get(file));
-    if (mpvTLS) {
+    if (fifo) {
+        const declarations = [
+            { owner: 'app/SourcesShared/VortxNativeRuntime.swift', signature: 'enum VortxNativeError:' },
+            { owner: 'app/SourcesShared/VortxNativeHostFieldMutation.swift', signature: 'protocol VortxMutationAuthority:' }
+        ].map(item => ({
+            ...item, bytes: extractDeclaration(captured.get(item.owner).toString('utf8'), item.signature)
+        }));
+        inputs.push(write('generated/FIFOContracts.swift',
+            'import Foundation\n\n' + declarations.map(item => item.bytes).join('\n\n') + '\n'));
+        write('fifo-contract-extraction.json', JSON.stringify({
+            declarations: declarations.map(({ owner, signature, bytes }) => ({
+                owner, signature, ownerSHA256: digest(captured.get(owner)), declarationSHA256: digest(Buffer.from(bytes))
+            })),
+            declarationTransformations: [],
+            boundary: 'Whole actual FIFO and unchanged 14-case XCTest files; exact enum/protocol only, no native ABI, resource, Session, storage or owned-receipt proof'
+        }, null, 2) + '\n');
+    } else if (mpvTLS) {
         const controller = captured.get('app/Sources/Player/MPVMetalViewController.swift').toString('utf8');
         const declarations = ['    private func applyRequiredTLSPolicy() -> Bool',
             '    private func configureLiveMode(_ live: Bool)'].map(signature => ({
@@ -397,7 +427,17 @@ async function main() {
             declarationTransformations: [], factoryExtraction: false
         }, null, 2) + '\n');
     }
-    write('compiler-inputs.sha256', inputs.map(file => `${digest(fs.readFileSync(file))}  ${path.relative(directory, file)}\n`).join(''));
+    if (subtitleProofMode) {
+        fs.mkdirSync(path.join(directory, 'generated'), { recursive: true });
+        const proofHost = path.join(directory, 'generated/NativeSubtitleProofHosts.swift');
+        const proofRun = spawnSync(process.execPath, [copies.get('scripts/extract-subtitle-proof-hosts.cjs'),
+            root, subtitleProofMode, proofHost], { cwd: root, encoding: 'utf8' });
+        if (proofRun.error || proofRun.status !== 0) throw new Error('Actual subtitle proof extraction failed: ' + (proofRun.stderr || proofRun.error));
+        inputs.push(proofHost);
+        write('subtitle-owner-proof-hosts.json', proofRun.stdout);
+    }
+    write('compiler-inputs.sha256', inputs.map(file => digest(fs.readFileSync(file)) + '  ' + path.relative(directory, file) + '\n').join(''));
+
     verifySources('source-precompile');
     const executable = path.join(directory, 'fixture');
     const helper = copies.get('scripts/native-migration-supervisor.cjs');

@@ -67,7 +67,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.withFrameNanos
@@ -94,7 +93,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.R
-import com.vortx.android.VortXApplication
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.player.extras.AutoLandscapeSetting
 import com.vortx.android.player.extras.HdrToneMapSetting
@@ -115,8 +113,6 @@ import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.theme.vortxGlassPanel
 import com.vortx.android.ui.theme.vortxGlassProminent
-import java.net.URI
-import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /// Sheets are shared by the phone and TV hosts. Focus trapping is only valid for the couch host: a phone
@@ -168,6 +164,8 @@ fun PlayerChrome(
     audioOutputMode: AudioOutputMode,
     onAdjustAudioDelay: (Double) -> Unit,
     onSelectAudioOutputMode: (AudioOutputMode) -> Unit,
+    sessionAudioPreset: SessionAudioPresetState = SessionAudioPresetState(),
+    onSelectSessionAudioPreset: (SessionAudioPreset) -> Unit = {},
     /// Whether the top scrim + control cluster and the bottom transport bar are drawn. The selection
     /// sheets and the error overlay are NOT gated on it: a sheet the viewer opened must survive an
     /// auto-hide tick, and an error must always be visible. The host owns the show/hide/auto-hide
@@ -211,6 +209,10 @@ fun PlayerChrome(
     /// [onSelectAddonSubtitle]. Empty (the default) leaves the sheet exactly as before.
     addonSubtitles: List<AddonSubtitle> = emptyList(),
     onSelectAddonSubtitle: (AddonSubtitle) -> Unit = {},
+    /// Pool IO/timing belongs to the player host's source/account/profile lifetime, not a sheet.
+    pooledSubtitles: List<SubtitlePoolClient.PooledSubtitle> = emptyList(),
+    poolLoadingId: Int? = null,
+    onSelectPooledSubtitle: (SubtitlePoolClient.PooledSubtitle) -> Unit = {},
     /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
     /// no community sheet (the common case for a title nobody has contributed yet, and always so while
     /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
@@ -226,6 +228,8 @@ fun PlayerChrome(
     /// (movies, trailers, ad-hoc links). Picking one switches in place via [onSwitchEpisode].
     episodeOptions: List<Episode> = emptyList(),
     currentSource: StreamSource? = null,
+    queueCount: Int = 0,
+    onShowQueue: (() -> Unit)? = null,
     sourceSwitching: Boolean = false,
     episodeSwitchPending: Boolean = false,
     sourceSwitchError: String? = null,
@@ -372,34 +376,6 @@ fun PlayerChrome(
     }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
     val engineChoices = remember { PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled) }
-
-    // WHY audit 07.5: only query the community pool when embedded + add-on choices are thin. IMDb is the
-    // authority; the visible title/year and URL filename are soft release hints for fingerprint matching.
-    val subtitleScope = rememberCoroutineScope()
-    val poolSignedIn = (context.applicationContext as? VortXApplication)?.syncManager?.isSignedIn == true
-    val poolThin = state.subtitleTracks.size + addonSubtitles.size < 2
-    var pooledSubtitles by remember(playable.url, playbackSessionRevision) {
-        mutableStateOf(emptyList<SubtitlePoolClient.PooledSubtitle>())
-    }
-    var poolLoadingId by remember(playable.url, playbackSessionRevision) { mutableStateOf<Int?>(null) }
-    var poolGeneration by remember { mutableStateOf(0L) }
-    LaunchedEffect(playable.url, playbackSessionRevision, poolThin, poolSignedIn) {
-        val generation = ++poolGeneration
-        pooledSubtitles = emptyList()
-        poolLoadingId = null
-        if (!poolThin || !poolSignedIn) return@LaunchedEffect
-        val filename = runCatching { URI(playable.url).path.substringAfterLast('/') }.getOrNull()
-        val ref = playable.mediaRef
-        val result = SubtitlePoolClient.fetchForPlayback(
-            ref = ref,
-            title = ref?.title ?: playable.title,
-            year = ref?.year,
-            filename = filename,
-            durationSecs = state.durationMs.takeIf { it > 0L }?.div(1000.0),
-            isSignedIn = true,
-        )
-        if (poolGeneration == generation) pooledSubtitles = result.subs
-    }
 
     // The persisted seek-bar style, read once and updatable live by the in-player Seek Bar Style sheet. A
     // change writes Apple's key immediately (so it rides the cross-device settings blob) and redraws the
@@ -859,21 +835,7 @@ fun PlayerChrome(
                                 selected = false,
                                 enabled = poolLoadingId == null,
                                 isChoice = true,
-                                onPick = {
-                                    val generation = poolGeneration
-                                    poolLoadingId = sub.id
-                                    subtitleScope.launch {
-                                        val local = SubtitlePoolClient.download(context, sub, isSignedIn = poolSignedIn)
-                                        if (poolGeneration == generation) {
-                                            poolLoadingId = null
-                                            if (local != null) {
-                                                onSelectAddonSubtitle(
-                                                    AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"),
-                                                )
-                                            }
-                                        }
-                                    }
-                                },
+                                onPick = { onSelectPooledSubtitle(sub) },
                             ),
                         )
                     }
@@ -966,7 +928,7 @@ fun PlayerChrome(
                     outputMode = audioOutputMode,
                     onAdjust = onAdjustAudioDelay,
                     onSelectOutput = onSelectAudioOutputMode,
-                ),
+                ) + sessionAudioPresetOptions(sessionAudioPreset, onSelectSessionAudioPreset),
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
@@ -992,6 +954,12 @@ fun PlayerChrome(
             ControlSheet.MORE -> ControlSelectionSheet(
                 title = "More player controls",
                 options = buildList {
+                    onShowQueue?.let { show ->
+                        add(SheetOption("Playback queue", false, detail = "$queueCount titles ›", onPick = {
+                            openSheet = ControlSheet.NONE
+                            show()
+                        }))
+                    }
                     if (PlayerChromeOverflowAction.QUALITY in overflowPlacement.overflow) {
                         add(SheetOption(qualityTitle, false, detail = "${qualityChoices.size} options ›", onPick = {
                             openMoreSubsheet(ControlSheet.QUALITY)
@@ -1784,6 +1752,44 @@ private fun subtitleSettingsOptions(
                 onPick = { onChangeStyle(style.copy(backgroundId = id)) },
             ),
         )
+    }
+}
+
+@Composable
+private fun sessionAudioPresetOptions(
+    state: SessionAudioPresetState,
+    onSelect: (SessionAudioPreset) -> Unit,
+): List<SheetOption> = buildList {
+    add(SheetOption(stringResource(R.string.player_audio_preset_title), false, enabled = false, isHeader = true))
+    val reason = when (state.availability) {
+        SessionAudioPresetAvailability.UNSUPPORTED -> R.string.player_audio_preset_media3_unavailable
+        SessionAudioPresetAvailability.NOT_READY -> R.string.player_audio_preset_not_ready
+        SessionAudioPresetAvailability.PASSTHROUGH -> R.string.player_audio_preset_passthrough
+        SessionAudioPresetAvailability.SAFETY_UNAVAILABLE -> R.string.player_audio_preset_safety_unavailable
+        SessionAudioPresetAvailability.UNKNOWN -> R.string.player_audio_preset_unknown
+        SessionAudioPresetAvailability.READY -> null
+    }
+    val notice = when (state.notice) {
+        SessionAudioPresetNotice.REJECTED_RESTORED -> R.string.player_audio_preset_restored
+        SessionAudioPresetNotice.UNKNOWN -> R.string.player_audio_preset_unknown
+        SessionAudioPresetNotice.UNAVAILABLE -> reason ?: R.string.player_audio_preset_safety_unavailable
+        SessionAudioPresetNotice.NONE -> reason
+    }
+    if (notice != null) add(SheetOption(stringResource(notice), false, enabled = false, isHeader = true))
+    SessionAudioPreset.entries.forEach { preset ->
+        val label = when (preset) {
+            SessionAudioPreset.NORMAL -> R.string.player_audio_preset_normal
+            SessionAudioPreset.DIALOGUE -> R.string.player_audio_preset_dialogue
+            SessionAudioPreset.NIGHT -> R.string.player_audio_preset_night
+        }
+        val detail = when (preset) {
+            SessionAudioPreset.NORMAL -> R.string.player_audio_preset_normal_detail
+            SessionAudioPreset.DIALOGUE -> R.string.player_audio_preset_dialogue_detail
+            SessionAudioPreset.NIGHT -> R.string.player_audio_preset_night_detail
+        }
+        add(SheetOption(stringResource(label), state.selected == preset,
+            detail = stringResource(detail), enabled = state.canSelect(preset), isChoice = true,
+            dismissOnPick = false, onPick = { onSelect(preset) }))
     }
 }
 

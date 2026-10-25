@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum PlaybackSettings {
     enum Key {
@@ -316,9 +317,11 @@ struct TrackPreferences: Equatable {
 /// (custom mpv options, URLs) never leak. This was impossible before: preference writes were silent, which is
 /// what made the DV mystery unsolvable.
 enum SettingsChangeLog {
-    private static let lock = NSLock()
-    private static var last: [String: String] = [:]
-    private static var watching = false
+    private struct State: Sendable {
+        var last: [String: String] = [:]
+        var watching = false
+    }
+    private static let state = OSAllocatedUnfairLock(initialState: State())
 
     /// Brand prefixes that identify one of the app's own preference keys. Everything else in UserDefaults
     /// (framework and system state) is ignored so the `[settings]` channel stays a clean record of deliberate
@@ -342,19 +345,21 @@ enum SettingsChangeLog {
     /// used to snapshot the whole preferences store here on the main thread (Apple TV log, 2026-10-16). A change
     /// made while Settings was off screen is never replayed as a stale diff.
     static func setWatching(_ on: Bool) {
-        lock.lock(); defer { lock.unlock() }
-        watching = on
-        last = on ? snapshot() : [:]
+        state.withLock { state in
+            state.watching = on
+            state.last = on ? snapshot() : [:]
+        }
     }
 
     /// Log any tracked preference key that changed since the last snapshot, while Settings is on view.
     static func logChanges() {
-        lock.lock(); defer { lock.unlock() }
-        guard watching else { return }
-        let current = snapshot()
-        for (key, value) in current where last[key] != value {
-            DiagnosticsLog.log("settings", "key=\(key) value=\(VXProbeRedaction.scrub(value))")
+        state.withLock { state in
+            guard state.watching else { return }
+            let current = snapshot()
+            for (key, value) in current where state.last[key] != value {
+                DiagnosticsLog.log("settings", "key=\(key) value=\(VXProbeRedaction.scrub(value))")
+            }
+            state.last = current
         }
-        last = current
     }
 }

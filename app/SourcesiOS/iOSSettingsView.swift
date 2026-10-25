@@ -399,15 +399,15 @@ struct iOSSettingsView: View {
             // The equality guard inside capturePlayback stops a profile switch's own flat-key writes
             // from echoing back as roster edits. Single-param onChange: the zero-/two-param forms are
             // iOS 17+, target here is iOS 16.
-            .onChange(of: prefAudioLang) { _ in StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
-            .onChange(of: prefSubLang) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
-            .onChange(of: matchAudioSubRaw) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
-            .onChange(of: prefForced) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: subFont) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: subColor) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: subBrightness) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: subBackground) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: prefAudioLang) { _ in StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: prefSubLang) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: matchAudioSubRaw) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
+            .onValueChange(of: prefForced) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: subFont) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: subColor) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: subBrightness) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: subBackground) { _ in ProfileStore.shared.capturePlayback() }
             // Source-ranking taste AND the 13 stream filters are per-profile, but they bind
             // DIRECTLY to the SourcePreferences singleton (no @AppStorage mirror), so without a
             // capture a filter edit lived ONLY in the flat keys: the roster stayed nil and the
@@ -418,15 +418,15 @@ struct iOSSettingsView: View {
             // body's type-check budget (b176 gate; mirrored here to keep this body cheap too). The
             // equality guard inside capturePlayback keeps a switch's own reload() echo from
             // becoming a roster edit unless it genuinely materializes new values.
-            .onChange(of: sourcePrefs.rankingSignature) { _ in ProfileStore.shared.capturePlayback() }
+            .onValueChange(of: sourcePrefs.rankingSignature) { _ in ProfileStore.shared.capturePlayback() }
             // Appearance is per-profile (accent + OLED chrome + text size, all mirrored into
             // ThemeManager); fold each change back into the active profile so it survives a
             // switch/relaunch, same as tvOS RootTabView. Without the accent/oled captures, the
             // launch-time applyTheme(active) in ProfileStore.init would write the profile's stale
             // accentID back over the just-picked one, resetting the accent on every relaunch.
-            .onChange(of: theme.accentID) { _ in ProfileStore.shared.captureTheme() }
-            .onChange(of: theme.oled) { _ in ProfileStore.shared.captureTheme() }
-            .onChange(of: theme.textScale) { _ in ProfileStore.shared.captureTheme() }
+            .onValueChange(of: theme.accentID) { _ in ProfileStore.shared.captureTheme() }
+            .onValueChange(of: theme.oled) { _ in ProfileStore.shared.captureTheme() }
+            .onValueChange(of: theme.textScale) { _ in ProfileStore.shared.captureTheme() }
             // Device-scoped settings (audioOutput, forceSDRTonemap, perfMode, directLinksOnly) are
             // deliberately NOT folded back: they describe THIS device, not the viewer.
             #if os(macOS)
@@ -458,7 +458,7 @@ struct iOSSettingsView: View {
                 }
             }
             .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
-            .onChange(of: updates.manualOutcome) { outcome in
+            .onValueChange(of: updates.manualOutcome) { outcome in
                 announceManualUpdateOutcome(outcome)
                 if case .updateAvailable = outcome {
                     // Keep one sheet owner in the root shell. An explicit Settings request may use it from this
@@ -728,7 +728,7 @@ struct iOSSettingsView: View {
                     Text(lang.name).tag(lang.code)
                 }
             }
-            .onChange(of: langSelection) { newValue in
+            .onValueChange(of: langSelection) { newValue in
                 AppLanguage.set(newValue == "system" ? nil : newValue)
                 pendingLangRestart = true
             }
@@ -1023,7 +1023,7 @@ struct iOSSettingsView: View {
             // (no relaunch); the same key can also be set with VORTX_PROBE=1 at launch.
             Toggle("Diagnostic logging", isOn: $probeLogging)
                 .tint(Theme.Palette.accent)
-                .onChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
+                .onValueChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
             Text("Logs detailed activity for troubleshooting.")
                 .font(.caption).foregroundStyle(.secondary)
             // Export the rolling diagnostic log. On macOS the Mac has a filesystem, so save it to Downloads
@@ -2656,8 +2656,8 @@ private struct iOSUpcomingScreen: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { refresh() }
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refresh() }
-        .onChange(of: core.library?.catalog.count ?? 0) { _ in refresh() }
-        .onChange(of: account.addons.count) { _ in refresh() }
+        .onValueChange(of: core.library?.catalog.count ?? 0) { _ in refresh() }
+        .onValueChange(of: account.addons.count) { _ in refresh() }
         .sheet(item: $selected) { sel in
             NavigationStack { iOSDetailView(id: sel.metaId, type: sel.type, title: "") }
         }

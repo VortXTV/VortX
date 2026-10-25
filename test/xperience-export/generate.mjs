@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
 const supervisorSHA = 'c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62';
@@ -37,6 +38,17 @@ function generate(repoArgument, runArgument, runnerArgument) {
     outputs.push({path: file, sha256: hash(text)});
   }
   const donor = name => read(path.join(repo, 'app/SourcesShared', name));
+  const proofComposer = path.join(repo, 'scripts/extract-subtitle-proof-hosts.cjs');
+  read(proofComposer);
+  read(path.join(repo, 'app/SourcesShared/CoreBridge.swift'));
+  read(path.join(repo, 'app/SourcesShared/VortxNativeCoreFacade.swift'));
+  read(path.join(repo, 'app/SourcesShared/LegacyWatchOwnership.swift'));
+  const proofPath = path.join(run, 'NativeSubtitleProofHosts.swift');
+  const proofRun = spawnSync(process.execPath, [proofComposer, repo, 'full-shells', proofPath], {encoding: 'utf8'});
+  if (proofRun.error || proofRun.status !== 0) throw new Error('Actual subtitle proof extraction failed: ' + (proofRun.stderr || proofRun.error));
+  const proofReceipt = JSON.parse(proofRun.stdout);
+  outputs.push({path: proofPath, sha256: hash(fs.readFileSync(proofPath))});
+  extracts.push({declaration: 'NativeSubtitleOwnerProofs', ...proofReceipt});
   read(runner); read(fileURLToPath(import.meta.url));
   read(path.join(repo, 'test/xperience-export/pinned-fixtures.sha256'));
   if (hash(read(path.join(repo, 'test/mpv-bounded-child.mjs'))) !== supervisorSHA) throw Error('Supervisor changed');

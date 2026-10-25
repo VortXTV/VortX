@@ -6,8 +6,24 @@ on:
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
+      - "scripts/test-playback-title-queue.sh"
+      - "scripts/test-native-qr-join.cjs"
+      - "scripts/native-migration-supervisor.cjs"
+      - "scripts/test-profile-selection-read.sh"
+      - "scripts/test-native-facade-lock.sh"
+      - "test/native-facade-lock.mjs"
+      - "scripts/test-legacy-profile-recovery.sh"
+      - "scripts/test-native-playback-snapshot.sh"
+      - "scripts/test-native-library-projection-perf.sh"
       - "scripts/test-avplayer-recovery-settlement.sh"
       - "scripts/test-player-skip-chrome.sh"
+      - "scripts/test-apple-playback-profile-lifecycle.sh"
+      - "scripts/test-landscape-backdrop-cache.sh"
+      - "scripts/test-native-transport.sh"
+      - "scripts/test-apple-usenet-admission.sh"
+      - "scripts/test-apple-nzb-operation.sh"
+      - "test/native-transport-redirect.py"
+      - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
@@ -17,6 +33,11 @@ on:
       - "scripts/test-hls-seek-producer-gate.sh"
       - "scripts/test-hls-startup-reservation.sh"
       - "scripts/test-mpv-seek-settlement.sh"
+      - "scripts/test-mpv-manual-subtitle-retirement.sh"
+      - "scripts/test-avplayer-subtitle-clock.sh"
+      - "scripts/test-subtitle-mount-owner.sh"
+      - "test/subtitle-mount-owner-fixture.cjs"
+      - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-profile-roster-propagation.sh"
@@ -24,6 +45,16 @@ on:
       - "test/android-profile-picker-startup.test.mjs"
       - "scripts/test-cw-service-selection.sh"
       - "scripts/test-home-cw-selection.sh"
+      - "scripts/test-cw-worker-currentness.sh"
+      - "scripts/test-series-sticky-ownership.sh"
+      - "scripts/test-loopback-playback-assertion.sh"
+      - "scripts/test-addon-stream-publication.sh"
+      - "scripts/test-native-preference-acknowledgement.sh"
+      - "scripts/test-binge-language-continuity.sh"
+      - "test/mpv-bounded-child.mjs"
+      - "test/cw-worker-currentness.mjs"
+      - "test/cw-profile-fixture.cjs"
+      - "test/xperience-harness-inputs.cjs"
       - "scripts/test-episode-source-isolation.sh"
       - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
@@ -39,6 +70,7 @@ on:
       - "scripts/verify-native-android-artifacts.sh"
       - "scripts/tests/release-source-recovery-contract.test.mjs"
       - "scripts/generate-native-apple-project.rb"
+      - "scripts/native-apple-swift6-policy.rb"
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
@@ -56,8 +88,24 @@ on:
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
+      - "scripts/test-playback-title-queue.sh"
+      - "scripts/test-native-qr-join.cjs"
+      - "scripts/native-migration-supervisor.cjs"
+      - "scripts/test-profile-selection-read.sh"
+      - "scripts/test-native-facade-lock.sh"
+      - "test/native-facade-lock.mjs"
+      - "scripts/test-legacy-profile-recovery.sh"
+      - "scripts/test-native-playback-snapshot.sh"
+      - "scripts/test-native-library-projection-perf.sh"
       - "scripts/test-avplayer-recovery-settlement.sh"
       - "scripts/test-player-skip-chrome.sh"
+      - "scripts/test-apple-playback-profile-lifecycle.sh"
+      - "scripts/test-landscape-backdrop-cache.sh"
+      - "scripts/test-native-transport.sh"
+      - "scripts/test-apple-usenet-admission.sh"
+      - "scripts/test-apple-nzb-operation.sh"
+      - "test/native-transport-redirect.py"
+      - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
@@ -67,6 +115,11 @@ on:
       - "scripts/test-hls-seek-producer-gate.sh"
       - "scripts/test-hls-startup-reservation.sh"
       - "scripts/test-mpv-seek-settlement.sh"
+      - "scripts/test-mpv-manual-subtitle-retirement.sh"
+      - "scripts/test-avplayer-subtitle-clock.sh"
+      - "scripts/test-subtitle-mount-owner.sh"
+      - "test/subtitle-mount-owner-fixture.cjs"
+      - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-profile-roster-propagation.sh"
@@ -74,6 +127,16 @@ on:
       - "test/android-profile-picker-startup.test.mjs"
       - "scripts/test-cw-service-selection.sh"
       - "scripts/test-home-cw-selection.sh"
+      - "scripts/test-cw-worker-currentness.sh"
+      - "scripts/test-series-sticky-ownership.sh"
+      - "scripts/test-loopback-playback-assertion.sh"
+      - "scripts/test-addon-stream-publication.sh"
+      - "scripts/test-native-preference-acknowledgement.sh"
+      - "scripts/test-binge-language-continuity.sh"
+      - "test/mpv-bounded-child.mjs"
+      - "test/cw-worker-currentness.mjs"
+      - "test/cw-profile-fixture.cjs"
+      - "test/xperience-harness-inputs.cjs"
       - "scripts/test-episode-source-isolation.sh"
       - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
@@ -89,6 +152,7 @@ on:
       - "scripts/verify-native-android-artifacts.sh"
       - "scripts/tests/release-source-recovery-contract.test.mjs"
       - "scripts/generate-native-apple-project.rb"
+      - "scripts/native-apple-swift6-policy.rb"
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
@@ -129,44 +193,129 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Ensure ripgrep is available
+        id: apple_prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
+          fi
+          rg --version
       - run: bash scripts/test-release-orchestration-contracts.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: ruby scripts/test-native-apple-project.rb
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-cinema-rail-layout.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-avplayer-recovery-settlement.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-player-skip-chrome.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-apple-playback-profile-lifecycle.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-landscape-backdrop-cache.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-native-transport.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-tv-search-collections.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-addon-selfhosted.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-episode-source-isolation.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - name: Fetch immutable public next-episode cancellation baseline
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
         run: git fetch --no-tags --depth=1 origin f9c45518ba6b8d779343c076da9f0dbcda129a30
       - run: bash scripts/test-next-preparation-attempt.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_apple_package.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_release_native_snapshot_argv.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_android_release_version.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_tv_hidden_up_reveal.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node --test workers/vortx-appcast/test/index.test.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-subtitle-source-contracts.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-apple-playback-recovery.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: node scripts/test-native-qr-join.cjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-selection-read.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-native-facade-lock.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-legacy-profile-recovery.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - name: Fetch immutable public playback snapshot baseline
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        run: git fetch --no-tags --depth=1 origin 57e1a98806d99b1ba074a455791b20aaea33894a
+      - run: bash scripts/test-native-playback-snapshot.sh working-tree --focused
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - name: Fetch immutable public Library projection oracle
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        run: git fetch --no-tags --depth=1 origin 82cc8387222469d36dfbb7fc09881c375e36de45
+      - run: bash scripts/test-native-library-projection-perf.sh working-tree --functional-only
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-issue240-playback-failures.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-source-continuity-and-seek-intent.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-hls-seek-producer-gate.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-hls-startup-reservation.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-mpv-seek-settlement.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-mpv-manual-subtitle-retirement.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-avplayer-subtitle-clock.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-subtitle-mount-owner.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-subtitle-timing-policy.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-sync-derived-document-revisions.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-native-bootstrap-archive.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-roster-propagation.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node --test test/android-profile-picker-startup.test.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - name: Fetch immutable public Continue Watching regression baselines
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
         run: |
           git fetch --no-tags --depth=1 origin 0e196c586ebe95810476be8efde84fb0c061ca12
           git fetch --no-tags --depth=1 origin 01a0ec988205781d345d94ec2c30a65d1f1bca8c
       - run: bash scripts/test-cw-service-selection.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-home-cw-selection.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-cw-worker-currentness.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-series-sticky-ownership.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-loopback-playback-assertion.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-addon-stream-publication.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-native-preference-acknowledgement.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-apple-parity-contracts.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node test/native-callback-generation.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-apple-player-timeline.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: swift app/Tests/MacSettingsShellContractTests.swift
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: swiftc -parse-as-library app/SourcesShared/TabBarPrefs.swift app/Tests/CompactNavigationPolicyTests.swift -o /tmp/compact-navigation-test && /tmp/compact-navigation-test
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
   web:
     if: ${{ !inputs.native_media_candidates }}
     runs-on: ubuntu-24.04

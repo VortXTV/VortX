@@ -107,7 +107,7 @@ private struct TraktConnectCard: View {
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on Trakt as watched here", isOn: $importWatched)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: importWatched) { on in
+                    .onValueChange(of: importWatched) { on in
                         // Turning import ON must pull the Trakt watched history NOW. An earlier import-off
                         // refresh already armed TraktSyncEngine's staleness throttle (it stamps on every
                         // refresh, even the ones whose pull no-op'd while the toggle was off), so a plain
@@ -125,7 +125,7 @@ private struct TraktConnectCard: View {
                 // nothing here changes it. The copy says "offer" deliberately, because a tap is required.
                 Toggle("Offer to pick up where you left off on another device", isOn: $resumeSuggestion)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: resumeSuggestion) { on in
+                    .onValueChange(of: resumeSuggestion) { on in
                         // Turning it off drops the cached positions now rather than leaving them on disk for
                         // a feature the user just declined. Turning it on lets the next pre-play open pull
                         // (refreshIfStale's own toggle gate blocked every earlier attempt).
@@ -182,8 +182,12 @@ private struct TraktConnectCard: View {
                 _ = try await TraktAuth.shared.pollForToken(session: dc.session, interval: dc.interval, expiresIn: dc.expiresIn)
                 // Authentication is a new account boundary. Supersede any signed-out no-op/in-flight pull
                 // and fetch the enabled playback surface immediately instead of inheriting its stale throttle.
-                TraktPlaybackShadow.shared.refreshNow()
-                await MainActor.run { connected = true; code = nil; qr = nil; status = "" }
+                await MainActor.run {
+                    // This successful credential event is a NEW explicit owner entry, not an old
+                    // provider completion trying to revive its retired read capability.
+                    TraktPlaybackShadow.shared.refreshNow()
+                    connected = true; code = nil; qr = nil; status = ""
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -261,7 +265,7 @@ private struct SIMKLConnectCard: View {
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on SIMKL as watched here", isOn: $importWatched)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: importWatched) { on in
+                    .onValueChange(of: importWatched) { on in
                         // Turning import ON must pull the SIMKL completed history NOW rather than on the next
                         // unrelated rebuild tick. refreshNow forces the schedule past the staleness throttle
                         // (see SIMKLWatchedShadow.refreshNow), so the just-enabled watched titles badge
@@ -273,7 +277,7 @@ private struct SIMKLConnectCard: View {
                 // rating: they live in SIMKLRatingsStore's local shadow, so turning it back on brings them back.
                 Toggle("Rate titles and sync your ratings", isOn: $ratings)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: ratings) { on in
+                    .onValueChange(of: ratings) { on in
                         // Turning it ON converges the user's existing SIMKL ratings now (drain any unpushed
                         // local edits, then pull the read-back) rather than on the next detail-page open.
                         if on { SIMKLRatingsStore.shared.refreshNow() }

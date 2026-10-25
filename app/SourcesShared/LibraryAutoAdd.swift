@@ -25,14 +25,18 @@ enum LibraryAutoAdd {
     private static let cap = 2000   // bound the remembered-ids set so it can't grow without limit
 
     /// The per-profile storage key. Falls back to a shared key when there is no active profile id.
-    private static func storageKey(profileID: UUID? = ProfileStore.shared.activeID) -> String {
+    private static func storageKey(profileID: UUID?) -> String {
         let namespace = CredentialScopeRegistry.shared.capture().namespace
         return "\(keyPrefix).native.\(namespace).\(profileID?.uuidString ?? "unavailable")"
     }
 
     /// Whether this (active-profile, id) has already been auto-added once. Public so the caller can cheaply
     /// short-circuit the ~60s tick without building any meta.
-    static func hasAutoAdded(_ id: String, profileID: UUID? = ProfileStore.shared.activeID) -> Bool {
+    static func hasAutoAdded(_ id: String) -> Bool {
+        hasAutoAdded(id, profileID: ProfileStore.shared.activeID)
+    }
+
+    static func hasAutoAdded(_ id: String, profileID: UUID?) -> Bool {
         (UserDefaults.standard.stringArray(forKey: storageKey(profileID: profileID)) ?? []).contains(id)
     }
 

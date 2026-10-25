@@ -1,457 +1,303 @@
+// Shared trailer range-proxy facade. Network.framework and URLSession objects
+// remain owned by the Objective-C transport; this Swift type coordinates
+// lease, port, preparation, and value-only readiness state for the player.
+
 import Foundation
-import Network
 
-/// A tiny local HTTP/1.1 range-proxy that sits between libmpv and googlevideo so YouTube trailers play.
-///
-/// WHY THIS EXISTS: googlevideo now 403s every Range shape libmpv/FFmpeg can send on its own. FFmpeg opens a
-/// media URL with either an open-ended `Range: bytes=0-` or no Range header at all, and googlevideo answers 403
-/// to both. What it DOES answer 200 to is a bounded window expressed as a query parameter on the URL itself:
-/// `&range=start-stop` (the same mechanism the browser player uses). So we cannot fix this by handing mpv a
-/// header, we have to fetch the bytes ourselves in bounded windows and re-serve them to mpv as a clean 206.
-///
-/// WHAT IT DOES: `proxied(_:mime:)` returns a `http://127.0.0.1:<port>/yt?u=<base64url>&mime=<mime>` URL that
-/// mpv opens instead of the raw googlevideo URL. For each mpv connection the proxy:
-///   1. reads the request line + headers, parses the client `Range: bytes=start-[end]` (default 0..clen-1),
-///   2. replies `206 Partial Content` with `Content-Range`/`Content-Length`/`Accept-Ranges: bytes`,
-///   3. streams the body by fetching googlevideo in <=1 MiB `&range=pos-stop` windows (each a plain HTTP 200),
-///      sending the InnerTube IOS-client User-Agent upstream and writing each window to mpv with backpressure.
-/// A full-file `&range=0-(clen-1)` is itself REJECTED (403) by googlevideo, which is exactly why the body is
-/// chunked into <=1 MiB windows. `clen` (total content length) is always present as a query param on every
-/// googlevideo URL, so the total size is read straight from the URL rather than probed.
-///
-/// SSRF GATE: `u` is only ever proxied when its decoded host contains "googlevideo"; anything else is refused.
-/// This proxy binds to 127.0.0.1 on an OS-assigned ephemeral port, so it is reachable only from this device.
-///
-/// FAIL-SOFT: every path is wrapped so a bad request, an upstream error, or a slow/gone client just closes that
-/// one connection. `proxied` returns nil (caller falls back to the raw URL) for a non-googlevideo host or a
-/// listener that will not start. Uses Network framework, which is available on iOS, tvOS, and macOS alike.
+struct VXTrailerPreparedURLs: Sendable {
+    let video: URL?
+    let audio: URL?
+}
+
+@MainActor
 final class VXTrailerProxy {
-
     static let shared = VXTrailerProxy()
 
-    /// Upstream fetch window. googlevideo 403s a full-file `&range=0-(clen-1)`, so the body is pulled in
-    /// windows no larger than this. 1 MiB is the size proven end to end against ffmpeg in the prototype.
-    private static let windowSize = 1_048_576
-
-    /// Per-window upstream retry budget. A single googlevideo window failure (transient network error, a
-    /// non-2xx status, or an empty body) must NOT truncate the track: the fixed-length 206 already promised the
-    /// full byte count, and a trailer streams video + audio as TWO independent proxied connections, so one
-    /// unretried hiccup ends just that track mid-clip (the "audio or video dies halfway, never finishes" bug).
-    /// Each window is re-requested (idempotent `&range=`) up to this many times with backoff before giving up.
-    private static let maxWindowAttempts = 4
-    /// Base backoff between window retries, scaled by attempt number.
-    private static let windowRetryBaseDelay: TimeInterval = 0.3
-    /// Per-window upstream timeout so a stalled window fails fast (and retries) instead of hanging the track.
-    private static let windowTimeout: TimeInterval = 20
-
-    private let queue = DispatchQueue(label: "com.stremiox.vxtrailerproxy")
-
-    /// A SEPARATE queue for the listener's state/connection callbacks. It must not be `queue`: `ensureListening`
-    /// blocks `queue` on a semaphore waiting for the `.ready` state, so the state handler has to run elsewhere or
-    /// it would deadlock against that wait.
-    private let listenerQueue = DispatchQueue(label: "com.stremiox.vxtrailerproxy.listener")
-
-    /// A shared ephemeral session for the upstream window GETs (no persistent cache/cookies; each window is a
-    /// one-shot range request). Guarded by `queue`.
-    private let upstream = URLSession(configuration: .ephemeral)
-
-    private var listener: NWListener?
-
-    /// The bound ephemeral port. Written by the listener state handler (on `listenerQueue`) and read by
-    /// `ensureListening` (on `queue`), so every access goes through `portLock` to keep the two queues from
-    /// racing on it. Use `currentPort` / `setPort`, never the backing store directly.
-    private var _port: UInt16 = 0
-    private let portLock = NSLock()
-
-    private var currentPort: UInt16 {
-        portLock.lock(); defer { portLock.unlock() }
-        return _port
-    }
-
-    private func setPort(_ value: UInt16) {
-        portLock.lock(); defer { portLock.unlock() }
-        _port = value
-    }
+    private var nextLeaseID: UInt64 = 1
+    private var nextOwnerID: UInt64 = 1
+    private var nextPreparationID: UInt64 = 1
+    private var activeLeaseID: UInt64?
+    private var activePort: UInt16 = 0
+    private var activeOwners = Set<UInt64>()
+    /// Controller identities are admitted only while registered. Removing an
+    /// identity on release prevents a queued/cancelled preparation from
+    /// re-admitting it, without retaining an ever-growing tombstone set.
+    /// Scene-wide invalidate() intentionally keeps registrations because the
+    /// controller survives backgrounding and may rebind a fresh lease.
+    private var registeredOwners = Set<UInt64>()
+    /// A controller can replace one trailer preparation while another caller
+    /// still awaits the shared listener. Track those waits separately so the
+    /// canceled older preparation cannot release the newer one.
+    private var pendingPreparations: [UInt64: UInt64] = [:]
+    private var readinessGeneration: UInt64 = 0
+    /// All callers for one lease await the same readiness operation. Starting
+    /// a second native listener for the same lease would cancel the first
+    /// listener and leave its continuation without a result.
+    private var readinessTask: Task<UInt16, Never>?
 
     private init() {}
 
-    // MARK: - Public contract
+    func registerOwner() -> UInt64? {
+        guard nextOwnerID != UInt64.max else { return nil }
+        let owner = nextOwnerID
+        nextOwnerID += 1
+        registeredOwners.insert(owner)
+        return owner
+    }
 
-    /// Return a `http://127.0.0.1/yt?...` proxy URL for a googlevideo `upstream`, lazily starting the listener.
-    /// Returns nil (so the caller falls back to the raw URL) when the host is not googlevideo (SSRF gate) or the
-    /// listener cannot start.
+    /// Start or reuse one native listener and return both trailer legs as a
+    /// single value. A failed/cancelled readiness path returns both original
+    /// URLs, never a partial pair.
+    func prepare(video: URL?, audio: URL?, owner: UInt64) async -> VXTrailerPreparedURLs {
+        let videoNeedsProxy = video?.host?.contains("googlevideo") ?? false
+        let audioNeedsProxy = audio?.host?.contains("googlevideo") ?? false
+        guard videoNeedsProxy || audioNeedsProxy else {
+            return VXTrailerPreparedURLs(video: video, audio: audio)
+        }
+        // A queued caller can be cancelled before this async method begins.
+        // Refuse that call before it mutates preparation or ownership state;
+        // otherwise the ready-port fast path could leave a ghost owner behind.
+        guard !Task.isCancelled,
+              registeredOwners.contains(owner) else {
+            return VXTrailerPreparedURLs(video: video, audio: audio)
+        }
+        guard nextPreparationID != UInt64.max else {
+            return VXTrailerPreparedURLs(video: video, audio: audio)
+        }
+        let preparationID = nextPreparationID
+        nextPreparationID += 1
+        pendingPreparations[preparationID] = owner
+        activeOwners.insert(owner)
+
+        let lease: UInt64
+        if let activeLeaseID {
+            lease = activeLeaseID
+        } else {
+            guard nextLeaseID != UInt64.max else {
+                pendingPreparations.removeValue(forKey: preparationID)
+                activeOwners.remove(owner)
+                return VXTrailerPreparedURLs(video: video, audio: audio)
+            }
+            lease = nextLeaseID
+            nextLeaseID += 1
+            activeLeaseID = lease
+        }
+
+        var callerCancelled = false
+        if activePort == 0 {
+            // The lease's upstream client identity must come from the leg
+            // that actually needs proxying. A normal video plus a googlevideo
+            // audio sidecar must not derive its UA from the normal video.
+            let source = videoNeedsProxy ? video : audio
+            let userAgent = source.map { YouTubeDirectResolver.requiredUserAgent(for: $0) } ?? ""
+            let task: Task<UInt16, Never>
+            let operationGeneration: UInt64
+            if let readinessTask {
+                task = readinessTask
+                operationGeneration = readinessGeneration
+            } else {
+                readinessGeneration &+= 1
+                operationGeneration = readinessGeneration
+                let newTask = Task { @MainActor [self] in
+                    await withTaskCancellationHandler(operation: {
+                        await withCheckedContinuation { continuation in
+                            VXTrailerNetworkOwner.shared().startLease(
+                                lease,
+                                userAgent: userAgent,
+                                completion: { returnedLease, returnedPort, success in
+                                    guard returnedLease == lease else { return }
+                                    continuation.resume(returning: success ? returnedPort : 0)
+                                },
+                                failure: { returnedLease in
+                                    // A ready lease can fail after its
+                                    // continuation was consumed. This is a
+                                    // state notification, never a second
+                                    // continuation result.
+                                    guard returnedLease == lease else { return }
+                                    Task { @MainActor [weak self] in
+                                        guard let self, self.activeLeaseID == lease else { return }
+                                        self.activeLeaseID = nil
+                                        self.activePort = 0
+                                        self.readinessTask = nil
+                                        self.readinessGeneration &+= 1
+                                        self.activeOwners.removeAll()
+                                        self.pendingPreparations.removeAll()
+                                    }
+                                }
+                            )
+                        }
+                    }, onCancel: {
+                        // The caller-level cancellation fence below owns the
+                        // preparation identity. This handler runs only when
+                        // the shared readiness task itself is canceled after
+                        // every owner has been removed.
+                        Task { @MainActor in
+                            VXTrailerNetworkOwner.shared().stopLease(lease)
+                        }
+                    })
+                }
+                readinessTask = newTask
+                task = newTask
+            }
+            let port = await withTaskCancellationHandler(operation: {
+                await task.value
+            }, onCancel: {
+                Task { @MainActor in
+                    VXTrailerProxy.shared.cancelPreparation(preparationID, owner: owner)
+                }
+            })
+            callerCancelled = Task.isCancelled
+            if activeLeaseID == lease, readinessGeneration == operationGeneration {
+                readinessTask = nil
+            }
+            guard activeLeaseID == lease, port != 0 else {
+                pendingPreparations.removeValue(forKey: preparationID)
+                // A failed native readiness path has already removed its
+                // lease. A cancelled caller must not tear down a readiness
+                // task shared by another caller; the listener is reusable by
+                // the next prepare call through the same lease ID.
+                if port == 0, activeLeaseID == lease {
+                    activeLeaseID = nil
+                    activePort = 0
+                    if !pendingPreparations.values.contains(owner) {
+                        activeOwners.remove(owner)
+                    }
+                    if activeOwners.isEmpty {
+                        VXTrailerNetworkOwner.shared().stopLease(lease)
+                    }
+                }
+                return VXTrailerPreparedURLs(video: video, audio: audio)
+            }
+            guard !Task.isCancelled, !callerCancelled else {
+                // Keep the successful lease alive. The next caller can reuse
+                // it without starting a second listener.
+                pendingPreparations.removeValue(forKey: preparationID)
+                return VXTrailerPreparedURLs(video: video, audio: audio)
+            }
+            activePort = port
+        }
+
+        guard !Task.isCancelled,
+              !callerCancelled,
+              pendingPreparations[preparationID] == owner,
+              registeredOwners.contains(owner),
+              activeOwners.contains(owner) else {
+            pendingPreparations.removeValue(forKey: preparationID)
+            return VXTrailerPreparedURLs(video: video, audio: audio)
+        }
+        pendingPreparations.removeValue(forKey: preparationID)
+        let port = activePort
+        guard port != 0 else {
+            return VXTrailerPreparedURLs(video: video, audio: audio)
+        }
+        if videoNeedsProxy, let video {
+            register(video, lease: lease)
+        }
+        if audioNeedsProxy, let audio {
+            register(audio, lease: lease)
+        }
+        return VXTrailerPreparedURLs(
+            video: videoNeedsProxy ? localURL(for: video!, port: port, mime: "video/mp4") : video,
+            audio: audioNeedsProxy ? localURL(for: audio!, port: port, mime: "audio/mp4") : audio
+        )
+    }
+
+    /// Global scene lifecycle teardown. tvOS/iOS backgrounding can invalidate
+    /// the loopback listener even while a player controller remains mounted;
+    /// stop admitting new connections so the next prepare rebinds, while an
+    /// already accepted stream is allowed to finish on the old native lease.
+    /// This is distinct from release(owner:), which releases one controller's
+    /// ownership and hard-stops the lease only after every owner is gone.
+    func invalidate() {
+        pendingPreparations.removeAll()
+        activeOwners.removeAll()
+        readinessGeneration &+= 1
+        readinessTask?.cancel()
+        readinessTask = nil
+        let lease = activeLeaseID
+        let hadReadyLease = activePort != 0
+        activeLeaseID = nil
+        activePort = 0
+        guard let lease else { return }
+        // A ready listener may still have accepted streams. Scene teardown
+        // drains those streams; a listener that never became ready has no
+        // accepted work and is hard-stopped so its pending continuation closes.
+        if hadReadyLease {
+            VXTrailerNetworkOwner.shared().drainLease(lease)
+        } else {
+            VXTrailerNetworkOwner.shared().stopLease(lease)
+        }
+    }
+
+    /// Retained for source compatibility. New trailer loads use `prepare` so
+    /// listener readiness is cancellable rather than hidden in a sync wait.
     func proxied(_ upstream: URL, mime: String = "video/mp4") -> URL? {
-        guard upstream.host?.contains("googlevideo") ?? false else { return nil }
-        guard let port = ensureListening() else { return nil }
+        guard upstream.host?.contains("googlevideo") ?? false,
+              activeLeaseID != nil,
+              activePort != 0 else { return nil }
+        if let lease = activeLeaseID {
+            register(upstream, lease: lease)
+        }
+        return localURL(for: upstream, port: activePort, mime: mime)
+    }
 
-        let encoded = Self.base64url(upstream.absoluteString)
-        var comps = URLComponents()
-        comps.scheme = "http"
-        comps.host = "127.0.0.1"
-        comps.port = Int(port)
-        comps.path = "/yt"
-        comps.queryItems = [
-            URLQueryItem(name: "u", value: encoded),
+    func release(owner: UInt64) {
+        registeredOwners.remove(owner)
+        pendingPreparations = pendingPreparations.filter { $0.value != owner }
+        activeOwners.remove(owner)
+        guard activeOwners.isEmpty else { return }
+        readinessGeneration &+= 1
+        readinessTask?.cancel()
+        readinessTask = nil
+        let lease = activeLeaseID
+        activeLeaseID = nil
+        activePort = 0
+        guard let lease else { return }
+        VXTrailerNetworkOwner.shared().stopLease(lease)
+    }
+
+    private func cancelPreparation(_ preparationID: UInt64, owner: UInt64) {
+        guard pendingPreparations[preparationID] == owner else { return }
+        pendingPreparations.removeValue(forKey: preparationID)
+        guard activePort == 0,
+              !pendingPreparations.values.contains(owner) else { return }
+        activeOwners.remove(owner)
+        guard activeOwners.isEmpty else { return }
+        readinessGeneration &+= 1
+        readinessTask?.cancel()
+        readinessTask = nil
+        let lease = activeLeaseID
+        activeLeaseID = nil
+        activePort = 0
+        guard let lease else { return }
+        VXTrailerNetworkOwner.shared().stopLease(lease)
+    }
+
+    private func register(_ upstream: URL, lease: UInt64) {
+        VXTrailerNetworkOwner.shared().registerUpstreamURL(
+            upstream.absoluteString,
+            userAgent: YouTubeDirectResolver.requiredUserAgent(for: upstream),
+            leaseID: lease
+        )
+    }
+
+    private func localURL(for upstream: URL, port: UInt16, mime: String) -> URL {
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = Int(port)
+        components.path = "/yt"
+        components.queryItems = [
+            URLQueryItem(name: "u", value: Self.base64url(upstream.absoluteString)),
             URLQueryItem(name: "mime", value: mime),
         ]
-        return comps.url
+        return components.url ?? upstream
     }
 
-    /// Tear down the memoized listener so the NEXT `proxied(_:)` rebinds on a fresh ephemeral port. The proxy
-    /// memoizes its NWListener and OS-assigned port ONCE (`ensureListening` short-circuits while both are set),
-    /// but a suspend/resume can leave that port dead after tvOS/iOS reclaims the socket, so every Home-screen
-    /// hero-preview trailer then fails 100%. The scenePhase `.background` handler calls this alongside the
-    /// server stop so the proxy rebinds lazily on the next preview. Runs on `queue` (which owns `listener`);
-    /// `allowLocalEndpointReuse` is already set on the params so the immediate rebind never trips a stale bind.
-    func invalidate() {
-        queue.async {
-            self.listener?.cancel()
-            self.listener = nil
-            self.setPort(0)
-        }
-    }
-
-    // MARK: - Listener lifecycle
-
-    /// Start the listener once (idempotent) and return its bound port, or nil on failure. Serialized on `queue`
-    /// so a double-resolve (hero + trailer button within seconds) cannot race two listeners into existence.
-    private func ensureListening() -> UInt16? {
-        queue.sync {
-            if listener != nil, currentPort != 0 { return currentPort }
-
-            do {
-                // Bind explicitly to loopback so the socket is never reachable off-device: an OS-assigned
-                // ephemeral port (port 0) on 127.0.0.1 only.
-                let params = NWParameters.tcp
-                params.allowLocalEndpointReuse = true
-                params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
-                let newListener = try NWListener(using: params)
-                newListener.newConnectionHandler = { [weak self] connection in
-                    self?.handle(connection)
-                }
-                // Resolve the OS-assigned ephemeral port once the listener is ready.
-                let ready = DispatchSemaphore(value: 0)
-                newListener.stateUpdateHandler = { [weak self] state in
-                    switch state {
-                    case .ready:
-                        // The state handler runs on `listenerQueue`; `ensureListening` reads `port` on `queue`
-                        // on the semaphore-timeout path. Guard the write with `portLock` so the two queues do
-                        // not race on `port`. (We cannot hop onto `queue` here: `ensureListening` is blocked
-                        // inside `queue.sync` waiting on `ready`, so a `queue.async` would deadlock.)
-                        self?.setPort(newListener.port?.rawValue ?? 0)
-                        ready.signal()
-                    case .failed, .cancelled:
-                        ready.signal()
-                        // Self-heal: a listener that fails or is cancelled AFTER it went ready (the OS reclaimed
-                        // the loopback socket across a suspend/resume, say) must not stay memoized as a live
-                        // listener, or `ensureListening` keeps short-circuiting to a dead port and every trailer
-                        // preview fails until the next scenePhase transition. Clear it on `queue` (which owns
-                        // `listener`) so the next `proxied(_:)` rebinds even without a background/foreground cycle.
-                        // Identity-guarded so a stale handler cannot wipe a listener a later rebind already installed;
-                        // on the startup-failure path `self.listener` is still nil (only set on success below), so
-                        // this is a no-op there.
-                        self?.queue.async {
-                            guard let self, self.listener === newListener else { return }
-                            self.listener = nil
-                            self.setPort(0)
-                        }
-                    default:
-                        break
-                    }
-                }
-                newListener.start(queue: listenerQueue)
-                // Wait briefly for the ready state so the caller gets a usable port synchronously.
-                _ = ready.wait(timeout: .now() + 2)
-                let boundPort = currentPort
-                guard newListener.port?.rawValue != nil, boundPort != 0 else {
-                    newListener.cancel()
-                    return nil
-                }
-                self.listener = newListener
-                NSLog("[yt-proxy] listener started on port %d", boundPort)
-                return boundPort
-            } catch {
-                NSLog("[yt-proxy] listener start failed: %@", String(describing: error))
-                return nil
-            }
-        }
-    }
-
-    // MARK: - Per-connection handling
-
-    /// How long a client has to send a complete request header before the connection is force-cancelled. A
-    /// client that connects and then stalls (or dribbles bytes without ever sending CRLFCRLF) would otherwise
-    /// keep the NWConnection and its receive-closure chain alive forever; this bounds that to a hard deadline.
-    private static let headerDeadline: TimeInterval = 15
-
-    /// Accept one mpv connection: read its request, then stream the requested byte range from googlevideo.
-    private func handle(_ connection: NWConnection) {
-        connection.start(queue: queue)
-        // Arm a header-read deadline so a client that connects but never finishes its header does not leak the
-        // connection. Disarmed (`.cancel()`) once the header is parsed and `serve` takes over.
-        let deadline = DispatchWorkItem { connection.cancel() }
-        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadline)
-        readRequest(connection, buffer: Data(), deadline: deadline)
-    }
-
-    /// Read from the connection until the header terminator (CRLFCRLF), then serve. Bounds the header read so a
-    /// malformed client cannot make us buffer without limit. `deadline` force-cancels a client that never
-    /// completes its header; it is cancelled the moment the header is fully parsed.
-    private func readRequest(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] chunk, _, isComplete, error in
-            guard let self else { return }
-            if error != nil {
-                deadline.cancel()
-                connection.cancel()
-                return
-            }
-            var accumulated = buffer
-            if let chunk, !chunk.isEmpty {
-                accumulated.append(chunk)
-            }
-
-            let terminator = Data("\r\n\r\n".utf8)
-            if let range = accumulated.range(of: terminator) {
-                deadline.cancel()   // header complete: disarm the idle-header deadline before serving
-                let headerData = accumulated.subdata(in: accumulated.startIndex..<range.lowerBound)
-                self.serve(connection, header: headerData)
-                return
-            }
-
-            // Guard against an unbounded / never-terminated header.
-            if isComplete || accumulated.count > 64_000 {
-                deadline.cancel()
-                connection.cancel()
-                return
-            }
-            self.readRequest(connection, buffer: accumulated, deadline: deadline)
-        }
-    }
-
-    /// Parse the request header (path query `u`/`mime` + `Range:`), apply the SSRF gate, then stream windows.
-    private func serve(_ connection: NWConnection, header: Data) {
-        guard let headerText = String(data: header, encoding: .utf8) else {
-            close(connection, status: "400 Bad Request")
-            return
-        }
-        let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            close(connection, status: "400 Bad Request")
-            return
-        }
-
-        // Request line: "GET /yt?u=...&mime=... HTTP/1.1"
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 2, let comps = URLComponents(string: "http://127.0.0.1\(parts[1])") else {
-            close(connection, status: "400 Bad Request")
-            return
-        }
-        let items = comps.queryItems ?? []
-        let encodedU = items.first(where: { $0.name == "u" })?.value ?? ""
-        // Whitelist the mime before it goes into the `Content-Type:` response header. The value is client
-        // supplied, so an un-checked value (containing CR/LF) would let a local client inject extra response
-        // headers into mpv. Anything not in the known set falls back to video/mp4.
-        let mime = Self.sanitizedMime(items.first(where: { $0.name == "mime" })?.value)
-
-        guard let upstreamString = Self.base64urlDecode(encodedU),
-              let upstreamURL = URL(string: upstreamString),
-              upstreamURL.host?.contains("googlevideo") ?? false else {
-            // SSRF gate: refuse anything that is not a googlevideo URL.
-            close(connection, status: "400 Bad Request")
-            return
-        }
-
-        // `clen` (total content length) is always present on a googlevideo URL.
-        let clen = Int(URLComponents(url: upstreamURL, resolvingAgainstBaseURL: false)?
-            .queryItems?.first(where: { $0.name == "clen" })?.value ?? "") ?? 0
-        guard clen > 0 else {
-            close(connection, status: "404 Not Found")
-            return
-        }
-
-        // Parse the client Range: "Range: bytes=start-[end]" (default the whole file).
-        var start = 0
-        var end = clen - 1
-        if let rangeLine = lines.first(where: { $0.lowercased().hasPrefix("range:") }) {
-            let spec = rangeLine.drop(while: { $0 != "=" }).dropFirst()   // "start-end"
-            let bounds = spec.components(separatedBy: "-")
-            if (bounds.first ?? "").isEmpty, bounds.count > 1, let n = Int(bounds[1]), n > 0 {
-                start = max(0, clen - n); end = clen - 1   // suffix range "bytes=-N": the last N bytes (RFC 7233)
-            } else {
-                if let s = Int(bounds.first ?? ""), s >= 0 { start = s }
-                if bounds.count > 1, let e = Int(bounds[1]), e >= start { end = e }
-            }
-        }
-        end = min(end, clen - 1)
-        guard start <= end else {
-            close(connection, status: "416 Range Not Satisfiable")
-            return
-        }
-
-        let length = end - start + 1
-        let head = """
-        HTTP/1.1 206 Partial Content\r
-        Content-Type: \(mime)\r
-        Accept-Ranges: bytes\r
-        Content-Range: bytes \(start)-\(end)/\(clen)\r
-        Content-Length: \(length)\r
-        Connection: close\r
-        \r
-
-        """
-        NSLog("[yt-proxy] serving host=%@ bytes=%d-%d clen=%d", upstreamURL.host ?? "?", start, end, clen)
-
-        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
-            guard let self, error == nil else {
-                connection.cancel()
-                return
-            }
-            self.streamWindows(connection, upstream: upstreamURL, pos: start, end: end, promised: length, sent: 0)
-        })
-    }
-
-    // MARK: - Windowed streaming
-
-    /// Fetch `[pos, end]` from googlevideo one <=1 MiB `&range=` window at a time, writing each to the client
-    /// before requesting the next (backpressure keeps memory bounded to a single window). Each window is fetched
-    /// with a bounded retry (see `fetchWindow`) so a transient upstream hiccup does not truncate the track.
-    /// `promised` is the fixed Content-Length announced in the 206; `sent` is the running total already written,
-    /// used only to confirm (in the log) that the FULL body was delivered when the loop completes.
-    private func streamWindows(_ connection: NWConnection, upstream: URL, pos: Int, end: Int, promised: Int, sent: Int) {
-        guard pos <= end else {
-            // Done: the 206 body is complete. `sent` should equal `promised`; log both so a device trace can
-            // confirm the full clip streamed (a mismatch would pinpoint a truncation the fix missed).
-            NSLog("[trailer] proxy stream complete host=%@ served=%d/%d bytes", upstream.host ?? "?", sent, promised)
-            connection.cancel()
-            return
-        }
-        let stop = min(pos + Self.windowSize - 1, end)
-        fetchWindow(connection, upstream: upstream, start: pos, stop: stop, end: end, promised: promised, sent: sent, attempt: 1)
-    }
-
-    /// Fetch ONE `[start, stop]` window and, on success, write it to the client and advance to the next window.
-    /// On a transient upstream failure (network error, non-2xx status, or empty body) it re-requests the SAME
-    /// idempotent `&range=` window up to `maxWindowAttempts` with a small backoff BEFORE giving up. This is the
-    /// fix for trailers dying halfway: previously any single window failure did `connection.cancel()`, closing
-    /// the socket after fewer bytes than the fixed Content-Length promised and truncating that one track.
-    ///
-    /// SHORT-READ FIX (the remaining "stops partway" bug): googlevideo may answer a bounded `&range=start-stop`
-    /// with FEWER bytes than the window width (a 200/206 with a partial body under throttling or at an internal
-    /// segment boundary). The old loop advanced to `stop + 1` REGARDLESS of how many bytes actually arrived, so
-    /// the undelivered bytes were skipped: the fixed-length 206 was then never satisfied (mpv stalled waiting for
-    /// the missing tail) and the byte misalignment corrupted the stream, cutting playback partway. The advance is
-    /// now by the ACTUAL bytes received (`start + data.count`), so a short read simply makes the next window pick
-    /// up exactly where this one ended and the promised Content-Length is always delivered in full.
-    private func fetchWindow(_ connection: NWConnection, upstream: URL, start: Int, stop: Int, end: Int,
-                             promised: Int, sent: Int, attempt: Int) {
-        guard let windowURL = Self.appendRange(upstream, start: start, stop: stop) else {
-            connection.cancel()
-            return
-        }
-
-        var request = URLRequest(url: windowURL)
-        request.timeoutInterval = Self.windowTimeout
-        // NO Range header upstream: googlevideo answers the bounded `&range=` query with a plain 200.
-        // UA lockstep: googlevideo binds each issued URL to the InnerTube client that MINTED it, so ask the
-        // resolver for the UA recorded against THIS upstream URL (`upstream` is the exact URL the resolver
-        // returned; the `&range=` window is appended after the lookup key). With the V2 flag off the registry
-        // is empty and this returns the IOS constant, byte-identical to the previous hardcoded header.
-        request.setValue(YouTubeDirectResolver.requiredUserAgent(for: upstream), forHTTPHeaderField: "User-Agent")
-
-        let task = upstream_session_dataTask(request) { [weak self] data, response, error in
-            guard let self else { return }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let ok = error == nil && (200...299).contains(status) && (data?.isEmpty == false)
-            guard ok, let data else {
-                // Transient upstream failure: retry the SAME window (idempotent) after a short backoff rather
-                // than cancelling and truncating this track. Only close once the retry budget is exhausted.
-                if attempt < Self.maxWindowAttempts {
-                    self.queue.asyncAfter(deadline: .now() + Self.windowRetryBaseDelay * Double(attempt)) { [weak self] in
-                        self?.fetchWindow(connection, upstream: upstream, start: start, stop: stop, end: end,
-                                          promised: promised, sent: sent, attempt: attempt + 1)
-                    }
-                } else {
-                    NSLog("[trailer] proxy window %d-%d gave up after %d attempts served=%d/%d (status=%d err=%@)",
-                          start, stop, attempt, sent, promised, status, String(describing: error))
-                    connection.cancel()
-                }
-                return
-            }
-            // A short read is NOT a failure: accept the bytes and resume from where they actually ended. Clamp to
-            // the requested window so a (theoretical) over-delivery can never push past the promised
-            // Content-Length; a bounded `&range=` normally returns exactly the window, so this is just a guard.
-            let requested = stop - start + 1
-            let payload = data.count > requested ? Data(data.prefix(requested)) : data
-            if payload.count < requested {
-                NSLog("[trailer] proxy short read host=%@ window=%d-%d requested=%d got=%d (resuming from actual)",
-                      upstream.host ?? "?", start, stop, requested, payload.count)
-            }
-            connection.send(content: payload, completion: .contentProcessed { [weak self] sendError in
-                guard let self, sendError == nil else {
-                    connection.cancel()   // client went away or a slow write failed
-                    return
-                }
-                // Advance by the bytes ACTUALLY delivered, never the requested window width, so a short upstream
-                // read cannot skip bytes and truncate the stream.
-                let nextPos = start + payload.count
-                self.streamWindows(connection, upstream: upstream, pos: nextPos, end: end,
-                                   promised: promised, sent: sent + payload.count)
-            })
-        }
-        task.resume()
-    }
-
-    /// Thin wrapper so the upstream session read stays on `queue` semantics without capturing it in the name.
-    private func upstream_session_dataTask(_ request: URLRequest,
-                                           completion: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask {
-        upstream.dataTask(with: request, completionHandler: completion)
-    }
-
-    // MARK: - Helpers
-
-    /// The only mime types this proxy ever serves. Anything else (including a CR/LF-bearing injection attempt)
-    /// falls back to `video/mp4` so the `Content-Type:` response header can never carry attacker-controlled text.
-    private static let allowedMimes: Set<String> = ["video/mp4", "audio/mp4"]
-
-    /// Clamp a client-supplied mime to the known-good set, defaulting to `video/mp4`. This is the response-header
-    /// injection guard: the returned value is always a literal from `allowedMimes`, never client text.
-    private static func sanitizedMime(_ raw: String?) -> String {
-        guard let raw, allowedMimes.contains(raw) else { return "video/mp4" }
-        return raw
-    }
-
-    /// Append (or replace) the bounded `&range=start-stop` window on a googlevideo URL.
-    private static func appendRange(_ url: URL, start: Int, stop: Int) -> URL? {
-        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
-        var items = comps.queryItems ?? []
-        items.removeAll(where: { $0.name == "range" })
-        items.append(URLQueryItem(name: "range", value: "\(start)-\(stop)"))
-        comps.queryItems = items
-        return comps.url
-    }
-
-    /// Write a bare status line and close (used for the refusal / error paths).
-    private func close(_ connection: NWConnection, status: String) {
-        let body = "HTTP/1.1 \(status)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        connection.send(content: Data(body.utf8), completion: .contentProcessed { _ in
-            connection.cancel()
-        })
-    }
-
-    /// URL-safe base64 with padding stripped (round-trips through `base64urlDecode`).
     private static func base64url(_ string: String) -> String {
         Data(string.utf8).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-    }
-
-    private static func base64urlDecode(_ string: String) -> String? {
-        var s = string
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while s.count % 4 != 0 { s.append("=") }
-        guard let data = Data(base64Encoded: s) else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 }

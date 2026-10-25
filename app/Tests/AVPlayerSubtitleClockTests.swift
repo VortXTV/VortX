@@ -20,6 +20,9 @@ import Foundation
     let subtitleRenderer = SubtitleCueRenderer()
     var subtitleOverlay: SubtitleClockFixtureOverlay? = SubtitleClockFixtureOverlay()
     var externalSubActive = false
+#if VORTX_CURRENT_ALIGNMENT
+    var subtitleAlignmentGeneration: UInt64 = 0
+#endif
     var nativeOverlayInvalidations = 0
     func invalidateNativeSubtitleOverlay() { nativeOverlayInvalidations += 1 }
 }
@@ -32,6 +35,9 @@ import Foundation
     }
     static func main() {
         let engine = SubtitleClockFixtureEngine()
+#if VORTX_CURRENT_ALIGNMENT
+        guard let originalRevision = engine.subtitleAlignmentRevision else { preconditionFailure("Concrete AV lost its capability") }
+#endif
         engine.subtitleRenderer.load(cues: [
             .init(start: 1006, end: 1008, text: "earlier source cue"),
             .init(start: 1009, end: 1011, text: "current source cue"),
@@ -39,6 +45,10 @@ import Foundation
             .init(start: 2009, end: 2011, text: "wrong double-origin cue")
         ])
         engine.setExternalSubtitleActive(true)
+#if VORTX_CURRENT_ALIGNMENT
+        check("external activation retires original alignment", engine.subtitleAlignmentRevision != originalRevision)
+        let beforeSync = engine.subtitleAlignmentRevision
+#endif
         check("paused remux activation immediately displays the source-time cue",
               engine.subtitleOverlay?.text == "current source cue")
         check("activation retains external/native rendering handoff and style",
@@ -48,13 +58,26 @@ import Foundation
 
         // No periodic tick occurs between these calls: each production method must refresh the right cue itself.
         engine.setSubDelay(3)
+#if VORTX_CURRENT_ALIGNMENT
+        check("positive timing edit retires alignment", engine.subtitleAlignmentRevision != beforeSync)
+        let afterPositiveSync = engine.subtitleAlignmentRevision
+#endif
         check("paused positive sync immediately displays earlier source cue",
               engine.subtitleOverlay?.text == "earlier source cue" && engine.subtitleRenderer.offset == 3)
         engine.setSubDelay(-3)
+#if VORTX_CURRENT_ALIGNMENT
+        check("negative timing edit retires alignment", engine.subtitleAlignmentRevision != afterPositiveSync)
+#endif
         check("paused negative sync immediately displays later source cue",
               engine.subtitleOverlay?.text == "later source cue" && engine.subtitleRenderer.offset == -3)
         engine.setSubDelay(0)
+#if VORTX_CURRENT_ALIGNMENT
+        let beforeRepeatedReset = engine.subtitleAlignmentRevision
+#endif
         engine.setSubDelay(0)
+#if VORTX_CURRENT_ALIGNMENT
+        check("equal-value reset still retires pending preparation", engine.subtitleAlignmentRevision != beforeRepeatedReset)
+#endif
         check("repeated sync reset neither double-adds origin nor rewinds to player zero",
               engine.subtitleOverlay?.text == "current source cue")
         check("sync never seeks or resumes the paused player", engine.player.paused && engine.player.seconds == 10)

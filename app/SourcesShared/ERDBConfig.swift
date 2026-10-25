@@ -116,6 +116,12 @@ enum Fanart {
 /// once. Precedence: ERDB (when the user set a token) wins, then the VortX / XRDB poster service, then the
 /// original add-on artwork. Keeps the three poster call sites and the two logo slots from each re-deciding.
 enum PosterArtwork {
+    /// Shared form of the existing hero's public IMDb clearlogo fallback. Provider resolution stays below.
+    static func metahubLogo(forID id: String?) -> String? {
+        guard let id, id.hasPrefix("tt") else { return nil }
+        return "https://images.metahub.space/logo/medium/\(id)/img"
+    }
+
     /// True when an art provider bakes ratings onto the image, so the app must NOT also draw its own rating
     /// badge (avoids a double badge). This is the PROVIDER-LEVEL flag: it says a baking provider is switched
     /// on, NOT that it can render any given id. Prefer `bakesRatings(forID:)` at a per-poster badge site.

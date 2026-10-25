@@ -14,7 +14,7 @@ import Foundation
 enum TerminationReceiptPolicy {
 
     /// Last-known session state persisted by the runtime helper.
-    struct Receipt: Codable, Equatable {
+    struct Receipt: Codable, Equatable, Sendable {
         var startedAtEpoch: TimeInterval
         var lastHeartbeatEpoch: TimeInterval
         var lastPhase: String            // "active" | "inactive" | "background" | "terminating"
@@ -30,7 +30,7 @@ enum TerminationReceiptPolicy {
 
     /// Process-local state. Never seed this from the prior process's receipt: that receipt is
     /// evidence to fold, not this process's start time or memory-warning history.
-    struct Session {
+    struct Session: Sendable {
         private(set) var receipt: Receipt
 
         init(now: TimeInterval) { receipt = .initial(now: now) }

@@ -3,10 +3,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p app/build
 timeline_test_dir=$(mktemp -d app/build/player-timeline-tests.XXXXXX)
-# Extract actual production view bodies/factories/editor methods; change only access control.
+# Include the whole real value-observation helper, then extract actual view bodies/factories/editor methods.
+# Only production access control is changed; fixture actor isolation stays explicit.
 node - "$timeline_test_dir" <<'NODE'
 const fs = require('node:fs');
 const source = fs.readFileSync('app/Sources/PlayerScreen.swift', 'utf8');
+const valueChange = fs.readFileSync('app/SourcesShared/ValueChangeObservation.swift', 'utf8');
 function slice(start, end) {
   const a = source.indexOf(start), b = source.indexOf(end, a);
   if (a < 0 || b < 0) throw new Error('Missing production slice: ' + start);
@@ -21,15 +23,15 @@ const tooltip = slice('extension View {\n    func skipDBTooltip(', '\n#endif');
 const submit = fs.readFileSync('app/SourcesShared/SkipDBSubmitView.swift', 'utf8');
 const segmentType = submit.slice(submit.indexOf('    enum SegmentType:'), submit.indexOf('    enum SubmitResult'));
 if (!segmentType) throw new Error('Missing production segment types');
-const output = 'import SwiftUI\n' + leaves + '\nstruct SkipDBSubmitView {\n' + segmentType + '\n}\nextension PlayerScreen {\n' + factories + '\n' + editor + '\n' + controls + '\n' + touchActions + '\n}\n' + tooltip + '\n';
+const output = valueChange + '\n' + leaves + '\nstruct SkipDBSubmitView {\n' + segmentType + '\n}\nextension PlayerScreen {\n' + factories + '\n' + editor + '\n' + controls + '\n' + touchActions + '\n}\n' + tooltip + '\n';
 fs.writeFileSync(process.argv[2] + '/timeline.swift', output.replace(/\b(?:fileprivate|private) (?=(?:final )?(?:class|struct|enum|func|var|let))/g, ''));
 NODE
 if [[ "${1:-}" == "--prepare-only" ]]; then
-  # These identical sources can also be compiled into a UIKit simulator probe.
+  # Prepared UIKit simulator consumers must compile these identical sources in Swift 6 mode.
   printf '%s\n' "$timeline_test_dir"
   exit 0
 fi
-xcrun swiftc -O -parse-as-library \
+xcrun swiftc -swift-version 6 -O -parse-as-library \
   "$timeline_test_dir/timeline.swift" app/Sources/Player/SkipSegments.swift \
   app/SourcesShared/GlassStyle.swift app/SourcesShared/Theme.swift app/SourcesShared/ThemeManager.swift app/SourcesShared/SeekBarStyle.swift \
   app/SourcesShared/ChipButtonStyle.swift app/SourcesShared/SkipEditPolicy.swift \

@@ -89,6 +89,7 @@ extension View {
 /// Holds the macOS player view to present at the app window's ROOT. A SwiftUI `.sheet` on macOS becomes
 /// a separate, mis-positioned window; this singleton lets the deep `platformFullScreenPlayerCover` call
 /// sites hand their player up to `MacRootPlayerOverlay` so it fills the actual app window instead.
+@MainActor
 final class MacPlayerHost: ObservableObject {
     static let shared = MacPlayerHost()
     @Published var content: AnyView?
@@ -187,7 +188,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         // dismantled BEFORE this runs (rapid present-then-dismiss in the same cycle), `c.cancelled` is
         // already set, so we bail without hiding the titlebar; otherwise we'd hide it with nothing left
         // to restore it and the window would lose its titlebar permanently.
-        DispatchQueue.main.async { [weak view] in
+        DispatchQueue.main.async { [weak view, c] in
             guard !c.cancelled, let host = view?.window else { return }
             c.host = host
             c.savedTitleVisibility = host.titleVisibility
@@ -202,9 +203,13 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
             c.titlebarObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didUpdateNotification, object: host, queue: .main
             ) { [weak c] _ in
-                guard let c, !c.cancelled, let host = c.host,
-                      MacPlayerHost.shared.content != nil, host.styleMask.contains(.fullScreen) else { return }
-                c.collapseTitlebar(host)
+                // NotificationCenter's callback is nonisolated even with queue: .main. Carry only
+                // this original coordinator into the owner turn; dismantle revokes it before restore.
+                DispatchQueue.main.async { [weak c] in
+                    guard let c, !c.cancelled, let host = c.host,
+                          MacPlayerHost.shared.content != nil, host.styleMask.contains(.fullScreen) else { return }
+                    c.collapseTitlebar(host)
+                }
             }
             // DO NOT toggle `host.toolbar?.isVisible`. That NSToolbar is OWNED by SwiftUI's ToolbarBridge;
             // mutating its visibility here corrupts the bridge, so the NEXT SwiftUI-driven toolbar rebuild
@@ -238,6 +243,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    @MainActor
     final class Coordinator {
         var host: NSWindow?
         var cancelled = false
@@ -251,13 +257,14 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var titlebarObserver: NSObjectProtocol?
         var chromeSubscription: AnyCancellable?
 
-        /// Windowed: fade the window buttons with the player's controls. Called from the main-queue block in
-        /// makeNSView; the subscription delivers on the main queue too, so both reach the main-actor controls.
-        @MainActor func follow(_ window: NSWindow) {
+        /// Windowed: fade the window buttons with the player's controls. The host owns all publisher
+        /// writes on MainActor. Keep the existing queued delivery, checking this receiver's lifetime
+        /// again after the queue boundary rather than assuming a scheduler confers actor isolation.
+        func follow(_ window: NSWindow) {
             MacWindowControls.restore(in: window, visible: MacPlayerHost.shared.chromeVisible)
-            chromeSubscription = MacPlayerHost.shared.$chromeVisible.removeDuplicates().receive(on: DispatchQueue.main)
+            chromeSubscription = MacPlayerHost.shared.$chromeVisible.removeDuplicates()
                 .sink { [weak self, weak window] visible in
-                    MainActor.assumeIsolated {
+                    DispatchQueue.main.async { [weak self, weak window] in
                         guard let self, !self.cancelled, let window, !window.styleMask.contains(.fullScreen) else { return }
                         MacWindowControls.setVisible(visible, in: window)
                     }
@@ -292,6 +299,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
 /// hoist trick MacPlayerHost uses for the player. A DEDICATED singleton (not MacPlayerHost) so the picker
 /// and a full-window player can never clobber one another's hosted view, and so the picker path never runs
 /// the player's chrome-hider, so the traffic lights stay live over the picker.
+@MainActor
 final class MacProfileCoverHost: ObservableObject {
     static let shared = MacProfileCoverHost()
     @Published var content: AnyView?

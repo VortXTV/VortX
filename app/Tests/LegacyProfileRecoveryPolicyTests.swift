@@ -31,13 +31,18 @@ import Foundation
         let start = profiles.range(of: "func bootstrapSync()")!.lowerBound
         let end = profiles.range(of: "private func importProfilesFromStremio", range: start..<profiles.endIndex)!.lowerBound
         let bootstrap = profiles[start..<end]
-        check(bootstrap.contains("Task { @MainActor [weak self] in"), "actual post-await inspection notice publication stays on the UI actor")
+        // Legacy network bootstrap was retired by the account-qualified native import. Keep
+        // this source gate on the actual no-op, not the obsolete removed inspection Task.
+        let open = bootstrap.firstIndex(of: "{")!
+        let close = bootstrap[bootstrap.index(after: open)...].firstIndex(of: "}")!
+        let body = bootstrap[bootstrap.index(after: open)..<close]
+            .split(separator: "\n").map { $0.components(separatedBy: "//")[0] }
+            .joined().filter { !$0.isWhitespace }
+        check(body == "return", "retired legacy bootstrap performs no network inspection, import, task or account write")
         check(!bootstrap.contains("migrateSalvagedWatch("), "UUID-only poison payload cannot auto-adopt into current roster")
-        check(bootstrap.contains("legacyHistoryNoticeState.inspected") && bootstrap.contains("Data(key.utf8)"), "recovery notice remains fenced to the captured credential")
-        let view = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/ProfilesView.swift"), encoding: .utf8)
         try await LegacyWatchOwnershipTests.run(root: root)
         try await LegacyProfileLifecycleTests.run(root: root)
-        check(view.contains("if let notice = store.legacyHistoryRecoveryNotice { return notice }"), "legacy recovery notice reaches actual profile picker error surface")
-        print("Legacy recovery: original remote data never scrubbed, ambiguous/unknown records not auto-adopted, 120-row full mirror positive control and121-row no-write capacity guard passed; callsite contracts verified")
+        check(profiles.contains("legacyHistoryNoticeState.visible(matching:"), "retained legacy notice getter remains owner-qualified; native picker presentation is a separate gate")
+        print("Retained legacy recovery: original remote data never scrubbed, ambiguous/unknown records not auto-adopted, 120-row full mirror positive control and121-row no-write capacity guard passed; retired bootstrap and current source contracts verified, not native picker rendering")
     }
 }

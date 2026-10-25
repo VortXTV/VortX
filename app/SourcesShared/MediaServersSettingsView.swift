@@ -24,7 +24,7 @@ struct MediaServersSettingsView: View {
 
                 Toggle("Sync server logins to my VortX account", isOn: $syncLogins)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: syncLogins) { store.syncLogins = $0 }
+                    .onValueChange(of: syncLogins) { store.syncLogins = $0 }
 
                 ForEach(store.servers) { record in
                     MSServerCard(record: record) { store.remove(id: record.id) }

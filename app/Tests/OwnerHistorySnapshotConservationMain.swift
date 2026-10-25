@@ -23,7 +23,11 @@ import Darwin
             "testColdReplacementMayRemoveKnownSourceWithoutErasingUnknownNative",
             "testRepeatedRawReadsDoNotRewriteSnapshotNativeOrSourceBytes",
             "testExistingProfileAndLibraryUpsertsRetainUnmentionedRows",
-            "testUnsupportedRootChangesMalformedNativeAndSourceInjectionStillReject"
+            "testUnsupportedRootChangesMalformedNativeAndSourceInjectionStillReject",
+            "testKeyedLargeHistoryMatchesCompleteDeltaAndRetainsInactiveRawSources",
+            "testKeyedAbsentOptionalsCreatedAndRemovedWithoutLosingDuplicateOrder",
+            "testKeyedWrongCurrentFenceRevisionAndMalformedSpliceRejectBeforePublication",
+            "testKeyedCrossObjectUnicodeAliasesAndUnknownMutationFieldsReject"
         ]
         let suite = XCTestSuite(forTestCaseClass: OwnerHistoryExactJSONAuthoredTests.self)
         guard suite.testCaseCount == names.count,
@@ -35,6 +39,6 @@ import Darwin
               run.skipCount == 0, run.totalFailureCount == 0 else {
             print("FAIL Snapshot XCTest execution or assertion"); exit(1)
         }
-        print("PASS actual raw Snapshot XCTest cases: 17 (7 original + 10 conservation)")
+        print("PASS actual raw Snapshot XCTest cases: 21 (17 existing + 4 keyed)")
     }
 }

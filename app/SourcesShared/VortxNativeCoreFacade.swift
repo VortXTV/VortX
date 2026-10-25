@@ -1,9 +1,151 @@
 import Foundation
+import Darwin
+import os
+
+/// Detail membership is independent of the Library screen's type/sort/watched filters. Build this value
+/// once from the complete acknowledged projection, then overlay metadata without scanning history again.
+struct VortxLibraryMembership: Sendable {
+    private let savedByID: [String: VortxJSON]
+
+    init(_ projected: [VortxJSON] = []) {
+        var saved: [String: VortxJSON] = [:]
+        for row in projected {
+            guard row["previouslyWatched"] != .bool(true), case .string(let id) = row["_id"],
+                  saved[id] == nil else { continue }
+            saved[id] = row
+        }
+        savedByID = saved
+    }
+
+    func item(for id: String) -> VortxJSON? { savedByID[id] }
+}
+
+/// One recursive transaction boundary for both the facade and its FIFO admission helper.
+/// Checked Sendable: both stored locks are immutable imported synchronization primitives;
+/// every mutable owner/depth/queue value lives in the unfair lock's checked Sendable State.
+final class VortxNativeFacadeLock: NSLocking, Sendable {
+    private struct State: Sendable {
+        var owner: UInt64?
+        var depth = 0
+        var pending: [@Sendable () -> Void] = []
+    }
+    private let underlying = NSRecursiveLock()
+    private let storage = OSAllocatedUnfairLock(initialState: State())
+
+    func lock() {
+        underlying.lock()
+        let thread = UInt64(pthread_mach_thread_np(pthread_self()))
+        storage.withLock { state in
+            precondition(state.owner == nil || state.owner == thread)
+            state.owner = thread; state.depth += 1
+        }
+    }
+    func unlock() {
+        let thread = UInt64(pthread_mach_thread_np(pthread_self()))
+        let ready = storage.withLock { state -> [@Sendable () -> Void] in
+            precondition(state.owner == thread && state.depth > 0)
+            state.depth -= 1
+            guard state.depth == 0 else { return [] }
+            state.owner = nil
+            var ready: [@Sendable () -> Void] = []
+            swap(&ready, &state.pending)
+            return ready
+        }
+        underlying.unlock()
+        // Swap retains the entire batch before releasing F. Neither queue reset nor an
+        // element's final capture destruction can call external code while F is held.
+        withExtendedLifetime(ready) {
+            for delivery in ready { delivery() }
+        }
+    }
+    func withLock<Result>(_ operation: () throws -> Result) rethrows -> Result {
+        lock(); defer { unlock() }
+        return try operation()
+    }
+    func afterOutermostUnlock(_ delivery: @escaping @Sendable () -> Void) {
+        withLock { storage.withLock { $0.pending.append(delivery) } }
+    }
+}
+
+/// Original Bridge installation/request stamps checked in the same Facade transaction
+/// as metadata insertion. Retiring either stamp never calls the Facade under this lock.
+final class VortxNativeMetadataAdmissionFence: Sendable {
+    struct Stamp: Sendable {
+        let installation: UUID
+        let request: UUID
+    }
+    private struct State: Sendable {
+        var installation = UUID()
+        var request = UUID()
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    func captureInstallation() -> UUID { state.withLock { $0.installation } }
+    func retireInstallation() { state.withLock { $0.installation = UUID() } }
+    func replaceRequest(_ request: UUID) { state.withLock { $0.request = request } }
+    fileprivate func withCurrent<Result: Sendable>(_ stamp: Stamp,
+        _ operation: @Sendable () -> Result) -> Result? {
+        state.withLock { state in
+            guard state.installation == stamp.installation, state.request == stamp.request else { return nil }
+            // Only local metadata insertion runs here. Cancellation and callbacks
+            // are staged until the outer Facade transaction has released both locks.
+            return operation()
+        }
+    }
+}
 
 /// Compatibility entry point for CoreBridge's existing Load/Unload wire. It never initializes or
 /// calls Stremio. Unsupported actions return false and record a non-sensitive diagnostic code.
 /// Account migration/key acquisition remain explicit prerequisites to constructing the session.
 final class VortxNativeCoreFacade: @unchecked Sendable {
+    /// Immutable presentation input captured by the ORIGINAL publishing transaction.
+    /// `fields` retains control markers; `values` never includes their private carriers.
+    struct ChangeReceipt: Sendable {
+        let sourceID: UUID
+        let fields: [String]
+        let values: [String: VortxJSON]
+        let sequence: UInt64
+        let accountGeneration: UUID
+        let profileGeneration: UUID
+        let registryGeneration: UUID
+        let profileID: String
+        /// Selection lifetime, preserved across range/page tasks for that same selection.
+        let resources: [String: UUID]
+        /// Last task that ACTUALLY published each retained resource value, not latest scheduled.
+        let resourceValues: [String: UUID]
+        fileprivate init(sourceID: UUID, fields: [String], values: [String: VortxJSON], sequence: UInt64,
+                         accountGeneration: UUID, profileGeneration: UUID, registryGeneration: UUID,
+                         profileID: String, resources: [String: UUID], resourceValues: [String: UUID]) {
+            self.sourceID = sourceID; self.fields = fields; self.values = values; self.sequence = sequence
+            self.accountGeneration = accountGeneration; self.profileGeneration = profileGeneration
+            self.registryGeneration = registryGeneration; self.profileID = profileID
+            self.resources = resources; self.resourceValues = resourceValues
+        }
+    }
+    /// Original callback origin, captured before delivery or any executor hop.
+    /// The source reference is historical identity, not fresh admission authority.
+    struct SourceEvent: Sendable {
+        enum Kind: Sendable {
+            case changed(legacyFields: [String], receipt: ChangeReceipt?)
+            case mutationAccepted
+            case progressAccepted
+        }
+        let producer: VortxNativeCoreFacade
+        let sourceID: UUID
+        let kind: Kind
+        fileprivate init(producer: VortxNativeCoreFacade, kind: Kind) {
+            self.producer = producer
+            self.sourceID = producer.sourceID
+            self.kind = kind
+        }
+    }
+
+    let sourceID = UUID()
+    private static let presentationFields: Set<String> = ["ctx", "addon_management", "board", "search", "discover",
+        "library", "meta_details", "local_search", "continue_watching_preview"]
+    private var changeSequence: UInt64 = 0
+    private var latestChangeSequence: [String: UInt64] = [:]
+    private var resourceSelections: [String: UUID] = [:]
+    private var resourceValueTasks: [String: UUID] = [:]
     struct RegistryBinding: Equatable, Sendable { let scope: VortxAccountScope; let profileID: String; let generation: UUID }
     struct WatchlistBinding: Equatable, Sendable {
         let scope: VortxAccountScope
@@ -17,9 +159,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var registrySnapshot: [VortxResourceAddon] { lock.withLock { registry } }
     // Dispatch admission is one synchronous transaction, including nested begin/enqueue helpers.
     // This prevents a profile change/rebind from slipping between a UI identity read and enqueue.
-    private let lock: NSRecursiveLock
+    private let lock: VortxNativeFacadeLock
     private let mutationFIFO: VortxNativeFIFOAdmission
     private var values: [String: VortxJSON] = [:]
+    // Replaced with acknowledged state under lock, never with a filtered Library screen response.
+    private var metadataLibraryMembership = VortxLibraryMembership()
     private var externalMetadataReceipts: [Data: (Data, UUID)] = [:]
     private var externalMetadataObservation = UUID()
     private var selections: [String: VortxJSON] = [:]
@@ -28,7 +172,19 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var closed = false
     // A commit may have reached disk before readback failed. Keep the last acknowledged
     // projections readable, but only a new authenticated session may certify more writes.
-    private var checkpointReopenRequired = false
+    private var checkpointSubtitleRetirement: CredentialPublicationOutbox.SubtitleRetirement?
+    private var checkpointReopenRequired = false {
+        willSet {
+            if newValue && !checkpointReopenRequired {
+                checkpointSubtitleRetirement = retireSubtitleOwnerAfterSynchronousChangeLocked()
+            }
+        }
+    }
+    // Installed only by private init, before exposure. Builders are pure local value capture;
+    // the returned delivery, never the client callback, is invoked after the outermost F.
+    private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?
+    private var sourceAcceptedDelivery: (@Sendable (Bool) -> (@Sendable () -> Void)?)?
+    private let ownedChange: (@Sendable (ChangeReceipt) -> Void)?
     private let changed: @Sendable ([String]) -> Void
     private let mutationAccepted: @Sendable () -> Void
     /// Playback progress alone; nil keeps reporting it through `mutationAccepted`.
@@ -73,6 +229,39 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var pendingProfileTransitions = 0
     private var accountEpoch = UUID()
     private var watchlistProfileGeneration = UUID()
+    struct NativeSubtitleOwnerProof: Equatable, Sendable {
+        let bridge: CoreBridge.NativeSubtitleOwnerProof
+        let profileGeneration: UUID
+        fileprivate init(bridge: CoreBridge.NativeSubtitleOwnerProof, profileGeneration: UUID) {
+            self.bridge = bridge; self.profileGeneration = profileGeneration
+        }
+    }
+    /// Caller holds B. This joins the original Bridge installation to the actual acknowledged
+    /// profile generation under F, then registers using only scalar condition bookkeeping.
+    func captureNativeSubtitleOwner(_ original: CoreBridge.NativeSubtitleOwnerProof)
+        -> CredentialPublicationOutbox.SubtitleMountOwner? {
+        lock.withLock {
+            guard !closed, !checkpointReopenRequired, pendingProfileTransitions == 0,
+                  original.sourceID == sourceID, original.accountGeneration == accountEpoch,
+                  values["native_state"]?["activeProfileId"] == .string(original.profileID.uuidString),
+                  session.scope.account == original.credential.namespace else { return nil }
+            return CredentialPublicationOutbox.registerSubtitleOwner(.init(bridge: original,
+                profileGeneration: watchlistProfileGeneration))
+        }
+    }
+    /// Caller owns F; records retirement synchronously before any owner field changes.
+    /// Only scalar stamps enter the coordinator. Native work and its wakeups never need F.
+    private func retireSubtitleOwnerAfterSynchronousChangeLocked() -> CredentialPublicationOutbox.SubtitleRetirement {
+        let retirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: sourceID)
+        lock.afterOutermostUnlock {
+            CredentialPublicationOutbox.drainSubtitleRenderers(retirement)
+            Task {
+                await CredentialPublicationOutbox.waitForSubtitleRetirement(retirement)
+                CredentialPublicationOutbox.finishSubtitleRetirement(retirement)
+            }
+        }
+        return retirement
+    }
     private var sourceArchive: Data?
     private var ownerHistoryActive = false
     private var ownerHistoryACKGeneration = UUID()
@@ -177,10 +366,13 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},
                        progressAccepted: (@Sendable () -> Void)? = nil,
+                       sourceEvent: (@Sendable (SourceEvent) -> Void)? = nil,
+                       ownedChange: (@Sendable (ChangeReceipt) -> Void)? = nil,
                        changed: @escaping @Sendable ([String]) -> Void) async throws -> VortxNativeCoreFacade {
         guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
         let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted,
-                                           progressAccepted: progressAccepted, changed: changed)
+                                           progressAccepted: progressAccepted, sourceEvent: sourceEvent,
+                                           ownedChange: ownedChange, changed: changed)
         let addonSnapshot = try await session.addonSnapshot()
         let state = addonSnapshot.state
         facade.addonInventories = addonSnapshot.inventories
@@ -193,11 +385,87 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         return facade
     }
     private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void,
-                 progressAccepted: (@Sendable () -> Void)?, changed: @escaping @Sendable ([String]) -> Void) {
-        let lock = NSRecursiveLock()
+                 progressAccepted: (@Sendable () -> Void)?, sourceEvent: (@Sendable (SourceEvent) -> Void)?,
+                 ownedChange: (@Sendable (ChangeReceipt) -> Void)?,
+                 changed: @escaping @Sendable ([String]) -> Void) {
+        let lock = VortxNativeFacadeLock()
         self.lock = lock; self.mutationFIFO = VortxNativeFIFOAdmission(lock: lock)
         self.session = session; self.registry = registry; self.changed = changed; self.mutationAccepted = mutationAccepted
-        self.progressAccepted = progressAccepted
+        self.progressAccepted = progressAccepted; self.ownedChange = ownedChange
+        if let sourceEvent {
+            sourceChangedDelivery = { [weak self] fields, receipt in
+                guard let self else { return nil }
+                let event = SourceEvent(producer: self, kind: .changed(legacyFields: fields, receipt: receipt))
+                return { sourceEvent(event) }
+            }
+            sourceAcceptedDelivery = { [weak self] progressOnly in
+                guard let self else { return nil }
+                let event = SourceEvent(producer: self, kind: progressOnly ? .progressAccepted : .mutationAccepted)
+                return { sourceEvent(event) }
+            }
+        }
+    }
+    /// F is held by the publishing transaction. Host reads set recordingChanges=false;
+    /// they never create a source callback or mark a retained value as freshly produced.
+    private func makeChangeReceipt(_ fields: [String], recordingChanges: Bool = true) -> ChangeReceipt? {
+        guard !closed, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
+        changeSequence += 1
+        let fields = Array(Set(fields)).sorted()
+        if recordingChanges { for field in fields { latestChangeSequence[field] = changeSequence } }
+        return .init(sourceID: sourceID, fields: fields,
+            values: values.filter { Self.presentationFields.contains($0.key) }, sequence: changeSequence,
+            accountGeneration: accountEpoch, profileGeneration: watchlistProfileGeneration,
+            registryGeneration: registryGeneration, profileID: profile,
+            resources: resourceSelections, resourceValues: resourceValueTasks)
+    }
+    /// Delivery ONLY. Never read current values or mint a receipt here: FIFO ACK stages its
+    /// already captured receipt at the original callback point after pending-profile release.
+    private func stageChanged(_ legacyFields: [String], receipt: ChangeReceipt?) {
+        guard receipt != nil || !legacyFields.isEmpty else { return }
+        lock.withLock {
+            let legacy = changed, owned = ownedChange
+            let source = sourceChangedDelivery?(legacyFields, receipt)
+            lock.afterOutermostUnlock {
+                source?()
+                if let receipt { owned?(receipt) }
+                if !legacyFields.isEmpty { legacy(legacyFields) }
+            }
+        }
+    }
+    /// Stage at the existing ACK callback point, after changed delivery has returned.
+    /// Do not add availability filtering: legacy ACK counts survive synchronous close/reentry.
+    private func stageAccepted(progressOnly: Bool, legacy: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            let source = sourceAcceptedDelivery?(progressOnly)
+            lock.afterOutermostUnlock {
+                source?()
+                legacy()
+            }
+        }
+    }
+    /// Original HOST initiation snapshot, not a callback upgrade or resource/write admission.
+    /// Last acknowledged cache remains readable during queued work/checkpoint uncertainty.
+    func captureHostChange(fields: [String]) -> ChangeReceipt? {
+        lock.withLock { makeChangeReceipt(fields, recordingChanges: false) }
+    }
+    /// Recheck immediately before the owning sink commits. Original Bridge installation,
+    /// credential and Session authority remain separate; no Session lease is acquired under F.
+    func acceptsChange(_ receipt: ChangeReceipt, field: String? = nil, settlingResource: Bool = false) -> Bool {
+        lock.withLock {
+            guard !closed, receipt.sourceID == sourceID, receipt.sequence > 0,
+                  receipt.sequence <= changeSequence, receipt.accountGeneration == accountEpoch,
+                  receipt.profileGeneration == watchlistProfileGeneration,
+                  receipt.registryGeneration == registryGeneration,
+                  values["native_state"]?["activeProfileId"] == .string(receipt.profileID) else { return false }
+            guard let field else { return !settlingResource }
+            guard Self.presentationFields.contains(field), values[field] != nil, receipt.values[field] != nil,
+                  (latestChangeSequence[field] ?? 0) <= receipt.sequence,
+                  receipt.resources[field] == resourceSelections[field] else { return false }
+            if settlingResource {
+                guard let producer = receipt.resourceValues[field], producer == generations[field] else { return false }
+            }
+            return true
+        }
     }
     func ownsSession(_ candidate: VortxNativeSession) -> Bool { session === candidate }
     func stateData(_ field: String) -> Data? {
@@ -224,16 +492,27 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return (state, host, values["native_own_overlay_pending"] ?? .object([:]), accountEpoch)
         }
     }
-    func close() {
-        lock.lock(); closed = true; mutationFIFO.close(); let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
+    @discardableResult
+    func close() -> CredentialPublicationOutbox.SubtitleRetirement {
+        let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: sourceID)
+        lock.lock(); closed = true; mutationFIFO.close(); let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); resourceSelections.removeAll(); resourceValueTasks.removeAll(); latestChangeSequence.removeAll(); values.removeAll(); metadataLibraryMembership = VortxLibraryMembership(); addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
+        CredentialPublicationOutbox.drainSubtitleRenderers(subtitleRetirement)
         session.revoke()
-        old.forEach { $0.cancel() }; Task { await session.close() }
+        old.forEach { $0.cancel() }
+        Task {
+            await CredentialPublicationOutbox.waitForSubtitleRetirement(subtitleRetirement)
+            CredentialPublicationOutbox.finishSubtitleRetirement(subtitleRetirement)
+            await session.close()
+        }
+        return subtitleRetirement
     }
     func shutdown() async {
         if lock.withLock({ ownerHistoryActive }) {
             await withCheckedContinuation { continuation in flushPendingProgress { continuation.resume() } }
         }
-        close(); await session.close()
+        let retirement = close()
+        await CredentialPublicationOutbox.waitForSubtitleRetirement(retirement)
+        await session.close()
     }
     var registryBinding: RegistryBinding? {
         lock.withLock {
@@ -241,6 +520,165 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return RegistryBinding(scope: session.scope, profileID: profile, generation: registryGeneration)
         }
     }
+    /// Accepted navigation may survive ordinary queued sync work, but never an unavailable
+    /// session or an acknowledged owner/resource replacement. No writes use this receipt.
+    struct AcceptedNavigationReceipt: Equatable, Sendable {
+        let owner: WatchlistBinding
+        let registry: RegistryBinding
+    }
+    func captureAcceptedNavigation(expected: WatchlistBinding) -> AcceptedNavigationReceipt? {
+        lock.withLock {
+            guard isAvailable, resourceRegistryValid,
+                  let owner = watchlistBinding, owner == expected else { return nil }
+            return .init(owner: owner, registry: .init(scope: session.scope, profileID: owner.profileID,
+                generation: registryGeneration))
+        }
+    }
+    func acceptedNavigationIsCurrent(_ receipt: AcceptedNavigationReceipt) -> Bool {
+        lock.withLock {
+            guard isAvailable, resourceRegistryValid, let owner = watchlistBinding else { return false }
+            let registry = RegistryBinding(scope: session.scope, profileID: owner.profileID, generation: registryGeneration)
+            return owner == receipt.owner && registry == receipt.registry
+        }
+    }
+
+    /// One admitted metadata selection, not a terminal/ready or persistence receipt.
+    /// Its ticket is the existing resource-producing-task identity. An owner/registry
+    /// ABA, different facade, explicit Unload/Load, rebind or close retires it.
+    struct MetadataSelectionReceipt: Equatable, Sendable {
+        let navigation: AcceptedNavigationReceipt
+        fileprivate let facade: ObjectIdentifier
+        fileprivate let ticket: UUID
+        let selection: VortxJSON?
+    }
+
+    /// Only navigation of the metadata RESOURCE is allowed here. This receipt
+    /// cannot authorize a native mutation, watched edit, token/auth or checkpoint.
+    /// Check and insertion are in the SAME F transaction; the composed lock drains
+    /// changed callbacks only after this method's outermost unlock. Call without B.
+    func dispatchMetadata(_ action: VortxJSON,
+                          expected: AcceptedNavigationReceipt) -> MetadataSelectionReceipt? {
+        lock.lock(); defer { lock.unlock() }
+        guard acceptedNavigationIsCurrent(expected), pendingProfileTransitions == 0 else { return nil }
+        let name = string(action["action"])
+        guard name == "Unload"
+            || (name == "Load" && string(action["args"]?["model"]) == "MetaDetails") else { return nil }
+        guard let data = try? JSONEncoder().encode(action),
+              dispatch(data: data, field: "meta_details"),
+              acceptedNavigationIsCurrent(expected), let ticket = generations["meta_details"] else { return nil }
+        return .init(navigation: expected, facade: ObjectIdentifier(self), ticket: ticket,
+                     selection: values["meta_details"]?["selected"])
+    }
+
+    func dispatchMetadata(_ action: VortxJSON, expected: AcceptedNavigationReceipt,
+        admissionFence: VortxNativeMetadataAdmissionFence,
+        original: VortxNativeMetadataAdmissionFence.Stamp) -> MetadataSelectionReceipt? {
+        lock.lock(); defer { lock.unlock() }
+        // F -> witness, never F -> Bridge/request locks. Recursive inner unlocks
+        // cannot drain; the witness releases before this outer F drains callouts.
+        return admissionFence.withCurrent(original) {
+            dispatchMetadata(action, expected: expected)
+        } ?? nil
+    }
+
+    /// Current-task check, not merely a matching title. In particular a same-title
+    /// episode replacement has another ticket even if its selected metaPath matches.
+    func metadataSelectionIsCurrent(_ receipt: MetadataSelectionReceipt) -> Bool {
+        lock.withLock {
+            receipt.facade == ObjectIdentifier(self)
+                && acceptedNavigationIsCurrent(receipt.navigation)
+                && generations["meta_details"] == receipt.ticket
+                && values["meta_details"]?["selected"] == receipt.selection
+        }
+    }
+
+    /// Join only ORIGINAL receipt values and their actual producing-task ticket.
+    /// Settlement requires a metadata marker; retained library overlays do not settle a phase.
+    /// A library caller must separately validate its original library marker/field sequence,
+    /// then recheck this original selection at the sink. Neither path captures a newer task.
+    func metadataSelection(for change: ChangeReceipt, expected: AcceptedNavigationReceipt,
+                           settlingResource: Bool = true) -> MetadataSelectionReceipt? {
+        lock.withLock {
+            guard !settlingResource || change.fields.contains("meta_details"),
+                  acceptsChange(change, field: "meta_details", settlingResource: settlingResource),
+                  acceptedNavigationIsCurrent(expected),
+                  let ticket = change.resourceValues["meta_details"],
+                  let value = change.values["meta_details"] else { return nil }
+            let selection = MetadataSelectionReceipt(navigation: expected,
+                facade: ObjectIdentifier(self), ticket: ticket, selection: value["selected"])
+            return metadataSelectionIsCurrent(selection) ? selection : nil
+        }
+    }
+
+    /// Copy the immutable checked-Sendable value, not a UI model or Foundation Any
+    /// graph. Consumer decoding is outside F; this API never admits a callback upgrade.
+    /// A missing field is not an explicit null/unloaded receipt.
+    func metadataSnapshot(expected receipt: MetadataSelectionReceipt) -> VortxJSON? {
+        lock.withLock {
+            guard metadataSelectionIsCurrent(receipt) else { return nil }
+            return values["meta_details"]
+        }
+    }
+
+    /// Linearize ONLY the already-prepared immutable presentation frame store
+    /// with the ORIGINAL source sequence/producing task. The trusted nonescaping
+    /// store performs a single eager plain reference swap; it sends nothing and
+    /// releases no last old payload reference while F is held. Source owner and
+    /// Bridge/M/proposal checks happen BEFORE entering here, never under F.
+    ///
+    /// Current first-party callers enter after actor admission, not from inside
+    /// an existing F transaction. No F callbacks are staged by this read/store
+    /// method. The changed/event notifications and subject fanout stay outside F.
+    @MainActor
+    func storeOriginalMetadataPresentationFrame(_ change: ChangeReceipt,
+        selection: MetadataSelectionReceipt, libraryOverlay: Bool,
+        storePreparedFrame: @MainActor () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard change.sourceID == sourceID,
+              metadataSelectionIsCurrent(selection),
+              let joined = metadataSelection(for: change, expected: selection.navigation,
+                  settlingResource: !libraryOverlay),
+              joined == selection else { return false }
+        if libraryOverlay {
+            guard change.fields.contains("library"),
+                  acceptsChange(change, field: "library"),
+                  acceptsChange(change, field: "meta_details", settlingResource: false) else { return false }
+        } else {
+            guard change.fields.contains("meta_details"),
+                  acceptsChange(change, field: "meta_details", settlingResource: true) else { return false }
+        }
+        // SEALED CALL GRAPH REQUIREMENT: the only callee is the02b plain store,
+        // whose new/old frame boxes and all sidecars were prepared outside F.
+        storePreparedFrame()
+        return true
+    }
+
+    /// Explicit HOST effects (a spinner/clear or independent selected-task
+    /// contribution) carry their admitted selection, not a manufactured source
+    /// receipt. Native bytes may have advanced within that SAME task; a different
+    /// producing selection, registry, profile or source may not own this store.
+    @MainActor
+    func storeOriginalMetadataHostFrame(selection: MetadataSelectionReceipt,
+        storePreparedFrame: @MainActor () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard metadataSelectionIsCurrent(selection) else { return false }
+        storePreparedFrame() // exact same sealed plain-frame-only call graph
+        return true
+    }
+
+    /// Capture the CURRENT original task for a HOST refresh, under the caller's
+    /// original navigation receipt. Never use this to upgrade an admitted callback:
+    /// changed callbacks must carry their producing receipt from Facade publication.
+    func captureMetadataSelection(expected: AcceptedNavigationReceipt) -> MetadataSelectionReceipt? {
+        lock.withLock {
+            guard acceptedNavigationIsCurrent(expected), let ticket = generations["meta_details"] else { return nil }
+            return .init(navigation: expected, facade: ObjectIdentifier(self), ticket: ticket,
+                         selection: values["meta_details"]?["selected"])
+        }
+    }
+
     /// One atomic, active-profile resource inventory. Ordinary queued progress/sync work is not a
     /// new owner; acknowledged registry/profile/account changes (including ABA) retire this receipt.
     func captureEpisodeSourceRegistry() -> (data: Data, isCurrent: @Sendable () -> Bool)? {
@@ -275,16 +713,20 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         await admission.1?.value
         await session.invalidateResources()
         let addonSnapshot = try await session.addonSnapshot()
-        let accepted = lock.withLock { () -> Bool in
+        let accepted = try lock.withLock { () throws -> Bool in
             guard !closed, expected.scope == session.scope, expected.generation == registryGeneration,
                   values["native_state"]?["activeProfileId"] == .string(expected.profileID), values["native_state"] == addonSnapshot.state else { return false }
+            let management = try addonManagementProjection(state: addonSnapshot.state, inventories: addonSnapshot.inventories)
             addonInventories = addonSnapshot.inventories
             registry = replacement; resourceRegistryValid = true; registryGeneration = UUID()
             values["ctx"] = .object(["profile": .object(["addons": .array(replacement.map {
                 .object(["transportUrl": .string($0.transportUrl), "manifest": $0.manifest ?? .object([:])])
-            })])]); return true
+            })])])
+            values["addon_management"] = management
+            stageChanged(["ctx", "addon_management"], receipt: makeChangeReceipt(["ctx", "addon_management"]))
+            return true
         }
-        guard accepted else { throw VortxNativeError.superseded }; changed(["ctx"])
+        guard accepted else { throw VortxNativeError.superseded }
     }
     /// Called under lock. Keep the durable-state publication, discard only prior resource ownership.
     private func invalidateResourcePublications() {
@@ -293,6 +735,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         resourceRegistryValid = false
         for (field, task) in tasks where field != "native_state" { task.cancel() }
         generations = generations.filter { $0.key == "native_state" }
+        resourceSelections.removeAll(); resourceValueTasks.removeAll()
         values = values.filter { ["native_state", "library"].contains($0.key) }; selections = [:]
     }
     private func resourceIdentity(_ state: VortxJSON?) -> VortxJSON {
@@ -308,29 +751,40 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func path(_ value: VortxJSON?) throws -> VortxResourceRequest {
         guard let value else { throw VortxNativeError.invalidResponse }; return try value.decode(VortxResourceRequest.self)
     }
-    private func begin(_ field: String) -> UUID? {
+    private func begin(_ field: String, replacingSelection: Bool = true) -> UUID? {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return nil }
-        let ticket = UUID(); tasks[field]?.cancel(); generations[field] = ticket; failure = nil; return ticket
+        if replacingSelection || resourceSelections[field] == nil { resourceSelections[field] = UUID() }
+        let ticket = UUID()
+        let previous = tasks.removeValue(forKey: field)
+        generations[field] = ticket; failure = nil
+        if let previous { lock.afterOutermostUnlock { previous.cancel() } }
+        return ticket
     }
     private func publish(_ fields: [String: VortxJSON], field: String, ticket: UUID) {
         lock.lock()
         guard !closed, generations[field] == ticket else { lock.unlock(); return }
         var changedFields: [String] = []
+        var ownedFields: [String] = []
         fields.forEach {
-            let projected = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
+            let projected = $0.key == "meta_details" ? metaWithPlayback($0.value, library: metadataLibraryMembership) : $0.value
             if values[$0.key] != projected { changedFields.append($0.key) }
+            // The first accepted value of a NEW task must reach owned consumers even if
+            // its bytes equal the prior task's value. Legacy value suppression is unchanged.
+            if values[$0.key] != projected || resourceValueTasks[$0.key] != ticket { ownedFields.append($0.key) }
             values[$0.key] = projected
+            resourceValueTasks[$0.key] = ticket
             if $0.key == "meta_details" { observeExternalMetadata(projected) }
         }
+        stageChanged(changedFields.sorted(), receipt: ownedFields.isEmpty ? nil : makeChangeReceipt(ownedFields))
         lock.unlock()
-        if !changedFields.isEmpty { changed(changedFields.sorted()) }
     }
-    private func enqueue(_ field: String, initial: VortxJSON? = nil, operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
-        enqueue(field, initial: initial) { _ in try await operation() }
+    private func enqueue(_ field: String, initial: VortxJSON? = nil, replacingSelection: Bool = true,
+                         operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
+        enqueue(field, initial: initial, replacingSelection: replacingSelection) { _ in try await operation() }
     }
-    private func enqueue(_ field: String, initial: VortxJSON? = nil,
+    private func enqueue(_ field: String, initial: VortxJSON? = nil, replacingSelection: Bool = true,
                          operation: @escaping @Sendable (@escaping @Sendable (VortxJSON) -> Void) async throws -> [String: VortxJSON]) -> Bool {
-        guard let ticket = begin(field) else { return false }
+        guard let ticket = begin(field, replacingSelection: replacingSelection) else { return false }
         if let initial { publish([field: initial], field: field, ticket: ticket) }
         let task = Task { [weak self] in
             do {
@@ -356,7 +810,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
         }
         lock.lock()
-        if closed || generations[field] != ticket { task.cancel() } else { tasks[field] = task }
+        if closed || generations[field] != ticket {
+            lock.afterOutermostUnlock { task.cancel() }
+        } else { tasks[field] = task }
         lock.unlock(); return true
     }
     private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
@@ -369,6 +825,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                  websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
                                  fifoMember: VortxNativeFIFOAdmission.Member? = nil, forceProfileTransition: Bool = false,
+                                 forceSubtitleOwnerTransition: Bool = false,
                                  forceProgress: Bool = false,
                                  ownerOperation: (@Sendable () async throws -> Void)? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
@@ -402,10 +859,26 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let predecessor = tasks["native_state"]
         let ticket = UUID(); generations["native_state"] = ticket
         let profileTransition = forceProfileTransition || ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile", "rebind_profile_account"].contains(type)
+        // Separate from pendingProfileTransitions: add/bind and typed owner-route work
+        // can replace accepted ownership without changing the selected profile.
+        let subtitleOwnerTransition = profileTransition || forceSubtitleOwnerTransition
+            || ["add_profile", "bind_sync_scope"].contains(type) || ownerOperation != nil
+            || legacyMaterial != nil || hostRemote != nil
+            || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty
+        let subtitleRetirement = subtitleOwnerTransition
+            ? CredentialPublicationOutbox.beginSubtitleRetirement(domain: sourceID) : nil
         if profileTransition { pendingProfileTransitions += 1 }
         // State intents are FIFO, never latest-wins: dropping one would lose progress/profile edits.
         tasks["native_state"] = Task { [weak self] in
             await predecessor?.value
+            if let subtitleRetirement {
+                await CredentialPublicationOutbox.waitForSubtitleRetirement(subtitleRetirement)
+            }
+            defer {
+                if let subtitleRetirement {
+                    CredentialPublicationOutbox.finishSubtitleRetirement(subtitleRetirement)
+                }
+            }
             defer { queueMember.finish() }
             guard let self else { completion?(.failure(VortxNativeError.closed)); return }
             var transitionReleased = false
@@ -449,7 +922,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // resolves own/share-primary before new-profile resource loads can be admitted.
                 let replacement = resourceChanged ? try? await session.resourceRegistry() : nil
                 if resourceChanged { await session.invalidateResources() }
-                let publication = try self.lock.withLock { () -> (fields: [String: VortxJSON], changed: [String])? in
+                let publication = try self.lock.withLock { () -> (fields: [String: VortxJSON], changed: [String], receipt: ChangeReceipt?)? in
                     guard !self.closed else { return nil }
                     // Compare against the acknowledged cache before a resource identity change
                     // clears it. Progress and unchanged sync reads must not synthesize ctx events.
@@ -483,12 +956,13 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     // ownership. Their identity transition still requires one fenced ctx event.
                     if identityChanged { changedFields.insert("ctx") }
                     fields.forEach { self.values[$0.key] = $0.value }
-                    return (fields, changedFields.sorted())
+                    let changed = changedFields.sorted()
+                    return (fields, changed, changed.isEmpty ? nil : self.makeChangeReceipt(changed))
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
                 // A later get_state must not hide the profile transition's accepted state.
                 if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 }; transitionReleased = true }
-                if let publication, !publication.changed.isEmpty { self.changed(publication.changed) }
+                if let publication { self.stageChanged(publication.changed, receipt: publication.receipt) }
                 guard publication != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
                 if ["report_progress", "mark_watched", "reset_watched"].contains(type) {
                     let count = playback["continueWatching"]?.array?.count ?? 0
@@ -496,9 +970,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     NSLog("[VortXNative] mutation=%@ result=acknowledged continueWatching=%ld savedLibrary=%ld", type, count, saved)
                 }
                 if type == "report_progress", hostEdits.isEmpty, !websiteChanged, let progressAccepted = self.progressAccepted {
-                    progressAccepted()
+                    self.stageAccepted(progressOnly: true, legacy: progressAccepted)
                 } else if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged {
-                    self.mutationAccepted()
+                    self.stageAccepted(progressOnly: false, legacy: self.mutationAccepted)
                 }
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
@@ -506,17 +980,28 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     let owns = await session.usesOwnerHistory()
                     self.lock.withLock { self.ownerHistoryActive = owns }
                 }
-                self.lock.withLock { self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain() }
+                let uncertainSubtitleRetirement = self.lock.withLock {
+                    self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain()
+                    return self.checkpointSubtitleRetirement
+                }
+                if let uncertainSubtitleRetirement {
+                    await CredentialPublicationOutbox.waitForSubtitleRetirement(uncertainSubtitleRetirement)
+                }
                 _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
             } catch {
                 if ownerOperation != nil || self.lock.withLock({ self.ownerHistoryActive }) {
                     let status = await session.ownerHistoryRouteStatus()
-                    self.lock.withLock {
+                    let uncertainSubtitleRetirement = self.lock.withLock { () -> CredentialPublicationOutbox.SubtitleRetirement? in
                         self.ownerHistoryActive = status.ownsHistory
                         if status.requiresAuthenticatedReopen {
                             self.checkpointReopenRequired = true
                             self.mutationFIFO.markUncertain()
+                            return self.checkpointSubtitleRetirement
                         }
+                        return nil
+                    }
+                    if let uncertainSubtitleRetirement {
+                        await CredentialPublicationOutbox.waitForSubtitleRetirement(uncertainSubtitleRetirement)
                     }
                     if status.requiresAuthenticatedReopen {
                         _ = self.fail("checkpoint_uncertain_reopen_required")
@@ -527,7 +1012,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 if durableCommitted {
                     // The acknowledged snapshot exists, but its required projection failed. Do
                     // not relabel the previous/empty history as the successful new profile state.
-                    self.close(); _ = self.fail("native_projection_unavailable_reopen_required")
+                    let closeSubtitleRetirement = self.close()
+                    await CredentialPublicationOutbox.waitForSubtitleRetirement(closeSubtitleRetirement)
+                    _ = self.fail("native_projection_unavailable_reopen_required")
                 } else { _ = self.fail("native_mutation_failed") }
                 completion?(.failure(error))
             }
@@ -596,7 +1083,13 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 try await self.session.flushPendingProgress()
             }
             catch VortxNativeError.checkpointUncertain {
-                self.lock.withLock { self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain() }
+                let uncertainSubtitleRetirement = self.lock.withLock {
+                    self.checkpointReopenRequired = true; self.mutationFIFO.markUncertain()
+                    return self.checkpointSubtitleRetirement
+                }
+                if let uncertainSubtitleRetirement {
+                    await CredentialPublicationOutbox.waitForSubtitleRetirement(uncertainSubtitleRetirement)
+                }
                 _ = self.fail("checkpoint_uncertain_reopen_required")
             } catch {
                 _ = self.fail("native_progress_flush_failed")
@@ -1104,7 +1597,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             guard start >= 0, end >= start else { return fail("invalid_range") }
             let previous = values[field]
             guard let profile = string(values["native_state"]?["activeProfileId"]) else { return fail("missing_profile") }
-            return enqueue(field) { [self] publish in
+            return enqueue(field, replacingSelection: false) { [self] publish in
                 [field: try await session.loadCatalogs(screen, catalogs: catalogs, selection: selection,
                     range: start...end, previous: previous, expectedProfileID: profile, onUpdate: publish)]
             }
@@ -1121,7 +1614,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             guard let loading = try? loadingEntry(next.0, next.1) else { return fail("invalid_catalog_page") }
             var pendingRows = rows; pendingRows[index] = .array((rows[index].array ?? []) + [loading])
             let pending: VortxJSON = .object(["selected": values[field]?["selected"] ?? .null, "catalogs": .array(pendingRows)])
-            return enqueue(field, initial: pending) { [self] in
+            return enqueue(field, initial: pending, replacingSelection: false) { [self] in
                 [field: try await session.loadCatalog(screen, request: next.1, addons: [next.0], append: true)]
             }
         }
@@ -1136,9 +1629,26 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 "metaItems": .array(addons.compactMap { try? loadingEntry($0, request) }),
                 "streams": .array(stream.map { path in addons.compactMap { try? loadingEntry($0, path) } } ?? []), "metaStreams": .array([])])
             guard let profile = string(values["native_state"]?["activeProfileId"]) else { return fail("missing_profile") }
-            return enqueue(field, initial: loading) { [self] publish in
-                [field: try await session.loadMeta(request: request, stream: stream, addons: addons,
-                    expectedProfileID: profile, onUpdate: publish)]
+            // Dispatch owns the lock: capture the preceding value and acknowledged owner together.
+            // A queued sync is not a new owner; committed identity changes retire these generations
+            // and the enqueue publication ticket, including profile/account/registry A -> B -> A.
+            let previous = values[field], account = accountEpoch
+            let profileGeneration = watchlistProfileGeneration, capturedRegistry = registryGeneration
+            let project: @Sendable (VortxJSON) -> VortxJSON = { [weak self] incoming in
+                guard let self else { return incoming }
+                return self.lock.withLock {
+                    let current = !self.closed && self.resourceRegistryValid
+                        && self.accountEpoch == account && self.watchlistProfileGeneration == profileGeneration
+                        && self.registryGeneration == capturedRegistry
+                        && self.values["native_state"]?["activeProfileId"] == .string(profile)
+                    return VortxMetaLoadingProjection.retainingReadyMetadata(previous: previous,
+                        incoming: incoming, ownerIsCurrent: current)
+                }
+            }
+            return enqueue(field, initial: project(loading)) { [self] publish in
+                let result = try await session.loadMeta(request: request, stream: stream, addons: addons,
+                    expectedProfileID: profile, onUpdate: { value in publish(project(value)) })
+                return [field: project(result)]
             }
         }
         if name == "Load", model == "CatalogWithFilters", field == "discover" {
@@ -1388,7 +1898,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let sameSelection = previous.first?["request"] == catalogRequest(chosen.0, chosen.1)
         let retained = append || sameSelection ? previous.filter { $0["content"]?["type"] == .string("Ready") } : []
         let initial = discoverProjection(pages: retained + [loading], chosen: chosen, requests: requests)
-        return enqueue("discover", initial: initial) { [self] in
+        return enqueue("discover", initial: initial, replacingSelection: !append) { [self] in
             let pages: [VortxJSON]
             do {
                 let board = try await session.loadCatalog(.discover, request: chosen.1, addons: [chosen.0], append: append)
@@ -1512,23 +2022,37 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         return .object(["searchResults": .array(Array(matches))])
     }
+    /// Read-only management membership from the same acknowledged kernel inventory. Disabled
+    /// descriptors remain editable without admitting resource work. Inputs belong to the same
+    /// initial snapshot or locked accepted-state transaction, not a newer Session lookup.
+    private func addonManagementProjection(state: VortxJSON, inventories: [String: [VortxJSON]]) throws -> VortxJSON {
+        guard let owner = addonOwner(for: state), let rows = inventories[owner] else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        return .object(["profile": .object(["addons": .array(rows)])])
+    }
     private func stateFields(_ state: VortxJSON) throws -> [String: VortxJSON] {
         // The formatter is local to this complete pass: no mutable formatter crosses threads.
         let formatter = ISO8601DateFormatter()
         let projected = try projectedLibraryItems(state, formatter: formatter)
+        let membership = VortxLibraryMembership(projected)
         let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
         var fields: [String: VortxJSON] = ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
+                "addon_management": try lock.withLock { try addonManagementProjection(state: state, inventories: addonInventories) },
                 "native_playback": playback ?? .null,
                 "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap { playbackRow($0, formatter: formatter) })]),
                 "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap { playbackRow($0, formatter: formatter) })]),
                 "library": libraryProjection(state: state, request: libraryRequest, projected: projected) ?? .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
-        if let detail = values["meta_details"] { fields["meta_details"] = metaWithPlayback(detail, library: projected) }
+        if let detail = values["meta_details"] { fields["meta_details"] = metaWithPlayback(detail, library: membership) }
+        // Only create-before-exposure and the locked acknowledged-state transaction call this method.
+        // Install the same full projection used by the metadata in this transaction.
+        metadataLibraryMembership = membership
         return fields
     }
-    private func metaWithPlayback(_ detail: VortxJSON, library: [VortxJSON]) -> VortxJSON {
+    private func metaWithPlayback(_ detail: VortxJSON, library: VortxLibraryMembership) -> VortxJSON {
         guard case .object(var fields) = detail, let id = string(detail["selected"]?["metaPath"]?["id"]) else { return detail }
         // Saved membership only: a watched-only Library row must leave Detail offering Add to Library.
-        fields["libraryItem"] = library.first { $0["_id"] == .string(id) && $0["previouslyWatched"] != .bool(true) } ?? .null
+        fields["libraryItem"] = library.item(for: id) ?? .null
         fields["watchedVideoIds"] = playback?["watchedVideoIdsByTitle"]?[id] ?? .array([])
         return .object(fields)
     }
@@ -1678,6 +2202,11 @@ extension VortxNativeCoreFacade {
                         guard enqueueMutation(type: type, raw: "", actions: actions,
                             checkpointValidator: checkpointValidator,
                             fifoMember: member, forceProfileTransition: transition,
+                            // Captured raw types have no enforced non-owner subset. Drain
+                            // without rejecting valid reducer operations or widening the
+                            // original profile-pending classifier. Direct progress and
+                            // resource paths do not pass through this adapter.
+                            forceSubtitleOwnerTransition: true,
                             completion: { continuation.resume(with: $0) }) else {
                             member.finish()
                             continuation.resume(throwing: VortxNativeError.closed)

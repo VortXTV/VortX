@@ -190,6 +190,90 @@ internal class NativeAccountCoordinator(
         val verified = pending.sources.filter { runCatching { it.withActive {} }.isSuccess }.map { it.profileID }.toSet()
         return pending.profiles.filter { it.usesOwnAccount && !it.isOwner }.map { StreamingProfile(it, it.id !in verified, true) }
     }
+    /** Opaque identity only, with no native read or credential/session monitor. */
+    internal fun streamingPresentationIdentity(): Any? = mounted.get() ?: pendingImport
+
+    /** Read-only picker metadata. This is never a selection, credential or mutation capability. */
+    internal class StreamingPresentation internal constructor(
+        val projection: com.vortx.android.profile.NativeProfileGateway.Projection?,
+        val streaming: List<StreamingProfile>,
+        val migration: MigrationStatus?,
+        private val admission: (() -> Unit) -> Boolean,
+    ) {
+        fun publishIfCurrent(action: () -> Unit): Boolean = admission(action)
+    }
+
+    /** Expensive work belongs to the caller's background refresh lane, never a Compose/init callback.
+     * One native read supplies all three views. Final publication checks only auth, mount identity
+     * and the atomic update stamp; it does not reacquire Session or serialize state on Main. */
+    internal fun captureStreamingPresentation(): StreamingPresentation {
+        val epoch = changes.value
+        val current = mounted.get()
+        if (current != null && accountCurrent(current.account)) {
+            return synchronized(current.session) {
+                // Presentation stays readable during checkpoint uncertainty, exactly like read().
+                // This metadata never grants mutation authority through withCurrentRead/owned.
+                val read = current.session.read()
+                check(mounted.get() === current && accountCurrent(current.account)) { "Native account changed" }
+                val version = current.session.updates.value
+                val projection = NativeProfileAccess.projection(read)
+                val document = read.state.optJSONObject("hostDocument")
+                val pending = document?.optJSONObject("nativeOwnAccountPending")
+                val streaming = projection.profiles.filter { it.usesOwnAccount && !it.isOwner }.map {
+                    StreamingProfile(it, false, pending?.has(it.id) == true)
+                }
+                val rows = NativeWatchedMigrationStorage.unresolvedCountForStatus(document)
+                val watchlists = document?.optJSONArray("nativeWatchlistMigrationPending")?.length() ?: 0
+                val candidates = document?.optJSONObject("nativeOwnAccountCandidates")?.length() ?: 0
+                val migration = MigrationStatus(rows, false, watchlists).takeIf { rows > 0 || candidates > 0 || watchlists > 0 }
+                StreamingPresentation(projection, streaming, migration) { action ->
+                    withStreamingPresentationAdmission(current.account) {
+                        synchronized(lifecycleLock) {
+                            if (mounted.get() === current && changes.value == epoch && current.session.updates.value == version) {
+                                action(); true
+                            } else false
+                        }
+                    }
+                }
+            }
+        }
+        val pending = pendingImport?.takeIf { it.isCurrent() && accountCurrent(it.account) }
+        if (pending != null) {
+            val verified = pending.sources.filter { runCatching { it.withActive {} }.isSuccess }.map { it.profileID }.toSet()
+            val streaming = pending.profiles.filter { it.usesOwnAccount && !it.isOwner }.map {
+                StreamingProfile(it, it.id !in verified, true)
+            }
+            val migration = MigrationStatus(NativeWatchedMigrationStorage.unresolvedCountForStatus(pending.document), true,
+                pending.document.optJSONArray("nativeWatchlistMigrationPending")?.length() ?: 0)
+            return StreamingPresentation(null, streaming, migration) { action ->
+                withStreamingPresentationAdmission(pending.account) {
+                    if (!pending.isCurrent()) false else synchronized(lifecycleLock) {
+                        if (mounted.get() == null && pendingImport === pending && changes.value == epoch) {
+                            action(); true
+                        } else false
+                    }
+                }
+            }
+        }
+        return StreamingPresentation(null, emptyList(), null) { action ->
+            synchronized(lifecycleLock) {
+                if (mounted.get() == null && pendingImport == null && changes.value == epoch) { action(); true }
+                else false
+            }
+        }
+    }
+
+    /** Same authenticated account fence as mutations, but stale metadata returns false. The
+     * caller enters lifecycle next and must never call a Session while this admission is held. */
+    private fun withStreamingPresentationAdmission(account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean {
+        val admission = captureOwnAccountAdmission(account)
+        if (admission == null) {
+            if (ownCredentials != null || !accountCurrent(account)) return false
+            return action() // Legacy deterministic fixtures only; production always supplies admission.
+        }
+        return admission { accountCurrent(account) && action() }
+    }
+
     fun captureStreamingTarget(profileID: String): StreamingTarget {
         mounted.get()?.takeIf { accountCurrent(it.account) }?.let { current ->
             val read = current.session.read()
@@ -259,6 +343,7 @@ internal class NativeAccountCoordinator(
         pendingImport = null
         val old = synchronized(lifecycleLock) {
             onAuthorityChanged()
+            if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
         }
         changes.value += 1
@@ -377,7 +462,13 @@ internal class NativeAccountCoordinator(
         val next = Mounted(account, candidate)
         // Authentication may take its own lock; never invoke it while holding lifecycleLock.
         val current = isCurrent() && accountCurrent(account)
-        val installed = current && synchronized(lifecycleLock) { onAuthorityChanged(); mounted.compareAndSet(null, next) }
+        val installed = current && synchronized(lifecycleLock) {
+            onAuthorityChanged()
+            if (mounted.get() != null) false else {
+                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                mounted.compareAndSet(null, next)
+            }
+        }
         if (!installed) {
             retireUnpublished(account, candidate); error("Native account changed")
         }
@@ -387,7 +478,12 @@ internal class NativeAccountCoordinator(
             changes.value += 1
             return true
         } catch (error: Throwable) {
-            val removed = synchronized(lifecycleLock) { mounted.compareAndSet(next, null) }
+            val removed = synchronized(lifecycleLock) {
+                if (mounted.get() !== next) false else {
+                    com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                    mounted.compareAndSet(next, null)
+                }
+            }
             if (removed) retireUnpublished(account, candidate)
             throw error
         }

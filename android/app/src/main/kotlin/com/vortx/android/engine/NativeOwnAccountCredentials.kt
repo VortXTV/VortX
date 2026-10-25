@@ -182,6 +182,9 @@ internal class NativeOwnAccountCredentials(
         require(existing == null || existing == intent) { "Immutable owner credential intent changed" }
         check((existing != null || write(intentKey, intent)) && confirmed(intentKey) == intent) { "Owner credential intent could not be stored" }
         // BEFORE attempting publication, even when it installs and its acknowledgement fails.
+        // Both production callers hold the original Main Session/auth/mounted admission. This
+        // certified selection transaction (including a same-UID relink) is not a sync ACK.
+        com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
         generations[key(account, expected.profileID)] = UUID.randomUUID()
         try {
             // Store.write is the durable commit acknowledgement. A redundant fallible read cannot

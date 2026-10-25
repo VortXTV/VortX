@@ -27,8 +27,15 @@ test('the first displayed image and both preloads share winning URL and bounded 
     assert.equal((source.match(/\.scale\(coil3\.size\.Scale\.FIT\)/g) ?? []).length, 2);
     assert.equal((source.match(/\.precision\(coil3\.size\.Precision\.INEXACT\)/g) ?? []).length, 2);
     assert.match(fallback, /decodeScale: coil3\.size\.Scale = coil3\.size\.Scale\.FILL/);
-    assert.match(fallback, /model = maxDecodePx\?\.let \{\s*ImageRequest\.Builder\(context\)\.data\(url\)\.size\(it\)\s*\.scale\(decodeScale\)\.precision\(coil3\.size\.Precision\.INEXACT\)\.build\(\)\s*\} \?: url/);
-    assert.match(fallback, /contentScale = ContentScale\.Crop/);
+    // Crossfade is now an independent optional request setting. The bounded decode branch
+    // still uses the caller's scale and INEXACT precision; the no-options path keeps a URL model.
+    assert.match(fallback, /val model = if \(maxDecodePx != null \|\| crossfade != null\) \{/);
+    assert.match(fallback, /ImageRequest\.Builder\(context\)\.data\(url\)\.apply \{/);
+    assert.match(fallback, /maxDecodePx\?\.let \{\s*size\(it\)\.scale\(decodeScale\)\.precision\(coil3\.size\.Precision\.INEXACT\)/);
+    assert.match(fallback, /crossfade\?\.let \{ requested -> crossfade\(requested\) \}/);
+    assert.match(fallback, /\}\.build\(\)\s*\} else \{\s*url\s*\}\s*AsyncImage\(\s*model = model,/);
+    assert.match(fallback, /^    contentScale: ContentScale = ContentScale\.Crop,/m);
+    assert.match(fallback, /contentScale = contentScale,/);
     assert.match(source, /private const val PICKER_ARTWORK_DECODE_PX = 1920/);
 });
 

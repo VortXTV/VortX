@@ -4,7 +4,8 @@ import CoreFoundation
 // This is an extraction regression, not live provider/native-ABI/device evidence. The script
 // compiles the full production public resource DTO/bridge/projection and unchanged formatter,
 // error enum, begin/current/invalidateScreens/loadMeta methods. Storage, lease, probe sink, and
-// blocking transport are inert. No socket, account, Keychain, SDK, app, or media is accessed.
+// blocking transport are inert. The full live C adapter is compiled and linked against the real SDK,
+// but these tests never construct it. No socket, account, Keychain, app, or media operation runs.
 // Wire fixtures model the verified public resource_result ABI: group.error has a string code
 // and optional numeric HTTP status. They contain no private engine implementation or identities.
 // INSERT_ACTUAL_ERROR
@@ -53,6 +54,8 @@ actor VortxNativeSession {
     private let transport: any VortxResourceTransport
     private var profile = "synthetic-owner"
     private var closed = false
+    // Host-only fixture: owner-history retirement is outside this focused resource proof.
+    private let ownerHistoryRetirementPending = false
     private var epoch = UUID()
     private var tickets: [String: UUID] = [:]
     private var bridges: [String: VortxResourceBridge] = [:]
@@ -68,6 +71,7 @@ actor VortxNativeSession {
             String(decoding: try JSONEncoder().encode(VortxJSON.object(["activeProfileId": .string(profile)])), as: UTF8.self)
         }
     }
+    private func presentationState() throws -> VortxJSON { try scope.validateSnapshot(stateJSON()) }
     func changeProfile() { profile = "synthetic-new-profile"; invalidateScreens() }
     func changeConfiguration() { invalidateScreens() }
     func revokeLeaseOnly() { lease.revoke() }
@@ -252,7 +256,10 @@ private final class FixtureTransport: VortxResourceTransport, @unchecked Sendabl
         expect(streams[13]["content"]?["content"]?["code"] == .string("native_resource_failed"), "arbitrary NSError becomes controlled generic failure")
         expect(streams[14]["content"]?["content"]?["code"] == .string("native_resource_failed"), "missing failure object receives controlled generic category")
         expect((metas + streams).allSatisfy { $0["content"]?["type"] != .string("Loading") }, "no registry row remains Loading at settlement")
-        expect(transport.count() == 76 && transport.observedBudgets().allSatisfy { $0 == 20_000 }, "every singleton leg receives own 20-second budget")
+        let budgets = Array(zip(transport.observedResources(), transport.observedBudgets()))
+        expect(transport.count() == 76 && budgets.count == 76 && budgets.allSatisfy {
+            $0.1 == ($0.0 == .stream ? 40_000 : 20_000)
+        }, "every admitted stream has 40 seconds and metadata retains 20 seconds")
         let lines = ReceiptSink.shared.lines(), parsed = lines.map(fields)
         expect(lines.count == 76, "accepted terminal receipt emitted exactly once per meta and stream leg")
         let keys = parsed.map { ($0["resource"] ?? "") + ":" + ($0["source"] ?? "") }

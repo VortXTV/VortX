@@ -505,29 +505,49 @@ struct NextEpisodePreloadPolicyTests {
     }
 
     private static func addonFanoutIsBoundedAndRetainsPartialResults() async {
-        let counter = ConcurrencyCounter()
-        let results: [Int?] = await BoundedPreloadWorkPool.map(
-            Array(0..<50),
-            limit: 5,
-            timeoutNanoseconds: 80_000_000
-        ) { value in
-            await counter.begin(value)
-            if value < 5 {
-                try? await Task<Never, Never>.sleep(nanoseconds: 10_000_000)
-            } else {
-                try? await Task<Never, Never>.sleep(nanoseconds: 500_000_000)
+        let gate = TimedOperationGate()
+        let worker = Task<[Int?], Never> {
+            let results: [Int?] = await BoundedPreloadWorkPool.map(
+                Array(0..<50),
+                limit: 5,
+                timeoutNanoseconds: 1_000_000_000
+            ) { value in
+                if value < 5 { return await gate.finishImmediately(value) }
+                let result = await gate.wait(for: value)
+                await gate.end(value)
+                return result
             }
-            await counter.end()
-            guard !Task.isCancelled else { return nil }
-            return value
+            await gate.close()
+            return results
         }
-        let snapshot = await counter.snapshot()
+        let watchdog = Task<Void, Never> {
+            do {
+                try await Task<Never, Never>.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+            await gate.markWatchdogFired()
+        }
+
+        // A second full window can be admitted only after the real collector has
+        // stored all five immediate results. Hold that window until its deadline,
+        // rather than assuming relative sleep durations establish completion order.
+        let replacementWindowRegistered = await gate.waitForStarted(10)
+        let results = await worker.value
+        watchdog.cancel()
+        await watchdog.value
+        let snapshot = await gate.snapshot()
+        expect(replacementWindowRegistered && !snapshot.watchdogFired,
+               "partial-result fixture reaches its held replacement window before the watchdog")
         expect(snapshot.maximum <= 5,
                "fifty add-ons never exceed the five-request sliding window")
         expect(results.prefix(5).compactMap { $0 } == Array(0..<5),
                "fast completed add-ons survive the attempt deadline")
         expect(results.dropFirst(5).allSatisfy { $0 == nil },
                "unfinished add-ons do not fabricate results after the deadline")
+        expect(snapshot.waitingCount == 0 && snapshot.active == 0
+            && Set(snapshot.ended) == Set(snapshot.started),
+               "the partial-result deadline retires every held operation without leaked continuations")
     }
 
     private static func addonResultsRetainInputOrder() async {

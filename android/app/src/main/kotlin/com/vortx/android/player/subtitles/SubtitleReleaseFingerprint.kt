@@ -83,7 +83,7 @@ object SubtitleReleaseFingerprint {
         val components = mutableListOf<String>()
 
         if (frameRate != null && frameRate > 0 && frameRate.isFinite()) {
-            components.add("fps:${"%.3f".format(frameRate)}")
+            components.add("fps:${"%.3f".format(java.util.Locale.ROOT, frameRate)}")
         }
 
         if (durationSecs != null && durationSecs > 0 && durationSecs.isFinite()) {

@@ -1,7 +1,7 @@
 package com.vortx.android.trickplay
 
 import java.net.HttpURLConnection
-import java.net.URL
+import java.net.URI
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -27,7 +27,7 @@ class TrickplayConsentGateTest {
         assertTrue(connection.disconnected)
     }
 
-    private class RecordingConnection : HttpURLConnection(URL("https://example.invalid")) {
+    private class RecordingConnection : HttpURLConnection(URI("https://example.invalid").toURL()) {
         var disconnected = false
 
         override fun disconnect() {

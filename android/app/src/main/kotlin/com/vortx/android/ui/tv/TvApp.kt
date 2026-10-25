@@ -26,7 +26,15 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.MediaType
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PreferredEpisode
+import com.vortx.android.VortXApplication
+import com.vortx.android.player.queue.PlaybackQueueState
+import com.vortx.android.player.queue.PlaybackQueueToken
+import com.vortx.android.player.queue.PlaybackQueueAcceptedTarget
+import com.vortx.android.ui.components.PlaybackQueueSheet
+import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.NextEpisodePreloadPolicy
@@ -49,10 +57,12 @@ import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.detailEpisodeRouteKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.randompick.RandomTitlePlayRequest
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
@@ -77,6 +87,12 @@ fun TvApp(
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf(null) })
+    val queueApplicationContext = LocalContext.current.applicationContext
+    val playbackQueue = remember(queueApplicationContext) {
+        (queueApplicationContext as? VortXApplication)?.playbackQueue
+    }
+    val queueState by (playbackQueue?.state?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf<PlaybackQueueState?>(null) })
 
     VortXTheme(
         accentId = activeProfile?.accentID ?: VortXAccents.default.id,
@@ -111,6 +127,12 @@ fun TvApp(
                 confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
+        var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
+        var pendingQueuePlay by remember { mutableStateOf<PlaybackQueueToken?>(null) }
+        var pendingQueueAccepted by remember { mutableStateOf(false) }
+        var pendingQueueAutomatic by remember { mutableStateOf(false) }
+        var showingPlaybackQueueFor by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var queuePolicyEpoch by remember(repo) { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
@@ -132,9 +154,84 @@ fun TvApp(
             )
         }
 
+        fun isLibraryPlayCurrent(request: RandomTitlePlayRequest): Boolean {
+            val store = profileStore ?: return false
+            val owner = repo.continueWatchingOwner()
+            // Use the actual roster selection, never activeProfileId's owner fallback.
+            val profile = store.active
+            return request.isCurrent(
+                currentOwner = owner,
+                currentProfile = profile,
+                needsPicker = store.needsPicker,
+                currentType = detail?.type,
+                currentId = detail?.id,
+                currentDetailGeneration = detailGeneration,
+            ) && pendingQueuePlay.let { queue ->
+                queue == null || (queue.owner == request.owner && queue.entry.item.type == request.type &&
+                    queue.entry.item.id == request.id &&
+                    (pendingQueueAccepted || playbackQueue?.accepts(queue) == true))
+            } && repo.continueWatchingOwner() == owner && store.active == profile && !store.needsPicker
+        }
+        fun retireLibraryPlayRoute() {
+            pendingQueuePlay = null
+            pendingQueueAccepted = false
+            pendingQueueAutomatic = false
+            if (pendingLibraryPlay == null) return
+            // Revoke callbacks synchronously, before the bounded ViewModel owner is forgotten.
+            pendingLibraryPlay = null
+            detailGeneration += 1
+            detail = null
+            playing = null
+            playingMeta = null
+        }
+        fun openLibraryPlay(item: MetaItem) {
+            retireLibraryPlayRoute()
+            val store = profileStore ?: return
+            val profile = store.active ?: return
+            if (store.needsPicker || item.continueWatchingAdmission?.isCurrent() == false) return
+            item.continueWatchingUnavailableMessage?.let { message ->
+                unavailableContinueWatching = "${item.name}\n\n$message"
+                return
+            }
+            val request = RandomTitlePlayRequest(
+                type = item.type,
+                id = item.id,
+                owner = repo.continueWatchingOwner(),
+                profile = profile,
+                detailGeneration = detailGeneration + 1,
+            )
+            if (!request.isCurrent(
+                    currentOwner = repo.continueWatchingOwner(),
+                    currentProfile = store.active,
+                    needsPicker = store.needsPicker,
+                    currentType = item.type,
+                    currentId = item.id,
+                    currentDetailGeneration = request.detailGeneration,
+                )) return
+            detailGeneration = request.detailGeneration
+            detail = item
+            pendingLibraryPlay = request
+        }
+        LaunchedEffect(repo, profileStore, activeProfile, playbackQueue, queueState?.revision) {
+            fun retireIfChanged() {
+                val owner = repo.continueWatchingOwner()
+                playbackQueue?.bindOwner(owner)
+                if (showingPlaybackQueueFor != null && showingPlaybackQueueFor != owner) showingPlaybackQueueFor = null
+                val request = pendingLibraryPlay ?: return
+                if (!isLibraryPlayCurrent(request)) retireLibraryPlayRoute()
+            }
+            retireIfChanged()
+            repo.ctxUpdates().collect {
+                queuePolicyEpoch += 1
+                retireIfChanged()
+            }
+        }
+
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
+            retireLibraryPlayRoute()
+            showingPlaybackQueueFor = null
             playing = null
             playingMeta = null
             autoAdvanceStreak[0] = 0
@@ -158,7 +255,7 @@ fun TvApp(
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let {
-                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
+                "$detailGeneration:${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
             } ?: "no-detail:$detailSourceEpoch",
         )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
@@ -201,8 +298,77 @@ fun TvApp(
             // Revoke an unresolved attempt before hiding the player. Coroutine cancellation is cooperative,
             // so the lease fence must lose authority before any late resolver callback can publish.
             playerVm?.abandonPlaybackRoute()
+            pendingQueuePlay = null
+            pendingQueueAccepted = false
+            pendingQueueAutomatic = false
+            pendingLibraryPlay = null
             playing = null
             if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
+        }
+        val queuePolicyForComposition = queuePolicyEpoch
+        val queueProfileForComposition = profileStore?.active
+        fun queueOwnerIsSelected(owner: ContinueWatchingOwner): Boolean {
+            val store = profileStore ?: return false
+            return !store.needsPicker && store.active?.id == owner.profileId &&
+                store.active == queueProfileForComposition && queuePolicyEpoch == queuePolicyForComposition &&
+                repo.continueWatchingOwner() == owner
+        }
+        val currentQueueOwner = repo.continueWatchingOwner()
+        val selectedQueueOwner = currentQueueOwner.takeIf { queueOwnerIsSelected(it) }
+        val visibleQueueState = rememberPlaybackQueuePresentation(
+            source = queueState,
+            repo = repo,
+            owner = selectedQueueOwner,
+            profile = queueProfileForComposition,
+            policyEpoch = queuePolicyForComposition,
+        )
+        fun openQueuePlay(token: PlaybackQueueToken, automatic: Boolean = false): Boolean {
+            val queue = playbackQueue ?: return false
+            val store = profileStore ?: return false
+            val profile = store.active ?: return false
+            val visible = visibleQueueState ?: return false
+            if (store.needsPicker || profile.id != token.owner.profileId ||
+                profile != queueProfileForComposition || queuePolicyEpoch != queuePolicyForComposition ||
+                repo.continueWatchingOwner() != token.owner || !queue.accepts(token) ||
+                !visible.ready || visible.owner != token.owner || visible.revision != token.revision ||
+                visible.entries.none { it == token.entry }) return false
+            // Revoke the outgoing resolver before moving to an ordinary detail/source route.
+            // The item carries only catalog metadata; it cannot reuse another viewer's resolved URL.
+            playerVm?.abandonPlaybackRoute()
+            playing = null
+            playingMeta = null
+            openLibraryPlay(token.entry.item)
+            val request = pendingLibraryPlay
+            if (request == null || request.owner != token.owner || !isLibraryPlayCurrent(request) ||
+                !queue.accepts(token)) {
+                retireLibraryPlayRoute()
+                return false
+            }
+            pendingQueuePlay = token
+            pendingQueueAccepted = false
+            pendingQueueAutomatic = automatic
+            showingPlaybackQueueFor = null
+            return true
+        }
+        if (showingPlaybackQueueFor == currentQueueOwner && visibleQueueState != null) {
+            PlaybackQueueSheet(
+                state = visibleQueueState,
+                onDismiss = { if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = null },
+                onPlay = { entry ->
+                    if (queueOwnerIsSelected(currentQueueOwner)) {
+                        playbackQueue?.capture(currentQueueOwner, entry.id)?.let { openQueuePlay(it) }
+                    }
+                },
+                onMove = { id, delta ->
+                    if (queueOwnerIsSelected(currentQueueOwner)) playbackQueue?.move(currentQueueOwner, id, delta)
+                },
+                onRemove = { id ->
+                    if (queueOwnerIsSelected(currentQueueOwner)) playbackQueue?.remove(currentQueueOwner, id)
+                },
+                onRetry = {
+                    if (queueOwnerIsSelected(currentQueueOwner)) playbackQueue?.retryLoad(currentQueueOwner)
+                },
+            )
         }
         if (playable != null) {
             // The player is a separate early-return branch, so it must enter the TV Material scope here
@@ -214,13 +380,14 @@ fun TvApp(
             var historyIdentity by remember(playable) {
                 mutableStateOf(PlayerEpisodeHistoryIdentity(playable))
             }
+            // Queue advancement and history share the SAME immutable original-owner witness.
+            val historyOwnerToken = remember(historyIdentity) { repo.continueWatchingOwner() }
             val playbackHistory = remember(historyIdentity) {
                 // The full owner token is captured SYNCHRONOUSLY at play launch (this remember runs once
                 // per identity) and the repository verifies it under the owner fence when the async
                 // begin executes -- any profile/account/principal/revision change in between fails
                 // closed instead of retargeting the session.
-                val ownerToken = repo.continueWatchingOwner()
-                TvPlaybackHistorySession(historyIdentity, playbackSessions, ownerToken)
+                TvPlaybackHistorySession(historyIdentity, playbackSessions, historyOwnerToken)
             }
             val playerSourceState = if (playerVm != null) {
                 playerVm.streams.collectAsStateWithLifecycle().value
@@ -289,6 +456,10 @@ fun TvApp(
                 if (!retryingSource || playerVm == null || launchedPlayerViewModel !== playerVm || launchedPlayerPrincipal != currentPlayerPrincipal) return@LaunchedEffect
                 when (val state = retryPlayback) {
                     is Playback.Ready -> {
+                        if (playing !== playable || !playerVm.isRouteAdmissionCurrent()) {
+                            state.playable.playbackLease?.close()
+                            return@LaunchedEffect
+                        }
                         playerVm.clearPlayback()
                         retryingSource = false
                         playing = state.playable
@@ -313,6 +484,27 @@ fun TvApp(
             }
             PlayerScreen(
                 playable = playable,
+                queueCount = visibleQueueState?.entries?.size ?: 0,
+                onShowQueue = visibleQueueState?.let { {
+                    if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = currentQueueOwner
+                } },
+                onQueueNaturalEnd = {
+                    // PlayerScreen only invokes this after its original real-completion gates.
+                    // A new profile/account or abandoned source may never advance this old file.
+                    if (playing !== playable || playerDetail == null || playingMeta?.id != playerDetail.id ||
+                        playingMeta?.type != playerDetail.type || advancingEpisode || retryingSource ||
+                        episodeHandoffRequest != null || launchedPlayerPrincipal != currentPlayerPrincipal ||
+                        launchedPlayerViewModel !== playerVm || repo.continueWatchingOwner() != historyOwnerToken) {
+                        false
+                    } else {
+                        val next = visibleQueueState?.takeIf { it.ready && it.owner == historyOwnerToken }
+                            ?.entries?.firstOrNull()?.let { playbackQueue?.capture(historyOwnerToken, it.id) }
+                        if (next == null) false else {
+                            cancelPreload()
+                            openQueuePlay(next, automatic = true)
+                        }
+                    }
+                },
                 engineOverride = playingEngineOverride,
                 autoAdvanceCount = autoAdvanceStreak[0],
                 onBingePrompted = { autoAdvanceStreak[0] = 0 },
@@ -431,9 +623,13 @@ fun TvApp(
             UpdatePromptHost()
             val current = detail
             if (current != null) {
+                val routeGeneration = detailGeneration
+                val libraryPlayRequest = pendingLibraryPlay
+                val queuePlayRequest = pendingQueuePlay
+                val queuePlayAutomatic = pendingQueueAutomatic
                 key(current.type, current.id, detailGeneration) {
-                    // The Compose generation resets the local screen tree, while this Activity-scoped
-                    // ViewModel key remains bounded by target and owner so repeat visits do not leak VMs.
+                    // The bounded owner also includes this visit's generation: a fresh Library Play
+                    // cannot inherit an older selection, pending source or consumed auto-watch intent.
                     val detailVm: DetailViewModel = viewModel(
                         viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
@@ -460,11 +656,39 @@ fun TvApp(
                         title = current.name,
                         onBack = {
                             detailVm.abandonPlaybackRoute()
+                            retireLibraryPlayRoute()
+                            detailGeneration += 1
                             detail = null
                         },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
-                            if (detailVm.isRouteAdmissionCurrent()) {
-                                autoAdvanceStreak[0] = 0
+                            val request = pendingLibraryPlay
+                            val currentRoute = detailGeneration == routeGeneration &&
+                                detail?.type == current.type && detail?.id == current.id &&
+                                (request == null || isLibraryPlayCurrent(request)) &&
+                                (queuePlayRequest == null || (pendingQueuePlay === queuePlayRequest &&
+                                    PlaybackQueueAcceptedTarget.matches(queuePlayRequest.entry, loadedMeta,
+                                        detailVm.selectedEpisodeId.value, resolved.isTrailer) &&
+                                    (pendingQueueAccepted || playbackQueue?.accepts(queuePlayRequest) == true)))
+                            if (currentRoute && detailVm.isRouteAdmissionCurrent()) {
+                                // The original catalog route remains the lease witness after mount.
+                                // Retire only this exact queue entry; a failed acknowledgement may not play.
+                                val firstQueueAcceptance = queuePlayRequest != null && !pendingQueueAccepted
+                                val acknowledged = queuePlayRequest == null || pendingQueueAccepted || run {
+                                    pendingQueueAccepted = true
+                                    if (playbackQueue?.consumeAfterAccepted(queuePlayRequest) == true) true else {
+                                        pendingQueueAccepted = false
+                                        false
+                                    }
+                                }
+                                if (!acknowledged) {
+                                    resolved.playbackLease?.close()
+                                    return@TvDetailScreen
+                                }
+                                if (queuePlayRequest == null || !pendingQueueAutomatic) {
+                                    autoAdvanceStreak[0] = 0
+                                } else if (firstQueueAcceptance && queuePlayAutomatic) {
+                                    autoAdvanceStreak[0] += 1
+                                }
                                 playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
                                     requested = requestedEngine,
                                     playable = resolved,
@@ -472,12 +696,103 @@ fun TvApp(
                                 )
                                 playingMeta = loadedMeta
                                 playing = resolved
+                                // Keep the consumed Random request and original token live for lease
+                                // admission/retries. Later edits affect future entries, not this stream.
                             } else resolved.playbackLease?.close()
                         },
+                        autoWatch = pendingLibraryPlay?.let { request ->
+                            !request.consumed && isLibraryPlayCurrent(request)
+                        } == true,
+                        autoWatchAdmission = {
+                            libraryPlayRequest != null && libraryPlayRequest.sameIntent(pendingLibraryPlay) &&
+                                isLibraryPlayCurrent(libraryPlayRequest)
+                        },
+                        onAutoWatchConsumed = {
+                            val request = libraryPlayRequest
+                            val ownsRoute = request != null && request.sameIntent(pendingLibraryPlay) &&
+                                routeGeneration == detailGeneration &&
+                                detail?.type == current.type && detail?.id == current.id
+                            if (!ownsRoute || request == null || pendingLibraryPlay?.consumed != false) {
+                                // An old composition must not consume or retire a replacement intent.
+                                false
+                            } else {
+                                val admitted = isLibraryPlayCurrent(request)
+                                if (admitted) {
+                                    // Consumption changes only the one-shot flag, not its resolve witness.
+                                    pendingLibraryPlay = request.copy(consumed = true)
+                                } else {
+                                    retireLibraryPlayRoute()
+                                    detailVm.abandonPlaybackRoute()
+                                }
+                                admitted
+                            }
+                        },
+                        onAutoWatchCancelled = {
+                            val request = libraryPlayRequest
+                            val admitted = detailGeneration == routeGeneration &&
+                                detail?.type == current.type && detail?.id == current.id &&
+                                (request == null || (request.sameIntent(pendingLibraryPlay) && isLibraryPlayCurrent(request))) &&
+                                (queuePlayRequest == null || (pendingQueuePlay === queuePlayRequest &&
+                                    queueOwnerIsSelected(currentQueueOwner)))
+                            if (request != null && request.sameIntent(pendingLibraryPlay)) {
+                                if (admitted && queuePlayRequest != null) {
+                                    // Picking another source changes how this queued title resolves,
+                                    // not which queue entry accepted playback must acknowledge.
+                                    pendingLibraryPlay = request.copy(consumed = true)
+                                    pendingQueueAutomatic = false
+                                } else {
+                                    pendingQueuePlay = null
+                                    pendingQueueAccepted = false
+                                    pendingQueueAutomatic = false
+                                    pendingLibraryPlay = null
+                                }
+                                detailVm.abandonPlaybackRoute()
+                            }
+                            // A deliberate manual action owns the existing Detail; do not replace it.
+                            admitted
+                        },
+                        onQueueInteraction = {
+                            val request = libraryPlayRequest
+                            val admitted = detailGeneration == routeGeneration &&
+                                detail?.type == current.type && detail?.id == current.id &&
+                                (request == null || (request.sameIntent(pendingLibraryPlay) && isLibraryPlayCurrent(request))) &&
+                                (queuePlayRequest == null || (pendingQueuePlay === queuePlayRequest &&
+                                    queueOwnerIsSelected(currentQueueOwner)))
+                            if (admitted) {
+                                pendingQueuePlay = null
+                                pendingQueueAccepted = false
+                                pendingQueueAutomatic = false
+                                pendingLibraryPlay = null
+                                detailVm.abandonPlaybackRoute(preserveRandomEpisodePick = true)
+                            }
+                            admitted
+                        },
+                        queueCount = visibleQueueState?.entries?.size ?: 0,
+                        queueAvailable = visibleQueueState?.ready == true && queueState?.let {
+                            it.ready && it.owner == currentQueueOwner && it.entries.size < 100
+                        } == true,
+                        onQueueAdd = { loaded, episode, playNext ->
+                            val owner = visibleQueueState?.owner
+                            if (owner != null && detailGeneration == routeGeneration && detail?.id == current.id &&
+                                detail?.type == current.type && loaded.id == current.id && loaded.type == current.type &&
+                                detailVm.isRouteAdmissionCurrent() && queueOwnerIsSelected(owner) &&
+                                (loaded.type == MediaType.MOVIE || loaded.type == MediaType.SERIES)) {
+                                playbackQueue?.add(owner, MetaItem(
+                                    id = loaded.id, type = loaded.type, name = loaded.name, poster = loaded.poster,
+                                    preferredEpisode = episode?.takeIf { loaded.type == MediaType.SERIES }?.let {
+                                        PreferredEpisode(it.season, it.episode, it.id)
+                                    },
+                                ), playNext)
+                            }
+                        },
+                        onShowQueue = visibleQueueState?.let { {
+                            if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = currentQueueOwner
+                        } },
                         // A Person-page filmography tile (opened from the detail's cast rail) resolves a
                         // title and opens it as a fresh detail, reusing the SAME detail slot the browse wall
                         // uses -- the couch analogue of the phone actor -> film walk.
                         onOpenTitle = {
+                            retireLibraryPlayRoute()
                             detailGeneration += 1
                             detail = it
                         },
@@ -489,14 +804,21 @@ fun TvApp(
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
                 TvShell(
-                    onProfileSelected = { profileSelection = it },
+                    onProfileSelected = {
+                        retireLibraryPlayRoute()
+                        profileSelection = it
+                    },
                     repo = repo,
                     auth = auth,
                     destination = shellDestination,
-                    onDestinationChange = { shellDestination = it },
+                    onDestinationChange = {
+                        retireLibraryPlayRoute()
+                        shellDestination = it
+                    },
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
                     onItem = {
+                        retireLibraryPlayRoute()
                         if (it.continueWatchingAdmission?.isCurrent() != false) {
                             if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
                             else {
@@ -505,10 +827,12 @@ fun TvApp(
                             }
                         }
                     },
+                    onDirectResume = ::openLibraryPlay,
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
                     onPlayLocal = {
+                        retireLibraryPlayRoute()
                         autoAdvanceStreak[0] = 0
                         playingEngineOverride = automaticEngineFor(it)
                         playingMeta = null

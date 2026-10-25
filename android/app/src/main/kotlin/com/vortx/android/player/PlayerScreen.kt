@@ -35,8 +35,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -82,6 +84,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
+import com.vortx.android.player.subtitles.SubtitlePoolClient
+import com.vortx.android.player.subtitles.SubtitleTimingSession
+import com.vortx.android.player.subtitles.subtitlePoolPlaybackQuery
+import com.vortx.android.profile.ContinueWatchingOwnerGate
 import com.vortx.android.skip.AutoSkipCountdownDecision
 import com.vortx.android.skip.AutoSkipCountdownPolicy
 import com.vortx.android.skip.AutoSkipCountdownState
@@ -96,7 +102,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
@@ -143,6 +152,10 @@ fun PlayerScreen(
     /// Defaults to [onBack] so a host without an auto-advance flow keeps the old exit-to-detail
     /// behavior; the phone shell wires it to the series Up Next auto-advance instead.
     onEnded: () -> Unit = onBack,
+    /** Optional upcoming-title queue. True means this exact natural completion accepted a queued route. */
+    onQueueNaturalEnd: (() -> Boolean)? = null,
+    queueCount: Int = 0,
+    onShowQueue: (() -> Unit)? = null,
     /// Called ONCE when the live source is judged BAD -- the engine's own hasError, the stall
     /// watchdog, or the runtime-mismatch verdict below (a file implausibly shorter than the title's
     /// expected runtime, e.g. a ~10s junk file standing in for a removed episode). The host is
@@ -200,6 +213,7 @@ fun PlayerScreen(
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
+    val currentOnQueueNaturalEnd by rememberUpdatedState(onQueueNaturalEnd)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
     val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
     val currentOnSwitchEpisode by rememberUpdatedState(onSwitchEpisode)
@@ -344,8 +358,55 @@ fun PlayerScreen(
     var speed by remember(playbackSessionKey) { mutableStateOf(1.0f) }
     // Whether the "contribute a skip time" editor overlay is open. Reset per playback session.
     var showSkipEditor by remember(playbackSessionKey) { mutableStateOf(false) }
-    var subtitleDelaySeconds by remember(playbackSessionKey) {
-        mutableStateOf(SubtitleOffsetMemory.savedOffset(context, subtitleContentKey) ?: 0.0)
+    val savedSubtitleDelay = remember(playbackSessionKey) {
+        SubtitleOffsetMemory.savedOffset(context, subtitleContentKey)
+    }
+    var subtitleDelaySeconds by remember(playbackSessionKey) { mutableStateOf(savedSubtitleDelay ?: 0.0) }
+    val subtitleTiming = remember(playbackSessionKey) { SubtitleTimingSession(savedSubtitleDelay) }
+    DisposableEffect(subtitleTiming) { onDispose { subtitleTiming.retire() } }
+    // Capture BEFORE the original manager/UI/account/profile proof; never adopt a successor epoch.
+    val originalOwnerCandidate = remember { PlaybackOwnerEpoch.capture() }
+    val subtitleApplication = context.applicationContext as? VortXApplication
+    val subtitleSyncManager = subtitleApplication?.syncManager
+    val subtitleAccountAdmission = remember(playbackSessionKey) {
+        subtitleSyncManager?.captureLocalLibraryMutationAdmission()
+    }
+    val subtitleProfileRevision = remember(playbackSessionKey) { ContinueWatchingOwnerGate.serialized { it } }
+    // Deliberately ONCE per mounted player, not per source/episode/engine fallback. A changed owner
+    // exits this mount and must create a fresh engine; no async completion may adopt a new owner.
+    val originalPlaybackOwner = remember {
+        val original = originalOwnerCandidate
+        if (original == null || subtitleApplication?.syncManager !== subtitleSyncManager) null else {
+            com.vortx.android.profile.ProfileStore.shared.capturePlaybackOwner(
+                original,
+                subtitleProfileRevision,
+                allowLocalOnly = subtitleSyncManager == null ||
+                    subtitleSyncManager.sessionUiState.value == com.vortx.android.sync.VortXSyncManager.SessionUiState.SignedOut,
+                accountRequired = subtitleSyncManager != null,
+                accountAdmission = subtitleAccountAdmission,
+            )
+        }
+    }
+    val currentSubtitleSessionKey by rememberUpdatedState(playbackSessionKey)
+    fun withCurrentSubtitleOwnerState(action: () -> Boolean): Boolean {
+        val original = originalPlaybackOwner ?: return false
+        if (!original.isActive) return false
+        if (subtitleApplication?.syncManager !== subtitleSyncManager) return false
+        return ContinueWatchingOwnerGate.serialized {
+            val validateAndMutateState: () -> Boolean = {
+                // The original revision authenticates initial capture only. Routine same-owner
+                // CW/settings refreshes may advance it; the permanent token now fences the real
+                // owner writers. Never recapture a fresh revision/token after async work.
+                currentSubtitleSessionKey == playbackSessionKey &&
+                    !playerExitRequested && original.isActive && action()
+            }
+            if (subtitleSyncManager == null) validateAndMutateState() else subtitleAccountAdmission?.invoke(validateAndMutateState) == true
+        }
+    }
+    fun withCurrentSubtitleOwner(action: () -> Boolean): Boolean {
+        // Native/property actions execute OUTSIDE account/profile monitors. Revocation cannot
+        // renew this instance: its final gate and native handle retain the original owner cell.
+        return withCurrentSubtitleOwnerState { true } && originalPlaybackOwner?.isActive == true && action()
     }
     var subtitleStyle by remember(playbackSessionKey) { mutableStateOf(SubtitleStyle.current(context)) }
     var audioDelaySeconds by remember(playbackSessionKey) { mutableStateOf(0.0) }
@@ -468,14 +529,42 @@ fun PlayerScreen(
         resourceReleaseGate.registerReleaseCallback(playbackSessionKey, onResourcesReleased)
         onDispose { }
     }
+    // These must exist during connecting/initial construction, BEFORE the engine-null early return.
+    DisposableEffect(outerPlaybackSessionId) {
+        onDispose { resourceReleaseGate.sessionDisposed() }
+    }
+    DisposableEffect(currentPlayable.playbackLease) {
+        currentPlayable.playbackLease?.let { resourceReleaseGate.leaseBound() }
+        onDispose {
+            runCatching { currentPlayable.playbackLease?.close() }
+            resourceReleaseGate.leaseReleased()
+        }
+    }
     fun releaseBoundEngine() {
         engineHolder.getAndSet(null)?.let { engine ->
             engine.release()
             resourceReleaseGate.decoderReleased()
         }
     }
+    // No owner writer invokes player/native teardown. Poll only an atomic one-way cell, then use
+    // the existing exact holder/release gate OUTSIDE account/profile/native-owner monitors.
+    // Native lease/final subtitle admission is denied immediately, not after this cleanup poll.
+    LaunchedEffect(originalPlaybackOwner, engineHolder) {
+        while (originalPlaybackOwner?.isActive == true) delay(100L)
+        releaseBoundEngine()
+        exitPlayer()
+    }
     var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
+        val original = originalPlaybackOwner
+        if (original == null || !original.isActive || !resourceReleaseGate.beginConstruction()) {
+            exitPlayer()
+            return@LaunchedEffect
+        }
+        var published = false
+        try {
+        // Reserve BEFORE factory dispatch; disposal cannot reclaim a local source while a
+        // non-cancellable constructor is still running with no published engine holder.
         // A user engine switch resumes at the live position; every other rebuild loads the source at its
         // own resume point. Consume the pending resume once so a later surface-fail rebuild is unaffected.
         val resumeAt = engineSwitchResumeMs[0]
@@ -490,8 +579,15 @@ fun PlayerScreen(
             // check below hands a build that lost its composition straight to release.
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
+                    if (!it.bindPlaybackOwner(original)) {
+                        it.release()
+                        return@withContext null
+                    }
+                    if (!resourceReleaseGate.decoderBound()) {
+                        it.release()
+                        return@withContext null
+                    }
                     engineHolder.set(it)
-                    resourceReleaseGate.decoderBound()
                     prepareAndLoadEngine(
                         it,
                         playableForEngine,
@@ -504,10 +600,24 @@ fun PlayerScreen(
                         if (it.audioOutputModeAvailable) it.setAudioOutputMode(audioOutputMode)
                     }
                 }
-            } ?: ExoPlayerEngine(context).also {
+            } ?: run {
+                if (!original.isActive) {
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
+                ExoPlayerEngine(context).also {
+                if (!it.bindPlaybackOwner(original)) {
+                    it.release()
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
+                if (!resourceReleaseGate.decoderBound()) {
+                    it.release()
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
                 engineHolder.set(it)
-                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -517,11 +627,21 @@ fun PlayerScreen(
                     pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
                     playbackIntent = playbackIntent,
                 )
+                }
             }
         } else {
             ExoPlayerEngine(context).also {
+                if (!it.bindPlaybackOwner(original)) {
+                    it.release()
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
+                if (!resourceReleaseGate.decoderBound()) {
+                    it.release()
+                    exitPlayer()
+                    return@LaunchedEffect
+                }
                 engineHolder.set(it)
-                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -533,10 +653,11 @@ fun PlayerScreen(
                 )
             }
         }
-        if (!isActive) {
+        if (!isActive || !original.isActive) {
             // The player left composition while the engine was still initializing; the dispose below
             // may already have run (and found the holder empty), so this tail owns the release.
             releaseBoundEngine()
+            if (isActive) exitPlayer()
             return@LaunchedEffect
         }
         // withContext above may have returned after ON_STOP. This is the final main-thread publication
@@ -551,8 +672,25 @@ fun PlayerScreen(
             refreshAudioRoute = {
                 if (engine.audioOutputModeAvailable) engine.setAudioOutputMode(audioOutputMode)
             },
-            publish = { builtEngine = it },
+            publish = {
+                if (original.isActive) {
+                    builtEngine = it
+                    published = true
+                } else {
+                    releaseBoundEngine()
+                    exitPlayer()
+                }
+            },
         )
+        } finally {
+            // Also runs on setup failure and prompt cancellation when withContext returns.
+            // Keep the reservation until the exact holder has been released or registered live.
+            try {
+                if (!published || !isActive || !original.isActive) releaseBoundEngine()
+            } finally {
+                resourceReleaseGate.endConstruction()
+            }
+        }
     }
     DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         onDispose { releaseBoundEngine() }
@@ -590,13 +728,24 @@ fun PlayerScreen(
     // wraps this screen). Deliberately AFTER the orientation/immersive effect so the connecting frame is
     // already landscape + edge-to-edge.
     val engine = builtEngine
+    // One deadline per physical attempt, spanning null -> built publication. Key collection by the
+    // actual engine so a replacement cannot consume a retained settled value from its predecessor.
+    val startupWindow = remember(engineHolder, subtitleProfileRevision) { StartupCoverWindow(SystemClock.elapsedRealtime()) }
+    val playerState = key(engine) {
+        if (engine == null) PlayerState(startupEvidence = PlaybackStartupEvidence.AWAITING)
+        else engine.state.collectAsStateWithLifecycle().value
+    }
     if (engine == null) {
+        val showStartup = rememberStartupCoverWindow(startupWindow, subtitleProfileRevision,
+            PlaybackStartupEvidence.AWAITING, allowed = !playerExitRequested && hostActivity?.isInPictureInPictureMode != true)
+        val startupArtwork = playerStartupPlaceholder(currentPlayable)
         Box(
             modifier = modifier
                 .fillMaxSize()
                 .background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
+            if (showStartup) PlayerStartupCover(startupArtwork)
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -701,7 +850,6 @@ fun PlayerScreen(
         onDispose { controller?.stop(); afrHolder.set(null) }
     }
 
-    val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
     // Automatic skip is a position-driven, media-scoped state machine. The state is keyed by the
@@ -741,18 +889,25 @@ fun PlayerScreen(
     }
 
     // Settings can change while the player remains mounted (including profile sync/restore). Keep one
-    // retained listener for the shared prefs file, refresh the delay immediately, and invalidate only the
-    // in-flight countdown; Off still leaves the manual Skip action available.
+    // retained listener for the shared prefs file. Auto-skip changes refresh the delay and invalidate only
+    // the in-flight countdown; the exact loudness key refreshes the exact mounted, owner-bound engine.
     val autoSkipPreferences = context.applicationContext
         .getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
     DisposableEffect(autoSkipPreferences, autoSkipIdentity, playbackSessionKey, engine) {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-            if (
+            when {
                 key == PlaybackBehaviorSettings.AUTO_SKIP_DELAY_SECONDS_KEY ||
-                    key == PlaybackBehaviorSettings.AUTO_SKIP_KEY
-            ) {
-                autoSkipDelaySeconds = PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext)
-                invalidateAutoSkipPending(engine.state.value.positionMs)
+                    key == PlaybackBehaviorSettings.AUTO_SKIP_KEY -> {
+                    autoSkipDelaySeconds = PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext)
+                    invalidateAutoSkipPending(engine.state.value.positionMs)
+                }
+                key == LoudnessNormalizationSetting.KEY -> {
+                    if (originalPlaybackOwner?.isActive == true &&
+                        builtEngine === engine && engineHolder.get() === engine
+                    ) {
+                        engine.applyLoudnessNormalization()
+                    }
+                }
             }
         }
         autoSkipPreferences.registerOnSharedPreferenceChangeListener(listener)
@@ -931,8 +1086,11 @@ fun PlayerScreen(
     // Re-apply player-local controls when the live engine instance changes during a fail-soft demotion.
     // The new engine advertises its capabilities, so unsupported offsets remain honest no-ops.
     LaunchedEffect(engine) {
-        if (engine.subtitleDelayAvailable && subtitleDelaySeconds != 0.0) {
-            engine.setSubtitleDelay(subtitleDelaySeconds)
+        if (engine.subtitleDelayAvailable) {
+            withCurrentSubtitleOwner {
+                engine.setSubtitleDelay(subtitleDelaySeconds)
+                true
+            }
         }
         if (engine.audioDelayAvailable && audioDelaySeconds != 0.0) {
             engine.setAudioDelay(audioDelaySeconds)
@@ -945,6 +1103,14 @@ fun PlayerScreen(
         if (engine.hardwareDecodingAvailable && !hardwareDecoding) {
             engine.setHardwareDecoding(false)
         }
+    }
+
+    // Apply the persisted normalizer only after this exact asynchronously-built engine is published.
+    // The original owner and holder identity fence this effect from an ambient successor replacement.
+    // ExoPlayer/Media3 reaches the PlayerEngine default no-op; no DSP capability is claimed.
+    LaunchedEffect(engine, originalPlaybackOwner) {
+        if (originalPlaybackOwner?.isActive != true || builtEngine !== engine || engineHolder.get() !== engine) return@LaunchedEffect
+        engine.applyLoudnessNormalization()
     }
 
     // SLEEP TIMER (timed leg). When armed for a number of minutes, pause playback once after that time (only
@@ -1110,6 +1276,10 @@ fun PlayerScreen(
         isPaused = playerState.isPaused,
         durationKnown = playerState.durationMs > 0L,
     )
+    val showStartupCover = rememberStartupCoverWindow(startupWindow, subtitleProfileRevision,
+        playerState.startupEvidence, allowed = !effectiveError && !playerExitRequested && !playerState.hasEnded && !pip.isInPip)
+    val startupArtwork = rememberPlayerStartupArtwork(currentPlayable, startupWindow, subtitleProfileRevision,
+        enabled = showStartupCover)
     // Crossing the PiP boundary: entering drops the chrome + any live gesture HUD (dead pixels in
     // the small window); expanding back restores the controls so the viewer lands oriented.
     var gestureHud by remember(playbackSessionKey) { mutableStateOf<PlayerGestureHud?>(null) }
@@ -1248,15 +1418,85 @@ fun PlayerScreen(
     // playable's imdb identity. Fail-soft at every step -- a trailer, an id-less playable, no
     // subtitle add-ons installed, or a flaky add-on simply leaves the sheet's add-on section empty.
     // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
-    // it on the live engine (mpv `sub-add` / the ExoPlayer side-loaded track rebuild) and
-    // auto-selects it once the engine reports the grown track list.
+    // it on the live engine. Each engine selects the exact requested file; the UI never guesses
+    // identity from inventory count/order, which can change when unrelated sidecars finish.
     var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
-    val mountedAddonSubs = remember(playbackSessionKey, engine) { mutableSetOf<String>() }
-    var pendingSubSelectAbove by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
-    fun mountAddonSubtitle(sub: AddonSubtitle) {
-        if (mountedAddonSubs.add(sub.url)) {
-            pendingSubSelectAbove = latestState.subtitleTracks.size
-            engine.addExternalSubtitle(sub.url)
+    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
+    fun mountAddonSubtitle(sub: AddonSubtitle, original: PlayerSubtitleSelection) {
+        engine.addExternalSubtitle(sub.url, original)
+    }
+    // Shared by phone and TV: pool IO is owned by the exact source/account/profile lifetime.
+    // Freeze the first real duration/release query rather than applying a duration-0 pool offset.
+    val subtitlePoolScope = rememberCoroutineScope()
+    val latestSubtitleEngine by rememberUpdatedState(engine)
+    val poolSignedIn = subtitleSyncManager?.isSignedIn == true
+    val poolThin = playerState.subtitleTracks.size + addonSubtitles.size < 2
+    val subtitlePoolQuery = remember(playbackSessionKey, playerState.durationMs > 0L) {
+        val filename = runCatching { java.net.URI(currentPlayable.url).path?.substringAfterLast('/') }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        val releaseName = filename ?: listOfNotNull(currentPlayable.mediaRef?.title ?: currentPlayable.title,
+            currentPlayable.mediaRef?.year?.toString()).joinToString(" ")
+        subtitlePoolPlaybackQuery(subtitleContentKey, playerState.durationMs, releaseName)
+    }
+    var pooledSubtitles by remember(playbackSessionKey) {
+        mutableStateOf(emptyList<SubtitlePoolClient.PooledSubtitle>())
+    }
+    var poolLoadingId by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
+    var poolLoadingSelection by remember(playbackSessionKey, engine) { mutableStateOf<PlayerSubtitleSelection?>(null) }
+    fun admitCurrentSubtitleEngine(action: () -> Boolean): Boolean = withCurrentSubtitleOwner {
+        latestSubtitleEngine === engine && action()
+    }
+    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, poolSignedIn) {
+        val query = subtitlePoolQuery ?: return@LaunchedEffect
+        val original = engine.captureSubtitleSelection() ?: return@LaunchedEffect
+        val syncEnabled = com.vortx.android.config.RemoteConfig.isFeatureOn("subtitleSync",
+            com.vortx.android.config.RemoteConfigDefaults.FEATURE_SUBTITLE_SYNC)
+        if (!poolSignedIn || (!poolThin && !(engine.subtitleDelayAvailable && syncEnabled)) ||
+            !admitCurrentSubtitleEngine { true }) return@LaunchedEffect
+        val result = SubtitlePoolClient.fetchPooled(
+            contentKey = query.contentKey,
+            fingerprint = query.fingerprint,
+            isSignedIn = true,
+        )
+        currentCoroutineContext().ensureActive()
+        admitCurrentSubtitleEngine {
+            pooledSubtitles = if (poolThin) result.subs else emptyList()
+            true
+        }
+        // Offset and subtitle choices came from THIS captured query, not a mutable title lookup.
+        if (syncEnabled && engine.isSubtitleSelectionCurrent(original)) subtitleTiming.applyCommunityAccepted(result.offsetMs, engine.subtitleDelayAvailable,
+            ::admitCurrentSubtitleEngine) { seconds ->
+            if (!engine.setSubtitleDelay(seconds, original)) return@applyCommunityAccepted false
+            subtitleDelaySeconds = seconds
+            true
+        }
+    }
+    fun selectPooledSubtitle(sub: SubtitlePoolClient.PooledSubtitle) {
+        if ((poolLoadingId != null && poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) ||
+            sub !in pooledSubtitles || !poolSignedIn ||
+            !admitCurrentSubtitleEngine { true }) return
+        val original = engine.beginSubtitleSelection() ?: return
+        showControls()
+        trackSelectionPhases = trackSelectionPhases.holdSubtitle()
+        poolLoadingId = sub.id
+        poolLoadingSelection = original
+        subtitlePoolScope.launch {
+            try {
+                val local = SubtitlePoolClient.download(context, sub, isSignedIn = true)
+                currentCoroutineContext().ensureActive()
+                admitCurrentSubtitleEngine {
+                    if (local != null && engine.isSubtitleSelectionCurrent(original)) {
+                        mountAddonSubtitle(AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), original)
+                    }
+                    true
+                }
+            } finally {
+                // An older completion/cancellation must not clear a newer choice's loading UI.
+                if (poolLoadingSelection === original) {
+                    poolLoadingId = null
+                    poolLoadingSelection = null
+                }
+            }
         }
     }
     LaunchedEffect(playbackSessionKey) {
@@ -1274,19 +1514,6 @@ fun PlayerScreen(
             language = AddonSubtitle::lang,
         )
     }
-    // A picked add-on subtitle has mounted when the engine's subtitle list grows past its pre-mount
-    // count; select the newly appended track (mpv appends on `sub-add`, the ExoPlayer rebuild
-    // appends the side-loaded config last). Idempotent on mpv, whose `sub-add` default flag already
-    // selects the new track.
-    LaunchedEffect(playerState.subtitleTracks) {
-        val preMountCount = pendingSubSelectAbove ?: return@LaunchedEffect
-        val tracks = latestState.subtitleTracks
-        if (tracks.size > preMountCount) {
-            tracks.lastOrNull()?.let { engine.selectSubtitleTrack(it.id) }
-            pendingSubSelectAbove = null
-        }
-    }
-
     // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
     // inventories can arrive independently, so each type gets one default decision once *its own*
     // selectable inventory appears. A viewer's manual or external subtitle pick holds that type until this
@@ -1299,7 +1526,6 @@ fun PlayerScreen(
     val matchAudioSub = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
     }
-    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
     LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks, trackSelectionPhases) {
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
@@ -1322,7 +1548,9 @@ fun PlayerScreen(
         if (defaults.selectAudio) audioId?.let { engine.selectAudioTrack(it) }
         if (defaults.selectSubtitle) {
             val subId = pick.subtitleId
-            if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
+            engine.captureSubtitleSelection()?.let { original ->
+                engine.selectSubtitleTrack(subId?.takeIf { it >= 0 }, original)
+            }
         }
         trackSelectionPhases = trackSelectionPhases.apply(defaults)
     }
@@ -1365,7 +1593,7 @@ fun PlayerScreen(
         // Reserve before mounting: the engine publishes a new inventory for the sidecar, which recomposes
         // this effect. The reservation prevents a second automatic overlay for the same loaded engine.
         trackSelectionPhases = trackSelectionPhases.recordAddonSelection()
-        mountAddonSubtitle(sub)
+        engine.captureSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
     }
 
     // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
@@ -1563,19 +1791,6 @@ fun PlayerScreen(
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
-    // A final proof is scoped to the mounted player, not an accepted source/episode replacement.
-    // The gate still waits for every decoder and lease counted by the entire outer session.
-    DisposableEffect(outerPlaybackSessionId) {
-        onDispose { resourceReleaseGate.sessionDisposed() }
-    }
-    // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
-    DisposableEffect(currentPlayable.playbackLease) {
-        currentPlayable.playbackLease?.let { resourceReleaseGate.leaseBound() }
-        onDispose {
-            runCatching { currentPlayable.playbackLease?.close() }
-            resourceReleaseGate.leaseReleased()
-        }
-    }
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
     // Next auto-advance for a series episode with a successor, or a plain return to the detail page
@@ -1591,6 +1806,7 @@ fun PlayerScreen(
     // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
+    var queueCompletionAttempted by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested) {
         val s = latestState
         if (
@@ -1624,6 +1840,14 @@ fun PlayerScreen(
         if (isLocalSession) {
             exitPlayer()
             return@LaunchedEffect
+        }
+        // The queue never inherits the manual-forced-source exemption. Ordinary series Up Next keeps
+        // its existing behavior, while a queued title requires this original non-junk natural end.
+        if (!queueCompletionAttempted && !currentPlayable.isTrailer && !currentPlayable.userForcedSource &&
+            !isJunkEof(s.positionMs, s.durationMs, currentPlayable)
+        ) {
+            queueCompletionAttempted = true
+            if (currentOnQueueNaturalEnd?.invoke() == true) return@LaunchedEffect
         }
         currentOnEnded()
     }
@@ -1856,6 +2080,7 @@ fun PlayerScreen(
             .focusable(),
     ) {
         engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb(), scaleMode = scaleMode)
+        if (showStartupCover) PlayerStartupCover(startupArtwork)
 
         // Tap layer: single tap toggles the chrome; double-tap seeks (right half = +10s, left half =
         // -10s, the standard mobile-player gesture) and re-shows the chrome so the seek is visible.
@@ -1919,6 +2144,8 @@ fun PlayerScreen(
 
         PlayerChrome(
             playable = currentPlayable,
+            queueCount = queueCount,
+            onShowQueue = onShowQueue,
             playbackSessionRevision = sourceSwitchState.revision,
             // The watchdog's stall verdict and the runtime-mismatch verdict both ride the same
             // hasError the engines publish, so the chrome has exactly one error surface (the overlay
@@ -1949,11 +2176,24 @@ fun PlayerScreen(
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
                 showControls()
-                subtitleDelaySeconds = adjustedPlayerDelay(subtitleDelaySeconds, delta)
-                engine.setSubtitleDelay(subtitleDelaySeconds)
-                SubtitleOffsetMemory.save(context, subtitleDelaySeconds, subtitleContentKey)
+                subtitleTiming.applyManualAccepted(adjustedPlayerDelay(subtitleDelaySeconds, delta),
+                    engine.subtitleDelayAvailable, ::admitCurrentSubtitleEngine) manualDelay@{ seconds ->
+                    // Manual timing is another explicit decision. Community/saved offset applications
+                    // do not create a new choice or silently revoke a selected external file.
+                    val original = engine.beginSubtitleSelection() ?: return@manualDelay false
+                    if (!engine.setSubtitleDelay(seconds, original)) return@manualDelay false
+                    // Only local state/cache work is admitted under owner monitors; never native work.
+                    withCurrentSubtitleOwnerState {
+                        subtitleDelaySeconds = seconds
+                        SubtitleOffsetMemory.save(context, subtitleDelaySeconds, subtitleContentKey)
+                        true
+                    }
+                }
             },
             subtitleStyle = subtitleStyle,
+            pooledSubtitles = pooledSubtitles,
+            poolLoadingId = poolLoadingId,
+            onSelectPooledSubtitle = ::selectPooledSubtitle,
             onChangeSubtitleStyle = { next ->
                 showControls()
                 SubtitleStyle.save(context, next)
@@ -1964,6 +2204,11 @@ fun PlayerScreen(
             audioDelaySeconds = audioDelaySeconds,
             audioOutputModeAvailable = engine.audioOutputModeAvailable,
             audioOutputMode = audioOutputMode,
+            sessionAudioPreset = playerState.sessionAudioPreset,
+            onSelectSessionAudioPreset = { preset ->
+                showControls()
+                engine.setSessionAudioPreset(preset)
+            },
             onAdjustAudioDelay = { delta ->
                 showControls()
                 audioDelaySeconds = adjustedPlayerDelay(audioDelaySeconds, delta)
@@ -1971,10 +2216,9 @@ fun PlayerScreen(
             },
             onSelectAudioOutputMode = { mode ->
                 showControls()
-                if (engine.audioOutputModeAvailable) {
+                if (engine.trySetAudioOutputMode(mode)) {
                     audioOutputMode = mode
                     AudioOutputMode.setCurrent(context, mode)
-                    engine.setAudioOutputMode(mode)
                 }
             },
             // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
@@ -2010,7 +2254,6 @@ fun PlayerScreen(
             onSelectSubtitle = {
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
-                pendingSubSelectAbove = null
                 engine.selectSubtitleTrack(it)
             },
             onSetSpeed = { newSpeed ->
@@ -2107,7 +2350,7 @@ fun PlayerScreen(
             onSelectAddonSubtitle = { sub ->
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
-                mountAddonSubtitle(sub)
+                engine.beginSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
             // recomposition so the checkmarks reflect the current secondary-sid / sid after a pick.
@@ -2117,7 +2360,6 @@ fun PlayerScreen(
             onSelectSecondarySubtitle = { id ->
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
-                pendingSubSelectAbove = null
                 engine.setSecondarySubtitleTrack(id)
             },
             // Sleep timer. End-of-episode is offered only for a series episode (it stops the auto-advance).

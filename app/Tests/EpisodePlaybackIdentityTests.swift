@@ -8,6 +8,8 @@
 //     app/SourcesShared/AppleEpisodeResolverAdmission.swift \
 //     app/SourcesShared/DebridPlaybackAvailability.swift \
 //     app/SourcesShared/UsenetStreamValidation.swift \
+//     app/SourcesShared/ProfileAddonPreferences.swift \
+//     app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \
@@ -52,6 +54,10 @@ enum StubError: Error { case unavailable }
 
 enum VortXSyncManager { static var appliedAddonOrder: [String] = [] }
 enum AddonTombstones { static func normalize(_ value: String) -> String { value } }
+enum ProfileStore {
+    static func activeDisabledAddons() -> Set<String> { [] }
+    static func activeAddonOrder(accountOrder: [String]) -> [String] { accountOrder }
+}
 
 final class DebridKeys {
     static let shared = DebridKeys()
@@ -155,7 +161,7 @@ private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
     )
     let sameSource = slice(
         playerSource, from: "private func retryResumeSameSource()",
-        to: "/// MID-PLAY libmpv FAILURE"
+        to: "private func rejectPrematureEOFIfNeeded("
     )
     let retryLoad = slice(
         playerSource, from: "private func retryLoad(",
@@ -477,14 +483,16 @@ private struct EpisodePlaybackIdentityTests {
                && !tvDetail.contains(".onChange(of: videos.count)"),
                "TV cached rows and watched rollup refresh on episode content, not only count")
         let phoneDetail = source("SourcesiOS/iOSDetailView.swift")
-        expect(phoneDetail.contains(".onChange(of: videos) { _ in")
-               && !phoneDetail.contains(".onChange(of: videos.count)"),
+        expect(phoneDetail.contains(".onValueChange(of: videos) { _ in")
+               && !phoneDetail.contains(".onChange(of: videos.count)")
+               && !phoneDetail.contains(".onValueChange(of: videos.count)"),
                "phone and Mac season validity and watched rollup observe episode content")
         expect(!blankAnime.hasSamePresentation(as: metadata(["videos": []])), "changed episode inventory republishes")
         expect(!blankAnime.hasSamePresentation(as: metadata(["trailerStreams": [["ytId": "abcdefghijk"]]])),
                "late trailer stream republishes")
-        expect(source("SourcesShared/CoreBridge.swift").contains("!currentMeta.hasSamePresentation(as: nextMeta)"),
-               "bridge consumes production metadata presentation comparison")
+        expect(source("SourcesShared/CoreBridge.swift").contains("current != next")
+               && source("SourcesShared/CoreModels.swift").contains("extension CoreMetaDetails: Equatable"),
+               "bridge consumes complete decoded metadata value comparison")
 
         let hash = "0123456789abcdef0123456789abcdef01234567"
         let e2 = stream(hash: hash, fileIdx: 1)
@@ -744,6 +752,9 @@ private struct EpisodePlaybackIdentityTests {
             usesGenerationOwnedRetryResume(playerScreenSource),
             "PlayerScreen retries and foreground reissue all use generation-owned deferred resume delivery"
         )
+        expect(!usesGenerationOwnedRetryResume(playerScreenSource.replacingOccurrences(
+            of: "recoverCurrentNativeDebridLink(reason: \"resume\")", with: "false"
+        )), "negative mutation rejects a same-source retry that drops the owned recovery route")
         let rootSource = source("SourcesiOS/iOSRootView.swift")
         expect(usesAllSeasonDirectResume(rootSource),
                "iOS direct resume wires the full all-season list into labels and resolver")
@@ -1031,6 +1042,74 @@ private struct EpisodePlaybackIdentityTests {
                "negative episode file selector fails closed")
         expect(EpisodePlaybackIdentity.playableTorrentFileIndex(fileIdx: -1, isEpisode: false) == nil,
                "negative movie file selector fails closed")
+        let unavailableMovieURL = URL(string: "http://127.0.0.1:0/fixture/0")!
+        let availableMovieURL = URL(string: "http://127.0.0.1:11470/fixture/0")!
+        expect(EpisodePlaybackIdentity.usableTorrentFallbackURL(unavailableMovieURL) == nil,
+               "unpublished native port zero is unavailable for explicit own-resolver fallback")
+        expect(EpisodePlaybackIdentity.usableTorrentFallbackURL(availableMovieURL) == availableMovieURL,
+               "valid published movie P2P fallback stays available")
+        expect(EpisodePlaybackIdentity.mayResolveTorrentWithoutURL(isEpisode: false, isRawTorrent: true,
+            hasPlayableURL: false, hasOwnResolver: true, hasSemanticEpisode: false),
+               "an own-provider movie resolution needs no fabricated episode hint")
+        expect(!EpisodePlaybackIdentity.mayResolveTorrentWithoutURL(isEpisode: true, isRawTorrent: true,
+            hasPlayableURL: false, hasOwnResolver: true, hasSemanticEpisode: false),
+               "movie admission never launders an episode without a semantic target")
+        expect(!EpisodePlaybackIdentity.mayResolveTorrentWithoutURL(isEpisode: false, isRawTorrent: true,
+            hasPlayableURL: false, hasOwnResolver: false, hasSemanticEpisode: false),
+               "movie without an own key gains no resolver-only authority")
+        expect(!EpisodePlaybackIdentity.mayResolveTorrentWithoutURL(isEpisode: false, isRawTorrent: false,
+            hasPlayableURL: false, hasOwnResolver: true, hasSemanticEpisode: false),
+               "unsupported and direct source classes gain no torrent resolution route")
+        let pooledEpisode = stream(hash: hash, fileIdx: nil)
+        expect(pooledEpisode.isTorrent && pooledEpisode.playableURL(isEpisode: true) == nil,
+               "real pooled hash-only episode still has no fabricated media URL")
+        expect(EpisodePlaybackIdentity.mayResolveEpisodeTorrentWithoutURL(
+            isEpisode: true, isRawTorrent: pooledEpisode.isTorrent,
+            hasPlayableURL: pooledEpisode.playableURL(isEpisode: true) != nil, hasOwnEpisodeResolver: true),
+               "real hash-only pooled source admits an own-provider semantic resolution attempt")
+        expect(!EpisodePlaybackIdentity.mayResolveEpisodeTorrentWithoutURL(
+            isEpisode: true, isRawTorrent: pooledEpisode.isTorrent,
+            hasPlayableURL: pooledEpisode.playableURL(isEpisode: true) != nil, hasOwnEpisodeResolver: false),
+               "real hash-only pooled source without an own resolver gains no play authority")
+        let directEpisode = try! JSONDecoder().decode(CoreStream.self, from: JSONSerialization.data(withJSONObject: [
+            "url": "https://media.invalid/selected-episode", "name": "Direct episode"
+        ]))
+        let mixedCandidates = [pooledEpisode, e2, directEpisode]
+        expect(EpisodePlaybackIdentity.episodePlaybackFallback(pooledEpisode, candidates: mixedCandidates,
+            hasOwnEpisodeResolver: true, isExplicitChoice: false) == e2,
+               "automatic fallback skips unresolved pooled best and retains the first safe indexed candidate")
+        expect(EpisodePlaybackIdentity.episodePlaybackFallback(pooledEpisode, candidates: [pooledEpisode, directEpisode, e2],
+            hasOwnEpisodeResolver: true, isExplicitChoice: false) == directEpisode,
+               "automatic fallback preserves original valid-URL candidate order")
+        expect(EpisodePlaybackIdentity.episodePlaybackFallback(pooledEpisode, candidates: mixedCandidates,
+            hasOwnEpisodeResolver: true, isExplicitChoice: true) == pooledEpisode,
+               "explicit eligible own-provider choice retains the exact pooled labeled source")
+        expect(EpisodePlaybackIdentity.episodePlaybackFallback(pooledEpisode, candidates: mixedCandidates,
+            hasOwnEpisodeResolver: false, isExplicitChoice: true) == e2,
+               "explicit choice without an own semantic resolver cannot displace a valid safe fallback")
+        expect(EpisodePlaybackIdentity.episodePlaybackFallback(pooledEpisode, candidates: [pooledEpisode],
+            hasOwnEpisodeResolver: true, isExplicitChoice: false) == nil,
+               "automatic hash-only source without cache proof does not acquire uncached resolution authority")
+        for isEpisode in [false, true] {
+            for isRawTorrent in [false, true] {
+                for hasPlayableURL in [false, true] {
+                    for hasOwnEpisodeResolver in [false, true] {
+                        let admitted = EpisodePlaybackIdentity.mayResolveEpisodeTorrentWithoutURL(
+                            isEpisode: isEpisode, isRawTorrent: isRawTorrent,
+                            hasPlayableURL: hasPlayableURL, hasOwnEpisodeResolver: hasOwnEpisodeResolver)
+                        expect(admitted == (isEpisode && isRawTorrent && !hasPlayableURL && hasOwnEpisodeResolver),
+                               "resolver-only episode eligibility requires every authority without inventing a URL")
+                        expect(!admitted || EpisodePlaybackIdentity.playableTorrentFileIndex(fileIdx: nil, isEpisode: true) == nil,
+                               "resolver-only admission keeps the hash-only episode file-zero fallback closed")
+                        for explicitChoice in [false, true] {
+                            expect(EpisodePlaybackIdentity.mayResolveUncachedTorrentPick(
+                                isExplicitChoice: explicitChoice, resolverOnlyEligible: admitted) == (explicitChoice && admitted),
+                                   "only an explicit eligible episode choice may bypass the instant cache shortcut")
+                        }
+                    }
+                }
+            }
+        }
         expect(EpisodePlaybackIdentity.engineBindingSource(
             isRawTorrent: true, fileIdx: e2.fileIdx, resolvedURL: nil
         ) == .original, "raw episode torrent with selector binds its original stream")

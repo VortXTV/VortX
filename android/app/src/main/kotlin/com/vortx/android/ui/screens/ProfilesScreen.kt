@@ -104,6 +104,7 @@ fun ProfilesScreen(
     DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
     val nativeState = nativeModel?.state?.collectAsState()?.value
     if (nativeModel == null || nativeState == null) { ProfilesUnavailable(onBack, modifier); return }
+    if (nativeState.loading) { ProfilesUnavailable(onBack, modifier, "Opening profiles…"); return }
     nativeState.formProfile?.let { profile ->
         NativeStreamingAccountForm(profile, nativeState, nativeModel::submit, nativeModel::close, modifier)
         return
@@ -319,6 +320,10 @@ internal fun ProfilePickerEditorRoute(
     }
     DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
     val nativeState = nativeModel?.state?.collectAsState()?.value
+    if (nativeState?.loading == true) {
+        ProfilesUnavailable(onCancel, modifier, "Opening profile editor…")
+        return
+    }
     if (nativeModel == null || nativeState == null || !nativeState.mounted) {
         ProfilesUnavailable(onCancel, modifier)
         return
@@ -861,7 +866,8 @@ private fun PinGateOverlay(profile: UserProfile, onUnlock: () -> Unit, onCancel:
 /// fail-soft boundary the rest of the app uses (an engine/store problem degrades, never crashes).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ProfilesUnavailable(onBack: () -> Unit, modifier: Modifier) {
+private fun ProfilesUnavailable(onBack: () -> Unit, modifier: Modifier,
+                                message: String = "Profiles are not available right now.") {
     Scaffold(
         modifier = modifier,
         topBar = {
@@ -875,7 +881,7 @@ private fun ProfilesUnavailable(onBack: () -> Unit, modifier: Modifier) {
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge)) {
             Text(
-                "Profiles are not available right now.",
+                message,
                 style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
             )
         }

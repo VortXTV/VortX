@@ -606,7 +606,7 @@ private final class ResolverOperation: @unchecked Sendable {
                 guard inet_ntop(AF_INET, &addressCopy, &text, socklen_t(text.count)) != nil else {
                     return .failure(PinnedHTTPClient.Failure.unsafeResolution)
                 }
-                let answer = NumericAddress(family: AF_INET, bytes: numericAddressBytes(address), presentation: String(cString: text))
+                let answer = NumericAddress(family: AF_INET, bytes: numericAddressBytes(address), presentation: String(decoding: text.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
                 guard answer.isPublic else { return .failure(PinnedHTTPClient.Failure.unsafeResolution) }
                 answers.insert(answer)
             case AF_INET6:
@@ -616,7 +616,7 @@ private final class ResolverOperation: @unchecked Sendable {
                 guard inet_ntop(AF_INET6, &addressCopy, &text, socklen_t(text.count)) != nil else {
                     return .failure(PinnedHTTPClient.Failure.unsafeResolution)
                 }
-                let answer = NumericAddress(family: AF_INET6, bytes: numericAddressBytes(address), presentation: String(cString: text))
+                let answer = NumericAddress(family: AF_INET6, bytes: numericAddressBytes(address), presentation: String(decoding: text.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
                 guard answer.isPublic else { return .failure(PinnedHTTPClient.Failure.unsafeResolution) }
                 answers.insert(answer)
             default:

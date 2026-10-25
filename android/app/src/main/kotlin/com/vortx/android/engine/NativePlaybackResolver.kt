@@ -94,9 +94,12 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
                 val url = resolver.resolve(infoHash = target.infoHash, episode = target.episode, fileIdx = target.fileIdx)
                 if (url != null) Playable(url, source.title)
                 else {
+                    val fallbackFileIdx = checkNotNull(nativeTorrentFallbackFileIndex(target.fileIdx, episode != null)) {
+                        "This source could not be resolved for the selected episode. Choose another source or check your debrid account."
+                    }
                     val base = if (VortxServer.streamingEnabled(context)) VortxServer.startIfNeeded(context) else null
                     checkNotNull(base) { "Native torrent server is unavailable; configure debrid or install a server-enabled artifact" }
-                    Playable("$base/${target.infoHash.lowercase()}/${target.fileIdx ?: 0}", source.title, viaStreamingServer = true, isTorrent = true)
+                    Playable("$base/${target.infoHash.lowercase()}/${fallbackFileIdx}", source.title, viaStreamingServer = true, isTorrent = true)
                 }
             }
             else -> throw UnsupportedOperationException("This native source type cannot be resolved")

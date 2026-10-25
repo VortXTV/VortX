@@ -1,0 +1,50 @@
+VortX backport: two merged upstream audio safety fixes without moving the custom base.
+
+Base: 8c67647b50059406c5c0444903597281b81516cf.
+Upstream:
+  3b276cef9b74fa78d38ebe02a4fe7150cc252138
+  https://github.com/mpv-player/mpv/commit/3b276cef9b74fa78d38ebe02a4fe7150cc252138
+  ao_aaudio: fix the out-of-bounds read in the channel mask retry loop
+  01a7420cbb4bfcb3ae275b864a8a734c61ee8831
+  https://github.com/mpv-player/mpv/commit/01a7420cbb4bfcb3ae275b864a8a734c61ee8831
+  ao_audiounit: keep the layout valid when a channel label is unknown
+
+Both merged 2026-10-22; these are post-stable backports, not a new stable mpv release.
+The hunks are verbatim upstream code. No DV/FEL, demux, HTTP, TLS, output-order,
+sample-rate, passthrough, or avfoundation policy is changed. AAudio is Android-only;
+AudioUnit is the iOS/tvOS fallback, not the Mac CoreAudio driver or preferred tvOS
+avfoundation route. Source integration is not an activated shipping artifact.
+
+--- a/audio/out/ao_aaudio.c
++++ b/audio/out/ao_aaudio.c
+@@ -359,7 +359,7 @@ static int init(struct ao *ao)
+             if (result != AAUDIO_ERROR_OUT_OF_RANGE) {
+                 break;
+             }
+-        } while (i++ < MP_ARRAY_SIZE(aaudio_max_chnums));
++        } while (++i < MP_ARRAY_SIZE(aaudio_max_chnums));
+ 
+         ao->channels = channels;
+     } else {
+--- a/audio/out/ao_audiounit.m
++++ b/audio/out/ao_audiounit.m
+@@ -163,14 +163,16 @@ static bool init_audiounit(struct ao *ao)
+         MP_VERBOSE(ao, "channel map: %i: %u\n", i, layout->mChannelDescriptions[i].mChannelLabel);
+     }
+ 
+-    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2) {
++    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2 ||
++        layout->mNumberChannelDescriptions > MP_NUM_CHANNELS)
++    {
+         ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
+         MP_VERBOSE(ao, "using stereo output\n");
+     } else {
+         ao->channels.num = (uint8_t)layout->mNumberChannelDescriptions;
+         for (UInt32 i = 0; i < layout->mNumberChannelDescriptions; i++) {
+-          ao->channels.speaker[i] =
+-              ca_label_to_mp_speaker_id(layout->mChannelDescriptions[i].mChannelLabel);
++            int speaker = ca_label_to_mp_speaker_id(layout->mChannelDescriptions[i].mChannelLabel);
++            ao->channels.speaker[i] = speaker < 0 ? MP_SPEAKER_ID_NA : speaker;
+         }
+         MP_VERBOSE(ao, "using standard channel mapping\n");
+     }

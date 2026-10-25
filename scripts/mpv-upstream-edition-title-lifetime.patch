@@ -1,0 +1,36 @@
+VortX backport: keep generated edition-title storage alive through composition.
+
+Base: 8c67647b50059406c5c0444903597281b81516cf.
+Verbatim upstream code hunks from:
+  c64675679925df40c3cbecb49bdfb9c93f918745
+  https://github.com/mpv-player/mpv/commit/c64675679925df40c3cbecb49bdfb9c93f918745
+  demux_lavf: fix stack-use-after-scope in edition titles
+  merged 2026-09-22
+
+mp_tprintf uses a compound-literal buffer whose lifetime ends at its enclosing
+block. The generated bitrate prefix is used by edition-title composition after
+that block. Give the same bounded 42-byte buffer the enclosing loop's lifetime.
+This changes neither media/track selection nor seeking, EOF, DV/FEL, network,
+TLS, output order or subtitle rendering. No new mpv pin or minimum OS is needed.
+Source integration is not proof of a rebuilt or activated shipping artifact.
+
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -1076,14 +1076,15 @@ static void build_editions(demuxer_t *demuxer)
+             if (name_idx >= 0)
+                 prefix = mp_tags_get_str(priv->streams[name_idx]->sh->tags, "comment");
+         }
++        char buf[42];
+         if (!prefix) {
+             char *vb = mp_tags_get_str(ed.metadata, "variant_bitrate");
+             char *end;
+             double rate = vb ? strtoll(vb, &end, 10) : 0;
+             if (rate > 0 && *end == '\0') {
+                 rate /= 1000.0;
+                 prefix = rate < 1000
+-                    ? mp_tprintf(42, "Bitrate: %.f kbps", rate)
+-                    : mp_tprintf(42, "Bitrate: %.3f Mbps", rate / 1000.0);
++                    ? mp_tprintf_buf(buf, sizeof(buf), "Bitrate: %.f kbps", rate)
++                    : mp_tprintf_buf(buf, sizeof(buf), "Bitrate: %.3f Mbps", rate / 1000.0);
+             }
+         }

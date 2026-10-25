@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The user's 1...10 SIMKL title ratings: a LOCAL shadow store (Application Support JSON) the app reads from,
 /// mirrored out to SIMKL over `POST /sync/ratings` and converged with the `POST /sync/ratings/{type}` read-back.
@@ -6,8 +7,8 @@ import Foundation
 /// The SIMKL peer of `TraktRatingsStore`, deliberately the same shape: local-first (so a badge is instant and a
 /// rating made offline / with SIMKL disconnected is never lost), SIMKL is a MIRROR WIRE never consulted to
 /// answer "what did the user rate?", and every fold rule lives in the pure `SIMKLRatingsCore` (see there). This
-/// type owns only the impure edges: `NSLock`, persistence, the change notification, the network mirror, and a
-/// generation guard so a disconnect mid-flight can never resurrect the wiped store into the next account.
+/// type owns only the impure edges: scoped locking, persistence, the change notification, the network mirror,
+/// and a generation guard so a disconnect mid-flight can never resurrect the wiped store into the next account.
 ///
 /// Two honest differences from the Trakt store, both rooted in SIMKL's surface, not a shortcut:
 ///   - No `TraktSyncEngine` exists for SIMKL, so convergence runs here: a throttled `refreshIfStale()`
@@ -15,7 +16,7 @@ import Foundation
 ///     the read-back. The persisted unpushed entries ARE the durable queue, so there is no separate queue file
 ///     (matching the rest of the SIMKL write side, which carries no offline push queue).
 ///   - SIMKL rates whole titles only, so this is movie / show level throughout (anime rides the `shows` array).
-final class SIMKLRatingsStore {
+final class SIMKLRatingsStore: Sendable {
     static let shared = SIMKLRatingsStore()
 
     /// Posted when the shadow changes (a user rating, or an adopted read-back row) so every mounted SIMKL
@@ -27,14 +28,18 @@ final class SIMKLRatingsStore {
     /// Minimum gap between read-back / drain refreshes, matching `SIMKLWatchedShadow`.
     private static let refreshInterval: TimeInterval = 5 * 60
 
-    private let lock = NSLock()
-    private var core: SIMKLRatingsCore
-    /// Bumped by `reset()`. An in-flight pull/push captures it before its awaits and refuses to write back if it
-    /// changed, so a disconnect can never resurrect the wiped store into the next account.
-    private var generation = 0
-    private var lastRefresh: Date?
-    private var refreshing = false
-    private var stateSessionID: SIMKLSessionID?
+    private struct State: Sendable {
+        var core: SIMKLRatingsCore
+        /// Bumped by `reset()`. An in-flight pull/push captures it before its awaits and refuses to write back
+        /// if it changed, so a disconnect can never resurrect the wiped store into the next account.
+        var generation = 0
+        var lastRefresh: Date?
+        var refreshing = false
+        var stateSessionID: SIMKLSessionID?
+    }
+    /// Every mutable cache/admission value has one checked owner. Provider awaits and notifications happen
+    /// outside the lock; local persistence remains synchronous with its matching in-memory mutation.
+    private let lock: OSAllocatedUnfairLock<State>
 
     private struct PersistedSnapshot: Codable {
         let sessionID: SIMKLSessionID
@@ -49,8 +54,10 @@ final class SIMKLRatingsStore {
 
     private init() {
         let initialSession = SIMKLAuth.storedSessionID
-        stateSessionID = initialSession
-        core = SIMKLRatingsCore(entries: initialSession.map(Self.load(for:)) ?? [:])
+        lock = OSAllocatedUnfairLock(initialState: State(
+            core: SIMKLRatingsCore(entries: initialSession.map(Self.load(for:)) ?? [:]),
+            stateSessionID: initialSession
+        ))
         SIMKLAuthBoundary.observe(key: "simkl-ratings-store") { [weak self] sessionID in
             self?.reset(to: sessionID)
         }
@@ -64,10 +71,11 @@ final class SIMKLRatingsStore {
     /// it inline. Never touches the network.
     func rating(imdb: String?, tmdb: Int?) -> Int? {
         guard let currentSession = SIMKLAuth.storedSessionID else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              SIMKLAuth.storedSessionID == currentSession else { return nil }
-        return core.rating(imdb: imdb, tmdb: tmdb)
+        return lock.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  SIMKLAuth.storedSessionID == currentSession else { return nil }
+            return state.core.rating(imdb: imdb, tmdb: tmdb)
+        }
     }
 
     // MARK: - Write side (user action)
@@ -85,17 +93,17 @@ final class SIMKLRatingsStore {
 
     private func write(rating: Int?, imdb: String?, tmdb: Int?, isSeries: Bool) {
         guard let sessionID = SIMKLAuth.storedSessionID else { return }
-        lock.lock()
-        guard stateSessionID == sessionID,
-              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        guard let entry = core.write(rating: rating, imdb: imdb, tmdb: tmdb, isSeries: isSeries) else {
-            lock.unlock(); return
+        let edit: (entry: SIMKLRatingsCore.RatingEntry, generation: Int)? = lock.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID,
+                  let entry = state.core.write(rating: rating, imdb: imdb, tmdb: tmdb, isSeries: isSeries)
+            else { return nil }
+            Self.persistLocked(state)
+            return (entry, state.generation)
         }
-        let gen = generation
-        persistLocked()
-        lock.unlock()
+        guard let edit else { return }
         notifyChanged()
-        mirror(entry, gen: gen, sessionID: sessionID)
+        mirror(edit.entry, gen: edit.generation, sessionID: sessionID)
     }
 
     // MARK: - Mirror (push one entry to SIMKL)
@@ -150,13 +158,13 @@ final class SIMKLRatingsStore {
         gen: Int,
         sessionID: SIMKLSessionID
     ) {
-        lock.lock()
-        guard gen == generation,
-              stateSessionID == sessionID,
-              SIMKLAuth.storedSessionID == sessionID,
-              core.markPushed(entry) else { lock.unlock(); return }
-        persistLocked()
-        lock.unlock()
+        lock.withLock { state in
+            guard gen == state.generation,
+                  state.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID,
+                  state.core.markPushed(entry) else { return }
+            Self.persistLocked(state)
+        }
     }
 
     // MARK: - Convergence (throttled drain + read-back)
@@ -169,42 +177,45 @@ final class SIMKLRatingsStore {
         guard SIMKLAuth.isConfigured,
               ExternalSyncToggle.isOn(ExternalSyncToggle.simklRatings),
               let sessionID = SIMKLAuth.storedSessionID else { return }
-        lock.lock()
-        guard stateSessionID == sessionID,
-              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        if refreshing { lock.unlock(); return }
-        if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
-        refreshing = true
-        let gen = generation
-        let unpushed = core.entries.values.filter { !$0.pushed }
-        lock.unlock()
+        let refresh: (generation: Int, unpushed: [SIMKLRatingsCore.RatingEntry])? = lock.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID,
+                  !state.refreshing else { return nil }
+            if let last = state.lastRefresh,
+               Date().timeIntervalSince(last) < Self.refreshInterval { return nil }
+            state.refreshing = true
+            return (state.generation, state.core.entries.values.filter { !$0.pushed })
+        }
+        guard let refresh else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            defer {
-                self.lock.lock()
-                self.refreshing = false
-                // Only stamp when no disconnect happened mid-refresh, matching the other SIMKL refreshers.
-                if self.generation == gen,
-                   self.stateSessionID == sessionID,
-                   SIMKLAuth.storedSessionID == sessionID {
-                    self.lastRefresh = Date()
-                }
-                self.lock.unlock()
-            }
+            defer { self.finishRefresh(gen: refresh.generation, sessionID: sessionID) }
             guard SIMKLAuth.storedSessionID == sessionID else { return }
-            for entry in unpushed {
-                await self.push(entry, gen: gen, sessionID: sessionID)
+            for entry in refresh.unpushed {
+                await self.push(entry, gen: refresh.generation, sessionID: sessionID)
             }
-            await self.pull(gen: gen, sessionID: sessionID)
+            await self.pull(gen: refresh.generation, sessionID: sessionID)
+        }
+    }
+
+    private func finishRefresh(gen: Int, sessionID: SIMKLSessionID) {
+        lock.withLock { state in
+            state.refreshing = false
+            // Only stamp when no disconnect happened mid-refresh, matching the other SIMKL refreshers.
+            if state.generation == gen,
+               state.stateSessionID == sessionID,
+               SIMKLAuth.storedSessionID == sessionID {
+                state.lastRefresh = Date()
+            }
         }
     }
 
     /// Force an immediate convergence past the throttle (on connect / toggle-on). Mirrors the other refreshers.
     func refreshNow() {
-        lock.lock()
-        let inFlight = refreshing
-        if !inFlight { lastRefresh = nil }
-        lock.unlock()
+        let inFlight = lock.withLock { state in
+            if !state.refreshing { state.lastRefresh = nil }
+            return state.refreshing
+        }
         if !inFlight { refreshIfStale() }
     }
 
@@ -216,15 +227,16 @@ final class SIMKLRatingsStore {
         ) else { return }
         let rows = SIMKLRatingsCore.remoteRatings(from: response)
         guard !rows.isEmpty else { return }
-        lock.lock()
-        guard gen == generation,
-              stateSessionID == sessionID,
-              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        let result = core.merge(rows)
-        guard result.dirty else { lock.unlock(); return }
-        persistLocked()
-        lock.unlock()
-        if result.valueChanged { notifyChanged() }
+        let changed = lock.withLock { state in
+            guard gen == state.generation,
+                  state.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID else { return false }
+            let result = state.core.merge(rows)
+            guard result.dirty else { return false }
+            Self.persistLocked(state)
+            return result.valueChanged
+        }
+        if changed { notifyChanged() }
     }
 
     // MARK: - Disconnect
@@ -235,13 +247,13 @@ final class SIMKLRatingsStore {
     }
 
     private func reset(to sessionID: SIMKLSessionID?) {
-        lock.lock()
-        core.wipe()
-        lastRefresh = nil
-        stateSessionID = sessionID
-        generation &+= 1
-        try? Self.storage?.reset()
-        lock.unlock()
+        lock.withLock { state in
+            state.core.wipe()
+            state.lastRefresh = nil
+            state.stateSessionID = sessionID
+            state.generation &+= 1
+            try? Self.storage?.reset()
+        }
         notifyChanged()
     }
 
@@ -269,12 +281,13 @@ final class SIMKLRatingsStore {
         return snapshot.entries
     }
 
-    private func persistLocked() {
-        guard let storage = Self.storage, let stateSessionID else {
+    /// Called only within the lock's synchronous mutation transaction, before notifying any reader.
+    private static func persistLocked(_ state: State) {
+        guard let storage, let stateSessionID = state.stateSessionID else {
             try? Self.storage?.reset()
             return
         }
-        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: core.entries)
+        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: state.core.entries)
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? storage.save(data)
     }

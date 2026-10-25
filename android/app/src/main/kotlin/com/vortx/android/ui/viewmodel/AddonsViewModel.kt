@@ -3,6 +3,7 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.AddonManagementSnapshot
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
@@ -49,6 +50,15 @@ class AddonsViewModel(
     private var pendingHealthUrls: List<String>? = null
     private var activeHealthUrls: List<String>? = null
     private var everLoaded = false
+    private var managementSnapshot: AddonManagementSnapshot? = null
+    private var managementGeneration = 0L
+    private var visibilityOperation: Any? = null
+    private val _loadingManagement = MutableStateFlow(true)
+    val loadingManagement: StateFlow<Boolean> = _loadingManagement.asStateFlow()
+    private val _changingVisibility = MutableStateFlow<String?>(null)
+    val changingVisibility: StateFlow<String?> = _changingVisibility.asStateFlow()
+    private val _visibilityMessages = MutableStateFlow<Map<String, String>>(emptyMap())
+    val visibilityMessages: StateFlow<Map<String, String>> = _visibilityMessages.asStateFlow()
 
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): re-reads the installed list on every
     /// ctx change (an install/remove from this screen, but also a sign-in pulling in the account's own
@@ -81,16 +91,40 @@ class AddonsViewModel(
     }
 
     fun load(showLoading: Boolean = true) {
+        val generation = ++managementGeneration
+        // Retire the old row authority synchronously. A queued callback or old finally cannot clear a
+        // successor's busy flag, report an error against its same-URL row, or target its selected profile.
+        managementSnapshot = null
+        visibilityOperation = null
+        _changingVisibility.value = null
+        _visibilityMessages.value = emptyMap()
+        _loadingManagement.value = true
         viewModelScope.launch {
             if (showLoading) _state.value = UiState.Loading
-            repo.installedAddons().fold(
-                onSuccess = {
-                    _state.value = UiState.Success(it)
-                    probeHealth(it)
+            repo.addonManagementSnapshot().fold(
+                onSuccess = { snapshot ->
+                    val published = snapshot.publishIfCurrent {
+                        if (generation == managementGeneration) {
+                            managementSnapshot = snapshot
+                            _state.value = UiState.Success(snapshot.addons)
+                            _loadingManagement.value = false
+                            probeHealth(snapshot.addons)
+                        }
+                    }
+                    if (!published && generation == managementGeneration) {
+                        // The account/profile changed while IO returned. Its ctx tick will load the
+                        // successor; keep the stale rows non-interactive until that load arrives.
+                        _state.value = UiState.Loading
+                    }
                 },
-                onFailure = { _state.value = UiState.Error(it.message ?: "Couldn't load your add-ons.") },
+                onFailure = {
+                    if (generation == managementGeneration) {
+                        _state.value = UiState.Error("Couldn't load your add-ons. Try again.")
+                        _loadingManagement.value = false
+                    }
+                },
             )
-            everLoaded = true
+            if (generation == managementGeneration) everLoaded = true
         }
     }
 
@@ -186,18 +220,21 @@ class AddonsViewModel(
     /// open with the error so the user can fix the URL.
     fun changeAddonUrl(addon: InstalledAddon, newUrl: String) {
         val trimmed = newUrl.trim()
-        if (trimmed.isEmpty() || trimmed == addon.transportUrl || _changingUrl.value) return
+        if (trimmed.isEmpty() || _changingUrl.value) return
+        _changingUrl.value = true
+        _changeUrlMessage.value = null
         viewModelScope.launch {
-            _changingUrl.value = true
-            _changeUrlMessage.value = null
-            repo.changeAddonUrl(addon, trimmed).fold(
-                onSuccess = {
-                    _changeUrlDone.value += 1
-                    load()
-                },
-                onFailure = { _changeUrlMessage.value = (it.message ?: "Couldn't change that add-on's URL.") to true },
-            )
-            _changingUrl.value = false
+            try {
+                repo.changeAddonUrl(addon, trimmed).fold(
+                    onSuccess = {
+                        _changeUrlDone.value += 1
+                        load()
+                    },
+                    onFailure = { _changeUrlMessage.value = (it.message ?: "Couldn't update that add-on.") to true },
+                )
+            } finally {
+                _changingUrl.value = false
+            }
         }
     }
 
@@ -263,14 +300,56 @@ class AddonsViewModel(
         val retryWhenRateLimited: Boolean = false,
     )
 
-    /// Flip an add-on on/off for the ACTIVE profile (the row's eye toggle, Apple
-    /// `AddonsView.swift:424` -> `profiles.toggleAddon`). A local per-profile overlay, never an
-    /// engine/account change; the repository excludes disabled add-ons from Home rows + source
-    /// groups. The silent reload re-stamps [InstalledAddon.isDisabled] so the icon flips at once.
+    /// Change the profile that produced this row, retaining its original Session/revision through
+    /// queued IO and acknowledgment. Disabled add-ons remain in management and installed state;
+    /// only the profile's active catalog/source registry excludes them.
     fun toggleAddon(addon: InstalledAddon) {
+        if (_loadingManagement.value || visibilityOperation != null) return
+        val snapshot = managementSnapshot ?: return
+        val generation = managementGeneration
+        val operation = Any()
+        var reserved = false
+        snapshot.publishIfCurrent {
+            if (snapshot === managementSnapshot && snapshot.addons.singleOrNull { it.transportUrl == addon.transportUrl } == addon) {
+                visibilityOperation = operation
+                _changingVisibility.value = addon.transportUrl
+                _visibilityMessages.value = _visibilityMessages.value - addon.transportUrl
+                reserved = true
+            }
+        }
+        if (!reserved) { load(showLoading = false); return }
         viewModelScope.launch {
-            repo.setAddonDisabled(addon.transportUrl, !addon.isDisabled)
-            load(showLoading = false)
+            fun isOriginalOperation() = visibilityOperation === operation && managementGeneration == generation && managementSnapshot === snapshot
+            try {
+                repo.setAddonVisibility(snapshot, addon, !addon.isDisabled).fold(
+                    onSuccess = { acknowledged ->
+                        if (isOriginalOperation()) {
+                            val published = acknowledged.publishIfCurrent {
+                                if (isOriginalOperation()) {
+                                    managementSnapshot = acknowledged
+                                    _state.value = UiState.Success(acknowledged.addons)
+                                    probeHealth(acknowledged.addons)
+                                }
+                            }
+                            if (!published && isOriginalOperation()) load(showLoading = false)
+                        }
+                    },
+                    onFailure = {
+                        val published = snapshot.publishIfCurrent {
+                            if (isOriginalOperation()) {
+                                _visibilityMessages.value = _visibilityMessages.value +
+                                    (addon.transportUrl to "Couldn't change this add-on's visibility. Try again.")
+                            }
+                        }
+                        if (!published && isOriginalOperation()) load(showLoading = false)
+                    },
+                )
+            } finally {
+                if (visibilityOperation === operation) {
+                    visibilityOperation = null
+                    _changingVisibility.value = null
+                }
+            }
         }
     }
 

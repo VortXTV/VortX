@@ -34,8 +34,8 @@ struct NativeWatchedMigrationNotice: View {
             .foregroundStyle(Theme.Palette.textPrimary)
             .background(Theme.Palette.surface1)
             .onDisappear(perform: cancelRetry)
-            .onChange(of: sync.account?.id) { _ in cancelRetry() }
-            .onChange(of: profiles.activeID) { _ in cancelRetry() }
+            .onValueChange(of: sync.account?.id) { _ in cancelRetry() }
+            .onValueChange(of: profiles.activeID) { _ in cancelRetry() }
         }
     }
 

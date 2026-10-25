@@ -25,13 +25,20 @@ function block(source, marker) {
   return source.slice(start, end);
 }
 const baseline = execFileSync('git', ['-C', root, 'show', `${ref}:app/SourcesShared/HomeContinueWatchingSelection.swift`], {encoding:'utf8'});
-writeFileSync(`${dir}/BaselineServiceSelection.swift`, baseline.replaceAll('HomeContinueWatchingSelection', 'BaselineServiceSelection'));
+const renamedBaseline = baseline.replaceAll('HomeContinueWatchingSelection', 'BaselineServiceSelection');
+// Fixture-only actor declarations; every historical decision body remains exact.
+writeFileSync(`${dir}/BaselineServiceSelection.swift`, renamedBaseline
+  .replace('        func isCurrent(core: CoreBridge, profiles: ProfileStore) -> Bool {',
+           '        @MainActor func isCurrent(core: CoreBridge, profiles: ProfileStore) -> Bool {')
+  .replace('    static func current(', '    @MainActor static func current(')
+  .replace('    static func permitsPrivateArtworkCommit(', '    @MainActor static func permitsPrivateArtworkCommit('));
 const shelf = read('app/SourcesTV/TopShelfSnapshotWriter.swift');
 writeFileSync(`${dir}/FixtureTopShelfMapper.swift`, 'import Foundation\nenum FixtureTopShelfMapper {\n' +
   ['struct PublicationKey:', 'static func publicationKey(', 'static func items(\n', 'private static func shelfProgress(', 'private static func shelfPoster('].map(marker => block(shelf, marker)).join('\n') + '\n}\n');
 // Source wiring only; the Swift cases below execute the actual key/mapper, not a second policy.
 const home = read('app/SourcesTV/HomeView.swift');
-if (!/\.onChange\(of: TopShelfSnapshotWriter\.publicationKey\(for: renderedContinueWatching\)\)\s*\{\s*_ in[\s\S]*?TopShelfSnapshotWriter\.publishCurrent\(\)/.test(home)) {
+const shelfPublisher = block(home, '.onChange(of: TopShelfSnapshotWriter.publicationKey(for: renderedContinueWatching))');
+if (!shelfPublisher.includes('TopShelfSnapshotWriter.publishCurrent()')) {
   throw new Error('Home must republish from its exact rendered shelf key');
 }
 const app = read('app/SourcesTV/VortXTVApp.swift');
@@ -130,8 +137,9 @@ actor FixtureSIMKLHTTPClient {
 }
 `);
 NODE
+node test/cw-profile-fixture.cjs "$cw_build_dir/HomeContinueWatchingFixtureStubs.swift"
 cw_inputs=(
-    app/Tests/HomeContinueWatchingFixtureStubs.swift
+    "$cw_build_dir/HomeContinueWatchingFixtureStubs.swift"
     app/SourcesShared/PlaybackMutationOwnershipPolicy.swift
     app/SourcesShared/ExternalSyncSessionPolicy.swift
     app/SourcesShared/TraktScrobbleProgressPolicy.swift

@@ -41,12 +41,6 @@ mkdir -p app/build
 switch_dir=$(mktemp -d "$PWD/app/build/native-profile-switch-admission.XXXXXX")
 export VORTX_PROFILE_SWITCH_SOURCE_HEAD
 VORTX_PROFILE_SWITCH_SOURCE_HEAD=$(git rev-parse HEAD)
-node test/native-profile-switch-admission.mjs --extract "$switch_dir" "${baseline_args[@]}"
-if [[ $extract_only -eq 1 ]]; then
-    printf 'Retained exact profile-switch extraction %s\n' "$switch_dir"
-    exit 0
-fi
-
 switch_inputs=(
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}"
@@ -56,14 +50,43 @@ switch_inputs=(
     "$switch_dir/Combined.swift"
 )
 
+switch_conservation_inputs=(
+    "$switch_library" "$switch_headers/vortx_ffi.h" "$switch_headers/module.modulemap"
+    scripts/test-native-profile-switch-admission.sh scripts/native-watched-swift-inputs.sh
+    test/native-profile-switch-admission.mjs app/Tests/NativeProfileSwitchAdmissionLiveTests.swift
+    app/SourcesShared/Profiles.swift app/SourcesShared/CoreBridge.swift app/SourcesShared/VortXSyncManager.swift
+    app/SourcesShared/ProfileDiscoveryPreferences.swift
+)
+for switch_source in "${switch_inputs[@]}"; do
+    [[ "$switch_source" != app/SourcesShared/*.swift ]] || switch_conservation_inputs+=("$switch_source")
+done
+shasum -a 256 "${switch_conservation_inputs[@]}" > "$switch_dir/inputs.before.sha256"
+switch_exit() {
+    local terminal_status=$?
+    trap - EXIT
+    shasum -a 256 "${switch_conservation_inputs[@]}" > "$switch_dir/inputs.after.sha256" || terminal_status=2
+    if ! cmp -s "$switch_dir/inputs.before.sha256" "$switch_dir/inputs.after.sha256"; then
+        printf 'FAIL: source or accepted SDK inputs changed during verification.\n' >&2
+        terminal_status=2
+    fi
+    printf 'Terminal status %s; retained %s\n' "$terminal_status" "$switch_dir"
+    exit "$terminal_status"
+}
+trap switch_exit EXIT
+nice -n 15 node test/native-profile-switch-admission.mjs --extract "$switch_dir" "${baseline_args[@]}"
+if [[ $extract_only -eq 1 ]]; then
+    printf 'Retained exact profile-switch extraction %s\n' "$switch_dir"
+    exit 0
+fi
+
 # Keep the compiler invocation intentionally identical in its strictness to the existing live
 # native fixtures.  This is the only build step; no SDK generation or artifact mutation occurs.
-xcrun swiftc -j 2 -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+nice -n 15 xcrun swiftc -j 1 -num-threads 1 -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     -D VORTX_NATIVE_DATA_ENGINE -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST \
     -I "$switch_headers" "${switch_inputs[@]}" "$switch_library" \
     -framework Security -framework SystemConfiguration -o "$switch_dir/native-profile-switch-admission"
 
-node test/native-profile-switch-admission.mjs "$switch_dir/native-profile-switch-admission" "$switch_dir"
+nice -n 15 node test/native-profile-switch-admission.mjs "$switch_dir/native-profile-switch-admission" "$switch_dir"
 test "$switch_library_hash" = "$(shasum -a 256 "$switch_library" | awk '{print $1}')"
 test "$switch_header_hash" = "$(shasum -a 256 "$switch_headers/vortx_ffi.h" | awk '{print $1}')"
 test "$switch_module_hash" = "$(shasum -a 256 "$switch_headers/module.modulemap" | awk '{print $1}')"

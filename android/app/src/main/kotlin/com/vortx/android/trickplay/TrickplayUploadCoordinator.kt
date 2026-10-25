@@ -51,6 +51,13 @@ class TrickplayUploadCoordinator {
     fun settledRevision(key: String): Long = states[key]?.settledRevision ?: 0L
     fun isFinalRejected(key: String): Boolean = states[key]?.finalRejected == true
 
+    /** Consent revocation retires active/deferred work; never reuse its claim sequence after re-enable. */
+    fun revokeAdmissions() {
+        inFlight = null
+        deferredFinal = null
+        states.clear()
+    }
+
     fun request(
         key: String,
         kind: Kind,

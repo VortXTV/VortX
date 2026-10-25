@@ -109,6 +109,7 @@ fun TvShell(
     onPlayLocal: (Playable) -> Unit = {},
     syncManager: VortXSyncManager? = null,
     onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
+    onDirectResume: (MetaItem) -> Unit = onItem,
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -261,6 +262,8 @@ fun TvShell(
                             viewModel = viewModel<LibraryViewModel>(factory = factory),
                             landingViewModel = landingViewModel,
                             onItem = onItem,
+                            onDirectResume = onDirectResume,
+                            pickerActive = libraryRoute == TvLibraryRoute.LANDING,
                             onDownloads = { openLibraryRoute(TvLibraryRoute.DOWNLOADS) },
                             onWatchlist = { openLibraryRoute(TvLibraryRoute.WATCHLIST) },
                             onPreviouslyWatched = { openLibraryRoute(TvLibraryRoute.HISTORY) },

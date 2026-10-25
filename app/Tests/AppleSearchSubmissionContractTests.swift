@@ -310,9 +310,9 @@ enum AppleSearchSubmissionContractTests {
         let discover = slice(root, from: "struct iOSDiscoverView: View {", to: "// MARK: Advanced filters")
         let presentation = slice(root, from: "final class AppleSearchPresentation: ObservableObject {", to: "/// Search across every installed add-on")
         let searchHandoff = slice(search, from: ".onReceive(MacSearchBridge.shared.$pending)", to: "#endif")
-        let searchQueryChange = slice(search, from: ".onChange(of: query) { value in", to: "#if os(iOS)")
+        let searchQueryChange = slice(search, from: ".onValueChange(of: query) { value in", to: "#if os(iOS)")
         let discoverHandoff = slice(discover, from: ".onReceive(MacSearchBridge.shared.$pending)", to: "#endif")
-        let discoverQueryChange = slice(discover, from: ".onChange(of: searchQuery) { value in", to: ".onChange(of: mergeDiscoverSearch)")
+        let discoverQueryChange = slice(discover, from: ".onValueChange(of: searchQuery) { value in", to: ".onValueChange(of: mergeDiscoverSearch)")
         expect(!search.isEmpty && !discover.isEmpty && !presentation.isEmpty,
                "source: Search, merged Discover, and presentation anchors are readable")
         expect(containsInOrder(searchHandoff, [

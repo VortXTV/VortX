@@ -20,6 +20,7 @@ enum HomeCacheCounters {
 }
 
 @main
+@MainActor
 struct AppleHomePresentationCacheTests {
     static var checks = 0
     /// One instant for every fixture item. Stamping each item with `Date()` let a 1000-item build

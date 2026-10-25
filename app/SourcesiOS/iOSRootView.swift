@@ -199,6 +199,7 @@ struct iOSRootView: View {
 
     var body: some View {
         shellWithProfilePicker
+            .modifier(iOSPlaybackTitleQueueHost())
     }
 
     /// Keeps the base presentation subtree in its own inferred type so the root's long-lived
@@ -216,10 +217,10 @@ struct iOSRootView: View {
         .allowsHitTesting(quickViewPresenter.presentation == nil)
         .accessibilityHidden(quickViewPresenter.presentation != nil)
         .overlay { CinemaQuickViewOverlay(presenter: quickViewPresenter) }
-        .onChange(of: profiles.activeID) { _ in
+        .onValueChange(of: profiles.activeID) { _ in
             quickViewPresenter.close()
         }
-        .onChange(of: tab) { newTab in
+        .onValueChange(of: tab) { newTab in
             quickViewPresenter.close()
             presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
@@ -291,14 +292,14 @@ struct iOSRootView: View {
                 updates.dismissPrompt()
             }
         }
-        .onChange(of: launchReady) { _ in presentUpdateIfReady() }
-        .onChange(of: shellVisible) { _ in presentUpdateIfReady() }
-        .onChange(of: playbackGate.playerActive) { active in
+        .onValueChange(of: launchReady) { _ in presentUpdateIfReady() }
+        .onValueChange(of: shellVisible) { _ in presentUpdateIfReady() }
+        .onValueChange(of: playbackGate.playerActive) { active in
             if active { quickViewPresenter.close() }
             if !active { presentUpdateIfReady() }
         }
-        .onChange(of: updates.available?.key) { _ in presentUpdateIfReady() }
-        .onChange(of: updates.forcePresentationNonce) { _ in presentUpdateIfReady(force: true) }
+        .onValueChange(of: updates.available?.key) { _ in presentUpdateIfReady() }
+        .onValueChange(of: updates.forcePresentationNonce) { _ in presentUpdateIfReady(force: true) }
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
         // device still owes its first VortX-account sync. armLaunchNag waits out the splashless iOS launch
         // + the profile picker, so the sheet never fights a modal; always dismissible, never blocks use.
@@ -309,7 +310,7 @@ struct iOSRootView: View {
             presentUpdateIfReady()
         }) { MoveSeedingNagView() }
         #if os(macOS)
-        .onChange(of: updates.manualOutcome) { outcome in
+        .onValueChange(of: updates.manualOutcome) { outcome in
             switch outcome {
             case .upToDate:
                 updateCheckFeedback = UpdateCheckFeedback(title: "You’re up to date", message: "This Mac already has the latest VortX build.")
@@ -331,28 +332,28 @@ struct iOSRootView: View {
         // A playing title covers the whole shell. Screens on `@VisibleCore` (the tabs and the detail page under it)
         // stop re-rendering on every engine event until it closes, then catch up in one pass.
         .environment(\.engineObservationActive, !playbackGate.playerActive)
-        .onChange(of: hideLiveTab) { hidden in
+        .onValueChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
         }
         // Same healing for the other hideable tabs (#117): hiding the ACTIVE tab lands on Home, so the
         // bar can never point at a screen it no longer shows (the tvOS RootTabView twin does the same).
-        .onChange(of: hideDiscoverTab) { hidden in
+        .onValueChange(of: hideDiscoverTab) { hidden in
             if hidden, tab == .discover { tab = .home }
             if hidden { homeBrowse = false }
         }
-        .onChange(of: hideLibraryTab) { hidden in
+        .onValueChange(of: hideLibraryTab) { hidden in
             if hidden, tab == .library { tab = .home }
         }
-        .onChange(of: hideSearchTab) { hidden in
+        .onValueChange(of: hideSearchTab) { hidden in
             if hidden, tab == .search { tab = .home }
         }
-        .onChange(of: mergeDiscoverSearch) { merged in
+        .onValueChange(of: mergeDiscoverSearch) { merged in
             // Search folds into Discover: if the bar was pointing at the now-dropped Search tab, land
             // on Discover, unless Discover itself is hidden in Settings > Tab bar (#117 rule: never
             // route to a hidden tab, fall back to Home like every other healer).
             if merged, tab == .search { selectTab(hideDiscoverTab ? .home : .discover) }
         }
-        .onChange(of: mergeHomeDiscover) { merged in
+        .onValueChange(of: mergeHomeDiscover) { merged in
             if merged, tab == .discover {
                 homeBrowse = !hideDiscoverTab
                 tab = .home
@@ -660,7 +661,7 @@ struct iOSRootView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 horizontalTabItems
             }
-            .onChange(of: tab) { item in
+            .onValueChange(of: tab) { item in
                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
                     proxy.scrollTo(item.rawValue, anchor: .center)
                 }
@@ -1076,6 +1077,7 @@ private struct iOSCWProducerProvenance: @unchecked Sendable {
     let traktSessionID: TraktSessionID?
     let intent: HomeContinueWatchingSelection.Intent
 
+    @MainActor
     func isCurrent(traktSessionID currentSessionID: TraktSessionID?) -> Bool {
         guard intent.isCurrent() else { return false }
         switch source {
@@ -1142,6 +1144,7 @@ struct iOSHomeView: View {
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showSignIn = false
+    @State private var homeSurpriseRoute: HomeSurpriseRoute?
     @StateObject private var hero = FeaturedHeroModel()
     @State private var homeHeroTint: FeaturedHeroTintSnapshot<Color>?
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
@@ -1497,6 +1500,11 @@ struct iOSHomeView: View {
                     #else
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
                     #endif
+                    HStack {
+                        HomeSurpriseButton(isActive: isActive, candidates: homeSurpriseCandidates) { homeSurpriseRoute = $0 }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, Theme.Space.md)
                     if !renderedContinueWatching.items.isEmpty {
                         // Continue Watching is PINNED first (not part of HomeRailPreferences): it is a resume
                         // queue stepped through in recency order, not a browse surface. A CW card tap resumes
@@ -1586,7 +1594,7 @@ struct iOSHomeView: View {
             // Keyboard browse drives the hero: the focused poster features in the billboard (the tvOS
             // focused-card-hero behaviour, adapted for the Mac). Focus leaving the cards lets it resume.
             // Debounced ~300ms: focus churns as the rails enrich, so feature only once focus settles.
-            .onChange(of: macFocus) { newValue in
+            .onValueChange(of: macFocus) { newValue in
                 macFocusDebounceTask?.cancel()
                 macFocusDebounceTask = Task {
                     try? await Task.sleep(nanoseconds: 300_000_000)
@@ -1601,7 +1609,7 @@ struct iOSHomeView: View {
             // Seed focus onto the first card so a responder exists and arrows start moving: once on appear,
             // and again when the rails first hydrate (boardRows / CW arrive async after onAppear).
             .onAppear { seedMacFocusIfNeeded() }
-            .onChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
+            .onValueChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
             #endif
             .background(homeAmbientCanvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
@@ -1648,6 +1656,25 @@ struct iOSHomeView: View {
             .alert("Playback unavailable", isPresented: Binding(get: { unavailableContinueWatching != nil }, set: { if !$0 { unavailableContinueWatching = nil } })) {
                 Button("OK", role: .cancel) { unavailableContinueWatching = nil }
             } message: { Text(unavailableContinueWatching ?? "") }
+            .onReceive(profiles.$activeID) { incoming in
+                if let route = homeSurpriseRoute, incoming != route.access.profile.id { homeSurpriseRoute = nil }
+            }
+            .onReceive(profiles.$profiles) { incoming in
+                if let route = homeSurpriseRoute,
+                   !route.access.matchesPublishedNavigationProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch) { homeSurpriseRoute = nil }
+            }
+            .onReceive(profiles.$pickedThisLaunch) { picked in
+                if !picked, profiles.profiles.count > 1 { homeSurpriseRoute = nil }
+            }
+            .onReceive(core.$revision) { _ in
+                if let route = homeSurpriseRoute, !route.access.isNavigationCurrent(profiles: profiles, core: core) { homeSurpriseRoute = nil }
+            }
+            .onReceive(account.$credentialBoundaryGeneration) { _ in homeSurpriseRoute = nil }
+            .navigationDestination(isPresented: homeSurprisePresented) {
+                if let route = homeSurpriseRoute {
+                    HomeSurpriseDestination(route: route).id(route.id)
+                }
+            }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
                 // Cinemeta meta is nil for a new/unreleased title.
@@ -1704,18 +1731,18 @@ struct iOSHomeView: View {
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
         .popToRootOnBump(TabScrollKeys.home, path: $path)
-        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onValueChange(of: path.count) { onNavigationDepthChanged?($0) }
         .onAppear { onNavigationDepthChanged?(path.count) }
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
-        .onChange(of: isActive) { active in
+        .onValueChange(of: isActive) { active in
             if active {
                 refreshContinueWatchingPresentation(selectionChanged: false)
                 if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
                 hero.seed(heroCandidates, reduceMotion: reduceMotion)
             } else { hero.stop() }
         }
-        .onChange(of: scenePhase) { phase in
+        .onValueChange(of: scenePhase) { phase in
             if phase == .active, isActive {
                 refreshContinueWatchingPresentation()
                 HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
@@ -1750,21 +1777,21 @@ struct iOSHomeView: View {
                 if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             }
         }
-        .onReceive(core.$metaDetails.dropFirst()) { _ in
+        .onReceive(core.metaDetailsPublisher.dropFirst()) { _ in
             DispatchQueue.main.async { refreshContinueWatchingPresentation(selectionChanged: false) }
         }
         .onReceive(core.$continueWatching.dropFirst()) { items in
             guard core.usesNativeProfileState || profiles.activeUsesEngineHistory else { return }
             refreshContinueWatchingPresentation(localItems: items)
         }
-        .onChange(of: homeHistoryKey) { _ in
+        .onValueChange(of: homeHistoryKey) { _ in
             guard core.usesNativeProfileState || profiles.activeUsesEngineHistory else { return }
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
         // The old `.onChange(of: core.revision)` hook observed every board/meta event. Observe the
         // durable history-receipt revision instead; the former `core.changedFields.contains("continue_watching_preview")`
         // check was only a latest-event hint and is intentionally replaced by the durable receipt below.
-        .onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
+        .onValueChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
             guard core.lastAcceptedHistoryReceipt != nil else { return }
             refreshContinueWatchingAfterHistoryReceipt()
             refreshTopPicks()
@@ -1785,30 +1812,30 @@ struct iOSHomeView: View {
                 }
             }
         }
-        .onChange(of: profiles.activeID) { _ in
+        .onValueChange(of: profiles.activeID) { _ in
             _ = refreshOverlayHistoryProjection()
             refreshContinueWatchingPresentation()
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
-        .onChange(of: core.usesNativeProfileState) { _ in
+        .onValueChange(of: core.usesNativeProfileState) { _ in
             _ = refreshOverlayHistoryProjection()
             refreshContinueWatchingPresentation()
         }
-        .onChange(of: profiles.activeUsesEngineHistory) { _ in
+        .onValueChange(of: profiles.activeUsesEngineHistory) { _ in
             _ = refreshOverlayHistoryProjection()
             refreshContinueWatchingPresentation()
             refreshTopPicks()
         }
-        .onChange(of: profiles.active?.discovery?.continueWatchingSource) { _ in refreshContinueWatchingPresentation() }
-        .onChange(of: profiles.active?.discovery?.continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
-        .onChange(of: continueWatchingSource) { _ in
+        .onValueChange(of: profiles.active?.discovery?.continueWatchingSource) { _ in refreshContinueWatchingPresentation() }
+        .onValueChange(of: profiles.active?.discovery?.continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
+        .onValueChange(of: continueWatchingSource) { _ in
             refreshContinueWatchingPresentation()
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             refreshTopPicks()
         }
-        .onChange(of: continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
+        .onValueChange(of: continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             refreshContinueWatchingPresentation()
@@ -1826,7 +1853,7 @@ struct iOSHomeView: View {
         }
         // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
         // Library membership remains independently keyed from the bounded visible CW observer.
-        .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
+        .onValueChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
         .onReceive(core.$library.dropFirst()) { _ in
             DispatchQueue.main.async {
                 refreshContinueWatchingPresentation(selectionChanged: continueWatchingSnapshot.selection.source.isPrivate)
@@ -1834,9 +1861,9 @@ struct iOSHomeView: View {
         }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
-        .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
-        .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
-        .onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
+        .onValueChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
+        .onValueChange(of: account.isSignedIn) { _ in refreshTopPicks() }
+        .onValueChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
         // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
         // replacement. Email is published by the successful sign-in path, so observe that event directly.
         .onReceive(account.$email) { _ in refreshTopPicks() }
@@ -1856,12 +1883,12 @@ struct iOSHomeView: View {
     /// offered once per profile the first time its choices are known and still undecided.
     private var homeForYouObservers: some View {
         homeCoreBody
-        .onChange(of: forYou.interests) { _ in refreshForYou() }
-        .onChange(of: forYou.collections) { _ in refreshForYou() }
-        .onChange(of: forYou.ready) { _ in refreshForYou() }
-        .onChange(of: forYou.profileID) { _ in refreshForYou() }
-        .onChange(of: isActive) { _ in offerInterestsIfNeeded() }
-        .onChange(of: profiles.needsPicker) { _ in offerInterestsIfNeeded() }
+        .onValueChange(of: forYou.interests) { _ in refreshForYou() }
+        .onValueChange(of: forYou.collections) { _ in refreshForYou() }
+        .onValueChange(of: forYou.ready) { _ in refreshForYou() }
+        .onValueChange(of: forYou.profileID) { _ in refreshForYou() }
+        .onValueChange(of: isActive) { _ in offerInterestsIfNeeded() }
+        .onValueChange(of: profiles.needsPicker) { _ in offerInterestsIfNeeded() }
         .sheet(item: $interestsPresentation) { presentation in
             ForYouInterestsView(session: presentation.session, firstRun: presentation.firstRun) {
                 if interestsPresentation?.id == presentation.id { interestsPresentation = nil }
@@ -1874,14 +1901,14 @@ struct iOSHomeView: View {
         homeAccountObservers
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
-        .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
+        .onValueChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
+        .onValueChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
         // tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
-        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshReleaseCalendar() }
+        .onValueChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshReleaseCalendar() }
         // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
         .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
         // SIMKL disconnect: same contract as Trakt above, drop the plan-to-watch rail now.
@@ -1981,6 +2008,41 @@ struct iOSHomeView: View {
 
     private func forYouRailItem(_ preview: MetaPreview) -> RailItem {
         RailItem(id: preview.id, type: preview.type, name: preview.name, poster: preview.poster, progress: 0)
+    }
+
+    /// Use the existing iOS 16 boolean-destination pattern without losing item identity.
+    /// An outgoing destination may dismiss only its own route, never a newer Surprise pick.
+    private var homeSurprisePresented: Binding<Bool> {
+        let routeID = homeSurpriseRoute?.id
+        return Binding(
+            get: { routeID != nil && homeSurpriseRoute?.id == routeID },
+            set: { presented in
+                guard !presented, let routeID, homeSurpriseRoute?.id == routeID else { return }
+                homeSurpriseRoute = nil
+            }
+        )
+    }
+
+    /// Match the visible Home sections; hidden/disabled catalogs and private Continue Watching
+    /// never become a surprise source. No fetch or source resolution occurs here.
+    private func homeSurpriseCandidates() -> HomeSurprisePool {
+        var pool = HomeSurprisePool()
+        if !railPrefs.isHidden(.forYou), forYouEnabled {
+            pool.recommendations += forYouRows.currentInterestItems(profileID: profiles.activeID,
+                interests: forYou.interests).map(HomeSurpriseItem.init)
+        }
+        if profiles.active?.isKids != true, !railPrefs.isHidden(.topPicks) {
+            pool.recommendations += topPicks.currentItems(profileID: profiles.activeID,
+                ownerKey: becauseYouWatchedOwnerKey).map(HomeSurpriseItem.init)
+        }
+        if !railPrefs.isHidden(.addonCatalogs) {
+            // Re-apply current visibility at action time: preference changes may precede the
+            // coalesced board publication. allCatalogs retains disabled/tombstone admission.
+            let allowed = Set(core.allCatalogs.map(\.key)).subtracting(CatalogPrefsStore.hidden())
+            pool.catalogs = core.boardRows.filter { allowed.contains($0.id) }
+                .flatMap(\.items).map(HomeSurpriseItem.init)
+        }
+        return pool
     }
 
     private var forYouEnabled: Bool {
@@ -2577,6 +2639,13 @@ struct iOSLibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+
+    // BEGIN RANDOM PICK LIBRARY STATE
+    @State private var randomLibrarySession = RandomPickPolicy.Session()
+    @State private var randomLibraryPreview: RandomPickPolicy.Ticket?
+    @State private var randomLibraryAccess: RandomPickUIAccess?
+    @State private var randomLibraryRoute: RandomPickLibraryRoute?
+    // END RANDOM PICK LIBRARY STATE
     /// The overlay profile's library is derived from an unbounded watch dictionary. Keep the bounded
     /// hero projection local to this view and refresh it from ProfileStore's published watch mutation,
     /// instead of sorting the entire dictionary while SwiftUI evaluates every body/signature pass.
@@ -2753,6 +2822,11 @@ struct iOSLibraryView: View {
                             // the predicates need, so they are evaluated on the source `CoreCWItem`s and the
                             // RailItem grid is then narrowed to the matching ids.
                             smartFilterBar(segmentedSource())
+                            Button(action: selectRandomLibraryItem) {
+                                Label("Random pick", systemImage: "shuffle")
+                            }
+                            .buttonStyle(ChipButtonStyle())
+                            .padding(.horizontal, Theme.Space.md)
                             PosterGrid(items: smartFiltered(segmented(libraryItems), pass: smartPassIDs(segmentedSource())),
                                        onTap: handleTap, onWatch: watchFromQuickView, menu: .library)
                         }
@@ -2780,6 +2854,7 @@ struct iOSLibraryView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(isPresented: randomLibraryPresented) { randomLibraryDestination }
             .navigationDestination(for: CinemaDetailTarget.self) { target in
                 iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
                               seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
@@ -2800,11 +2875,58 @@ struct iOSLibraryView: View {
             #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
         }
+
+        // BEGIN RANDOM PICK LIBRARY LIFECYCLE
+        .sheet(isPresented: randomLibraryPreviewPresented) {
+            if let ticket = randomLibraryPreview {
+                RandomPickPreviewCard(ticket: ticket,
+                    onOpen: { openRandomLibraryItem(ticket, autoPlay: false) },
+                    onPlay: { openRandomLibraryItem(ticket, autoPlay: true) },
+                    onPickAgain: { pickRandomLibraryAgain(ticket) })
+                    .id(ticket.id)
+            }
+        }
+        .onReceive(profiles.$activeID) { profileID in
+            if let ticket = randomLibrarySession.ticket, ticket.profileID != profileID { clearRandomLibraryPick() }
+        }
+        .onReceive(profiles.$profiles) { incoming in
+            if let route = randomLibraryRoute {
+                if !(route.intent?.matchesPublishedProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch)
+                    ?? route.access.matchesPublishedNavigationProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch)) { clearRandomLibraryPick() }
+            } else if let access = randomLibraryAccess,
+               !access.matchesPublishedProfiles(incoming, pickedThisLaunch: profiles.pickedThisLaunch) { clearRandomLibraryPick() }
+        }
+        .onReceive(profiles.$pickedThisLaunch) { picked in
+            if !picked, profiles.profiles.count > 1 { clearRandomLibraryPick() }
+        }
+        .onValueChange(of: account.credentialBoundaryGeneration) { _ in clearRandomLibraryPick() }
+        .onValueChange(of: segment) { _ in clearRandomLibraryPick() }
+        .onValueChange(of: activeFilters) { _ in clearRandomLibraryPick() }
+        .onReceive(core.$revision) { _ in
+            if let route = randomLibraryRoute {
+                if !(route.intent?.routeIsCurrent(core: core, profiles: profiles)
+                    ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) { clearRandomLibraryPick() }
+            } else if let access = randomLibraryAccess, !access.isCurrent(profiles: profiles, core: core) { clearRandomLibraryPick() }
+        }
+        .onReceive(core.$library) { library in
+            if core.usesNativeProfileState || profiles.activeUsesEngineHistory {
+                invalidateRandomLibraryRecord(in: library?.catalog ?? [])
+            }
+        }
+        .onReceive(profiles.$watch) { _ in
+            // Overlay watch publishes before its value changes. Revoke its preview immediately;
+            // an already-admitted detail destination owns its metadata/source lifecycle.
+            if !core.usesNativeProfileState, !profiles.activeUsesEngineHistory,
+               randomLibraryPreview != nil { clearRandomLibraryPick() }
+        }
+        .onValueChange(of: isActive) { active in if !active { clearRandomLibraryPick() } }
+        .onDisappear { if randomLibraryRoute == nil { clearRandomLibraryPick() } }
+        // END RANDOM PICK LIBRARY LIFECYCLE
         // Re-tapping the active Library tab pops any pushed detail/Downloads back to root (#22).
         .popToRootOnBump(TabScrollKeys.library, path: $path)
         // Quiet the ambient hero while this tab is hidden (mounted but opacity 0, so onDisappear never
         // fires); re-arm on return. Reseeds below are gated the same way so re-emits can't re-arm it.
-        .onChange(of: isActive) { active in
+        .onValueChange(of: isActive) { active in
             #if !os(tvOS)
             // Offline launch routing handoff (#120), already-mounted case: hidden tabs stay mounted
             // forever (opacity-switched, #24), so a Library visited earlier in the session gets NO
@@ -2832,7 +2954,7 @@ struct iOSLibraryView: View {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion)
         }
-        .onChange(of: heroCandidateSignature) { _ in
+        .onValueChange(of: heroCandidateSignature) { _ in
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
         }
         // Overlay watch is the only unbounded source here. Its @Published dictionary is the existing
@@ -2841,7 +2963,7 @@ struct iOSLibraryView: View {
         .onReceive(profiles.$watch) { _ in
             _ = refreshOverlayHeroCandidates()
         }
-        .onChange(of: profiles.activeID) { _ in
+        .onValueChange(of: profiles.activeID) { _ in
             let refreshed = refreshOverlayHeroCandidates()
             if isActive { hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion) }
         }
@@ -2849,7 +2971,7 @@ struct iOSLibraryView: View {
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
-        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        .onValueChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
         .onDisappear { hero.stop() }
     }
 
@@ -2863,6 +2985,98 @@ struct iOSLibraryView: View {
         hero.noteInteraction()
         path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
+
+
+    // BEGIN RANDOM PICK LIBRARY HELPERS
+    private var randomLibraryScope: String {
+        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ","))"
+    }
+
+    /// Runs on an explicit pick/revalidation, never as a body signature.
+    private func randomLibraryCandidates() -> [CoreCWItem] {
+        let items = segmentedSource()
+        let pass = smartPassIDs(items)
+        return RandomPickPolicy.eligibleLibraryItems(items.filter { pass?.contains($0.id) ?? true })
+    }
+
+    private func selectRandomLibraryItem() {
+        guard let access = RandomPickUIAccess.capture(profiles: profiles, core: core) else { clearRandomLibraryPick(); return }
+        let records = randomLibraryCandidates().map(RandomPickPolicy.libraryRecord)
+        var generator = SystemRandomNumberGenerator()
+        randomLibraryAccess = access
+        randomLibraryPreview = randomLibrarySession.select(records, profileID: profiles.activeID,
+                                                           scope: randomLibraryScope, using: &generator)
+        if randomLibraryPreview == nil { clearRandomLibraryPick() }
+    }
+
+    private func currentRandomLibraryItem(_ origin: RandomPickPolicy.Ticket) -> CoreCWItem? {
+        // An old sheet closure may not revoke or borrow the newer sheet's ticket.
+        guard randomLibrarySession.ticket == origin else { return nil }
+        let current = randomLibraryCandidates().first {
+            $0.id == origin.record.identity.id && $0.type == origin.record.identity.type
+        }
+        guard randomLibrarySession.accepts(origin, profileID: profiles.activeID, scope: randomLibraryScope,
+                ownerIsCurrent: randomLibraryAccess?.isCurrent(profiles: profiles, core: core) == true,
+                currentRecord: current.map(RandomPickPolicy.libraryRecord)) else {
+            clearRandomLibraryPick(); return nil
+        }
+        return current
+    }
+
+    private func pickRandomLibraryAgain(_ origin: RandomPickPolicy.Ticket) {
+        guard currentRandomLibraryItem(origin) != nil else { return }
+        selectRandomLibraryItem()
+    }
+
+    private func openRandomLibraryItem(_ origin: RandomPickPolicy.Ticket, autoPlay: Bool) {
+        guard let current = currentRandomLibraryItem(origin), let access = randomLibraryAccess else { return }
+        randomLibraryRoute?.intent?.revoke()
+        let intent = autoPlay ? RandomPickPlayIntent(ticketID: origin.id, access: access) {
+            randomLibraryRoute?.ticket == origin && currentRandomLibraryItem(origin) != nil
+        } : nil
+        randomLibraryRoute = RandomPickLibraryRoute(ticket: origin, item: current, access: access, autoPlay: autoPlay, intent: intent)
+        randomLibraryPreview = nil
+    }
+
+    private func invalidateRandomLibraryRecord(in items: [CoreCWItem]) {
+        // Inventory owns the pending preview, not the normal Detail route it already admitted.
+        guard randomLibraryPreview != nil, randomLibraryRoute == nil,
+              let ticket = randomLibrarySession.ticket else { return }
+        let current = items.first { $0.id == ticket.record.identity.id && $0.type == ticket.record.identity.type }
+        guard let current, !RandomPickPolicy.eligibleLibraryItems([current]).isEmpty,
+              RandomPickPolicy.libraryRecord(current) == ticket.record else { clearRandomLibraryPick(); return }
+    }
+
+    private var randomLibraryPreviewPresented: Binding<Bool> {
+        Binding(get: { randomLibraryPreview != nil }, set: { presented in
+            guard !presented else { return }
+            if randomLibraryRoute == nil { clearRandomLibraryPick() }
+            else { randomLibraryPreview = nil }
+        })
+    }
+
+    private var randomLibraryPresented: Binding<Bool> {
+        Binding(get: { randomLibraryRoute != nil }, set: { if !$0 { clearRandomLibraryPick() } })
+    }
+
+    @ViewBuilder private var randomLibraryDestination: some View {
+        if let route = randomLibraryRoute,
+           randomLibrarySession.ticket == route.ticket, profiles.activeID == route.ticket.profileID,
+           (route.intent?.routeIsCurrent(core: core, profiles: profiles)
+            ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) {
+            iOSDetailView(id: route.item.id, type: route.item.type, title: route.item.name,
+                          autoPlayOnAppear: route.autoPlay, randomPickPlayIntent: route.intent)
+        }
+    }
+
+    private func clearRandomLibraryPick() {
+        randomLibraryRoute?.intent?.revoke()
+        randomLibraryPreview = nil
+        randomLibraryRoute = nil
+        randomLibraryAccess = nil
+        randomLibrarySession.clear()
+    }
+    // END RANDOM PICK LIBRARY HELPERS
 
     private func resumeLibraryContinueWatching(_ item: RailItem) {
         hero.noteInteraction()
@@ -3449,6 +3663,7 @@ struct iOSDownloadsScreen: View {
 
 /// One shared presentation subscriber for both Apple search surfaces. CoreBridge owns query/
 /// owner fencing; only its accepted result publisher can rebuild the card projection.
+@MainActor
 final class AppleSearchPresentation: ObservableObject {
     static let shared = AppleSearchPresentation()
     @Published private(set) var results = AppleSearchResultProjection([])
@@ -3605,7 +3820,7 @@ struct iOSSearchView: View {
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
-            .onChange(of: query) { value in
+            .onValueChange(of: query) { value in
                 searchPresentation.setQuery(value)
                 let alreadySubmitted = submittedSuggestion == value
                 submittedSuggestion = nil
@@ -3613,13 +3828,13 @@ struct iOSSearchView: View {
                 scheduleSearch(value)
             }
             #if os(iOS)
-            .onChange(of: isActive) { active in if !active { searchFocused = false } }
-            .onChange(of: path.count) { count in if count > 0 { searchFocused = false } }
+            .onValueChange(of: isActive) { active in if !active { searchFocused = false } }
+            .onValueChange(of: path.count) { count in if count > 0 { searchFocused = false } }
             #elseif os(macOS)
-            .onChange(of: isActive) { active in if !active { macInlineSearchFocused = false } }
-            .onChange(of: path.count) { count in if count > 0 { macInlineSearchFocused = false } }
+            .onValueChange(of: isActive) { active in if !active { macInlineSearchFocused = false } }
+            .onValueChange(of: path.count) { count in if count > 0 { macInlineSearchFocused = false } }
             #endif
-            .onChange(of: profiles.activeID) { _ in
+            .onValueChange(of: profiles.activeID) { _ in
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
             .onDisappear { searchTask?.cancel() }
@@ -4082,15 +4297,15 @@ struct iOSDiscoverView: View {
         }
         // Re-tapping the active Discover tab pops a pushed detail/category browse back to root (#22).
         .popToRootOnBump(TabScrollKeys.discover, path: $path)
-        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onValueChange(of: path.count) { onNavigationDepthChanged?($0) }
         .onAppear { onNavigationDepthChanged?(path.count) }
         // Keep the filtered grid full: when a page settles or the filter set changes, pull the next page
         // while too few cards match and more pages exist (loadDiscoverNextPage self-guards duplicate loads).
-        .onChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
-        .onChange(of: catalogPrefs.discoverFilters) { _ in autoFillFilteredGrid() }
+        .onValueChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
+        .onValueChange(of: catalogPrefs.discoverFilters) { _ in autoFillFilteredGrid() }
         // Quiet the ambient hero while this tab is hidden (mounted but opacity 0, so onDisappear never
         // fires); re-arm on return. Reseeds below are gated the same way so re-emits can't re-arm it.
-        .onChange(of: isActive) { active in
+        .onValueChange(of: isActive) { active in
             if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
         }
         .onAppear {
@@ -4098,17 +4313,17 @@ struct iOSDiscoverView: View {
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             if showCollectionsHub { collectionsHub.load() }
         }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
+        .onValueChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
         // The visible catalog's bounded candidate signature changes whenever a different type/catalog/
         // genre/page selection changes its first five items. Unrelated core revisions stay off this path.
-        .onChange(of: heroCandidateSignature) { _ in
+        .onValueChange(of: heroCandidateSignature) { _ in
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
         }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
-        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        .onValueChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
         #if os(macOS)
         // Merged Discover+Search mode: the Search tab is dropped, so the persistent top bar's submit
         // routes here. Consume the pending query into the inline merged search (same engine contract).
@@ -4131,13 +4346,13 @@ struct iOSDiscoverView: View {
         #endif
         // Merged search: debounce the query into the engine (same contract as iOSSearchView), and clear the
         // field/results when the user turns the merge off so Discover returns to the plain catalog browse.
-        .onChange(of: searchQuery) { value in
+        .onValueChange(of: searchQuery) { value in
             searchPresentation.setQuery(value)
             let alreadySubmitted = submittedSuggestion == value
             submittedSuggestion = nil
             if mergeDiscoverSearch, !alreadySubmitted { scheduleMergedSearch(value) }
         }
-        .onChange(of: mergeDiscoverSearch) { on in
+        .onValueChange(of: mergeDiscoverSearch) { on in
             if !on {
                 searchTask?.cancel()
                 searchDebouncePending = false
@@ -5752,7 +5967,7 @@ private struct PosterRailBody: View {
                 .focused(macFocus, equals: target)
                 .macCardFocus(isFocused)
                 // Only the old and new focused cells receive a changed Bool as focus walks the row.
-                .onChange(of: isFocused) { focused in
+                .onValueChange(of: isFocused) { focused in
                     if focused { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
                 }
         } else {

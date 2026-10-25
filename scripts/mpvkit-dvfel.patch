@@ -12,10 +12,16 @@ index 9d9b0af..b19bd8e 100644
                  .linkedFramework("Metal"),
                  .linkedFramework("VideoToolbox"),
 diff --git a/Sources/BuildScripts/XCFrameworkBuild/main.swift b/Sources/BuildScripts/XCFrameworkBuild/main.swift
-index e5f872c..dcaca5b 100644
+index e5f872cf14336741fcd52076bd6f6ef9dab766d9..f4db2db395eae3ea4e13db0b5d2514258e2c1dee 100644
 --- a/Sources/BuildScripts/XCFrameworkBuild/main.swift
 +++ b/Sources/BuildScripts/XCFrameworkBuild/main.swift
-@@ -45,12 +45,40 @@ do {
+@@ -1,4 +1,5 @@
+ import Foundation
++import CryptoKit
+ 
+ do {
+     let options = try ArgumentOptions.parse(CommandLine.arguments)
+@@ -45,12 +46,40 @@
  
  enum Library: String, CaseIterable {
      case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype, libfribidi, libharfbuzz, libass, libsmbclient, libplacebo, libdav1d, gmp, nettle, gnutls, libuchardet, libbluray, libluajit, libuavs3d
@@ -58,7 +64,7 @@ index e5f872c..dcaca5b 100644
          case .openssl:
              return "3.3.5"
          case .gnutls:
-@@ -76,7 +104,10 @@ enum Library: String, CaseIterable {
+@@ -76,7 +105,10 @@
          case .lcms2:
              return "2.17.0"
          case .libplacebo:
@@ -70,7 +76,7 @@ index e5f872c..dcaca5b 100644
          case .libdovi:
              return "3.3.2"
          case .vulkan:
-@@ -123,7 +154,8 @@ enum Library: String, CaseIterable {
+@@ -123,7 +155,8 @@
          case .lcms2:
              return "https://github.com/mpvkit/lcms2-build/releases/download/\(self.version)/lcms2-all.zip"
          case .libplacebo:
@@ -80,10 +86,12 @@ index e5f872c..dcaca5b 100644
          case .libdav1d:
              return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
          case .libdovi:
-@@ -372,6 +404,17 @@ private class BuildMPV: BaseBuild {
+@@ -370,6 +403,17 @@
+ private class BuildMPV: BaseBuild {
+     init() {
          super.init(library: .libmpv)
-     }
- 
++    }
++
 +    // SPIKE: pinned master SHA rather than the v0.41.0 tag. All three MPVKit patches
 +    // (moltenvk context, swift-frontend revert, tvOS avfoundation AO) were verified to
 +    // apply cleanly at this commit.
@@ -93,12 +101,10 @@ index e5f872c..dcaca5b 100644
 +                                 library: .libmpv,
 +                                 into: directoryURL)
 +        try SpikeGit.applyPatches(for: library, in: directoryURL)
-+    }
-+
+     }
+ 
      override func flagsDependencelibrarys() -> [Library] {
-         if BaseBuild.options.enableGPL {
-             return [.gmp, .libsmbclient]
-@@ -396,6 +439,14 @@ private class BuildMPV: BaseBuild {
+@@ -396,6 +440,14 @@
              "-Djpeg=disabled",
              "-Dvapoursynth=disabled",
              "-Drubberband=disabled",
@@ -113,7 +119,7 @@ index e5f872c..dcaca5b 100644
          ]
          if BaseBuild.options.enableGPL {
              array.append("-Dgpl=true")
-@@ -450,7 +501,16 @@ private class BuildFFMPEG: BaseBuild {
+@@ -450,7 +502,16 @@
      }
  
      override func beforeBuild() throws {
@@ -131,7 +137,7 @@ index e5f872c..dcaca5b 100644
  
          if Utility.shell("which nasm") == nil {
              Utility.shell("brew install nasm")
-@@ -609,7 +669,18 @@ private class BuildFFMPEG: BaseBuild {
+@@ -609,7 +670,18 @@
          //        if platform == .isimulator || platform == .tvsimulator {
          //            arguments.append("--assert-level=1")
          //        }
@@ -151,7 +157,7 @@ index e5f872c..dcaca5b 100644
          if BaseBuild.options.enableGPL {
              dependencyLibrary += [.libsmbclient]
          }
-@@ -681,6 +752,22 @@ private class BuildFFMPEG: BaseBuild {
+@@ -681,6 +753,22 @@
          "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",
          "--enable-encoder=movtext", "--enable-encoder=mpeg4", "--enable-encoder=h264_videotoolbox",
          "--enable-encoder=hevc_videotoolbox", "--enable-encoder=prores", "--enable-encoder=prores_videotoolbox",
@@ -174,7 +180,7 @@ index e5f872c..dcaca5b 100644
          // ./configure --list-protocols
          "--enable-protocols",
          // ./configure --list-demuxers
-@@ -778,10 +865,239 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -778,12 +866,241 @@
  }
  
  
@@ -226,7 +232,7 @@ index e5f872c..dcaca5b 100644
 +        }
 +        return args
 +    }
-+}
+ }
 +
 +// SPIKE: shared helpers for cloning a dependency at an exact commit. BaseBuild.beforeBuild
 +// can only clone a tag/branch via `--branch`, which cannot express a SHA.
@@ -235,7 +241,7 @@ index e5f872c..dcaca5b 100644
 +        NSError(domain: "VortX.MPVKit.Pin", code: 1,
 +                userInfo: [NSLocalizedDescriptionKey: message])
 +    }
-+
+ 
 +    private static func output(_ command: String, in directoryURL: URL) throws -> String {
 +        // Utility.shell returns an empty string on success unless isOutput is true. Every
 +        // validation command below consumes stdout, so keep that flag explicit rather than
@@ -412,6 +418,495 @@ index e5f872c..dcaca5b 100644
 +            }
 +        }
 +    }
++}
++
+ private class BuildOpenSSL: ZipBaseBuild {
+     init() {
+         super.init(library: .openssl)
+@@ -838,12 +1155,266 @@
+     }
  }
  
- private class BuildOpenSSL: ZipBaseBuild {
++
++// Metadata correction for one retained binary wrapper, not a Samba upgrade.
++// The hardcoded proof is inseparable from this policy; callers supply observations only.
++enum SmbMetadataNormalizer {
++    struct Row {
++        let key: String
++        let templateHash: String
++        let archiveHash: String?
++        let archiveSize: Int?
++        let pam: Bool
++        let glib: Bool
++    }
++    struct Restored {
++        let text: String
++        let archiveHash: String?
++        let headers: [String: String]
++    }
++    struct Snapshot {
++        let version: String
++        let zipHash: String
++        let headers: [String: String]
++        let archives: [String: String]
++        let templates: [String: String]
++        let requested: Set<String>
++        let restored: [String: Restored]
++    }
++    static let version = "4.15.13-2512"
++    static let zipHash = "6861f0b0e45abd3248a8160d1c0b4ede66eef5163f04598830883a951607cef9"
++    static let headerPins = [
++        "libsmbclient.h": (125287, "9e0fd2184591f449c79b6bc5b5468443920523ea943440534df04294b940ce1c"),
++        "samba/version.h": (421, "d601401634a789612aab95d50295c69713af8fb4ac5addf39dffcc402e978554"),
++    ]
++    // Catalyst/XR templates are known but have no approved payload/normalization proof.
++    static let rows: [Row] = [
++        Row(key: "ios/arm64", templateHash: "c402ab6609efd9b6fdf52f5ee33baa1a26c8464a1bf33644fdb901bfb4345491", archiveHash: "1c378176da85ff2386f5c81c903860f8ab258a4e846ddba5bb0febc284f01cd0", archiveSize: 31955240, pam: false, glib: false),
++        Row(key: "isimulator/arm64", templateHash: "18ea5d36f0ae911113674a2679ef883727ba38b4b9c7b3ad99d9fdeba2376b2f", archiveHash: "bcb902da9a24ebbd3571bd1d04eeea88b3782e10ad98eee9a2be90e15ddeb795", archiveSize: 31948848, pam: false, glib: false),
++        Row(key: "isimulator/x86_64", templateHash: "decd43bcf84a5209394fe3f85af5ea8a8faa192022e9050261435dab3d3c6693", archiveHash: "0602a2a2eb8c987677b38a150cdf8b03d0f88f13eb7dd7877cacb4a41d7a5254", archiveSize: 26473896, pam: false, glib: true),
++        Row(key: "maccatalyst/arm64", templateHash: "47cd77b01d846894a34efa3bd716d4ce695b46ab53f0e8a2937b921f8b7db374", archiveHash: nil, archiveSize: nil, pam: true, glib: true),
++        Row(key: "maccatalyst/x86_64", templateHash: "8d6303f78c1cd103debd35da383987a1146c58d324dbb8b2bf5e454da25c50ec", archiveHash: nil, archiveSize: nil, pam: true, glib: true),
++        Row(key: "macos/arm64", templateHash: "47b6baa7178657f8fccf7f1b9f1b5cc4cf8105aa2ce52ecbd1cc85385c4d0415", archiveHash: "4f6a36df06ad0e5f36c3106c7c61a1978dbc642a7d27c4f9aceb19540998424f", archiveSize: 31933296, pam: true, glib: true),
++        Row(key: "macos/x86_64", templateHash: "b89cacc30d7a8c41ca54016b3f9434b1195589ab1372fb2343de22777ffd9b8c", archiveHash: "0c9c03db4279b730b86b505b09c2fedc11b879ee7914ef818c940a38e867ae81", archiveSize: 27602360, pam: true, glib: true),
++        Row(key: "tvos/arm64", templateHash: "1db8cdd4f79691213a19834a6c130153a63a8409b63434d920e6b4dd3077f45c", archiveHash: "4921e4c649589e920e139078219b1a3f01a1fea6cd5bc8b71875d15c09aad252", archiveSize: 31955264, pam: false, glib: false),
++        Row(key: "tvos/arm64e", templateHash: "18b5baf5c9170178646cdc87cba34d0063a890231268652cbb5858ee737b2055", archiveHash: "0267dfcd4ca93acf1e62bb75bc7509f6640c2367c63da99a3c983ec9ad9d8206", archiveSize: 32054336, pam: false, glib: true),
++        Row(key: "tvsimulator/arm64", templateHash: "2f6c4296d61766d192267a65bd0e798fa092aee815784489ffca3fbd3868e238", archiveHash: "6960f069a31801eb0f0f70eb0efd67239502d5c7081163a9ca38faca226a29fd", archiveSize: 31948880, pam: false, glib: false),
++        Row(key: "tvsimulator/x86_64", templateHash: "89c22b07d3db861d6089760cd96df29cce34ab51d6640b2105f7a9305bd8c423", archiveHash: "4295cab93d2e40c1234f81a8032d28a0da970643d07cb3c01aaf9b63cd103ef1", archiveSize: 26474992, pam: false, glib: true),
++        Row(key: "xros/arm64", templateHash: "2e8a211f6736fa9bc7d4f931ccb85d4ca7c3520f7e26b742eb4b968d9b56d220", archiveHash: nil, archiveSize: nil, pam: false, glib: false),
++        Row(key: "xrsimulator/arm64", templateHash: "b135f28f4938a4c22346d96483c3e9ce2451d242c40b1affe28523d50a37212e", archiveHash: nil, archiveSize: nil, pam: false, glib: false),
++    ]
++    static func fail(_ message: String) -> NSError {
++        NSError(domain: "VortX.SmbMetadata", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
++    }
++    static func digest(_ data: Data) -> String {
++        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
++    }
++    static func template(_ row: Row, corrected: Bool = false) -> String {
++        let parts = row.key.split(separator: "/")
++        let glib = row.glib && !(corrected && row.archiveHash != nil)
++        let flags = "-lresolv -lpthread -lz -liconv -lgnutls" + (row.pam ? " -lpam" : "") + " -lncurses -lreadline" + (glib ? " -lglib-2.0" : "")
++        return """
++        prefix=/path/to/workdir/libsmbclient/\(parts[0])/thin/\(parts[1])
++        exec_prefix=${prefix}
++        libdir=${prefix}/lib
++        includedir=${prefix}/include/samba-4.0
++
++        Name: smbclient
++        Description: A SMB library interface
++        Version: 0.7.0
++        Libs:  -L${libdir} -lsmbclient
++        Libs.private: \(flags)
++        Requires.private: gnutls\(glib ? " glib-2.0" : "")
++        Cflags: -I${includedir}
++        URL: http://www.samba.org/
++
++        """
++    }
++    // Pure policy shared by production IO and the bounded functional fixture.
++    // Observed fingerprints are not caller-selected policy: every pin below is fixed.
++    static func plan(_ snapshot: Snapshot, outputRoot: URL) throws -> [String: String] {
++        let expectedHeaders = headerPins.mapValues { $0.1 }
++        let keys = Set(rows.map { $0.key })
++        let archivePins = Dictionary(uniqueKeysWithValues: rows.compactMap { row in row.archiveHash.map { (row.key, $0) } })
++        guard snapshot.version == version, snapshot.zipHash == zipHash,
++              snapshot.headers == expectedHeaders, snapshot.archives == archivePins,
++              Set(snapshot.templates.keys) == keys,
++              snapshot.requested.isSubset(of: keys), Set(snapshot.restored.keys) == snapshot.requested else {
++            throw fail("Unapproved SMB wrapper, payload, header or target observation")
++        }
++        var result: [String: String] = [:]
++        for row in rows {
++            let original = template(row)
++            guard digest(Data(original.utf8)) == row.templateHash,
++                  snapshot.templates[row.key] == original else {
++                throw fail("Unapproved SMB original template: \(row.key)")
++            }
++            guard snapshot.requested.contains(row.key), let restored = snapshot.restored[row.key] else { continue }
++            guard restored.headers == expectedHeaders, restored.archiveHash == row.archiveHash else {
++                throw fail("Unapproved SMB restored payload/header: \(row.key)")
++            }
++            let before = original.replacingOccurrences(of: "/path/to/workdir", with: outputRoot.path)
++            let after = template(row, corrected: true).replacingOccurrences(of: "/path/to/workdir", with: outputRoot.path)
++            guard restored.text == before || restored.text == after else {
++                throw fail("SMB metadata is neither the exact original nor approved afterimage: \(row.key)")
++            }
++            if restored.text != after { result[row.key] = after }
++        }
++        return result
++    }
++    static func fileHash(_ url: URL, size: Int) throws -> String {
++        let info = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
++        guard info.isRegularFile == true, info.isSymbolicLink != true, info.fileSize == size else {
++            throw fail("Unexpected SMB file kind or size: \(url.lastPathComponent)")
++        }
++        let input = try FileHandle(forReadingFrom: url)
++        defer { try? input.close() }
++        var hash = SHA256()
++        var total = 0
++        while let bytes = try input.read(upToCount: 65536), !bytes.isEmpty {
++            total += bytes.count
++            guard total <= size else { throw fail("SMB input grew while hashing") }
++            hash.update(data: bytes)
++        }
++        guard total == size else { throw fail("SMB input changed while hashing") }
++        return hash.finalize().map { String(format: "%02x", $0) }.joined()
++    }
++    static func snapshot(wrapper: URL, outputRoot: URL, version observedVersion: String, requested: Set<String>) throws -> Snapshot {
++        guard observedVersion == version, wrapper.lastPathComponent == "libsmbclient-\(version)" else {
++            throw fail("SMB metadata correction is bound to wrapper \(version)")
++        }
++        let zip = try fileHash(wrapper.appendingPathComponent("libsmbclient.zip"), size: 97090982)
++        var headers: [String: String] = [:]
++        for (name, pin) in headerPins {
++            headers[name] = try fileHash(wrapper.appendingPathComponent("include/samba-4.0/\(name)"), size: pin.0)
++        }
++        let templateRoot = wrapper.appendingPathComponent("pkgconfig-example")
++        var enumerationError: Error?
++        guard let entries = FileManager.default.enumerator(at: templateRoot,
++            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [],
++            errorHandler: { _, error in enumerationError = error; return false }) else {
++            throw fail("Missing SMB wrapper templates")
++        }
++        var actualPCs: Set<String> = []
++        for case let entry as URL in entries {
++            let info = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
++            guard info.isSymbolicLink != true else { throw fail("Unexpected SMB template symlink") }
++            if info.isDirectory != true { actualPCs.insert(entry.path) }
++        }
++        if let error = enumerationError { throw error }
++        let expectedPCs = Set(rows.map { wrapper.appendingPathComponent("pkgconfig-example/\($0.key)/smbclient.pc").path })
++        guard actualPCs == expectedPCs else { throw fail("Unknown SMB wrapper template set") }
++        var archives: [String: String] = [:]
++        var templates: [String: String] = [:]
++        var restored: [String: Restored] = [:]
++        for row in rows {
++            let sourcePC = wrapper.appendingPathComponent("pkgconfig-example/\(row.key)/smbclient.pc")
++            guard try fileHash(sourcePC, size: template(row).utf8.count) == row.templateHash else {
++                throw fail("Changed SMB wrapper template: \(row.key)")
++            }
++            templates[row.key] = try String(contentsOf: sourcePC, encoding: .utf8)
++            if let size = row.archiveSize {
++                archives[row.key] = try fileHash(wrapper.appendingPathComponent("lib/\(row.key.replacingOccurrences(of: "/", with: "/thin/"))/lib/libsmbclient.a"), size: size)
++            }
++            guard requested.contains(row.key) else { continue }
++            let components = row.key.split(separator: "/")
++            let target = outputRoot.appendingPathComponent("libsmbclient/\(components[0])/thin/\(components[1])")
++            var targetHeaders: [String: String] = [:]
++            for (name, pin) in headerPins {
++                targetHeaders[name] = try fileHash(target.appendingPathComponent("include/samba-4.0/\(name)"), size: pin.0)
++            }
++            let archive = try row.archiveSize.map { try fileHash(target.appendingPathComponent("lib/libsmbclient.a"), size: $0) }
++            let pc = target.appendingPathComponent("lib/pkgconfig/smbclient.pc")
++            let info = try pc.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
++            guard info.isRegularFile == true, info.isSymbolicLink != true,
++                  let size = info.fileSize, size <= 4096 else { throw fail("Invalid SMB restored PC") }
++            restored[row.key] = Restored(text: try String(contentsOf: pc, encoding: .utf8), archiveHash: archive, headers: targetHeaders)
++        }
++        return Snapshot(version: observedVersion, zipHash: zip, headers: headers, archives: archives,
++                        templates: templates, requested: requested, restored: restored)
++    }
++    static func validateWrapper(_ wrapper: URL, version: String) throws {
++        _ = try plan(snapshot(wrapper: wrapper, outputRoot: wrapper, version: version, requested: []), outputRoot: wrapper)
++    }
++    static func validateArchive(_ archive: URL, version observedVersion: String) throws {
++        guard observedVersion == version, archive.lastPathComponent == "libsmbclient.zip",
++              archive.deletingLastPathComponent().lastPathComponent == "libsmbclient-\(version)" else {
++            throw fail("Unapproved SMB archive selection")
++        }
++        guard try fileHash(archive, size: 97090982) == zipHash else {
++            throw fail("Changed SMB wrapper archive; refusing extraction")
++        }
++    }
++    static func validateFreshDirectory(_ directory: URL) throws {
++        let attributes: [FileAttributeKey: Any]
++        do {
++            attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
++        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
++            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
++            return
++        } catch {
++            throw error
++        }
++        guard attributes[.type] as? FileAttributeType == .typeDirectory,
++              try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty else {
++            throw fail("SMB cache without its pinned ZIP must be absent or an empty real directory")
++        }
++    }
++    static func normalize(wrapper: URL, outputRoot: URL, version: String, requested: Set<String>) throws {
++        let observed = try snapshot(wrapper: wrapper, outputRoot: outputRoot, version: version, requested: requested)
++        let changes = try plan(observed, outputRoot: outputRoot)
++        // Validate every input before any write; each file is atomic, the set is not.
++        // An interrupted set remains recoverable only from exact before/after states.
++        for key in changes.keys.sorted() {
++            let parts = key.split(separator: "/")
++            let destination = outputRoot.appendingPathComponent("libsmbclient/\(parts[0])/thin/\(parts[1])/lib/pkgconfig/smbclient.pc")
++            try changes[key]!.write(to: destination, atomically: true, encoding: .utf8)
++        }
++    }
++}
+ 
+ private class BuildSmbclient: ZipBaseBuild {
+     init() {
+         super.init(library: .libsmbclient)
+     }
+ 
++    override func validateDownloadedArchive(_ archive: URL) throws {
++        try SmbMetadataNormalizer.validateArchive(archive, version: library.version)
++    }
++
++    override func beforeBuild() throws {
++        guard library.version == SmbMetadataNormalizer.version else {
++            throw SmbMetadataNormalizer.fail("Unapproved SMB wrapper version")
++        }
++        let archive = directoryURL.appendingPathComponent("libsmbclient.zip")
++        // Reject cached zero/unknown/symlink inputs before ZipBaseBuild's cleanup branch.
++        let cached: Bool
++        do {
++            _ = try FileManager.default.attributesOfItem(atPath: archive.path)
++            cached = true
++        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
++            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
++            cached = false
++        } catch {
++            throw error
++        }
++        if cached {
++            try validateDownloadedArchive(archive)
++        } else {
++            try SmbMetadataNormalizer.validateFreshDirectory(directoryURL)
++        }
++        try super.beforeBuild()
++        try SmbMetadataNormalizer.validateWrapper(directoryURL, version: library.version)
++    }
++
++    override func afterBuild() throws {
++        let requested = Set(BaseBuild.platforms.flatMap { platform in
++            architectures(platform).map { "\(platform.rawValue)/\($0.rawValue)" }
++        })
++        try SmbMetadataNormalizer.normalize(wrapper: directoryURL, outputRoot: URL.currentDirectory,
++                                            version: library.version, requested: requested)
++        try super.afterBuild()
++    }
+ }
+ 
+ private class BuildDav1d: ZipBaseBuild {
+diff --git a/Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch b/Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch
+index 8b268af..7a075b0 100644
+--- a/Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch
++++ b/Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch
+@@ -1,5 +1,5 @@
+ diff --git forkSrcPrefix/osdep/mac/meson.build forkDstPrefix/osdep/mac/meson.build
+-index 16605288419c54cb9d89680a6fafd6a2f315487e..a154dea05ea77243f760a05067ead7f32623b991 100644
++index 16605288419c54cb9d89680a6fafd6a2f315487e..732dcd0805a27a5f26f7a86ba3e42caa4c6ff5da 100644
+ --- forkSrcPrefix/osdep/mac/meson.build
+ +++ forkDstPrefix/osdep/mac/meson.build
+ @@ -6,12 +6,12 @@ swift_flags = ['-c', '-emit-library', '-static', '-sdk', macos_sdk_path,
+@@ -10,7 +10,8 @@ index 16605288419c54cb9d89680a6fafd6a2f315487e..a154dea05ea77243f760a05067ead7f3
+ +#if swift_ver.version_compare('<5.8')
+      message('Falling back to old swift frontend build')
+      swift_prog = find_program(run_command(xcrun, '-find', 'swift', check: true).stdout().strip())
+-     swift_flags = ['-frontend', '-c', '-sdk', macos_sdk_path,
++-    swift_flags = ['-frontend', '-c', '-sdk', macos_sdk_path,
+++    swift_flags = ['-frontend', '-c', '-whole-module-optimization', '-sdk', macos_sdk_path,
+                     '-enable-objc-interop', '-emit-objc-header', '-parse-as-library']
+ -endif
+ +#endif
+diff --git a/Sources/BuildScripts/XCFrameworkBuild/base.swift b/Sources/BuildScripts/XCFrameworkBuild/base.swift
+index 3e56ee0eb0d4b913c54ab7f354b665f69b6e0bfe..a5b87d6b0d9dd5062afb536a2004f10bfd70ac6d 100644
+--- a/Sources/BuildScripts/XCFrameworkBuild/base.swift
++++ b/Sources/BuildScripts/XCFrameworkBuild/base.swift
+@@ -87,6 +87,124 @@
+         }
+ 
+         return options
++    }
++}
++
++enum SDKSystemMetadata {
++    static func fail(_ message: String) -> NSError {
++        NSError(domain: "VortX.SDKSystemMetadata", code: 1,
++                userInfo: [NSLocalizedDescriptionKey: message])
++    }
++
++    private static func attributes(_ url: URL) throws -> [FileAttributeKey: Any]? {
++        do {
++            return try FileManager.default.attributesOfItem(atPath: url.path)
++        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
++            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
++            return nil
++        }
++    }
++
++    private static func realDirectory(_ url: URL) throws {
++        guard try attributes(url)?[.type] as? FileAttributeType == .typeDirectory,
++              url.standardizedFileURL.path == url.resolvingSymlinksInPath().path else {
++            throw fail("Expected a real target build/SDK directory")
++        }
++    }
++
++    private static func sdkData(_ path: String, root: URL, limit: Int) throws -> Data {
++        let resolved = root.appendingPathComponent(path).resolvingSymlinksInPath()
++        guard resolved.path.hasPrefix(root.path + "/"),
++              let info = try attributes(resolved), info[.type] as? FileAttributeType == .typeRegular,
++              let size = info[.size] as? NSNumber, size.intValue > 0, size.intValue <= limit else {
++            throw fail("Missing or unsafe target SDK input: \(path)")
++        }
++        let bytes = try Data(contentsOf: resolved)
++        guard bytes.count == size.intValue else { throw fail("Target SDK input changed while reading") }
++        return bytes
++    }
++
++    private static func version(_ macro: String, header: Data) throws -> String {
++        guard let text = String(data: header, encoding: .utf8) else { throw fail("Unreadable target SDK header") }
++        let name = NSRegularExpression.escapedPattern(for: macro)
++        let definitions = text.components(separatedBy: .newlines).filter {
++            $0.range(of: "^[ \\t]*#[ \\t]*define[ \\t]+" + name + "\\b", options: .regularExpression) != nil
++        }
++        let expression = try NSRegularExpression(pattern: "^[ \\t]*#[ \\t]*define[ \\t]+" + name + #"[ \t]+"([0-9]{1,3}(?:\.[0-9]{1,3}){1,3})"[ \t]*$"#)
++        guard definitions.count == 1, let line = definitions.first,
++              let match = expression.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
++              let range = Range(match.range(at: 1), in: line) else {
++            throw fail("Target SDK must declare one bounded numeric \(macro)")
++        }
++        return String(line[range])
++    }
++
++    private static func validateStub(_ path: String, installName: String, root: URL) throws {
++        guard let stub = String(data: try sdkData(path, root: root, limit: 1048576), encoding: .utf8),
++              stub.hasPrefix("--- !tapi-tbd") else { throw fail("Target SDK linker stub is unavailable") }
++        let name = NSRegularExpression.escapedPattern(for: installName)
++        let pattern = "(?m)^install-name:[ \\t]+(?:'" + name + "'|\"" + name + "\"|" + name + ")[ \\t]*$"
++        guard stub.range(of: pattern, options: .regularExpression) != nil else {
++            throw fail("Unexpected target SDK linker stub identity")
++        }
++    }
++
++    static func prepare(sdkRoot: URL, buildRoot: URL) throws -> URL {
++        guard sdkRoot.isFileURL, buildRoot.isFileURL else { throw fail("Target SDK metadata requires file URLs") }
++        let sdk = sdkRoot.resolvingSymlinksInPath().standardizedFileURL
++        guard sdk.pathExtension == "sdk", sdk.path.rangeOfCharacter(from: .controlCharacters) == nil,
++              !sdk.path.contains("$") else { throw fail("Metadata requires the selected target SDK") }
++        try realDirectory(sdk)
++        try realDirectory(buildRoot)
++        let zlibVersion = try version("ZLIB_VERSION", header: sdkData("usr/include/zlib.h", root: sdk, limit: 262144))
++        let xmlVersion = try version("LIBXML_DOTTED_VERSION", header: sdkData("usr/include/libxml2/libxml/xmlversion.h", root: sdk, limit: 262144))
++        try validateStub("usr/lib/libz.tbd", installName: "/usr/lib/libz.1.dylib", root: sdk)
++        try validateStub("usr/lib/libxml2.tbd", installName: "/usr/lib/libxml2.2.dylib", root: sdk)
++        let include = sdk.appendingPathComponent("usr/include/libxml2").path
++            .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
++        let contents = [
++            "zlib.pc": "Name: zlib\nDescription: Target Apple SDK zlib\nVersion: \(zlibVersion)\nLibs: -lz\nCflags:\n",
++            "libxml-2.0.pc": "Name: libxml-2.0\nDescription: Target Apple SDK libxml2\nVersion: \(xmlVersion)\nLibs: -lxml2\nCflags: -I\"\(include)\"\n",
++        ].mapValues { Data($0.utf8) }
++        let metadata = buildRoot.appendingPathComponent("vortx-sdk-pkgconfig")
++        guard !metadata.path.contains(":"), metadata.path.rangeOfCharacter(from: .controlCharacters) == nil else {
++            throw fail("Target SDK metadata path cannot be represented in pkg-config LIBDIR")
++        }
++        let existing = try attributes(metadata)
++        if existing != nil {
++            try realDirectory(metadata)
++            let names = Set(try FileManager.default.contentsOfDirectory(atPath: metadata.path))
++            guard names.isSubset(of: Set(contents.keys)) else { throw fail("Refusing unknown target SDK metadata files") }
++        }
++        // Validate BOTH existing files before creating or writing either one.
++        var missing: [String] = []
++        for name in contents.keys.sorted() {
++            let destination = metadata.appendingPathComponent(name)
++            let bytes = contents[name]!
++            if let info = try attributes(destination) {
++                guard info[.type] as? FileAttributeType == .typeRegular,
++                      let size = info[.size] as? NSNumber, size.intValue == bytes.count,
++                      try Data(contentsOf: destination) == bytes else {
++                    throw fail("Refusing changed existing target SDK metadata: \(name)")
++                }
++            } else {
++                missing.append(name)
++            }
++        }
++        if existing == nil { try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false) }
++        for name in missing {
++            try contents[name]!.write(to: metadata.appendingPathComponent(name), options: .withoutOverwriting)
++        }
++        return metadata
++    }
++
++    static func append(to environment: inout [String: String], sdkRoot: URL, buildRoot: URL) throws {
++        guard let target = environment["PKG_CONFIG_LIBDIR"], !target.isEmpty,
++              !target.components(separatedBy: ":").contains(""), environment["PKG_CONFIG_PATH"] == "" else {
++            throw fail("SDK metadata requires explicit target-only pkg-config roots")
++        }
++        let metadata = try prepare(sdkRoot: sdkRoot, buildRoot: buildRoot)
++        environment["PKG_CONFIG_LIBDIR"] = target + ":" + metadata.path
+     }
+ }
+ 
+@@ -228,7 +346,8 @@
+     func build(platform: PlatformType, arch: ArchType) throws {
+         let buildURL = scratch(platform: platform, arch: arch)
+         try? FileManager.default.createDirectory(at: buildURL, withIntermediateDirectories: true, attributes: nil)
+-        let environ = environment(platform: platform, arch: arch)
++        var environ = environment(platform: platform, arch: arch)
++        try SDKSystemMetadata.append(to: &environ, sdkRoot: URL(fileURLWithPath: platform.isysroot), buildRoot: buildURL)
+         if FileManager.default.fileExists(atPath: (directoryURL + "meson.build").path) {
+             if Utility.shell("which meson") == nil {
+                 Utility.shell("brew install meson")
+@@ -319,7 +438,6 @@
+         let cFlags = cFlags(platform: platform, arch: arch).joined(separator: " ")
+         let ldFlags = ldFlags(platform: platform, arch: arch).joined(separator: " ")
+         let pkgConfigPath = platform.pkgConfigPath(arch: arch)
+-        let pkgConfigPathDefault = Utility.shell("pkg-config --variable pc_path pkg-config", isOutput: true)!
+         return [
+             "LC_CTYPE": "C",
+             "CC": "/usr/bin/clang",
+@@ -333,7 +451,9 @@
+             "CXXFLAGS": cFlags,
+             "ASMFLAGS": cFlags,
+             "LDFLAGS": ldFlags,
+-            "PKG_CONFIG_LIBDIR": pkgConfigPath + pkgConfigPathDefault,
++            // Resolve target metadata only; never search host defaults or ambient overrides.
++            "PKG_CONFIG_LIBDIR": pkgConfigPath,
++            "PKG_CONFIG_PATH": "",
+             "PATH": BaseBuild.defaultPath,
+         ]
+     }
+@@ -959,6 +1079,9 @@
+ 
+ class ZipBaseBuild : BaseBuild {
+ 
++    // Subclasses may bind an exact archive before it can be extracted.
++    func validateDownloadedArchive(_ archive: URL) throws {}
++
+     override func beforeBuild() throws {
+         // unzip builded static library
+         let outputFileName = "\(library.rawValue).zip"
+@@ -972,7 +1095,10 @@
+ 
+         if !FileManager.default.fileExists(atPath: outputFile.path) {
+             try! Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
++            try validateDownloadedArchive(outputFile)
+             try! Utility.launch(path: "/usr/bin/unzip", arguments: ["-o",outputFileName], currentDirectoryURL: directoryURL)
++        } else {
++            try validateDownloadedArchive(outputFile)
+         }
+     }
+ 
+@@ -1245,14 +1371,13 @@
+     }
+ 
+     func pkgConfigPath(arch: ArchType) -> String {
+-        var pkgConfigPath = ""
++        var pkgConfigPaths: [String] = []
+         for lib in Library.allCases {
+             let path = URL.currentDirectory + [lib.rawValue, rawValue, "thin", arch.rawValue]
+-            if FileManager.default.fileExists(atPath: path.path) {
+-                pkgConfigPath += "\(path.path)/lib/pkgconfig:"
+-            }
+-        }
+-        return pkgConfigPath
++            // Include even absent target roots so LIBDIR is explicit and never empty.
++            pkgConfigPaths.append("\(path.path)/lib/pkgconfig")
++        }
++        return pkgConfigPaths.joined(separator: ":")
+     }
+ }
+ 

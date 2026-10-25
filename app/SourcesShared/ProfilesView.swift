@@ -235,15 +235,15 @@ struct ProfilePickerView: View {
             // A full-screen child can hide its presenter without removing its identity.
             if !signInNeeded { signInCredential = nil; signInProfileID = nil }
         }
-        .onChange(of: nativeSync.accountRestoreState) { state in
+        .onValueChange(of: nativeSync.accountRestoreState) { state in
             if state == .failed { deferredSelection.cancel() }
             if state == .ready, !profileAction.isRunning { profileAction.cancel() }
             resumeDeferredSelection()
         }
-        .onChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
-        .onChange(of: profileAction.errorMessage) { _ in resumeDeferredSelection() }
-        .onChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
-        .onChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
+        .onValueChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
+        .onValueChange(of: profileAction.errorMessage) { _ in resumeDeferredSelection() }
+        .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
+        .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             deferredSelection.cancel()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
@@ -980,7 +980,7 @@ struct PinGateOverlay: View {
                             .frame(maxWidth: 360)
                             .accessibilityLabel("Enter your four-digit PIN")
                             .accessibilityFocused($pinAccessibilityFocused)
-                            .onChange(of: input) { _ in
+                            .onValueChange(of: input) { _ in
                                 input = String(input.filter(\.isNumber).prefix(4))
                                 wrong = false
                             }
@@ -1095,7 +1095,7 @@ struct ProfileEditorView: View {
                         TextField("Or type your own: any emoji or a letter", text: $customAvatar)
                             .font(Theme.Typography.body)
                             .frame(maxWidth: 600)
-                            .onChange(of: customAvatar) { _ in
+                            .onValueChange(of: customAvatar) { _ in
                                 // One grapheme (emoji-safe); single letters display uppercased.
                                 guard let first = customAvatar.first else { return }
                                 let avatar = String(first)
@@ -1176,7 +1176,7 @@ struct ProfileEditorView: View {
                             .font(Theme.Typography.body)
                             .numberPadKeyboard()
                             .frame(maxWidth: 600)
-                            .onChange(of: pinText) { _ in
+                            .onValueChange(of: pinText) { _ in
                                 pinText = String(pinText.filter(\.isNumber).prefix(4))
                             }
                         if draft.hasPin {

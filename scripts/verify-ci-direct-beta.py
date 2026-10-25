@@ -31,6 +31,8 @@ MARKER = "<!-- vortx-distribution: hosted-direct-beta -->"
 PROVENANCE = "VortX-Hosted-Direct-Beta-Provenance.json"
 SUMS = "SHA256SUMS.txt"
 ENGINE = "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"
+NATIVE_BETA7_TAG = "v0.5.6-beta.7"
+NATIVE_BETA7_ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
 HISTORICAL_BETA2_ENGINE = "af29b22e4c45740a1f5b6cb415b81f8430f55b9f"
 STREMIO = "31c66611822043e089f5819ad232a5df93975873"
 BUNDLETOOL_SHA = "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
@@ -88,6 +90,24 @@ LANES = {
     "android": ("android-release.yml", "release-android", "VortX-Android-release", ANDROID_STEPS,
                 "Upload the immutable Android handoff"),
 }
+
+
+# Historical step contracts above are immutable: beta7 follows the reviewed native-only workflows.
+NATIVE_BETA7_APPLE_STEPS = ("Preserve the workflow revision's native acceptance tool",) + tuple(
+    "Promote the vortx-core engine workspace + verify it (fail closed)"
+    if step == "Promote the vortx-core engine workspace + verify both engines (fail closed)" else step
+    for step in APPLE_STEPS if step != "Fetch stremiox-core (private, pinned)")
+NATIVE_BETA7_ANDROID_STEPS = (
+    "Acquire reviewed Android mpv component from the checked-out release source",
+    "Build exact host JNI for native sync release tests",
+    "Require real native sync revision and account tests before packaging",
+    "Retain native sync release JUnit and bounded provenance",
+) + tuple(
+    {"Promote the vortx-core workspace + record exact private source pins":
+         "Promote the vortx-core workspace + record the exact private source pin",
+     "Verify native BuildConfig and native-only engine in every Android artifact":
+         "Verify native-only engine in every Android artifact"}.get(step, step)
+    for step in ANDROID_STEPS if step != "Fetch stremiox-core (private, pinned)")
 
 
 def require(ok, message):
@@ -228,6 +248,8 @@ def tag_version(tag):
 
 def expected_engine(tag):
     # Exact reviewed tag interpretation, never a caller-supplied/fallback engine pin.
+    if tag == NATIVE_BETA7_TAG:
+        return NATIVE_BETA7_ENGINE
     if tag == "v0.5.6-beta.2":
         return HISTORICAL_BETA2_ENGINE
     # beta.3 was tagged but never published; beta.4 is its corrected build and beta.5/beta.6 follow on the
@@ -268,7 +290,7 @@ def provenance_binding(body):
     return match[1]
 
 
-def source_contract(root, source, version):
+def source_contract(root, source, version, tag):
     require(subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip() == source,
             "verifier checkout is not the exact source commit")
     hashes = {}
@@ -276,21 +298,59 @@ def source_contract(root, source, version):
         recorded = subprocess.check_output(["git", "-C", str(root), "show", f"{source}:{relative}"])
         require((root / relative).read_bytes() == recorded, f"working file differs from source: {relative}")
         hashes[relative] = hashlib.sha256(recorded).hexdigest()
-    project = (root / "app/project.yml").read_text()
+    build = source_versions((root / "app/project.yml").read_text(),
+                            (root / "android/app/build.gradle.kts").read_text(), version, tag)
+    return build, hashes
+
+
+def source_versions(project, gradle, version, tag):
+    expected_engine(tag)  # Unknown future tags cannot select a version/step policy.
+    require(tag_version(tag) == version, "source version differs from the exact beta tag")
     versions = re.findall(r'^\s*MARKETING_VERSION:\s*"?([0-9.]+)"?\s*$', project, re.M)
     builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
-    require(len(versions) == len(builds) == 6 and set(versions) == {version} and len(set(builds)) == 1,
-            "six Apple target version/build pairs must agree with the beta tag")
-    gradle = (root / "android/app/build.gradle.kts").read_text()
+    expected_pairs = 5 if tag == NATIVE_BETA7_TAG else 6
+    require(len(versions) == len(builds) == expected_pairs and set(versions) == {version} and len(set(builds)) == 1,
+            "Apple target version/build pairs must agree with the exact beta contract")
+    if tag == NATIVE_BETA7_TAG:
+        sections = project.split("\ntargets:\n")
+        require(len(sections) == 2, "native beta7 requires the actual project target section")
+        targets = sections[1].split("\nschemes:\n", 1)[0]
+        blocks = re.findall(r'^  ([A-Za-z_][A-Za-z0-9_]*):\n(.*?)(?=^  [A-Za-z_][A-Za-z0-9_]*:\n|\Z)',
+                            targets, re.M | re.S)
+        for name in ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite"):
+            selected = [body for target, body in blocks if target == name]
+            require(len(selected) == 1 and
+                    re.findall(r'^\s*MARKETING_VERSION:\s*"?([0-9.]+)"?\s*$', selected[0], re.M) == [version] and
+                    re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', selected[0], re.M) == [builds[0]],
+                    "native beta7 target version/build differs: " + name)
     require(re.findall(r'versionName = "([^"]+)"', gradle) == [version] and
             re.findall(r'^\s*versionCode = ([0-9]+)\s*$', gradle, re.M) == [builds[0]],
             "Android source version/build differs from Apple/tag")
     positive(int(builds[0]))
-    return builds[0], hashes
+    return builds[0]
 
 
-def successful_job(jobs, lane, run_id, attempt, source):
-    _, name, _, required, upload = LANES[lane]
+def job_contract(lane, tag):
+    expected_engine(tag)
+    required = LANES[lane][3]
+    skipped = ("Refuse Android-only publication",) if lane == "android" else (
+        "Validate immutable Beta 1 source recovery", "Build the content-addressed release feed artifact",
+        "Upload the immutable feed handoff", "Constrain legacy comparison to artifact-only builds",
+        "Constrain Full tvOS test mode to artifact-only builds", "Package Full tvOS test IPA",
+    )
+    if tag == NATIVE_BETA7_TAG:
+        required = NATIVE_BETA7_APPLE_STEPS if lane == "apple" else NATIVE_BETA7_ANDROID_STEPS
+        if lane == "apple":
+            skipped = tuple("Reject removed legacy comparison builds"
+                            if step == "Constrain legacy comparison to artifact-only builds" else step
+                            for step in skipped) + (
+                "Checkout the immutable recovered app source", "Verify immutable recovered source checkout")
+    return required, skipped
+
+
+def successful_job(jobs, lane, run_id, attempt, source, tag):
+    _, name, _, _, upload = LANES[lane]
+    required, skipped = job_contract(lane, tag)
     found = [job for job in jobs if job.get("name") == name]
     require(len(found) == 1, "expected one exact original build job")
     job = found[0]
@@ -302,11 +362,6 @@ def successful_job(jobs, lane, run_id, attempt, source):
         selected = [step for step in steps if step.get("name") == name]
         require(len(selected) == 1 and selected[0].get("status") == "completed" and
                 selected[0].get("conclusion") == "success", f"required step did not succeed: {name}")
-    skipped = ("Refuse Android-only publication",) if lane == "android" else (
-        "Validate immutable Beta 1 source recovery", "Build the content-addressed release feed artifact",
-        "Upload the immutable feed handoff", "Constrain legacy comparison to artifact-only builds",
-        "Constrain Full tvOS test mode to artifact-only builds", "Package Full tvOS test IPA",
-    )
     for name in skipped:
         selected = [step for step in steps if step.get("name") == name]
         require(len(selected) == 1 and selected[0].get("conclusion") == "skipped",
@@ -363,7 +418,8 @@ def extract_exact(path, artifact, names, output):
 def authenticate_build(lane, pointer, tag, source, names, work):
     require(set(pointer) == {"runId", "attempt", "artifactId"}, "build pointer has unknown/missing fields")
     run_id, attempt, artifact_id = (positive(pointer[key]) for key in ("runId", "attempt", "artifactId"))
-    workflow, job_name, artifact_name, required, _ = LANES[lane]
+    workflow, job_name, artifact_name, _, _ = LANES[lane]
+    required, _ = job_contract(lane, tag)
     run = api(f"actions/runs/{run_id}")
     workflow_meta = api(f"actions/workflows/{workflow}")
     repository = run.get("repository", {})
@@ -384,7 +440,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
         if len(jobs) >= payload["total_count"]:
             break
     require(len(jobs) == payload["total_count"], "job pagination incomplete")
-    job, upload = successful_job(jobs, lane, run_id, attempt, source)
+    job, upload = successful_job(jobs, lane, run_id, attempt, source, tag)
     if lane == "apple":
         require(all(j.get("conclusion") == "skipped" for j in jobs if j.get("name") in
                     ("attach-release", "publish-existing-055")), "Apple write lane unexpectedly ran")
@@ -504,23 +560,32 @@ def inspect_apple(directory, pointer, tag, source, version, build, tools, helper
                      "receiptSha256": {path.name: digest(path) for path in sorted(directory.glob("native-*.json"))}}
 
 
+def validate_android_evidence(lines, pointer, tag, source, version, build):
+    engine = expected_engine(tag)
+    expected = [
+        ("release tag", tag), ("release tag commit", source), ("source commit", source),
+        ("native engine source commit", engine), ("native engine Cargo features", "jni,server,resource-host"),
+        ("workflow run", f"https://github.com/{REPO}/actions/runs/{pointer['runId']}"),
+        ("workflow run attempt", str(pointer["attempt"])),
+        ("Android versionCode", build), ("Android versionName", version),
+    ]
+    if tag == NATIVE_BETA7_TAG:
+        require(not any(line.startswith("legacy Stremio source commit") for line in lines),
+                "native beta7 evidence must not record a legacy engine source")
+    else:
+        expected.append(("legacy Stremio source commit (not packaged)", STREMIO))
+    for label, value in expected:
+        require([line for line in lines if line.startswith(label + ": ")] == [f"{label}: {value}"],
+                f"original Android evidence identity differs: {label}")
+
+
 def inspect_android(directory, pointer, tag, source, version, build, root, bundletool):
     engine = expected_engine(tag)
     _, _, names = file_matrix(tag, version)
     files = {name: directory / name for name in sorted(names)}
     checksums(directory / "SHA256SUMS-android.txt", files)
     evidence = (directory / "SIGNING_PROVENANCE.txt").read_text()
-    lines = evidence.splitlines()
-    for label, value in (
-        ("release tag", tag), ("release tag commit", source), ("source commit", source),
-        ("native engine source commit", engine), ("native engine Cargo features", "jni,server,resource-host"),
-        ("legacy Stremio source commit (not packaged)", STREMIO),
-        ("workflow run", f"https://github.com/{REPO}/actions/runs/{pointer['runId']}"),
-        ("workflow run attempt", str(pointer["attempt"])),
-        ("Android versionCode", build), ("Android versionName", version),
-    ):
-        require([line for line in lines if line.startswith(label + ": ")] == [f"{label}: {value}"],
-                f"original Android evidence identity differs: {label}")
+    validate_android_evidence(evidence.splitlines(), pointer, tag, source, version, build)
     require(digest(bundletool) == BUNDLETOOL_SHA, "bundletool content is not the pinned verifier")
     environment = dict(os.environ, BUNDLETOOL_JAR=str(bundletool))
     paths = [str(files[name]) for name in sorted(files)]
@@ -563,7 +628,7 @@ def stable_snapshot(tag, helper):
 def build_manifest(args, pointers, stable, helper, work):
     version = tag_version(args.tag)
     source = sha(args.source_commit, 40)
-    build, tools = source_contract(args.repo_root, source, version)
+    build, tools = source_contract(args.repo_root, source, version, args.tag)
     check_tag(args.tag, source)
     apple_names, apple_matrix, android_names = file_matrix(args.tag, version)
     apple_dir, apple_run = authenticate_build("apple", pointers["apple"], args.tag, source, apple_matrix, work)
@@ -633,7 +698,7 @@ def main():
     sha(args.source_commit, 40)
     positive(args.release_id)
     # Authenticate checked-out helper bytes before importing their package/route inspection.
-    source_contract(args.repo_root, args.source_commit, tag_version(args.tag))
+    source_contract(args.repo_root, args.source_commit, tag_version(args.tag), args.tag)
     specification = importlib.util.spec_from_file_location("direct_apple_content", args.repo_root / "scripts/verify-apple-direct-test-release.py")
     helper = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(helper)

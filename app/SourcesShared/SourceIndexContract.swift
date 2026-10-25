@@ -5,17 +5,18 @@ import Darwin
 enum SourceIndexContract {
     static let maxSafeSizeBytes: Int64 = 9_007_199_254_740_991
     static let maxSeeders = 1_000_000
-    /// A legitimate response is at most 100 rows x roughly 300 bytes, or about 30 KiB. 64 KiB is more than
-    /// twice that bound while remaining small enough to contain a regressed or hostile first-party response.
-    /// Re-derive this value if the accepted row shape or row cap changes.
+    /// Transport and database work remain page-bounded; this is not a total result limit.
     static let maxResponseBodyBytes = 64 * 1024
-    static let maxServedSources = 100
-    /// Bound on Singularity rows that carry NO usable display metadata (no resolution, size, seeders, provider
-    /// fact, or tag). Such rows are indistinguishable from one another, so a metadata-poor pool must not fill the
-    /// list with a wall of anonymous "Other" duplicates. Rows WITH metadata are never capped by this; only the
-    /// undifferentiated tail is. Well below `maxServedSources`; a handful is plenty to signal "the pool also has
-    /// these unlabelled sources" without spamming.
-    static let maxAnonymousServedSources = 12
+    static let maxServedSources = 100 // maximum rows in one version-1 server page
+    static let maxAssembledResponseBytes = 8 * 1024 * 1024
+    static let maxServeTraversalSeconds: TimeInterval = 30
+    static let maxServeCursorBytes = 512
+
+    static func isValidServeCursor(_ raw: String) -> Bool {
+        !raw.isEmpty && raw.utf8.count <= maxServeCursorBytes
+            && raw.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0)
+                || (97...122).contains($0) || $0 == 45 || $0 == 95 }
+    }
     /// A FLOOR-OF-FLOORS sanity bound on a served row. It is deliberately the lowest value any worker policy
     /// could use, NOT a statement of the worker's current policy.
     ///

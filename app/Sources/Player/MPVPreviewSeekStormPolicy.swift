@@ -3,7 +3,7 @@ import Foundation
 /// Bounds observational SEEK/RESTART work without dropping native settlement events or errors.
 /// The controller serializes this state with load ownership under loadTokenLock.
 struct MPVNativeSeekDiagnosticPolicy<Owner: Equatable> {
-    struct Admission: Equatable {
+    struct Admission: Equatable, Sendable {
         let suppressedEvents: Int
     }
 
@@ -108,3 +108,7 @@ struct MPVPreviewSeekStormPolicy<Owner: Equatable> {
         seekCount = 0
     }
 }
+
+// Owner identity is the only generic payload retained by these pure policies.
+extension MPVNativeSeekDiagnosticPolicy: Sendable where Owner: Sendable {}
+extension MPVPreviewSeekStormPolicy: Sendable where Owner: Sendable {}

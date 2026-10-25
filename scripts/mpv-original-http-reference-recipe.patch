@@ -1,0 +1,462 @@
+--- a/stream/stream.h
++++ b/stream/stream.h
+@@ -27,6 +27,7 @@
+ #include <sys/types.h>
+ 
+ #include "misc/bstr.h"
++#include "reference_source.h"
+ 
+ // Minimum guaranteed buffer and seek-back size. For any reads <= of this size,
+ // it's guaranteed that you can seek back by <= of this size again.
+@@ -215,6 +216,14 @@
+ 
+     unsigned int buffer_mask; // buffer_size-1, where buffer_size == 2**n
+     uint8_t *buffer;
++
++    // Independent native-open witness. Minted only after the backend and stream
++    // buffer open successfully; zero means generation space is exhausted.
++    int64_t original_source_generation;
++    enum stream_reference_backend original_source_backend;
++    // Optional immutable HTTP recipe. The stream owns one reference; retained
++    // leases survive its close without borrowing this stream or its cancel.
++    struct stream_reference_source *reference_source;
+ } stream_t;
+ 
+ // Non-inline version of stream_read_char().
+--- a/stream/stream.c
++++ b/stream/stream.c
+@@ -107,6 +107,23 @@
+ // Must be power of 2.
+ #define STREAM_MAX_BUFFER_SIZE (512 * 1024 * 1024)
+ 
++// A source generation is never a URL hash and is never reused. Exhaustion
++// disables the optional reference capability without failing ordinary opens.
++static atomic_uint_fast64_t last_source_generation;
++
++static int64_t new_source_generation(void)
++{
++    uint_fast64_t value = atomic_load_explicit(&last_source_generation,
++                                              memory_order_relaxed);
++    while (value < INT64_MAX) {
++        uint_fast64_t next = value + 1;
++        if (atomic_compare_exchange_weak_explicit(&last_source_generation,
++                &value, next, memory_order_relaxed, memory_order_relaxed))
++            return (int64_t)next;
++    }
++    return 0;
++}
++
+ struct stream_opts {
+     int64_t buffer_size;
+     bool load_unsafe_playlists;
+@@ -421,6 +438,9 @@
+ 
+     mp_assert(s->seekable == !!s->seek);
+ 
++    s->original_source_generation = new_source_generation();
++    stream_reference_source_finish_open(s, s->original_source_generation);
++
+     if (s->mime_type)
+         MP_VERBOSE(s, "Mime-type: '%s'\n", s->mime_type);
+ 
+@@ -503,8 +523,10 @@
+ // Never reset s->cancel: stop/source retirement must remain permanently latched.
+ void stream_request_seek_interrupt(stream_t *s)
+ {
+-    if (s && s->seek_interruptible)
++    if (s && s->seek_interruptible) {
+         atomic_fetch_add(&s->requested_io_epoch, 1);
++        stream_reference_source_invalidate(s);
++    }
+ }
+ 
+ bool stream_io_interrupted(stream_t *s)
+@@ -825,6 +847,7 @@
+     if (!s)
+         return;
+ 
++    stream_reference_source_close(s);
+     if (s->close)
+         s->close(s);
+     talloc_free(s);
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -15,8 +15,11 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <limits.h>
++
+ #include <libavformat/avformat.h>
+ #include <libavformat/avio.h>
++#include <libavutil/mem.h>
+ #include <libavutil/opt.h>
+ 
+ #include "options/path.h"
+@@ -62,6 +65,249 @@
+     char *reopen_url;
+ };
+ 
++// This is native-only source authority, not an alignment capability. A later
++// reader still needs format/track/entity/prefix validation and final admission.
++// The source owns one reference; workers own leases and never borrow stream_t,
++// AVIOContext or the original cancellation object's lifetime.
++struct stream_reference_source {
++    atomic_uint refs;
++    atomic_bool retired;
++    atomic_uint_fast64_t epoch;
++    int64_t generation; // assigned once, before the stream is published
++    char *url;
++    AVDictionary *options; // immutable ORIGINAL pre-open options
++};
++
++#define REFERENCE_URL_LIMIT (16 * 1024)
++#define REFERENCE_OPTION_LIMIT 64
++#define REFERENCE_KEY_LIMIT 128
++#define REFERENCE_VALUE_LIMIT (32 * 1024)
++#define REFERENCE_OPTIONS_BYTES (128 * 1024)
++
++extern const stream_info_t stream_info_ffmpeg;
++
++static void reference_source_unref(struct stream_reference_source *source)
++{
++    if (!source)
++        return;
++    unsigned previous = atomic_fetch_sub_explicit(&source->refs, 1,
++                                                  memory_order_acq_rel);
++    mp_assert(previous > 0);
++    if (previous == 1) {
++        av_dict_free(&source->options);
++        av_free(source->url);
++        av_free(source);
++    }
++}
++
++static struct stream_reference_source *reference_source_ref(
++    struct stream_reference_source *source)
++{
++    if (!source)
++        return NULL;
++    unsigned count = atomic_load_explicit(&source->refs, memory_order_relaxed);
++    while (count && count < UINT_MAX) {
++        if (atomic_compare_exchange_weak_explicit(&source->refs, &count, count + 1,
++                memory_order_relaxed, memory_order_relaxed))
++            return source;
++    }
++    return NULL;
++}
++
++static bool reference_options_valid(const AVDictionary *options)
++{
++    // Explicitly unsupported: file-backed CA/client keys, POST/listen modes,
++    // offsets and unknown custom protocol options. This narrows only the new
++    // recipe; original playback and its exact configured options are untouched.
++    static const char *const allowed[] = {
++        "reconnect", "reconnect_delay_max", "user_agent", "cookies", "tls_verify",
++        "headers", "icy", "timeout", "rw_timeout", "http_proxy", "method",
++        "referer", "auth_type", "protocol_whitelist", "protocol_blacklist", NULL,
++    };
++    if (!options || av_dict_count(options) > REFERENCE_OPTION_LIMIT)
++        return false;
++    size_t bytes = 0;
++    unsigned seen = 0;
++    AVDictionaryEntry *entry = NULL;
++    while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
++        if (!entry->key || !entry->value)
++            return false;
++        size_t key = strnlen(entry->key, REFERENCE_KEY_LIMIT + 1);
++        size_t value = strnlen(entry->value, REFERENCE_VALUE_LIMIT + 1);
++        if (!key || key > REFERENCE_KEY_LIMIT || value > REFERENCE_VALUE_LIMIT ||
++            key + value + 2 > REFERENCE_OPTIONS_BYTES - bytes)
++            return false;
++        bytes += key + value + 2;
++        int known = -1;
++        for (int n = 0; allowed[n]; n++) {
++            if (!strcmp(entry->key, allowed[n])) {
++                known = n;
++                break;
++            }
++        }
++        // AVDictionary can represent duplicate keys with AV_DICT_MULTIKEY.
++        // Refuse even identical duplicates; first/last option semantics must
++        // never make TLS or method certification ambiguous.
++        if (known < 0 || known >= (int)(sizeof(seen) * CHAR_BIT) ||
++            (seen & (1u << known)))
++            return false;
++        seen |= 1u << known;
++    }
++    AVDictionaryEntry *tls = av_dict_get(options, "tls_verify", NULL,
++                                       AV_DICT_MATCH_CASE);
++    AVDictionaryEntry *method = av_dict_get(options, "method", NULL,
++                                          AV_DICT_MATCH_CASE);
++    return tls && !strcmp(tls->value, "1") &&
++        (!method || !strcmp(method->value, "GET"));
++}
++
++static struct stream_reference_source *reference_source_new(
++    stream_t *s, const char *url, const AVDictionary *options)
++{
++    // Pointer identity matters: the unsafe descriptor has the same name and
++    // open function. Curl, wrappers and every other backend remain unsupported.
++    if (s->info != &stream_info_ffmpeg || s->mode != STREAM_READ ||
++        s->stream_origin != STREAM_ORIGIN_NET || !url ||
++        (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) ||
++        strnlen(url, REFERENCE_URL_LIMIT + 1) > REFERENCE_URL_LIMIT ||
++        !reference_options_valid(options))
++        return NULL;
++    struct stream_reference_source *source = av_mallocz(sizeof(*source));
++    if (!source)
++        return NULL;
++    atomic_init(&source->refs, 1);
++    atomic_init(&source->retired, false);
++    atomic_init(&source->epoch, 1);
++    source->url = av_strdup(url);
++    if (!source->url || av_dict_copy(&source->options, options, 0) < 0) {
++        reference_source_unref(source);
++        return NULL;
++    }
++    return source;
++}
++
++static void reference_source_retire(struct stream_reference_source *source)
++{
++    if (source)
++        atomic_store_explicit(&source->retired, true, memory_order_release);
++}
++
++void stream_reference_source_close(stream_t *s)
++{
++    if (!s)
++        return;
++    struct stream_reference_source *source = s->reference_source;
++    s->reference_source = NULL;
++    s->original_source_backend = STREAM_REFERENCE_UNAVAILABLE;
++    reference_source_retire(source);
++    reference_source_unref(source);
++}
++
++void stream_reference_source_finish_open(stream_t *s, int64_t generation)
++{
++    struct stream_reference_source *source = s->reference_source;
++    if (!source)
++        return;
++    if (s->info != &stream_info_ffmpeg || s->mode != STREAM_READ ||
++        !s->seekable || !s->seek_interruptible || generation <= 0 ||
++        source->generation || atomic_load(&source->refs) != 1) {
++        stream_reference_source_close(s);
++        return;
++    }
++    source->generation = generation;
++    s->original_source_backend = STREAM_REFERENCE_LAVF_HTTP_GET_INITIAL;
++}
++
++void stream_reference_source_invalidate(stream_t *s)
++{
++    struct stream_reference_source *source = s ? s->reference_source : NULL;
++    if (!source)
++        return;
++    uint_fast64_t value = atomic_load_explicit(&source->epoch, memory_order_relaxed);
++    while (value < UINT64_MAX) {
++        if (atomic_compare_exchange_weak_explicit(&source->epoch, &value, value + 1,
++                memory_order_release, memory_order_relaxed))
++            return;
++    }
++    // Never wrap back to an earlier lease, including on narrower platforms.
++    reference_source_retire(source);
++}
++
++bool stream_reference_lease_cancelled(const struct stream_reference_lease *lease)
++{
++    const struct stream_reference_source *source = lease ? lease->source : NULL;
++    return !source || lease->authority != STREAM_REFERENCE_INITIAL_REQUEST_ONLY ||
++        lease->source_generation <= 0 || !lease->epoch ||
++        source->generation != lease->source_generation ||
++        atomic_load_explicit(&source->retired, memory_order_acquire) ||
++        atomic_load_explicit(&source->epoch, memory_order_acquire) != lease->epoch;
++}
++
++void stream_reference_lease_release(struct stream_reference_lease *lease)
++{
++    if (!lease)
++        return;
++    struct stream_reference_source *source = lease->source;
++    *lease = (struct stream_reference_lease){0};
++    reference_source_unref(source);
++}
++
++bool stream_reference_source_acquire_initial_request(
++    stream_t *s, struct stream_reference_lease *out)
++{
++    // Owner-thread-only. This is INITIAL request authority, never a claim about
++    // current learned cookies, response identity, format or a complete prefix.
++    // No AVIO/cookie getter or private protocol layout is inspected here.
++    if (!s || !out || out->source || s->info != &stream_info_ffmpeg ||
++        s->mode != STREAM_READ || !s->seekable || !s->seek_interruptible ||
++        s->original_source_backend != STREAM_REFERENCE_LAVF_HTTP_GET_INITIAL ||
++        s->original_source_generation <= 0 || !s->reference_source ||
++        mp_cancel_test(s->cancel) || stream_io_interrupted(s))
++        return false;
++    struct stream_reference_source *source = s->reference_source;
++    if (source->generation != s->original_source_generation ||
++        !reference_source_ref(source))
++        return false;
++    struct stream_reference_lease lease = {
++        .source = source,
++        .authority = STREAM_REFERENCE_INITIAL_REQUEST_ONLY,
++        .source_generation = source->generation,
++        .epoch = atomic_load_explicit(&source->epoch, memory_order_acquire),
++    };
++    if (mp_cancel_test(s->cancel) || stream_io_interrupted(s) ||
++        stream_reference_lease_cancelled(&lease)) {
++        stream_reference_lease_release(&lease);
++        return false;
++    }
++    *out = lease;
++    return true;
++}
++
++bool stream_reference_lease_copy_initial_request(
++    const struct stream_reference_lease *lease, char **url, AVDictionary **options)
++{
++    if (url)
++        *url = NULL;
++    if (options)
++        *options = NULL;
++    if (!url || !options)
++        return false;
++    if (stream_reference_lease_cancelled(lease))
++        return false;
++    const struct stream_reference_source *source = lease->source;
++    char *copy_url = av_strdup(source->url);
++    AVDictionary *copy_options = NULL;
++    if (!copy_url || av_dict_copy(&copy_options, source->options, 0) < 0 ||
++        stream_reference_lease_cancelled(lease)) {
++        av_free(copy_url);
++        av_dict_free(&copy_options);
++        return false;
++    }
++    *url = copy_url;
++    *options = copy_options;
++    return true;
++}
++
+ static int interrupt_cb(void *ctx);
+ 
+ static bool reopen_at(stream_t *s, int64_t offset)
+@@ -76,6 +322,10 @@
+         mp_cancel_test(s->cancel) || stream_io_interrupted(s))
+         return false;
+ 
++    // Recovery can update source-local cookies. An older immutable reference
++    // recipe must not silently become authority for that changed request.
++    reference_source_retire(s->reference_source);
++
+     // HTTP exports cookies learned during redirects/authentication. Keep that
+     // source-local state, but never substitute another source's global options.
+     if (av_opt_get(p->avio, "cookies", AV_OPT_SEARCH_CHILDREN, &cookies) < 0)
+@@ -408,6 +658,7 @@
+     AVIOContext *avio = NULL;
+     int res = STREAM_ERROR;
+     AVDictionary *dict = NULL;
++    struct stream_reference_source *reference = NULL;
+     void *temp = talloc_new(NULL);
+ 
+     stream->seek = NULL;
+@@ -480,6 +731,9 @@
+         p->reopen_url = talloc_strdup(p, filename);
+         if (av_dict_copy(&p->reopen_opts, dict, 0) < 0)
+             goto out;
++        // Optional, bounded snapshot BEFORE avio_open2 consumes the options.
++        // An unsupported/over-budget snapshot does not fail original playback.
++        reference = reference_source_new(stream, filename, dict);
+     }
+ 
+     int err = avio_open2(&avio, filename, flags, &cb, &dict);
+@@ -510,6 +764,10 @@
+     stream->get_size = get_size;
+     stream->control = control;
+     stream->close = close_f;
++    if (stream->seekable) {
++        stream->reference_source = reference;
++        reference = NULL;
++    }
+     // enable cache (should be avoided for files, but no way to detect this)
+     stream->streaming = true;
+     if (stream->info->stream_origin == STREAM_ORIGIN_NET)
+@@ -517,6 +775,7 @@
+     res = STREAM_OK;
+ 
+ out:
++    reference_source_unref(reference);
+     if (res != STREAM_OK)
+         av_dict_free(&p->reopen_opts);
+     av_dict_free(&dict);
+--- /dev/null
++++ b/stream/reference_source.h
+@@ -0,0 +1,66 @@
++/* Internal native source authority. Not part of libmpv's public client ABI. */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct stream;
++struct AVDictionary;
++struct stream_reference_source;
++
++enum stream_reference_backend {
++    STREAM_REFERENCE_UNAVAILABLE = 0,
++    STREAM_REFERENCE_LAVF_HTTP_GET_INITIAL = 1,
++};
++
++enum stream_reference_authority {
++    // Exact initial request only: no learned-cookie, current-response, resource
++    // entity, format/track or timing-prefix equivalence is certified.
++    STREAM_REFERENCE_INITIAL_REQUEST_ONLY = 1,
++};
++
++// An owning, move-only-by-convention native lease. Initialize to {0}, acquire
++// once and release once. Do not memcpy/copy this into a second owning lease.
++// No stream, AVIOContext, borrowed cancel, URL or option pointer is present.
++struct stream_reference_lease {
++    struct stream_reference_source *source;
++    enum stream_reference_authority authority;
++    int64_t source_generation;
++    uint64_t epoch;
++};
++
++// The successful stream-open owner calls this exactly once, before publishing
++// the stream to any other thread. Zero/exhausted generation drops only the new
++// optional recipe; ordinary playback remains available.
++void stream_reference_source_finish_open(struct stream *s, int64_t generation);
++
++// ONLY the original stream/demux owner may call acquire while s is alive. It
++// checks only the actual safe backend and exact ORIGINAL request recipe. It
++// never inspects current AVIO/cookie state. Learned-cookie/current-response and
++// resource equivalence remain uncertified; this is not a reader capability.
++// A core/utility caller must not borrow s. Future admission needs a real bridge.
++bool stream_reference_source_acquire_initial_request(
++    struct stream *s, struct stream_reference_lease *out);
++
++// Transport seek interruption invalidates all previous epochs. Close retires
++// the source permanently before the backend or its borrowed cancel is freed.
++// These functions require the existing stream lifetime/owner discipline.
++void stream_reference_source_invalidate(struct stream *s);
++void stream_reference_source_close(struct stream *s);
++
++// These operate only on a retained lease and are safe off the stream owner.
++// The cancellation query covers close/retirement and transport-epoch changes.
++// It does NOT retain or poll the old stream's cancel. A future reader must also
++// combine its independently owned request/source cancellation and deadline.
++bool stream_reference_lease_cancelled(const struct stream_reference_lease *lease);
++void stream_reference_lease_release(struct stream_reference_lease *lease);
++
++// Internal utility-worker prerequisite only: make private owned copies of the
++// ORIGINAL URL/options, never reread globals or live AVIO state. No I/O occurs.
++// The caller must free *url with av_free() and *options with av_dict_free().
++// Both outputs are NULL on failure. The copies contain credentials and must
++// never cross the public mpv/Swift ABI, be logged or be persisted. Cancellation
++// must still be checked during any later open/read and at final admission.
++bool stream_reference_lease_copy_initial_request(
++    const struct stream_reference_lease *lease,
++    char **url, struct AVDictionary **options);

@@ -243,6 +243,10 @@ internal fun orderStreamGroupsByAppliedAddonOrder(
         .map { it.value }
 }
 
+/** A failed debrid episode resolve must never turn a hash-only season pack into the movie /0 fallback. */
+internal fun nativeTorrentFallbackFileIndex(fileIdx: Int?, isEpisode: Boolean): Int? =
+    fileIdx?.takeIf { it >= 0 } ?: if (fileIdx == null && !isEpisode) 0 else null
+
 internal fun StreamSource.debridResolveTarget(
     fallbackHandle: String,
     selectedEpisode: Episode?,

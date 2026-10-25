@@ -1,32 +1,39 @@
 import Foundation
+import os
 
 /// Account-scoped causal watched intent for the owner profile. The engine remains local playback
 /// bookkeeping; this is the exact per-title/per-video sync carrier for explicit watch and unwatch.
 enum OwnerWatchedIntentStore {
-    struct Entry: Codable, Equatable { let titleID: String; let videoID: String; let watched: Bool; let updatedAt: Double; let actor: String }
+    struct Entry: Codable, Equatable, Sendable { let titleID: String; let videoID: String; let watched: Bool; let updatedAt: Double; let actor: String }
     private static let keyPrefix = "vortx.owner.watchedIntent.v1."
     private static let actorPrefix = "vortx.owner.watchedIntent.actor.v1."
-    private static var ownerID: String?
-    private static var cachedOwnerID: String?
-    private static var cache: [String: Entry] = [:]
-    private static let cacheLock = NSLock()
+    // Identity, not a wrapping counter: an intervening bind/publication cannot pass an old
+    // post-persistence cache commit, including a same-owner A/B/A callback sequence.
+    private final class Publication: Sendable {}
+    private struct State: Sendable {
+        var ownerID: String?
+        var cachedOwnerID: String?
+        var cache: [String: Entry] = [:]
+        var publication = Publication()
+    }
+    private static let state = OSAllocatedUnfairLock(initialState: State())
+    private static var ownerID: String? { state.withLock { $0.ownerID } }
     // A long-running account can legitimately exceed a few thousand episode intents. This is a
     // malformed-document safety ceiling, not a transport trim; writers preserve all known rows.
     private static let maximumRows = 50_000
     @MainActor static func bind(ownerID raw: String?) {
         guard let raw, let scope = CredentialScope(canonicalRemoteAccountID: raw) else {
-            ownerID = nil; cacheLock.lock(); cachedOwnerID = nil; cache = [:]; cacheLock.unlock(); return
+            state.withLock { $0 = State() }; return
         }
         let nextOwner = scope.keychainOwnerID
         let nextCache = load(owner: nextOwner)
         // Publish identity and its decoded snapshot together. Readers reject a snapshot whose owner
         // does not match their current credential capture during a switch-before-bind window.
-        cacheLock.lock(); ownerID = nextOwner; cachedOwnerID = nextOwner; cache = nextCache; cacheLock.unlock()
+        state.withLock { $0 = State(ownerID: nextOwner, cachedOwnerID: nextOwner, cache: nextCache) }
     }
-    private static var key: String? { ownerID.map { keyPrefix + $0 } }
     private static var actorKey: String? { ownerID.map { actorPrefix + $0 } }
     private static func id(_ title: String, _ video: String) -> String { title + "\u{1f}" + video }
-    private static func actor() -> String? {
+    @MainActor private static func actor() -> String? {
         guard let actorKey else { return nil }
         if let value = UserDefaults.standard.string(forKey: actorKey), !value.isEmpty { return value }
         let value = UUID().uuidString.lowercased(); UserDefaults.standard.set(value, forKey: actorKey); return value
@@ -46,14 +53,29 @@ enum OwnerWatchedIntentStore {
     private static func entries() -> [String: Entry] {
         let capture = CredentialScopeRegistry.shared.capture()
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return [:] }
-        cacheLock.lock(); defer { cacheLock.unlock() }
-        guard cachedOwnerID == capture.scope.keychainOwnerID else { return [:] }
-        return cache
+        return state.withLock { value in
+            guard value.cachedOwnerID == capture.scope.keychainOwnerID,
+                  CredentialScopeRegistry.shared.isCurrent(capture) else { return [:] }
+            return value.cache
+        }
     }
-    private static func save(_ value: [String: Entry]) {
-        guard let key, let data = try? JSONEncoder().encode(value) else { return }
+    @MainActor private static func save(_ value: [String: Entry], capture: CredentialScopeRegistry.Capture) -> Bool {
+        let (owner, publication) = state.withLock { ($0.ownerID, $0.publication) }
+        guard let owner, owner == capture.scope.keychainOwnerID,
+              CredentialScopeRegistry.shared.isCurrent(capture),
+              let data = try? JSONEncoder().encode(value) else { return false }
+        let key = keyPrefix + owner
         UserDefaults.standard.set(data, forKey: key)
-        cacheLock.lock(); cache = value; cacheLock.unlock()
+        // Defaults may synchronously notify observers. Do not hold the state lock over that
+        // callback or replace a newer cache if an observer saved again or rebound the owner.
+        // This is a cache-publication fence, not a new durable UserDefaults transaction protocol.
+        state.withLock { current in
+            guard current.ownerID == owner, current.publication === publication,
+                  CredentialScopeRegistry.shared.isCurrent(capture) else { return }
+            current.cache = value
+            current.publication = Publication()
+        }
+        return true
     }
     @discardableResult @MainActor static func record(titleID: String, videoID: String, watched: Bool,
                                                      capture: CredentialScopeRegistry.Capture = CredentialScopeRegistry.shared.capture()) -> Bool {
@@ -74,7 +96,7 @@ enum OwnerWatchedIntentStore {
             all[id(titleID, videoID)] = Entry(titleID: titleID, videoID: videoID, watched: watched,
                                              updatedAt: stamp, actor: actor)
         }
-        save(all); return true
+        return save(all, capture: capture)
     }
     @discardableResult @MainActor static func mergeWire(_ raw: Any?, capture: CredentialScopeRegistry.Capture = CredentialScopeRegistry.shared.capture()) -> Bool {
         guard CredentialScopeRegistry.shared.isCurrent(capture), capture.scope.keychainOwnerID == ownerID else { return false }
@@ -87,7 +109,7 @@ enum OwnerWatchedIntentStore {
             let incoming = Entry(titleID: t, videoID: v, watched: w, updatedAt: u, actor: a); guard u.isFinite, u > 0 else { continue }
             let key = id(t, v); if wins(incoming, over: all[key]) { all[key] = incoming; changed = true }
         }
-        if changed { save(all) }; return changed
+        return changed && save(all, capture: capture)
     }
     static func wire(merging raw: Any?) -> [String: [String: Any]] {
         var all = entries()

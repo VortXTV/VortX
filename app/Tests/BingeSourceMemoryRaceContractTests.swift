@@ -9,15 +9,7 @@
 // production sources plus small stubs for the peripheral types the ranker names but the settle gate never calls
 // (SourcePreferences read surface, pin/health/sticky). Run:
 //
-//   xcrun swiftc -o /tmp/binge-race-test \
-//     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
-//     app/SourcesShared/CatalogRowResolution.swift \
-//     app/SourcesShared/SubtitleReleaseFingerprint.swift \
-//     app/SourcesShared/UsenetStreamValidation.swift \
-//     app/SourcesShared/CoreModels.swift \
-//     app/SourcesShared/SourceSettlementPolicy.swift \
-//     app/SourcesShared/StreamRanking.swift \
-//     app/Tests/BingeSourceMemoryRaceContractTests.swift && /tmp/binge-race-test
+//   bash scripts/test-binge-language-continuity.sh
 
 import Foundation
 

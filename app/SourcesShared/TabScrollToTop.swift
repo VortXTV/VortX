@@ -66,7 +66,7 @@ struct ScrollToTopOnBump: ViewModifier {
     func body(content: Content) -> some View {
         ScrollViewReader { proxy in
             content
-                .onChange(of: signal.token(key)) { _ in
+                .onValueChange(of: signal.token(key)) { _ in
                     withAnimation(.easeOut(duration: 0.3)) {
                         proxy.scrollTo(ScrollToTopAnchor.id, anchor: .top)
                     }
@@ -100,7 +100,7 @@ struct PopToRootOnBump: ViewModifier {
     }
 
     func body(content: Content) -> some View {
-        content.onChange(of: signal.token(key)) { _ in
+        content.onValueChange(of: signal.token(key)) { _ in
             if !path.isEmpty { path.removeLast(path.count) }
         }
     }
@@ -118,7 +118,7 @@ struct PopToRootOnBumpTyped<Element>: ViewModifier {
     }
 
     func body(content: Content) -> some View {
-        content.onChange(of: signal.token(key)) { _ in
+        content.onValueChange(of: signal.token(key)) { _ in
             if !path.isEmpty { path.removeAll() }
         }
     }

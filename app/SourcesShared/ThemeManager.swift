@@ -11,7 +11,7 @@ private func themeRGB(_ r: Double, _ g: Double, _ b: Double) -> Color {
 
 /// A selectable accent. `base` recolors focus / selection / primary / progress everywhere;
 /// `bright` is the focus-glow peak.
-struct AccentOption: Identifiable {
+struct AccentOption: Identifiable, Sendable {
     let id: String
     let label: String
     let base: Color
@@ -21,6 +21,7 @@ struct AccentOption: Identifiable {
 /// The user-chosen theme (accent + chrome), persisted to `UserDefaults` and applied through
 /// `Theme.Palette`, which reads `ThemeManager.shared`. The top-level screens observe this object so a
 /// change repaints the app live, without a `.id` rebuild that would drop focus mid-pick.
+@MainActor
 final class ThemeManager: ObservableObject {
     static let shared = ThemeManager()
 
@@ -46,8 +47,8 @@ final class ThemeManager: ObservableObject {
         }
     }
 
-    static let textScaleRange: ClosedRange<Double> = 0.80...1.40
-    static let textScaleStep: Double = 0.05
+    nonisolated static let textScaleRange: ClosedRange<Double> = 0.80...1.40
+    nonisolated static let textScaleStep: Double = 0.05
 
     private static let accentKey = "stremiox.theme.accent"
     private static let oledKey = "stremiox.theme.oled"
@@ -98,7 +99,7 @@ final class ThemeManager: ObservableObject {
 
     /// Nine curated accents. VortX (the brand gold/obsidian) is the default; Ember matches the original
     /// ember design and stays available for anyone who prefers the coral cast.
-    static let accents: [AccentOption] = [
+    nonisolated static let accents: [AccentOption] = [
         AccentOption(id: "vortx",   label: "VortX",   base: themeRGB(0.851, 0.467, 0.024), bright: themeRGB(0.961, 0.620, 0.043)),
         AccentOption(id: "ember",   label: "Ember",   base: themeRGB(0.949, 0.471, 0.294), bright: themeRGB(1.000, 0.569, 0.388)),
         AccentOption(id: "ocean",   label: "Ocean",   base: themeRGB(0.298, 0.565, 0.886), bright: themeRGB(0.435, 0.690, 0.984)),

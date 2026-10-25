@@ -106,11 +106,11 @@ struct CurationCollectionShelf<Destination: View>: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onChange(of: collection.id) { _ in resetSelection() }
-        .onChange(of: collection.folders.map(\.id)) { ids in
+        .onValueChange(of: collection.id) { _ in resetSelection() }
+        .onValueChange(of: collection.folders.map(\.id)) { ids in
             if let selectedFolderID, !ids.contains(selectedFolderID) { resetSelection() }
         }
-        .onChange(of: collection.presentation.showAll) { showAll in
+        .onValueChange(of: collection.presentation.showAll) { showAll in
             if !showAll, selectedFolderID == nil { selectedFolderID = collection.folders.first?.id }
         }
     }

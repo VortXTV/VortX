@@ -46,7 +46,8 @@ import Foundation
                      && coordinator.contains("selected?.metaPath.id == expected.metaID")
                      && coordinator.contains("selected?.streamPath?.id == expected.streamID"))
         precondition(coordinator.contains("if action == .deadline { break }") && coordinator.contains("if action == .reassert"))
-        precondition(bridge.contains("requestedMetaLoadTarget = MetaLoadTarget(metaID: id, streamID: streamID)"))
+        precondition(bridge.contains("private var requestedMetaLoadTarget: MetaLoadTarget?")
+                     && bridge.contains("requestedMetaLoadTarget = .init(metaID: id, streamID: streamID)"))
         print("PASS late/early shared-slot recovery, empty deadline, repeated-preemption cap, exact identities and production wiring")
     }
 }

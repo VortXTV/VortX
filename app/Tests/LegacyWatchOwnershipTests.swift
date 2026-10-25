@@ -77,7 +77,9 @@ enum LegacyWatchOwnershipTests {
         check(scheduling.contains("authKey: capturedKey, isCurrent: isCurrent") && scheduling.components(separatedBy: "guard isCurrent()").count == 3, "actual caller sends captured token and fences transport plus result")
         check(scheduling.contains("CredentialScopeRegistry.shared.capture()") && scheduling.contains("LegacyWatchOwnership.session()"), "actual caller binds account generation and streaming session epoch")
         check(scheduling.contains("Keychain.confirmedString(slot)") && scheduling.contains("Keychain.confirmedString(currentSlot)"), "missing or uncertain durable credentials cannot authorize a mirror write")
-        check(profiles.contains("CredentialScopeRegistry.shared.isCurrent(inspectionOwner)") && profiles.contains("LegacyWatchOwnership.session() == inspectionSession"), "late recovery inspection also cannot publish across owner/session ABA")
+        check(scheduling.contains("if let owner = mirrorNoticeOwner, self.currentLegacyNoticeOwner() == owner")
+            && scheduling.contains("legacyHistoryNoticeState.mirrored(result, owner: owner)"),
+              "retained async mirror result publishes only to its captured certified notice owner")
         let lifecycleParts = profiles.components(separatedBy: "// BEGIN legacy-watch lifecycle projection")
         check(lifecycleParts.count == 2, "actual lifecycle projection has one entry marker")
         let lifecycleTail = lifecycleParts[1].components(separatedBy: "// END legacy-watch lifecycle projection.")

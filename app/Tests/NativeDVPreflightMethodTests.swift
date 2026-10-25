@@ -37,6 +37,8 @@ typealias PlayerLoadToken = Int
     func replaceCurrentItem(with item: AVPlayerItem?) { currentItem = item; replacements += 1 }
 }
 @MainActor final class PreflightFixtureEngine {
+    // Same stored counter/default as the actual AV owner; the runner retains its real retirement method.
+    var subtitleAlignmentGeneration: UInt64 = 0
     var activeLoadToken: PlayerLoadToken? = 1
     var itemGeneration: UInt64 = 1
     var nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()

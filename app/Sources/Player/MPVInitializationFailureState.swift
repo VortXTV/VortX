@@ -21,3 +21,6 @@ struct MPVInitializationFailureState<Token: Equatable> {
 
     mutating func stop() { message = nil; activeToken = nil }
 }
+
+// Engine failure receipts retain only a String and the generic load identity.
+extension MPVInitializationFailureState: Sendable where Token: Sendable {}

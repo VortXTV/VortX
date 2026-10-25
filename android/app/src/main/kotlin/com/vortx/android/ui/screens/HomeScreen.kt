@@ -206,6 +206,14 @@ private fun HomeContent(
     ) {
         // A single explicit doorway keeps Home and Discover connected without duplicating Discover's
         // filters or creating a second navigation owner. It is optional for callers such as previews.
+        item(key = "vortx.home.surprise") {
+            com.vortx.android.ui.randompick.HomeSurpriseControl(
+                onPick = {
+                    viewModel.pickHomeSurprise()?.let { onItem(it); true } ?: false
+                },
+                modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+            )
+        }
         onDiscover?.let { discover ->
             item {
                 TextButton(

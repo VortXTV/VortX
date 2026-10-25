@@ -100,7 +100,7 @@ private struct AccentSpec {
     var brightColor: Color { Color(.sRGB, red: bright.0, green: bright.1, blue: bright.2, opacity: 1) }
 }
 
-private enum PlayerThemeFixture {
+@MainActor private enum PlayerThemeFixture {
     static let accents: [AccentSpec] = [${swiftAccentRows}
     ]
     static var accentID = accents[0].id
@@ -167,17 +167,17 @@ enum Theme {
     enum Radius { static let card: CGFloat = 16 }
     enum Space { static let md: CGFloat = 20 }
     enum Palette {
-        static var accent: Color { PlayerThemeFixture.accent }
-        static var accentBright: Color { PlayerThemeFixture.accentBright }
-        static var playerGlassUsesCrimson: Bool { PlayerThemeFixture.playerGlassUsesCrimson }
-        static var playerGlassAccent: Color { PlayerThemeFixture.playerGlassAccent }
-        static var onAccent: Color { PlayerThemeFixture.onAccent }
-        static var canvas: Color { PlayerThemeFixture.canvas }
-        static var surface1: Color { PlayerThemeFixture.surface1 }
-        static var surface2: Color { PlayerThemeFixture.surface2 }
-        static var surface3: Color { PlayerThemeFixture.surface3 }
-        static var glassVeil: Color { PlayerThemeFixture.glassVeil }
-        static var hairline: Color { PlayerThemeFixture.hairline }
+        @MainActor static var accent: Color { PlayerThemeFixture.accent }
+        @MainActor static var accentBright: Color { PlayerThemeFixture.accentBright }
+        @MainActor static var playerGlassUsesCrimson: Bool { PlayerThemeFixture.playerGlassUsesCrimson }
+        @MainActor static var playerGlassAccent: Color { PlayerThemeFixture.playerGlassAccent }
+        @MainActor static var onAccent: Color { PlayerThemeFixture.onAccent }
+        @MainActor static var canvas: Color { PlayerThemeFixture.canvas }
+        @MainActor static var surface1: Color { PlayerThemeFixture.surface1 }
+        @MainActor static var surface2: Color { PlayerThemeFixture.surface2 }
+        @MainActor static var surface3: Color { PlayerThemeFixture.surface3 }
+        @MainActor static var glassVeil: Color { PlayerThemeFixture.glassVeil }
+        @MainActor static var hairline: Color { PlayerThemeFixture.hairline }
         static let textTertiary = Color(.sRGB, red: 0.620, green: 0.580, blue: 0.520, opacity: 1)
     }
 }

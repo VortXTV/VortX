@@ -37,15 +37,29 @@ const preparation = sync.split('private func prepareNativeLegacyMaterial')[1].sp
 const probe = preparation.split('let probe = try VortxEncryptedCheckpointStore(')[1].split('\n        let remote')[0];
 assert.ok(probe.includes('installationKey: VortxNativeInstallationKey.loadOrCreate()'),
     'legacy preparation must authenticate the same multi-account inventory as the opener');
-const board = source.split('private func scheduleBoardRebuild(capturedPublicationToken')[1].split('private func buildBoardRows()')[0];
-assert.equal((board.match(/decode\(CoreBoardState\.self, field: "board"\)/g) || []).length, 1);
-assert.ok(board.includes('boardState.map { self.buildBoardRows($0) }'));
+const board = source.split('private func scheduleNativeLegacyBoard(receipt:')[1].split('private static func prepareNativeLegacyBoard')[0];
+assert.ok(board.includes('Task.detached(priority: .userInitiated)'),
+    'legacy board scheduling must keep preparation in a detached worker');
+assert.ok(board.includes('prepareNativeLegacyBoard(receipt: receipt, preferences: preferences)'),
+    'legacy board scheduling must use the value-only preparation split');
+assert.ok(board.includes('DispatchQueue.main.asyncAfter'),
+    'legacy board scheduling must retain debounced cancellation handling');
+const nativeBoardPreparation = source.split('private static func prepareNativeLegacyBoard(receipt:')[1].split('\n    }\n', 1)[0];
+assert.equal((nativeBoardPreparation.match(/nativeLegacyDecode\(CoreBoardState\.self/g) || []).length, 1);
+assert.ok(nativeBoardPreparation.includes('nativeLegacyDecode(CoreBoardState.self, value: receipt.values["board"])'),
+    'legacy board preparation must decode the board value in the worker');
+assert.ok(nativeBoardPreparation.includes('nativeLegacyDecode(CoreCtx.self, value: receipt.values["ctx"])'),
+    'legacy board preparation must decode context in the worker');
+assert.ok(!nativeBoardPreparation.includes('JSONEncoder'),
+    'legacy board preparation must not encode under the worker split');
+assert.ok(!nativeBoardPreparation.includes('JSONSerialization'),
+    'legacy board preparation must not use actor-bound JSONSerialization');
 for (const name of ['settleResidentNativeSession', 'prepareNativeProfileActionTarget']) {
     const method = source.split(`func ${name}`)[1].split('\n    }')[0];
     assert.ok(method.includes('await facade.settleNativeMutations()'));
     assert.ok(!method.includes('.settled()'));
 }
-console.log('Board snapshot: one decode per rebuild; profile admission: native FIFO only PASS');
+console.log('Board snapshot: detached preparation; value-only/no encoding; profile admission: native FIFO only PASS');
 JS
 printf 'Retained synthetic receipts: %s\n' "$persistence_test_dir"
 if [[ -n "${VORTX_NATIVE_PERSISTENCE_SDK:-}" ]]; then

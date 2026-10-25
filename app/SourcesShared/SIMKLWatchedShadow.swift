@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Additive-READ SIMKL shadow: the SIMKL analog of `TraktSyncEngine`'s watched-history import. On refresh
 /// (throttled) it pulls the user's COMPLETED movies / shows / anime from SIMKL into a LOCAL cache
@@ -26,7 +27,7 @@ import Foundation
 ///
 /// Fully fail-soft: any pull error / offline / not-configured leaves the last cache intact and never
 /// disturbs playback or the UI.
-final class SIMKLWatchedShadow {
+final class SIMKLWatchedShadow: Sendable {
     static let shared = SIMKLWatchedShadow()
 
     /// Minimum gap between network refreshes; foreground + rail rebuilds call `refreshIfStale` freely.
@@ -34,20 +35,22 @@ final class SIMKLWatchedShadow {
     /// per interval across both features.
     private static let refreshInterval: TimeInterval = 5 * 60
 
-    private let lock = NSLock()
-    /// Pure state core (fold / replace / wipe / gate). Guarded by `lock`.
-    private var core: SIMKLWatchedCore
-    private var lastRefresh: Date?
-    private var refreshing = false
-    /// Set by `refreshNow()` when a force arrives while a refresh is already in flight, so the in-flight
-    /// refresh honors it once on completion instead of the single-flight guard swallowing it. Guarded by
-    /// `lock`. Same coalescing latch as `TraktSyncEngine.refreshAgain`.
-    private var refreshAgain = false
-    /// Bumped by `reset()` (disconnect / sign-out). An in-flight pull captures it before its network awaits
-    /// and refuses to write back if it changed meanwhile, so a pull that started before a disconnect can
-    /// never resurrect the wiped shadow into the next account.
-    private var generation = 0
-    private var stateSessionID: SIMKLSessionID?
+    private struct State: Sendable {
+        /// Pure state core (fold / replace / wipe / gate), owned with the admission fields below.
+        var core: SIMKLWatchedCore
+        var lastRefresh: Date?
+        var refreshing = false
+        /// Set by `refreshNow()` when a force arrives while a refresh is already in flight, so the in-flight
+        /// refresh honors it once on completion. Same coalescing latch as `TraktSyncEngine.refreshAgain`.
+        var refreshAgain = false
+        /// Bumped by `reset()` (disconnect / sign-out). A pull captures it before its network awaits and
+        /// refuses to write back if it changed, so pre-reset history cannot enter the next account.
+        var generation = 0
+        var stateSessionID: SIMKLSessionID?
+    }
+    /// One checked owner for every mutable cache/admission value. Provider awaits and notifications happen
+    /// outside the lock; local persistence remains synchronous with its matching in-memory mutation.
+    private let lock: OSAllocatedUnfairLock<State>
 
     private struct PersistedSnapshot: Codable {
         let sessionID: SIMKLSessionID
@@ -62,10 +65,10 @@ final class SIMKLWatchedShadow {
 
     private init() {
         let initialSession = SIMKLAuth.storedSessionID
-        stateSessionID = initialSession
-        core = SIMKLWatchedCore(
-            watchedIDs: initialSession.map { Set(Self.loadWatched(for: $0)) } ?? []
-        )
+        lock = OSAllocatedUnfairLock(initialState: State(
+            core: SIMKLWatchedCore(watchedIDs: initialSession.map { Set(Self.loadWatched(for: $0)) } ?? []),
+            stateSessionID: initialSession
+        ))
         SIMKLAuthBoundary.observe(key: "simkl-watched-shadow") { [weak self] sessionID in
             self?.reset(to: sessionID)
         }
@@ -81,10 +84,11 @@ final class SIMKLWatchedShadow {
     func shadowWatchedIDs() -> Set<String> {
         let on = ExternalSyncToggle.isOn(ExternalSyncToggle.simklImportWatched, default: false)
         guard let currentSession = SIMKLAuth.storedSessionID else { return [] }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              SIMKLAuth.storedSessionID == currentSession else { return [] }
-        return core.visibleIDs(importOn: on)
+        return lock.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  SIMKLAuth.storedSessionID == currentSession else { return [] }
+            return state.core.visibleIDs(importOn: on)
+        }
     }
 
     // MARK: - Disconnect
@@ -97,13 +101,13 @@ final class SIMKLWatchedShadow {
     }
 
     private func reset(to sessionID: SIMKLSessionID?) {
-        lock.lock()
-        core.wipe()
-        lastRefresh = nil
-        stateSessionID = sessionID
-        generation &+= 1   // invalidate any in-flight pull so it cannot write its pre-reset result back
-        try? Self.storage?.reset()
-        lock.unlock()
+        lock.withLock { state in
+            state.core.wipe()
+            state.lastRefresh = nil
+            state.stateSessionID = sessionID
+            state.generation &+= 1   // invalidate any in-flight pull so it cannot write its pre-reset result back
+            try? Self.storage?.reset()
+        }
         DispatchQueue.main.async { WatchedIndex.shared.externalShadowChanged() }
     }
 
@@ -122,38 +126,43 @@ final class SIMKLWatchedShadow {
         // stamp is still fresh) and to pull the instant the user asks rather than on the next rebuild tick.
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.simklImportWatched, default: false) else { return }
         guard let sessionID = SIMKLAuth.storedSessionID else { return }
-        lock.lock()
-        guard stateSessionID == sessionID,
-              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        if refreshing { lock.unlock(); return }
-        if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
-        refreshing = true
-        let gen = generation
-        lock.unlock()
+        let gen: Int? = lock.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID,
+                  !state.refreshing else { return nil }
+            if let last = state.lastRefresh,
+               Date().timeIntervalSince(last) < Self.refreshInterval { return nil }
+            state.refreshing = true
+            return state.generation
+        }
+        guard let gen else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            defer {
-                self.lock.lock()
-                self.refreshing = false
-                // Only stamp when no disconnect happened mid-refresh: a reset bumps generation and nulls
-                // lastRefresh, and re-stamping here would make refreshIfStale early-return for up to
-                // refreshInterval, delaying the reconnected account's first pull. Leaving it nil on a stale
-                // generation lets the next call pull immediately.
-                if self.generation == gen,
-                   self.stateSessionID == sessionID,
-                   SIMKLAuth.storedSessionID == sessionID {
-                    self.lastRefresh = Date()
-                }
-                // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard; its
-                // throttle clear was re-armed by the stamp above. Honor it now with one more pass.
-                let force = self.refreshAgain
-                self.refreshAgain = false
-                self.lock.unlock()
-                if force { self.refreshNow() }
-            }
+            defer { self.finishRefresh(gen: gen, sessionID: sessionID) }
             guard SIMKLAuth.storedSessionID == sessionID else { return }
             await self.pullCompleted(expectedSession: sessionID, gen: gen)
         }
+    }
+
+    private func finishRefresh(gen: Int, sessionID: SIMKLSessionID) {
+        let force = lock.withLock { state in
+            state.refreshing = false
+            // Only stamp when no disconnect happened mid-refresh: a reset bumps generation and nulls
+            // lastRefresh, and re-stamping here would make refreshIfStale early-return for up to
+            // refreshInterval, delaying the reconnected account's first pull. Leaving it nil on a stale
+            // generation lets the next call pull immediately.
+            if state.generation == gen,
+               state.stateSessionID == sessionID,
+               SIMKLAuth.storedSessionID == sessionID {
+                state.lastRefresh = Date()
+            }
+            // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard; its
+            // throttle clear was re-armed by the stamp above. Honor it now with one more pass.
+            let force = state.refreshAgain
+            state.refreshAgain = false
+            return force
+        }
+        if force { refreshNow() }
     }
 
     /// Force an immediate refresh, bypassing the `refreshInterval` throttle. Called when the user just
@@ -162,11 +171,11 @@ final class SIMKLWatchedShadow {
     /// instead of being lost to the single-flight guard. Still gated on config / sign-in / import-toggle
     /// downstream: this forces the SCHEDULE, never the gates.
     func refreshNow() {
-        lock.lock()
-        lastRefresh = nil
-        let inFlight = refreshing
-        if inFlight { refreshAgain = true }
-        lock.unlock()
+        let inFlight = lock.withLock { state in
+            state.lastRefresh = nil
+            if state.refreshing { state.refreshAgain = true }
+            return state.refreshing
+        }
         if !inFlight { refreshIfStale() }
     }
 
@@ -196,15 +205,17 @@ final class SIMKLWatchedShadow {
         // Commit whenever every leg answered. An empty `next` is a truthful empty account result and must
         // replace a populated cache, otherwise removed history remains visible forever.
         guard allOK else { return }
-        lock.lock()
-        // A disconnect while this pull was in flight wiped the set and bumped generation; do NOT write the
-        // pre-reset result back, or the imported badges would resurrect after the user disconnected.
-        guard generation == gen,
-              stateSessionID == expectedSession,
-              SIMKLAuth.storedSessionID == expectedSession else { lock.unlock(); return }
-        let changed = core.replace(with: next)
-        if changed { persistLocked() }
-        lock.unlock()
+        let watchedIDs = next
+        let changed = lock.withLock { state in
+            // A disconnect while this pull was in flight wiped the set and bumped generation; do NOT write the
+            // pre-reset result back, or the imported badges would resurrect after the user disconnected.
+            guard state.generation == gen,
+                  state.stateSessionID == expectedSession,
+                  SIMKLAuth.storedSessionID == expectedSession else { return false }
+            let changed = state.core.replace(with: watchedIDs)
+            if changed { Self.persistLocked(state) }
+            return changed
+        }
         if changed {
             await MainActor.run { WatchedIndex.shared.externalShadowChanged() }
         }
@@ -230,14 +241,15 @@ final class SIMKLWatchedShadow {
         return snapshot.watchedIDs
     }
 
-    private func persistLocked() {
-        guard let storage = Self.storage, let stateSessionID else {
+    /// Called only within the lock's synchronous mutation transaction, before notifying any reader.
+    private static func persistLocked(_ state: State) {
+        guard let storage, let stateSessionID = state.stateSessionID else {
             try? Self.storage?.reset()
             return
         }
         let snapshot = PersistedSnapshot(
             sessionID: stateSessionID,
-            watchedIDs: Array(core.watchedIDs)
+            watchedIDs: Array(state.core.watchedIDs)
         )
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? storage.save(data)

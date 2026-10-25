@@ -26,14 +26,14 @@ enum SourceControlsLayoutContractTests {
         precondition(tabs.contains(".foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)"))
         precondition(tabs.contains(".accessibilityAddTraits(selected ? [.isSelected] : [])"))
         precondition(tabs.contains("selected: selectedSourceAddon == nil") && tabs.contains("selectSourceAddon(nil)"))
-        precondition(tabs.contains("selected: selectedSourceAddon == group.addon") && tabs.contains("selectSourceAddon(group.addon)"))
+        precondition(tabs.contains("selected: selectedSourceAddon == group.id") && tabs.contains("selectSourceAddon(group.id)"))
         let selection = source.components(separatedBy: "private func selectSourceAddon(_ addon: String?) {")[1]
             .components(separatedBy: "// MARK: Sort control")[0]
         precondition(selection.contains("selectedSourceAddon = addon") && selection.contains("sourceFilter = addon"))
         // All must reveal the list too, before the optional per-addon expansion branch is evaluated.
         precondition(selection.components(separatedBy: "if let addon {")[0].contains("showAllSources = true"))
         precondition(selection.contains("collapsed.remove(addon)"))
-        precondition(selection.contains("groups.first { $0.addon == name }?.id"))
+        precondition(selection.contains("groups.first { $0.id == id }?.id"))
         precondition(selection.contains("?? \"cinema-source-list\""))
         precondition(selection.contains("DispatchQueue.main.async { jumpToSource?(anchor) }"))
         precondition(source.contains(".id(\"cinema-source-\\(wg.group.id)\")")

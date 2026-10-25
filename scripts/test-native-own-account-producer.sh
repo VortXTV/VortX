@@ -35,13 +35,14 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     printf '%s\n' 'import Foundation'
     sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
 } > "$own_source_dir/Discovery.swift"
-xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+node scripts/extract-subtitle-proof-hosts.cjs "$PWD" full-shells "$own_source_dir/NativeSubtitleProofHosts.swift" > "$own_source_dir/native-subtitle-proof-hosts.json"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
     app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift \
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift app/SourcesShared/VortxNativeAccountCredentials.swift \
-    "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountProducerTests.swift \
+    "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" "$own_source_dir/NativeSubtitleProofHosts.swift" app/Tests/VortxNativeOwnAccountProducerTests.swift \
     -o "$own_source_dir/own-source"
 "$own_source_dir/own-source"
 if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
@@ -49,16 +50,23 @@ if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
     own_header_hash=$(shasum -a 256 "${VORTX_FFI_HEADER:?exact reviewed header required}" | awk '{print $1}')
     cp "$VORTX_FFI_HEADER" "$own_source_dir/vortx_ffi.h"
     printf 'module VortxEngine { header "vortx_ffi.h" export * }\n' > "$own_source_dir/module.modulemap"
-    xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+    node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-shell "$own_source_dir/NativeSubtitleBridgeProofHosts.swift" > "$own_source_dir/native-subtitle-bridge-proof-hosts.json"
+    shasum -a 256 "$0" scripts/extract-subtitle-proof-hosts.cjs app/SourcesShared/CoreBridge.swift \
+        app/SourcesShared/CredentialScope.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+        app/SourcesShared/LegacyWatchOwnership.swift \
+        "$own_source_dir/NativeSubtitleBridgeProofHosts.swift" "$own_source_dir/native-subtitle-bridge-proof-hosts.json" \
+        > "$own_source_dir/native-subtitle-bridge-proof-inputs.sha256"
+    xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
         -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$own_source_dir" \
-        app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
+        app/SourcesShared/CredentialScope.swift app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
         app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift \
         app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
         app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift \
         app/SourcesShared/VortxNativeProfiles.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeAccountCredentials.swift \
-        "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountLiveTests.swift \
+        "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" "$own_source_dir/NativeSubtitleBridgeProofHosts.swift" app/Tests/VortxNativeOwnAccountLiveTests.swift \
         "$VORTX_FFI_LIBRARY" -o "$own_source_dir/own-live"
     DYLD_LIBRARY_PATH="$(dirname "$VORTX_FFI_LIBRARY"):$(dirname "$VORTX_FFI_LIBRARY")/deps" "$own_source_dir/own-live" "$own_source_dir/checkpoints"
+    shasum -a 256 --check "$own_source_dir/native-subtitle-bridge-proof-inputs.sha256"
     test "$own_library_hash" = "$(shasum -a 256 "$VORTX_FFI_LIBRARY" | awk '{print $1}')"
     test "$own_header_hash" = "$(shasum -a 256 "$VORTX_FFI_HEADER" | awk '{print $1}')"
     printf 'Verified immutable own-account ABI/header: %s %s\n' "$own_library_hash" "$own_header_hash"

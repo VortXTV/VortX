@@ -59,6 +59,7 @@ struct SkipKeysView: View {
 // MARK: - Shared field builders (fileprivate free functions so both screens reuse them)
 
 /// A masked credential field (keys are credentials, Bug 3).
+@MainActor
 @ViewBuilder fileprivate func metaKeyField(_ title: String, text: Binding<String>, hint: String) -> some View {
     VStack(alignment: .leading, spacing: Theme.Space.sm) {
         HStack {
@@ -82,6 +83,7 @@ struct SkipKeysView: View {
 }
 
 /// A plain (non-masked) field: a base URL is configuration, not a credential.
+@MainActor
 @ViewBuilder fileprivate func metaURLField(_ title: String, text: Binding<String>, hint: String) -> some View {
     VStack(alignment: .leading, spacing: Theme.Space.sm) {
         HStack {

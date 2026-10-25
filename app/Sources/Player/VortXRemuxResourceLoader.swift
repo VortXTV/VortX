@@ -1,6 +1,7 @@
 #if os(iOS) || os(tvOS) || os(macOS)
 import Foundation
 import AVFoundation
+import os
 
 /// Serves the DV-for-MKV streaming remux (`VortXMKVRemuxStream`) to AVPlayer as a `vortxremux://` custom-scheme
 /// asset. AVPlayer refuses to load a custom scheme itself, so it hands every content-information + data request
@@ -22,7 +23,7 @@ import AVFoundation
 /// LEGACY delivery (b166): the default DV-remux delivery is now local HLS (`VortXRemuxHLSServer`), the one
 /// way AVFoundation reliably consumes a growing fMP4. This progressive loader stays compiled as the instant
 /// rollback path behind `VortXRemuxHLSServer.deliveryEnabled`.
-final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate, Sendable {
 
     static let scheme = "vortxremux"
 
@@ -37,8 +38,7 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// the stream to stop; this relay fires when its input and producer thread are actually gone.
     private let producerTerminalRelay: VortXRemuxProducerTerminalRelay
     private let queue = DispatchQueue(label: "vortx.dvremux.loader")
-    private var invalidated = false
-    private let invalidateLock = NSLock()
+    private let invalidation = OSAllocatedUnfairLock(initialState: false)
 
     /// Build a loader that will drive `stream`. The caller starts the stream (or we start it lazily on the
     /// first request) and mounts an `AVURLAsset(url:)` whose scheme is `vortxremux`.
@@ -98,16 +98,17 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
-        invalidateLock.lock()
-        let already = invalidated
-        invalidated = true
-        invalidateLock.unlock()
-        guard !already else { return }
+        let shouldCancel = invalidation.withLock { invalidated in
+            guard !invalidated else { return false }
+            invalidated = true
+            return true
+        }
+        guard shouldCancel else { return }
         stream.cancel()
     }
 
     private var isInvalidated: Bool {
-        invalidateLock.lock(); defer { invalidateLock.unlock() }; return invalidated
+        invalidation.withLock { $0 }
     }
 
     // MARK: AVAssetResourceLoaderDelegate

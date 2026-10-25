@@ -33,6 +33,70 @@ struct PlaybackDiagnostics: Sendable {
     }
 }
 
+/// Captured at the external-subtitle request, never reconstructed from whichever account is current
+/// after extraction. Only the Bridge's original native binding can mint the mount receipt.
+struct PlayerSubtitleAlignmentOwner: Sendable {
+    let mount: CredentialPublicationOutbox.SubtitleMountOwner
+    let account: CredentialScopeRegistry.Capture
+    let applicationEpoch: UUID
+    let profileID: UUID
+
+    private init(mount: CredentialPublicationOutbox.SubtitleMountOwner,
+                 account: CredentialScopeRegistry.Capture, applicationEpoch: UUID, profileID: UUID) {
+        self.mount = mount; self.account = account
+        self.applicationEpoch = applicationEpoch; self.profileID = profileID
+    }
+
+    @MainActor
+    static func capture(core: CoreBridge, target: PlaybackMutationTarget) -> Self? {
+        guard case .native(let original?) = target,
+              let epoch = LegacyWatchOwnership.captureApplicationEpoch(),
+              let mount = core.captureNativeSubtitleOwner(target, originalApplicationEpoch: epoch) else { return nil }
+        return .init(mount: mount, account: original.credential,
+                     applicationEpoch: epoch, profileID: original.profileID)
+    }
+}
+
+/// Presentation authority only. A UUID distinguishes repeated requests for the same URL/load,
+/// and the weak original player makes cancellation unable to touch a successor engine.
+@MainActor
+struct SubtitleAlignmentPresentationRequest {
+    let id = UUID()
+    let url: String
+    weak var player: (any PlayerEngine)?
+    var requestGeneration: UInt64?
+
+    init(player: any PlayerEngine, url: String) {
+        self.player = player; self.url = url
+    }
+}
+
+struct PlayerAlignedSubtitleSelection: Sendable {
+    let url: String
+    let title: String
+    let lang: String
+}
+
+enum PlayerSubtitleAlignmentResult: Sendable {
+    case aligned, unavailable, unmatched, superseded, failed, needsStop
+
+    var failureMessage: String? {
+        switch self {
+        case .aligned: return nil
+        case .unavailable:
+            return String(localized: "Automatic alignment is unavailable for this video and subtitle. Your current subtitles were kept.")
+        case .unmatched:
+            return String(localized: "No reliable timing match was found. Your current subtitles were kept.")
+        case .superseded:
+            return String(localized: "Playback or subtitle settings changed before alignment finished. Your current subtitles were kept.")
+        case .needsStop:
+            return String(localized: "Stop playback before trying alignment again.")
+        case .failed:
+            return String(localized: "Subtitle alignment failed. Try selecting the subtitle normally.")
+        }
+    }
+}
+
 /// The finite surface the player chrome drives playback through. Today the chrome (`PlayerScreen` on
 /// iOS/Mac, `TVPlayerView` on tvOS) talks to the engine exclusively via `coordinator.player?.<method>`
 /// plus an inbound string-keyed property-event bus (`MPVPlayerDelegate`). Every member below is something
@@ -97,9 +161,19 @@ protocol PlayerEngine: AnyObject {
     func setSubtitleTrack(_ id: Int)
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?)
+    var automaticSubtitleAlignmentAvailable: Bool { get }
+    var alignedExternalSubtitle: PlayerAlignedSubtitleSelection? { get }
+    func alignExternalSubtitle(url: String, title: String, lang: String,
+                               owner: PlayerSubtitleAlignmentOwner,
+                               completion: @escaping (PlayerSubtitleAlignmentResult) -> Void) -> UInt64?
     /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
     /// every selected subtitle; AVPlayer supports it only while the VortX external-cue overlay is active.
     var subtitleDelayAvailable: Bool { get }
+    /// Opaque revision for the current subtitle selection/timing intent, not a download cancellation token.
+    /// Capture it with the original load/track/owner before preparing alignment; any intervening selection,
+    /// timing edit or load transition retires that preparation. nil means this engine cannot provide it.
+    /// Equality alone does not authorize applying a result: final load, track and owner admission is required.
+    var subtitleAlignmentRevision: UInt64? { get }
     func setSubDelay(_ seconds: Double)
     func setAudioDelay(_ seconds: Double)
     func applySubtitleStyle()
@@ -155,6 +229,18 @@ extension PlayerEngine {
     /// libmpv is the established full-capability path. The AVPlayer conformer overrides this with its
     /// current-track external-overlay state, so adding the capability does not widen every concrete engine.
     var subtitleDelayAvailable: Bool { true }
+
+    /// Unsupported conformers must not accidentally grant automatic-alignment authority with a fixed zero.
+    var subtitleAlignmentRevision: UInt64? { nil }
+
+    var automaticSubtitleAlignmentAvailable: Bool { false }
+    var alignedExternalSubtitle: PlayerAlignedSubtitleSelection? { nil }
+    func alignExternalSubtitle(url: String, title: String, lang: String,
+                               owner: PlayerSubtitleAlignmentOwner,
+                               completion: @escaping (PlayerSubtitleAlignmentResult) -> Void) -> UInt64? {
+        completion(.unavailable)
+        return nil
+    }
 
     /// The chrome calls `addExternalSubtitle(url:title:lang:)` (the rest defaulted). Protocol requirements
     /// can't carry default values, so this convenience forwards to the full requirement, needed once the

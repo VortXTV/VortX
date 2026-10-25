@@ -147,7 +147,7 @@ struct ForYouPeoplePicker: View {
                     .padding(Theme.Space.sm)
                     .vortxSettingsCard()
                     .frame(maxWidth: 640, alignment: .leading)
-                    .onChange(of: query) { value in search(value) }
+                    .onValueChange(of: query) { value in search(value) }
             }
             if !results.isEmpty {
                 FlowLayout(spacing: Theme.Space.sm) {

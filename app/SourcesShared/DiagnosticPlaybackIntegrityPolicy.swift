@@ -5,7 +5,7 @@ import Foundation
 /// the first positive tick can spend the correction, and a viewer/resume seek retires it.
 struct FreshPlaybackOriginPolicy<Token: Equatable> {
     enum Decision: Equatable { case forward, suppress, correct, recovered }
-    private enum Phase { case inactive, firstPositive, awaitingCommand, awaitingSeek, awaitingOrigin, failed }
+    private enum Phase: Sendable { case inactive, firstPositive, awaitingCommand, awaitingSeek, awaitingOrigin, failed }
     private var owner: Token?
     private var phase = Phase.inactive
     static var openingTolerance: Double { 1 }
@@ -423,7 +423,7 @@ enum MPVResumeSeekRecoveryPolicy {
 /// A subsequent command establishes a fresh boundary. A drained-queue native read at the latest
 /// absolute destination can also confirm landing without attributing any previously queued event.
 struct MPVSeekSettlementPolicy<Owner: Equatable> {
-    enum Phase: Equatable { case awaitingSeek, seekObserved, settled }
+    enum Phase: Equatable, Sendable { case awaitingSeek, seekObserved, settled }
     struct Attempt: Equatable {
         let owner: Owner
         let generation: UInt64
@@ -1007,3 +1007,9 @@ struct EpisodicAssetSanityAttempt<Token: Equatable> {
         return callbackOwner == owner && verdict == .reject
     }
 }
+
+// These policies cross the native event/UI boundary only as locked value snapshots.
+extension FreshPlaybackOriginPolicy: Sendable where Token: Sendable {}
+extension MPVResumeSeekTicket: Sendable where Owner: Sendable {}
+extension MPVSeekSettlementPolicy: Sendable where Owner: Sendable {}
+extension MPVSeekSettlementPolicy.Attempt: Sendable where Owner: Sendable {}

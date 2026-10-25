@@ -78,7 +78,14 @@ fun TvWhosWatching(
     onSelected: (ProfileSelectionRequest) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val gateway = rememberTvProfileGateway()
+    val (gateway, loading) = rememberTvProfileGateway()
+    if (loading) {
+        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Opening profiles…", style = VortXTheme.type.body)
+        }
+        BackHandler(onBack = onDone)
+        return
+    }
     if (gateway == null) {
         LaunchedEffect(Unit) { onDone() }
         return

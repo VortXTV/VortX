@@ -18,6 +18,7 @@ struct VortXAccountJoinerView: View {
     @State private var qrImage: CGImage?
     @State private var status: Status = .starting
     @State private var poller: Task<Void, Never>?
+    @State private var pollGeneration = UUID()
     // Honesty state so the screen is never a silent forever-"waiting": the reducer folds each poll result
     // into an action, `reachTrouble` surfaces recurring relay/transport failure under the QR, and
     // `codeMintedAt` lets a stale code re-mint even if the relay never reports it expired (see #153).
@@ -101,16 +102,22 @@ struct VortXAccountJoinerView: View {
             }
         }
         .onAppear { start() }
-        .onDisappear { poller?.cancel() }
+        .onDisappear { stop() }
     }
 
     private func start() {
-        poller?.cancel()
+        stop()
+        let generation = pollGeneration
         status = .starting
         reachTrouble = false
         reducer = QrJoinerReducer()          // fresh code, fresh error/age accounting
         poller = Task { @MainActor in
-            guard let s = await VortXSyncManager.shared.qrStart() else { status = .failed; return }
+            let result = await VortXSyncManager.shared.qrStart()
+            guard !Task.isCancelled, pollGeneration == generation else {
+                if let result { VortXSyncManager.shared.qrCancel(result) }
+                return
+            }
+            guard let s = result else { status = .failed; return }
             session = s
             codeMintedAt = Date()
             // The QR opens vortx.tv/approve carrying the code plus this device's ephemeral public key, so the
@@ -118,16 +125,23 @@ struct VortXAccountJoinerView: View {
             // they need no escaping in the query string (see the approveBase note above, #153).
             qrImage = QRCodeImage.make("\(Self.approveBase)?c=\(s.code)&k=\(s.devicePublicKey)")
             status = .waiting
-            await pollLoop(s)
+            await pollLoop(s, generation: generation)
         }
     }
 
-    private func pollLoop(_ s: VortXSyncManager.QrJoinSession) async {
-        while !Task.isCancelled {
+    private func stop() {
+        pollGeneration = UUID()
+        poller?.cancel(); poller = nil
+        if let session { VortXSyncManager.shared.qrCancel(session) }
+        session = nil; qrImage = nil
+    }
+
+    private func pollLoop(_ s: VortXSyncManager.QrJoinSession, generation: UUID) async {
+        while !Task.isCancelled, pollGeneration == generation {
             try? await Task.sleep(nanoseconds: Self.pollInterval)
-            if Task.isCancelled { return }
+            if Task.isCancelled || pollGeneration != generation { return }
             let result = await VortXSyncManager.shared.qrPoll(s)
-            if Task.isCancelled { return }
+            if Task.isCancelled || pollGeneration != generation { return }
             switch reducer.onResult(result, codeAge: Date().timeIntervalSince(codeMintedAt)) {
             case .keepWaiting(let trouble):
                 if reachTrouble != trouble { reachTrouble = trouble }

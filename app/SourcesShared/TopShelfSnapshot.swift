@@ -404,10 +404,11 @@ enum TopShelfSnapshot {
 
     /// The snapshot file is untrusted input: under a signing service's shared group another app could have
     /// written it. A row is shown only when its action round-trips through the app's own link parser, and
-    /// its poster only when it is https or a file inside the managed artwork folder.
+    /// its progress satisfies TVServices' 0...1 contract, and its poster is https or a file inside
+    /// the managed artwork folder. Reject malformed rows without repairing the shared cache.
     static func displayable(_ item: Item, artworkDirectory: URL?) -> Item? {
         guard let link = openURL(type: item.type, id: item.id), parse(link) == .open(type: item.type, id: item.id),
-              item.progress.isFinite else { return nil }
+              item.progress.isFinite, (0...1).contains(item.progress) else { return nil }
         guard let poster = item.poster else { return item }
         let accepted: Bool
         if let url = URL(string: poster), url.scheme?.lowercased() == "https", url.host?.isEmpty == false {

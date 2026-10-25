@@ -91,7 +91,7 @@ struct iOSCollectionsHub: View {
             GeometryReader { geo in
                 Color.clear
                     .onAppear { containerWidth = geo.size.width }
-                    .onChange(of: geo.size.width) { containerWidth = $0 }
+                    .onValueChange(of: geo.size.width) { containerWidth = $0 }
             }
         }
     }

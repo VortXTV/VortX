@@ -41,7 +41,7 @@ struct ResolvedPin: Equatable, Sendable {
 
 /// The minimal title context a stream list needs to offer pinning: the meta id (the movie or the show)
 /// and whether it is a series, which only changes the menu wording ("this show" vs "this movie").
-struct SourcePinContext: Equatable {
+struct SourcePinContext: Equatable, Sendable {
     let metaId: String
     let isSeries: Bool
     var entryNoun: String { isSeries ? "show" : "movie" }
@@ -50,6 +50,7 @@ struct SourcePinContext: Equatable {
 /// Per-profile store of pinned sources, persisted in `UserDefaults` and namespaced by the active profile
 /// id (like `LastStreamStore` and the streaming flat keys). Reloaded on a profile switch from `Profiles`,
 /// alongside `SourcePreferences.reload()`.
+@MainActor
 final class SourcePinStore: ObservableObject {
     static let shared = SourcePinStore()
 
@@ -113,7 +114,7 @@ final class SourcePinStore: ObservableObject {
 
     // MARK: Build a pin from a chosen stream
 
-    static func makePin(addon: String, stream: CoreStream) -> SourcePin {
+    nonisolated static func makePin(addon: String, stream: CoreStream) -> SourcePin {
         SourcePin(addon: addon,
                   quality: StreamRanking.qualityLabel(stream),
                   flavor: StreamRanking.releaseFlavor(stream),
@@ -160,7 +161,7 @@ final class SourcePinStore: ObservableObject {
 
     /// Whether `stream` (from `addon`) matches a resolved pin. Used by both the ranker bonus and the row
     /// badge, so the badge marks exactly the streams the pin would float to the top.
-    static func matches(_ stream: CoreStream, addon: String, pin: ResolvedPin) -> Bool {
+    nonisolated static func matches(_ stream: CoreStream, addon: String, pin: ResolvedPin) -> Bool {
         let addonEqual = addon.caseInsensitiveCompare(pin.pin.addon) == .orderedSame
         switch pin.scope {
         case .global:

@@ -67,7 +67,7 @@ def main():
         # The new normal SDK must expose every real owner-history JNI function on EACH ABI.
         # Mutate only a copied ELF's .dynstr spelling; do not compile a fake native library or
         # replace the actual callable-export predicate with text fixtures.
-        if args.source_sha in {"0c30f4782aee544a2b7e33169ad60d03630d4097", "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"}:
+        if args.source_sha in {"2ea2e0f27dd2e53b7b28228435ca35a70f92831f", "d2ca37b89556c732da6edc1e5ca1f5908cf5d508", "0c30f4782aee544a2b7e33169ad60d03630d4097", "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"}:
             owner_methods = (
                 "nativeOwnerHistoryCanonicalize", "nativeOwnerHistoryOpen",
                 "nativeOwnerHistoryFork", "nativeOwnerHistoryRequest", "nativeOwnerHistoryClose",

@@ -1,11 +1,18 @@
 // Runtime regression for launch-time crash-marker classification.
 //
-// RUN:
-//   xcrun swiftc -o /tmp/crash-marker-launch-snapshot-tests \
+// UNRUN recipe; run only in the authorized bounded supervisor. task_dir must be a
+// fresh disposable directory below /Users/daksh/VortXTV/_recovery/, not an app container.
+// The C object is the complete real production shim, not a fixture stand-in.
+//   xcrun clang -std=c11 -Wall -Wextra -Werror -c \
+//     app/Sources/Player/VortXCrashSignal.c -o "$task_dir/VortXCrashSignal.o"
+//   xcrun swiftc -import-objc-header app/Sources/Player/VortXCrashSignal.h \
+//     -o "$task_dir/crash-marker-launch-snapshot-tests" \
 //     app/SourcesShared/TerminationReceiptPolicy.swift \
 //     app/SourcesShared/VortXCrashReporter.swift \
-//     app/Tests/CrashMarkerLaunchSnapshotTests.swift && \
-//   /tmp/crash-marker-launch-snapshot-tests
+//     app/Tests/CrashMarkerLaunchSnapshotTests.swift \
+//     "$task_dir/VortXCrashSignal.o" && \
+//   "$task_dir/crash-marker-launch-snapshot-tests"
+// Existing diagnostics-only Swift seams and all actual marker/classification assertions are unchanged.
 
 import Foundation
 

@@ -15,6 +15,7 @@ struct TraktNextEpisodeHomeRow: View {
     let onOpen: (TraktNextEpisodeOffer) -> Void
     @EnvironmentObject private var theme: ThemeManager
 
+    @MainActor
     static func permitsOpening(_ offer: TraktNextEpisodeOffer) -> Bool {
         offer.isCurrent()
             && offer.intent.source == .trakt

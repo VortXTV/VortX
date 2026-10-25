@@ -189,9 +189,9 @@ extension SmartCollectionRules {
             Button("Cancel", role: .cancel) {}
         }
         .onAppear { schedulePreview(immediately: true) }
-        .onChange(of: rules) { _ in schedulePreview(immediately: false) }
+        .onValueChange(of: rules) { _ in schedulePreview(immediately: false) }
         .onDisappear { previewTask?.cancel() }
-        .onChange(of: readLifetime.generation) { _ in previewTask?.cancel(); items = []; loading = false }
+        .onValueChange(of: readLifetime.generation) { _ in previewTask?.cancel(); items = []; loading = false }
         #if os(tvOS)
         .fullScreenCover(isPresented: appearancePresented) { appearanceEditor }
         #else

@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p app/build
 dir=$(mktemp -d app/build/for-you-model.XXXXXX)
-trap 'rm -rf "$dir"' EXIT
+trap 'printf "Retained For You model fixture: %s\n" "$dir"' EXIT
 {
   printf '%s\n' 'import Foundation'
   sed -n '/^indirect enum VortxJSON/,/^}/p' app/SourcesShared/VortxResourceBridge.swift
@@ -16,7 +16,7 @@ trap 'rm -rf "$dir"' EXIT
   printf '%s\n' '}'
 } > "$dir/support.swift"
 grep -q 'static func validateForYouField' "$dir/support.swift"
-sed -n '/^struct MetaPreview: Identifiable, Decodable, Hashable {/,/^}/p' app/SourcesShared/Addon.swift > "$dir/preview.swift"
+sed -n '/^struct MetaPreview: Identifiable, Decodable, Hashable, Sendable {/,/^}/p' app/SourcesShared/Addon.swift > "$dir/preview.swift"
 mkdir -p "$dir/model" "$dir/rows"
 for target in model rows; do
   cp "$dir/support.swift" app/SourcesShared/ForYouInterests.swift app/SourcesShared/ForYouDiscover.swift "$dir/$target/"
@@ -27,6 +27,6 @@ cp app/Tests/ForYouModelTests.swift "$dir/model/main.swift"
 cp "$dir/preview.swift" app/SourcesShared/ForYouRowsModel.swift "$dir/rows/"
 cp app/Tests/ForYouRowsModelTests.swift "$dir/rows/main.swift"
 for target in model rows; do
-  xcrun swiftc -swift-version 5 -o "$dir/$target/run" "$dir/$target"/*.swift
+  xcrun swiftc -swift-version 5 -j 1 -num-threads 1 -o "$dir/$target/run" "$dir/$target"/*.swift
   "$dir/$target/run"
 done

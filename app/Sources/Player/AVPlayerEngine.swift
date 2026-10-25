@@ -7,6 +7,7 @@ import CoreMedia
 import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
+import os
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -273,6 +274,170 @@ struct AVPlayerStallEpisodeState: Equatable {
 }
 
 // MARK: - AVPlayer engine
+
+// Objective-C does not promise a callback executor for this protocol. Only
+// immutable event values cross to the owner; the SDK controller and its restore
+// completion remain in the original callback's synchronous stack.
+private final class AVPlayerPiPDelegateBridge: NSObject, AVPictureInPictureControllerDelegate, Sendable {
+    enum Kind: Sendable {
+        case willStart
+        case didStart(possible: Bool, active: Bool)
+        case failedToStart(String)
+        case willStop
+        case didStop(possible: Bool, active: Bool)
+        case observed(possible: Bool, active: Bool)
+    }
+    struct Event: Sendable {
+        let controllerID: ObjectIdentifier
+        let generation: UInt64
+        let kind: Kind
+    }
+    private struct Reservation: Sendable {
+        let controllerID: ObjectIdentifier
+        let generation: UInt64
+        let ordinal: UInt64
+    }
+    private enum Phase: Sendable { case pending, active(UInt64), retired }
+    private struct State: Sendable {
+        var phase = Phase.pending
+        var lastReserved: UInt64 = 0
+        var nextDelivery: UInt64 = 1
+        var ready: [UInt64: Event] = [:]
+        var drainScheduled = false
+    }
+    private let controllerID: ObjectIdentifier
+    private let receive: @MainActor @Sendable (Event) -> Void
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(controllerID: ObjectIdentifier, receive: @escaping @MainActor @Sendable (Event) -> Void) {
+        self.controllerID = controllerID
+        self.receive = receive
+        super.init()
+    }
+
+    func activate(generation: UInt64) {
+        state.withLock {
+            guard case .pending = $0.phase else { return }
+            $0.phase = .active(generation)
+        }
+    }
+
+    func retire() {
+        state.withLock {
+            $0.phase = .retired
+            $0.ready.removeAll()
+        }
+    }
+
+    private func isActive(for controller: AVPictureInPictureController) -> Bool {
+        guard ObjectIdentifier(controller) == controllerID else { return false }
+        return state.withLock {
+            guard case .active = $0.phase else { return false }
+            return true
+        }
+    }
+
+    // Admission and ordinal reservation precede every SDK getter or error
+    // localization. A slower/reentrant payload cannot let a later event overtake it.
+    private func reserve(for controller: AVPictureInPictureController,
+                         expectedGeneration: UInt64?) -> Reservation? {
+        guard ObjectIdentifier(controller) == controllerID else { return nil }
+        return state.withLock {
+            guard case .active(let generation) = $0.phase,
+                  expectedGeneration == nil || expectedGeneration == generation,
+                  $0.lastReserved < UInt64.max else { return nil }
+            $0.lastReserved += 1
+            return Reservation(controllerID: controllerID, generation: generation, ordinal: $0.lastReserved)
+        }
+    }
+
+    private func commit(_ kind: Kind, reservation: Reservation) {
+        let event = Event(controllerID: reservation.controllerID, generation: reservation.generation, kind: kind)
+        let schedule = state.withLock {
+            guard case .active(let original) = $0.phase, original == reservation.generation,
+                  reservation.ordinal >= $0.nextDelivery,
+                  $0.ready[reservation.ordinal] == nil else { return false }
+            $0.ready[reservation.ordinal] = event
+            guard !$0.drainScheduled, $0.ready[$0.nextDelivery] != nil else { return false }
+            $0.drainScheduled = true
+            return true
+        }
+        if schedule { DispatchQueue.main.async { [self] in drain() } }
+    }
+
+    @MainActor private func drain() {
+        while let batch = state.withLock({ state -> [Event]? in
+            var batch: [Event] = []
+            while let event = state.ready.removeValue(forKey: state.nextDelivery) {
+                batch.append(event)
+                state.nextDelivery &+= 1
+            }
+            guard !batch.isEmpty else {
+                state.drainScheduled = false
+                return nil
+            }
+            return batch
+        }) {
+            // Only contiguous original reservations are delivered. No SDK work,
+            // owner callback, or completion executes while this lock is held.
+            for event in batch { receive(event) }
+        }
+    }
+
+    func observe(_ controller: AVPictureInPictureController, generation: UInt64) {
+        guard let original = reserve(for: controller, expectedGeneration: generation) else { return }
+        commit(.observed(possible: controller.isPictureInPicturePossible,
+                         active: controller.isPictureInPictureActive), reservation: original)
+    }
+
+    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard let original = reserve(for: controller, expectedGeneration: nil) else { return }
+        commit(.willStart, reservation: original)
+    }
+
+    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard let original = reserve(for: controller, expectedGeneration: nil) else { return }
+        commit(.didStart(possible: controller.isPictureInPicturePossible,
+                        active: controller.isPictureInPictureActive), reservation: original)
+    }
+
+    func pictureInPictureController(_ controller: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error) {
+        guard let original = reserve(for: controller, expectedGeneration: nil) else { return }
+        commit(.failedToStart(error.localizedDescription), reservation: original)
+    }
+
+    func pictureInPictureControllerWillStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard let original = reserve(for: controller, expectedGeneration: nil) else { return }
+        commit(.willStop, reservation: original)
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        guard let original = reserve(for: controller, expectedGeneration: nil) else { return }
+        commit(.didStop(possible: controller.isPictureInPicturePossible,
+                       active: controller.isPictureInPictureActive), reservation: original)
+    }
+
+    func pictureInPictureController(_ controller: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        // PlayerScreen remains mounted: answer from this original attachment,
+        // synchronously exactly once, after releasing the checked state lock.
+        let restored = isActive(for: controller)
+        completionHandler(restored)
+    }
+}
+
+// A main-actor owner for the existing non-Sendable PlayerEngine completion API.
+// The worker receives this owner, never the raw caller closure or UI controller.
+@MainActor private final class AVPlayerFrameCaptureCompletion {
+    private var callback: ((Data?) -> Void)?
+    init(_ callback: @escaping (Data?) -> Void) { self.callback = callback }
+    func deliver(_ data: Data?) {
+        let original = callback
+        callback = nil
+        original?(data)
+    }
+}
 
 /// AVFoundation implementation of `PlayerEngine`. It drives one `AVPlayer` and maps its KVO + a periodic
 /// time observer onto the SAME `MPVProperty` event keys the chrome already listens for, so the full
@@ -604,6 +769,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var remuxSubtitleInventoryRefreshTask: Task<Void, Never>?
     private var observations: [NSKeyValueObservation] = []
     private var pipController: AVPictureInPictureController?
+    private var pipDelegate: AVPlayerPiPDelegateBridge?
     private var pipObservations: [NSKeyValueObservation] = []
     private var pipState = AVPlayerPictureInPictureState()
     /// Published from the current AVPictureInPictureController only. The PlayerScreen child view observes the
@@ -673,6 +839,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// New external subtitle requests supersede every earlier fetch, including a later Off/built-in choice on
     /// the same AVPlayerItem.  Item/token ownership alone cannot distinguish those requests.
     private var externalSubtitleRequestRevision: UInt64 = 0
+    /// Subtitle intent/timing authority is independent of fetch and native-legible settlement revisions.
+    private var subtitleAlignmentGeneration: UInt64 = 0
     /// A loaded external cue file waits here while AVFoundation is still resolving native legible deselection.
     /// Unlike a Boolean, its generation/mount/revision ownership survives the final bounded retry and lets the
     /// matching media-selection notification consume the overlay activation exactly once.
@@ -967,6 +1135,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // MARK: Loading + transport
 
     func invalidateLoadToken() {
+        retireSubtitleAlignment()
         replacementReadyDeadlineTask?.cancel()
         replacementReadyDeadlineTask = nil
         cancelColdLocalRemuxPreparation()
@@ -1157,6 +1326,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        // A same-logical-token remount still retires preparation made against the previous mount.
+        retireSubtitleAlignment()
         let carriedSeekTarget = pendingRequestedSourcePositionSeconds
         invalidateSeekRequests()
         eventOwnedRecoveryTask?.cancel()
@@ -2133,6 +2304,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         selectionTopologyGeneration = nil
         selectionRefreshState.reset()
 
+        retireSubtitleAlignment()
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         itemGeneration &+= 1
         midPlaybackRecoveryBudget.reset(for: playbackMountIdentity)
@@ -3516,6 +3688,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// detour through an embedded track or Off), which is what makes the external row behave like every other
     /// row in the picker instead of being a one-way door.
     func setSubtitleTrack(_ id: Int) {
+        retireSubtitleAlignment()
         // This user decision supersedes any in-flight external file fetch for the same item.
         externalSubtitleRequestRevision &+= 1
         let nativeID: Int
@@ -3565,6 +3738,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         _ requested: AVMediaSelectionOption?,
         activatingExternalAfterSettlement: Bool
     ) {
+        retireSubtitleAlignment()
         invalidateNativeSubtitleOverlay()
         subtitleSelectionRevision &+= 1
         let revision = subtitleSelectionRevision
@@ -3654,6 +3828,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func setExternalSubtitleActive(_ active: Bool) {
+        // Settlement can activate the overlay after preparation started; the commit is a new revision too.
+        retireSubtitleAlignment()
         if active { invalidateNativeSubtitleOverlay() }
         externalSubActive = active
         guard active else {
@@ -3760,6 +3936,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// AVPlayer-native legible track so subtitles never double up. `completion(true)` once cues are loaded.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
+        retireSubtitleAlignment()
         externalSubtitleRequestRevision &+= 1
         let requestRevision = externalSubtitleRequestRevision
         // Keep the current selection during I/O. A failed/empty subtitle must not erase a working native
@@ -3813,6 +3990,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// the chrome has already hidden that add-on's own row (it lives in `addedSubURLs`) on the promise that
     /// the subtitle re-appears in the ordinary track list. `discardingCues: true` is the title-change reset.
     private func disableExternalSubtitle(discardingCues: Bool = false) {
+        retireSubtitleAlignment()
         // Cancellation is required even when keeping parsed cues for a picker detour: a newer selection may
         // re-activate them, but delayed settlement work from the old one must never do so on its own.
         externalSubtitleSettlement.clear()
@@ -3829,9 +4007,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// cue renderer consumes `setSubDelay`, so the chrome must gate its Sync controls on this live capability.
     var subtitleDelayAvailable: Bool { externalSubActive }
 
+    var subtitleAlignmentRevision: UInt64? { subtitleAlignmentGeneration }
+
+    private func retireSubtitleAlignment() {
+        subtitleAlignmentGeneration &+= 1
+    }
+
     /// Manual subtitle sync in seconds (positive = subtitles appear LATER, matching libmpv `sub-delay`). Applied
     /// as the renderer's offset, so the change is live: the next overlay update uses the new offset immediately.
     func setSubDelay(_ seconds: Double) {
+        retireSubtitleAlignment()
         subtitleRenderer.offset = seconds
         if externalSubActive {
             updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
@@ -4176,18 +4361,76 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Load the video track's nominal frame rate off the main thread and cache it for `containerFrameRate()`
     /// (Gap 8), using the non-deprecated async `load(.nominalFrameRate)`. No-op for HLS (no AVAssetTrack
     /// objects) and identity-guarded like loadChapters, so a later load never sees a stale value.
-    private func loadContainerFrameRate(_ item: AVPlayerItem) {
+    private func loadContainerFrameRate(_ item: AVPlayerItem,
+                                        loadToken: PlayerLoadToken,
+                                        generation: UInt64) {
         let asset = item.asset
         Task { @MainActor in
             let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
-            guard player.currentItem === item else { return }
+            guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+                  player.currentItem === item else { return }
             for track in tracks {
                 let fps = (try? await track.load(.nominalFrameRate)) ?? 0
-                guard player.currentItem === item else { return }
-                if fps > 0 { containerFPS = Double(fps); return }
+                guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+                      player.currentItem === item else { return }
+                if fps > 0 {
+                    containerFPS = Double(fps)
+                    #if os(tvOS)
+                    // The ready callback may run before AVFoundation finishes this async property load.
+                    // Reuse the same classifier/range/size request once the owned value arrives; the
+                    // load-token + exact-item fence prevents a retired item from touching the display.
+                    reassertRemuxDisplayMode(
+                        for: item, loadToken: loadToken, generation: generation)
+                    #endif
+                    return
+                }
             }
         }
     }
+
+    #if os(tvOS)
+    /// Reassert the existing remux display policy after AVFoundation's async frame-rate property resolves.
+    /// This keeps the original classified-first, asset-fallback ordering without using the deprecated
+    /// synchronous AVAssetTrack.nominalFrameRate accessor. A classified rate remains usable immediately;
+    /// an asset-only rate is applied on this callback once its exact current load is known.
+    private func reassertRemuxDisplayMode(for item: AVPlayerItem,
+                                          loadToken: PlayerLoadToken,
+                                          generation: UInt64) {
+        guard isReady, isRemuxMounted,
+              pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+              self.item === item,
+              player.currentItem === item else { return }
+        let size = item.presentationSize
+        let assetFPS = containerFPS
+        let classifiedFPS = remuxHLSServer?.authoritativeFrameRate
+            ?? remuxRemoteMount?.authoritativeFrameRate ?? 0
+        if let fps = DVPlaybackPolicy.frameRate(
+            classified: classifiedFPS, assetTrack: assetFPS) {
+            let videoRange = remuxHLSServer?.signaling?.videoRange
+                ?? remuxRemoteMount?.videoRange
+            let range = DVPlaybackPolicy.remuxDisplayRange(
+                dolbyVision: remuxHLSServer?.signaling?.dolbyVision
+                    ?? remuxRemoteMount?.carriesDolbyVision ?? false,
+                hdrFallback: usingHDRFallbackItem, videoRange: videoRange)
+            let requestedRange: ContentDynamicRange
+            switch range {
+            case .dolbyVision: requestedRange = .dolbyVision
+            case .hdr10: requestedRange = .hdr10
+            case .hlg: requestedRange = .hlg
+            case .sdr: requestedRange = .sdr
+            }
+            HDRDisplayMode.request(requestedRange, fps: fps,
+                                   width: Int(size.width), height: Int(size.height), in: nil)
+            VXProbe.log(
+                "dv",
+                "AVPlayer ready -> re-asserted \(requestedRange.rawValue) display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
+        } else {
+            VXProbe.log(
+                "dv",
+                "AVPlayer ready -> display mode deferred: frame rate unknown \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
+        }
+    }
+    #endif
 
     // MARK: Decode / audio routing (AVFoundation-managed; no-ops on this engine)
 
@@ -4204,17 +4447,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else {
             completion(nil); return
         }
+        // CIImage retains this acquired frame as an immutable, lazy image graph.
+        // Only SDK-Sendable CIImage/CIContext cross the utility queue; no raw
+        // CVPixelBuffer, caller closure, or controller is transferred.
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
         let ctx = captureContext
-        // Downscale + JPEG-encode off the main thread; CVPixelBuffer and CIContext are safe to hand off.
+        let delivery = AVPlayerFrameCaptureCompletion(completion)
         DispatchQueue.global(qos: .utility).async {
-            let data = Self.encodeJPEG(from: pixelBuffer, maxWidth: maxWidth, context: ctx)
-            DispatchQueue.main.async { completion(data) }
+            let data = Self.encodeJPEG(from: image, maxWidth: maxWidth, context: ctx)
+            DispatchQueue.main.async { delivery.deliver(data) }
         }
     }
 
-    /// CVPixelBuffer (BGRA) -> downscaled JPEG via ImageIO (cross-platform; no UIKit/AppKit dependency).
-    private static func encodeJPEG(from pixelBuffer: CVPixelBuffer, maxWidth: CGFloat, context: CIContext) -> Data? {
-        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+    /// Immutable BGRA image -> downscaled JPEG; rendering and encoding remain off-main.
+    nonisolated private static func encodeJPEG(from ci: CIImage, maxWidth: CGFloat, context: CIContext) -> Data? {
         let width = ci.extent.width
         guard width > 0, ci.extent.height > 0 else { return nil }
         let scale = min(1, maxWidth / width)
@@ -4255,7 +4501,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             publishPictureInPictureState()
             return
         }
-        pictureInPictureController.delegate = self
+        let callback = AVPlayerPiPDelegateBridge(controllerID: ObjectIdentifier(pictureInPictureController)) { [weak self] event in
+            self?.receivePictureInPictureEvent(event)
+        }
+        pipDelegate = callback
+        pictureInPictureController.delegate = callback
         // Allow AVKit to enter PiP automatically when this inline layer backgrounds. Explicit starts still go
         // through startPictureInPicture(), so the manual button and automatic entry share the same state truth.
         #if os(iOS)
@@ -4266,8 +4516,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             supported: true,
             possible: pictureInPictureController.isPictureInPicturePossible,
             active: pictureInPictureController.isPictureInPictureActive)
+        callback.activate(generation: generation)
         publishPictureInPictureState()
-        observePictureInPicture(pictureInPictureController, generation: generation)
+        guard pictureInPictureGeneration(for: pictureInPictureController) == generation else { return }
+        observePictureInPicture(pictureInPictureController, generation: generation, callback: callback)
     }
 
     /// Retire every KVO/delegate edge only when its owning engine or physical layer is going away. The old
@@ -4275,10 +4527,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func resetPictureInPictureController(for event: AVPlayerPictureInPictureOwnershipEvent) {
         guard event.invalidatesController else { return }
         let retiredController = pipController
+        let retiredDelegate = pipDelegate
+        retiredDelegate?.retire()
         let shouldStop = retiredController?.isPictureInPictureActive == true || pipState.isTransitioning
         pipObservations.forEach { $0.invalidate() }
         pipObservations.removeAll()
         retiredController?.delegate = nil
+        pipDelegate = nil
         pipController = nil
         pipState.invalidate()
         publishPictureInPictureState()
@@ -4315,31 +4570,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     private func observePictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController,
-        generation: UInt64
+        generation: UInt64,
+        callback: AVPlayerPiPDelegateBridge
     ) {
         let possible = pictureInPictureController.observe(
             \.isPictureInPicturePossible,
-            options: [.initial, .new]) { [weak self] observedController, _ in
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          let callbackGeneration = self.pictureInPictureGeneration(for: observedController),
-                          callbackGeneration == generation else { return }
-                    self.refreshPictureInPictureState(
-                        for: observedController,
-                        generation: generation)
-                }
+            options: [.initial, .new]) { [weak callback] observedController, _ in
+                callback?.observe(observedController, generation: generation)
             }
         let active = pictureInPictureController.observe(
             \.isPictureInPictureActive,
-            options: [.initial, .new]) { [weak self] observedController, _ in
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          let callbackGeneration = self.pictureInPictureGeneration(for: observedController),
-                          callbackGeneration == generation else { return }
-                    self.refreshPictureInPictureState(
-                        for: observedController,
-                        generation: generation)
-                }
+            options: [.initial, .new]) { [weak callback] observedController, _ in
+                callback?.observe(observedController, generation: generation)
             }
         pipObservations.append(contentsOf: [possible, active])
     }
@@ -4701,7 +4943,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
             emitDynamicRange(item)             // Existing playback/capture behavior remains unchanged.
             refreshBadgeMetadataIfNeeded(item)
-            loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
+            loadContainerFrameRate(
+                item, loadToken: loadToken, generation: itemGeneration
+            )                                      // Gap 8: cache the video track fps for the subtitle fingerprint
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
                 // A remux resume is fulfilled by opening the INPUT at its origin, not by seeking AVPlayer into
@@ -4772,35 +5016,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 // exact AVAsset.preferredDisplayCriteria object loaded and applied before attach, which covers
                 // a replaced display manager without inventing metadata. reset() on stop returns the default.
                 if isRemuxMounted {
-                    let size = item.presentationSize
-                    let assetFPS = Double(item.tracks.first {
-                        $0.assetTrack?.mediaType == .video
-                    }?.assetTrack?.nominalFrameRate ?? 0)
-                    let classifiedFPS = remuxHLSServer?.authoritativeFrameRate
-                        ?? remuxRemoteMount?.authoritativeFrameRate ?? 0
-                    if let fps = DVPlaybackPolicy.frameRate(
-                        classified: classifiedFPS, assetTrack: assetFPS) {
-                        let videoRange = remuxHLSServer?.signaling?.videoRange
-                            ?? remuxRemoteMount?.videoRange
-                        let range = DVPlaybackPolicy.remuxDisplayRange(
-                            dolbyVision: remuxHLSServer?.signaling?.dolbyVision
-                                ?? remuxRemoteMount?.carriesDolbyVision ?? false,
-                            hdrFallback: usingHDRFallbackItem, videoRange: videoRange)
-                        let requestedRange: ContentDynamicRange
-                        switch range {
-                        case .dolbyVision: requestedRange = .dolbyVision
-                        case .hdr10: requestedRange = .hdr10
-                        case .hlg: requestedRange = .hlg
-                        case .sdr: requestedRange = .sdr
-                        }
-                        HDRDisplayMode.request(requestedRange, fps: fps,
-                                               width: Int(size.width), height: Int(size.height), in: nil)
-                        VXProbe.log(
-                            "dv",
-                            "AVPlayer ready -> re-asserted \(requestedRange.rawValue) display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
-                    } else {
-                        VXProbe.log("dv", "AVPlayer ready -> display mode deferred: frame rate unknown \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
-                    }
+                    reassertRemuxDisplayMode(
+                        for: item, loadToken: loadToken, generation: itemGeneration)
                 } else if contentIsDolbyVision, let nativeDisplayCriteria {
                     let reapplied = HDRDisplayMode.applyNativePreferredCriteria(nativeDisplayCriteria, in: nil)
                     VXProbe.log(
@@ -5657,6 +5874,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               selectionTopologyGeneration == itemGeneration,
               let loadToken = activeLoadToken,
               owns(changedItem, loadToken: loadToken) else { return }
+        // System media-selection changes can leave and return to the same subtitle without a picker call.
+        retireSubtitleAlignment()
         retireBadgeMetadata()
         defer {
             if owns(changedItem, loadToken: loadToken) { publishTrackListIfTopologyReady() }
@@ -5739,8 +5958,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
     }
 
-    deinit {
+    isolated deinit {
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
+        pipDelegate?.retire()
         replacementReadyDeadlineTask?.cancel()
         coldLocalRemuxPreparation?.cancel()
         coldLocalRemuxMountTask?.cancel()
@@ -5757,62 +5977,30 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 }
 
-extension AVPlayerEngineController: AVPictureInPictureControllerDelegate {
-    func pictureInPictureControllerWillStartPictureInPicture(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) {
-        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
-              pipState.willStart(generation: generation) else { return }
+extension AVPlayerEngineController {
+    private func receivePictureInPictureEvent(_ event: AVPlayerPiPDelegateBridge.Event) {
+        guard let controller = pipController,
+              ObjectIdentifier(controller) == event.controllerID,
+              let generation = pictureInPictureGeneration(for: controller),
+              generation == event.generation else { return }
+        switch event.kind {
+        case .willStart:
+            guard pipState.willStart(generation: generation) else { return }
+        case .didStart(let possible, let active):
+            guard pipState.didStart(possible: possible, active: active, generation: generation) else { return }
+        case .failedToStart(let description):
+            guard pipState.failStart(generation: generation) else { return }
+            publishPictureInPictureState()
+            DiagnosticsLog.log("avplayer", "PiP start failed: \(description)")
+            return
+        case .willStop:
+            guard pipState.willStop(generation: generation) else { return }
+        case .didStop(let possible, let active):
+            guard pipState.didStop(possible: possible, active: active, generation: generation) else { return }
+        case .observed(let possible, let active):
+            guard pipState.observe(possible: possible, active: active, generation: generation) else { return }
+        }
         publishPictureInPictureState()
-    }
-
-    func pictureInPictureControllerDidStartPictureInPicture(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) {
-        guard let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return }
-        guard pipState.didStart(
-            possible: pictureInPictureController.isPictureInPicturePossible,
-            active: pictureInPictureController.isPictureInPictureActive,
-            generation: generation) else { return }
-        publishPictureInPictureState()
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        failedToStartPictureInPictureWithError error: Error
-    ) {
-        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
-              pipState.failStart(generation: generation) else { return }
-        publishPictureInPictureState()
-        DiagnosticsLog.log("avplayer", "PiP start failed: \(error.localizedDescription)")
-    }
-
-    func pictureInPictureControllerWillStopPictureInPicture(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) {
-        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
-              pipState.willStop(generation: generation) else { return }
-        publishPictureInPictureState()
-    }
-
-    func pictureInPictureControllerDidStopPictureInPicture(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) {
-        guard let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return }
-        guard pipState.didStop(
-            possible: pictureInPictureController.isPictureInPicturePossible,
-            active: pictureInPictureController.isPictureInPictureActive,
-            generation: generation) else { return }
-        publishPictureInPictureState()
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
-    ) {
-        // PlayerScreen remains mounted over the same layer, so there is no second UI to present. A retired
-        // controller must decline restoration rather than waking a replacement screen with stale state.
-        completionHandler(pictureInPictureGeneration(for: pictureInPictureController) != nil)
     }
 }
 #endif

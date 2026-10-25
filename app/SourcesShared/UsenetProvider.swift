@@ -527,7 +527,7 @@ struct UsenetProviderView: View {
 
                 Toggle("Use SSL", isOn: $useSSL)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: useSSL) { applySSLDefaultPort($0) }
+                    .onValueChange(of: useSSL) { applySSLDefaultPort($0) }
 
                 Text("Most providers use SSL on port 563, or plain NNTP on port 119. Keep connections at or below your provider's limit.")
                     .font(Theme.Typography.label)

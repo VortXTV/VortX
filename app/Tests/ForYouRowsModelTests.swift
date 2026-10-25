@@ -41,13 +41,25 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String, line: Int =
     let libraryOnly = SmartCollection.make(name: "Library only", rules: SmartCollectionRules(), home: false)
     let model = ForYouRowsModel()
 
-    model.refresh(profileID: profile, interests: interests, collections: [pinned, libraryOnly], owned: [], watched: [], enabled: true)
+    let homeReadNow = Date()
+    model.refresh(profileID: profile, interests: interests, collections: [pinned, libraryOnly], owned: [], watched: [], enabled: true, now: homeReadNow)
     await settle(model)
     expect(model.interestRows.map(\.id) == ["forYou.genre.scifi", "forYou.person.7"], "interest rows follow the plan order")
     expect(model.interestRows.first?.eyebrow == "From your interests", "the reason is shown")
     expect(model.collectionRows.map(\.title) == ["Weekend dramas"], "only collections pinned to Home become rows")
     let fetched = TMDBClient.calls.count
     expect(fetched == 3, "two interest rows and one pinned collection are fetched")
+
+    let visibleInterests = model.interestRows.flatMap(\.items)
+    expect(model.currentInterestItems(profileID: profile, interests: interests, now: homeReadNow) == visibleInterests,
+           "Home action accepts only the current profile/query rows")
+    expect(model.currentInterestItems(profileID: UUID(), interests: interests, now: homeReadNow).isEmpty,
+           "Home action cannot borrow a previous profile's rows before observer refresh")
+    expect(model.currentInterestItems(profileID: profile, interests: ForYouInterests(genres: ["drama"]), now: homeReadNow).isEmpty,
+           "Home action rejects rows from replaced interest choices")
+    expect(model.currentInterestItems(profileID: profile, interests: interests, now: homeReadNow.addingTimeInterval(86_400)).isEmpty,
+           "Home action rejects stale date-bounded recommendations")
+    expect(TMDBClient.calls.count == fetched, "Home ownership checks never start a recommendation fetch")
 
     let firstScifi = model.interestRows[0].items[0].id
     let firstDrama = model.collectionRows[0].items[0].id
@@ -67,6 +79,8 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String, line: Int =
 
     model.refresh(profileID: profile, interests: interests, collections: [], owned: [], watched: [], enabled: false)
     expect(model.interestRows.isEmpty && model.collectionRows.isEmpty, "disabled clears every row at once")
+    expect(model.currentInterestItems(profileID: profile, interests: interests, now: homeReadNow).isEmpty,
+           "Home action cannot retain disabled recommendation rows")
 
     TMDBClient.empty = true
     let other = UUID()

@@ -36,8 +36,10 @@ struct JSProviderURLPolicy: Sendable {
         if deniedHosts.contains(host) { return false }
         if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") { return false }
         let normalizedIPv6 = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        // IPv6 loopback, unspecified, unique-local, and link-local literals.
-        if normalizedIPv6 == "::" || normalizedIPv6 == "::1" || normalizedIPv6.hasPrefix("fc") ||
+        // Apply IPv6 prefixes only to a colon-bearing URL host, not a DNS name such as fcastle.example.
+        // Numeric-peer validation after DNS remains mandatory and unchanged.
+        if normalizedIPv6.contains(":"),
+           normalizedIPv6 == "::" || normalizedIPv6 == "::1" || normalizedIPv6.hasPrefix("fc") ||
             normalizedIPv6.hasPrefix("fd") || ["fe8", "fe9", "fea", "feb"].contains(where: { normalizedIPv6.hasPrefix($0) }) { return false }
         if Self.isBlockedIPv4(host) { return false }
         return true
@@ -74,7 +76,7 @@ struct JSProviderURLPolicy: Sendable {
             var numeric = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(info.ai_addr, info.ai_addrlen, &numeric, socklen_t(numeric.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { return nil }
-            let value = String(cString: numeric)
+            let value = String(decoding: numeric.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
             guard isPublicNumericAddress(value) else { return nil }
             addresses.insert(value)
         }

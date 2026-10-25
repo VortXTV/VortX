@@ -12,19 +12,27 @@ package com.vortx.android.player.mpv.seam
 internal class MpvNativeHandleGate(initialHandle: Long) {
     private enum class Phase { ACTIVE, DESTROYING, DESTROYED }
 
-    private val lock = java.lang.Object()
+    private val lock = Any()
     private var phase = Phase.ACTIVE
     private var handle = initialHandle
     private var inFlightCalls = 0
+    private var originalOwnerLiveness: java.util.concurrent.atomic.AtomicBoolean? = null
     private var destroyAfterLastCall: ((Long) -> Unit)? = null
 
     init {
         require(initialHandle != 0L) { "native handle must be non-zero" }
     }
 
+    /** Initialization may precede binding, but owner binding is permanent and never renewable. */
+    fun bindOriginalOwner(liveness: java.util.concurrent.atomic.AtomicBoolean): Boolean = synchronized(lock) {
+        if (phase != Phase.ACTIVE || originalOwnerLiveness != null) return@synchronized false
+        originalOwnerLiveness = liveness
+        liveness.get()
+    }
+
     fun <T> withHandle(defaultValue: T, call: (Long) -> T): T {
         val leasedHandle = synchronized(lock) {
-            if (phase != Phase.ACTIVE) return defaultValue
+            if (phase != Phase.ACTIVE || originalOwnerLiveness?.get() == false) return defaultValue
             inFlightCalls += 1
             handle
         }

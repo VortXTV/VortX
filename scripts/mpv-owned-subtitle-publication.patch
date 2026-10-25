@@ -1,0 +1,1158 @@
+VortX exact-ticket owned subtitle primary-slot publication, first-drain successor.
+
+Base: mpv 8c67647b50059406c5c0444903597281b81516cf, after retained
+platform/HTTP/audio/GPU/original-file/edition patches and
+mpv-owned-subtitle-constructor.patch. The original-local-file witness property
+is a prerequisite. This carries the corrected independently reviewed 16 native
+paths only; no private engine or unrelated custom working-tree delta is added.
+
+Preparation uses the bounded whole-corpus constructor off-core. Commit/revoke
+retain exact positive ticket ownership. Primary OSD readers and destruction
+retain native lifetime. Closing occurs before the FIRST live-core client drain;
+its idempotent fallback cannot queue reapers after last-client core-thread join.
+Commands use existing public node transport; no exported C ABI is introduced.
+
+The host must still reserve original account/profile renderer ownership and
+prove retirement. Native tuple equality is not host authority. Source carrier
+is not compilation, runtime, packaged adoption or release acceptance. Fresh
+complete builds and caller/lifetime/device gates remain required. Existing
+upstream licensing applies.
+
+diff --git a/input/cmd.c b/input/cmd.c
+--- a/input/cmd.c
++++ b/input/cmd.c
+@@ -588,6 +588,10 @@ void mp_cmd_dump(struct mp_log *log, int msgl, char *header, struct mp_cmd *cmd)
+         mp_msg(log, msgl, "(NULL)\n");
+         return;
+     }
++    if (cmd->def->redact_args) {
++        mp_msg(log, msgl, "%s, flags=%d, args=<private>\n", cmd->name, cmd->flags);
++        return;
++    }
+     mp_msg(log, msgl, "%s, flags=%d, args=[", cmd->name, cmd->flags);
+     int argc = get_arg_count(cmd->def);
+     for (int n = 0; n < cmd->nargs; n++) {
+diff --git a/input/cmd.h b/input/cmd.h
+--- a/input/cmd.h
++++ b/input/cmd.h
+@@ -41,6 +41,7 @@ struct mp_cmd_def {
+     bool scalable;      // command called with scale for high resolution input
+     bool is_ignore;     // used by ignore command only, avoids queuing commands
+     bool is_noisy;      // reduce log level
++    bool redact_args;   // retained private cue payload; never dump contents
+     bool default_async; // default to MP_ASYNC flag if none set by user
+     // If you set this, handler() must ensure mp_cmd_ctx_complete() is called
+     // at some point (can be after handler() returns). If you don't set it, the
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -169,6 +169,7 @@
+     'player/audio.c',
+     'player/client.c',
+     'player/command.c',
++    'player/owned_subtitle.c',
+     'player/configfiles.c',
+     'player/external_files.c',
+     'player/loadfile.c',
+diff --git a/options/m_config_frontend.c b/options/m_config_frontend.c
+--- a/options/m_config_frontend.c
++++ b/options/m_config_frontend.c
+@@ -520,6 +520,8 @@ static void config_destroy(void *p)
+ {
+     struct m_config *config = p;
+     config->option_change_callback = NULL;
++    config->option_set_attempt_callback = NULL;
++    config->option_set_attempt_callback_ctx = NULL;
+     m_config_restore_backups(config);
+ 
+     struct m_opt_backup **list = &config->watch_later_backup_opts;
+@@ -635,6 +637,9 @@ int m_config_set_option_raw(struct m_config *config,
+ 
+     m_config_mark_co_flags(co, flags);
+ 
++    if (config->option_set_attempt_callback)
++        config->option_set_attempt_callback(config->option_set_attempt_callback_ctx, co);
++
+     m_option_copy(co->opt, co->data, data);
+     if (m_config_cache_write_opt(config->cache, co->data))
+         force_self_notify_change_opt(config, co, false);
+diff --git a/options/m_config_frontend.h b/options/m_config_frontend.h
+--- a/options/m_config_frontend.h
++++ b/options/m_config_frontend.h
+@@ -92,6 +92,11 @@ typedef struct m_config {
+                                    uint64_t flags, bool self_update);
+     void *option_change_callback_ctx;
+ 
++    // Validated write attempt, including same-value writes, before copy.
++    // Scalar retirement only; never apply options or enter a renderer here.
++    void (*option_set_attempt_callback)(void *ctx, struct m_config_option *co);
++    void *option_set_attempt_callback_ctx;
++
+     // For the command line parser
+     int recursion_depth;
+ 
+diff --git a/player/client.c b/player/client.c
+--- a/player/client.c
++++ b/player/client.c
+@@ -44,6 +44,7 @@
+ #include "stream/stream.h"
+ 
+ #include "command.h"
++#include "owned_subtitle.h"
+ #include "core.h"
+ #include "client.h"
+ 
+@@ -542,6 +543,10 @@ void mpv_terminate_destroy(mpv_handle *ctx)
+ // Also happens to take care of shutting down any async work.
+ void mp_shutdown_clients(struct MPContext *mpctx)
+ {
++    // Close publication and queue every owned cleanup while the actual
++    // core owner can still service dispatch in the async drain below.
++    // mp_destroy after last-client join calls this again; it is idempotent.
++    mp_vortx_owned_subtitle_shutdown(mpctx);
+     struct mp_client_api *clients = mpctx->clients;
+ 
+     // Forcefully abort async work after 2 seconds of waiting.
+diff --git a/player/command.c b/player/command.c
+--- a/player/command.c
++++ b/player/command.c
+@@ -46,6 +46,7 @@
+ #include "common/stats.h"
+ #include "filters/f_decoder_wrapper.h"
+ #include "command.h"
++#include "owned_subtitle.h"
+ #include "osdep/als.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+@@ -4650,6 +4651,7 @@
+     {"env", mp_property_env},
+     {"stream-open-filename", mp_property_stream_open_filename},
+     {"vortx-original-local-file", mp_property_original_local_file},
++    {"vortx-owned-subtitle-state", mp_property_vortx_owned_subtitle},
+     {"file-size", mp_property_file_size},
+     {"path", mp_property_path},
+     {"media-title", mp_property_media_title},
+@@ -8009,6 +8011,22 @@
+     { "flush-status-line", cmd_flush_status_line, { {"clear", OPT_BOOL(v.b)} } },
+ 
+     { "notify-property", cmd_notify_property, { {"property", OPT_STRING(v.s)} } },
++    { "vortx-subtitle-owned-prepare", cmd_vortx_owned_subtitle_prepare, {
++        {"intent", OPT_INT64(v.i64)}, {"entry", OPT_INT64(v.i64)},
++        {"source", OPT_INT64(v.i64)}, {"sid", OPT_INT64(v.i64)},
++        {"ff-index", OPT_INT64(v.i64)}, {"origin", OPT_DOUBLE(v.d)},
++        {"payload", OPT_STRING(v.s)},
++    }, .spawn_thread = true, .can_abort = true, .abort_on_playback_end = true,
++       .redact_args = true },
++    { "vortx-subtitle-owned-commit", cmd_vortx_owned_subtitle_commit, {
++        {"ticket", OPT_INT64(v.i64)}, {"intent", OPT_INT64(v.i64)},
++        {"entry", OPT_INT64(v.i64)}, {"source", OPT_INT64(v.i64)},
++        {"sid", OPT_INT64(v.i64)}, {"ff-index", OPT_INT64(v.i64)},
++        {"origin", OPT_DOUBLE(v.d)},
++    } },
++    { "vortx-subtitle-owned-revoke", cmd_vortx_owned_subtitle_revoke, {
++        {"ticket", OPT_INT64(v.i64)},
++    } },
+ 
+     {0}
+ };
+@@ -8019,6 +8037,7 @@
+ void command_uninit(struct MPContext *mpctx)
+ {
+     struct command_ctx *ctx = mpctx->command_ctx;
++    mp_vortx_owned_subtitle_uninit(mpctx);
+ 
+     mp_assert(!ctx->cache_dump_cmd); // closing the demuxer must have aborted it
+ 
+@@ -8043,6 +8062,7 @@
+         .last_seek_pts = MP_NOPTS_VALUE,
+     };
+     mpctx->command_ctx = ctx;
++    mp_vortx_owned_subtitle_init(mpctx);
+ 
+     int num_base = MP_ARRAY_SIZE(mp_properties_base);
+     int num_opts = m_config_get_co_count(mpctx->mconfig);
+@@ -8153,6 +8173,7 @@
+ 
+ void handle_command_updates(struct MPContext *mpctx)
+ {
++    mp_vortx_owned_subtitle_updates(mpctx);
+     struct command_ctx *ctx = mpctx->command_ctx;
+ 
+     // This is a bit messy: ao_hotplug wakes up the player, and then we have
+@@ -8228,6 +8249,7 @@
+     struct MPContext *mpctx = ctx;
+     struct MPOpts *opts = mpctx->opts;
+     void *opt_ptr = !co ? NULL : co->data; // NULL on start
++    mp_vortx_owned_subtitle_option_attempt(mpctx, co);
+ 
+     if (co)
+         mp_notify_property(mpctx, co->name);
+diff --git a/player/core.h b/player/core.h
+--- a/player/core.h
++++ b/player/core.h
+@@ -446,6 +446,7 @@ typedef struct MPContext {
+ 
+     struct screenshot_ctx *screenshot_ctx;
+     struct command_ctx *command_ctx;
++    struct vortx_owned_subtitle *vortx_owned_subtitle;
+     struct encode_lavc_context *encode_lavc_ctx;
+ 
+     struct mp_option_callback *option_callbacks;
+diff --git a/player/loadfile.c b/player/loadfile.c
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -60,6 +60,7 @@
+ 
+ #include "core.h"
+ #include "command.h"
++#include "owned_subtitle.h"
+ 
+ // Called from the demuxer thread if a new packet is available, or other changes.
+ static void wakeup_demux(void *pctx)
+@@ -750,6 +751,10 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
+     mp_assert(type >= 0 && type < STREAM_TYPE_COUNT);
+     mp_assert(order >= 0 && order < num_ptracks[type]);
+ 
++    // An explicit same-track A->A write is still a manual intent.
++    if (type == STREAM_SUB)
++        mp_vortx_owned_subtitle_retire(mpctx);
++
+     // Mark the current track selection as explicitly user-requested. (This is
+     // different from auto-selection or disabling a track due to errors.)
+     if (flags & FLAG_MARK_SELECTION)
+@@ -2065,6 +2070,7 @@ terminate_playback:
+     reinit_complex_filters(mpctx, true);
+     uninit_audio_chain(mpctx);
+     uninit_video_chain(mpctx);
++    mp_vortx_owned_subtitle_retire(mpctx);
+     uninit_sub_all(mpctx);
+     if (!opts->gapless_audio && !mpctx->encode_lavc_ctx)
+         uninit_audio_out(mpctx);
+diff --git a/player/main.c b/player/main.c
+--- a/player/main.c
++++ b/player/main.c
+@@ -68,6 +68,7 @@
+ #include "core.h"
+ #include "client.h"
+ #include "command.h"
++#include "owned_subtitle.h"
+ #include "screenshot.h"
+ 
+ #include "stream/stream_curl.h"
+@@ -177,6 +178,8 @@ void mp_print_version(struct mp_log *log, int always)
+ 
+ void mp_destroy(struct MPContext *mpctx)
+ {
++    // Close owned publication before shutdown joins every native worker.
++    mp_vortx_owned_subtitle_shutdown(mpctx);
+     mp_shutdown_clients(mpctx);
+ 
+     mp_uninit_ipc(mpctx->ipc_ctx);
+@@ -320,6 +323,7 @@ struct MPContext *mp_create(void)
+     init_libav(mpctx->global);
+     mp_clients_init(mpctx);
+     mpctx->osd = osd_create(mpctx->global);
++    mp_vortx_owned_subtitle_bind_osd(mpctx);
+ 
+ #if HAVE_COCOA
+     cocoa_set_input_context(mpctx->input);
+diff --git a/player/owned_subtitle.c b/player/owned_subtitle.c
+new file mode 100644
+--- /dev/null
++++ b/player/owned_subtitle.c
+@@ -0,0 +1,593 @@
++/* Owned, whole-corpus subtitle publication through the real primary OSD slot.
++ * This file is linked inside libmpv. Only existing node commands/properties
++ * cross into Swift; no internal pointer or borrowed packet crosses that ABI.
++ */
++#include <assert.h>
++#include <limits.h>
++#include <math.h>
++#include <string.h>
++
++#include "config.h"
++#include "mpv_talloc.h"
++#include "mpv/client.h"
++#include "common/common.h"
++#include "common/playlist.h"
++#include "demux/demux.h"
++#include "demux/stheader.h"
++#include "input/cmd.h"
++#include "misc/json.h"
++#include "misc/node.h"
++#include "misc/thread_pool.h"
++#include "misc/thread_tools.h"
++#include "options/m_config_frontend.h"
++#include "options/m_option.h"
++#include "options/m_property.h"
++#include "options/options.h"
++#include "osdep/timer.h"
++#include "player/client.h"
++#include "player/command.h"
++#include "player/core.h"
++#include "sub/dec_sub.h"
++#include "sub/osd.h"
++#include "sub/owned_text_slot.h"
++#include "owned_subtitle.h"
++
++#define OWNED_JSON_LIMIT (9 * 1024 * 1024)
++
++struct owned_witness {
++    int64_t intent, entry, source;
++    int sid, ff_index, play_dir;
++    double origin, video_fps;
++    bool visible;
++};
++
++struct vortx_owned_subtitle {
++    int64_t intent, sequence;
++    bool preparing, closing;
++    struct vortx_owned_text *ready;
++    struct owned_witness ready_witness, active_witness;
++    struct vortx_owned_text *retired[2];
++    int retired_count;
++    int64_t reaping_tickets[2];
++    int reaping_count;
++};
++
++struct owned_reap {
++    struct MPContext *mpctx;
++    struct osd_state *osd;
++    struct vortx_owned_text *objects[2];
++    int64_t tickets[2];
++    int count;
++};
++
++static void kick_reaper(struct MPContext *mpctx);
++
++static void retire_object(struct vortx_owned_subtitle *s,
++                          struct vortx_owned_text *object)
++{
++    if (!object)
++        return;
++    // No prepare/publish is admitted with a retirement/reaper backlog. A
++    // replacement then mandatory revoke therefore needs at most two slots.
++    mp_assert(s->retired_count < MP_ARRAY_SIZE(s->retired));
++    s->retired[s->retired_count++] = object;
++}
++
++void mp_vortx_owned_subtitle_retire(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    if (!s)
++        return;
++    if (mpctx->osd)
++        retire_object(s, osd_vortx_owned_text_exchange(mpctx->osd, NULL));
++    retire_object(s, s->ready);
++    s->ready = NULL;
++    if (s->intent < INT64_MAX)
++        s->intent++;
++    // Notification wakes a deferred poll/reaper without acquiring an OSD or
++    // decoder lock. No destructor runs in an option or source admission body.
++    if (mpctx->clients && mpctx->osd) {
++        mp_notify_property(mpctx, "vortx-owned-subtitle-state");
++        mp_wakeup_core(mpctx);
++    }
++}
++
++void mp_vortx_owned_subtitle_option_attempt(void *p, struct m_config_option *co)
++{
++    static const char *const names[] = {
++        "sid", "secondary-sid", "sub-delay", "sub-speed", "sub-fps",
++        "sub-visibility", "secondary-sub-visibility", "rebase-start-time",
++        "input-terminal", "input-default-bindings", "input-vo-keyboard", "osc",
++        "config", "scripts", "load-scripts", "vf", "lavfi-complex",
++        "play-dir", "video-fps-override", NULL,
++    };
++    for (int n = 0; co && names[n]; n++) {
++        if (!strcmp(co->name, names[n])) {
++            mp_vortx_owned_subtitle_retire(p);
++            break;
++        }
++    }
++}
++
++static bool false_option(struct MPContext *mpctx, const char *name)
++{
++    struct m_config_option *co = m_config_get_co(mpctx->mconfig, bstr0(name));
++    return co && co->data && co->opt->type == CONF_TYPE_BOOL && !*(bool *)co->data;
++}
++
++static bool capture(struct MPContext *mpctx, struct owned_witness *out)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    struct MPOpts *o = mpctx->opts;
++    struct demuxer *d = mpctx->demuxer;
++    if (!s || s->closing || !mpctx->osd ||
++        !osd_vortx_owned_text_available(mpctx->osd) ||
++        s->intent <= 0 || s->intent == INT64_MAX || mpctx->stop_play ||
++        !mpctx->playback_initialized || !mpctx->playing || mpctx->playing->id <= 0 ||
++        !d || !d->original_local_file_identity || d->original_local_file_generation <= 0 ||
++        d->is_network || d->is_streaming || strcmp(d->desc->name, "lavf") ||
++        !isfinite(d->start_time) || fabs(d->start_time) > 86400 ||
++        mpctx->num_option_callbacks || mpctx->num_tracks < 1 || mpctx->num_tracks > 128 ||
++        !o->rebase_start_time || o->subs_shared->sub_delay[0] != 0 ||
++        o->subs_rend->sub_speed != 1 || o->subs_rend->sub_fps != 0 ||
++        (mpctx->play_dir != 1 && mpctx->play_dir != -1) ||
++        o->consolecontrols || o->load_config || o->auto_load_scripts ||
++        (o->script_files && o->script_files[0]) ||
++        (o->vf_settings && o->vf_settings[0].name) ||
++        (o->lavfi_complex && o->lavfi_complex[0]) ||
++        !false_option(mpctx, "input-default-bindings") ||
++        !false_option(mpctx, "input-vo-keyboard") ||
++        mpctx->mconfig->option_set_attempt_callback != mp_vortx_owned_subtitle_option_attempt ||
++        mpctx->mconfig->option_set_attempt_callback_ctx != mpctx)
++        return false;
++#if HAVE_LUA
++    if (o->lua_load_osc)
++        return false;
++#endif
++    struct track *primary = mpctx->current_track[0][STREAM_SUB];
++    if (!primary || primary->type != STREAM_SUB || !primary->selected ||
++        primary->is_external || primary->demuxer != d || !primary->stream ||
++        primary->user_tid <= 0 || primary->ff_index < 0 || primary->ff_index >= 128 ||
++        mpctx->current_track[1][STREAM_SUB] == primary)
++        return false;
++    int matches = 0;
++    for (int n = 0; n < mpctx->num_tracks; n++) {
++        struct track *t = mpctx->tracks[n];
++        if (t->type == STREAM_SUB && t->user_tid == primary->user_tid)
++            matches++;
++    }
++    if (matches != 1)
++        return false;
++    struct track *video = mpctx->current_track[0][STREAM_VIDEO];
++    double fps = video && video->stream && video->stream->codec ?
++                     video->stream->codec->fps : 25;
++    if (!isfinite(fps) || fps < 0)
++        return false;
++    *out = (struct owned_witness){
++        .intent = s->intent, .entry = mpctx->playing->id,
++        .source = d->original_local_file_generation,
++        .sid = primary->user_tid, .ff_index = primary->ff_index,
++        .origin = d->start_time, .visible = o->subs_shared->sub_visibility[0],
++        .play_dir = mpctx->play_dir, .video_fps = fps,
++    };
++    return true;
++}
++
++static bool same(const struct owned_witness *a, const struct owned_witness *b)
++{
++    return a->intent == b->intent && a->entry == b->entry &&
++        a->source == b->source && a->sid == b->sid && a->ff_index == b->ff_index &&
++        a->origin == b->origin && a->visible == b->visible &&
++        a->play_dir == b->play_dir && a->video_fps == b->video_fps;
++}
++
++static bool args_match(struct mp_cmd_ctx *cmd, int offset,
++                       const struct owned_witness *s)
++{
++    return cmd->args[offset].v.i64 == s->intent &&
++        cmd->args[offset + 1].v.i64 == s->entry &&
++        cmd->args[offset + 2].v.i64 == s->source &&
++        cmd->args[offset + 3].v.i64 == s->sid &&
++        cmd->args[offset + 4].v.i64 == s->ff_index &&
++        cmd->args[offset + 5].v.d == s->origin;
++}
++
++int mp_property_vortx_owned_subtitle(void *p, struct m_property *prop,
++                                    int action, void *arg)
++{
++    struct MPContext *mpctx = p;
++    struct owned_witness s;
++    if (!capture(mpctx, &s))
++        return M_PROPERTY_UNAVAILABLE;
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++    struct mpv_node *r = arg;
++    node_init(r, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(r, "version", 1);
++    node_map_add_int64(r, "intent-generation", s.intent);
++    node_map_add_int64(r, "entry-id", s.entry);
++    node_map_add_int64(r, "source-generation", s.source);
++    node_map_add_int64(r, "sid", s.sid);
++    node_map_add_int64(r, "ff-index", s.ff_index);
++    node_map_add_double(r, "origin", s.origin);
++    node_map_add_flag(r, "primary-visible", s.visible);
++    struct vortx_owned_text *active = osd_vortx_owned_text_current(mpctx->osd);
++    node_map_add_int64(r, "active-ticket", active ? active->ticket : 0);
++    return M_PROPERTY_OK;
++}
++
++static struct attachment_list *copy_attachments(struct demuxer *d)
++{
++    // Snapshot ONLY the original primary media demuxer. Reject over-budget
++    // inputs before copying any font; silently dropping fonts changes layout.
++    if (d->num_attachments < 0 || d->num_attachments > SUB_OWNED_TEXT_MAX_ATTACHMENTS ||
++        (d->num_attachments && !d->attachments))
++        return NULL;
++    size_t total = 0;
++    for (int n = 0; n < d->num_attachments; n++) {
++        struct demux_attachment *a = &d->attachments[n];
++        if (!a->name || !a->type || (a->data_size && !a->data) ||
++            strnlen(a->name, SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME + 1) > SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME ||
++            strnlen(a->type, SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME + 1) > SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME ||
++            a->data_size > SUB_OWNED_TEXT_MAX_ATTACHMENT_BYTES ||
++            a->data_size > SUB_OWNED_TEXT_MAX_ATTACHMENT_TOTAL - total)
++            return NULL;
++        total += a->data_size;
++    }
++    struct attachment_list *copy = talloc_zero(NULL, struct attachment_list);
++    copy->entries = talloc_zero_array(copy, struct demux_attachment, d->num_attachments);
++    copy->num_entries = d->num_attachments;
++    for (int n = 0; n < d->num_attachments; n++) {
++        struct demux_attachment *a = &d->attachments[n];
++        copy->entries[n] = (struct demux_attachment){
++            .name = talloc_strdup(copy, a->name), .type = talloc_strdup(copy, a->type),
++            .data = talloc_memdup(copy, a->data, a->data_size), .data_size = a->data_size,
++        };
++    }
++    return copy;
++}
++
++static bool exact_keys(struct mpv_node *node, const char *const *keys, int count)
++{
++    if (node->format != MPV_FORMAT_NODE_MAP || !node->u.list ||
++        node->u.list->num != count || !node->u.list->keys || !node->u.list->values)
++        return false;
++    unsigned seen = 0;
++    for (int n = 0; n < count; n++) {
++        const char *key = node->u.list->keys[n];
++        int found = -1;
++        for (int k = 0; key && k < count; k++)
++            if (!strcmp(key, keys[k]))
++                found = k;
++        if (found < 0 || (seen & (1u << found)))
++            return false;
++        seen |= 1u << found;
++    }
++    return true;
++}
++
++static int hex(char c)
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++static bool lossless_json_escapes(const char *json)
++{
++    // mpv's generic parser accepts C escapes and returns NUL-terminated strings.
++    // Refuse byte escapes and escaped NUL BEFORE parsing so strlen cannot hide
++    // a truncated cue or key. Escaped literal backslashes remain ordinary text.
++    for (size_t n = 0; json[n]; n++) {
++        if (json[n] != '\\')
++            continue;
++        char c = json[++n];
++        if (!c || !strchr("\"\\/bfnrtu", c))
++            return false;
++        if (c != 'u')
++            continue;
++        unsigned value = 0;
++        for (int k = 0; k < 4; k++) {
++            int digit = hex(json[++n]);
++            if (digit < 0)
++                return false;
++            value = value * 16 + digit;
++        }
++        if (!value)
++            return false;
++    }
++    return true;
++}
++
++static struct dec_sub *decode_payload(struct mpv_global *global,
++                                      struct attachment_list *attachments,
++                                      const char *payload, int direction, double fps,
++                                      struct mp_cancel *cancel, int64_t deadline)
++{
++    void *tmp = talloc_new(NULL);
++    struct dec_sub *decoder = NULL;
++    if (!payload || strnlen(payload, OWNED_JSON_LIMIT + 1) > OWNED_JSON_LIMIT ||
++        !lossless_json_escapes(payload) || mp_cancel_test(cancel))
++        goto done;
++    char *cursor = talloc_strdup(tmp, payload);
++    struct mpv_node root = {0};
++    if (json_parse(tmp, &root, &cursor, 5) < 0)
++        goto done;
++    json_skip_whitespace(&cursor);
++    if (*cursor)
++        goto done;
++    const char *const root_keys[] = {"version", "language", "cues"};
++    if (!exact_keys(&root, root_keys, 3))
++        goto done;
++    struct mpv_node *version = node_map_get(&root, "version");
++    struct mpv_node *language = node_map_get(&root, "language");
++    struct mpv_node *cues = node_map_get(&root, "cues");
++    if (version->format != MPV_FORMAT_INT64 || version->u.int64 != 1 ||
++        language->format != MPV_FORMAT_STRING || !language->u.string ||
++        cues->format != MPV_FORMAT_NODE_ARRAY || !cues->u.list ||
++        cues->u.list->num < 1 || cues->u.list->num > SUB_OWNED_TEXT_MAX_CUES ||
++        !cues->u.list->values)
++        goto done;
++    int count = cues->u.list->num;
++    struct sub_owned_text_cue *owned = talloc_zero_array(tmp, struct sub_owned_text_cue, count);
++    const char *const cue_keys[] = {"startMs", "endMs", "text"};
++    for (int n = 0; n < count; n++) {
++        struct mpv_node *cue = &cues->u.list->values[n];
++        if (!exact_keys(cue, cue_keys, 3))
++            goto done;
++        struct mpv_node *start = node_map_get(cue, "startMs");
++        struct mpv_node *end = node_map_get(cue, "endMs");
++        struct mpv_node *text = node_map_get(cue, "text");
++        if (start->format != MPV_FORMAT_INT64 || start->u.int64 < 0 ||
++            end->format != MPV_FORMAT_INT64 || end->u.int64 <= start->u.int64 ||
++            end->u.int64 > SUB_OWNED_TEXT_MAX_END_MS ||
++            text->format != MPV_FORMAT_STRING || !text->u.string)
++            goto done;
++        owned[n] = (struct sub_owned_text_cue){
++            .start_ms = start->u.int64, .end_ms = end->u.int64,
++            .utf8 = text->u.string,
++            .length = strnlen(text->u.string, SUB_OWNED_TEXT_MAX_CUE_BYTES + 1),
++        };
++    }
++    // All decoding/filtering completes on this worker. The constructor owns
++    // attachments on entry and never borrows a live track, stream or demuxer.
++    decoder = sub_create_owned_text(global, attachments, language->u.string,
++        owned, count, direction, fps, cancel, deadline, NULL);
++    attachments = NULL;
++done:
++    talloc_free(attachments);
++    talloc_free(tmp);
++    return decoder;
++}
++
++void cmd_vortx_owned_subtitle_prepare(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    struct owned_witness original, current;
++    cmd->success = false;
++    if (!s || mp_cancel_test(cmd->abort->cancel) ||
++        s->preparing || s->ready || s->retired_count || s->reaping_count ||
++        s->sequence == INT64_MAX || !capture(mpctx, &original) ||
++        !args_match(cmd, 0, &original))
++        return;
++    struct attachment_list *attachments = copy_attachments(mpctx->demuxer);
++    if (!attachments)
++        return;
++    int64_t ticket = ++s->sequence; // consume even on cancellation/failure
++    s->preparing = true;
++    struct mpv_global *global = mpctx->global;
++    int64_t deadline = mp_time_ns() + SUB_OWNED_TEXT_MAX_WORK_NS;
++    // spawn_thread's outstanding_async hold keeps mpctx/global/config/log alive.
++    // No core/admission/OSD/decoder lock remains held while fonts and cues decode.
++    mp_core_unlock(mpctx);
++    struct dec_sub *decoder = decode_payload(global, attachments, cmd->args[6].v.s,
++        original.play_dir, original.video_fps, cmd->abort->cancel, deadline);
++    struct vortx_owned_text *ready = NULL;
++    if (decoder) {
++        ready = talloc(NULL, struct vortx_owned_text);
++        *ready = (struct vortx_owned_text){.ticket = ticket, .decoder = decoder};
++    }
++    mp_core_lock(mpctx);
++    s->preparing = false;
++    if (!ready || mp_cancel_test(cmd->abort->cancel) ||
++        !capture(mpctx, &current) || !same(&original, &current) || s->ready) {
++        mp_core_unlock(mpctx);
++        if (ready) {
++            sub_destroy_owned_text(ready->decoder);
++            talloc_free(ready);
++        }
++        mp_core_lock(mpctx);
++        return;
++    }
++    s->ready = ready;
++    s->ready_witness = original;
++    node_init(&cmd->result, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(&cmd->result, "version", 1);
++    node_map_add_int64(&cmd->result, "ticket", ticket);
++    cmd->success = true;
++}
++
++void cmd_vortx_owned_subtitle_commit(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    struct owned_witness current;
++    cmd->success = false;
++    if (!s || !s->ready || s->retired_count || s->reaping_count ||
++        cmd->args[0].v.i64 <= 0 || s->ready->ticket != cmd->args[0].v.i64 ||
++        !capture(mpctx, &current) || !same(&s->ready_witness, &current) ||
++        !args_match(cmd, 1, &current))
++        return;
++    // Final native admission contains scalar checks and a lock-free exchange.
++    // The ORIGINAL host effect lease remains retained outside its scalar lock.
++    struct vortx_owned_text *ready = s->ready;
++    retire_object(s, osd_vortx_owned_text_exchange(mpctx->osd, ready));
++    s->ready = NULL;
++    s->active_witness = current;
++    node_init(&cmd->result, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(&cmd->result, "version", 1);
++    node_map_add_int64(&cmd->result, "ticket", ready->ticket);
++    node_map_add_flag(&cmd->result, "committed", true);
++    cmd->success = true;
++    mp_notify_property(mpctx, "vortx-owned-subtitle-state");
++    mp_wakeup_core(mpctx);
++}
++
++void cmd_vortx_owned_subtitle_revoke(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    int64_t ticket = cmd->args[0].v.i64;
++    bool released = false;
++    if (s && ticket > 0) {
++        if (s->ready && s->ready->ticket == ticket) {
++            retire_object(s, s->ready);
++            s->ready = NULL;
++            released = true;
++        }
++        struct vortx_owned_text *active = mpctx->osd ?
++            osd_vortx_owned_text_current(mpctx->osd) : NULL;
++        if (active && active->ticket == ticket) {
++            retire_object(s, osd_vortx_owned_text_exchange(mpctx->osd, NULL));
++            released = true;
++        }
++    }
++    node_init(&cmd->result, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(&cmd->result, "version", 1);
++    node_map_add_flag(&cmd->result, "released", released);
++    if (released) {
++        mp_notify_property(mpctx, "vortx-owned-subtitle-state");
++        mp_wakeup_core(mpctx);
++    }
++}
++
++static void reap_worker(void *p)
++{
++    struct owned_reap *work = p;
++    // Removal happened under core before this work was queued. New publication
++    // refuses until exact reap acknowledgement. This join holds neither core
++    // nor OSD; old render readers finish their complete bitmap copies first.
++    osd_vortx_owned_text_wait_quiescent(work->osd);
++    for (int n = 0; n < work->count; n++) {
++        sub_destroy_owned_text(work->objects[n]->decoder);
++        talloc_free(work->objects[n]);
++    }
++    struct MPContext *mpctx = work->mpctx;
++    mp_core_lock(mpctx);
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    mp_assert(s->reaping_count == work->count);
++    for (int n = 0; n < work->count; n++)
++        mp_assert(s->reaping_tickets[n] == work->tickets[n]);
++    s->reaping_count = 0;
++    kick_reaper(mpctx);
++    mpctx->outstanding_async--;
++    mp_wakeup_core(mpctx);
++    talloc_free(work);
++    mp_core_unlock(mpctx);
++}
++
++static void kick_reaper(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    if (!s || !s->retired_count || s->reaping_count)
++        return;
++    struct owned_reap *work = talloc_zero(NULL, struct owned_reap);
++    work->mpctx = mpctx;
++    work->osd = mpctx->osd;
++    work->count = s->retired_count;
++    for (int n = 0; n < work->count; n++) {
++        work->objects[n] = s->retired[n];
++        work->tickets[n] = s->reaping_tickets[n] = s->retired[n]->ticket;
++        s->retired[n] = NULL;
++    }
++    s->retired_count = 0;
++    s->reaping_count = work->count;
++    mpctx->outstanding_async++;
++    // A decoder exists only after prepare ran on this same thread pool. Its
++    // min_threads=1 keeps a worker thereafter; queue() can always queue onto
++    // that worker even if a new thread cannot be created. Shutdown joins these
++    // outstanding leases before command/OSD/config/log/libav destruction.
++    bool queued = mp_thread_pool_queue(mpctx->thread_pool, reap_worker, work);
++    mp_assert(queued);
++}
++
++void mp_vortx_owned_subtitle_updates(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    if (!s)
++        return;
++    struct vortx_owned_text *active = mpctx->osd ?
++        osd_vortx_owned_text_current(mpctx->osd) : NULL;
++    if (!active && !s->ready) {
++        kick_reaper(mpctx);
++        return;
++    }
++    struct owned_witness current;
++    bool valid = capture(mpctx, &current);
++    if ((active && (!valid || !same(&s->active_witness, &current) ||
++                    osd_vortx_owned_text_failed(mpctx->osd) == active->ticket)) ||
++        (s->ready && (!valid || !same(&s->ready_witness, &current))))
++        mp_vortx_owned_subtitle_retire(mpctx);
++    kick_reaper(mpctx);
++}
++
++void mp_vortx_owned_subtitle_init(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = talloc_zero(NULL, struct vortx_owned_subtitle);
++    s->intent = 1;
++    mpctx->vortx_owned_subtitle = s;
++    // Never steal another extension's callback. Capability refuses if ours is
++    // missing, replaced or paired with another owner context.
++    if (!mpctx->mconfig->option_set_attempt_callback) {
++        mpctx->mconfig->option_set_attempt_callback = mp_vortx_owned_subtitle_option_attempt;
++        mpctx->mconfig->option_set_attempt_callback_ctx = mpctx;
++    }
++}
++
++void mp_vortx_owned_subtitle_bind_osd(struct MPContext *mpctx)
++{
++    osd_vortx_owned_text_bind_wakeup(mpctx->osd, mp_wakeup_core_cb, mpctx);
++}
++
++void mp_vortx_owned_subtitle_shutdown(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    // First call runs in mp_shutdown_clients on the still-live core owner,
++    // BEFORE its async-drain loop. mp_destroy may run after libmpv joined that
++    // thread: the second call must never create new work needing dead dispatch.
++    // CLI/init-failure mp_destroy remains a safe first-call fallback.
++    if (!s || s->closing)
++        return;
++    s->closing = true;
++    mp_vortx_owned_subtitle_retire(mpctx);
++    kick_reaper(mpctx);
++}
++
++void mp_vortx_owned_subtitle_uninit(struct MPContext *mpctx)
++{
++    struct vortx_owned_subtitle *s = mpctx->vortx_owned_subtitle;
++    if (!s)
++        return;
++    // mp_shutdown_clients joined outstanding preparation/reaper leases; outputs
++    // have joined before command_uninit. Nothing owned may survive into osd_free.
++    mp_assert(!s->preparing && !s->ready && !s->retired_count && !s->reaping_count);
++    mp_assert(!mpctx->osd || !osd_vortx_owned_text_current(mpctx->osd));
++    if (mpctx->osd)
++        osd_vortx_owned_text_bind_wakeup(mpctx->osd, NULL, NULL);
++    if (mpctx->mconfig->option_set_attempt_callback == mp_vortx_owned_subtitle_option_attempt &&
++        mpctx->mconfig->option_set_attempt_callback_ctx == mpctx) {
++        mpctx->mconfig->option_set_attempt_callback = NULL;
++        mpctx->mconfig->option_set_attempt_callback_ctx = NULL;
++    }
++    talloc_free(s);
++    mpctx->vortx_owned_subtitle = NULL;
++}
+diff --git a/player/owned_subtitle.h b/player/owned_subtitle.h
+new file mode 100644
+--- /dev/null
++++ b/player/owned_subtitle.h
+@@ -0,0 +1,25 @@
++/* Internal core API only; no new exported libmpv ABI. */
++#ifndef MP_VORTX_OWNED_SUBTITLE_H
++#define MP_VORTX_OWNED_SUBTITLE_H
++
++#include <stdint.h>
++
++struct MPContext;
++struct m_config_option;
++struct m_property;
++
++void mp_vortx_owned_subtitle_init(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_bind_osd(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_shutdown(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_uninit(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_updates(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_retire(struct MPContext *mpctx);
++void mp_vortx_owned_subtitle_option_attempt(void *p, struct m_config_option *co);
++
++int mp_property_vortx_owned_subtitle(void *p, struct m_property *prop,
++                                    int action, void *arg);
++void cmd_vortx_owned_subtitle_prepare(void *p);
++void cmd_vortx_owned_subtitle_commit(void *p);
++void cmd_vortx_owned_subtitle_revoke(void *p);
++
++#endif
+diff --git a/sub/osd.c b/sub/osd.c
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -169,6 +169,20 @@ struct osd_state *osd_create(struct mpv_global *global)
+     };
+     mp_mutex_init(&osd->lock);
+     osd->opts = osd->opts_cache->opts;
++    struct vortx_owned_text_slot *slot = &osd->vortx_owned_text;
++    atomic_init(&slot->active, NULL);
++    atomic_init(&slot->readers, 0);
++    atomic_init(&slot->waiting, false);
++    atomic_init(&slot->dirty, false);
++    atomic_init(&slot->failed_ticket, 0);
++    mp_mutex_init(&slot->wait_lock);
++    mp_cond_init(&slot->idle);
++    // C11 does not promise lock-free atomics on every target. Refuse the
++    // capability rather than silently taking a hidden lock at final admission.
++    slot->available = atomic_is_lock_free(&slot->active) &&
++        atomic_is_lock_free(&slot->readers) && atomic_is_lock_free(&slot->waiting) &&
++        atomic_is_lock_free(&slot->dirty) &&
++        atomic_is_lock_free(&slot->failed_ticket);
+ 
+     for (int n = 0; n < MAX_OSD_PARTS; n++) {
+         struct osd_object *obj = talloc(osd, struct osd_object);
+@@ -191,6 +205,12 @@ void osd_free(struct osd_state *osd)
+ {
+     if (!osd)
+         return;
++    // command/global teardown is forbidden until every worker and VO
++    // reader has drained; no owned decoder may be parked in this slot.
++    mp_assert(!osd_vortx_owned_text_current(osd));
++    mp_assert(!atomic_load(&osd->vortx_owned_text.readers));
++    mp_cond_destroy(&osd->vortx_owned_text.idle);
++    mp_mutex_destroy(&osd->vortx_owned_text.wait_lock);
+     osd_destroy_backend(osd);
+     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
+     mp_mutex_destroy(&osd->lock);
+@@ -224,6 +244,127 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
++bool osd_vortx_owned_text_available(struct osd_state *osd)
++{
++    return osd && osd->vortx_owned_text.available;
++}
++
++void osd_vortx_owned_text_bind_wakeup(struct osd_state *osd,
++                                      void (*wakeup)(void *ctx), void *ctx)
++{
++    // Before outputs start / after outputs join only. Never changed concurrently
++    // with a renderer borrow. The core/global outlives every outstanding reaper.
++    osd->vortx_owned_text.wakeup = wakeup;
++    osd->vortx_owned_text.wakeup_ctx = ctx;
++}
++
++struct vortx_owned_text *osd_vortx_owned_text_current(struct osd_state *osd)
++{
++    return atomic_load_explicit(&osd->vortx_owned_text.active, memory_order_seq_cst);
++}
++
++struct vortx_owned_text *osd_vortx_owned_text_exchange(
++    struct osd_state *osd, struct vortx_owned_text *ready)
++{
++    // Native core only after original source/manual/host-effect admission.
++    // Never acquires an OSD/decoder mutex or destroys the returned object.
++    struct vortx_owned_text *old = atomic_exchange_explicit(
++        &osd->vortx_owned_text.active, ready, memory_order_seq_cst);
++    if (old != ready)
++        atomic_store_explicit(&osd->vortx_owned_text.dirty, true, memory_order_release);
++    return old;
++}
++
++int64_t osd_vortx_owned_text_failed(struct osd_state *osd)
++{
++    return atomic_load_explicit(&osd->vortx_owned_text.failed_ticket,
++                                memory_order_acquire);
++}
++
++void osd_vortx_owned_text_wait_quiescent(struct osd_state *osd)
++{
++    // Reaper worker only, with no core/OSD/admission/decoder lock. Removal was
++    // already SC-published, so a reader that can still hold the retired pointer
++    // increments before the zero observation. A later reader sees its successor.
++    struct vortx_owned_text_slot *slot = &osd->vortx_owned_text;
++    mp_mutex_lock(&slot->wait_lock);
++    // waiting and readers share the SC order: a reader cannot skip signaling
++    // after this store while this waiter still observes its positive count.
++    atomic_store_explicit(&slot->waiting, true, memory_order_seq_cst);
++    while (atomic_load_explicit(&slot->readers, memory_order_seq_cst))
++        mp_cond_wait(&slot->idle, &slot->wait_lock);
++    atomic_store_explicit(&slot->waiting, false, memory_order_seq_cst);
++    mp_mutex_unlock(&slot->wait_lock);
++}
++
++static struct sub_bitmaps *vortx_render_primary(struct osd_state *osd,
++                                                struct osd_object *obj,
++                                                int format, double video_pts)
++{
++    struct vortx_owned_text_slot *slot = &osd->vortx_owned_text;
++    // Ordinary primary rendering retains its existing owner and does not need
++    // an owned decoder lease. No per-frame condition mutex on an idle feature.
++    if (!osd_vortx_owned_text_current(osd)) {
++        if (obj->vortx_seen_ticket) {
++            obj->vortx_seen_ticket = 0;
++            obj->vo_change_id++;
++        }
++        struct sub_bitmaps *ordinary = NULL;
++        if (obj->sub && sub_is_primary_visible(obj->sub))
++            ordinary = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
++        if (osd_vortx_owned_text_current(osd)) {
++            talloc_free(ordinary);
++            ordinary = NULL;
++        }
++        return ordinary;
++    }
++    // The surrounding osd->lock serializes the sole actual reader. Increment
++    // MUST precede loading active; the core exchanges without taking that lock.
++    unsigned previous = atomic_fetch_add_explicit(&slot->readers, 1,
++                                                  memory_order_seq_cst);
++    mp_assert(previous == 0);
++    struct vortx_owned_text *owned = osd_vortx_owned_text_current(osd);
++    struct dec_sub *selected = owned ? owned->decoder : obj->sub;
++    int64_t ticket = owned ? owned->ticket : 0;
++    if (obj->vortx_seen_ticket != ticket) {
++        obj->vortx_seen_ticket = ticket;
++        obj->vo_change_id++;
++    }
++    bool valid = true;
++    if (owned) {
++        valid = osd_vortx_owned_text_failed(osd) != ticket &&
++            sub_refresh_owned_text(selected, NULL,
++                mp_time_ns() + SUB_OWNED_TEXT_MAX_WORK_NS, NULL);
++        if (!valid) {
++            // Refresh's checked path is all-corpus or nonrenderable. Never show
++            // its earlier successful cues, and never destroy on this OSD owner.
++            atomic_store_explicit(&slot->failed_ticket, ticket, memory_order_release);
++            if (slot->wakeup)
++                slot->wakeup(slot->wakeup_ctx);
++        }
++    }
++    struct sub_bitmaps *res = NULL;
++    if (valid && selected && sub_is_primary_visible(selected))
++        res = sub_get_bitmaps(selected, obj->vo_res, format, video_pts);
++    // A concurrent source/manual retirement or replacement must not return an
++    // old bitmap just because rendering/font work started before admission.
++    // This does not withdraw a frame already handed to the VO/presentation.
++    if (osd_vortx_owned_text_current(osd) != owned) {
++        talloc_free(res);
++        res = NULL;
++    }
++    // sub_get_bitmaps' real ASS path completed sub_bitmaps_copy and retained
++    // packed mp_image refs before returning. VO no longer borrows this decoder.
++    previous = atomic_fetch_sub_explicit(&slot->readers, 1, memory_order_seq_cst);
++    mp_assert(previous == 1);
++    if (atomic_load_explicit(&slot->waiting, memory_order_seq_cst)) {
++        mp_mutex_lock(&slot->wait_lock);
++        mp_cond_broadcast(&slot->idle);
++        mp_mutex_unlock(&slot->wait_lock);
++    }
++    return res;
++}
++
+ bool osd_get_render_subs_in_filter(struct osd_state *osd)
+ {
+     mp_mutex_lock(&osd->lock);
+@@ -326,7 +467,9 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+     check_obj_resize(osd, osdres, obj);
+ 
+     if (obj->type == OSDTYPE_SUB) {
+-        if (obj->sub && sub_is_primary_visible(obj->sub))
++        if (osd_vortx_owned_text_available(osd))
++            res = vortx_render_primary(osd, obj, format, video_pts);
++        else if (obj->sub && sub_is_primary_visible(obj->sub))
+             res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
+     } else if (obj->type == OSDTYPE_SUB2) {
+         if (obj->sub && sub_is_secondary_visible(obj->sub))
+@@ -513,8 +656,10 @@ void osd_changed(struct osd_state *osd)
+ 
+ bool osd_query_and_reset_want_redraw(struct osd_state *osd)
+ {
++    bool owned_dirty = atomic_exchange_explicit(&osd->vortx_owned_text.dirty,
++                                                 false, memory_order_acq_rel);
+     mp_mutex_lock(&osd->lock);
+-    bool r = osd->want_redraw_notification;
++    bool r = owned_dirty || osd->want_redraw_notification;
+     osd->want_redraw_notification = false;
+     mp_mutex_unlock(&osd->lock);
+     return r;
+diff --git a/sub/osd.h b/sub/osd.h
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -194,6 +194,13 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd);
+ 
+ void osd_set_text(struct osd_state *osd, const char *text);
+ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
++struct vortx_owned_text;
++bool osd_vortx_owned_text_available(struct osd_state *osd);
++void osd_vortx_owned_text_bind_wakeup(struct osd_state *osd, void (*wakeup)(void *), void *ctx);
++struct vortx_owned_text *osd_vortx_owned_text_current(struct osd_state *osd);
++struct vortx_owned_text *osd_vortx_owned_text_exchange(struct osd_state *osd, struct vortx_owned_text *ready);
++int64_t osd_vortx_owned_text_failed(struct osd_state *osd);
++void osd_vortx_owned_text_wait_quiescent(struct osd_state *osd);
+ 
+ bool osd_get_render_subs_in_filter(struct osd_state *osd);
+ void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -4,6 +4,7 @@
+ #include <stdatomic.h>
+ 
+ #include "osd.h"
++#include "owned_text_slot.h"
+ #include "osdep/threads.h"
+ 
+ enum mp_osdtype {
+@@ -39,6 +40,7 @@ struct osd_object {
+ 
+     // OSDTYPE_SUB/OSDTYPE_SUB2
+     struct dec_sub *sub;
++    int64_t vortx_seen_ticket; // OSD owner only
+ 
+     // OSDTYPE_EXTERNAL
+     struct osd_external **externals;
+@@ -72,6 +74,7 @@ struct osd_state {
+ 
+     bool render_subs_in_filter;
+     _Atomic double force_video_pts;
++    struct vortx_owned_text_slot vortx_owned_text;
+ 
+     bool want_redraw;
+     bool want_redraw_notification;
+diff --git a/sub/owned_text_slot.h b/sub/owned_text_slot.h
+new file mode 100644
+--- /dev/null
++++ b/sub/owned_text_slot.h
+@@ -0,0 +1,35 @@
++/* Native core is the sole writer. Only the existing serialized OSD renderer
++ * may borrow. This is NOT an account/profile/source admission capability.
++ */
++#ifndef MP_VORTX_OWNED_TEXT_SLOT_H
++#define MP_VORTX_OWNED_TEXT_SLOT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdatomic.h>
++#include "osdep/threads.h"
++
++struct dec_sub;
++
++// Created only after sub_create_owned_text returned the complete corpus.
++// Immutable until removal, reader quiescence and off-core destruction.
++struct vortx_owned_text {
++    int64_t ticket;
++    struct dec_sub *decoder;
++};
++
++struct vortx_owned_text_slot {
++    _Atomic(struct vortx_owned_text *) active;
++    atomic_uint readers;
++    atomic_bool waiting;
++    atomic_bool dirty;
++    atomic_int_fast64_t failed_ticket;
++    bool available; // initialized before any render thread starts
++    mp_mutex wait_lock;
++    mp_cond idle;
++    // Set before video outputs start, cleared only after outputs join.
++    void (*wakeup)(void *ctx);
++    void *wakeup_ctx;
++};
++
++#endif

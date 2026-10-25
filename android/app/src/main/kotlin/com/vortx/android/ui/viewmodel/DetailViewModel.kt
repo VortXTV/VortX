@@ -42,6 +42,9 @@ import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.LastStreamStore
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.ui.randompick.RandomEpisodeAccess
+import com.vortx.android.ui.randompick.RandomEpisodePickModel
+import com.vortx.android.ui.randompick.RandomEpisodePlaybackLease
 import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.CanonicalContentIdentity
 import com.vortx.android.sources.ProviderHealth
@@ -71,6 +74,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import java.time.Instant
+
+private data class RandomEpisodePlayTarget(
+    val access: RandomEpisodeAccess,
+    val detail: MetaDetail,
+    val episode: Episode,
+)
 
 internal data class EpisodeSwitchRollbackTarget(val episodeId: String?, val season: Int?)
 
@@ -191,15 +201,22 @@ internal class PlaybackResolveFence {
     class Lease internal constructor(
         val sourceRequest: SourceRequestFence.Token,
         val attemptGeneration: Long,
-    )
+        val admission: () -> Boolean,
+    ) {
+        /** Ready no longer owns the resolver slot; retain its exact source and action witness. */
+        fun readyAdmission(
+            sourceIsCurrent: (SourceRequestFence.Token) -> Boolean,
+            routeIsCurrent: () -> Boolean,
+        ): () -> Boolean = { routeIsCurrent() && admission() && sourceIsCurrent(sourceRequest) }
+    }
 
     private var nextAttemptGeneration = 0L
     private var activeLease: Lease? = null
 
-    fun begin(request: SourceRequestFence.Token): Lease =
-        Lease(request, ++nextAttemptGeneration).also { activeLease = it }
+    fun begin(request: SourceRequestFence.Token, admission: () -> Boolean = { true }): Lease =
+        Lease(request, ++nextAttemptGeneration, admission).also { activeLease = it }
 
-    fun accepts(lease: Lease): Boolean = activeLease == lease
+    fun accepts(lease: Lease): Boolean = activeLease == lease && runCatching(lease.admission).getOrDefault(false)
 
     /** Revokes the active attempt only when it belongs to the target about to be invalidated. */
     fun invalidateForSourceRequest(request: SourceRequestFence.Token): Boolean {
@@ -210,6 +227,14 @@ internal class PlaybackResolveFence {
 
     fun finish(lease: Lease) {
         if (activeLease == lease) activeLease = null
+    }
+
+    /** A rejected old result cannot clear a newer attempt, even on the same source token. */
+    fun retireIfOwned(lease: Lease, onRetired: () -> Unit): Boolean {
+        if (activeLease !== lease) return false
+        activeLease = null
+        onRetired()
+        return true
     }
 }
 
@@ -610,6 +635,91 @@ class DetailViewModel(
     /// Smart-Source episode tap, whose auto-pick stays exactly as it was.
     @Volatile private var pendingAdvanceHint: Pair<String?, String?>? = null
 
+    private val randomEpisodePicker = RandomEpisodePickModel(
+        scope = viewModelScope,
+        currentOwner = ::currentRandomEpisodeAccess,
+        readDetail = { repo.peekMeta(type, metaId) },
+        currentEpisodeId = { _selectedEpisodeId.value },
+    )
+    internal val randomEpisodePickState get() = randomEpisodePicker.state
+    private var randomEpisodePlayLease: RandomEpisodePlaybackLease<RandomEpisodeAccess>? = null
+
+    private fun currentRandomEpisodeAccess(): RandomEpisodeAccess? {
+        val store = ProfileStore.sharedOrNull() ?: return null
+        val profile = store.active ?: return null
+        val owner = runCatching { repo.continueWatchingOwner() }.getOrNull() ?: return null
+        val access = RandomEpisodeAccess.capture(
+            owner, profile, store.needsPicker, metaId, sourceSticky.currentProfileId(), isRouteAdmissionCurrent(),
+        ) ?: return null
+        return access.takeIf {
+            store.active == profile && !store.needsPicker && repo.continueWatchingOwner() == owner && metaId == access.effectiveMetaId
+        }
+    }
+
+    private fun acceptsRandomEpisodePlayback(lease: RandomEpisodePlaybackLease<RandomEpisodeAccess>): Boolean =
+        randomEpisodePlayLease === lease && lease.accepts(
+            currentOwner = currentRandomEpisodeAccess(),
+            currentRequest = sourceRequestFence.currentToken(),
+            selectedEpisodeId = _selectedEpisodeId.value,
+            currentDetail = (_meta.value as? UiState.Success)?.data,
+            now = Instant.now(),
+        )
+
+    /** Nulling the random witness also revokes the resolver fence before cooperative cancellation. */
+    private fun retireRandomEpisodePlayback() {
+        if (randomEpisodePlayLease == null) return
+        randomEpisodePlayLease = null
+        pendingAutoPick = false
+        pendingAdvanceHint = null
+        episodeBudgetJob?.cancel()
+        automaticEpisodeBudget = null
+        cancelPlaybackResolveForSourceTargetInvalidation()
+    }
+
+    internal fun clearRandomEpisodePick() {
+        randomEpisodePicker.invalidate()
+        retireRandomEpisodePlayback()
+    }
+
+    internal fun pickRandomEpisode() {
+        retireRandomEpisodePlayback()
+        randomEpisodePicker.pick()
+    }
+
+    internal fun openRandomEpisode(onOpened: (Episode) -> Unit = {}) {
+        randomEpisodePicker.forAction { detail, episode, access ->
+            if (currentRandomEpisodeAccess() != access) return@forAction
+            retireRandomEpisodePlayback()
+            // Open is a manual browse target, never the settings-driven auto-pick intent.
+            pendingAutoPick = false
+            pendingAdvanceHint = null
+            episodeBudgetJob?.cancel()
+            automaticEpisodeBudget = null
+            cancelPlaybackResolveForSourceTargetInvalidation()
+            _meta.value = UiState.Success(detail)
+            explicitManualEpisodeId = episode.id
+            _selectedSeason.value = episode.season
+            selectEpisode(episode.id, userTap = false)
+            onOpened(episode)
+        }
+    }
+
+    internal fun playRandomEpisode() {
+        randomEpisodePicker.forAction { detail, episode, access ->
+            if (currentRandomEpisodeAccess() != access) return@forAction
+            retireRandomEpisodePlayback()
+            _meta.value = UiState.Success(detail)
+            explicitManualEpisodeId = episode.id
+            _selectedSeason.value = episode.season
+            _selectedEpisodeId.value = episode.id
+            pendingAdvanceHint = null
+            // Explicit Play is independent of the optional Smart Source Selection setting. A fresh
+            // normal source request also handles an already-selected episode without stale rows.
+            pendingAutoPick = true
+            startSourceLoad(episode.id, randomPlay = RandomEpisodePlayTarget(access, detail, episode))
+        }
+    }
+
     /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by an
     /// immutable profile/owner/source-request lease and consumed once by [playNextEpisode] so an accepted Up
     /// Next skips the source-assembly "Starting..." wait. A monotonic generation is separate from the source
@@ -629,6 +739,14 @@ class DetailViewModel(
     /// succeeded, so it can never race ahead of or clobber the first load.
     init {
         viewModelScope.launch {
+            repo.ctxUpdates().collect { clearRandomEpisodePick() }
+        }
+        ProfileStore.sharedOrNull()?.let { profileStore ->
+            viewModelScope.launch {
+                profileStore.activeProfile.collect { clearRandomEpisodePick() }
+            }
+        }
+        viewModelScope.launch {
             repo.detailUpdates().collect {
                 if (_meta.value !is UiState.Success) return@collect
                 repo.peekMeta(type, metaId)?.let { fresh -> _meta.value = UiState.Success(fresh) }
@@ -637,7 +755,9 @@ class DetailViewModel(
         viewModelScope.launch {
             // WHY audit R01: persist every successfully resolved source before the player can outlive this process.
             playback.collect { state ->
-                val playable = (state as? Playback.Ready)?.playable?.takeUnless { it.isTrailer } ?: return@collect
+                val ready = state as? Playback.Ready ?: return@collect
+                if (!ready.isAdmitted()) return@collect
+                val playable = ready.playable.takeUnless { it.isTrailer } ?: return@collect
                 val source = lastPlayedSource
                 val targetId = _selectedEpisodeId.value ?: id
                 val stored = resumeRef?.takeIf { it.targetId == targetId && it.source.id == source?.id }
@@ -785,6 +905,7 @@ class DetailViewModel(
     /// the ORIGINAL route id again (not the previously-recovered one), and re-run the load. Mirrors Apple
     /// `retryMeta`.
     fun retryMeta() {
+        clearRandomEpisodePick()
         detailMutationFence.invalidate()
         invalidateWarmNextSource()
         profileReloadJob?.cancel()
@@ -804,6 +925,7 @@ class DetailViewModel(
     /// land, instead of making the viewer pick from the list. The init-time programmatic selection passes
     /// false, so opening a detail page never auto-plays.
     fun selectEpisode(episodeId: String, userTap: Boolean = true) {
+        clearRandomEpisodePick()
         if (userTap) explicitManualEpisodeId = episodeId
         if (_selectedEpisodeId.value == episodeId) return
         invalidateWarmNextSource()
@@ -812,7 +934,13 @@ class DetailViewModel(
         startSourceLoad(episodeId)
     }
 
-    private fun startSourceLoad(episodeId: String?, forceRefresh: Boolean = false) {
+    private fun startSourceLoad(
+        episodeId: String?,
+        forceRefresh: Boolean = false,
+        randomPlay: RandomEpisodePlayTarget? = null,
+    ) {
+        // A non-random request may never inherit the outgoing random auto-play latch.
+        if (randomPlay == null) retireRandomEpisodePlayback()
         invalidateWarmNextSource()
         cancelPlaybackResolveForSourceTargetInvalidation()
         val profileId = sourceSticky.currentProfileId()
@@ -822,6 +950,10 @@ class DetailViewModel(
             sourceRequestFence.begin(profileId, episodeId)
         }
         sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, _sourceAudioLanguageHint.value)
+        // Install the witness before launch: an immediate cached source update may not suspend.
+        randomEpisodePlayLease = randomPlay?.let {
+            RandomEpisodePlaybackLease(it.access, it.detail.id, it.detail.type, it.episode, token)
+        }
         sourceSettlement.value = EpisodeSourceSettlement(token)
         sourceLoadJob?.cancel()
         episodeBudgetJob?.cancel()
@@ -889,6 +1021,13 @@ class DetailViewModel(
      * episode auto-pick is not accidentally erased before its sources arrive.
      */
     fun abandonPlaybackRoute() {
+        abandonPlaybackRoute(preserveRandomEpisodePick = false)
+    }
+
+    /** An admitted detail action may still need to consume its current Random Episode preview. */
+    internal fun abandonPlaybackRoute(preserveRandomEpisodePick: Boolean) {
+        val abandonedReady = _playback.value as? Playback.Ready
+        if (preserveRandomEpisodePick) retireRandomEpisodePlayback() else clearRandomEpisodePick()
         pendingAutoPick = false
         pendingAdvanceHint = null
         resetPlaybackAudioIntent()
@@ -899,6 +1038,8 @@ class DetailViewModel(
             _episodeBrowseAnchor.value = EpisodeBrowseAnchor(it, ++episodeBrowseRevision)
         }
         _playback.value = Playback.Idle
+        // This Ready was discarded before handoff; normal clearPlayback still transfers its lease.
+        runCatching { abandonedReady?.playable?.playbackLease?.close() }
     }
 
     private fun canPublishPlaybackResolve(lease: PlaybackResolveFence.Lease): Boolean =
@@ -906,8 +1047,18 @@ class DetailViewModel(
             sourceRequestFence.accepts(lease.sourceRequest, sourceSticky.currentProfileId())
 
     private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean {
-        if (!canPublishPlaybackResolve(lease)) return false
-        _playback.value = state
+        if (!canPublishPlaybackResolve(lease)) {
+            (state as? Playback.Ready)?.playable?.playbackLease?.close()
+            retireRejectedPlaybackResolve(lease)
+            return false
+        }
+        // Ready outlives the resolver fence: preserve its immutable admission through screen handoff.
+        _playback.value = if (state is Playback.Ready) state.copy(
+            admission = lease.readyAdmission(
+                sourceIsCurrent = { sourceRequestFence.accepts(it, sourceSticky.currentProfileId()) },
+                routeIsCurrent = ::isRouteAdmissionCurrent,
+            ),
+        ) else state
         if (state is Playback.Ready && type == MediaType.SERIES) lastAcceptedEpisodeId = _selectedEpisodeId.value
         if (state is Playback.Ready || state is Playback.Failed) {
             automaticEpisodeBudget = null
@@ -915,6 +1066,12 @@ class DetailViewModel(
         }
         playbackResolveFence.finish(lease)
         return true
+    }
+
+    private fun retireRejectedPlaybackResolve(lease: PlaybackResolveFence.Lease) {
+        playbackResolveFence.retireIfOwned(lease) {
+            if (_playback.value is Playback.Resolving) _playback.value = Playback.Idle
+        }
     }
 
     /// Re-find sources (viewer escape hatch on the detail screen + terminal playback-failure path): re-query
@@ -928,11 +1085,13 @@ class DetailViewModel(
     /// untouched. Only ever called from the detail screen or after playback has stopped, so it never wipes a
     /// warmed next-episode lane mid-binge.
     fun refreshSources() {
+        clearRandomEpisodePick()
         val episodeId = _selectedEpisodeId.value
         startSourceLoad(episodeId, forceRefresh = true)
     }
 
     private fun rebuildForProfile(profileId: String) {
+        clearRandomEpisodePick()
         resetPlaybackAudioIntent(refreshRanking = false)
         lastAcceptedEpisodeId = null
         _episodeBrowseAnchor.value = null
@@ -1196,6 +1355,7 @@ class DetailViewModel(
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
         val credentialRevision = debridKeys.currentCredentialRevision()
+        val cacheDisplayRevision = DebridKeys.credentialRevision.value
         val cacheGeneration = cacheCheckGate.begin()
         cacheCheckJob?.cancel()
         cacheCheckJob = viewModelScope.launch {
@@ -1213,7 +1373,8 @@ class DetailViewModel(
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
                 !cacheCheckGate.isCurrent(cacheGeneration) ||
                 !debridKeys.isCurrent(owner) ||
-                debridKeys.currentCredentialRevision() != credentialRevision
+                debridKeys.currentCredentialRevision() != credentialRevision ||
+                DebridKeys.credentialRevision.value != cacheDisplayRevision
             ) {
                 return@launch
             }
@@ -1231,14 +1392,17 @@ class DetailViewModel(
                 usenetUrls = cachedUsenetUrls,
             )
             // Badge + rank up any account-cached add-on torrent the add-on itself did not tag.
-            val decorated = decorateCached(raw, torrentServices.keys)
+            val decorated = com.vortx.android.sources.markAccountConfirmedCache(
+                decorateCached(raw, torrentServices.keys), torrentServices.keys, cacheDisplayRevision,
+            )
             if (
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
                 sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
                 cacheCheckGate.isCurrent(cacheGeneration) &&
                 debridKeys.isCurrent(owner) &&
-                debridKeys.currentCredentialRevision() == credentialRevision
+                debridKeys.currentCredentialRevision() == credentialRevision &&
+                DebridKeys.credentialRevision.value == cacheDisplayRevision
             ) {
                 sourceModel.setRawGroups(decorated)
             }
@@ -1329,6 +1493,7 @@ class DetailViewModel(
     fun setSourceAudioLanguageHint(language: String?) {
         val normalized = language?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         if (_sourceAudioLanguageHint.value == normalized) return
+        clearRandomEpisodePick()
         invalidateWarmNextSource()
         // The picker is session-only, but it still changes the immutable ranking input.  Advance the same
         // source request fence used for episode changes so an in-flight assembly for the old language cannot
@@ -1378,18 +1543,28 @@ class DetailViewModel(
     /// Browse a different season's episode list (does NOT touch the sources selection -- the hero keeps
     /// showing whichever episode's sources were last chosen via [selectEpisode]).
     fun selectSeason(season: Int) {
+        clearRandomEpisodePick()
         _selectedSeason.value = season
     }
 
     /// Resolve a chosen source to a [Playable] and request playback. Drives a Resolving -> Ready /
     /// Failed transition so the row can show progress and a resolve failure surfaces instead of
     /// silently doing nothing.
-    fun play(source: StreamSource) = play(source, manualPick = true, startPositionOverrideMs = null)
+    fun play(source: StreamSource) {
+        clearRandomEpisodePick()
+        play(source, manualPick = true, startPositionOverrideMs = null)
+    }
 
     private fun playAutomatically(source: StreamSource, startPositionOverrideMs: Long? = null,
-                                  preserveAudioIntent: Boolean = false) =
+                                  preserveAudioIntent: Boolean = false) {
+        val randomLease = randomEpisodePlayLease
+        if (randomLease != null && !acceptsRandomEpisodePlayback(randomLease)) {
+            retireRandomEpisodePlayback()
+            return
+        }
         play(source, manualPick = false, startPositionOverrideMs = startPositionOverrideMs,
             freshPlayback = !preserveAudioIntent)
+    }
 
     private fun play(
         source: StreamSource,
@@ -1420,11 +1595,22 @@ class DetailViewModel(
         // which case playback simply doesn't scrobble.
         val ref = currentMediaRef()
         playbackResolveJob?.cancel()
-        val resolveLease = playbackResolveFence.begin(request)
+        // Capture, rather than re-read a nullable guard: retiring a random intent must never turn
+        // a late resolver into an ordinary, unguarded one.
+        val randomAdmission = randomEpisodePlayLease?.takeIf { it.request === request }
+        val resolveLease = playbackResolveFence.begin(request) {
+            randomAdmission == null || acceptsRandomEpisodePlayback(randomAdmission)
+        }
         playbackResolveJob = viewModelScope.launch {
+            if (!canPublishPlaybackResolve(resolveLease)) {
+                retireRejectedPlaybackResolve(resolveLease)
+                return@launch
+            }
             val result = resolveForOwner(source, episode, actionOwner)
             if (!canPublishPlaybackResolve(resolveLease)) {
-                result.getOrNull()?.playbackLease?.close(); return@launch
+                result.getOrNull()?.playbackLease?.close()
+                retireRejectedPlaybackResolve(resolveLease)
+                return@launch
             }
             val nextPlayback = result.fold(
                 onSuccess = { playable ->
@@ -1814,6 +2000,7 @@ class DetailViewModel(
     /// true` (the shell skips library/progress side effects). No-op when the meta carries no trailer id or a
     /// resolve/play is already running.
     fun playTrailer() {
+        clearRandomEpisodePick()
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1856,9 +2043,25 @@ class DetailViewModel(
     /// point WITHOUT clearing it (the library `timeOffset` is left untouched, so the primary Resume
     /// still seeks there next time). It only forces the player's start position to zero across all
     /// three legs below by not reading [resumeOffsetMs]; nothing engine/account state is written.
-    fun playBest(fromStart: Boolean = false) = playBest(fromStart, startPositionOverrideMs = null)
+    fun playBest(fromStart: Boolean = false) {
+        clearRandomEpisodePick()
+        playBest(fromStart, startPositionOverrideMs = null)
+    }
 
-    private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true) {
+    /** A queued Library Play carries its immutable route/profile witness into the real resolver. */
+    internal fun playBestWhen(admission: () -> Boolean) {
+        clearRandomEpisodePick()
+        if (!admission()) return
+        playBest(fromStart = false, startPositionOverrideMs = null, admission = admission)
+    }
+
+    private fun playBest(
+        fromStart: Boolean,
+        startPositionOverrideMs: Long?,
+        freshPlayback: Boolean = true,
+        admission: () -> Boolean = { true },
+    ) {
+        if (!admission()) return
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1872,7 +2075,7 @@ class DetailViewModel(
         val episode = currentModelEpisode()
         val actionOwner = debridKeys.ownerToken()
         playbackResolveJob?.cancel()
-        val resolveLease = playbackResolveFence.begin(request)
+        val resolveLease = playbackResolveFence.begin(request, admission)
         playbackResolveJob = viewModelScope.launch {
             if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
                 publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
@@ -1883,7 +2086,9 @@ class DetailViewModel(
             // Playable after an account change.
             val resolved = resolveForOwner(best, episode, actionOwner)
             if (!canPublishPlaybackResolve(resolveLease)) {
-                resolved.getOrNull()?.playbackLease?.close(); return@launch
+                resolved.getOrNull()?.playbackLease?.close()
+                retireRejectedPlaybackResolve(resolveLease)
+                return@launch
             }
             publishPlaybackResolve(resolveLease, resolved.fold(
                 onSuccess = { playable ->
@@ -2089,6 +2294,7 @@ class DetailViewModel(
     }
 
     fun clearPlayback() {
+        retireRandomEpisodePlayback()
         abandonPlaybackResolve()
         _playback.value = Playback.Idle
     }
@@ -2180,6 +2386,7 @@ class DetailViewModel(
 
     fun playNextEpisode() {
         if (_playback.value is Playback.Resolving) return
+        clearRandomEpisodePick()
         val next = nextEpisode() ?: return
         // Consume a warm-cached best source for this episode (PLR-8): resolve the pre-ranked source right
         // away and skip the source-assembly "Starting..." wait. Any miss falls through to the cold path
@@ -2470,6 +2677,7 @@ class DetailViewModel(
     /// stops the coalescer (it runs on [viewModelScope], which is cancelled anyway, but the contributors own
     /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
     override fun onCleared() {
+        clearRandomEpisodePick()
         sourceSwitchCommitGate.invalidate()
         invalidateWarmNextSource()
         super.onCleared()
@@ -2658,7 +2866,9 @@ internal fun detailAudioLanguageOptions(groups: List<StreamGroup>): List<Pair<St
 sealed interface Playback {
     data object Idle : Playback
     data object Resolving : Playback
-    data class Ready(val playable: Playable) : Playback
+    data class Ready(val playable: Playable, val admission: () -> Boolean = { true }) : Playback {
+        fun isAdmitted(): Boolean = runCatching(admission).getOrDefault(false)
+    }
     data class Failed(val message: String) : Playback
 }
 

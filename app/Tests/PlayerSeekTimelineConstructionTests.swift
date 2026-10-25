@@ -8,9 +8,10 @@ import UIKit
 // Fixtures replace application state and external effects only. The script extracts the exact
 // production bottomBar factories, every editor section/tooltip body, and concrete view bodies.
 // GlassStyle, Theme, ThemeManager and SkipSegments compile from their production files.
+@MainActor
 @propertyWrapper
-struct ProbeValue<Value> {
-    final class Storage { var value: Value; init(_ value: Value) { self.value = value } }
+struct ProbeValue<Value>: Sendable {
+    @MainActor final class Storage { var value: Value; init(_ value: Value) { self.value = value } }
     private let storage: Storage
     init(wrappedValue: Value) { storage = Storage(wrappedValue) }
     var wrappedValue: Value {
@@ -52,6 +53,7 @@ enum StreamRanking {
     static func hasMultipleResolutions(_ groups: [CoreStreamSourceGroup]) -> Bool { !groups.isEmpty }
 }
 
+@MainActor
 struct PlayerScreen {
     let timePosClock: TimePosClock = {
         let clock = TimePosClock()

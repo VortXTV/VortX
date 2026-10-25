@@ -300,8 +300,8 @@ struct TraktCheckinConflict: Codable, Sendable {
 
 /// Timestamp parsing for the Trakt wire format ("2026-07-16T12:00:00.000Z"). Trakt sends fractional
 /// seconds; the plain form is accepted as a fallback so a format change degrades to "no expiry shown"
-/// instead of silently dropping the value. Reuses the shared `ISO8601DateFormatter` instances
-/// (formatters are costly to build and are not thread-safe to mutate, so these are never reconfigured).
+/// instead of silently dropping the value. Reuses CoreModels' Sendable ISO parser values without
+/// sharing mutable formatters or constructing one for every timestamp.
 enum TraktDate {
     static func parse(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }

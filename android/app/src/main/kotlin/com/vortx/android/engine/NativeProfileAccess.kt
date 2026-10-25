@@ -31,15 +31,21 @@ internal class NativeProfileAccess(
         }
     }
     override fun read(): NativeProfileGateway.Projection = projection(session().read())
-    override fun <T> withProjection(expected: NativeProfileGateway.Projection, action: () -> T): T {
+    override fun <T> withProjection(expected: NativeProfileGateway.Projection, action: () -> T): T =
+        withCurrentProjection { current ->
+            check(current == expected) { "Native profile projection changed" }
+            action()
+        }
+    override fun <T> withCurrentProjection(action: (NativeProfileGateway.Projection) -> T): T {
         val runtime = session()
-        // Session must precede provider/account admission; nested native reads then reenter this monitor.
+        // One native read under the same Session -> account -> mounted publication admission.
+        // Consumers must finish synchronously; no snapshot or lock is carried across an await.
         return runtime.withCurrentRead { current ->
             val admit = checkNotNull(publicationAdmission) { "Native profile publication admission unavailable" }
             var result: Result<T>? = null
             check(admit(runtime) {
-                check(session() === runtime && projection(current) == expected) { "Native profile projection changed" }
-                result = runCatching(action)
+                check(session() === runtime) { "Native profile projection changed" }
+                result = runCatching { action(projection(current)) }
                 true
             }) { "Native profile account changed" }
             checkNotNull(result).getOrThrow()

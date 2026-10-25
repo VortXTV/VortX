@@ -58,7 +58,7 @@ struct iOSLiveView: View {
             // outside the Home board's default window. Widen the board so they hydrate here; re-run when
             // add-ons finish loading (their manifests arrive async, after the first appear).
             .onAppear { core.ensureLiveCatalogsLoaded() }
-            .onChange(of: core.addons.count) { _ in core.ensureLiveCatalogsLoaded() }
+            .onValueChange(of: core.addons.count) { _ in core.ensureLiveCatalogsLoaded() }
         }
         // Re-tapping the active Live tab pops any pushed channel/event detail back to root (#125): the
         // shell bumps TabScrollKeys.live like every tab, but nothing here observed it, so a pushed live

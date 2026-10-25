@@ -22,8 +22,11 @@ import java.net.URLEncoder
  *
  * The pool lets any signed-in VortX user READ subtitles other users contributed for the same title/episode,
  * (best-effort, in the background) UPLOAD embedded/add-on subtitle text so the next user benefits, and learn
- * and share a per-rip SYNC OFFSET. This is the FOUNDATION client: pure, self-contained, callable. A later
- * integration pass wires it into the player's subtitle list and the offset slider (the same split Apple uses).
+ * and share a per-rip SYNC OFFSET. Android's shared PlayerScreen consumes the actual pool read for its
+ * subtitle choices and supported libmpv constant timing offset, fenced to the captured source/profile/account
+ * lifetime. Media3 can offer the subtitle choices but has no supported live delay adjustment. A learned
+ * constant offset is not speech/cue/FPS/drift alignment. Upload/post APIs remain separate helpers; this host
+ * integration does not automatically contribute manual adjustments without a consent/eligibility path.
  *
  * FAIL-SOFT CONTRACT (every method): any network / decode / signing / size error returns the empty / null /
  * no-op result. Nothing throws to a caller. A disabled feature (`features.communitySubtitles` off, etc.) is a

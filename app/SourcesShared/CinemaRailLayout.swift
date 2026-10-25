@@ -2,6 +2,18 @@ import Foundation
 
 /// Pure viewport geometry shared by the title/collection and episode rails, never playback state.
 enum CinemaRailLayout {
+    /// A desktop/tablet preview floats inside its window; narrow phones use all available height.
+    /// Keep these limits independent of content so long text scrolls rather than expanding past the window.
+    static func quickViewFrame(viewport: CGSize) -> CGSize {
+        let width = max(1, viewport.width)
+        let height = max(1, viewport.height)
+        let inset: CGFloat = width >= 700 ? 32 : (width >= 600 ? 16 : 0)
+        return CGSize(width: max(1, min(1180, width - 2 * inset)),
+                      height: width < 600 ? height : max(1, min(820, height - 2 * inset)))
+    }
+
+    static func quickViewContentInset(width: CGFloat) -> CGFloat { width >= 700 ? 40 : 20 }
+
     static func titleWidth(viewport: CGFloat, compact: Bool, inset: CGFloat, spacing: CGFloat) -> CGFloat {
         let available = max(1, viewport - 2 * inset)
         if compact { return max(1, (available - spacing) / 2) }

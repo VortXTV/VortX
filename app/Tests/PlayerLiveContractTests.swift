@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/player-live-contract \
 //     app/Sources/Player/DVPlaybackPolicy.swift \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/VortXHostedResponse.swift \
 //     app/Sources/Player/PlayerStallPolicy.swift \
 //     app/Sources/Player/VortXHLSSeekAnchorState.swift \
 //     app/Sources/Player/AudioLanguagePolicy.swift \
@@ -16,6 +17,7 @@
 // rather than mirrored here.
 
 import Foundation
+import os
 
 // Standalone-compilation stub for the buffer's production default. Tests pass an explicit tiny byte floor so a
 // long-window eviction can execute without allocating the app's 64 MiB minimum.
@@ -146,6 +148,130 @@ private final class ManualSegmentSender {
     }
 }
 
+// Only the changed spool pumps use these checked, thread-safe fixtures.
+private final class WeakSpoolResponse {
+    weak var value: VortXSpoolResponsePump?
+    init(_ value: VortXSpoolResponsePump?) { self.value = value }
+}
+
+private final class ManualSpoolSender: Sendable {
+    private struct Acknowledgment: Sendable {
+        let complete: @Sendable (Bool) -> Void
+    }
+    private struct State: Sendable {
+        var payloads: [Data] = []
+        var pending: [Acknowledgment] = []
+        var lastAcknowledged: Acknowledgment?
+        var inFlight = 0
+        var maximumInFlight = 0
+        var sendDepth = 0
+        var maximumSendDepth = 0
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let condition = NSCondition()
+    private let synchronousAcknowledgments: Bool
+    private let onFirstSend: (@Sendable () -> Void)?
+
+    init(synchronousAcknowledgments: Bool = false,
+         onFirstSend: (@Sendable () -> Void)? = nil) {
+        self.synchronousAcknowledgments = synchronousAcknowledgments
+        self.onFirstSend = onFirstSend
+    }
+
+    private func update<Result: Sendable>(
+        _ body: @Sendable (inout State) -> Result
+    ) -> Result {
+        condition.lock()
+        let result = state.withLock(body)
+        condition.broadcast()
+        condition.unlock()
+        return result
+    }
+
+    func send(_ data: Data, completion: @escaping @Sendable (Bool) -> Void) {
+        let first = update { value in
+            value.payloads.append(data)
+            value.pending.append(.init(complete: completion))
+            value.inFlight += 1
+            value.maximumInFlight = max(value.maximumInFlight, value.inFlight)
+            value.sendDepth += 1
+            value.maximumSendDepth = max(value.maximumSendDepth, value.sendDepth)
+            return value.payloads.count == 1
+        }
+        // No application callback or ACK executes while either fixture lock is held.
+        if first { onFirstSend?() }
+        if synchronousAcknowledgments { _ = completeNext(true) }
+        update { $0.sendDepth -= 1 }
+    }
+
+    @discardableResult
+    func completeNext(_ succeeded: Bool) -> Bool {
+        let acknowledgment = update { value -> Acknowledgment? in
+            guard !value.pending.isEmpty else { return nil }
+            let original = value.pending.removeFirst()
+            value.inFlight -= 1
+            value.lastAcknowledged = original
+            return original
+        }
+        acknowledgment?.complete(succeeded)
+        return acknowledgment != nil
+    }
+
+    func repeatLastAcknowledgment(_ succeeded: Bool) {
+        let original = state.withLock { $0.lastAcknowledged }
+        original?.complete(succeeded)
+    }
+
+    func waitForSendCount(_ count: Int, timeout: TimeInterval = 2) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while state.withLock({ $0.payloads.count < count }) {
+            if !condition.wait(until: deadline) {
+                return state.withLock { $0.payloads.count >= count }
+            }
+        }
+        return true
+    }
+
+    var payloads: [Data] { state.withLock { $0.payloads } }
+    var maximumInFlight: Int { state.withLock { $0.maximumInFlight } }
+    var maximumSendDepth: Int { state.withLock { $0.maximumSendDepth } }
+}
+
+private final class SpoolTerminalRecord<Outcome: Sendable>: Sendable {
+    private struct State: Sendable { var values: [Outcome] = [] }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let condition = NSCondition()
+
+    func record(_ outcome: Outcome) {
+        condition.lock()
+        state.withLock { $0.values.append(outcome) }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitForCount(_ count: Int, timeout: TimeInterval = 2) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while state.withLock({ $0.values.count < count }) {
+            if !condition.wait(until: deadline) {
+                return state.withLock { $0.values.count >= count }
+            }
+        }
+        return true
+    }
+
+    var values: [Outcome] { state.withLock { $0.values } }
+}
+
+private final class SpoolCancellationRecord: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: false)
+    func set(_ value: Bool) { state.withLock { $0 = value } }
+    func isCancelled() -> Bool { state.withLock { $0 } }
+}
+
 @MainActor @main
 enum PlayerLiveContractTests {
     static func main() {
@@ -205,6 +331,7 @@ enum PlayerLiveContractTests {
         testOptionalSubtitleAdmissionCanRetryAfterCapacityDrains()
         testRetentionCapacityAndDeadlineAdmission()
         testSpoolResponsePump()
+        testRangedSpoolResponsePump()
         testSessionLifecycleAndScavenge()
         testDisplayRequestLifecycle()
         testSelectionRefreshLifecycle()
@@ -2688,47 +2815,59 @@ enum PlayerLiveContractTests {
                   && leasesAfterInvalidConstruction == 0
                   && spool.activeLeaseCount == 0)
 
-        guard let lease = spool.openResource(key, now: 1),
-              let response = VortXSpoolResponsePump(lease: lease, chunkSize: 2) else {
+        guard let lease = spool.openResource(key, now: 1) else {
             check("file pump: durable resource opens before any response header", false)
             return
         }
-        let sender = ManualSegmentSender()
-        var terminal: VortXSpoolResponsePump.Terminal?
-        var routeOwner: VortXSpoolResponsePump? = response
+        var routeOwner = VortXSpoolResponsePump(lease: lease, chunkSize: 2)
+        guard routeOwner != nil else {
+            check("file pump: durable resource opens before any response header", false)
+            return
+        }
+        let retainedResponse = WeakSpoolResponse(routeOwner)
+        let sender = ManualSpoolSender()
+        let terminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
         routeOwner?.start(
             header: Data("head".utf8),
             cancelled: { false },
             send: sender.send,
-            terminal: { terminal = $0 })
+            terminal: terminal.record)
         routeOwner = nil
-        sender.completeNext(true)
-        sender.completeNext(true)
-        sender.completeNext(true)
-        sender.completeNext(true)
-        sender.completeNext(true)
+        check("file pump: pending callback retains the original response and file lease after route release",
+              retainedResponse.value != nil && spool.activeLeaseCount == 1)
+        for expectedSendCount in 1...5 {
+            check("file pump: next bounded send becomes observable before its manual ACK",
+                  sender.waitForSendCount(expectedSendCount))
+            check("file pump: each bounded send has one original pending ACK", sender.completeNext(true))
+        }
+        check("file pump: final ACK reaches a terminal predicate", terminal.waitForCount(1))
         check("file pump: one open handle stays owned through header and every bounded body callback",
-              terminal == .complete
+              terminal.values == [.complete]
                   && sender.payloads == [
                       Data("head".utf8), Data(bytes[0..<2]), Data(bytes[2..<4]),
                       Data(bytes[4..<6]), Data(bytes[6..<8]),
                   ])
         check("file pump: terminal completion releases the request lease", spool.activeLeaseCount == 0)
+        check("file pump: manual transport never has overlapping sends",
+              sender.maximumInFlight == 1 && sender.maximumSendDepth == 1)
 
         let errorKey = VortXHLSSessionSpool.ResourceKey.video(segmentID: 1)
         _ = spool.spill([.init(
             key: errorKey, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)])
         if let errorLease = spool.openResource(errorKey, now: 1),
            let errorPump = VortXSpoolResponsePump(lease: errorLease, chunkSize: 2) {
-            let errorSender = ManualSegmentSender()
-            var errorTerminal: VortXSpoolResponsePump.Terminal?
+            let errorSender = ManualSpoolSender()
+            let errorTerminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
             errorPump.start(
                 header: Data("head".utf8), cancelled: { false },
-                send: errorSender.send, terminal: { errorTerminal = $0 })
+                send: errorSender.send, terminal: errorTerminal.record)
+            check("file pump: failure header send is ready", errorSender.waitForSendCount(1))
             errorSender.completeNext(true)
+            check("file pump: failure body send is ready", errorSender.waitForSendCount(2))
             errorSender.completeNext(false)
+            check("file pump: failed ACK reaches terminal", errorTerminal.waitForCount(1))
             check("file pump: a mid-body send failure drains its file lease exactly once",
-                  errorTerminal == .sendError && spool.activeLeaseCount == 0)
+                  errorTerminal.values == [.sendError] && spool.activeLeaseCount == 0)
         } else {
             check("file pump: send-failure fixture opens", false)
         }
@@ -2739,21 +2878,209 @@ enum PlayerLiveContractTests {
             durationMilliseconds: 4_000)])
         if let cancellationLease = spool.openResource(cancellationKey, now: 1),
            let cancellationPump = VortXSpoolResponsePump(lease: cancellationLease, chunkSize: 2) {
-            let cancellationSender = ManualSegmentSender()
-            var cancelled = false
-            var cancellationTerminal: VortXSpoolResponsePump.Terminal?
+            let cancellationSender = ManualSpoolSender()
+            let cancelled = SpoolCancellationRecord()
+            let cancellationTerminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
             cancellationPump.start(
-                header: Data("head".utf8), cancelled: { cancelled },
-                send: cancellationSender.send, terminal: { cancellationTerminal = $0 })
+                header: Data("head".utf8), cancelled: cancelled.isCancelled,
+                send: cancellationSender.send, terminal: cancellationTerminal.record)
+            check("file pump: cancellation header send is ready", cancellationSender.waitForSendCount(1))
             cancellationSender.completeNext(true)
-            cancelled = true
+            check("file pump: cancellation body send is ready", cancellationSender.waitForSendCount(2))
+            cancelled.set(true)
             cancellationSender.completeNext(true)
+            check("file pump: cancelled ACK reaches terminal", cancellationTerminal.waitForCount(1))
             check("file pump: mid-body cancellation stops before another read and drains its lease",
-                  cancellationTerminal == .cancelled
+                  cancellationTerminal.values == [.cancelled]
                       && cancellationSender.payloads.count == 2
                       && spool.activeLeaseCount == 0)
         } else {
             check("file pump: cancellation fixture opens", false)
+        }
+
+        if let duplicateLease = spool.openResource(key, now: 1),
+           let duplicatePump = VortXSpoolResponsePump(lease: duplicateLease, chunkSize: 2) {
+            let duplicateSender = ManualSpoolSender()
+            let duplicateTerminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
+            duplicatePump.start(header: Data("head".utf8), cancelled: { false },
+                                send: duplicateSender.send, terminal: duplicateTerminal.record)
+            duplicateSender.completeNext(true)
+            check("file pump: stale-header test holds the first body ACK", duplicateSender.waitForSendCount(2))
+            duplicateSender.repeatLastAcknowledgment(true)
+            duplicateSender.repeatLastAcknowledgment(false)
+            for expectedSendCount in 2...5 {
+                check("file pump: duplicate ACK cannot replace the next original body ACK",
+                      duplicateSender.waitForSendCount(expectedSendCount))
+                duplicateSender.completeNext(true)
+            }
+            check("file pump: duplicate test reaches terminal", duplicateTerminal.waitForCount(1))
+            duplicateSender.repeatLastAcknowledgment(true)
+            duplicateSender.repeatLastAcknowledgment(false)
+            // Actual start is synchronous on the production owner. This ignored repeat
+            // fences earlier queued stale ACKs; it is not a fixture/private-queue drain.
+            duplicatePump.start(header: Data("ignored".utf8), cancelled: { false },
+                                send: duplicateSender.send, terminal: duplicateTerminal.record)
+            check("file pump: duplicate/stale ACKs and restart cannot advance or terminate twice",
+                  duplicateTerminal.values == [.complete]
+                      && duplicateSender.payloads == [
+                          Data("head".utf8), Data(bytes[0..<2]), Data(bytes[2..<4]),
+                          Data(bytes[4..<6]), Data(bytes[6..<8]),
+                      ]
+                      && duplicateSender.maximumInFlight == 1
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("file pump: duplicate fixture opens", false)
+        }
+
+        if let inlineLease = spool.openResource(key, now: 1),
+           let inlinePump = VortXSpoolResponsePump(lease: inlineLease, chunkSize: 2) {
+            let inlineTerminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
+            let replacementTerminal = SpoolTerminalRecord<VortXSpoolResponsePump.Terminal>()
+            let inlineSender = ManualSpoolSender(synchronousAcknowledgments: true, onFirstSend: { [weak inlinePump] in
+                inlinePump?.start(header: Data("replacement".utf8), cancelled: { false },
+                                  send: { _, ack in ack(false) }, terminal: replacementTerminal.record)
+            })
+            // A broken same-owner sync would deadlock its worker, not the test's
+            // main actor. Predicate waits remain bounded by the fixture deadline.
+            DispatchQueue.global(qos: .utility).async { [inlinePump] in
+                inlinePump.start(header: Data("head".utf8), cancelled: { false },
+                                 send: inlineSender.send, terminal: { [weak inlinePump] outcome in
+                    inlinePump?.start(header: Data("terminal-replacement".utf8), cancelled: { false },
+                                      send: { _, ack in ack(false) }, terminal: replacementTerminal.record)
+                    inlineTerminal.record(outcome)
+                })
+            }
+            check("file pump: inline ACK and reentrant start reach terminal", inlineTerminal.waitForCount(1))
+            check("file pump: synchronous ACK never overlaps sender stacks or replaces original callbacks",
+                  inlineTerminal.values == [.complete]
+                      && replacementTerminal.values.isEmpty
+                      && inlineSender.payloads == [
+                          Data("head".utf8), Data(bytes[0..<2]), Data(bytes[2..<4]),
+                          Data(bytes[4..<6]), Data(bytes[6..<8]),
+                      ]
+                      && inlineSender.maximumSendDepth == 1
+                      && inlineSender.maximumInFlight == 1
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("file pump: inline ACK fixture opens", false)
+        }
+    }
+
+    private static func testRangedSpoolResponsePump() {
+        let root = scratchDirectory("ranged-spool-pump")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = VortXRemuxBuffer(windowFloorBytes: 1)
+        let bytes = Array(UInt8(0)..<UInt8(8))
+        append(bytes, to: source)
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root, capacityBytes: 8, chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("range pump: session directory is creatable", false)
+            return
+        }
+        let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        guard spool.spill([.init(
+            key: key, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)]) else {
+            check("range pump: durable fixture spills", false)
+            return
+        }
+        if let invalidLease = spool.openResource(key, now: 1) {
+            let invalid = VortXRangedSpoolPump(lease: invalidLease, chunkSize: 2, range: 0...8)
+            check("range pump: invalid resolved range closes the real lease",
+                  invalid == nil && spool.activeLeaseCount == 0)
+        } else {
+            check("range pump: invalid-range fixture opens", false)
+        }
+
+        let expected = [Data("range".utf8), Data(bytes[2..<4]), Data(bytes[4..<6])]
+        if let lease = spool.openResource(key, now: 1),
+           let pump = VortXRangedSpoolPump(lease: lease, chunkSize: 2, range: 2...5) {
+            let sender = ManualSpoolSender()
+            let terminal = SpoolTerminalRecord<VortXRangedSpoolPump.Terminal>()
+            pump.start(header: Data("range".utf8), cancelled: { false },
+                       send: sender.send, terminal: terminal.record)
+            check("range pump: open file remains leased while header ACK is pending", spool.activeLeaseCount == 1)
+            sender.completeNext(true)
+            check("range pump: first exact range chunk is observable", sender.waitForSendCount(2))
+            sender.repeatLastAcknowledgment(true)
+            sender.repeatLastAcknowledgment(false)
+            sender.completeNext(true)
+            check("range pump: second exact range chunk is observable", sender.waitForSendCount(3))
+            sender.completeNext(true)
+            check("range pump: last byte ACK reaches terminal", terminal.waitForCount(1))
+            sender.repeatLastAcknowledgment(false)
+            sender.repeatLastAcknowledgment(true)
+            // This is the actual synchronous, ignored repeat-start API, fencing
+            // earlier queued stale ACKs without exposing a fake test drain.
+            pump.start(header: Data("ignored".utf8), cancelled: { false },
+                       send: sender.send, terminal: terminal.record)
+            check("range pump: exact inclusive bytes survive duplicate ACKs and terminate once",
+                  terminal.values == [.complete] && sender.payloads == expected
+                      && sender.maximumInFlight == 1 && sender.maximumSendDepth == 1
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("range pump: resolved-range fixture opens", false)
+        }
+
+        if let lease = spool.openResource(key, now: 1),
+           let pump = VortXRangedSpoolPump(lease: lease, chunkSize: 2, range: 2...5) {
+            let sender = ManualSpoolSender()
+            let terminal = SpoolTerminalRecord<VortXRangedSpoolPump.Terminal>()
+            pump.start(header: Data("range".utf8), cancelled: { false },
+                       send: sender.send, terminal: terminal.record)
+            sender.completeNext(true)
+            check("range pump: failure body ACK is pending", sender.waitForSendCount(2))
+            sender.completeNext(false)
+            check("range pump: failed body ACK reaches terminal", terminal.waitForCount(1))
+            check("range pump: failure closes only the original range lease",
+                  terminal.values == [.sendError] && sender.payloads.count == 2
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("range pump: failure fixture opens", false)
+        }
+
+        if let lease = spool.openResource(key, now: 1),
+           let pump = VortXRangedSpoolPump(lease: lease, chunkSize: 2, range: 2...5) {
+            let sender = ManualSpoolSender()
+            let cancelled = SpoolCancellationRecord()
+            let terminal = SpoolTerminalRecord<VortXRangedSpoolPump.Terminal>()
+            pump.start(header: Data("range".utf8), cancelled: cancelled.isCancelled,
+                       send: sender.send, terminal: terminal.record)
+            sender.completeNext(true)
+            check("range pump: cancellation body ACK is pending", sender.waitForSendCount(2))
+            cancelled.set(true)
+            sender.completeNext(true)
+            check("range pump: cancellation reaches terminal", terminal.waitForCount(1))
+            check("range pump: cancellation prevents the next range read and releases the lease",
+                  terminal.values == [.cancelled] && sender.payloads.count == 2
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("range pump: cancellation fixture opens", false)
+        }
+
+        if let lease = spool.openResource(key, now: 1),
+           let pump = VortXRangedSpoolPump(lease: lease, chunkSize: 2, range: 2...5) {
+            let terminal = SpoolTerminalRecord<VortXRangedSpoolPump.Terminal>()
+            let replacementTerminal = SpoolTerminalRecord<VortXRangedSpoolPump.Terminal>()
+            let sender = ManualSpoolSender(synchronousAcknowledgments: true, onFirstSend: { [weak pump] in
+                pump?.start(header: Data("replacement".utf8), cancelled: { false },
+                            send: { _, ack in ack(false) }, terminal: replacementTerminal.record)
+            })
+            DispatchQueue.global(qos: .utility).async { [pump] in
+                pump.start(header: Data("range".utf8), cancelled: { false },
+                           send: sender.send, terminal: { [weak pump] outcome in
+                    pump?.start(header: Data("terminal-replacement".utf8), cancelled: { false },
+                                send: { _, ack in ack(false) }, terminal: replacementTerminal.record)
+                    terminal.record(outcome)
+                })
+            }
+            check("range pump: inline ACK and same-owner reentry reach terminal", terminal.waitForCount(1))
+            check("range pump: inline ACK preserves original callbacks with no nested send stack",
+                  terminal.values == [.complete] && replacementTerminal.values.isEmpty
+                      && sender.payloads == expected && sender.maximumInFlight == 1
+                      && sender.maximumSendDepth == 1 && spool.activeLeaseCount == 0)
+        } else {
+            check("range pump: inline ACK fixture opens", false)
         }
     }
 

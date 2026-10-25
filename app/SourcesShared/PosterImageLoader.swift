@@ -551,17 +551,33 @@ enum PosterImageLoader {
 
     // MARK: dominant (average) color for the hero / detail backdrop tint
 
-    /// Cached average colors, keyed by art URL. A tiny class box because NSCache stores objects; bounded
-    /// so a long browse session can't grow it without limit (entries are 3 CGFloats, the cap is generous).
-    private final class TintBox {
+    private struct Tint: Sendable {
         let red: CGFloat, green: CGFloat, blue: CGFloat
-        init(red: CGFloat, green: CGFloat, blue: CGFloat) { (self.red, self.green, self.blue) = (red, green, blue) }
     }
-    private static let tintCache: NSCache<NSURL, TintBox> = {
-        let c = NSCache<NSURL, TintBox>()
-        c.countLimit = 300
-        return c
-    }()
+
+    /// Keep Foundation's non-Sendable NSCache and its object boxes inside one checked actor owner. Only
+    /// immutable scalar tints cross the boundary; networking, decoding and averaging stay outside the actor.
+    /// NSCache retains its existing URL keys, count limit and pressure-driven eviction behavior.
+    private actor TintCache {
+        private final class TintBox {
+            let value: Tint
+            init(_ value: Tint) { self.value = value }
+        }
+        private let cache: NSCache<NSURL, TintBox> = {
+            let cache = NSCache<NSURL, TintBox>()
+            cache.countLimit = 300
+            return cache
+        }()
+
+        func value(for url: URL) -> Tint? {
+            cache.object(forKey: url as NSURL)?.value
+        }
+
+        func insert(_ value: Tint, for url: URL) {
+            cache.setObject(TintBox(value), forKey: url as NSURL)
+        }
+    }
+    private static let tintCache = TintCache()
 
     /// The average color of the art at `urlString`, for the dynamic hero/detail backdrop tint. CHEAP by
     /// construction: bytes come from the same dedicated poster URLCache (so a backdrop the screen is
@@ -571,7 +587,7 @@ enum PosterImageLoader {
     /// Never touches the decoded poster `memory` cache (a 32 px thumbnail must not replace a card's image).
     static func averageColor(_ urlString: String?) async -> Color? {
         guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else { return nil }
-        if let hit = tintCache.object(forKey: url as NSURL) {
+        if let hit = await tintCache.value(for: url) {
             return Color(red: hit.red, green: hit.green, blue: hit.blue)
         }
         let key = PosterImageNegativeCacheKey(url: url, variant: .averageColor, maxPixel: 32)
@@ -599,7 +615,7 @@ enum PosterImageLoader {
             return nil
         }
         await negativeCache.clear(key)
-        tintCache.setObject(TintBox(red: tint.red, green: tint.green, blue: tint.blue), forKey: url as NSURL)
+        await tintCache.insert(Tint(red: tint.red, green: tint.green, blue: tint.blue), for: url)
         return Color(red: tint.red, green: tint.green, blue: tint.blue)
     }
 

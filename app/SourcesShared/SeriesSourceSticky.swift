@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The source a viewer chose BY HAND for a series, remembered so the next episode keeps picking it.
 ///
@@ -46,9 +47,11 @@ enum SeriesSourceSticky {
     }
 
     /// One immutable selection context follows the asynchronous prepare/resolve transaction.
+    /// The transport stays unisolated; live capture and admission below belong to the main actor.
     @TaskLocal static var resolvingChoice: Snapshot?
     @TaskLocal static var rejectedStreams: Set<String> = []
 
+    @MainActor
     static func snapshot(for seriesKey: String) -> Snapshot {
         if let resolvingChoice, resolvingChoice.seriesKey == seriesKey,
            resolvingChoice.profile == activeProfileKey { return resolvingChoice }
@@ -56,6 +59,7 @@ enum SeriesSourceSticky {
     }
 
     /// Admission must read the live profile, never its task-local (deliberately frozen) ranking context.
+    @MainActor
     static func currentSnapshot(for seriesKey: String) -> Snapshot {
         let (profile, choices) = loaded()
         let choice = choices[seriesKey]
@@ -64,6 +68,7 @@ enum SeriesSourceSticky {
                         resolution: choice?.resolution)
     }
 
+    @MainActor
     static func admits(_ frozen: Snapshot?) -> Bool {
         guard let frozen else { return false }
         return frozen == currentSnapshot(for: frozen.seriesKey)
@@ -88,23 +93,23 @@ enum SeriesSourceSticky {
 
     /// The active profile's stable key, mirroring `SourcePinStore`: `activeID` is a `UUID?`, so a not-yet-loaded
     /// roster still has a namespace.
+    @MainActor
     private static var activeProfileKey: String { ProfileStore.shared.activeID?.uuidString ?? "default" }
 
-    /// Guards ONLY the in-memory dictionary. Every `UserDefaults` read/write below happens with the lock
-    /// released: MIS-260731-02 shipped a launch deadlock by holding an app-level lock across UserDefaults I/O,
-    /// whose change notification re-enters app code on the main thread.
-    private static let lock = NSLock()
+    /// Live cache state shares the synchronous main-actor owner with profile selection and preference edits.
+    /// Never hold an app-level lock across UserDefaults I/O: its change notification can re-enter app code.
+    @MainActor
     private static var cache: [String: Choice]?
+    @MainActor
     private static var cachedProfile: String?
 
     /// The active profile's picks, decoded once and kept in memory (the ranking sites read this per pick, and
-    /// a JSON decode per read would land in a render path). Two threads racing the first load both decode the
-    /// same bytes, so the redundant work is harmless.
+    /// a JSON decode per read would land in a render path). Capture is synchronous; detached ranking receives
+    /// only the returned immutable preference, never a live store fallback.
+    @MainActor
     private static func loaded() -> (profile: String, choices: [String: Choice]) {
         let profile = activeProfileKey
-        lock.lock()
-        if cachedProfile == profile, let hit = cache { lock.unlock(); return (profile, hit) }
-        lock.unlock()
+        if cachedProfile == profile, let hit = cache { return (profile, hit) }
         var decoded: [String: Choice] = [:]
         if let data = UserDefaults.standard.data(forKey: key(profile)) {
             if let blob = try? JSONDecoder().decode([String: Choice].self, from: data) {
@@ -113,7 +118,8 @@ enum SeriesSourceSticky {
                 quarantineUndecodableBlob(data, profile: profile)
             }
         }
-        lock.lock(); cachedProfile = profile; cache = decoded; lock.unlock()
+        cachedProfile = profile
+        cache = decoded
         return (profile, decoded)
     }
 
@@ -129,6 +135,7 @@ enum SeriesSourceSticky {
     ///
     /// NOTE for whoever fixes the same shape elsewhere: `SourcePinStore` and `LastStreamStore` decode the same
     /// way and have the same wipe-on-next-write behavior. They are deliberately NOT touched here.
+    @MainActor
     private static func quarantineUndecodableBlob(_ data: Data, profile: String) {
         let quarantineKey = key(profile) + ".undecodable"
         guard UserDefaults.standard.data(forKey: quarantineKey) == nil else { return }
@@ -138,6 +145,7 @@ enum SeriesSourceSticky {
 
     /// Remember the source the viewer just chose by hand for `seriesKey` (the show's meta id, so every episode
     /// shares it). A pick carrying neither signal is not worth a record.
+    @MainActor
     static func record(seriesKey: String, addon: String?, bingeGroup: String?, resolution: Int? = nil) {
         guard !seriesKey.isEmpty,
               addon?.isEmpty == false || bingeGroup?.isEmpty == false else { return }
@@ -149,12 +157,14 @@ enum SeriesSourceSticky {
             dict = Dictionary(uniqueKeysWithValues:
                 dict.sorted { $0.value.ts > $1.value.ts }.prefix(keepSeries).map { ($0.key, $0.value) })
         }
-        lock.lock(); cachedProfile = profile; cache = dict; lock.unlock()
+        cachedProfile = profile
+        cache = dict
         if let data = try? JSONEncoder().encode(dict) {
-            UserDefaults.standard.set(data, forKey: key(profile))   // outside the lock, deliberately
+            UserDefaults.standard.set(data, forKey: key(profile))
         }
     }
 
+    @MainActor
     static func recordAudio(seriesKey: String, language: String) {
         let language = BingeAudioContinuityPolicy.canonical(language)
         guard !seriesKey.isEmpty, let language else { return }
@@ -169,7 +179,8 @@ enum SeriesSourceSticky {
             dict = Dictionary(uniqueKeysWithValues:
                 dict.sorted { $0.value.ts > $1.value.ts }.prefix(keepSeries).map { ($0.key, $0.value) })
         }
-        lock.lock(); cachedProfile = profile; cache = dict; lock.unlock()
+        cachedProfile = profile
+        cache = dict
         if let data = try? JSONEncoder().encode(dict) {
             UserDefaults.standard.set(data, forKey: key(profile))
         }
@@ -177,6 +188,7 @@ enum SeriesSourceSticky {
 
     /// The remembered pick for `seriesKey`, in the shape `StreamRanking.best` / `rankedCandidates` take.
     /// `nil` when the viewer has never chosen a source for this show.
+    @MainActor
     static func preference(for seriesKey: String) -> (addon: String?, bingeGroup: String?)? {
         guard !seriesKey.isEmpty, let choice = loaded().choices[seriesKey] else { return nil }
         return (addon: choice.addon, bingeGroup: choice.bingeGroup)
@@ -257,32 +269,49 @@ enum ProviderHealth {
     /// the viewer comes back.
     static let failureDecaySeconds: TimeInterval = 600
 
-    private static let lock = NSLock()
-    /// Add-on NAME (lowercased) -> the monotonic `systemUptime` of its last failure. The name is `manifest.name`,
-    /// the app-owned identity a pin and the sticky record also key on - NOT the add-on's transport base URL,
-    /// which is what "addon base" means everywhere else in this codebase (`engineAddonBase`). `systemUptime`
-    /// rather than `Date` so a clock change cannot make a failure look older or newer than it is.
-    private static var failures: [String: TimeInterval] = [:]
+    /// A checked shared owner, also independently constructible for deterministic in-memory tests.
+    /// Copies share the same lock-owned state; neither keys nor the mutable dictionary escape.
+    struct Store: Sendable {
+        /// Add-on NAME (lowercased), not its transport URL, maps to the last monotonic uptime.
+        private let failures = OSAllocatedUnfairLock(initialState: [String: TimeInterval]())
+
+        /// Read-only diagnostics; this never exposes the stored names or timestamps.
+        var rememberedAddonCount: Int { failures.withLock { $0.count } }
+
+        func noteFailure(addonName: String,
+                         uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+            guard !addonName.isEmpty else { return }
+            let now = uptime()
+            let key = addonName.lowercased()
+            failures.withLock { values in
+                values[key] = now
+                if values.count > 64 {
+                    // Prune expired entries, not a hard cap: every still-live failure remains remembered.
+                    values = values.filter { now - $0.value < ProviderHealth.failureDecaySeconds }
+                }
+            }
+        }
+
+        func penaltyActive(addonName: String?,
+                           uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) -> Bool {
+            guard let addonName, !addonName.isEmpty else { return false }
+            let key = addonName.lowercased()
+            let failedAt = failures.withLock { $0[key] }
+            guard let failedAt else { return false }
+            // Read the clock after releasing the lock, preserving the original expiry boundary.
+            return uptime() - failedAt < ProviderHealth.failureDecaySeconds
+        }
+    }
+
+    private static let store = Store()
 
     /// Record that `addonName` just failed to produce playable video.
     static func noteFailure(addonName: String) {
-        guard !addonName.isEmpty else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        let key = addonName.lowercased()   // outside the lock: no work under it (MIS-260731-02)
-        lock.lock()
-        failures[key] = now
-        if failures.count > 64 {   // defensive cap; drop everything already decayed
-            failures = failures.filter { now - $0.value < failureDecaySeconds }
-        }
-        lock.unlock()
+        store.noteFailure(addonName: addonName)
     }
 
     /// Whether `addonName` failed inside the decay window. `nil`/empty is never penalized.
     static func penaltyActive(addonName: String?) -> Bool {
-        guard let addonName, !addonName.isEmpty else { return false }
-        let key = addonName.lowercased()   // outside the lock: no work under it (MIS-260731-02)
-        lock.lock(); let failedAt = failures[key]; lock.unlock()
-        guard let failedAt else { return false }
-        return ProcessInfo.processInfo.systemUptime - failedAt < failureDecaySeconds
+        store.penaltyActive(addonName: addonName)
     }
 }

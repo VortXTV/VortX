@@ -129,7 +129,7 @@ struct VortXiOSApp: App {
                 .onAppear { UpdateChecker.shared.startMonitoring() }
                 // Infuse reporting where the viewer stopped (its x-success callback to vortx://).
                 .onOpenURL { _ = InfuseReturnCoordinator.handle($0) }
-                .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
+                .onValueChange(of: scenePhase) { phase in   // preserves the iOS 16 deployment floor
                     // Termination evidence: keep the receipt's last-known phase current so the next
                     // launch can distinguish a backgrounded jetsam kill from a foreground kill.
                     switch phase {
@@ -185,7 +185,7 @@ struct VortXiOSApp: App {
                         VortXSyncManager.shared.syncUpOnBackground()
                     }
                 }
-                .onChange(of: sync.isSignedIn) { signedIn in   // iOS 16 single-parameter form
+                .onValueChange(of: sync.isSignedIn) { signedIn in   // preserves the iOS 16 deployment floor
                     // A VortX sign-in from ANY entry point (password, create, recover, QR approve) must
                     // restore add-ons + owner library WITHOUT waiting for a background/foreground cycle:
                     // adopt() hydrates at the sign-in chokepoint, and this root-level hook re-runs the

@@ -56,7 +56,7 @@ enum SeriesWatched {
     /// Tolerant `released` parser: full ISO-8601 (with or without fractional seconds), else a bare
     /// `yyyy-MM-dd` calendar day (midnight UTC). Returns nil when absent or unparseable, which the callers
     /// treat as unaired. A fresh day-formatter per call (DateFormatter is not thread-safe); the ISO
-    /// formatters are the shared reused instances from CoreModels.
+    /// paths use the shared Sendable parser values from CoreModels.
     private static func airDate(_ released: String?) -> Date? {
         guard let released, !released.isEmpty else { return nil }
         if let d = ISO8601DateFormatter.epg.date(from: released) { return d }

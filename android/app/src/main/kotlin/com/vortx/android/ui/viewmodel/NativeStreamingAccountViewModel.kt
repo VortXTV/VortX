@@ -9,6 +9,10 @@ import com.vortx.android.profile.UserProfile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
@@ -29,7 +33,7 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
         },
         session = { accounts.session() },
     )
-    data class State(val mounted: Boolean = false, val profiles: List<UserProfile> = emptyList(), val activeID: String? = null,
+    data class State(val loading: Boolean = true, val mounted: Boolean = false, val profiles: List<UserProfile> = emptyList(), val activeID: String? = null,
                      val streaming: List<NativeAccountCoordinator.StreamingProfile> = emptyList(),
                      val migration: NativeAccountCoordinator.MigrationStatus? = null,
                      val formProfile: UserProfile? = null, val busy: Boolean = false, val message: String? = null)
@@ -39,22 +43,83 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
     private var request: Job? = null
     private var retryTarget: NativeAccountCoordinator.MigrationTarget? = null
 
+    // At most one full native snapshot is being read and one newest request is pending. A fresh
+    // identity closes A -> B -> A completion reuse without a wrapping numeric generation.
+    private val refreshRequests = Channel<Unit>(Channel.CONFLATED)
+    private val refreshGeneration = AtomicReference(Any())
+    private var rejectedRefresh: Any? = null
+    private var presentationIdentity: Any? = Any()
+
     init {
-        refresh()
+        viewModelScope.launch {
+            while (refreshRequests.receiveCatching().isSuccess) {
+                val generation = refreshGeneration.get()
+                try {
+                    val snapshot = withContext(Dispatchers.Default) { accounts.captureStreamingPresentation() }
+                    currentCoroutineContext().ensureActive()
+                    if (refreshGeneration.get() !== generation) continue
+                    val published = snapshot.publishIfCurrent {
+                        if (refreshGeneration.get() === generation) {
+                            // UI actions may have changed the form while the snapshot was reading.
+                            // Copy the current state so their busy/form/message fields remain intact.
+                            val projection = snapshot.projection
+                            mutable.value = mutable.value.copy(loading = false, mounted = projection != null,
+                                profiles = projection?.profiles ?: snapshot.streaming.map { it.profile },
+                                activeID = projection?.activeID, streaming = snapshot.streaming, migration = snapshot.migration)
+                        }
+                    }
+                    if (!published && refreshGeneration.get() === generation) {
+                        // One bounded retry closes a stamp race even if its flow wake was conflated.
+                        // Permanent admission failure must not spin or strand initial loading forever.
+                        if (rejectedRefresh !== generation) {
+                            rejectedRefresh = generation
+                            refreshRequests.trySend(Unit)
+                        } else refreshFailed(generation)
+                    }
+                } catch (cancel: CancellationException) {
+                    throw cancel
+                } catch (_: LinkageError) {
+                    refreshFailed(generation)
+                } catch (_: Exception) {
+                    refreshFailed(generation)
+                }
+            }
+        }
         viewModelScope.launch {
             accounts.changes.collectLatest {
+                val identity = accounts.streamingPresentationIdentity()
+                if (identity !== presentationIdentity) {
+                    presentationIdentity = identity
+                    // A new/retired account mount or replaced setup cannot keep the former roster,
+                    // PIN/form target or error visible while its new background snapshot is pending.
+                    // Mount/setup transitions can be produced by the currently admitted mutation
+                    // itself. Keep its job handle for close()/ViewModel disposal; its captured native
+                    // fences decide commit, while these retired UI targets reject its late message.
+                    target = null; retryTarget = null
+                    mutable.value = State()
+                }
                 refresh()
                 runCatching { accounts.session() }.getOrNull()?.updates?.collect { refresh() }
             }
         }
     }
 
+    /** Enqueue only; neither the UI nor a native mutation's callback waits for state serialization. */
     fun refresh() {
-        val projection = runCatching { NativeProfileAccess.projection(accounts.session().read()) }.getOrNull()
-        val streaming = runCatching { accounts.streamingProfiles() }.getOrDefault(emptyList())
-        mutable.value = mutable.value.copy(mounted = projection != null,
-            profiles = projection?.profiles ?: streaming.map { it.profile }, activeID = projection?.activeID, streaming = streaming,
-            migration = runCatching { accounts.migrationStatus() }.getOrNull())
+        refreshGeneration.set(Any())
+        refreshRequests.trySend(Unit)
+    }
+
+    private fun refreshFailed(generation: Any) {
+        if (refreshGeneration.get() !== generation) return
+        mutable.value = mutable.value.copy(loading = false, mounted = false, profiles = emptyList(), activeID = null,
+            streaming = emptyList(), migration = null,
+            message = mutable.value.message ?: "Profiles couldn't load. Try again or export diagnostics.")
+    }
+
+    override fun onCleared() {
+        refreshRequests.close()
+        super.onCleared()
     }
     fun prepare(profileID: String): Prepared? = runCatching { Prepared(accounts.captureStreamingTarget(profileID)) }.getOrElse {
         mutable.value = mutable.value.copy(message = "The profile changed. Open it again before signing in."); null

@@ -230,9 +230,39 @@ jni_func(jlong, nativeLoadFileWithEntryID, jlong instance, jstring jurl) {
     return entry_id;
 }
 
+static bool is_af_property(const char *property) {
+    return property && (std::strcmp(property, "af") == 0 ||
+                        std::strcmp(property, "options/af") == 0 ||
+                        std::strcmp(property, "file-local-options/af") == 0);
+}
+
+static bool command_may_replace_af(const char *const *args, int count) {
+    if (count < 1 || !args[0])
+        return false;
+    const char *name = args[0];
+    if (std::strcmp(name, "af") == 0)
+        return true;
+    if (std::strcmp(name, "cycle-values") == 0 && count > 2 && args[1] &&
+        std::strcmp(args[1], "!reverse") == 0 && is_af_property(args[2]))
+        return true;
+    if (count > 1 && is_af_property(args[1]) &&
+        (std::strcmp(name, "set") == 0 || std::strcmp(name, "set_property") == 0 ||
+         std::strcmp(name, "set_property_string") == 0 || std::strcmp(name, "add") == 0 ||
+         std::strcmp(name, "cycle") == 0 || std::strcmp(name, "cycle-values") == 0 ||
+         std::strcmp(name, "multiply") == 0 || std::strcmp(name, "change-list") == 0))
+        return true;
+    // Opaque profile/config/script routes can replace AF without naming it in this argument list.
+    return std::strcmp(name, "apply-profile") == 0 || std::strcmp(name, "restore-profile") == 0 ||
+        std::strcmp(name, "load-config-file") == 0 || std::strcmp(name, "load-script") == 0 ||
+        std::strcmp(name, "script-message") == 0 || std::strcmp(name, "script-message-to") == 0 ||
+        std::strcmp(name, "script-binding") == 0;
+}
+
 jni_func(void, nativeCommand, jlong instance, jobjectArray jarray) {
+    if (!jarray || env->ExceptionCheck())
+        return;
     auto mpv_instance = reinterpret_cast<MPVInstance*>(instance);
-    if (!mpv_instance->mpv) {
+    if (!mpv_instance || !mpv_instance->mpv) {
         ALOGE("Cannot run command: mpv is not initialized");
         return;
     }
@@ -241,23 +271,39 @@ jni_func(void, nativeCommand, jlong instance, jobjectArray jarray) {
     jstring stringRefs[128] = { nullptr };
 
     int len = env->GetArrayLength(jarray);
+    if (env->ExceptionCheck())
+        return;
 
     if (len >= ARRAYLEN(arguments)) {
         ALOGE("Cannot run command: too many arguments");
         return;
     }
 
+    // Release only acquired chars/refs, including a partial iteration with a pending exception.
+    const auto releaseArguments = [&]() {
+        for (int i = 0; i < len; ++i) {
+            if (arguments[i])
+                env->ReleaseStringUTFChars(stringRefs[i], arguments[i]);
+            if (stringRefs[i])
+                env->DeleteLocalRef(stringRefs[i]);
+        }
+    };
     for (int i = 0; i < len; ++i) {
         stringRefs[i] = (jstring)env->GetObjectArrayElement(jarray, i);
+        if (env->ExceptionCheck() || !stringRefs[i]) {
+            releaseArguments();
+            return;
+        }
         arguments[i] = env->GetStringUTFChars(stringRefs[i], nullptr);
-    }
-
-    mpv_command(mpv_instance->mpv, arguments);
-
-    for (int i = 0; i < len; ++i) {
-        if (stringRefs[i]) {
-            env->ReleaseStringUTFChars(stringRefs[i], arguments[i]);
-            env->DeleteLocalRef(stringRefs[i]);
+        if (env->ExceptionCheck() || !arguments[i]) {
+            releaseArguments();
+            return;
         }
     }
+
+    const int status = mpv_command(mpv_instance->mpv, arguments);
+    if (status >= 0 && command_may_replace_af(arguments, len))
+        mpv_instance->session_audio_preset_owned = 0;
+
+    releaseArguments();
 }

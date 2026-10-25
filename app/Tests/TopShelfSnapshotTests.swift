@@ -11,8 +11,12 @@
 // possible precisely because that file is deliberately Foundation-only and free of every VortX type
 // (which is also what keeps the extension's compile surface at one file). Run it with:
 //
-//     swiftc -O app/SourcesShared/TopShelfSnapshot.swift app/Tests/TopShelfSnapshotTests.swift \
-//         -o /tmp/topshelf-tests && /tmp/topshelf-tests
+//     mkdir -p app/build/top-shelf-tests
+//     swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+//         -target arm64-apple-macosx14.0 -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+//         app/SourcesShared/TopShelfSnapshot.swift app/Tests/TopShelfSnapshotTests.swift \
+//         -o app/build/top-shelf-tests/top-shelf
+//     (cd app/build/top-shelf-tests && ./top-shelf)
 //
 // These fixtures never resolve or touch a real App Group/container or local preferences. Explicit
 // disposable file/directory URLs exercise the real bounded reader/writer and pure artwork paths.
@@ -310,6 +314,26 @@ check(
 
 // MARK: Bounded local-file snapshot fixtures
 
+section("untrusted progress obeys the system shelf's inclusive 0...1 contract")
+
+let managedPoster = syntheticArtwork.appendingPathComponent("fixture.webp").absoluteString
+let progressPosters: [String?] = [nil, "https://fixture.invalid/poster.jpg", managedPoster, "http://fixture.invalid/poster.jpg"]
+for poster in progressPosters {
+    for progress in [-Double.infinity, -Double.leastNonzeroMagnitude, -0.5, 1.0.nextUp, 1.5, Double.infinity, Double.nan] {
+        let row = TopShelfSnapshot.Item(id: "tt-progress", type: "movie", title: "Progress", poster: poster, progress: progress)
+        check(TopShelfSnapshot.displayable(row, artworkDirectory: syntheticArtwork) == nil,
+              "out-of-range or non-finite progress is rejected before every poster branch")
+    }
+    for progress in [0.0, 0.5, 1.0] {
+        let row = TopShelfSnapshot.Item(id: "tt-progress", type: "movie", title: "Progress", poster: poster, progress: progress)
+        let shown = TopShelfSnapshot.displayable(row, artworkDirectory: syntheticArtwork)
+        let expectedPoster = poster?.hasPrefix("http:") == true ? nil : poster
+        check(shown == TopShelfSnapshot.Item(id: row.id, type: row.type, title: row.title,
+                                             poster: expectedPoster, progress: progress),
+              "valid progress including both endpoints retains the original row and artwork policy")
+    }
+}
+
 section("snapshot reads and writes use only a disposable local directory")
 
 do {
@@ -351,6 +375,21 @@ do {
     check(shown.map(\.id) == ["tt1", "tt2"], "a row whose action does not round-trip through the link parser is not shown")
     check(shown.allSatisfy { $0.poster == nil },
           "a poster outside the managed artwork folder or not https is dropped, the row kept")
+    let progressFile = directory.appendingPathComponent("untrusted-progress.json")
+    let invalidProgressRows = [
+        TopShelfSnapshot.Item(id: "below", type: "movie", title: "Below", poster: nil, progress: -0.01),
+        TopShelfSnapshot.Item(id: "above", type: "series", title: "Above", poster: "https://fixture.invalid/poster.jpg", progress: 1.01),
+    ]
+    let progressBytes = try encoder.encode(TopShelfSnapshot.Payload(version: TopShelfSnapshot.currentVersion,
+        writtenAt: Date(), items: invalidProgressRows + items))
+    try progressBytes.write(to: progressFile)
+    check(TopShelfSnapshot.read(from: progressFile) == items,
+          "the actual bounded file reader excludes corrupt progress without discarding valid neighboring rows")
+    let progressResult = TopShelfSnapshot.readResult(from: progressFile)
+    check(progressResult.status == .ready && progressResult.items == items,
+          "diagnostic and compatibility readers enforce the same progress contract")
+    check(try Data(contentsOf: progressFile) == progressBytes,
+          "rejecting corrupt progress does not rewrite, normalize or delete saved cache bytes")
     let original = try Data(contentsOf: file)
     check(!TopShelfSnapshot.write(eight, to: file), "unchanged readable content does not rewrite the cache")
     check(try Data(contentsOf: file) == original, "unchanged publication preserves exact cache bytes")

@@ -53,13 +53,13 @@ import Combine
     @ObservedObject var controller: XperienceCurationExportController
     let ticket: XperienceCurationExportController.Ticket
     let refresh: Bool
-    let onFinish: () -> Void
+    let onFinish: @MainActor @Sendable () -> Void
     @StateObject private var input: XperienceCurationExportPromptState
     private var busy: Bool { controller.phase == .loading || controller.phase == .saving }
 
     init(controller: XperienceCurationExportController,
          ticket: XperienceCurationExportController.Ticket, refresh: Bool,
-         onFinish: @escaping () -> Void) {
+         onFinish: @escaping @MainActor @Sendable () -> Void) {
         self.controller = controller; self.ticket = ticket; self.refresh = refresh
         self.onFinish = onFinish
         _input = StateObject(wrappedValue: .init(controller: controller, ticket: ticket))

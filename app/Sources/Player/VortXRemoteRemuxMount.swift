@@ -103,17 +103,18 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     /// Begin steady-state polling after the bounded readiness wait succeeds. Startup owns its own status loop,
     /// so a young session cannot spend the steady-state silence budget before it has published its first init.
     func start() {
-        lock.lock()
-        guard !invalidated, poller == nil else { lock.unlock(); return }
-        lock.unlock()
-        let task = Task.detached(priority: .utility) { [weak self] in
-            while let self, !Task.isCancelled, !self.isInvalidated {
-                await self.pollOnce()
-                try? await Task.sleep(
-                    nanoseconds: UInt64(VortXEngineHostPolicy.healthPollSeconds * 1_000_000_000))
+        // Publish the poller in the same transaction as admission. Concurrent starts or
+        // invalidation cannot leave an unowned task running after teardown.
+        lock.withLock {
+            guard !invalidated, poller == nil else { return }
+            poller = Task.detached(priority: .utility) { [weak self] in
+                while let self, !Task.isCancelled, !self.isInvalidated {
+                    await self.pollOnce()
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(VortXEngineHostPolicy.healthPollSeconds * 1_000_000_000))
+                }
             }
         }
-        lock.lock(); poller = task; lock.unlock()
     }
 
     private var isInvalidated: Bool {
@@ -121,26 +122,30 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         return invalidated
     }
 
-    private func cacheSuccessfulStatus(_ status: VortXEngineProtocol.SessionStatus) {
+    private func cacheSuccessfulStatus(_ status: VortXEngineProtocol.SessionStatus) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
+        guard !invalidated else { return false }
         latest = status
         consecutiveFailures = 0
-        lock.unlock()
+        return true
     }
 
     private func pollOnce() async {
         let status = await engine.status(session)
-        lock.lock()
-        if let status {
-            latest = status
-            consecutiveFailures = 0
-        } else {
-            consecutiveFailures += 1
+        let failures: Int? = lock.withLock {
+            // A response that finished after retirement cannot revive the cache or
+            // turn an ordinary teardown into a new host-loss/failover notification.
+            guard !invalidated else { return nil }
+            if let status {
+                latest = status
+                consecutiveFailures = 0
+            } else {
+                consecutiveFailures += 1
+            }
+            return consecutiveFailures
         }
-        let failures = consecutiveFailures
-        let alreadyGone = invalidated
-        lock.unlock()
-        guard !alreadyGone else { return }
+        guard let failures else { return }
         let hostReportsHealthy = status?.failed == true ? false : status?.healthy
         let decision = VortXEngineHostPolicy.failover(
             consecutiveControlFailures: failures,
@@ -171,7 +176,8 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { return .failure(.timeout) }
             if let status = await engine.status(session, timeoutSeconds: remaining) {
-                cacheSuccessfulStatus(status)
+                guard !Task.isCancelled else { return .failure(.cancelled) }
+                guard cacheSuccessfulStatus(status) else { return .failure(.retired) }
                 let decision = VortXEngineHostPolicy.remoteReadiness(
                     statusReceived: true,
                     healthy: status.healthy,
@@ -204,9 +210,9 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
         while Date() < deadline, !isInvalidated, !Task.isCancelled {
             if let status = await engine.status(session) {
-                cacheSuccessfulStatus(status)
+                guard !Task.isCancelled, cacheSuccessfulStatus(status) else { return false }
+                guard status.failed != true, status.healthy else { return false }
                 if status.supportsHDRFallback == true { return true }
-                if !status.healthy { return false }
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }

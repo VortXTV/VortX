@@ -1,0 +1,136 @@
+{
+  "capture": "reviewed-public-native-topology-20261021",
+  "schema_version": 1,
+  "counts": {
+    "original_inventory_lanes": 63,
+    "supplemental_runtime_observations": 4,
+    "unique_upstream_sources": 69,
+    "omitted_original_rows": 0
+  },
+  "scope_notes": {
+    "dovi": {
+      "repository_surface": "quietvoid/dovi_tool CLI 2.x tags/releases",
+      "underlying_component": "libdovi 3.x",
+      "immutable_source": "dolby_vision/Cargo.toml",
+      "version_field": "[package].version",
+      "status": "UNVERIFIED",
+      "reason": "Repository tags/releases identify the CLI only; the libdovi version requires a separate immutable-file observation."
+    }
+  },
+  "github": [
+    ["android-libmpv", "jarnedemeulemeester/libmpv-android"],
+    ["aws-lc", "aws/aws-lc"],
+    ["cmake", "Kitware/CMake"],
+    ["dovi", "quietvoid/dovi_tool"],
+    ["fribidi", "fribidi/fribidi"],
+    ["glslang", "KhronosGroup/glslang"],
+    ["harfbuzz", "harfbuzz/harfbuzz"],
+    ["kotlin", "JetBrains/kotlin"],
+    ["lcms", "mm2/Little-CMS"],
+    ["libass", "libass/libass"],
+    ["libplacebo", "haasn/libplacebo"],
+    ["libunibreak", "adah1972/libunibreak"],
+    ["linuxdeploy", "linuxdeploy/linuxdeploy"],
+    ["linuxdeploy-appimage", "linuxdeploy/linuxdeploy-plugin-appimage"],
+    ["mbedtls", "Mbed-TLS/mbedtls"],
+    ["meson", "mesonbuild/meson"],
+    ["moltenvk", "KhronosGroup/MoltenVK"],
+    ["mpv", "mpv-player/mpv"],
+    ["mpv-windows-packager", "zhongfly/mpv-winbuild"],
+    ["mpvkit", "mpvkit/MPVKit"],
+    ["ninja", "ninja-build/ninja"],
+    ["openssl", "openssl/openssl"],
+    ["pkgconf", "pkgconf/pkgconf"],
+    ["quickjs-ng", "quickjs-ng/quickjs"],
+    ["rust-stable", "rust-lang/rust"],
+    ["shaderc", "google/shaderc"],
+    ["spirv-headers", "KhronosGroup/SPIRV-Headers"],
+    ["spirv-tools", "KhronosGroup/SPIRV-Tools"],
+    ["swift", "swiftlang/swift"],
+    ["temurin17", "adoptium/temurin17-binaries"],
+    ["temurin21", "adoptium/temurin21-binaries"],
+    ["uavs3d", "uavs3/uavs3d"],
+    ["uchardet-wrapper", "mpvkit/libuchardet-build"],
+    ["vulkan-headers", "KhronosGroup/Vulkan-Headers"]
+  ],
+  "unsupported": [
+    ["ffmpeg", "official-archive/feed", "https://ffmpeg.org/releases/"],
+    ["gnutls", "official-archive/feed", "https://www.gnutls.org/news.html"],
+    ["gmp", "official-archive/feed", "https://gmplib.org/download/gmp/"],
+    ["nettle", "official-archive/feed", "https://ftp.gnu.org/gnu/nettle/"],
+    ["freetype", "official-archive/feed", "https://download.savannah.gnu.org/releases/freetype/"],
+    ["samba", "official-archive/feed", "https://download.samba.org/pub/samba/"],
+    ["dav1d", "official-archive/feed", "https://download.videolan.org/pub/videolan/dav1d/"],
+    ["uchardet", "official-archive/feed", "https://gitlab.freedesktop.org/api/v4/projects/uchardet%2Fuchardet/repository/tags?per_page=100&page={page}"],
+    ["libbluray", "official-archive/feed", "https://download.videolan.org/pub/videolan/libbluray/"],
+    ["luajit", "rolling-commit", "https://api.github.com/repos/LuaJIT/LuaJIT/commits?sha=v2.1&per_page=100&page={page}"],
+    ["lua", "official-archive/feed", "https://www.lua.org/ftp/"],
+    ["libxml2", "official-archive/feed", "https://download.gnome.org/sources/libxml2/"],
+    ["fontconfig", "official-archive/feed", "https://cgit.freedesktop.org/fontconfig/refs/tags"],
+    ["media3", "parent-registry", [
+      "https://dl.google.com/dl/android/maven2/androidx/media3/media3-exoplayer/maven-metadata.xml",
+      "https://dl.google.com/dl/android/maven2/androidx/media3/media3-exoplayer-hls/maven-metadata.xml",
+      "https://dl.google.com/dl/android/maven2/androidx/media3/media3-ui/maven-metadata.xml",
+      "https://dl.google.com/dl/android/maven2/androidx/media3/media3-session/maven-metadata.xml"
+    ]],
+    ["agp", "parent-registry", [
+      "https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/maven-metadata.xml"
+    ]],
+    ["gradle", "official-archive/feed", "https://services.gradle.org/versions/all"],
+    ["android-sdk", "official-archive/feed", "https://dl.google.com/android/repository/repository2-1.xml"],
+    ["jdk-major-discovery", "official-archive/feed", "https://api.adoptium.net/v3/info/available_releases"],
+    ["quickjs-bellard", "official-archive/feed", "https://bellard.org/quickjs/"],
+    ["apple-releases", "official-archive/feed", "https://developer.apple.com/news/releases/rss/releases.rss"],
+    ["mpv-macos-packager", "official-archive/feed", "https://laboratory.stolendata.net/~djinn/mpv_osx/"],
+    ["ubuntu-mpv", "official-archive/feed", "https://launchpad.net/ubuntu/+source/mpv/+publishinghistory"],
+    ["nasm", "official-archive/feed", "https://www.nasm.us/pub/nasm/releasebuilds/"],
+    ["wget", "official-archive/feed", "https://ftp.gnu.org/gnu/wget/"],
+    ["vortx-sdk", "internal", null],
+    ["aws-lc-rust", "parent-registry", [
+      "https://crates.io/api/v1/crates/aws-lc-rs",
+      "https://crates.io/api/v1/crates/aws-lc-sys"
+    ]],
+    ["rquickjs", "parent-registry", [
+      "https://crates.io/api/v1/crates/rquickjs",
+      "https://crates.io/api/v1/crates/rquickjs-sys"
+    ]],
+    ["ring", "parent-registry", ["https://crates.io/api/v1/crates/ring"]],
+    ["rust-build-helpers", "parent-registry", [
+      "https://crates.io/api/v1/crates/cc",
+      "https://crates.io/api/v1/crates/cmake"
+    ]],
+    ["rust-channels", "rolling-commit", "https://static.rust-lang.org/dist/channel-rust-stable.toml"],
+    ["python-runtime", "official-archive/feed", "https://www.python.org/downloads/feed.rss"],
+    ["pyyaml-runtime", "parent-registry", "https://pypi.org/pypi/PyYAML/json"],
+    ["node-runtime", "official-archive/feed", "https://nodejs.org/dist/index.json"],
+    ["postgres-server", "official-archive/feed", "https://www.postgresql.org/support/versioning/"],
+    ["postgres-image", "official-archive/feed", "https://hub.docker.com/v2/repositories/library/postgres/tags?page_size=100&page={page}"]
+  ],
+  "lanes": [
+    [1, ["mpvkit"], "A1"], [2, ["mpv"], "A2"], [3, ["ffmpeg"], "A3"], [4, ["libplacebo"], "A4"],
+    [5, ["openssl"], "A5"], [6, ["gnutls"], "A6"], [7, ["gmp"], "A7"], [8, ["nettle"], "A8"],
+    [9, ["libass"], "A9"], [10, ["libunibreak"], "A10"], [11, ["freetype"], "A11"], [12, ["fribidi"], "A12"],
+    [13, ["harfbuzz"], "A13"], [14, ["samba"], "A14"], [15, ["dav1d"], "A15"], [16, ["lcms"], "A16"],
+    [17, ["dovi"], "A17"], [18, ["moltenvk"], "A18"], [19, ["shaderc"], "A19"], [20, ["spirv-tools"], "A19"],
+    [21, ["glslang"], "A19"], [22, ["spirv-headers", "vulkan-headers"], "A19"], [23, ["uchardet", "uchardet-wrapper"], "A20"],
+    [24, ["libbluray"], "A21"], [25, ["luajit"], "A22"], [26, ["uavs3d"], "A23"], [27, ["android-libmpv"], "D1"],
+    [28, ["mpv"], "D1"], [29, ["ffmpeg"], "D1"], [30, ["libplacebo"], "D1"], [31, ["libass"], "D1"],
+    [32, ["lua"], "D1"], [33, ["libxml2"], "D1"], [34, ["fontconfig"], "D1"], [35, ["mbedtls"], "D1"],
+    [36, ["media3"], "D2"], [37, ["agp"], "D3"], [38, ["kotlin"], "D4"], [39, ["gradle"], "D5"],
+    [40, ["android-sdk"], "D6"], [41, ["cmake", "android-sdk"], "D7"], [42, ["android-sdk"], "D8"],
+    [43, ["temurin17", "temurin21", "jdk-major-discovery"], "D9"], [44, ["quickjs-bellard"], "D10"],
+    [45, ["apple-releases", "swift"], "T1"], [46, ["apple-releases"], "T2"], [47, ["apple-releases"], "T2"],
+    [48, ["mpv-macos-packager", "mpv"], "P1"], [49, ["mpv-windows-packager", "mpv"], "P2"],
+    [50, ["ubuntu-mpv", "mpv"], "P3"], [51, ["linuxdeploy", "linuxdeploy-appimage"], "P3"],
+    [52, ["meson"], "T3"], [53, ["ninja"], "T3"], [54, ["cmake"], "T3"], [55, ["nasm"], "T3"],
+    [56, ["pkgconf"], "T3"], [57, ["wget"], "T3"], [58, ["vortx-sdk"], "N1"],
+    [59, ["aws-lc", "aws-lc-rust"], "N2"], [60, ["quickjs-ng", "rquickjs"], "N3"], [61, ["ring"], "N4"],
+    [62, ["rust-build-helpers"], "N5"], [63, ["rust-stable", "rust-channels"], "N6"]
+  ],
+  "supplemental": [
+    ["monitor-python", ["python-runtime"]],
+    ["monitor-pyyaml", ["pyyaml-runtime"]],
+    ["monitor-node", ["node-runtime"]],
+    ["service-postgres", ["postgres-server", "postgres-image"]]
+  ]
+}

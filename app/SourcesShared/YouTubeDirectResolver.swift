@@ -193,12 +193,29 @@ enum YouTubeDirectResolver {
     /// One InnerTube client identity: `context` is the exact `client` object sent in the request body; `ua`
     /// is the matching User-Agent header; `clientNameNum` is the numeric id for the x-youtube-client-name
     /// header (yt-dlp INNERTUBE_CONTEXT_CLIENT_NAME).
-    private struct Client {
+    /// The static identities contain only JSON strings and integer SDK versions. Keep those values checked
+    /// across tasks, and erase them to Foundation JSON objects only while building one local request body.
+    private enum ClientContextValue: Sendable, ExpressibleByStringLiteral, ExpressibleByIntegerLiteral {
+        case string(String)
+        case integer(Int)
+
+        init(stringLiteral value: String) { self = .string(value) }
+        init(integerLiteral value: Int) { self = .integer(value) }
+
+        var jsonValue: Any {
+            switch self {
+            case .string(let value): value
+            case .integer(let value): value
+            }
+        }
+    }
+
+    private struct Client: Sendable {
         let name: String
         let ua: String
         let clientNameNum: Int
         let clientVersion: String
-        let context: [String: Any]
+        let context: [String: ClientContextValue]
     }
 
     /// Ladder order: IOS first (best formats on residential IPs), then ANDROID, then the embedded-TV client
@@ -270,13 +287,13 @@ enum YouTubeDirectResolver {
         clientVersion: androidVRClientVersion,
         context: [
             "clientName": "ANDROID_VR",
-            "clientVersion": androidVRClientVersion,
+            "clientVersion": .string(androidVRClientVersion),
             "deviceMake": "Oculus",
-            "deviceModel": androidVRDeviceModel,
+            "deviceModel": .string(androidVRDeviceModel),
             "androidSdkVersion": 32,
             "osName": "Android",
             "osVersion": "12L",
-            "userAgent": androidVRUserAgent,
+            "userAgent": .string(androidVRUserAgent),
             "hl": "en",
             "gl": "US",
         ]
@@ -365,7 +382,7 @@ enum YouTubeDirectResolver {
         let body: [String: Any] = [
             "videoId": videoID,
             "context": [
-                "client": client.context,
+                "client": client.context.mapValues { $0.jsonValue },
                 // A minimal user-info block; InnerTube tolerates it and it mirrors real clients.
                 "user": ["lockedSafetyMode": false],
                 "request": ["useSsl": true],

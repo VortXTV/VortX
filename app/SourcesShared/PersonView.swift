@@ -100,7 +100,7 @@ struct PersonView: View {
             GeometryReader { geometry in
                 Color.clear
                     .onAppear { viewportWidth = geometry.size.width }
-                    .onChange(of: geometry.size.width) { viewportWidth = $0 }
+                    .onValueChange(of: geometry.size.width) { viewportWidth = $0 }
             }
         }
         .environment(\.cinemaCardViewportWidth, viewportWidth)

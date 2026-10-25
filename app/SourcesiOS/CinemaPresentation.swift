@@ -43,18 +43,20 @@ struct CinemaQuickViewOverlay: View {
         if let presentation = presenter.presentation {
             GeometryReader { geometry in
                 ZStack {
-                    Color.black.opacity(0.48)
+                    Color.black.opacity(0.58)
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture { presenter.close() }
                         .accessibilityHidden(true)
+                    let frame = CinemaRailLayout.quickViewFrame(viewport: geometry.size)
+                    let shape = RoundedRectangle(cornerRadius: geometry.size.width < 600 ? 0 : 24,
+                                                 style: .continuous)
                     CinemaQuickView(item: presentation.item, onWatch: presentation.onWatch,
                                     onDetails: presentation.onDetails, onClose: { presenter.close() })
                         .id(presentation.id)
-                        .frame(width: max(1, min(820, geometry.size.width - 32)),
-                               height: max(1, min(760, geometry.size.height - 32)))
-                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-                        .vortxGlass(in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        .frame(width: frame.width, height: frame.height)
+                        .clipShape(shape)
+                        .vortxGlass(in: shape, fillAlpha: 0.12, tone: .scrim, materialOpacity: 0.42)
                         .shadow(color: .black.opacity(0.4), radius: 30, y: 16)
                         .accessibilityAddTraits(.isModal)
                 }
@@ -78,12 +80,21 @@ struct CinemaQuickView: View {
     @State private var sheetDetent: PresentationDetent = .large
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    @EnvironmentObject private var theme: ThemeManager
     @State private var isWatchlisted = false
     @State private var watchlistStatus: String?
     @State private var watchlistFailure: String?
     @State private var loadedSynopsis: String?
+    @State private var loadedSynopsisKey: RatingRequestKey?
     @State private var loadedRatings: MDBListRatings?
     @State private var loadedRatingsKey: RatingRequestKey?
+    @State private var loadedArtworkKey: RatingRequestKey?
+    @State private var loadedBackdrop: String?
+    @State private var loadedLogo: String?
+    @State private var loadedCreditsKey: RatingRequestKey?
+    @State private var castMembers: [TMDBClient.CastMember] = []
     @StateObject private var watchlistAction = ProfileMutationPresentation()
 
     private var watchlistType: String? { LibraryWatchedMutationPolicy.normalizedCatalogType(item.type) }
@@ -92,7 +103,7 @@ struct CinemaQuickView: View {
     }
     private var synopsis: String? {
         let provided = item.description?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return provided?.isEmpty == false ? provided : loadedSynopsis
+        return provided?.isEmpty == false ? provided : (loadedSynopsisKey == ratingRequest ? loadedSynopsis : nil)
     }
 
     private var facts: [String] {
@@ -108,37 +119,48 @@ struct CinemaQuickView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 17, weight: .semibold))
-                        .frame(width: 44, height: 44)
-                        .vortxGlassDisc()
+        GeometryReader { geometry in
+            let inset = CinemaRailLayout.quickViewContentInset(width: geometry.size.width)
+            let wide = geometry.size.width >= 700
+            ZStack(alignment: .top) {
+                backdrop(size: geometry.size, wide: wide)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Color.clear
+                            .frame(height: min(wide ? 130 : 150, geometry.size.height * 0.2))
+                            .accessibilityHidden(true)
+                        titleAndFacts(wide: wide)
+                        if let description = synopsis, !description.isEmpty {
+                            Text(description)
+                                .font(Theme.Typography.body)
+                                .foregroundStyle(Theme.Palette.textPrimary.opacity(0.92))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .lineLimit(wide ? 4 : 6)
+                                .frame(maxWidth: 680, alignment: .leading)
+                        }
+                        actionBar
+                        status
+                        if !visibleCast.isEmpty { castRail }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, inset)
+                    .padding(.bottom, inset)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close preview")
-                .accessibilityIdentifier("cinema-quick-view-close")
-                .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.top, Theme.Space.sm)
-            ScrollView {
-                ViewThatFits(in: .horizontal) {
-                    wideLayout
-                    compactLayout
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    header
+                        .padding(.horizontal, inset)
+                        .padding(.top, Theme.Space.md)
                 }
-                .padding(Theme.Space.md)
             }
         }
         .presentationDetents([.medium, .large], selection: $sheetDetent)
         .presentationDragIndicator(.visible)
-        .background(Theme.Palette.canvas.opacity(0.82))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Quick view for \(item.name)")
         .onAppear(perform: refreshWatchlist)
         .task(id: item.type + ":" + item.id) { await loadMissingSynopsis() }
+        .task(id: ratingRequest) { await loadPreviewArtwork() }
+        .task(id: ratingRequest) { await loadPreviewCredits() }
         .task(id: ratingRequest) {
             #if !CINEMA_UI_SMOKE_RENDERER
             let requested = ratingRequest
@@ -154,123 +176,227 @@ struct CinemaQuickView: View {
         .onDisappear { watchlistAction.cancel() }
     }
 
+    private var requiresContrast: Bool { reduceTransparency || accessibilityContrast == .increased }
+    private var visibleCast: [TMDBClient.CastMember] {
+        loadedCreditsKey == ratingRequest ? castMembers : []
+    }
+    private var artworkURL: String? {
+        (loadedArtworkKey == ratingRequest ? loadedBackdrop : nil) ?? item.background ?? item.poster
+    }
+
     private func close() {
         if let onClose { onClose() } else { dismiss() }
     }
 
-    private var wideLayout: some View {
-        HStack(alignment: .top, spacing: Theme.Space.lg) {
-            artwork
-                .frame(width: 260, height: 390)
-                .clipped()
-            copy
-        }
-        .frame(minWidth: 540, alignment: .leading)
+    private func openDetails() {
+        close()
+        onDetails()
     }
 
-    private var compactLayout: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            artwork.frame(maxWidth: .infinity).frame(height: 230).clipped()
-            copy
-        }
-    }
-
-    private var artwork: some View {
-        ZStack {
-            CachedPosterImage(url: item.background ?? item.poster)
-                .scaledToFill()
-                .overlay(Color.black.opacity(0.32))
-            if let poster = item.poster, !poster.isEmpty {
-                CachedPosterImage(url: poster)
-                    .scaledToFill()
-                    .frame(width: 132, height: 196)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-                    .shadow(color: .black.opacity(0.45), radius: 12, y: 6)
+    /// A real route to the established detail/source owner, never a pretend inline Streams tab.
+    private var header: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Text("Quick view")
+                .font(Theme.Typography.eyebrow)
+                .foregroundStyle(Theme.Palette.textPrimary.opacity(0.9))
+                .textCase(.uppercase)
+            Spacer(minLength: Theme.Space.md)
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .vortxGlassDisc()
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close preview")
+            .accessibilityIdentifier("cinema-quick-view-close")
+            .keyboardShortcut(.cancelAction)
         }
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .padding(.bottom, Theme.Space.sm)
+        .background {
+            LinearGradient(colors: [.black.opacity(0.72), .clear], startPoint: .top, endPoint: .bottom)
+                .padding(.horizontal, -40)
+                .padding(.top, -24)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func backdrop(size: CGSize, wide: Bool) -> some View {
+        ZStack {
+            Theme.Palette.canvas
+            CachedPosterImage(url: artworkURL)
+                .scaledToFill()
+                .frame(width: size.width, height: size.height)
+                .clipped()
+            LinearGradient(stops: [
+                .init(color: .black.opacity(wide ? 0.94 : 0.72), location: 0),
+                .init(color: .black.opacity(wide ? 0.82 : 0.72), location: 0.60),
+                .init(color: .black.opacity(wide ? 0.30 : 0.72), location: 1)
+            ], startPoint: .leading, endPoint: .trailing)
+            LinearGradient(colors: [.clear, .black.opacity(requiresContrast ? 0.96 : 0.88)],
+                           startPoint: .center, endPoint: .bottom)
+        }
+        .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 
-    private var copy: some View {
+    private func titleAndFacts(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            Text(item.type.capitalized)
-                .font(Theme.Typography.eyebrow)
-                .foregroundStyle(Theme.Palette.accent)
-                .textCase(.uppercase)
-            Text(item.name)
-                .font(Theme.Typography.hero)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .fixedSize(horizontal: false, vertical: true)
+            #if CINEMA_UI_SMOKE_RENDERER
+            titleText
+                .frame(maxWidth: wide ? 460 : 320, minHeight: 84, alignment: .bottomLeading)
+            #else
+            ResolvedTitleLogo(id: LibraryWatchedMutationPolicy.isCanonicalCatalogID(item.id) ? item.id : nil, type: item.type,
+                              fallbackLogo: loadedArtworkKey == ratingRequest ? loadedLogo : nil,
+                              maxWidth: wide ? 460 : 320, maxHeight: 84,
+                              accessibilityName: item.name) { titleText }
+                .frame(minHeight: 84, alignment: .bottomLeading)
+                .accessibilityAddTraits(.isHeader)
+            #endif
             if !facts.isEmpty {
+                Text(facts.joined(separator: "  ·  "))
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textPrimary.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let genres = item.genres, !genres.isEmpty {
                 FlowLayout(spacing: Theme.Space.xs) {
-                    ForEach(facts, id: \.self) { fact in
-                        Text(fact)
+                    ForEach(Array(genres.prefix(4)), id: \.self) { genre in
+                        Text(genre)
                             .font(Theme.Typography.eyebrow)
-                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .foregroundStyle(Theme.Palette.textPrimary.opacity(0.9))
                             .padding(.horizontal, Theme.Space.sm)
-                            .frame(minHeight: 30)
-                            .vortxGlassChip(selected: false)
+                            .padding(.vertical, 5)
+                            .background(Theme.Palette.textPrimary.opacity(0.08),
+                                        in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                     }
                 }
             }
-            if let description = synopsis, !description.isEmpty {
-                Text(description)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: Theme.Space.sm) {
-                Button {
-                    close()
-                    onWatch()
-                } label: {
-                    Label("Watch Now", systemImage: "play.fill")
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                }
-                .buttonStyle(.plain)
-                .vortxGlassProminent(in: Capsule())
-                .accessibilityHint("Opens this title's playback options")
-
-                Button {
-                    toggleWatchlist()
-                } label: {
-                    Label(watchlistAction.isRunning ? "Saving…" : (isWatchlisted ? "In Watchlist" : "Add to Watchlist"),
-                          systemImage: isWatchlisted ? "bookmark.fill" : "bookmark")
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                }
-                .buttonStyle(.plain)
-                .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
-                .disabled(!supportsWatchlist || watchlistAction.isRunning)
-                .accessibilityHint(isWatchlisted ? "Removes this title from your watchlist" : "Saves this title to your watchlist")
-            }
-            if !supportsWatchlist {
-                Text("This add-on's title cannot be saved to Watchlist yet.")
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-            }
-            if let watchlistStatus {
-                Text(watchlistStatus)
-                    .font(Theme.Typography.eyebrow)
-                    .foregroundStyle(watchlistStatus.hasPrefix("Added") ? Theme.Palette.accent : Theme.Palette.textSecondary)
-            }
-            if let error = watchlistAction.errorMessage {
-                Text(error).font(.caption).foregroundStyle(Theme.Palette.textSecondary)
-            }
-            Button {
-                close()
-                onDetails()
-            } label: {
-                Label("Details", systemImage: "info.circle")
-                    .frame(maxWidth: .infinity, minHeight: 44)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Theme.Palette.textSecondary)
-            .accessibilityHint("Opens the full title page")
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: item.id)
+        .frame(maxWidth: 680, alignment: .leading)
+    }
+
+    private var titleText: some View {
+        Text(item.name)
+            .font(Theme.Typography.hero)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var actionBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: Theme.Space.sm) { watchButton; streamsButton; watchlistButton }
+                .fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.sm) { watchButton; watchlistButton }
+                streamsButton
+            }
+        }
+        .frame(maxWidth: 680, alignment: .leading)
+    }
+
+    private var watchButton: some View {
+        Button {
+            close()
+            onWatch()
+        } label: {
+            Label("Watch Now", systemImage: "play.fill")
+                .font(Theme.Typography.label.weight(.semibold))
+                .padding(.horizontal, Theme.Space.lg)
+                .frame(minWidth: 148, minHeight: 46)
+        }
+        .buttonStyle(.plain)
+        .vortxGlassTintedSurface(in: Capsule(), fillAlpha: 0.22, tintAlpha: 0.12,
+                                highlight: 0.16, tone: .scrim, contained: true, forceOpaque: requiresContrast)
+        .overlay(Capsule().strokeBorder(Theme.Palette.accent.opacity(0.72), lineWidth: 1))
+        .accessibilityHint("Opens this title's playback options")
+    }
+
+    private var streamsButton: some View {
+        Button(action: openDetails) {
+            Text("View streams")
+                .font(Theme.Typography.label.weight(.semibold))
+                .padding(.horizontal, Theme.Space.lg)
+                .frame(minWidth: 148, minHeight: 46)
+        }
+        .buttonStyle(.plain)
+        .vortxGlassTintedSurface(in: Capsule(), fillAlpha: 0.16, tintAlpha: 0.03,
+                                highlight: 0.12, tone: .scrim, contained: true, forceOpaque: requiresContrast)
+        .overlay(Capsule().strokeBorder(Theme.Palette.accent.opacity(0.48), lineWidth: 1))
+        .accessibilityHint("Opens the full title page and its source list")
+    }
+
+    private var watchlistButton: some View {
+        Button(action: toggleWatchlist) {
+            Group {
+                if watchlistAction.isRunning {
+                    ProgressView().controlSize(.small).tint(Theme.Palette.textPrimary)
+                } else {
+                    Image(systemName: isWatchlisted ? "bookmark.fill" : "bookmark")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+            }
+            .frame(width: 46, height: 46)
+        }
+        .buttonStyle(.plain)
+        .vortxGlassTintedSurface(in: Circle(), fillAlpha: 0.16, tintAlpha: 0.03,
+                                tone: .scrim, contained: true, forceOpaque: requiresContrast)
+        .disabled(!supportsWatchlist || watchlistAction.isRunning)
+        .accessibilityLabel(watchlistAction.isRunning ? "Saving watchlist" : (isWatchlisted ? "Remove from Watchlist" : "Add to Watchlist"))
+    }
+
+    @ViewBuilder private var status: some View {
+        if !supportsWatchlist {
+            Text("This add-on's title cannot be saved to Watchlist yet.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+        if let watchlistStatus {
+            Text(watchlistStatus).font(Theme.Typography.eyebrow)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+        if let error = watchlistAction.errorMessage {
+            Text(error).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textPrimary)
+        }
+    }
+
+    private var castRail: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack {
+                Text("Cast").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Spacer()
+                Text("Preview")
+                    .font(Theme.Typography.eyebrow).foregroundStyle(Theme.Palette.textPrimary.opacity(0.82))
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.md) {
+                    ForEach(visibleCast) { member in
+                        VStack(spacing: Theme.Space.xs) {
+                            CachedPosterImage(url: member.profileURL)
+                                .frame(width: 72, height: 92)
+                                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                .accessibilityHidden(true)
+                            Text(member.name).font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textPrimary).lineLimit(2)
+                            if let character = member.character {
+                                Text(character).font(Theme.Typography.eyebrow)
+                                    .foregroundStyle(Theme.Palette.textPrimary.opacity(0.82)).lineLimit(2)
+                            }
+                        }
+                        .frame(width: 86, alignment: .top)
+                        .multilineTextAlignment(.center)
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(Theme.Space.md)
+        // A flat local wash protects captions when this rail scrolls over the bright side of the art.
+        // It adds no second material blur; accessibility contrast retains an opaque warm scrim.
+        .background(VortXGlass.fill(requiresContrast ? 1 : 0.72, tone: .scrim),
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
     }
 
     private func refreshWatchlist() {
@@ -282,6 +408,8 @@ struct CinemaQuickView: View {
     @MainActor
     private func loadMissingSynopsis() async {
         #if !CINEMA_UI_SMOKE_RENDERER
+        let requested = ratingRequest
+        loadedSynopsisKey = requested; loadedSynopsis = nil
         guard item.description?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else { return }
         let core = CoreBridge.shared
         let target = PlaybackMutationTarget.capture(core: core)
@@ -306,9 +434,50 @@ struct CinemaQuickView: View {
             return url
         }
         let synopsis = await CinemaPreviewSynopsis.load(urls: urls, id: item.id, type: item.type)
-        guard !Task.isCancelled, ProfileStore.shared.activeID == profileID,
+        guard !Task.isCancelled, loadedSynopsisKey == requested, ProfileStore.shared.activeID == profileID,
               target.stillOwnsCurrentContext(core: core) else { return }
-        loadedSynopsis = synopsis
+        if let synopsis { loadedSynopsis = synopsis }
+        #endif
+    }
+
+    /// Optional enrichment reuses the existing coalescing artwork cache and never delays catalog first paint.
+    @MainActor
+    private func loadPreviewArtwork() async {
+        #if !CINEMA_UI_SMOKE_RENDERER
+        let requested = ratingRequest
+        loadedArtworkKey = requested; loadedBackdrop = nil; loadedLogo = nil
+        guard ["movie", "series"].contains(requested.type),
+              LibraryWatchedMutationPolicy.isCanonicalCatalogID(requested.id) else { return }
+        let core = CoreBridge.shared
+        let target = PlaybackMutationTarget.capture(core: core)
+        let profileID = ProfileStore.shared.activeID
+        let backdrop = await LandscapeBackdropCache.backdrop(id: requested.id, type: requested.type)
+        guard !Task.isCancelled, loadedArtworkKey == requested,
+              ProfileStore.shared.activeID == profileID, target.stillOwnsCurrentContext(core: core) else { return }
+        loadedBackdrop = backdrop
+        let logo = await LandscapeBackdropCache.logo(id: requested.id, type: requested.type)
+        guard !Task.isCancelled, loadedArtworkKey == requested,
+              ProfileStore.shared.activeID == profileID, target.stillOwnsCurrentContext(core: core) else { return }
+        loadedLogo = logo
+        #endif
+    }
+
+    /// Full detail already uses this public credits path. Keep the preview isolated from its live metadata slot.
+    @MainActor
+    private func loadPreviewCredits() async {
+        #if !CINEMA_UI_SMOKE_RENDERER
+        let requested = ratingRequest
+        loadedCreditsKey = requested; castMembers = []
+        guard ["movie", "series"].contains(requested.type), requested.id.hasPrefix("tt"),
+              LibraryWatchedMutationPolicy.isCanonicalCatalogID(requested.id) else { return }
+        let core = CoreBridge.shared
+        let target = PlaybackMutationTarget.capture(core: core)
+        let profileID = ProfileStore.shared.activeID
+        let result = await TMDBClient.credits(imdbID: requested.id, type: requested.type)
+        guard !Task.isCancelled, loadedCreditsKey == requested,
+              ProfileStore.shared.activeID == profileID, target.stillOwnsCurrentContext(core: core) else { return }
+        castMembers = Array((result?.cast ?? []).prefix(12))
+        if synopsis == nil { loadedSynopsisKey = requested; loadedSynopsis = result?.overview }
         #endif
     }
 
@@ -386,7 +555,7 @@ struct CinemaWatchlist: View {
         #endif
         .macBackAffordance()
         .onAppear { entries = LibraryAutoAdd.watchlist() }
-        .onChange(of: profiles.activeID) { _ in entries = LibraryAutoAdd.watchlist() }
+        .onValueChange(of: profiles.activeID) { _ in entries = LibraryAutoAdd.watchlist() }
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
             entries = LibraryAutoAdd.watchlist()
         }

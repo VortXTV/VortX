@@ -50,9 +50,10 @@ extension MediaServerKind: Codable {}
 
 // MARK: - Store
 
-/// The user's connected media servers. Mirrors `DebridKeys`: a plain (non-@MainActor) `ObservableObject` so
-/// the sync push/pull path can read it from any context, with a `Task { @MainActor in ... }` hop only for the
-/// coordinator reload (which is main-actor isolated, exactly like `DebridCoordinator`).
+/// The user's connected media servers. The observable list and every read-modify-write transaction share
+/// the main actor with their UI and sync-apply callers. Stateless credential/defaults readers remain
+/// nonisolated so auth workers and encrypted sync serialization never need a UI-executor hop.
+@MainActor
 final class MediaServerStore: ObservableObject {
     static let shared = MediaServerStore()
 
@@ -60,14 +61,14 @@ final class MediaServerStore: ObservableObject {
     @Published private(set) var servers: [MediaServerRecord] = []
 
     // Non-secret metadata (UserDefaults). Tokens are Keychain-only (see `tokenAccount`).
-    private static let listKey       = "vortx.mediaServers.list"
-    private static let removedKey    = "vortx.mediaServers.removed"     // [uuidString: epochMillis] tombstones
-    private static let syncLoginsKey = "vortx.mediaServers.syncLogins"  // include tokens in the sync blob (default ON)
-    private static let deviceIdKey   = "vortx.mediaserver.deviceId"     // stable per-install client/device id
-    private static let plexClientKey = "vortx.mediaserver.plexClientId" // stable Plex X-Plex-Client-Identifier
+    private nonisolated static let listKey       = "vortx.mediaServers.list"
+    private nonisolated static let removedKey    = "vortx.mediaServers.removed"     // [uuidString: epochMillis] tombstones
+    private nonisolated static let syncLoginsKey = "vortx.mediaServers.syncLogins"  // include tokens in the sync blob (default ON)
+    private nonisolated static let deviceIdKey   = "vortx.mediaserver.deviceId"     // stable per-install client/device id
+    private nonisolated static let plexClientKey = "vortx.mediaserver.plexClientId" // stable Plex X-Plex-Client-Identifier
 
-    private func tokenAccount(_ id: UUID) -> String { "vortx.mediaserver.\(id.uuidString).token" }
-    static let plexAccountTokenAccount = "vortx.mediaserver.plexAccount.token"
+    private nonisolated func tokenAccount(_ id: UUID) -> String { "vortx.mediaserver.\(id.uuidString).token" }
+    nonisolated static let plexAccountTokenAccount = "vortx.mediaserver.plexAccount.token"
 
     private init() {
         servers = Self.loadRecords()
@@ -79,7 +80,7 @@ final class MediaServerStore: ObservableObject {
 
     /// A stable per-install id used as the Jellyfin/Emby `DeviceId` and the Plex `X-Plex-Client-Identifier`.
     /// Persisted so a Plex token (which is anchored to the client identifier) survives relaunches.
-    static var deviceId: String {
+    nonisolated static var deviceId: String {
         if let s = UserDefaults.standard.string(forKey: deviceIdKey), !s.isEmpty { return s }
         let s = UUID().uuidString
         UserDefaults.standard.set(s, forKey: deviceIdKey)
@@ -88,7 +89,7 @@ final class MediaServerStore: ObservableObject {
 
     /// The Plex client identifier. Kept distinct from `deviceId` so it can be rotated independently if a Plex
     /// token is ever revoked, and because it anchors the account token across discovery re-runs.
-    static var plexClientIdentifier: String {
+    nonisolated static var plexClientIdentifier: String {
         if let s = UserDefaults.standard.string(forKey: plexClientKey), !s.isEmpty { return s }
         let s = UUID().uuidString
         UserDefaults.standard.set(s, forKey: plexClientKey)
@@ -99,7 +100,7 @@ final class MediaServerStore: ObservableObject {
 
     /// Whether server tokens ride the account sync channel (default ON). When OFF, the sync blob carries the
     /// server metadata but not its token, so a peer device shows the server as `needsReauth` and re-links.
-    var syncLogins: Bool {
+    nonisolated var syncLogins: Bool {
         get { UserDefaults.standard.object(forKey: Self.syncLoginsKey) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: Self.syncLoginsKey); nudgeSync() }
     }
@@ -108,14 +109,14 @@ final class MediaServerStore: ObservableObject {
 
     /// The access token for a server, or nil when absent (a synced-without-token server, or one that needs
     /// re-auth). Keychain-only, never UserDefaults.
-    func token(for id: UUID) -> String? {
+    nonisolated func token(for id: UUID) -> String? {
         Keychain.string(tokenAccount(id))
     }
 
-    func hasToken(for id: UUID) -> Bool { !(token(for: id) ?? "").isEmpty }
+    nonisolated func hasToken(for id: UUID) -> Bool { !(token(for: id) ?? "").isEmpty }
 
     /// The Plex account token (kept only to re-run resource discovery), or nil.
-    var plexAccountToken: String? { Keychain.string(Self.plexAccountTokenAccount) }
+    nonisolated var plexAccountToken: String? { Keychain.string(Self.plexAccountTokenAccount) }
 
     // MARK: Mutations
 
@@ -201,7 +202,8 @@ final class MediaServerStore: ObservableObject {
     /// without a relaunch. Deliberately does NOT `save()` (a read must never write) and does NOT `nudgeSync()`:
     /// applying the account's own data must not echo straight back up as a fresh push. Guarded, so an unchanged
     /// list never churns `objectWillChange` or the coordinator. Callers are on the main thread (see
-    /// `SettingsBackup.reloadLiveStores`); this class is intentionally not `@MainActor`, matching `syncBlob()`.
+    /// `SettingsBackup.reloadLiveStores`), sharing this store's main-actor transaction boundary.
+    /// `syncBlob()` remains a separate nonisolated persisted-data read and never accesses this list.
     func reloadFromDefaults() {
         let saved = Self.loadRecords()
         guard servers != saved else { return }
@@ -217,13 +219,13 @@ final class MediaServerStore: ObservableObject {
         nudgeSync()
     }
 
-    /// Nudge the E2E sync. `VortXSyncManager` is `@MainActor`, and this store is intentionally not (so the
-    /// sync push path can read it), so hop like `DebridKeys.setKey` does.
-    private func nudgeSync() {
+    /// Nudge the E2E sync without making the nonisolated persisted-settings setter a UI dependency.
+    /// This task carries no mutable list or credentials into the main-actor request.
+    private nonisolated func nudgeSync() {
         Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
     }
 
-    private static func loadRecords() -> [MediaServerRecord] {
+    private nonisolated static func loadRecords() -> [MediaServerRecord] {
         guard let data = UserDefaults.standard.data(forKey: listKey),
               let decoded = try? JSONDecoder().decode([MediaServerRecord].self, from: data) else { return [] }
         return decoded
@@ -231,7 +233,7 @@ final class MediaServerStore: ObservableObject {
 
     // MARK: Removal tombstones (last-writer-wins across devices)
 
-    private static func loadRemoved() -> [String: Double] {
+    private nonisolated static func loadRemoved() -> [String: Double] {
         (UserDefaults.standard.dictionary(forKey: removedKey) as? [String: Double]) ?? [:]
     }
     private func stampRemovedTombstone(_ id: UUID) {
@@ -252,7 +254,7 @@ final class MediaServerStore: ObservableObject {
     /// is nothing to sync (no servers AND no tombstones). Reads from UserDefaults + Keychain directly (both
     /// thread-safe) so it is safe to call from the sync push path off the main actor without racing @Published.
     /// The token is included per server ONLY when the sync-logins toggle is ON.
-    func syncBlob() -> String? {
+    nonisolated func syncBlob() -> String? {
         let records = Self.loadRecords()
         let removed = Self.loadRemoved()
         guard !records.isEmpty || !removed.isEmpty else { return nil }

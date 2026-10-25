@@ -14,6 +14,9 @@ import UIKit
 /// - `warning()`:  a soft "heads up" notification (a recoverable miss, a no-op the user tried).
 ///
 /// Use these sparingly. Haptics should punctuate intent, not narrate every state change.
+#if os(iOS)
+@MainActor
+#endif
 enum Haptics {
     /// A light impact, for confirming a discrete tap-style action.
     static func tap() {

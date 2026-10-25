@@ -10,7 +10,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
-internal const val NATIVE_PROVIDER_BUDGET_MS = 20_000L
+internal const val NATIVE_PROVIDER_METADATA_BUDGET_MS = 20_000L
+internal const val NATIVE_PROVIDER_STREAM_BUDGET_MS = 40_000L
+
+/** Stream aggregation can outlast metadata; each budget starts only after its FIFO slot is admitted. */
+internal fun nativeProviderBudgetMs(resource: VortxResourceRequest.Resource): Long =
+    if (resource == VortxResourceRequest.Resource.STREAM) NATIVE_PROVIDER_STREAM_BUDGET_MS
+    else NATIVE_PROVIDER_METADATA_BUDGET_MS
 internal const val NATIVE_PROVIDER_BODY_BYTES = 8_388_608L
 internal const val NATIVE_RESOURCE_RESULT_BYTES = 33_554_432L
 

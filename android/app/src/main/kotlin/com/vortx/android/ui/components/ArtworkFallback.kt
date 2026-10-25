@@ -13,6 +13,7 @@ import androidx.compose.ui.layout.ContentScale
 import coil3.compose.AsyncImage
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
+import coil3.request.crossfade
 
 internal fun artworkCandidates(urls: List<String?>): List<String> =
     urls.mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }.distinct()
@@ -31,6 +32,9 @@ internal fun FallbackArtwork(
     maxDecodePx: Int? = null,
     /** Keep existing Crop/FILL requests by default; scoped callers can bound the decode with FIT. */
     decodeScale: coil3.size.Scale = coil3.size.Scale.FILL,
+    /** Keep the shared ImageLoader default when null; startup covers explicitly pass false. */
+    contentScale: ContentScale = ContentScale.Crop,
+    crossfade: Boolean? = null,
 ) {
     val candidates = artworkCandidates(urls)
     key(candidates) {
@@ -40,13 +44,20 @@ internal fun FallbackArtwork(
             placeholder()
             candidates.getOrNull(requestIndex)?.let { url ->
                 val context = LocalPlatformContext.current
+                val model = if (maxDecodePx != null || crossfade != null) {
+                    ImageRequest.Builder(context).data(url).apply {
+                        maxDecodePx?.let {
+                            size(it).scale(decodeScale).precision(coil3.size.Precision.INEXACT)
+                        }
+                        crossfade?.let { requested -> crossfade(requested) }
+                    }.build()
+                } else {
+                    url
+                }
                 AsyncImage(
-                    model = maxDecodePx?.let {
-                        ImageRequest.Builder(context).data(url).size(it)
-                            .scale(decodeScale).precision(coil3.size.Precision.INEXACT).build()
-                    } ?: url,
+                    model = model,
                     contentDescription = contentDescription,
-                    contentScale = ContentScale.Crop,
+                    contentScale = contentScale,
                     modifier = Modifier.fillMaxSize(),
                     onError = { index = nextArtworkCandidate(index, requestIndex, candidates.size) },
                 )

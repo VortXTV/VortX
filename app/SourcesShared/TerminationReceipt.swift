@@ -1,4 +1,5 @@
 import Foundation
+import os
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -18,9 +19,9 @@ enum TerminationReceipt {
         .urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("termination-receipt.json")
 
-    private static let receiptLock = NSLock()
-    // Access only under receiptLock. Runtime callbacks never reload a previous process's receipt.
-    nonisolated(unsafe) private static var session: TerminationReceiptPolicy.Session?
+    // Checked, value-owned storage. The lock owns the session; no unprotected static mutable slot.
+    // Runtime callbacks never reload a previous process's receipt.
+    private static let receiptStore = OSAllocatedUnfairLock<TerminationReceiptPolicy.Session?>(initialState: nil)
     @MainActor private static var installed = false
 
     /// Call from each app's `@main` right after VortXCrashReporter.install(). Inspect the prior
@@ -30,11 +31,11 @@ enum TerminationReceipt {
         installed = true
         let previousReceipt = load()
         foldPreviousRun(receipt: previousReceipt)
-        receiptLock.lock()
-        let fresh = TerminationReceiptPolicy.Session(now: Date().timeIntervalSince1970)
-        session = fresh
-        save(fresh.receipt)
-        receiptLock.unlock()
+        receiptStore.withLock { session in
+            let fresh = TerminationReceiptPolicy.Session(now: Date().timeIntervalSince1970)
+            session = fresh
+            save(fresh.receipt)
+        }
         startHeartbeat()
         observeMemoryWarnings()
         observeOrdinaryQuit()
@@ -51,7 +52,7 @@ enum TerminationReceipt {
         #if os(macOS)
         quitObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: nil
-        ) { _ in
+        ) { @Sendable _ in
             markTerminating()
         }
         #endif
@@ -72,15 +73,15 @@ enum TerminationReceipt {
 
     /// Serialize state plus its atomic file replacement. No logging, observer delivery or actor
     /// hops occur under this lock. Late callbacks cannot overwrite an intentional termination.
-    private static func updateSession(_ update: (inout TerminationReceiptPolicy.Session) -> Void) {
-        receiptLock.lock()
-        defer { receiptLock.unlock() }
-        guard var current = session else { return }
-        let before = current.receipt
-        update(&current)
-        guard current.receipt != before else { return }
-        session = current
-        save(current.receipt)
+    private static func updateSession(_ update: @Sendable (inout TerminationReceiptPolicy.Session) -> Void) {
+        receiptStore.withLock { session in
+            guard var current = session else { return }
+            let before = current.receipt
+            update(&current)
+            guard current.receipt != before else { return }
+            session = current
+            save(current.receipt)
+        }
     }
 
     /// Explicit intentional exit. A later captured crash still takes precedence on next launch.
@@ -120,7 +121,7 @@ enum TerminationReceipt {
         heartbeatTimer?.invalidate()
         // Main-runloop timer; 60 s granularity is plenty to separate "died while running" from
         // "device was off" (the policy's stale window is 24 h).
-        let timer = Timer(timeInterval: 60, repeats: true) { _ in
+        let timer = Timer(timeInterval: 60, repeats: true) { @Sendable _ in
             heartbeat()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -133,7 +134,7 @@ enum TerminationReceipt {
         #if canImport(UIKit)
         memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
-        ) { _ in
+        ) { @Sendable _ in
             memoryWarning(footprintMB: currentFootprintMB())
         }
         #endif
@@ -163,10 +164,10 @@ enum TerminationReceipt {
     #if canImport(MetricKit) && !os(tvOS)
     @available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
     private final class MetricSubscriber: NSObject, MXMetricManagerSubscriber {
-        static let shared = MetricSubscriber()
-        private var registered = false
+        @MainActor static let shared = MetricSubscriber()
+        @MainActor private var registered = false
 
-        func registerOnce() {
+        @MainActor func registerOnce() {
             guard !registered else { return }
             registered = true
             MXMetricManager.shared.add(self)
@@ -204,4 +205,3 @@ enum TerminationReceipt {
     }
     #endif
 }
-

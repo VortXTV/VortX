@@ -47,10 +47,10 @@ enum UIScreenshotSeamsContractTests {
         precondition(tabs.contains("ScrollViewReader { proxy in")
                      && tabs.contains(".id(SourceAddonTabAnchor.all)")
                      && tabs.contains(".id(SourceAddonTabAnchor.addon(group.id))")
-                     && tabs.contains("groups.first(where: { $0.addon == addon })")
+                     && tabs.contains("groups.first(where: { $0.id == addon })")
                      && tabs.contains("return .addon(group.id)")
                      && !tabs.contains(".id(SourceAddonTabAnchor.addon(group.addon))")
-                     && tabs.contains(".onChange(of: selectedSourceAddon)")
+                     && tabs.contains(".onValueChange(of: selectedSourceAddon)")
                      && tabs.contains("proxy.scrollTo(sourceAddonTabAnchor(addon), anchor: .center)")
                      && tabs.contains("withAnimation(reduceMotion ? nil : Theme.Motion.state)"),
                      "selecting an offscreen source tab reveals it while honoring Reduce Motion")

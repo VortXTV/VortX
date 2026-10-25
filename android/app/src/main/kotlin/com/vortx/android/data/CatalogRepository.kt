@@ -20,6 +20,7 @@ import com.vortx.android.model.PlaybackContext
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
@@ -54,6 +55,27 @@ data class ContinueWatchingSnapshot(
     val owner: ContinueWatchingOwner,
     val items: List<MetaItem>,
 )
+
+/** The installed list and its original publication/mutation authority travel together. The opaque
+ * token belongs to the repository that produced these rows; callers cannot recapture a later owner
+ * from a URL. Read-only alternate repositories carry no visibility authority by default. */
+class AddonManagementSnapshot internal constructor(
+    val addons: List<InstalledAddon>,
+    internal val visibilityOwner: Any? = null,
+    private val publication: (() -> Unit) -> Boolean = { action -> action(); true },
+) {
+    fun publishIfCurrent(action: () -> Unit): Boolean {
+        var entered = false
+        return try {
+            publication { entered = true; action() }
+        } catch (error: Exception) {
+            // A revoked authenticated admission may reject before entering the callback. Treat that
+            // as stale metadata, while preserving cancellation and errors from the UI callback itself.
+            if (entered || error is CancellationException) throw error
+            false
+        }
+    }
+}
 
 /** Opaque identity for one playback-history session. Every progress/end callback must return it. */
 @JvmInline
@@ -260,6 +282,19 @@ interface CatalogRepository {
     /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
     /// `ctx.profile.addons`.
     suspend fun installedAddons(): Result<List<InstalledAddon>>
+
+    /** A management screen must retain the authority that produced its rows, before any tap is queued. */
+    suspend fun addonManagementSnapshot(): Result<AddonManagementSnapshot> =
+        installedAddons().map { AddonManagementSnapshot(it.toList()) }
+
+    /** Change only a row from [snapshot], then return its acknowledged successor. No URL-only fallback:
+     * implementations without an owner-bound mutation cannot silently change a later active profile. */
+    suspend fun setAddonVisibility(
+        snapshot: AddonManagementSnapshot,
+        addon: InstalledAddon,
+        disabled: Boolean,
+    ): Result<AddonManagementSnapshot> =
+        Result.failure(UnsupportedOperationException("Add-on visibility is unavailable."))
 
     /// Canonicalize a pasted add-on URL to the exact transport URL the engine keys add-ons by (trim +
     /// scheme check + `/manifest.json` suffix), mirroring Apple `CoreBridge.normalizedAddonURL`. Null for

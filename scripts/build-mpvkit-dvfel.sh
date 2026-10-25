@@ -66,6 +66,8 @@
 #   scripts/mpvkit-dvfel.patch        patches MPVKit's Package.swift and build driver: dependency
 #                                     pins, libplacebo source build, Security.framework linkage,
 #                                     Apple TLS selection, and the E-AC-3 encoder.
+#                                     Also carries exact 0002 frontend WMO for one Swift object.
+#                                     base.swift keeps pkg-config metadata within each target.
 #   scripts/mpv-moltenvk-resize.patch patches MPV itself. Installed below as patch 0004 next to
 #                                     MPVKit's own 0001-0003, because it edits the file MPVKit's 0001
 #                                     creates and so must be applied after it.
@@ -177,8 +179,8 @@ else
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$line" in
-      ' M Package.swift'|'M Package.swift'|' M Sources/BuildScripts/XCFrameworkBuild/main.swift'|'M Sources/BuildScripts/XCFrameworkBuild/main.swift') ;;
-      '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch'|'?? Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch') ;;
+      ' M Package.swift'|'M Package.swift'|' M Sources/BuildScripts/XCFrameworkBuild/main.swift'|'M Sources/BuildScripts/XCFrameworkBuild/main.swift'|' M Sources/BuildScripts/XCFrameworkBuild/base.swift'|'M Sources/BuildScripts/XCFrameworkBuild/base.swift'|' M Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch'|'M Sources/BuildScripts/patch/libmpv/0002-revert-build-static.patch') ;;
+      '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch'|'?? Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch'|'?? Sources/BuildScripts/patch/libmpv/0007-upstream-audio-layout-bounds.patch'|'?? Sources/BuildScripts/patch/libmpv/0008-upstream-gpu-next-seek-reset.patch'|'?? Sources/BuildScripts/patch/libmpv/0009-original-local-file-witness.patch'|'?? Sources/BuildScripts/patch/libmpv/0010-upstream-edition-title-lifetime.patch'|'?? Sources/BuildScripts/patch/libmpv/0011-owned-subtitle-constructor.patch'|'?? Sources/BuildScripts/patch/libmpv/0012-owned-subtitle-publication.patch'|'?? Sources/BuildScripts/patch/libmpv/0013-original-http-reference-recipe.patch') ;;
       *) fail "existing MPVKit checkout has unexpected dirty state: $line" ;;
     esac
   done <<< "$STATUS"
@@ -218,6 +220,24 @@ copy_exact "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch" \
   "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch"
 copy_exact "$REPO/scripts/mpv-http-seek-interrupt.patch" \
   "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch"
+copy_exact "$REPO/scripts/mpv-upstream-audio-layout-bounds.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0007-upstream-audio-layout-bounds.patch"
+copy_exact "$REPO/scripts/mpv-upstream-gpu-next-seek-reset.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0008-upstream-gpu-next-seek-reset.patch"
+# Read-only original-source evidence; this does not enable subtitle alignment or change the C ABI.
+copy_exact "$REPO/scripts/mpv-original-local-file-witness.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0009-original-local-file-witness.patch"
+copy_exact "$REPO/scripts/mpv-upstream-edition-title-lifetime.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0010-upstream-edition-title-lifetime.patch"
+# Bounded decoder foundation only; renderer commands and host activation remain separate.
+copy_exact "$REPO/scripts/mpv-owned-subtitle-constructor.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0011-owned-subtitle-constructor.patch"
+# Exact-ticket primary-slot publication; app caller ownership remains a separate gate.
+copy_exact "$REPO/scripts/mpv-owned-subtitle-publication.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0012-owned-subtitle-publication.patch"
+# Immutable INITIAL_REQUEST_ONLY prerequisite; no remote reader/node/UI activation.
+copy_exact "$REPO/scripts/mpv-original-http-reference-recipe.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0013-original-http-reference-recipe.patch"
 
 # A prior interrupted experiment installed this retired VortX-only FFmpeg patch as an untracked
 # file. Do not delete or overwrite it implicitly; fail with an actionable path instead.

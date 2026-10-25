@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -91,6 +92,9 @@ fun AddonsScreen(
     val installMessage by viewModel.installMessage.collectAsStateWithLifecycle()
     val health by viewModel.health.collectAsStateWithLifecycle()
     val pendingUpdate by viewModel.pendingUpdate.collectAsStateWithLifecycle()
+    val loadingManagement by viewModel.loadingManagement.collectAsStateWithLifecycle()
+    val changingVisibility by viewModel.changingVisibility.collectAsStateWithLifecycle()
+    val visibilityMessages by viewModel.visibilityMessages.collectAsStateWithLifecycle()
     val colors = VortXTheme.colors
     val context = LocalContext.current
 
@@ -265,6 +269,9 @@ fun AddonsScreen(
                                 onRemove = { viewModel.remove(addon) },
                                 onConfigure = { addon.configureUrl?.let { openInBrowser(context, it) } },
                                 onChangeUrl = { changeUrlAddon = addon },
+                                visibilityBusy = loadingManagement || changingVisibility != null,
+                                visibilityChanging = changingVisibility == addon.transportUrl,
+                                visibilityMessage = visibilityMessages[addon.transportUrl],
                             )
                         }
                     }
@@ -283,6 +290,9 @@ private fun AddonRow(
     onRemove: () -> Unit,
     onConfigure: () -> Unit,
     onChangeUrl: () -> Unit,
+    visibilityBusy: Boolean,
+    visibilityChanging: Boolean,
+    visibilityMessage: String?,
 ) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -355,8 +365,9 @@ private fun AddonRow(
                 // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide;
                 // the same eye / eye-slash pair as Apple `AddonsView.visibilityToggle`.
                 if (!addon.isProtected || addon.isDisabled) {
-                    IconButton(onClick = onToggle) {
-                        Icon(
+                    IconButton(onClick = onToggle, enabled = !visibilityBusy) {
+                        if (visibilityChanging) CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        else Icon(
                             imageVector = if (addon.isDisabled) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
                             contentDescription = if (addon.isDisabled) "Turn on ${addon.name}" else "Turn off ${addon.name}",
                             tint = if (addon.isDisabled) colors.textTertiary else colors.accent,
@@ -368,6 +379,9 @@ private fun AddonRow(
                         Icon(VortXIcons.delete, contentDescription = "Remove ${addon.name}", tint = colors.danger)
                     }
                 }
+            }
+            visibilityMessage?.let {
+                Text(it, style = VortXTheme.type.label.copy(color = colors.danger))
             }
         }
     }
@@ -412,13 +426,13 @@ private fun ChangeAddonUrlDialog(
 
     AlertDialog(
         onDismissRequest = { if (!changing) onDismiss() },
-        title = { Text("Change add-on URL", style = VortXTheme.type.cardTitle) },
+        title = { Text("Update add-on", style = VortXTheme.type.cardTitle) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                 Text(addon.name, style = VortXTheme.type.label.copy(color = colors.textSecondary))
                 Text(
-                    "Replace this add-on's manifest URL, for example after reconfiguring it. The new URL is " +
-                        "installed first, then the old one removed.",
+                    "Keep the current URL to refresh this add-on's latest manifest, or paste a new URL " +
+                        "after reconfiguring it. Your existing add-on stays until the update confirms.",
                     style = VortXTheme.type.label.copy(color = colors.textSecondary),
                 )
                 OutlinedTextField(
@@ -441,9 +455,9 @@ private fun ChangeAddonUrlDialog(
         confirmButton = {
             TextButton(
                 onClick = { viewModel.changeAddonUrl(addon, url) },
-                enabled = !changing && url.isNotBlank() && url.trim() != addon.transportUrl,
+                enabled = !changing && url.isNotBlank(),
             ) {
-                Text(if (changing) "Updating…" else "Update", color = colors.accent)
+                Text(if (changing) "Updating…" else if (url.trim() == addon.transportUrl) "Refresh manifest" else "Update URL", color = colors.accent)
             }
         },
         dismissButton = {

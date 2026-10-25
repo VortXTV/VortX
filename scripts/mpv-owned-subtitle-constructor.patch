@@ -1,0 +1,928 @@
+VortX bounded owned subtitle constructor and checked conversion/filter completion.
+
+Base: mpv 8c67647b50059406c5c0444903597281b81516cf, after retained platform,
+HTTP/audio/GPU, original-local-file witness and edition-title lifetime patches.
+All eight constructor preimages equal that exact upstream commit. Only these
+subtitle files are carried; unrelated custom native work is excluded.
+
+Includes the four-line owned filter-cache root-mask correction: changing a
+filter group must retain its declared UPDATE_SUB_FILT root mask before native
+filter reset and whole-corpus re-decode. Ordinary decoder entry points retain
+their existing behavior. A complete native rebuild is required after the
+sd_functions layout addition; old objects must never substitute for that rebuild.
+
+This source carrier is not a platform SDK, renderer/host integration, installed
+feature, device or release acceptance. The bounded 74-assertion native fixture
+passes with its intentional incomplete-gate exit2; open fault/bitmap/sanitizer
+and consumer lifetime gates remain separate. Existing upstream licensing applies.
+
+diff --git a/sub/dec_sub.c b/sub/dec_sub.c
+index 33b3878..4362878 100644
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -32,10 +32,13 @@
+ #include "common/msg.h"
+ #include "common/recorder.h"
+ #include "misc/dispatch.h"
++#include "misc/thread_tools.h"
+ #include "osdep/threads.h"
++#include "osdep/timer.h"
+ 
+ extern const struct sd_functions sd_ass;
+ extern const struct sd_functions sd_lavc;
++extern const struct m_sub_options mp_sub_filter_opts;
+ #if HAVE_SUBRANDR
+ extern const struct sd_functions sd_sbr;
+ #endif
+@@ -59,6 +62,10 @@ struct dec_sub {
+     struct mp_subtitle_shared_opts *shared_opts;
+     struct m_config_cache *opts_cache;
+     struct m_config_cache *shared_opts_cache;
++    struct m_config_cache *owned_filter_cache;
++    bool owned_text;
++    bool owned_text_ready;
++    size_t owned_text_bytes;
+ 
+     struct mp_recorder_sink *recorder_sink;
+ 
+@@ -148,7 +155,8 @@ void sub_destroy(struct dec_sub *sub)
+ {
+     if (!sub)
+         return;
+-    demux_set_stream_wakeup_cb(sub->sh, NULL, NULL);
++    if (!sub->owned_text)
++        demux_set_stream_wakeup_cb(sub->sh, NULL, NULL);
+     if (sub->sd) {
+         sub_reset(sub);
+         sub->sd->driver->uninit(sub->sd);
+@@ -162,6 +170,8 @@ static struct sd *init_decoder(struct dec_sub *sub)
+ {
+     for (int n = 0; sd_list[n]; n++) {
+         const struct sd_functions *driver = sd_list[n];
++        if (sub->owned_text && driver != &sd_ass)
++            continue;
+         struct sd *sd = talloc(NULL, struct sd);
+         *sd = (struct sd){
+             .global = sub->global,
+@@ -174,6 +184,7 @@ static struct sd *init_decoder(struct dec_sub *sub)
+             .codec = sub->codec,
+             .lang = sub->lang,
+             .preload_ok = true,
++            .owned_text = sub->owned_text,
+         };
+ 
+         if (sd->driver->init(sd) >= 0)
+@@ -192,10 +203,11 @@ static struct sd *init_decoder(struct dec_sub *sub)
+ // do not need to acquire locks.
+ // Ownership of attachments goes to the callee, and is released with
+ // talloc_free() (even on failure).
+-struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+-                           struct attachment_list *attachments, int order)
++static struct dec_sub *sub_create_internal(
++    struct mpv_global *global, struct sh_stream *sh, char *lang,
++    struct attachment_list *attachments, int order, bool owned_text)
+ {
+-    mp_assert(track->stream && track->stream->type == STREAM_SUB);
++    mp_assert(sh && sh->type == STREAM_SUB);
+ 
+     struct dec_sub *sub = talloc(NULL, struct dec_sub);
+     *sub = (struct dec_sub){
+@@ -204,9 +216,10 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+         .packet_pool = demux_packet_pool_get(global),
+         .opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_sub_opts),
+         .shared_opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_shared_sub_opts),
+-        .sh = track->stream,
+-        .codec = track->stream->codec,
+-        .lang = track->lang,
++        .sh = sh,
++        .codec = sh->codec,
++        .lang = lang,
++        .owned_text = owned_text,
+         .attachments = talloc_steal(sub, attachments),
+         .play_dir = 1,
+         .order = order,
+@@ -215,6 +228,11 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+         .start = MP_NOPTS_VALUE,
+         .end = MP_NOPTS_VALUE,
+     };
++    if (owned_text) {
++        talloc_steal(sub, sh); // Own codec and copied language before init fails.
++        sub->owned_filter_cache =
++            m_config_cache_alloc(sub, global, &mp_sub_filter_opts);
++    }
+     sub->opts = sub->opts_cache->opts;
+     sub->shared_opts = sub->shared_opts_cache->opts;
+     mp_mutex_init(&sub->lock);
+@@ -229,6 +247,232 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+     return NULL;
+ }
+ 
++struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
++                           struct attachment_list *attachments, int order)
++{
++    mp_assert(track->stream && track->stream->type == STREAM_SUB);
++    return sub_create_internal(global, track->stream, track->lang,
++                               attachments, order, false);
++}
++
++static void owned_text_error(enum sub_owned_text_error *error,
++                             enum sub_owned_text_error value)
++{
++    if (error)
++        *error = value;
++}
++
++static bool owned_text_budget(struct mp_cancel *cancel, int64_t deadline_ns,
++                              enum sub_owned_text_error *error)
++{
++    if (mp_cancel_test(cancel)) {
++        owned_text_error(error, SUB_OWNED_TEXT_CANCELLED);
++        return false;
++    }
++    int64_t now = mp_time_ns();
++    if (deadline_ns <= now) {
++        owned_text_error(error, SUB_OWNED_TEXT_EXPIRED);
++        return false;
++    }
++    if (deadline_ns - now > SUB_OWNED_TEXT_MAX_WORK_NS) {
++        owned_text_error(error, SUB_OWNED_TEXT_INVALID_INPUT);
++        return false;
++    }
++    return true;
++}
++
++static bool owned_text_attachments_valid(struct attachment_list *attachments)
++{
++    if (!attachments || attachments->num_entries < 0 ||
++        attachments->num_entries > SUB_OWNED_TEXT_MAX_ATTACHMENTS ||
++        (attachments->num_entries && !attachments->entries))
++        return false;
++    size_t total = 0;
++    for (int n = 0; n < attachments->num_entries; n++) {
++        struct demux_attachment *a = &attachments->entries[n];
++        if (!a->name || !a->type || (a->data_size && !a->data) ||
++            strnlen(a->name, SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME + 1) >
++                SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME ||
++            strnlen(a->type, SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME + 1) >
++                SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME ||
++            a->data_size > SUB_OWNED_TEXT_MAX_ATTACHMENT_BYTES ||
++            a->data_size > SUB_OWNED_TEXT_MAX_ATTACHMENT_TOTAL - total)
++            return false;
++        total += a->data_size;
++    }
++    return true;
++}
++
++static bool owned_text_decode_all(struct dec_sub *sub, struct mp_cancel *cancel,
++                                  int64_t deadline_ns,
++                                  enum sub_owned_text_error *error)
++{
++    if (!sub->sd->driver->decode_prepared) {
++        owned_text_error(error, SUB_OWNED_TEXT_DECODER_FAILED);
++        return false;
++    }
++    for (int n = 0; n < sub->num_cached_pkts; n++) {
++        if (!owned_text_budget(cancel, deadline_ns, error))
++            return false;
++        if (!sub->sd->driver->decode_prepared(sub->sd, sub->cached_pkts[n])) {
++            owned_text_error(error, SUB_OWNED_TEXT_DECODE_FAILED);
++            return false;
++        }
++    }
++    return owned_text_budget(cancel, deadline_ns, error);
++}
++
++struct dec_sub *sub_create_owned_text(
++    struct mpv_global *global, struct attachment_list *owned_attachments,
++    const char *language, const struct sub_owned_text_cue *cues, size_t count,
++    int play_dir, double video_fps, struct mp_cancel *cancel, int64_t deadline_ns,
++    enum sub_owned_text_error *error)
++{
++    owned_text_error(error, SUB_OWNED_TEXT_INVALID_INPUT);
++    if (!global || !cues || count == 0 || count > SUB_OWNED_TEXT_MAX_CUES ||
++        (play_dir != 1 && play_dir != -1) ||
++        !isfinite(video_fps) || video_fps < 0 ||
++        !owned_text_attachments_valid(owned_attachments))
++        goto invalid;
++
++    size_t lang_length = language
++        ? strnlen(language, SUB_OWNED_TEXT_MAX_LANGUAGE + 1) : 0;
++    if (lang_length > SUB_OWNED_TEXT_MAX_LANGUAGE ||
++        (language && bstr_validate_utf8((bstr){(unsigned char *)language,
++                                              lang_length}) < 0))
++        goto invalid;
++
++    size_t total = 0;
++    for (size_t n = 0; n < count; n++) {
++        if (!owned_text_budget(cancel, deadline_ns, error))
++            goto invalid;
++        const struct sub_owned_text_cue *cue = &cues[n];
++        if (!cue->utf8 || !cue->length ||
++            cue->length > SUB_OWNED_TEXT_MAX_CUE_BYTES ||
++            cue->length > SUB_OWNED_TEXT_MAX_BYTES - total ||
++            cue->start_ms >= cue->end_ms ||
++            cue->end_ms > SUB_OWNED_TEXT_MAX_END_MS ||
++            (n && cue->start_ms <= cues[n - 1].start_ms) ||
++            memchr(cue->utf8, 0, cue->length) ||
++            bstr_validate_utf8((bstr){(unsigned char *)cue->utf8,
++                                      cue->length}) < 0)
++            goto invalid;
++        total += cue->length;
++    }
++    if (!owned_text_budget(cancel, deadline_ns, error))
++        goto invalid;
++
++    struct sh_stream *sh = demux_alloc_sh_stream(STREAM_SUB);
++    sh->codec->codec = talloc_strdup(sh->codec, "subrip");
++    char *lang = language ? talloc_strndup(sh, language, lang_length) : NULL;
++    struct dec_sub *sub = sub_create_internal(global, sh, lang,
++                                              owned_attachments, 0, true);
++    // The internal constructor owns sh/codec/lang/attachments even on failure.
++    if (!sub) {
++        owned_text_error(error, SUB_OWNED_TEXT_DECODER_FAILED);
++        return NULL;
++    }
++    if (!owned_text_budget(cancel, deadline_ns, error))
++        goto failed;
++    sub->play_dir = play_dir;
++    sub->video_fps = video_fps;
++    update_subtitle_speed(sub);
++    if (!isfinite(sub->sub_speed) || sub->sub_speed <= 0) {
++        owned_text_error(error, SUB_OWNED_TEXT_INVALID_INPUT);
++        goto failed;
++    }
++
++    for (size_t n = 0; n < count; n++) {
++        if (!owned_text_budget(cancel, deadline_ns, error))
++            goto failed;
++        const struct sub_owned_text_cue *cue = &cues[n];
++        struct demux_packet *pkt = new_demux_packet(sub->packet_pool, cue->length);
++        if (!pkt) {
++            owned_text_error(error, SUB_OWNED_TEXT_PACKET_FAILED);
++            goto failed;
++        }
++        memcpy(pkt->buffer, cue->utf8, cue->length);
++        pkt->pts = cue->start_ms / 1000.0;
++        pkt->dts = pkt->pts;
++        pkt->duration = (cue->end_ms - cue->start_ms) / 1000.0;
++        pkt->pos = n;
++        MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
++    }
++    sub->owned_text_bytes = total;
++    if (!owned_text_decode_all(sub, cancel, deadline_ns, error))
++        goto failed;
++    sub->owned_text_ready = true;
++    owned_text_error(error, SUB_OWNED_TEXT_OK);
++    return sub;
++
++failed:
++    sub_destroy(sub);
++    return NULL;
++invalid:
++    talloc_free(owned_attachments);
++    return NULL;
++}
++
++bool sub_refresh_owned_text(struct dec_sub *sub, struct mp_cancel *cancel,
++                           int64_t deadline_ns, enum sub_owned_text_error *error)
++{
++    owned_text_error(error, SUB_OWNED_TEXT_INVALID_STATE);
++    if (!sub || !sub->owned_text)
++        return false;
++    mp_mutex_lock(&sub->lock);
++    bool ok = sub->owned_text_ready;
++    if (!ok)
++        goto done;
++    if (!owned_text_budget(cancel, deadline_ns, error)) {
++        ok = false;
++        goto done;
++    }
++
++    struct m_config_cache *caches[] = {
++        sub->opts_cache, sub->shared_opts_cache, sub->owned_filter_cache,
++    };
++    uint64_t flags = 0;
++    for (int n = 0; n < MP_ARRAY_SIZE(caches); n++) {
++        caches[n]->change_flags = 0;
++        bool changed = m_config_cache_update(caches[n]);
++        if (n == 0 && changed)
++            update_subtitle_speed(sub);
++        flags |= caches[n]->change_flags;
++        // A cache rooted at this group excludes the root group's change mask.
++        // Its individual filter options have no flags, so retain that mask here.
++        if (changed && caches[n] == sub->owned_filter_cache)
++            flags |= mp_sub_filter_opts.change_flags;
++    }
++    if (!isfinite(sub->sub_speed) || sub->sub_speed <= 0) {
++        owned_text_error(error, SUB_OWNED_TEXT_INVALID_STATE);
++        ok = false;
++        goto done;
++    }
++    if (flags && (!sub->sd->driver->control ||
++                  sub->sd->driver->control(sub->sd, SD_CTRL_UPDATE_OPTS,
++                                           &flags) != CONTROL_OK)) {
++        owned_text_error(error, SUB_OWNED_TEXT_DECODER_FAILED);
++        ok = false;
++        goto done;
++    }
++    if (flags & (UPDATE_SUB_HARD | UPDATE_SUB_FILT))
++        ok = owned_text_decode_all(sub, cancel, deadline_ns, error);
++    else
++        ok = owned_text_budget(cancel, deadline_ns, error);
++    if (ok)
++        owned_text_error(error, SUB_OWNED_TEXT_OK);
++done:
++    sub->owned_text_ready = ok;
++    mp_mutex_unlock(&sub->lock);
++    return ok;
++}
++
++void sub_destroy_owned_text(struct dec_sub *sub)
++{
++    mp_assert(!sub || sub->owned_text);
++    sub_destroy(sub);
++}
++
+ // Called locked.
+ static void update_segment(struct dec_sub *sub)
+ {
+@@ -431,7 +675,8 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+ 
+     struct sub_bitmaps *res = NULL;
+ 
+-    if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
++    if ((!sub->owned_text || sub->owned_text_ready) &&
++        !(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
+         sub->sd->driver->get_bitmaps)
+         res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts);
+ 
+@@ -450,7 +695,8 @@ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
+     sub->last_vo_pts = pts;
+     update_segment(sub);
+ 
+-    if (sub->sd->driver->get_text)
++    if ((!sub->owned_text || sub->owned_text_ready) &&
++        sub->sd->driver->get_text)
+         text = sub->sd->driver->get_text(sub->sd, pts, type);
+     mp_mutex_unlock(&sub->lock);
+     return text;
+@@ -480,7 +726,8 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+     sub->last_vo_pts = pts;
+     update_segment(sub);
+ 
+-    if (sub->sd->driver->get_times)
++    if ((!sub->owned_text || sub->owned_text_ready) &&
++        sub->sd->driver->get_times)
+         res = sub->sd->driver->get_times(sub->sd, pts);
+ 
+     mp_mutex_unlock(&sub->lock);
+@@ -494,6 +741,8 @@ void sub_reset(struct dec_sub *sub)
+         sub->sd->driver->reset(sub->sd);
+     sub->last_pkt_pts = MP_NOPTS_VALUE;
+     sub->last_vo_pts = MP_NOPTS_VALUE;
++    if (sub->owned_text)
++        sub->owned_text_ready = false;
+     destroy_cached_pkts(sub);
+     demux_packet_pool_push(sub->packet_pool, sub->new_segment);
+     sub->new_segment = NULL;
+@@ -623,7 +872,8 @@ struct sub_lines *sub_get_lines(struct dec_sub *sub)
+ {
+     mp_mutex_lock(&sub->lock);
+     struct sub_lines *res = NULL;
+-    if (sub->sd->driver->get_lines) {
++    if ((!sub->owned_text || sub->owned_text_ready) &&
++        sub->sd->driver->get_lines) {
+         res = sub->sd->driver->get_lines(sub->sd);
+         qsort(res->entries, res->num_entries, sizeof(res->entries[0]),
+               sub_line_cmp);
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index d8f1539..330a99d 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -3,6 +3,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ #include "player/core.h"
+ #include "osd.h"
+@@ -13,6 +14,7 @@ struct demux_packet;
+ struct mp_recorder_sink;
+ struct dec_sub;
+ struct sd;
++struct mp_cancel;
+ 
+ enum sd_ctrl {
+     SD_CTRL_SUB_STEP,
+@@ -54,6 +56,65 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+                            struct attachment_list *attachments, int order);
+ void sub_destroy(struct dec_sub *sub);
+ 
++// Worker-only detached primary text construction. This never opens a stream,
++// reads a demuxer or selects a player track. Own attachments on ENTRY, including
++// every failure. The caller must already hold native/global lifetime, and copy
++// all attachments under the live source owner BEFORE calling off-core.
++#define SUB_OWNED_TEXT_MAX_CUES 12000
++#define SUB_OWNED_TEXT_MAX_CUE_BYTES 16384
++#define SUB_OWNED_TEXT_MAX_BYTES (8 * 1024 * 1024)
++#define SUB_OWNED_TEXT_MAX_END_MS 91000000
++#define SUB_OWNED_TEXT_MAX_ATTACHMENTS 128
++#define SUB_OWNED_TEXT_MAX_ATTACHMENT_BYTES (16 * 1024 * 1024)
++#define SUB_OWNED_TEXT_MAX_ATTACHMENT_TOTAL (64 * 1024 * 1024)
++#define SUB_OWNED_TEXT_MAX_ATTACHMENT_NAME 4096
++#define SUB_OWNED_TEXT_MAX_LANGUAGE 255
++#define SUB_OWNED_TEXT_MAX_WORK_NS INT64_C(30000000000)
++
++struct sub_owned_text_cue {
++    uint64_t start_ms, end_ms;
++    const char *utf8; // Exact cue body, not SRT indices/timecode lines.
++    size_t length;
++};
++
++enum sub_owned_text_error {
++    SUB_OWNED_TEXT_OK,
++    SUB_OWNED_TEXT_INVALID_INPUT,
++    SUB_OWNED_TEXT_CANCELLED,
++    SUB_OWNED_TEXT_EXPIRED,
++    SUB_OWNED_TEXT_DECODER_FAILED,
++    SUB_OWNED_TEXT_PACKET_FAILED,
++    SUB_OWNED_TEXT_DECODE_FAILED,
++    SUB_OWNED_TEXT_INVALID_STATE,
++};
++
++// Validates and copies ALL cues, strict UTF-8 without NUL, strictly increasing
++// starts and start < end <= MAX_END_MS. Overlaps/markup are preserved through the
++// real FFmpeg SubRip -> ASS converter. Returns only a completely decoded object.
++// play_dir is a captured +1/-1; video_fps is captured finite >= 0. Cue/language
++// borrows end before return; attachments/sh/codec/packets are owned thereafter.
++// Deadline is absolute mp_time_ns(), <= 30s ahead. Cancellation is cooperative
++// between bounded steps, NOT preemption of libass/font-provider calls. It is
++// checked after such calls before any ready object is returned.
++struct dec_sub *sub_create_owned_text(
++    struct mpv_global *global, struct attachment_list *owned_attachments,
++    const char *language, const struct sub_owned_text_cue *cues, size_t count,
++    int play_dir, double video_fps, struct mp_cancel *cancel, int64_t deadline_ns,
++    enum sub_owned_text_error *error);
++
++// Existing OSD/decoder owner only, never under native core or host admission.
++// Refreshes this object's OWN subtitle/shared/filter caches. Hard/filter changes
++// decode the complete retained packet set with the checked path. On failure the
++// object is no longer renderable; caller must revoke it, not show partial text.
++// Font/style/filter work may run here. Calls must not overlap bitmap/text reads.
++bool sub_refresh_owned_text(struct dec_sub *sub, struct mp_cancel *cancel,
++                           int64_t deadline_ns, enum sub_owned_text_error *error);
++
++// Off-core, after removal from publication and ALL decoder readers quiesce.
++// Native/global/config/log lifetime must remain held through terminal cleanup.
++// Do not call demux/read/preload/reset/control APIs on an owned text object.
++void sub_destroy_owned_text(struct dec_sub *sub);
++
+ bool sub_can_preload(struct dec_sub *sub);
+ void sub_preload(struct dec_sub *sub);
+ void sub_redecode_cached_packets(struct dec_sub *sub);
+diff --git a/sub/filter_jsre.c b/sub/filter_jsre.c
+index fb71181..ca88a54 100644
+--- a/sub/filter_jsre.c
++++ b/sub/filter_jsre.c
+@@ -107,8 +107,9 @@ static bool jsre_init(struct sd_filter *ft)
+     return true;
+ }
+ 
+-static struct demux_packet *jsre_filter(struct sd_filter *ft,
+-                                      struct demux_packet *pkt)
++static struct sd_filter_result jsre_filter_internal(struct sd_filter *ft,
++                                                    struct demux_packet *pkt,
++                                                    bool checked)
+ {
+     struct priv *p = ft->priv;
+     char *text = bstrto0(NULL, sd_ass_pkt_text(ft, pkt, p->offset));
+@@ -127,14 +128,32 @@ static struct demux_packet *jsre_filter(struct sd_filter *ft,
+         } else if (err) {
+             MP_WARN(ft, "jsre: test regex %d: %s.\n", n, get_err(p->J));
+             js_pop(p->J, 1);
++            if (checked) {
++                talloc_free(text);
++                return (struct sd_filter_result){SD_FILTER_ERROR, NULL};
++            }
+         }
+     }
+ 
+     talloc_free(text);
+-    return drop ? NULL : pkt;
++    return (struct sd_filter_result){drop ? SD_FILTER_DROP : SD_FILTER_KEEP,
++                                    drop ? NULL : pkt};
++}
++
++static struct demux_packet *jsre_filter(struct sd_filter *ft,
++                                      struct demux_packet *pkt)
++{
++    return jsre_filter_internal(ft, pkt, false).packet;
++}
++
++static struct sd_filter_result jsre_filter_prepared(struct sd_filter *ft,
++                                                    struct demux_packet *pkt)
++{
++    return jsre_filter_internal(ft, pkt, true);
+ }
+ 
+ const struct sd_filter_functions sd_filter_jsre = {
+     .init   = jsre_init,
+     .filter = jsre_filter,
++    .filter_prepared = jsre_filter_prepared,
+ };
+diff --git a/sub/filter_regex.c b/sub/filter_regex.c
+index 1d29ea1..8f264bb 100644
+--- a/sub/filter_regex.c
++++ b/sub/filter_regex.c
+@@ -56,8 +56,9 @@ static void rf_uninit(struct sd_filter *ft)
+         regfree(&p->regexes[n]);
+ }
+ 
+-static struct demux_packet *rf_filter(struct sd_filter *ft,
+-                                      struct demux_packet *pkt)
++static struct sd_filter_result rf_filter_internal(struct sd_filter *ft,
++                                                  struct demux_packet *pkt,
++                                                  bool checked)
+ {
+     struct priv *p = ft->priv;
+     char *text = bstrto0(NULL, sd_ass_pkt_text(ft, pkt, p->offset));
+@@ -75,15 +76,33 @@ static struct demux_packet *rf_filter(struct sd_filter *ft,
+             break;
+         } else if (err != REG_NOMATCH) {
+             MP_WARN(ft, "Error on regexec() on regex %d.\n", n);
++            if (checked) {
++                talloc_free(text);
++                return (struct sd_filter_result){SD_FILTER_ERROR, NULL};
++            }
+         }
+     }
+ 
+     talloc_free(text);
+-    return drop ? NULL : pkt;
++    return (struct sd_filter_result){drop ? SD_FILTER_DROP : SD_FILTER_KEEP,
++                                    drop ? NULL : pkt};
++}
++
++static struct demux_packet *rf_filter(struct sd_filter *ft,
++                                      struct demux_packet *pkt)
++{
++    return rf_filter_internal(ft, pkt, false).packet;
++}
++
++static struct sd_filter_result rf_filter_prepared(struct sd_filter *ft,
++                                                  struct demux_packet *pkt)
++{
++    return rf_filter_internal(ft, pkt, true);
+ }
+ 
+ const struct sd_filter_functions sd_filter_regex = {
+     .init   = rf_init,
+     .uninit = rf_uninit,
+     .filter = rf_filter,
++    .filter_prepared = rf_filter_prepared,
+ };
+diff --git a/sub/filter_sdh.c b/sub/filter_sdh.c
+index 0178124..07911f7 100644
+--- a/sub/filter_sdh.c
++++ b/sub/filter_sdh.c
+@@ -454,20 +454,20 @@ static bool sdh_init(struct sd_filter *ft)
+     return true;
+ }
+ 
+-static struct demux_packet *sdh_filter(struct sd_filter *ft,
+-                                       struct demux_packet *pkt)
++static struct sd_filter_result sdh_filter_prepared(struct sd_filter *ft,
++                                                    struct demux_packet *pkt)
+ {
+     bstr text = sd_ass_pkt_text(ft, pkt, sd_ass_fmt_offset(ft->event_format));
+     if (!text.start || !text.len || pkt->len >= INT_MAX)
+-        return pkt;  // we don't touch it
++        return (struct sd_filter_result){SD_FILTER_KEEP, pkt};
+ 
+     ptrdiff_t toff = text.start - pkt->buffer;
+     char *line = filter_SDH(ft, (char *)pkt->buffer, (int)pkt->len, toff);
+     if (!line)
+-        return NULL;
++        return (struct sd_filter_result){SD_FILTER_DROP, NULL};
+     if (0 == bstrcmp0((bstr){(char *)pkt->buffer, pkt->len}, line)) {
+         talloc_free(line);
+-        return pkt;  // unmodified, no need to allocate new packet
++        return (struct sd_filter_result){SD_FILTER_KEEP, pkt};
+     }
+ 
+     // Stupidly, this copies it again. One could possibly allocate the packet
+@@ -478,10 +478,17 @@ static struct demux_packet *sdh_filter(struct sd_filter *ft,
+         demux_packet_copy_attribs(npkt, pkt);
+ 
+     talloc_free(line);
+-    return npkt;
++    return (struct sd_filter_result){npkt ? SD_FILTER_KEEP : SD_FILTER_ERROR, npkt};
++}
++
++static struct demux_packet *sdh_filter(struct sd_filter *ft,
++                                       struct demux_packet *pkt)
++{
++    return sdh_filter_prepared(ft, pkt).packet;
+ }
+ 
+ const struct sd_filter_functions sd_filter_sdh = {
+     .init   = sdh_init,
+     .filter = sdh_filter,
++    .filter_prepared = sdh_filter_prepared,
+ };
+diff --git a/sub/lavc_conv.c b/sub/lavc_conv.c
+index da21033..7dc508a 100644
+--- a/sub/lavc_conv.c
++++ b/sub/lavc_conv.c
+@@ -227,13 +227,16 @@ static int parse_webvtt(AVPacket *in, AVPacket *pkt)
+ // Return a NULL-terminated list of ASS event lines and have
+ // the AVSubtitle display PTS and duration set to input
+ // double variables.
+-char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
+-                        double *sub_pts, double *sub_duration)
++static char **lavc_conv_decode_internal(struct lavc_conv *priv,
++                                         struct demux_packet *packet,
++                                         double *sub_pts, double *sub_duration,
++                                         bool *complete)
+ {
+     AVCodecContext *avctx = priv->avctx;
+     AVPacket *curr_pkt = priv->avpkt;
+     int ret, got_sub;
+     int num_cur = 0;
++    bool converted = false;
+ 
+     avsubtitle_free(&priv->cur);
+ 
+@@ -268,6 +271,7 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
+     if (ret < 0) {
+         MP_ERR(priv, "Error decoding subtitle\n");
+     } else if (got_sub) {
++        converted = ret == curr_pkt->size;
+         *sub_pts = packet->pts + mp_pts_from_av(priv->cur.start_display_time,
+                                                &avctx->time_base);
+         *sub_duration = priv->cur.end_display_time == UINT32_MAX ?
+@@ -277,21 +281,42 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
+                                        &avctx->time_base);
+ 
+         for (int i = 0; i < priv->cur.num_rects; i++) {
+-            if (priv->cur.rects[i]->w > 0 && priv->cur.rects[i]->h > 0)
++            if (priv->cur.rects[i]->w > 0 && priv->cur.rects[i]->h > 0) {
+                 MP_WARN(priv, "Ignoring bitmap subtitle.\n");
++                converted = false;
++            }
+             char *ass_line = priv->cur.rects[i]->ass;
+-            if (!ass_line)
++            if (!ass_line) {
++                converted = false;
+                 continue;
++            }
+             MP_TARRAY_APPEND(priv, priv->cur_list, num_cur, ass_line);
+         }
+     }
+ 
+ done:
++    if (complete)
++        *complete = converted && num_cur > 0;
+     av_packet_unref(priv->avpkt_vtt);
+     MP_TARRAY_APPEND(priv, priv->cur_list, num_cur, NULL);
+     return priv->cur_list;
+ }
+ 
++char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
++                        double *sub_pts, double *sub_duration)
++{
++    return lavc_conv_decode_internal(priv, packet, sub_pts, sub_duration, NULL);
++}
++
++char **lavc_conv_decode_prepared(struct lavc_conv *priv,
++                                struct demux_packet *packet,
++                                double *sub_pts, double *sub_duration,
++                                bool *complete)
++{
++    mp_assert(complete);
++    return lavc_conv_decode_internal(priv, packet, sub_pts, sub_duration, complete);
++}
++
+ bool lavc_conv_is_styled(struct lavc_conv *priv)
+ {
+     return priv->styled;
+diff --git a/sub/sd.h b/sub/sd.h
+index d7cea26..55643f0 100644
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -34,6 +34,8 @@ struct sd {
+     // Set to false as soon as the decoder discards old subtitle events.
+     // (only needed if sd_functions.accept_packets_in_advance == false)
+     bool preload_ok;
++    // Bounded detached cue corpus: retain events for backward native queries.
++    bool owned_text;
+ };
+ 
+ struct sd_functions {
+@@ -41,6 +43,9 @@ struct sd_functions {
+     bool accept_packets_in_advance;
+     int  (*init)(struct sd *sd);
+     void (*decode)(struct sd *sd, struct demux_packet *packet);
++    // Optional checked path for fully retained, synthetic text only. A false
++    // result rejects the entire owned object; ordinary decode is unchanged.
++    bool (*decode_prepared)(struct sd *sd, struct demux_packet *packet);
+     void (*reset)(struct sd *sd);
+     void (*select)(struct sd *sd, bool selected);
+     void (*uninit)(struct sd *sd);
+@@ -61,6 +66,10 @@ struct lavc_conv *lavc_conv_create(struct sd *sd);
+ char *lavc_conv_get_extradata(struct lavc_conv *priv);
+ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
+                         double *sub_pts, double *sub_duration);
++char **lavc_conv_decode_prepared(struct lavc_conv *priv,
++                                struct demux_packet *packet,
++                                double *sub_pts, double *sub_duration,
++                                bool *complete);
+ bool lavc_conv_is_styled(struct lavc_conv *priv);
+ void lavc_conv_reset(struct lavc_conv *priv);
+ void lavc_conv_uninit(struct lavc_conv *priv);
+@@ -90,6 +99,20 @@ struct sd_filter {
+     char *event_format;
+ };
+ 
++// Per-call completion for owned text. Ordinary filters historically return NULL
++// for either an intentional drop or an allocation failure; do not infer success
++// from that ambiguous ordinary result when preparing a complete owned corpus.
++enum sd_filter_result_kind {
++    SD_FILTER_KEEP,
++    SD_FILTER_DROP,
++    SD_FILTER_ERROR,
++};
++
++struct sd_filter_result {
++    enum sd_filter_result_kind kind;
++    struct demux_packet *packet; // nonnull only for KEEP; caller owns replacements
++};
++
+ struct sd_filter_functions {
+     bool (*init)(struct sd_filter *ft);
+ 
+@@ -106,6 +129,12 @@ struct sd_filter_functions {
+     struct demux_packet *(*filter)(struct sd_filter *ft,
+                                    struct demux_packet *pkt);
+ 
++    // Checked owned-text path: KEEP(nonnull), intentional DROP(NULL), or
++    // processing/allocation ERROR(NULL). Input/replacement ownership is exactly
++    // the ordinary filter contract. Missing callback rejects owned preparation.
++    struct sd_filter_result (*filter_prepared)(struct sd_filter *ft,
++                                                struct demux_packet *pkt);
++
+     void (*uninit)(struct sd_filter *ft);
+ };
+ 
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index db4d67d..fcea67a 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -283,7 +283,8 @@ static void assobjects_init(struct sd *sd)
+ #endif
+ 
+ #if LIBASS_VERSION >= 0x01703010
+-    ass_configure_prune(ctx->ass_track, sd->opts->ass_prune_delay * 1000.0);
++    ass_configure_prune(ctx->ass_track,
++                        sd->owned_text ? -1.0 : sd->opts->ass_prune_delay * 1000.0);
+ #endif
+ 
+     enable_output(sd, true);
+@@ -367,7 +368,7 @@ static bool is_animated(const char *str)
+ }
+ 
+ // Note: pkt is not necessarily a fully valid refcounted packet.
+-static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
++static bool filter_and_add(struct sd *sd, struct demux_packet *pkt, bool checked)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
+     struct demux_packet *orig_pkt = pkt;
+@@ -376,12 +377,29 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
+ 
+     for (int n = 0; n < ctx->num_filters; n++) {
+         struct sd_filter *ft = ctx->filters[n];
+-        struct demux_packet *npkt = ft->driver->filter(ft, pkt);
++        struct sd_filter_result result = {.kind = SD_FILTER_ERROR};
++        if (checked) {
++            if (ft->driver->filter_prepared)
++                result = ft->driver->filter_prepared(ft, pkt);
++        } else {
++            result.packet = ft->driver->filter(ft, pkt);
++            result.kind = result.packet ? SD_FILTER_KEEP : SD_FILTER_DROP;
++        }
++        struct demux_packet *npkt = result.packet;
++        bool keep = result.kind == SD_FILTER_KEEP && npkt;
++        bool drop = result.kind == SD_FILTER_DROP && !npkt;
++        if (!keep && !drop) {
++            if (npkt && npkt != pkt && npkt != orig_pkt)
++                talloc_free(npkt);
++            if (pkt != orig_pkt)
++                talloc_free(pkt);
++            return false;
++        }
+         if (pkt != npkt && pkt != orig_pkt)
+             talloc_free(pkt);
+         pkt = npkt;
+-        if (!pkt)
+-            return;
++        if (drop)
++            return true; // Explicit intentional suppression, never an error.
+     }
+ 
+     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
+@@ -419,6 +437,7 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
+ 
+     if (pkt != orig_pkt)
+         talloc_free(pkt);
++    return !checked || track->n_events > old_n_events;
+ }
+ 
+ // Test if the packet with the given file position and pts was already consumed.
+@@ -451,7 +470,7 @@ static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
+ 
+ #define UNKNOWN_DURATION (INT_MAX / 1000)
+ 
+-static void decode(struct sd *sd, struct demux_packet *packet)
++static bool decode_internal(struct sd *sd, struct demux_packet *packet, bool checked)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
+     ASS_Track *track = ctx->ass_track;
+@@ -461,14 +480,27 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+     if (ctx->converter) {
+         if (!sd->opts->sub_clear_on_seek && packet->pos >= 0 &&
+             check_packet_seen(sd, packet))
+-            return;
++            return !checked;
+ 
+         double sub_pts = 0;
+         double sub_duration = 0;
+-        char **r = lavc_conv_decode(ctx->converter, packet, &sub_pts,
+-                                    &sub_duration);
+-        if (sd->opts->sub_stretch_durations ||
+-            packet->duration < 0 || sub_duration == UINT32_MAX) {
++        bool complete = false;
++        char **r = checked
++            ? lavc_conv_decode_prepared(ctx->converter, packet, &sub_pts,
++                                        &sub_duration, &complete)
++            : lavc_conv_decode(ctx->converter, packet, &sub_pts, &sub_duration);
++        if (checked && (!complete || !isfinite(sub_pts) ||
++                        !isfinite(sub_duration) || sub_duration <= 0 ||
++                        fabs(sub_pts - packet->pts) > 0.001 ||
++                        fabs(sub_duration - packet->duration) > 0.001))
++            return false;
++        // Retimed owned cues have exact finite durations. Preserve them instead
++        // of applying the ordinary unknown-duration/stretch heuristic.
++        if (checked) {
++            sub_pts = packet->pts;
++            sub_duration = packet->duration;
++        } else if (sd->opts->sub_stretch_durations ||
++                   packet->duration < 0 || sub_duration == UINT32_MAX) {
+             MP_VERBOSE(sd, "Subtitle with unknown duration.\n");
+             sub_duration = UNKNOWN_DURATION;
+         }
+@@ -480,7 +512,8 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+                 .buffer = r[n],
+                 .len = strlen(r[n]),
+             };
+-            filter_and_add(sd, &pkt2);
++            if (!filter_and_add(sd, &pkt2, checked))
++                return false;
+         }
+         for (int n = track->n_events - 1; n >= 0; n--) {
+             if (track->events[track->n_events - 1].Start == track->events[n].Start)
+@@ -501,8 +534,25 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+         // for discarding duplicate (already seen) packets but we check this
+         // anyways for our purposes for ASS subtitles.
+         packet->seen = check_packet_seen(sd, packet);
+-        filter_and_add(sd, packet);
++        if (!filter_and_add(sd, packet, checked))
++            return false;
+     }
++    return true;
++}
++
++static void decode(struct sd *sd, struct demux_packet *packet)
++{
++    (void)decode_internal(sd, packet, false);
++}
++
++static bool decode_prepared(struct sd *sd, struct demux_packet *packet)
++{
++    // Only the new owned SubRip constructor may use this checked route.
++    if (!sd->owned_text || strcmp(sd->codec->codec, "subrip") || !packet ||
++        !isfinite(packet->pts) || !isfinite(packet->duration) ||
++        packet->duration <= 0 || packet->pos < 0)
++        return false;
++    return decode_internal(sd, packet, true);
+ }
+ 
+ // Calculate the height used for scaling subtitle text size so --sub-scale-with-window
+@@ -1106,6 +1156,7 @@ const struct sd_functions sd_ass = {
+     .accept_packets_in_advance = true,
+     .init = init,
+     .decode = decode,
++    .decode_prepared = decode_prepared,
+     .get_bitmaps = get_bitmaps,
+     .get_text = get_text,
+     .get_times = get_times,

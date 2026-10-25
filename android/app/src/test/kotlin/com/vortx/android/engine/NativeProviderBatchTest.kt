@@ -123,14 +123,29 @@ class NativeProviderBatchTest {
         assertTrue(nativePlaybackIdentityCanRecord(context.copy(type = "movie", videoId = context.contentId, season = null, episode = null)))
     }
 
-    @Test fun `fifth dispatched native request gets fresh full budget and single addon body allowance`() = runBlocking {
+    @Test fun `fifth dispatched native request gets fresh full stream budget and single addon body allowance`() = runBlocking {
         val transport = Transport(slow = setOf("p0", "p1", "p2", "p3"), enteredCount = 4)
         open(transport).use { session ->
             val pending = async(Dispatchers.Default) { session.loadProviders("streams", session.read().owner, legs(22)) { _, _ -> } }
             assertTrue(transport.entered.await(3, TimeUnit.SECONDS)); assertEquals(4, transport.calls.get())
-            transport.virtualClock.set(19_000); transport.release.countDown(); pending.await()
-            assertEquals(22, transport.calls.get()); assertTrue(transport.dispatched.any { it.first == "p4" && it.second == 19_000 })
-            assertTrue(transport.wires.all { it.getLong("budgetMs") == 20_000L && it.getLong("maxResponseBytes") == 8_388_608L && it.getJSONArray("addons").length() == 1 })
+            transport.virtualClock.set(39_000); transport.release.countDown(); pending.await()
+            assertEquals(22, transport.calls.get()); assertTrue(transport.dispatched.any { it.first == "p4" && it.second == 39_000 })
+            assertTrue(transport.wires.all { it.getLong("budgetMs") == 40_000L && it.getLong("maxResponseBytes") == 8_388_608L && it.getJSONArray("addons").length() == 1 })
+        }
+    }
+
+    @Test fun `actual native wires retain metadata deadline while stream aggregation gets forty seconds`() = runBlocking {
+        val transport = Transport(slow = emptySet(), enteredCount = 0)
+        open(transport).use { session ->
+            session.loadProviders("mixed-deadlines", session.read().owner, legs(2, true) + legs(4)) { _, _ -> }
+            assertEquals(6, transport.wires.size)
+            assertEquals(2, transport.wires.count { it.getJSONObject("request").getString("resource") == "meta" })
+            assertEquals(4, transport.wires.count { it.getJSONObject("request").getString("resource") == "stream" })
+            assertTrue(transport.wires.all { wire ->
+                val streamLeg = wire.getJSONObject("request").getString("resource") == "stream"
+                wire.getLong("budgetMs") == (if (streamLeg) 40_000L else 20_000L) &&
+                    wire.getLong("maxResponseBytes") == 8_388_608L && wire.getJSONArray("addons").length() == 1
+            })
         }
     }
 

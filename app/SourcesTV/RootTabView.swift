@@ -72,6 +72,9 @@ struct PlaybackRequest: Identifiable {
     /// the stored resume point untouched: VortX remains the sole resume authority and re-records its own
     /// position from here as playback proceeds. Takes precedence over `startFromZero` (a caller sets one).
     var startAtSeconds: Double? = nil
+    /// Identity for a queue-admitted launch. The queue token is not a source URL or a watch receipt;
+    /// TVPlayerView uses it only to acknowledge accepted first-frame/completion ownership.
+    var playbackQueueToken: PlaybackTitleQueue.Token? = nil
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -139,6 +142,40 @@ struct RootView: View {
     private var core: CoreBridge { CoreBridge.shared }   // actions only; not observed, so engine events do not re-render it
     @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
     @State private var splashDone = false
+    @ObservedObject private var playbackQueue = PlaybackTitleQueue.shared
+    @State private var presentedShellCover: ShellCover?
+    /// Snapshot the exact item that the current cover acknowledged. SwiftUI may nil the binding before calling
+    /// onDismiss; this prevents that setter from clearing a newer queue route or a newer deep link.
+    @State private var acknowledgedShellCover: ShellCover?
+    @State private var shellCoverDismissing = false
+    @State private var shellDismissalReason: ShellDismissalReason = .user
+
+    private enum ShellDismissalReason {
+        case user
+        case hostBoundary
+    }
+
+    private enum ShellCoverID: Hashable {
+        case deepLink(type: String, id: String)
+        case queueDetail(UUID)
+        case queueEditor(UUID)
+    }
+
+    /// One shell-child cover owns all ordinary detail/editor presentations. Typed IDs remain stable while the
+    /// underlying queue ticket/deep-link is alive; a new queue ticket can never be mistaken for its predecessor.
+    private enum ShellCover: Identifiable {
+        case deepLink(DeepLinkDetailTarget)
+        case queueDetail(PlaybackTitleQueue.Route)
+        case queueEditor(UUID)
+
+        var id: ShellCoverID {
+            switch self {
+            case .deepLink(let target): return .deepLink(type: target.type, id: target.id)
+            case .queueDetail(let route): return .queueDetail(route.id)
+            case .queueEditor(let id): return .queueEditor(id)
+            }
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -147,6 +184,8 @@ struct RootView: View {
             // a flash of the main profile's Home underneath.
             Theme.Palette.canvas.ignoresSafeArea()
             RootTabView(launchReady: splashDone && shellVisible)
+                // Keep profile/account boundary invalidation mounted while the player covers the shell.
+                .modifier(PlaybackTitleQueueBoundaryObserver())
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
                 // A `vortx://open` link (today: a Top Shelf tap) opens the title's detail page.
@@ -161,8 +200,23 @@ struct RootView: View {
                 //
                 // Hung on the shell child rather than on the ZStack because the profile picker's cover is
                 // already on the ZStack, and two presentation modifiers on ONE view do not both present.
-                .fullScreenCover(item: deepLinkDetail) { target in
-                    NavigationStack { DetailView(type: target.type, id: target.id) }
+                .fullScreenCover(item: shellCoverBinding, onDismiss: acknowledgeShellCover) { cover in
+                    switch cover {
+                    case .deepLink(let target):
+                        NavigationStack { DetailView(type: target.type, id: target.id) }
+                    case .queueDetail(let route):
+                        NavigationStack {
+                            DetailView(type: route.entry.candidate.type,
+                                       id: route.entry.candidate.contentID,
+                                       autoPlayOnAppear: true,
+                                       randomPlayIntent: route.intent,
+                                       playbackQueueToken: route.token,
+                                       initialVideoID: route.entry.candidate.videoIDHint)
+                                .safeAreaInset(edge: .top) { PlaybackTitleQueueRouteActions(routeID: route.id) }
+                        }
+                    case .queueEditor:
+                        PlaybackTitleQueueEditor()
+                    }
                 }
             if let req = presenter.request {
                 // #76: AVPlayer is now FIRST-CLASS under the full TVPlayerView chrome. Every request goes to
@@ -185,6 +239,7 @@ struct RootView: View {
                              debridCachedHashes: req.debridCachedHashes,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
+                             playbackQueueToken: req.playbackQueueToken,
                              onPlaybackIdentityCommitted: {
                                  presenter.recordCommittedPlayback($0, requestID: req.id)
                              },
@@ -204,9 +259,17 @@ struct RootView: View {
             }
         }
         .fullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
+        .onAppear { syncShellCover() }
+        .onChange(of: splashDone) { _, _ in syncShellCover() }
+        .onChange(of: playbackQueue.change) { _, _ in syncShellCover() }
+        .onChange(of: router.detailTarget) { _, _ in syncShellCover() }
         // Re-sync the bar's visibility after playback ends: two shots, because the desync can
         // assert itself after the first layout settles.
         .onChange(of: presenter.request?.id) {
+            // Dismiss a queue/deep-link cover as soon as the sibling player mounts. The player remains the
+            // foreground even while its source is loading or showing an error; the queue ticket stays pending
+            // because host-boundary dismissal never calls dismissRoute.
+            syncShellCover()
             guard presenter.request == nil else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { TabBarHealer.heal("player-closed") }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { TabBarHealer.heal("player-closed+3s") }
@@ -221,6 +284,7 @@ struct RootView: View {
         // The picker dismissing (or a profile switch settling) makes the shell visible again; re-assert
         // the bar in case it desynced while hidden, so the menu is never missing on return (issue #75).
         .onChange(of: profiles.needsPicker) {
+            syncShellCover()
             guard !profiles.needsPicker, presenter.request == nil else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { TabBarHealer.heal("picker-dismissed") }
         }
@@ -242,18 +306,97 @@ struct RootView: View {
         )
     }
 
-    /// The deep link's detail page, presented only once the shell is actually ready for it: past the
-    /// splash, past the profile picker, and with no player up.
-    ///
-    /// The target stays PARKED in the router until then rather than being dropped, so the two cases
-    /// that matter both land: a cold launch started BY a Top Shelf tap (the link arrives long before
-    /// the shell mounts) and a tap that arrives while playback is up (it opens when the player closes).
-    /// The getter re-evaluates whenever those inputs change, so parking costs nothing.
-    private var deepLinkDetail: Binding<DeepLinkDetailTarget?> {
-        Binding(
-            get: { splashDone && shellVisible ? router.detailTarget : nil },
-            set: { target in if target == nil { router.detailTarget = nil } }
+    /// One binding drives the shell-child cover. A host-triggered dismissal never clears its route; only a
+    /// user dismissal acknowledges the exact queue/deep-link item. This keeps a successor ticket or a parked
+    /// Top Shelf link alive across player/profile cover transitions.
+    private var shellCoverBinding: Binding<ShellCover?> {
+        let expectedID = presentedShellCover?.id
+        return Binding(
+            get: { presentedShellCover },
+            set: { incoming in
+                guard case nil = incoming, let current = presentedShellCover,
+                      current.id == expectedID else { return }
+                // Preserve the exact acknowledgement, but revoke pending source work immediately when
+                // the viewer cancels. An old binding's late nil cannot dismiss a newer cover identity.
+                shellDismissalReason = .user
+                shellCoverDismissing = true
+                presentedShellCover = nil
+                dismissShellCover(current)
+            }
         )
+    }
+
+    private func acknowledgeShellCover() {
+        let dismissed = acknowledgedShellCover
+        let reason = shellDismissalReason
+        acknowledgedShellCover = nil
+        shellCoverDismissing = false
+        shellDismissalReason = .user
+        if case .user = reason, let dismissed { dismissShellCover(dismissed) }
+        presentedShellCover = nil
+        // Route selection is deliberately deferred until the old cover is gone. A queue completion can have
+        // published a successor while the old detail was still animating away.
+        DispatchQueue.main.async { syncShellCover() }
+    }
+
+    private func beginHostDismissal() {
+        shellDismissalReason = .hostBoundary
+        shellCoverDismissing = true
+        presentedShellCover = nil
+    }
+
+    private func dismissShellCover(_ cover: ShellCover) {
+        switch cover {
+        case .deepLink(let target):
+            // Clear only the exact link the cover displayed. A newer link remains parked.
+            guard router.detailTarget == target else { return }
+            router.detailTarget = nil
+        case .queueDetail(let route):
+            playbackQueue.dismissRoute(route.id)
+        case .queueEditor(let id):
+            playbackQueue.dismissEditor(id)
+        }
+    }
+
+    /// Synchronizes one shell-child presentation owner. Queue detail has priority over a parked deep link,
+    /// but the deep link is never destroyed while waiting. Queue detail dismisses when a player request mounts;
+    /// the source-admitted queue receipt remains pending until that player accepts its actual first frame.
+    private func syncShellCover() {
+        // The shared manager owns the original profile/account boundary. Refresh it before any host
+        // presentation decision; this does not replace the manager's captured-owner guards.
+        playbackQueue.invalidateIfNeeded()
+        guard !shellCoverDismissing else { return }
+        if let presented = presentedShellCover {
+            switch presented {
+            case .deepLink(let target):
+                guard splashDone, shellVisible, router.detailTarget == target else {
+                    beginHostDismissal(); return
+                }
+            case .queueDetail(let route):
+                guard splashDone, shellVisible, playbackQueue.route?.id == route.id else {
+                    beginHostDismissal(); return
+                }
+            case .queueEditor(let id):
+                guard splashDone, shellVisible, playbackQueue.editorID == id else {
+                    beginHostDismissal(); return
+                }
+            }
+            return
+        }
+        guard splashDone, shellVisible else { return }
+        let next: ShellCover?
+        if let route = playbackQueue.route {
+            next = .queueDetail(route)
+        } else if let editorID = playbackQueue.editorID {
+            next = .queueEditor(editorID)
+        } else if let target = router.detailTarget {
+            next = .deepLink(target)
+        } else {
+            next = nil
+        }
+        guard let next else { return }
+        acknowledgedShellCover = next
+        presentedShellCover = next
     }
 }
 
@@ -686,6 +829,7 @@ struct RootTabView: View {
 /// tab change forced a real layout pass. The heal uses the SUPPORTED visibility API (frame surgery
 /// on the private container gets stomped by the next layout pass) and logs what it saw, so a
 /// failed heal explains itself in the log.
+@MainActor
 enum TabBarHealer {
     private static let log = Logger(subsystem: "com.stremiox.app", category: "tabbar")
 
@@ -696,14 +840,17 @@ enum TabBarHealer {
                 let bar = tabs.tabBar
                 let container = bar.superview
                 let containerY = container?.frame.origin.y ?? .nan
+                // Logger interpolation retains value reads, never UIKit references.
+                let barHidden = bar.isHidden
                 if #available(tvOS 18.0, *) {
-                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden) controllerHidden=\(tabs.isTabBarHidden)")
+                    let controllerHidden = tabs.isTabBarHidden
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(barHidden) controllerHidden=\(controllerHidden)")
                     if tabs.isTabBarHidden {
                         tabs.setTabBarHidden(false, animated: false)
                         log.info("heal: setTabBarHidden(false) applied")
                     }
                 } else {
-                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden)")
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(barHidden)")
                 }
                 // Re-home a parked container as well; harmless if the layout pass recomputes it.
                 if let container, container.frame.origin.y < -(max(container.frame.height, 68) * 3) {

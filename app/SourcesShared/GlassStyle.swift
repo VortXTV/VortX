@@ -190,7 +190,7 @@ enum VortXGlass {
     /// that sits on the app's own chrome) resolves to the themeable `glassVeil` so the surface rises one step
     /// up the SAME ladder as `surface1` / `surface2` / `surface3` and stays hue-coherent across all 9 accents
     /// and both chrome modes. `.scrim` resolves to the fixed warm near-black above.
-    static func fill(_ alpha: Double, tone: Tone = .lift) -> Color {
+    @MainActor static func fill(_ alpha: Double, tone: Tone = .lift) -> Color {
         switch tone {
         case .lift:
             return Theme.Palette.glassVeil.opacity(alpha)
@@ -276,12 +276,13 @@ enum VortXGlass {
     /// The ember active / selected fill for a nav item (mockups: `rgba(245,158,11,.16)`). The accent
     /// shorthand for `activeTint`; uses the themeable accent so a chosen accent flows through, exactly
     /// like the rest of the selection language.
-    static var activeFill: Color { activeTint(Theme.Palette.accent) }
+    @MainActor static var activeFill: Color { activeTint(Theme.Palette.accent) }
 
     /// The active / selected overlay fill at a caller-chosen tint. Defaults to the accent (the `activeFill`
     /// shorthand); a warn / amber or destructive tint can be passed so one active-state path serves every
     /// meaning without hardcoding the accent.
-    static func activeTint(_ tint: Color = Theme.Palette.accent) -> Color { tint.opacity(0.16) }
+    static func activeTint(_ tint: Color) -> Color { tint.opacity(0.16) }
+    @MainActor static func activeTint() -> Color { activeTint(Theme.Palette.accent) }
 
     // MARK: Shadow presets (soft drop shadow under a raised element)
 
@@ -338,7 +339,7 @@ enum VortXGlass {
     /// `hugsTightly` forces the shape-clipped `material` on EVERY OS (never `glassEffect`) for tight small
     /// circular controls (discs): glassEffect's ambient shadow / lensing bloom is not clipped to the shape,
     /// so on a ~44pt disc it draws a dark rounded halo larger than the disc and reads over-blurred.
-    @ViewBuilder
+    @MainActor @ViewBuilder
     static func blurLayer<S: InsettableShape>(in shape: S, reduceTransparency: Bool,
                                               material: Material = .ultraThinMaterial,
                                               glassTint: Color? = nil,
@@ -376,7 +377,7 @@ enum VortXGlass {
     #if canImport(UIKit)
     /// The glass fill as a `UIColor`, so the tvOS native `UITabBarAppearance` (which cannot host a SwiftUI
     /// material) can tint its system-blurred background with the SAME warm fill the SwiftUI material uses.
-    static func fillUIColor(_ alpha: Double) -> UIColor { UIColor(fill(alpha)) }
+    @MainActor static func fillUIColor(_ alpha: Double) -> UIColor { UIColor(fill(alpha)) }
     #endif
 
     #if os(tvOS)
@@ -403,7 +404,7 @@ enum VortXGlass {
     /// while an inline settings card behind it read at 1.102:1. The only reason the bar had any outline was
     /// the system's own 1px edge (rgb(28,24,20), luminance +6.0): an edge ~30x more visible than the surface
     /// it encloses is exactly the CEO's "barely there", and it was a direction error, not a weak number.
-    static func tabBarBackgroundImage() -> UIImage {
+    @MainActor static func tabBarBackgroundImage() -> UIImage {
         let highlightTop = 0.14
         let size = CGSize(width: 1, height: 4)
         let image = UIGraphicsImageRenderer(size: size).image { ctx in

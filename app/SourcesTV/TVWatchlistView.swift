@@ -100,7 +100,7 @@ struct TVWatchlistView: View {
         }
         .onAppear { isVisible = true; reload() }
         .onDisappear { isVisible = false; cancelReload() }
-        .onChange(of: profiles.activeID) { _ in boundaryChanged() }
+        .onChange(of: profiles.activeID) { boundaryChanged() }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             boundaryChanged()
         }
@@ -108,7 +108,7 @@ struct TVWatchlistView: View {
             retireNavigationIfNeeded()
             if isVisible { reload() }
         }
-        .onChange(of: core.revision) { _ in
+        .onChange(of: core.revision) {
             retireNavigationIfNeeded()
             // A mount or same-profile account rebind can retire admission without changing activeID.
             if isVisible && !canDisplay && reloadTask == nil { reload() }

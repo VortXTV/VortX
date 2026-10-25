@@ -45,6 +45,16 @@ final class ForYouRowsModel: ObservableObject {
         publish()
     }
 
+    /// A new profile's preferences can publish before Home's refresh observer runs. An
+    /// explicit pick accepts only the rows produced for these exact current query inputs.
+    func currentInterestItems(profileID: UUID?, interests: ForYouInterests?, now: Date = Date()) -> [MetaPreview] {
+        guard let profileID else { return [] }
+        let plan = interests.map { ForYouQuery.plan($0) } ?? []
+        let key = "\(profileID.uuidString)|\(ForYouQuery.day(now))|" + plan.map { "\($0.id)=\($0.source)" }.joined(separator: ",")
+        guard interestKey == key else { return [] }
+        return interestRows.flatMap(\.items)
+    }
+
     func clear() {
         interestTask?.cancel(); collectionTask?.cancel()
         interestTask = nil; collectionTask = nil

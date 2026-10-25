@@ -78,7 +78,7 @@ enum ProviderBrandMap {
 
     /// The flat brand background for a provider, or the neutral surface fallback for the long tail
     /// (regional providers, small services) so every tile still reads as a finished brand card.
-    static func brandColor(for providerID: Int) -> Color {
+    @MainActor static func brandColor(for providerID: Int) -> Color {
         colors[providerID] ?? Theme.Palette.surface2
     }
 

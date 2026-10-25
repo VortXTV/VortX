@@ -202,6 +202,7 @@ class NativeSearchBatchTest {
     internal class Runtime : VortxRuntimeBindings {
         private val values = mutableMapOf<Long, String>(); private var next = 0L
         private fun profile(id: String, owner: Boolean) = JSONObject().put("id", id).put("name", id).put("owner", owner)
+            .put("account", JSONObject().put("kind", "local_only"))
             .put("deleted", false).put("addons", "share_primary").put("parental", JSONObject().put("kids", false))
             .put("settings", JSONObject().put("disabledAddons", JSONArray()))
         private fun library() = JSONObject().put("items", JSONArray()).put("history", JSONArray()).put("resume", JSONObject())

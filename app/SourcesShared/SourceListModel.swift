@@ -52,6 +52,43 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// Setting it changes `inputsHash`, which retriggers the detached rank with the override installed as a
     /// task-local. nil = profile preference.
     @Published var sessionAudioLanguages: [String]? = nil
+    /// Transient list projection only. It never changes ranking, best, settlement or playback receipts.
+    @Published private var quickFilterSession = SourceQuickFilterPolicy.Session()
+    private var quickFilterIdentity: OutputIdentity?
+    private var quickFilterProfileID: UUID?
+    private var quickFilterCacheCapture: CredentialScopeRegistry.Capture?
+    var quickFilters: SourceQuickFilterPolicy.Selection { quickFilterSession.selection }
+
+    var quickFilterGroups: [SourceQuickFilterPolicy.Group] {
+        quickFilterSession.displayed(
+            scopeIsCurrent: publishedIdentity == outputIdentity(for: context) && quickFilterIdentity == publishedIdentity,
+            cacheIsCurrent: quickFilterCacheCapture.map { CredentialScopeRegistry.shared.isCurrent($0) } == true)
+    }
+
+    func setQuickFilters(_ selection: SourceQuickFilterPolicy.Selection) {
+        let snapshot = debridCache?.confirmedCacheSnapshot
+        quickFilterCacheCapture = snapshot?.capture
+        quickFilterSession.select(selection, cachedHashes: snapshot?.hashes ?? [], cachedUsenetURLs: snapshot?.usenetURLs ?? [])
+    }
+
+    private func projectQuickFilters() {
+        let snapshot = debridCache?.confirmedCacheSnapshot
+        quickFilterCacheCapture = snapshot?.capture
+        quickFilterSession.refresh(cachedHashes: snapshot?.hashes ?? [], cachedUsenetURLs: snapshot?.usenetURLs ?? [])
+    }
+
+    private func installQuickFilterIndex(_ index: SourceQuickFilterPolicy.Index) {
+        let identity = outputIdentity(for: context)
+        let profileID = ProfileStore.shared.activeID
+        let snapshot = debridCache?.confirmedCacheSnapshot
+        let reset = quickFilterIdentity != identity || quickFilterProfileID != profileID
+            || quickFilterCacheCapture != snapshot?.capture
+        quickFilterIdentity = identity
+        quickFilterProfileID = profileID
+        quickFilterCacheCapture = snapshot?.capture
+        quickFilterSession.install(index, resetSelection: reset,
+            cachedHashes: snapshot?.hashes ?? [], cachedUsenetURLs: snapshot?.usenetURLs ?? [])
+    }
 
     var groups: [CoreStreamSourceGroup] {
         publishedIdentity == outputIdentity(for: context) ? publishedGroups : []
@@ -69,6 +106,75 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         publishedIdentity == outputIdentity(for: context) ? publishedSettlement : .waiting
     }
     var isSettled: Bool { settlement.isSettled }
+
+    // BEGIN RANDOM PLAY SOURCE RECEIPT
+    struct PlaybackReceipt: Equatable {
+        fileprivate let generation: Int
+        fileprivate let signature: Signature
+    }
+
+    /// The existing complete-set publication, not merely a non-empty list. Fresh epochs also reject
+    /// a contributor change BEFORE the trailing coalescer has rebuilt/published another list.
+    func playbackReceipt(pin: ResolvedPin?) -> PlaybackReceipt? {
+        guard isSettled, pendingSignature == nil, let signature = publishedSignature,
+              signature == currentPlaybackSignature(context: livePlaybackContext(pin: pin)) else { return nil }
+        return PlaybackReceipt(generation: generation, signature: signature)
+    }
+
+    func playbackReceiptIsCurrent(_ receipt: PlaybackReceipt, pin: ResolvedPin?) -> Bool {
+        playbackReceipt(pin: pin) == receipt
+    }
+
+    private func livePlaybackContext(pin: ResolvedPin?) -> Context {
+        var current = context
+        current.pin = pin
+        current.prefsSignature = SourcePreferences.shared.rankingSignature
+        current.sessionAudioLanguages = sessionAudioLanguages
+        current.isKids = ProfileStore.activeIsKids()
+        current.directLinksOnly = PlaybackSettings.directLinksOnly
+        current.disabledAddons = ProfileStore.activeDisabledAddons()
+        return current
+    }
+
+    private func currentPlaybackSignature(context ctx: Context) -> Signature? {
+        guard let core, let torbox, let singularity, let mediaServers, let debridCache else { return nil }
+        let cachedHashes = debridCache.cachedHashes
+        let tombstones = AddonTombstones.all()
+        let sticky: (addon: String?, bingeGroup: String?)? = ctx.streamId != nil && !ctx.metaId.isEmpty
+            ? SeriesSourceSticky.preference(for: ctx.metaId) : nil
+        // O(1)-ish signature: three epochs + one fold of the small inputs. No per-stream work.
+        var hasher = Hasher()
+        hasher.combine(ctx.metaId)
+        hasher.combine(ctx.streamId)
+        hasher.combine(ctx.auxiliaryTarget)
+        hasher.combine(ctx.mediaServerTarget)
+        hasher.combine(ctx.continuity)
+        hasher.combine(String(describing: ctx.pin))
+        hasher.combine(ctx.prefsSignature)
+        hasher.combine(ctx.sessionAudioLanguages)
+        hasher.combine(ctx.isKids)
+        hasher.combine(ctx.directLinksOnly)
+        hasher.combine(ctx.disabledAddons)
+        hasher.combine(cachedHashes)
+        hasher.combine(tombstones)
+        // A pick made in the player changes the rank without changing any epoch, so it has to be in the
+        // signature or the list would keep serving the pre-pick order until something else moved.
+        hasher.combine(sticky?.addon)
+        hasher.combine(sticky?.bingeGroup)
+        let signature = Signature(streamsEpoch: core.streamsEpoch,
+                                  torboxEpoch: torbox.epoch,
+                                  singularityEpoch: singularity.epoch,
+                                  mediaServerEpoch: mediaServers.epoch,
+                                  torboxSettlementEpoch: torbox.settlementEpoch,
+                                  singularitySettlementEpoch: singularity.settlementEpoch,
+                                  mediaServerSettlementEpoch: mediaServers.settlementEpoch,
+                                  jsProviderEpoch: jsProvider?.epoch ?? 0,
+                                  jsProviderSettlementEpoch: jsProvider?.settlementEpoch ?? 0,
+                                  settlementDeadlineExpired: settlementDeadlineExpired,
+                                  inputsHash: hasher.finalize())
+        return signature
+    }
+    // END RANDOM PLAY SOURCE RECEIPT
 
     // MARK: Context (the view-owned ranking inputs, set from body, equality-guarded)
 
@@ -93,7 +199,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
     /// O(1) rebuild signature: epochs + one hash. Equal signature = the published output is already
     /// correct, skip the whole assembly.
-    private struct Signature: Equatable {
+    fileprivate struct Signature: Equatable {
         let streamsEpoch: Int
         let torboxEpoch: Int
         let singularityEpoch: Int
@@ -112,13 +218,6 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let streamId: String?
         let auxiliaryContentToken: String?
         let mediaServerTargetToken: String?
-    }
-
-    /// Sendable weak indirection for the detached worker's main-actor publish. Capturing `weak self` directly
-    /// and then closing over that mutable weak capture inside `MainActor.run` is rejected in Swift 6 mode.
-    private final class WeakOwner: @unchecked Sendable {
-        weak var value: SourceListModel?
-        init(_ value: SourceListModel) { self.value = value }
     }
 
     private weak var core: CoreBridge?
@@ -177,9 +276,21 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         self.mediaServers = mediaServers
         self.debridCache = debridCache
         self.jsProvider = jsProvider
+        // Deliver after @Published's willSet, then read the current-credential snapshot. Queued
+        // emissions cannot restore another account's retained cache facts. No new provider requests.
+        Publishers.CombineLatest(debridCache.$cachedHashes, debridCache.$cachedUsenetURLs)
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.projectQuickFilters()
+                }
+            }
+            .store(in: &subscriptions)
 
         var events: [AnyPublisher<Void, Never>] = [
-            core.$streamsEpoch.map { _ in () }.eraseToAnyPublisher(),      // ready-stream set really changed
+            core.streamsEpochPublisher.map { _ in () }.eraseToAnyPublisher(),      // ready-stream set really changed
             core.$addons.map { _ in () }.eraseToAnyPublisher(),            // add-on installed/removed (tombstones)
             torbox.$streams.map { _ in () }.eraseToAnyPublisher(),         // TorBox search results replaced
             torbox.$settlementEpoch.map { _ in () }.eraseToAnyPublisher(), // including empty/error terminal result
@@ -196,7 +307,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         }
         Publishers.MergeMany(events)
             .throttle(for: .milliseconds(Self.coalesceMs), scheduler: DispatchQueue.main, latest: true)
-            .sink { [weak self] in self?.rebuild() }
+            .sink { [weak self] in MainActor.assumeIsolated { self?.rebuild() } }
             .store(in: &subscriptions)
         // Paint immediately on first bind (back-navigation can arrive with streams already resident).
         rebuild()
@@ -310,40 +421,13 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         // Capture-free and lock-guarded inside, so it is safe to call from the detached rank.
         let providerPenalty: @Sendable (String) -> Bool = { ProviderHealth.penaltyActive(addonName: $0) }
 
-        // O(1)-ish signature: three epochs + one fold of the small inputs. No per-stream work.
-        var hasher = Hasher()
-        hasher.combine(ctx.metaId)
-        hasher.combine(ctx.streamId)
-        hasher.combine(ctx.auxiliaryTarget)
-        hasher.combine(ctx.mediaServerTarget)
-        hasher.combine(ctx.continuity)
-        hasher.combine(String(describing: ctx.pin))
-        hasher.combine(ctx.prefsSignature)
-        hasher.combine(ctx.sessionAudioLanguages)
-        hasher.combine(ctx.isKids)
-        hasher.combine(ctx.directLinksOnly)
-        hasher.combine(ctx.disabledAddons)
-        hasher.combine(cachedHashes)
-        hasher.combine(tombstones)
-        // A pick made in the player changes the rank without changing any epoch, so it has to be in the
-        // signature or the list would keep serving the pre-pick order until something else moved.
-        hasher.combine(sticky?.addon)
-        hasher.combine(sticky?.bingeGroup)
-        let signature = Signature(streamsEpoch: core.streamsEpoch,
-                                  torboxEpoch: torbox.epoch,
-                                  singularityEpoch: singularity.epoch,
-                                  mediaServerEpoch: mediaServers.epoch,
-                                  torboxSettlementEpoch: torbox.settlementEpoch,
-                                  singularitySettlementEpoch: singularity.settlementEpoch,
-                                  mediaServerSettlementEpoch: mediaServers.settlementEpoch,
-                                  jsProviderEpoch: jsProvider?.epoch ?? 0,
-                                  jsProviderSettlementEpoch: jsProvider?.settlementEpoch ?? 0,
-                                  settlementDeadlineExpired: settlementDeadlineExpired,
-                                  inputsHash: hasher.finalize())
+        guard let signature = currentPlaybackSignature(context: ctx) else { return }
         guard signature != publishedSignature, signature != pendingSignature else { return }
         pendingSignature = signature
         generation &+= 1
         let gen = generation
+        let previousQuickFilterIndex = quickFilterIdentity == outputIdentity(for: ctx)
+            && quickFilterProfileID == ProfileStore.shared.activeID ? quickFilterSession.index : .empty
 
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
@@ -402,16 +486,23 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             auxiliary: auxiliarySettlement,
             deadlineExpired: settlementDeadlineExpired
         )
-        // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
-        // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
-        // main thread (Settings edits, profile reload()), so reading them from the detached rank below
-        // would race. The snapshot is installed as a task-local INSIDE the detached task (Task.detached
-        // does not inherit task-locals), so the off-main rank reads this frozen copy, never the singleton.
+        // Freeze every mutable ranking preference before the worker hop. The
+        // worker entry accepts only these checked values, never a TaskLocal
+        // branch that can fall back to a live actor/profile singleton.
         let prefsSnapshot = SourcePreferences.shared.snapshot()
-        let owner = WeakOwner(self)
+        let workerPreferences = StreamRanking.WorkerPreferences(
+            source: prefsSnapshot,
+            audioLanguages: TrackPreferences.$audioLanguagesOverride.withValue(ctx.sessionAudioLanguages) {
+                TrackPreferences.current.audioLanguages
+            },
+            isKids: ctx.isKids)
+        // SourceListModel is a real MainActor reference (implicitly Sendable).
+        // Carry only the original Bridge identity across the detached hop.
+        let owner = self
+        let originalCoreIdentity = ObjectIdentifier(core)
         let metaToken = VXProbeRedaction.identityToken(ctx.metaId.isEmpty ? nil : ctx.metaId)
 
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [weak owner] in
             // STEP 3 (delete fix), belt and suspenders: CoreBridge.streamGroups() already subtracts
             // tombstoned add-ons at the streams layer; re-filtering the snapshot here keeps the model
             // correct even for a caller that fed it un-subtracted groups.
@@ -447,26 +538,22 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                     return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
                 }
             }
-            // Run the rank against the frozen prefs snapshot (task-local), so StreamRanking never reads the
-            // mutable SourcePreferences singleton across threads. withValue binds it for this synchronous
-            // scope only; existing main-actor StreamRanking callers install nothing and read the live singleton.
             let (ranked, rankedBest, rankedTiers, rankedResOpts) =
-                TrackPreferences.$audioLanguagesOverride.withValue(ctx.sessionAudioLanguages) {
-                SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
-                    let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
-                    let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
-                                                  sticky: sticky, stickyAuthoritative: false,
-                                                  providerPenalty: providerPenalty,
-                                                  debridCachedHashes: cachedHashes)
-                    return (groups, best, StreamRanking.tiers(groups), StreamRanking.resolutionOptions(groups))
-                }
-            }
+                StreamRanking.capturedPresentation(assembled, preferences: workerPreferences,
+                    continuity: ctx.continuity, pin: ctx.pin, sticky: sticky,
+                    providerPenalty: providerPenalty, debridCachedHashes: cachedHashes)
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
+            let quickFilterIndex = SourceQuickFilterPolicy.Index(groups: ranked, previous: previousQuickFilterIndex,
+                reportedTags: StreamRanking.flavorTags)
 
-            await MainActor.run {
-                guard let self = owner.value else { return }
-                // A newer rebuild superseded this one mid-flight: discard the stale result.
-                guard gen == self.generation else { return }
+            // Freeze the weak actor reference before the nested Sendable hop;
+            // MainActor.run never closes over mutable weak-capture storage.
+            guard let publicationOwner = owner else { return }
+            await MainActor.run { [publicationOwner] in
+                // Never transfer/recapture a Bridge across the worker hop. Only
+                // the original identity plus captured epoch may complete here.
+                guard gen == publicationOwner.generation, let core = publicationOwner.core,
+                      ObjectIdentifier(core) == originalCoreIdentity else { return }
                 // A contributor can finish or retry while detached ranking is running. Never attach a
                 // complete receipt to a rank built from a different contributor generation.
                 guard core.streamsEpoch == signature.streamsEpoch,
@@ -476,11 +563,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                       torbox.settlementEpoch == signature.torboxSettlementEpoch,
                       singularity.settlementEpoch == signature.singularitySettlementEpoch,
                       mediaServers.settlementEpoch == signature.mediaServerSettlementEpoch,
-                      (self.jsProvider?.epoch ?? 0) == signature.jsProviderEpoch,
-                      (self.jsProvider?.settlementEpoch ?? 0) == signature.jsProviderSettlementEpoch,
-                      self.settlementDeadlineExpired == signature.settlementDeadlineExpired else {
-                    self.pendingSignature = nil
-                    self.trigger.send()
+                      (publicationOwner.jsProvider?.epoch ?? 0) == signature.jsProviderEpoch,
+                      (publicationOwner.jsProvider?.settlementEpoch ?? 0) == signature.jsProviderSettlementEpoch,
+                      publicationOwner.settlementDeadlineExpired == signature.settlementDeadlineExpired else {
+                    publicationOwner.pendingSignature = nil
+                    publicationOwner.trigger.send()
                     return
                 }
                 guard singularity.permitsDetachedPublish(
@@ -488,31 +575,32 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                     lifecycle: sourceLifecycle,
                     includedSingularity: includedSingularity
                 ) else {
-                    self.pendingSignature = nil
-                    self.trigger.send()
+                    publicationOwner.pendingSignature = nil
+                    publicationOwner.trigger.send()
                     return
                 }
-                self.pendingSignature = nil
-                self.publishedSignature = signature
-                self.publishedIdentity = self.outputIdentity(for: ctx)
+                publicationOwner.pendingSignature = nil
+                publicationOwner.publishedSignature = signature
+                publicationOwner.publishedIdentity = publicationOwner.outputIdentity(for: ctx)
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
                 // 250 ms coalescer is broken (this used to fire per body eval, thousands of lines).
-                VXProbe.log("sing", "merged rebuild inst=\(self.instanceID) meta=\(metaToken) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
-                self.publishedGroups = ranked
-                self.publishedBest = rankedBest
-                self.publishedTiers = rankedTiers
-                self.publishedResolutionOptions = rankedResOpts
-                if self.publishedSettlement != settlement {
+                VXProbe.log("sing", "merged rebuild inst=\(publicationOwner.instanceID) meta=\(metaToken) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
+                publicationOwner.publishedGroups = ranked
+                publicationOwner.installQuickFilterIndex(quickFilterIndex)
+                publicationOwner.publishedBest = rankedBest
+                publicationOwner.publishedTiers = rankedTiers
+                publicationOwner.publishedResolutionOptions = rankedResOpts
+                if publicationOwner.publishedSettlement != settlement {
                     let pending = auxiliarySettlement.filter { $0 == .pending }.count
                     VXProbe.log(
                         "sources",
                         "settlement meta=\(metaToken) decision=\(String(describing: settlement)) raw=\(rawProgress.loaded)/\(rawProgress.total) auxiliaryPending=\(pending) gen=\(gen)"
                     )
                 }
-                self.publishedSettlement = settlement
+                publicationOwner.publishedSettlement = settlement
                 if settlement == .settledAll {
-                    self.settlementDeadlineTask?.cancel()
-                    self.settlementDeadlineTask = nil
+                    publicationOwner.settlementDeadlineTask?.cancel()
+                    publicationOwner.settlementDeadlineTask = nil
                 }
             }
 
@@ -528,6 +616,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         publishedSignature = nil
         publishedIdentity = nil
         publishedGroups = []
+        quickFilterSession.invalidate()
+        quickFilterIdentity = nil
+        quickFilterProfileID = nil
+        quickFilterCacheCapture = nil
         publishedBest = nil
         publishedTiers = []
         publishedResolutionOptions = []

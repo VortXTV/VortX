@@ -20,13 +20,19 @@ struct ContinueWatchingServiceTests {
         ProfileStore.shared.activeID = profileA; ProfileStore.shared.activeUsesEngineHistory = eligible
         ProfileStore.shared.active = UserProfile(id: profileA, usesEngineHistory: eligible,
             discovery: .init(continueWatchingSource: source, continueWatchingWindow: window))
-        let credential = CredentialScopeRegistry.Capture(namespace: "inert-account", generation: 1)
+        let credential = CredentialScopeRegistry.shared.capture()
         CoreBridge.shared.nativeBinding = .init(profileID: profileA, credential: credential,
             sessionGeneration: UUID(), accountGeneration: UUID())
         CoreBridge.shared.usesNativeProfileState = true
         CoreBridge.shared.continueWatching = [.init(id: "local", type: "movie", name: "Local",
             poster: nil, state: .init(timeOffset: 10_000, duration: 100_000, videoId: nil))]
         SIMKLAuth.storedSessionID = session; SIMKLAuth.isConfigured = true
+    }
+    static func readOwner(_ context: HomeContinueWatchingSelection.Context) -> CoreBridge.NativePlaybackReadCapability {
+        guard let target = context.nativeTarget,
+              let owner = CoreBridge.shared.captureNativePlaybackReadCapability(target),
+              context.isCurrent(owner: owner) else { fatalError("Missing current fixture native read owner") }
+        return owner
     }
     static func responses(stamp: String = "2026-10-09T12:00:00Z", shows: String? = nil,
                           playback: String? = nil, removed: String? = nil) -> [String: String] {
@@ -209,7 +215,7 @@ struct ContinueWatchingServiceTests {
         configure(); SIMKLContinueWatchingShadow.shared.clear()
         await SIMKLService.shared.configure(responses())
         let before = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
-        await SIMKLContinueWatchingShadow.shared.refresh(context: before.context)?.value
+        await SIMKLContinueWatchingShadow.shared.refresh(context: before.context, owner: readOwner(before.context))?.value
         let selected = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
         require(selected.selection.source == .simkl && selected.selection.items.count == 1, "actual SIMKL shadow projects through production primary selector")
         require(selected.selection.items.first?.state.duration == 0 && selected.selection.items.first?.resumeSeconds == 0, "SIMKL never manufactures duration or resume seconds")
@@ -217,9 +223,10 @@ struct ContinueWatchingServiceTests {
         require(selected.intent.isCurrent(), "captured rendered SIMKL intent is current")
         let shelf = FixtureTopShelfMapper.items(from: selected.selection.items, source: .simkl, displayProgress: selected.selection.displayProgress)
         require(shelf.first?.progress == 0.425 && shelf.first?.poster == nil, "actual Top Shelf mapper displays real SIMKL percent without private hotlinks")
+        let selectedOwner = readOwner(selected.context)
         await SIMKLService.shared.configure(responses(playback: ""))
-        require(SIMKLContinueWatchingShadow.shared.refresh(context: selected.context) == nil, "actual Home re-entry reader remains throttled inside five minutes")
-        await SIMKLContinueWatchingShadow.shared.refresh(context: selected.context, now: Date().addingTimeInterval(301))?.value
+        require(SIMKLContinueWatchingShadow.shared.refresh(context: selected.context, owner: selectedOwner) == nil, "actual Home re-entry reader remains throttled inside five minutes")
+        await SIMKLContinueWatchingShadow.shared.refresh(context: selected.context, owner: selectedOwner, now: Date().addingTimeInterval(301))?.value
         let focused = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
         let focusRequests = await SIMKLService.shared.requests
         require(focusRequests.map(\.path) == ["/sync/activities", "/sync/playback"] && focused.selection.displayProgress["tt100"] == nil && focused.selection.items.first?.state.videoId == "tt100:2:4", "actual throttled focus refresh reconciles expired pause under unchanged activities without fake progress")
@@ -258,7 +265,7 @@ struct ContinueWatchingServiceTests {
         await SIMKLService.shared.configure(responses(stamp: "2026-10-10T12:00:00Z", shows: sourceOnly, playback: pauses,
                                                      removed: "2026-10-10T12:00:00Z"))
         let before = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
-        await SIMKLContinueWatchingShadow.shared.refresh(context: before.context)?.value
+        await SIMKLContinueWatchingShadow.shared.refresh(context: before.context, owner: readOwner(before.context))?.value
         let selected = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared)
         let show = selected.selection.items.first { $0.id == "simkl:series:810" }
         let movie = selected.selection.items.first { $0.id == "simkl:movie:811" }
@@ -304,10 +311,10 @@ struct ContinueWatchingServiceTests {
         let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         func read(_ path: String) -> String { (try? String(contentsOf: app.appendingPathComponent(path), encoding: .utf8)) ?? "" }
         let settings = read("SourcesShared/ContinueWatchingSettingsView.swift")
-        require(settings.components(separatedBy: "ContinueWatchingPreferences.writeUserChoice").count == 3 && !settings.contains(".onChange(of: source)") && !settings.contains(".onChange(of: window)"), "both actual settings Picker bindings use synchronous production setter rather than coalesced callbacks")
+        require(settings.components(separatedBy: "ContinueWatchingPreferences.writeUserChoice").count == 3 && !settings.contains(".onChange(of: source)") && !settings.contains(".onChange(of: window)") && !settings.contains(".onValueChange(of: source)") && !settings.contains(".onValueChange(of: window)"), "both actual settings Picker bindings use synchronous production setter rather than coalesced callbacks")
         let tv = read("SourcesTV/HomeView.swift"), ios = read("SourcesiOS/iOSRootView.swift")
         require(tv.contains("if let reason = intent?.unavailableReason(id: item.id") && tv.contains("$0.intent?.permitsDetails(id:") && ios.contains("if let reason = provenance.intent.unavailableReason(id: item.id") && ios.contains("target.intent.permitsDetails(id:"), "actual TV/iOS unavailable tap and deferred destination consume tested admission fences")
-        require(read("SourcesTV/RootTabView.swift").contains("HomeView(isActive: selection == 0)") && tv.contains(".onChange(of: scenePhase)") && tv.contains("if active, scenePhase == .active") && ios.contains(".onChange(of: scenePhase)") && ios.contains("if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent"), "actual Home visibility and foreground re-entry trigger only selected-source throttled refresh")
+        require(read("SourcesTV/RootTabView.swift").contains("HomeView(isActive: selection == 0)") && tv.contains(".onChange(of: scenePhase)") && tv.contains("if active, scenePhase == .active") && ios.contains(".onValueChange(of: scenePhase)") && ios.contains("if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent"), "actual Home visibility and foreground re-entry trigger only selected-source throttled refresh")
         var focusLookups = 0
         for source in [ContinueWatchingService.trakt, .simkl] {
             if FixtureContinueWatchingFocus.permitsHeroEnrichment(source: source, traktSessionID: nil) { focusLookups += 1 }
@@ -328,15 +335,16 @@ struct ContinueWatchingServiceTests {
         TraktAuth.storedSessionID = trakt
         let shadow = TraktPlaybackShadow()
         let captured = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared, shadow: shadow)
+        let capturedOwner = readOwner(captured.context)
         let seed = TraktContinueWatchingSeed(id: "tt500", type: "movie", name: "Inert Trakt", progress: 40,
             pausedAt: "2026-10-09T00:00:00Z", runtimeMinutes: 100, videoID: nil, poster: nil, aliases: [])
-        require(shadow.commitFixture(progress: ["tt500": 40], items: [seed], sessionID: trakt, context: captured.context), "actual Trakt cache/presentation commit admits current captured context")
+        require(shadow.commitFixture(progress: ["tt500": 40], items: [seed], sessionID: trakt, context: captured.context, owner: capturedOwner), "actual Trakt cache/presentation commit admits current captured context")
         UserDefaults.standard.set("local", forKey: ContinueWatchingPreferences.sourceKey)
         ContinueWatchingPreferences.retireSelection()
         UserDefaults.standard.set("trakt", forKey: ContinueWatchingPreferences.sourceKey)
         ContinueWatchingPreferences.retireSelection()
         require(!captured.intent.isCurrent(), "Trakt source ABA retires prior rendered tap")
-        require(!shadow.commitFixture(progress: [:], items: [], sessionID: trakt, context: captured.context), "late actual Trakt transport commit is rejected across source ABA")
+        require(!shadow.commitFixture(progress: [:], items: [], sessionID: trakt, context: captured.context, owner: capturedOwner), "late actual Trakt transport commit is rejected across source ABA")
         let current = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared, shadow: shadow)
         UserDefaults.standard.set("40", forKey: ContinueWatchingPreferences.windowKey)
         ContinueWatchingPreferences.retireSelection()

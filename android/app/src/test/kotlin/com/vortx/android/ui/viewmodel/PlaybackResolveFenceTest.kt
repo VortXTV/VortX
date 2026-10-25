@@ -1,6 +1,7 @@
 package com.vortx.android.ui.viewmodel
 
 import com.vortx.android.sources.SourceRequestFence
+import com.vortx.android.model.Playable
 import java.io.File
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -79,7 +80,7 @@ class PlaybackResolveFenceTest {
     @Test
     fun `best source resolver publishes only through its own playback lease`() {
         val best = resolverBody(
-            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true)",
+            "private fun playBest(\n",
             "/// Race the account-confirmed-cached",
         )
 
@@ -89,7 +90,7 @@ class PlaybackResolveFenceTest {
     @Test
     fun `best source resolver rejects a publication through a different lease`() {
         val best = resolverBody(
-            "private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true)",
+            "private fun playBest(\n",
             "/// Race the account-confirmed-cached",
         )
         val oneDifferentLease = best.replaceFirst(
@@ -100,15 +101,76 @@ class PlaybackResolveFenceTest {
         assertFalse(publicationsUseExactLease(oneDifferentLease, expectedPublicationCount = 2))
     }
 
+    @Test
+    fun queuedAdmissionRemainsBoundToTheActualResolver() {
+        val sources = SourceRequestFence("profile-a")
+        val request = sources.begin("profile-a", "episode-10")
+        val playback = PlaybackResolveFence()
+        var admitted = true
+        val lease = playback.begin(request) { admitted }
+        assertTrue(playback.accepts(lease))
+        admitted = false
+        assertFalse(playback.accepts(lease))
+        assertTrue(sources.accepts(request, "profile-a"))
+    }
+
+    @Test
+    fun readyKeepsItsImmutableAdmissionAfterTheResolverFinishes() {
+        val sources = SourceRequestFence("profile-a")
+        val request = sources.begin("profile-a", "episode-10")
+        val playback = PlaybackResolveFence()
+        var admitted = true
+        var routeCurrent = true
+        val lease = playback.begin(request) { admitted }
+        val ready = Playback.Ready(
+            Playable("https://example.invalid/video", "Episode"),
+            lease.readyAdmission({ sources.accepts(it, "profile-a") }, { routeCurrent }),
+        )
+        playback.finish(lease)
+        assertFalse(playback.accepts(lease))
+        assertTrue(ready.isAdmitted())
+        admitted = false
+        assertFalse(ready.isAdmitted())
+        admitted = true
+        routeCurrent = false
+        assertFalse(ready.isAdmitted())
+        routeCurrent = true
+        sources.begin("profile-a", "episode-11")
+        assertFalse(ready.isAdmitted())
+    }
+
+    @Test
+    fun rejectedAttemptRetiresOnlyItsOwnResolvingState() {
+        val sources = SourceRequestFence("profile-a")
+        val request = sources.begin("profile-a", "episode-10")
+        val playback = PlaybackResolveFence()
+        val old = playback.begin(request) { false }
+        val current = playback.begin(request)
+        var state: Playback = Playback.Resolving
+        assertFalse(playback.retireIfOwned(old) { state = Playback.Idle })
+        assertTrue(state is Playback.Resolving)
+        assertTrue(playback.accepts(current))
+        assertTrue(playback.retireIfOwned(current) { state = Playback.Idle })
+        assertTrue(state is Playback.Idle)
+        assertFalse(playback.accepts(current))
+    }
+
+    @Test
+    fun ordinaryReadyRetainsItsDefaultAdmission() {
+        assertTrue(Playback.Ready(Playable("https://example.invalid/video", "Episode")).isAdmitted())
+        assertFalse(Playback.Ready(Playable("https://example.invalid/video", "Episode")) { error("retired") }.isAdmitted())
+    }
+
     private fun assertResolverUsesItsOwnLease(body: String, expectedPublicationCount: Int) {
         val cancel = body.indexOf("playbackResolveJob?.cancel()")
-        val begin = body.indexOf("val resolveLease = playbackResolveFence.begin(request)")
+        val begin = Regex("val resolveLease = playbackResolveFence\\.begin\\(request(?:,|\\))")
+            .find(body)?.range?.first ?: -1
         val launch = body.indexOf("playbackResolveJob = viewModelScope.launch")
         val publisher = detailViewModelSource()
             .substringAfter("private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean")
             .substringBefore("/// Re-find sources")
-        val publicationGuard = publisher.indexOf("if (!canPublishPlaybackResolve(lease)) return false")
-        val publication = publisher.indexOf("_playback.value = state")
+        val publicationGuard = publisher.indexOf("if (!canPublishPlaybackResolve(lease)) {")
+        val publication = publisher.indexOf("_playback.value = if (state is Playback.Ready)")
         val finish = publisher.indexOf("playbackResolveFence.finish(lease)")
 
         assertTrue("The prior resolver must be cancelled before replacing its lease", cancel >= 0)
@@ -123,6 +185,10 @@ class PlaybackResolveFenceTest {
         assertTrue("Publication must first validate its exact lease", publicationGuard >= 0)
         assertTrue("Publication must mutate only after that exact lease validates", publication > publicationGuard)
         assertTrue("Publication must finish that same lease after mutation", finish > publication)
+        assertTrue(
+            "A rejected admission must return before any Ready or Failed state publication",
+            publisher.substring(publicationGuard, publication).contains("return false"),
+        )
     }
 
     private fun publicationsUseExactLease(body: String, expectedPublicationCount: Int): Boolean {

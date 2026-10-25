@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import xperienceInputs from './xperience-harness-inputs.cjs';
+import guardedInputs from './addon-guarded-presentation-inputs.cjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 if (process.argv[2] === '--extract') {
@@ -65,6 +66,10 @@ if (process.argv[2] === '--extract') {
     '    private func pushSyncDocAt(', '    private func commitNativePulledDocument(', '    private func applyNativeGlobals(',
     '    static func ownedAddons(', '    func syncDown(', '    private func handle(', '    private func startPoll()'];
   let combined = await readFile('app/Tests/AppleSyncReceivePublicationPeer.swift', 'utf8');
+  // Keep fileprivate mirror publishers and their exact production namespace in Combined.swift.
+  // The split UserProfile.swift input below contains only model declarations and imports.
+  combined += '\n' + slice(profiles, 'enum ProfileSelectionRead {', '\n/// The profile roster and the active selection.')
+    + '\nextension ProfileStore {\n' + member(profiles, '    private func selectionReadSnapshot()') + '\n}\n';
   function exactDeclaration(expression, label) {
     const matches = [...manager.text.matchAll(expression)];
     assert.equal(matches.length, 1, `missing or ambiguous ${label}`);
@@ -119,29 +124,40 @@ if (process.argv[2] === '--extract') {
   combined += '\nextension VortXSyncManager {\n'
     + '    func broadcastForFixture(version: Int) { handle(.string("{\\"type\\":\\"updated\\",\\"version\\":\\(version)}"), credentialCapture: credentialAuthority.capture()) }\n'
     + '    func pollForFixture() { startPoll() }\n}\n';
-  const coreMembers = ['    func hasCertifiedNativeSession(', '    func captureNativePlaybackTarget(',
-    '    func nativePlaybackTargetIsCurrent(', '    private func currentNativePlaybackBinding(',
-    '    private func nativePlaybackBinding(', '    func mergeNativeAccountDocument(', '    private func refreshNativeProfiles(',
-    '    @MainActor func nativeWatchlist()', '    private var enginePublicationBlocked:', '    private func capturePublicationToken()',
-    '    private func publicationStillCurrent(', '    private func publicationEpochMatches(',
-    '    func stateData(_ field:', '    func decode<T:', '    private func playerActiveSnapshot()', '    private func recordAcceptedHistoryReceipt(',
-    '    private func refreshAddons()', '    private func refreshAddons(capturedPublicationToken',
-    '    func hydrateAddonsFromAccount(', '    private func addonMutationStillAllowed(',
-    '    private func ensureCatalogOrderRangeLoaded(', '    private func widenBoardRange('];
-  combined += '\nextension CoreBridge {\n' + coreMembers.map(marker => member(core, marker)).join('\n')
+  // CURRENT exact source lane. Do not revive the removed callback/scheduler.
+  assert(core.text.includes('private final class MetadataPresentation'),
+    'Current owned presentation source cut required; no legacy-handle fallback');
+  const exactSlices = [];
+  function currentMember(marker) {
+    const selected = guardedInputs.exact(core.text, marker, exactSlices, core.path);
+    receipts.push({path:core.path, marker, sourceSHA256:sha256(core.text), sliceSHA256:sha256(selected)});
+    return selected;
+  }
+  const coreMembers = ['func hasCertifiedNativeSession(', 'func captureNativePlaybackTarget(',
+    'func nativePlaybackTargetIsCurrent(', 'private func currentNativePlaybackBinding(',
+    'private func nativePlaybackBinding(', 'func mergeNativeAccountDocument(', 'private func refreshNativeProfiles(',
+    '@MainActor func nativeWatchlist()', 'private var enginePublicationBlocked:', 'private func capturePublicationToken()',
+    'private func publicationStillCurrent(', 'private func publicationEpochMatches(',
+    'func stateData(_ field:', 'func decode<T:', 'private func playerActiveSnapshot()', 'private func recordAcceptedHistoryReceipt(',
+    'private func refreshAddons()', 'private func refreshAddons(capturedPublicationToken',
+    'func hydrateAddonsFromAccount(', 'private func addonMutationStillAllowed(',
+    'private func ensureCatalogOrderRangeLoaded(', 'private func widenBoardRange(',
+    'private struct NativeCallbackOrigin:', 'private func nativeCallbackSourceIsCurrent(',
+    'private func nativeCallbackOriginIsCurrent(', 'private func nativeLegacyReceiptIsCurrent(',
+    'private func publishNativeLegacyHistory(', 'private func publishNativeLegacyContext(',
+    'private static func nativeLegacyFoundationValue(', 'private func recordNativeLegacyCoarseEvent(',
+    'fileprivate final class NativePlaybackReadLifetime:', 'struct NativePlaybackReadCapability:',
+    'func captureNativePlaybackReadCapability('];
+  const lifetime = currentMember('private struct NativeCallbackLifetime:');
+  combined += '\n' + lifetime + '\nextension CoreBridge {\n'
+    + coreMembers.map(currentMember).join('\n')
     + '\n' + slice(core, '    static let decoder:', '\n    }()', true)
     + '\n' + slice(core, '    func rebuildContinueWatching()', '\n    /// Record an owner-tagged history receipt')
-    + '\n    @MainActor func refreshProfilesForFixture() throws { try refreshNativeProfiles() }\n'
-    + '    func handleHistoryFields(_ fields: [String]) {\n'
-    + '        let data = try! JSONSerialization.data(withJSONObject: ["name": "NewState", "args": fields])\n'
-    + '        handleEvent(data)\n    }\n'
-    + slice(core, '    fileprivate func handleEvent(_ data: Data) {', '\n        // Legacy authKey migration')
-    + '\n' + slice(core, '        if fields.contains("continue_watching_preview") {', '\n        // The board needs ctx')
-    + '\n' + slice(core, '        if fields.contains("ctx") {\n            VXProbe.log("engine", "ctx/settings changed', '\n            // MID-SEARCH RE-PLAN')
-    + '\n        }\n'
-    + '\n' + slice(core, '        if fields.contains("library") {', '\n            // AddToLibrary / RemoveFromLibrary dispatch emits')
-    + '\n        }\n' + slice(core, '        // `changedFields` is written unconditionally', '\n    // MARK: meta_details coalesce + diff')
-    + '\n}\n';
+    + '\n    @MainActor func refreshProfilesForFixture() throws { try refreshNativeProfiles() }\n}\n';
+  const historyFixture = await source('app/Tests/AppleHistoryFixture.swift');
+  combined += '\n' + historyFixture.text;
+  receipts.push({path:historyFixture.path,marker:'whole explicit fixture source-event/host plumbing',
+    sourceSHA256:sha256(historyFixture.text),sliceSHA256:sha256(historyFixture.text)});
   combined += '\nextension PlaybackMutationTarget {\n'
     + slice(target, '    static func capture(core: CoreBridge)', '\n    func stillOwnsAccountContext(') + '\n}\n';
   // Full typed projection declarations; unrelated player/source models are excluded.
@@ -150,7 +166,7 @@ if (process.argv[2] === '--extract') {
     + slice(models, 'struct CoreLibraryRequest:', '// MARK: - VortX account-owned add-on')
     + slice(models, 'struct CoreCtx:', '// MARK: assembled UI row')
     + slice(models, 'struct VortXOwnedAddon {', '// MARK: - Stremio mirror settings'));
-  await writeFile(join(output, 'UserProfile.swift'), slice(profiles, 'import Foundation', '/// The profile roster and the active selection.'));
+  await writeFile(join(output, 'UserProfile.swift'), slice(profiles, 'import Foundation', '/// Process-local selection facts'));
   receipts.push({ path: discovery.path, marker: 'entire Foundation-only discovery persistence bridge', sourceSHA256: sha256(discovery.text), sliceSHA256: sha256(discovery.text) });
   await writeFile(join(output, 'Discovery.swift'), discovery.text);
   // Include the actual observable cache, not just static reads from the backing store:
@@ -164,7 +180,8 @@ if (process.argv[2] === '--extract') {
   await writeFile(join(output, 'Combined.swift'), combined);
   await writeFile(join(output, 'extraction.json'), JSON.stringify({ sourceHEAD: process.env.VORTX_RECEIVE_SOURCE_HEAD, receipts, productionMatches,
     boundaries: ['Synthetic keys and owned encrypted checkpoint directories', 'Loopback HTTP request environment',
-      'ProfileStore presentation sink invokes actual discovery apply; quarantine/admission and UI board rendering are not exercised',
+      'ProfileStore RAM sink initializes the real mirror once and brackets roster/activeID mutations; actual scalar projector and discovery apply are extracted; real Combine publication, quarantine/admission and UI board rendering are not exercised',
+      'Actual Facade/Session emit typed SourceEvent; exact original-origin/lifetime/history/context/coarse helpers execute with explicit fixture decode/generation/host plumbing. Actual05 worker/board/search and metadata pipeline do not execute; no fabricated SourceEvent initializer or engine symbols',
       'Fresh fixture sessions perform genuine deterministic empty legacy import and exact receipt replay; no real-account preparation, provider fetch or open-detail refresh exercised',
       'Explicit fixture uploader obtains an authenticated GET witness and requires exact create0/base-plus-one; it does not perform the manager upload merge'],
     combinedSHA256: sha256(combined) }, null, 2));
@@ -262,7 +279,7 @@ try {
   check(received.selection[0].offset === 234000 && received.selection[0].duration === 1200000, 'Home selection retains exact native progress milliseconds');
   check(received.version === 1 && received.stamped === 1 && received.hasApplied && received.outcome === 'completed', 'actual syncDown acknowledges version and success only after committed native document');
   check(received.historyReceipts >= 2, 'actual accepted library/CW history receipt functions ran');
-  check(received.revision > 0 && received.changedFields.includes('library') && received.changedFields.includes('continue_watching_preview'), 'actual NewState common tail publishes history changed fields and revision');
+  check(received.revision > 0 && received.changedFields.includes('library') && received.changedFields.includes('continue_watching_preview'), 'actual typed-source coarse tail publishes history changed fields and revision');
   check(received.staleLibraryRejected && received.staleCWRejected && received.staleReceiptRejected, 'late main-queue library/CW/receipt callbacks reject changed credential owner');
   check(received.staleSelectionRejected, 'captured Home intent rejects changed credential owner');
   check(wire.length === 5 && wire[0].method === 'GET' && wire[0].status === 404

@@ -4,6 +4,11 @@ package com.vortx.android.profile
 internal interface NativeProfileGateway {
     data class Projection(val profiles: List<UserProfile>, val activeID: String)
     fun read(): Projection
+    /** Consume one current snapshot while this gateway's existing publication fence remains held. */
+    fun <T> withCurrentProjection(action: (Projection) -> T): T {
+        val current = read()
+        return withProjection(current) { action(current) }
+    }
     /** Publish only while the same native projection and account still own this mutation. */
     fun <T> withProjection(expected: Projection, action: () -> T): T = synchronized(this) {
         check(read() == expected) { "Native profile projection changed" }

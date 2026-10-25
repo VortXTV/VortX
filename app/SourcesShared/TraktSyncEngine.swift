@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Additive-READ Trakt shadow: on sign-in and foreground (throttled) it pulls the user's watched
 /// history + watchlist into a LOCAL cache (Application Support JSON) and exposes the watched id set
@@ -22,7 +23,7 @@ import Foundation
 ///
 /// Fully fail-soft: any pull error / offline / not-configured leaves the last cache intact and never
 /// disturbs playback or the UI.
-final class TraktSyncEngine {
+final class TraktSyncEngine: Sendable {
     static let shared = TraktSyncEngine()
 
     /// Minimum gap between network refreshes; foreground + rail rebuilds call `refreshIfStale` freely.
@@ -32,48 +33,50 @@ final class TraktSyncEngine {
     /// The reader fails closed at this key cap; it never commits a truncated episode history.
     private static let episodeKeyCap = TraktWatchedSnapshotReader.Limits().episodeKeys
 
-    private let lock = NSLock()
-    /// The watched id set pulled from Trakt (movies + shows), unioned into `WatchedIndex`. Holds BOTH
-    /// identity forms per title: imdb `tt…` and `tmdb:<id>` (plus `tmdb:movie:<id>` / `tmdb:tv:<id>`),
-    /// so a cover keyed by either identity matches. A cover carries one id; the union covers both.
-    private var watchedIDs: Set<String>
-    /// Per-episode watched keys, `<showIdentity>|<season>|<episode>` (e.g. `tt0944947|1|1`), holding the
-    /// SAME identity forms per show as `watchedIDs` does per title, for the same reason: the reader knows
-    /// the show by whatever identity its catalog used, so we index every form Trakt gave us and let the
-    /// lookup match on one. Deliberately keyed on (season, episode) rather than the app's video id: video
-    /// ids are opaque add-on strings, and Trakt speaks season/number, so mapping through the numbers keeps
-    /// us from ever parsing a video id's format.
-    private var watchedEpisodeKeys: Set<String>
-    /// Persisted retry queue of pushes that failed (offline). Drained on refresh.
-    private var pendingPushes: [PendingPush]
-    /// `<movies.watched_at>|<episodes.watched_at>` from the last SUCCESSFUL pull, per `/sync/last_activities`.
-    /// It can skip a read only when paired with the current complete-pagination read version.
-    private var lastActivityFingerprint: String?
-    private var watchedReadVersion: Int?
-    private var watchedShowInventory: [TraktWatchedShowInventoryEntry]?
-    private var watchedInventoryRevision: UUID?
-    /// Never carries raw state across an account boundary; guarded by the same lock as the cache.
-    private var snapshotRetention: TraktSyncSnapshotEnvelope?
-    private var snapshotPersistenceBlocked = false
-    /// One watched read across badge and selected-CW callers. A reset invalidates its owner token;
-    /// the retired flight's defer cannot release a successor flight.
-    private var watchedReadFlight: UUID?
-    private var lastWatchedRead: Date?
-    private var lastRefresh: Date?
-    private var refreshing = false
-    /// Set by `refreshNow()` when a force arrives while a refresh is already in flight. The single-flight
-    /// guard would otherwise swallow the force, and this refresh's `defer` re-arms the very throttle the
-    /// force cleared, so the in-flight refresh honors it once on completion with one more pass. Guarded by
-    /// `lock`.
-    private var refreshAgain = false
-    /// Bumped by `reset()` (disconnect / sign-out). An in-flight refresh captures it before its network
-    /// awaits and refuses to write back if it changed meanwhile, so a pull/drain that started before a
-    /// disconnect can never resurrect the wiped shadow cache or push queue into the next account.
-    private var generation = 0
-    /// Exact Trakt credential session that owns every field above.
-    private var stateSessionID: TraktSessionID?
+    private struct State: Sendable {
+        /// The watched id set pulled from Trakt (movies + shows), unioned into `WatchedIndex`. Holds BOTH
+        /// identity forms per title: imdb `tt…` and `tmdb:<id>` (plus `tmdb:movie:<id>` / `tmdb:tv:<id>`),
+        /// so a cover keyed by either identity matches. A cover carries one id; the union covers both.
+        var watchedIDs: Set<String> = []
+        /// Per-episode watched keys, `<showIdentity>|<season>|<episode>` (e.g. `tt0944947|1|1`), holding the
+        /// SAME identity forms per show as `watchedIDs` does per title, for the same reason: the reader knows
+        /// the show by whatever identity its catalog used, so we index every form Trakt gave us and let the
+        /// lookup match on one. Deliberately keyed on (season, episode) rather than the app's video id: video
+        /// ids are opaque add-on strings, and Trakt speaks season/number, so mapping through the numbers keeps
+        /// us from ever parsing a video id's format.
+        var watchedEpisodeKeys: Set<String> = []
+        /// Persisted retry queue of pushes that failed (offline). Drained on refresh.
+        var pendingPushes: [PendingPush] = []
+        /// `<movies.watched_at>|<episodes.watched_at>` from the last SUCCESSFUL pull, per `/sync/last_activities`.
+        /// It can skip a read only when paired with the current complete-pagination read version.
+        var lastActivityFingerprint: String?
+        var watchedReadVersion: Int?
+        var watchedShowInventory: [TraktWatchedShowInventoryEntry]?
+        var watchedInventoryRevision: UUID?
+        /// Never carries raw state across an account boundary; guarded by the same lock as the cache.
+        var snapshotRetention: TraktSyncSnapshotEnvelope?
+        var snapshotPersistenceBlocked = false
+        /// One watched read across badge and selected-CW callers. A reset invalidates its owner token;
+        /// the retired flight's defer cannot release a successor flight.
+        var watchedReadFlight: UUID?
+        var lastWatchedRead: Date?
+        var lastRefresh: Date?
+        var refreshing = false
+        /// Set by `refreshNow()` when a force arrives while a refresh is already in flight. The single-flight
+        /// guard would otherwise swallow the force, and this refresh's `defer` re-arms the very throttle the
+        /// force cleared, so the in-flight refresh honors it once on completion with one more pass. Guarded by
+        /// the checked state lock.
+        var refreshAgain = false
+        /// Bumped by `reset()` (disconnect / sign-out). An in-flight refresh captures it before its network
+        /// awaits and refuses to write back if it changed meanwhile, so a pull/drain that started before a
+        /// disconnect can never resurrect the wiped shadow cache or push queue into the next account.
+        var generation = 0
+        /// Exact Trakt credential session that owns every field above.
+        var stateSessionID: TraktSessionID?
+    }
+    private let cache: OSAllocatedUnfairLock<State>
 
-    private struct PersistedSnapshot: Codable {
+    private struct PersistedSnapshot: Codable, Sendable {
         let sessionID: TraktSessionID
         let watchedIDs: [String]
         let watchedEpisodeKeys: [String]
@@ -99,18 +102,20 @@ final class TraktSyncEngine {
 
     private init() {
         let initialSession = TraktAuth.storedSessionID
-        stateSessionID = initialSession
         let loaded = initialSession.map(Self.load(for:))
         let snapshot = loaded?.snapshot
-        watchedIDs = Set(snapshot?.watchedIDs ?? [])
-        watchedEpisodeKeys = Set((snapshot?.watchedEpisodeKeys ?? []).prefix(Self.episodeKeyCap))
-        pendingPushes = (snapshot?.pendingPushes ?? []).filter { $0.sessionID == initialSession }
-        lastActivityFingerprint = snapshot?.lastActivityFingerprint
-        watchedReadVersion = snapshot?.watchedReadVersion
-        watchedShowInventory = snapshot?.watchedShowInventory
-        watchedInventoryRevision = snapshot?.watchedInventoryRevision
-        snapshotRetention = loaded?.retention
-        snapshotPersistenceBlocked = loaded?.blocked ?? false
+        var initial = State()
+        initial.stateSessionID = initialSession
+        initial.watchedIDs = Set(snapshot?.watchedIDs ?? [])
+        initial.watchedEpisodeKeys = Set((snapshot?.watchedEpisodeKeys ?? []).prefix(Self.episodeKeyCap))
+        initial.pendingPushes = (snapshot?.pendingPushes ?? []).filter { $0.sessionID == initialSession }
+        initial.lastActivityFingerprint = snapshot?.lastActivityFingerprint
+        initial.watchedReadVersion = snapshot?.watchedReadVersion
+        initial.watchedShowInventory = snapshot?.watchedShowInventory
+        initial.watchedInventoryRevision = snapshot?.watchedInventoryRevision
+        initial.snapshotRetention = loaded?.retention
+        initial.snapshotPersistenceBlocked = loaded?.blocked ?? false
+        cache = OSAllocatedUnfairLock(initialState: initial)
         TraktAuthBoundary.observe(key: "trakt-sync-engine") { [weak self] sessionID in
             self?.reset(to: sessionID)
         }
@@ -126,14 +131,15 @@ final class TraktSyncEngine {
         expectedSession: TraktSessionID, purpose: TraktWatchedReadPurpose = .badgeImport
     ) -> TraktWatchedShowInventory? {
         guard Self.watchedPurposeIsCurrent(purpose) else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        guard !snapshotPersistenceBlocked, stateSessionID == expectedSession,
-              TraktAuth.storedSessionID == expectedSession,
-              watchedReadVersion == TraktWatchedSnapshotReader.readVersion,
-              let entries = watchedShowInventory, let revision = watchedInventoryRevision else { return nil }
-        return .init(sessionID: expectedSession, revision: revision,
-                     readVersion: TraktWatchedSnapshotReader.readVersion,
-                     activityFingerprint: lastActivityFingerprint, entries: entries)
+        return cache.withLock { state in
+            guard !state.snapshotPersistenceBlocked, state.stateSessionID == expectedSession,
+                  TraktAuth.storedSessionID == expectedSession,
+                  state.watchedReadVersion == TraktWatchedSnapshotReader.readVersion,
+                  let entries = state.watchedShowInventory, let revision = state.watchedInventoryRevision else { return nil }
+            return .init(sessionID: expectedSession, revision: revision,
+                         readVersion: TraktWatchedSnapshotReader.readVersion,
+                         activityFingerprint: state.lastActivityFingerprint, entries: entries)
+        }
     }
 
     /// Read-only refresh for a captured caller purpose. Never drains provider writes, pulls ratings,
@@ -144,10 +150,10 @@ final class TraktSyncEngine {
     ) async -> TraktWatchedShowInventory? {
         guard TraktAuth.isConfigured, Self.watchedPurposeIsCurrent(purpose),
               TraktAuth.storedSessionID == expectedSession else { return nil }
-        let context: (generation: Int, recent: Bool)? = lock.withLock {
-            guard stateSessionID == expectedSession else { return nil }
-            let recent = lastWatchedRead.map { Date().timeIntervalSince($0) < Self.refreshInterval } ?? false
-            return (generation, recent)
+        let context: (generation: Int, recent: Bool)? = cache.withLock { state in
+            guard state.stateSessionID == expectedSession else { return nil }
+            let recent = state.lastWatchedRead.map { Date().timeIntervalSince($0) < Self.refreshInterval } ?? false
+            return (state.generation, recent)
         }
         guard let context else { return nil }
         if !context.recent { await pullWatched(expectedSession: expectedSession, gen: context.generation, purpose: purpose) }
@@ -161,10 +167,11 @@ final class TraktSyncEngine {
     func shadowWatchedIDs() -> Set<String> {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return [] }
         guard let currentSession = TraktAuth.storedSessionID else { return [] }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              TraktAuth.storedSessionID == currentSession else { return [] }
-        return watchedIDs
+        return cache.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  TraktAuth.storedSessionID == currentSession else { return [] }
+            return state.watchedIDs
+        }
     }
 
     /// True when Trakt records `season`x`episode` of the show known by `showIdentity` as watched. Gated on
@@ -174,11 +181,12 @@ final class TraktSyncEngine {
     func shadowWatchedEpisode(showIdentity: String, season: Int, episode: Int) -> Bool {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return false }
         guard let currentSession = TraktAuth.storedSessionID else { return false }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              TraktAuth.storedSessionID == currentSession else { return false }
-        guard !watchedEpisodeKeys.isEmpty else { return false }
-        return watchedEpisodeKeys.contains(TraktWatchedFold.episodeKey(showIdentity, season, episode))
+        return cache.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  TraktAuth.storedSessionID == currentSession else { return false }
+            guard !state.watchedEpisodeKeys.isEmpty else { return false }
+            return state.watchedEpisodeKeys.contains(TraktWatchedFold.episodeKey(showIdentity, season, episode))
+        }
     }
 
     /// True when the episode shadow holds anything at all. Lets a caller skip per-episode work entirely
@@ -186,10 +194,11 @@ final class TraktSyncEngine {
     func hasEpisodeShadow() -> Bool {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return false }
         guard let currentSession = TraktAuth.storedSessionID else { return false }
-        lock.lock(); defer { lock.unlock() }
-        guard stateSessionID == currentSession,
-              TraktAuth.storedSessionID == currentSession else { return false }
-        return !watchedEpisodeKeys.isEmpty
+        return cache.withLock { state in
+            guard state.stateSessionID == currentSession,
+                  TraktAuth.storedSessionID == currentSession else { return false }
+            return !state.watchedEpisodeKeys.isEmpty
+        }
     }
 
     // MARK: - Disconnect
@@ -206,23 +215,23 @@ final class TraktSyncEngine {
     }
 
     private func reset(to sessionID: TraktSessionID?) {
-        lock.lock()
-        watchedIDs = []
-        watchedEpisodeKeys = []
-        pendingPushes = []
-        lastActivityFingerprint = nil
-        watchedReadVersion = nil
-        watchedShowInventory = nil
-        watchedInventoryRevision = nil
-        snapshotRetention = nil
-        snapshotPersistenceBlocked = false
-        watchedReadFlight = nil
-        lastWatchedRead = nil
-        lastRefresh = nil
-        stateSessionID = sessionID
-        generation &+= 1   // invalidate any in-flight refresh so it cannot write its pre-reset result back
-        try? Self.storage?.reset()
-        lock.unlock()
+        cache.withLock { state in
+            state.watchedIDs = []
+            state.watchedEpisodeKeys = []
+            state.pendingPushes = []
+            state.lastActivityFingerprint = nil
+            state.watchedReadVersion = nil
+            state.watchedShowInventory = nil
+            state.watchedInventoryRevision = nil
+            state.snapshotRetention = nil
+            state.snapshotPersistenceBlocked = false
+            state.watchedReadFlight = nil
+            state.lastWatchedRead = nil
+            state.lastRefresh = nil
+            state.stateSessionID = sessionID
+            state.generation &+= 1   // invalidate any in-flight refresh so it cannot write its pre-reset result back
+            try? Self.storage?.reset()
+        }
         DispatchQueue.main.async { WatchedIndex.shared.externalShadowChanged() }
     }
 
@@ -234,34 +243,34 @@ final class TraktSyncEngine {
     func refreshIfStale() {
         guard TraktAuth.isConfigured,
               let sessionID = TraktAuth.storedSessionID else { return }
-        lock.lock()
-        guard stateSessionID == sessionID,
-              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        if refreshing { lock.unlock(); return }
-        if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
-        refreshing = true
-        let gen = generation
-        lock.unlock()
+        let admission: Int? = cache.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID, !state.refreshing else { return nil }
+            if let last = state.lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { return nil }
+            state.refreshing = true
+            return state.generation
+        }
+        guard let gen = admission else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
-                let force = self.lock.withLock {
-                    self.refreshing = false
+                let force = self.cache.withLock { state in
+                    state.refreshing = false
                     // Only stamp lastRefresh when no disconnect/reset happened mid-refresh. A reset bumps
                     // generation and nulls lastRefresh; re-stamping it here would make refreshIfStale early-
                     // return for up to refreshInterval, silently delaying the reconnected account's first
                     // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
                     // pull immediately.
-                    if self.generation == gen,
-                       self.stateSessionID == sessionID,
+                    if state.generation == gen,
+                       state.stateSessionID == sessionID,
                        TraktAuth.storedSessionID == sessionID {
-                        self.lastRefresh = Date()
+                        state.lastRefresh = Date()
                     }
                     // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard;
                     // its throttle clear was then re-armed by the stamp above. Honor it now with one more pass
                     // so a just-enabled import is never deferred to the next unrelated engine event.
-                    let force = self.refreshAgain
-                    self.refreshAgain = false
+                    let force = state.refreshAgain
+                    state.refreshAgain = false
                     return force
                 }
                 if force { self.refreshNow() }
@@ -288,11 +297,12 @@ final class TraktSyncEngine {
     /// `refreshAgain` so it re-runs on completion rather than being lost to the single-flight guard. Still
     /// gated on config / sign-in / import-toggle downstream: this forces the SCHEDULE, never the gates.
     func refreshNow() {
-        lock.lock()
-        lastRefresh = nil
-        let inFlight = refreshing
-        if inFlight { refreshAgain = true }
-        lock.unlock()
+        let inFlight = cache.withLock { state in
+            state.lastRefresh = nil
+            let inFlight = state.refreshing
+            if inFlight { state.refreshAgain = true }
+            return inFlight
+        }
         if !inFlight { refreshIfStale() }
     }
 
@@ -332,13 +342,13 @@ final class TraktSyncEngine {
         expectedSession: TraktSessionID, gen: Int, purpose: TraktWatchedReadPurpose = .badgeImport
     ) async {
         guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else { return }
-        let context: (flight: UUID, fingerprint: String?, version: Int?)? = lock.withLock {
-            guard !snapshotPersistenceBlocked, generation == gen, stateSessionID == expectedSession,
-                  watchedReadFlight == nil else { return nil }
+        let context: (flight: UUID, fingerprint: String?, version: Int?)? = cache.withLock { state in
+            guard !state.snapshotPersistenceBlocked, state.generation == gen, state.stateSessionID == expectedSession,
+                  state.watchedReadFlight == nil else { return nil }
             let flight = UUID()
-            watchedReadFlight = flight
-            let seenVersion = watchedShowInventory != nil && watchedInventoryRevision != nil ? watchedReadVersion : nil
-            return (flight, lastActivityFingerprint, seenVersion)
+            state.watchedReadFlight = flight
+            let seenVersion = state.watchedShowInventory != nil && state.watchedInventoryRevision != nil ? state.watchedReadVersion : nil
+            return (flight, state.lastActivityFingerprint, seenVersion)
         }
         guard let context else { return }
         let flight = context.flight
@@ -356,9 +366,9 @@ final class TraktSyncEngine {
             )
             guard let complete else {
                 guard watchedPullIsCurrent(expectedSession: expectedSession, gen: gen, purpose: purpose) else { return }
-                lock.withLock {
-                    if generation == gen, stateSessionID == expectedSession, watchedReadFlight == flight {
-                        lastWatchedRead = Date()
+                cache.withLock { state in
+                    if state.generation == gen, state.stateSessionID == expectedSession, state.watchedReadFlight == flight {
+                        state.lastWatchedRead = Date()
                     }
                 }
                 return
@@ -372,32 +382,32 @@ final class TraktSyncEngine {
         // Evaluate external intent outside the engine lock: a caller predicate is never invoked
         // under our lock. The consumer independently fences its own publication after this await.
         guard Self.watchedPurposeIsCurrent(purpose) else { return }
-        let prepared: (candidate: PersistedSnapshot, data: Data, changed: Bool)? = lock.withLock {
+        let prepared: (candidate: PersistedSnapshot, data: Data, changed: Bool)? = cache.withLock { state in
             guard !Task.isCancelled,
-                  generation == gen,
-                  watchedReadFlight == flight,
-                  stateSessionID == expectedSession,
+                  state.generation == gen,
+                  state.watchedReadFlight == flight,
+                  state.stateSessionID == expectedSession,
                   TraktAuth.storedSessionID == expectedSession else { return nil }
-            let changed = snapshot.watchedIDs != watchedIDs || snapshot.episodeKeys != watchedEpisodeKeys
+            let changed = snapshot.watchedIDs != state.watchedIDs || snapshot.episodeKeys != state.watchedEpisodeKeys
             let revision = UUID()
             // Preflight the complete retained envelope before publishing any part of the transaction.
             // Raw inventory rows can be large; overflow must not become a partial or memory-only cursor.
             let candidate = PersistedSnapshot(sessionID: expectedSession,
                 watchedIDs: Array(snapshot.watchedIDs), watchedEpisodeKeys: Array(snapshot.episodeKeys),
-                pendingPushes: pendingPushes.filter { $0.sessionID == expectedSession },
+                pendingPushes: state.pendingPushes.filter { $0.sessionID == expectedSession },
                 lastActivityFingerprint: snapshot.activityFingerprint,
                 watchedReadVersion: TraktWatchedSnapshotReader.readVersion,
                 watchedShowInventory: snapshot.shows, watchedInventoryRevision: revision)
-            guard let data = persistedDataLocked(candidate) else { return nil }
+            guard let data = Self.persistedDataLocked(candidate, state: state) else { return nil }
             return (candidate, data, changed)
         }
         guard let prepared else { return }
         // Recheck Home intent after potentially expensive envelope encoding. If a queue edit or
         // reset wins while unlocked, discard this candidate instead of overwriting the newer state.
         guard Self.watchedPurposeIsCurrent(purpose) else { return }
-        let committed = lock.withLock {
-            guard !Task.isCancelled, generation == gen, stateSessionID == expectedSession,
-                  watchedReadFlight == flight, pendingPushes == prepared.candidate.pendingPushes,
+        let committed = cache.withLock { state in
+            guard !Task.isCancelled, state.generation == gen, state.stateSessionID == expectedSession,
+                  state.watchedReadFlight == flight, state.pendingPushes == prepared.candidate.pendingPushes,
                   TraktAuth.storedSessionID == expectedSession else { return false }
             guard let storage = Self.storage else { return false }
             do {
@@ -407,13 +417,13 @@ final class TraktSyncEngine {
                 // state/cursors when protected persistence is unavailable; a later pull can retry.
                 return false
             }
-            watchedIDs = snapshot.watchedIDs
-            watchedEpisodeKeys = snapshot.episodeKeys
-            lastActivityFingerprint = snapshot.activityFingerprint
-            watchedReadVersion = TraktWatchedSnapshotReader.readVersion
-            watchedShowInventory = snapshot.shows
-            watchedInventoryRevision = prepared.candidate.watchedInventoryRevision
-            lastWatchedRead = Date()
+            state.watchedIDs = snapshot.watchedIDs
+            state.watchedEpisodeKeys = snapshot.episodeKeys
+            state.lastActivityFingerprint = snapshot.activityFingerprint
+            state.watchedReadVersion = TraktWatchedSnapshotReader.readVersion
+            state.watchedShowInventory = snapshot.shows
+            state.watchedInventoryRevision = prepared.candidate.watchedInventoryRevision
+            state.lastWatchedRead = Date()
             // The one saved envelope includes both sets and cursor, even if only its version changed.
             return true
         }
@@ -433,26 +443,26 @@ final class TraktSyncEngine {
     }
 
     private func finishWatchedRead(flight: UUID) {
-        lock.lock(); defer { lock.unlock() }
-        if watchedReadFlight == flight { watchedReadFlight = nil }
+        cache.withLock { state in
+            if state.watchedReadFlight == flight { state.watchedReadFlight = nil }
+        }
     }
 
     /// Cheap loop fence: no Keychain, defaults, or caller callbacks. The generation preserves ABA
     /// protection even if a reset rebinds to an equal session identifier during parsing.
     private func watchedParsingIsCurrent(expectedSession: TraktSessionID, gen: Int) -> Bool {
         guard !Task.isCancelled else { return false }
-        lock.lock(); defer { lock.unlock() }
-        return generation == gen && stateSessionID == expectedSession
+        return cache.withLock { $0.generation == gen && $0.stateSessionID == expectedSession }
     }
 
     private func watchedPullIsCurrent(
         expectedSession: TraktSessionID, gen: Int, purpose: TraktWatchedReadPurpose
     ) -> Bool {
         guard Self.watchedPurposeIsCurrent(purpose) else { return false }
-        lock.lock()
-        defer { lock.unlock() }
-        return generation == gen && stateSessionID == expectedSession
-            && TraktAuth.storedSessionID == expectedSession
+        return cache.withLock { state in
+            state.generation == gen && state.stateSessionID == expectedSession
+                && TraktAuth.storedSessionID == expectedSession
+        }
     }
 
     /// Keep the existing guarded bearer transport, endpoint, timeout, redirect policy and 8 MiB
@@ -561,52 +571,53 @@ final class TraktSyncEngine {
             DiagnosticsLog.log("trakt-queue", "push dropped reason=stale-session")
             return
         }
-        lock.lock()
-        guard stateSessionID == sessionID,
-              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
-        if push.isRating {
-            pendingPushes.removeAll { $0.isRating && $0.sameTitle(as: push) }
-            pendingPushes.append(push)
-            if pendingPushes.count > Self.queueCap { pendingPushes.removeFirst(pendingPushes.count - Self.queueCap) }
-        } else if !pendingPushes.contains(push) {
-            pendingPushes.append(push)
-            if pendingPushes.count > Self.queueCap { pendingPushes.removeFirst(pendingPushes.count - Self.queueCap) }
+        cache.withLock { state in
+            guard state.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID else { return }
+            if push.isRating {
+                state.pendingPushes.removeAll { $0.isRating && $0.sameTitle(as: push) }
+                state.pendingPushes.append(push)
+                if state.pendingPushes.count > Self.queueCap { state.pendingPushes.removeFirst(state.pendingPushes.count - Self.queueCap) }
+            } else if !state.pendingPushes.contains(push) {
+                state.pendingPushes.append(push)
+                if state.pendingPushes.count > Self.queueCap { state.pendingPushes.removeFirst(state.pendingPushes.count - Self.queueCap) }
+            }
+            Self.persistLocked(state)
         }
-        persistLocked()
-        lock.unlock()
     }
 
     /// Re-attempt every queued push; keep the ones that still fail. Runs inside `refreshIfStale`.
     private func drainQueue(expectedSession: TraktSessionID, gen: Int) async {
-        let capturedQueue: [PendingPush]? = lock.withLock {
-            guard generation == gen,
-                  stateSessionID == expectedSession,
+        let capturedQueue: [PendingPush]? = cache.withLock { state in
+            guard state.generation == gen,
+                  state.stateSessionID == expectedSession,
                   TraktAuth.storedSessionID == expectedSession else { return nil }
-            return pendingPushes
+            return state.pendingPushes
         }
         guard let queue = capturedQueue, !queue.isEmpty else { return }
         var stillFailing: [PendingPush] = []
         for push in queue {
             if await send(push, expectedSession: expectedSession) == false { stillFailing.append(push) }
         }
-        lock.withLock {
+        let failedSnapshot = stillFailing
+        cache.withLock { state in
             // A disconnect/reset while we were sending bumps generation and wipes the queue. Writing our
             // pre-reset survivors back here would resurrect the wiped queue and let a push drain into the
             // NEXT account that signs in on this device (the cross-account contamination reset() prevents).
             // Drop the stale result; the live (empty) queue stands.
-            guard generation == gen,
-                  stateSessionID == expectedSession,
+            guard state.generation == gen,
+                  state.stateSessionID == expectedSession,
                   TraktAuth.storedSessionID == expectedSession else { return }
             // Merge, do not overwrite: enqueue() may have appended pushes while our sends were awaiting
             // (a watched-mark made mid-drain). Overwriting pendingPushes with stillFailing alone would
             // silently drop those for a still-connected provider. Keep the survivors, then append anything
             // added since the drained snapshot, deduped and capped as enqueue() does.
-            let appendedDuringDrain = pendingPushes.filter { !queue.contains($0) }
-            var merged = stillFailing
+            let appendedDuringDrain = state.pendingPushes.filter { !queue.contains($0) }
+            var merged = failedSnapshot
             for push in appendedDuringDrain where !merged.contains(push) { merged.append(push) }
             if merged.count > Self.queueCap { merged.removeFirst(merged.count - Self.queueCap) }
-            pendingPushes = merged
-            persistLocked()
+            state.pendingPushes = merged
+            Self.persistLocked(state)
         }
     }
 
@@ -772,35 +783,35 @@ final class TraktSyncEngine {
         }
     }
 
-    /// Called only with `lock` held, so no stale save can overtake a boundary reset.
-    private func persistLocked() {
-        guard !snapshotPersistenceBlocked else { return }
-        guard let storage = Self.storage, let stateSessionID else {
+    /// Called only with the checked cache lock held, so no stale save can overtake a boundary reset.
+    private static func persistLocked(_ state: State) {
+        guard !state.snapshotPersistenceBlocked else { return }
+        guard let storage = Self.storage, let stateSessionID = state.stateSessionID else {
             try? Self.storage?.reset()
             return
         }
         let snapshot = PersistedSnapshot(
             sessionID: stateSessionID,
-            watchedIDs: Array(watchedIDs),
-            watchedEpisodeKeys: Array(watchedEpisodeKeys),
-            pendingPushes: pendingPushes.filter { $0.sessionID == stateSessionID },
-            lastActivityFingerprint: lastActivityFingerprint,
-            watchedReadVersion: watchedReadVersion,
-            watchedShowInventory: watchedShowInventory,
-            watchedInventoryRevision: watchedInventoryRevision
+            watchedIDs: Array(state.watchedIDs),
+            watchedEpisodeKeys: Array(state.watchedEpisodeKeys),
+            pendingPushes: state.pendingPushes.filter { $0.sessionID == stateSessionID },
+            lastActivityFingerprint: state.lastActivityFingerprint,
+            watchedReadVersion: state.watchedReadVersion,
+            watchedShowInventory: state.watchedShowInventory,
+            watchedInventoryRevision: state.watchedInventoryRevision
         )
-        guard let data = persistedDataLocked(snapshot) else { return }
+        guard let data = persistedDataLocked(snapshot, state: state) else { return }
         try? storage.save(data)
     }
 
-    private func persistedDataLocked(_ snapshot: PersistedSnapshot) -> Data? {
-        guard !snapshotPersistenceBlocked, let stateSessionID,
+    private static func persistedDataLocked(_ snapshot: PersistedSnapshot, state: State) -> Data? {
+        guard !state.snapshotPersistenceBlocked, let stateSessionID = state.stateSessionID,
               snapshot.sessionID == stateSessionID,
               TraktAuth.storedSessionID == stateSessionID else { return nil }
         guard let owned = try? JSONEncoder().encode(snapshot),
               owned.count <= TraktSyncSnapshotEnvelope.maximumBytes else { return nil }
         let data: Data
-        if let snapshotRetention {
+        if let snapshotRetention = state.snapshotRetention {
             guard let retained = try? snapshotRetention.merging(owned, expectedSession: stateSessionID, knownRowKey: {
                 Self.pendingRowKey($0, expectedSession: stateSessionID)
             }) else { return nil }

@@ -7,10 +7,15 @@ mkdir -p "$build_dir"
 
 {
   printf '%s\n' 'import Foundation' 'enum MPVSubtitleAdmission {'
-  sed -n '/^    private static func acceptsExternalSubtitleURL(/,/^    }/p' \
-    app/Sources/Player/MPVMetalViewController.swift | sed 's/private static func/static func/'
+  sed -n '/^    private nonisolated static func acceptsExternalSubtitleURL(/,/^    }/p' \
+    app/Sources/Player/MPVMetalViewController.swift | sed 's/private nonisolated static func/nonisolated static func/'
   printf '%s\n' '}'
 } > "$build_dir/mpv-subtitle-url-admission.swift"
+# Fail at the declaration boundary if the current source shape changes; never compile an empty facade.
+grep -Fq '    nonisolated static func acceptsExternalSubtitleURL(' "$build_dir/mpv-subtitle-url-admission.swift" || {
+  printf '%s\n' 'Missing current production subtitle URL prefilter' >&2
+  exit 1
+}
 swiftc -parse-as-library -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
   "$build_dir/mpv-subtitle-url-admission.swift" app/Tests/MPVSubtitleURLAdmissionTests.swift \
   -o "$build_dir/mpv-subtitle-url-admission"

@@ -1,6 +1,7 @@
 // Exact extracted production session/startup controls, under inert dependencies. No app build,
 // Keychain, accounts, log-cache access, listener, HTTP, Finder or share-sheet execution.
 import Foundation
+import os
 
 protocol ObservableObject {}
 @propertyWrapper struct Published<Value> {

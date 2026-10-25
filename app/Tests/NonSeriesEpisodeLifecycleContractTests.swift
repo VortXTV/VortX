@@ -143,7 +143,7 @@ private func hasBroadPhysicalWiring(coreModels: String, bridge: String,
                                     qualityPicker: String) -> Bool {
     let cwResume = slice(coreModels, from: "static func resolvedURL(for entry", to: "// MARK:")
     let engineBinding = slice(
-        bridge, from: "func loadEnginePlayer(for stream: CoreStream)",
+        bridge, from: "func loadEnginePlayer(for stream: CoreStream, sourceGroupID:",
         to: "func loadEnginePlayer(for stream: CoreStream, videoId: String"
     )
     let iosDirectResume = slice(
@@ -402,7 +402,7 @@ private struct NonSeriesEpisodeLifecycleContractTests {
         expect(cwResumeSource.contains("EpisodePlaybackIdentity.isEpisodicContext("),
                "physical consumer 1: CW semantic reresolve keeps broad identity")
         let engineBindingSource = slice(
-            bridgeSource, from: "func loadEnginePlayer(for stream: CoreStream)",
+            bridgeSource, from: "func loadEnginePlayer(for stream: CoreStream, sourceGroupID:",
             to: "func loadEnginePlayer(for stream: CoreStream, videoId: String"
         )
         expect(engineBindingSource.contains("EpisodePlaybackIdentity.isEpisodicContext("),

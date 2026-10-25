@@ -11,6 +11,9 @@ packages:
     path: Vendor/MPVKit-DVFEL
 settings:
   base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
     VORTX_EDGE_SECRET: ""
     TRAKT_CLIENT_ID: ""
     SIMKL_CLIENT_ID: ""

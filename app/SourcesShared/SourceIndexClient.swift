@@ -1043,53 +1043,84 @@ enum SourceIndexClient {
             return []
         }
 
-        var req = URLRequest(url: url, timeoutInterval: requestTimeout)
-        req.httpMethod = "GET"
-        req.setValue("application/json", forHTTPHeaderField: "accept")
-        VortXEdgeAuth.sign(&req)
-        let signed = req.value(forHTTPHeaderField: "X-VX-Sig") != nil
-        // Moat token: the SERVE gate is login-only AND moat-token-gated. Stamp X-VX-Moat after the edge
-        // signature. Fail-soft: no current token returns empty before transport.
+        // Account/consent/source generation is checked at every page boundary, not only the first read.
         let currentMoat = await moatProvider()
         guard await gate(), let currentMoat, !currentMoat.isEmpty else {
             diag(.fetchPooledGateClosed, reason: .gateChangedOrNoMoat)
             return []
         }
-        req.setValue(currentMoat, forHTTPHeaderField: MoatToken.header)
-        // The URL is NOT logged: its query string is the content id. Only whether the request got stamped.
-        diag(.fetchPooledGet, counts: [(.edgeSigned, signed ? 1 : 0), (.moatToken, 1)])
-
         do {
-            // Both mid-flight gate checks were SILENT returns. F4 requires every bail path to stay
-            // distinguishable, and these two are not the same event: one means the gate shut before we spent a
-            // request, the other means it shut while the response was already in the air.
-            guard await gate() else {
-                diag(.fetchPooledGateClosed, reason: .gateClosedBeforeTransport)
-                return []
+            var pageURL = url
+            let deadline = ProcessInfo.processInfo.systemUptime + SourceIndexContract.maxServeTraversalSeconds
+            var totalBytes = 0
+            var cursors = Set<String>()
+            var identities = Set<String>()
+            var requiresVersionedPage = false
+            var sources: [PooledSource] = []
+            while true {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
+                guard await gate(), !Task.isCancelled else {
+                    diag(.fetchPooledGateClosed, reason: .gateClosedBeforeTransport)
+                    return []
+                }
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { throw URLError(.timedOut) }
+                var req = URLRequest(url: pageURL, timeoutInterval: min(requestTimeout, remaining))
+                req.httpMethod = "GET"
+                req.setValue("application/json", forHTTPHeaderField: "accept")
+                VortXEdgeAuth.sign(&req)
+                req.setValue(currentMoat, forHTTPHeaderField: MoatToken.header)
+                diag(.fetchPooledGet, counts: [(.edgeSigned, req.value(forHTTPHeaderField: "X-VX-Sig") == nil ? 0 : 1), (.moatToken, 1)])
+                let (data, resp) = try await transport(req)
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
+                guard await gate(), !Task.isCancelled else {
+                    diag(.fetchPooledGateClosed, reason: .gateClosedAfterTransport)
+                    return []
+                }
+                guard let http = resp as? HTTPURLResponse, isSuccessfulHTTPStatus(http.statusCode) else {
+                    diag(.fetchPooledHTTP, reason: .httpNon2xx,
+                         counts: [(.status, (resp as? HTTPURLResponse)?.statusCode ?? -1)])
+                    return []
+                }
+                guard data.count <= SourceIndexContract.maxResponseBodyBytes,
+                      data.count <= SourceIndexContract.maxAssembledResponseBytes - totalBytes else {
+                    throw SourceIndexTransportError.tooLarge
+                }
+                totalBytes += data.count
+                let decoded = try JSONDecoder().decode(SourcesResponse.self, from: data)
+                let page = decoded.sources ?? []
+                if decoded.paginationVersion != nil {
+                    guard case .some = decoded.sources else { throw SourceIndexTransportError.invalidAcknowledgement }
+                    guard decoded.paginationVersion == 1,
+                          page.count <= SourceIndexContract.maxServedSources,
+                          let hasMore = decoded.hasMore,
+                          hasMore == (decoded.nextCursor != nil) else {
+                        throw SourceIndexTransportError.invalidAcknowledgement
+                    }
+                    requiresVersionedPage = true
+                } else if requiresVersionedPage || decoded.nextCursor != nil || decoded.hasMore != nil {
+                    throw SourceIndexTransportError.invalidAcknowledgement
+                }
+                for source in page {
+                    // Keep selectors/metadata verbatim; duplicate traversal identities do not duplicate rows.
+                    if let kind = source.kind, let id = source.id {
+                        guard identities.insert(kind + "\n" + id).inserted else { continue }
+                    }
+                    sources.append(source)
+                }
+                diag(.fetchPooledHTTPOK, outcome: SourceIndexDiag.Outcome(worker: decoded.reason),
+                     counts: [(.status, http.statusCode), (.corroboratedSources, sources.count)])
+                guard let cursor = decoded.nextCursor else {
+                    guard await gate(), !Task.isCancelled else { return [] }
+                    guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
+                    return sources
+                }
+                guard SourceIndexContract.isValidServeCursor(cursor), cursors.insert(cursor).inserted,
+                      let nextURL = serveURL(contentID: contentID, cursor: cursor) else {
+                    throw SourceIndexTransportError.invalidAcknowledgement
+                }
+                pageURL = nextURL
             }
-            let (data, resp) = try await transport(req)
-            guard await gate() else {
-                diag(.fetchPooledGateClosed, reason: .gateClosedAfterTransport)
-                return []
-            }
-            guard let http = resp as? HTTPURLResponse, isSuccessfulHTTPStatus(http.statusCode) else {
-                let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                diag(.fetchPooledHTTP, reason: .httpNon2xx, counts: [(.status, status)])
-                return []
-            }
-            let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data)
-            let sources = Array((decoded?.sources ?? []).prefix(SourceIndexContract.maxServedSources))
-            // The worker `reason` is server-authored text and is still never echoed. It is MAPPED, through a
-            // closed client-side enum, onto one of a fixed handful of outcomes.
-            //
-            // Dropping it outright was a regression, and the reason given for dropping it ("the row count
-            // already distinguishes an empty login_required read from a real empty pool") is false: both
-            // bodies decode to zero rows, so both emitted this line byte for byte. SERVE is deliberately
-            // login-gated, so login_required is the most common correct explanation for an empty pool.
-            diag(.fetchPooledHTTPOK,
-                 outcome: SourceIndexDiag.Outcome(worker: decoded?.reason),
-                 counts: [(.status, http.statusCode), (.corroboratedSources, sources.count)])
-            return sources
         } catch {
             // `localizedDescription` embeds the failing URL (hence the content id) on URLError, so only the
             // transport error CODE crosses into the log.
@@ -1134,15 +1165,12 @@ enum SourceIndexClient {
     /// provider THIS requester has -- so an adversarial response can never inject arbitrary text into a row and
     /// the pool's provider claim never fabricates a cached badge (the own-key cache-check stays the authority).
     ///
-    /// ANONYMOUS-TAIL BOUND: rows that carry no usable metadata at all (legacy entries with no resolution, size,
-    /// seeders, provider fact, or tag) are the wall of undifferentiated "Other" rows the pool used to spam. They
-    /// rank last at the worker already; here their remainder is capped so a metadata-poor pool cannot fill the
-    /// list with anonymous duplicates. Rich rows are all kept.
+    /// Metadata-poor rows sort after rich rows but remain available through the same lazy UI windows.
     static func streams(from pooled: [PooledSource],
                         capabilities: ServeCapabilities = .torrentOnly) -> [CoreStream] {
         var rich: [CoreStream] = []
         var anonymous: [CoreStream] = []
-        for src in pooled.prefix(SourceIndexContract.maxServedSources) {
+        for src in pooled {
             guard let kind = src.kind, SourceIndexContract.canReconstructPooledKind(kind),
                   let id = src.id, !id.isEmpty,
                   // MIRROR the worker's serve floor; never exceed it (the worker already applied its kind-aware
@@ -1163,7 +1191,7 @@ enum SourceIndexClient {
             guard let stream else { continue }
             if display.hasMetadata { rich.append(stream) } else { anonymous.append(stream) }
         }
-        let built = rich + anonymous.prefix(SourceIndexContract.maxAnonymousServedSources)
+        let built = rich + anonymous
         diag(.streamsReconstruct, counts: [(.pooled, pooled.count), (.playable, built.count)])
         return built
     }
@@ -1263,10 +1291,10 @@ enum SourceIndexClient {
     }
 
     /// Deterministic decode boundary used by the live GET path's contract tests. Invalid JSON is empty and a
-    /// valid response cannot admit more rows than the worker's maximum even before reconstruction filters it.
+    /// valid bounded response retains every row; the page assembler validates the versioned server contract.
     static func pooledSources(fromResponseData data: Data) -> [PooledSource] {
         guard let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data) else { return [] }
-        return Array((decoded.sources ?? []).prefix(SourceIndexContract.maxServedSources))
+        return decoded.sources ?? []
     }
 
     static func pooledSources(statusCode: Int, fromResponseData data: Data) -> [PooledSource] {
@@ -1397,9 +1425,10 @@ enum SourceIndexClient {
     }
 
     /// Pure SERVE request builder shared with standalone tests. Invalid title keys return nil before telemetry
-    /// or network work. Filter on the worker BEFORE its ranked LIMIT: otherwise unplayable HTTP/NZB rows can
-    /// consume all 100 returned slots and starve torrents that this client can safely reconstruct.
-    static func serveURL(contentID: String) -> URL? {
+    /// or network work. Filter on the worker before paging so unsupported URL/NZB kinds do not consume
+    /// torrent-only client work. The cursor is opaque and may never replace the baked request origin.
+    static func serveURL(contentID: String, cursor: String? = nil) -> URL? {
+        if let cursor, !SourceIndexContract.isValidServeCursor(cursor) { return nil }
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               var components = URLComponents(
                 url: baseURL.appendingPathComponent("sources"),
@@ -1408,7 +1437,9 @@ enum SourceIndexClient {
         components.queryItems = [
             URLQueryItem(name: "content_id", value: contentID),
             URLQueryItem(name: "kind", value: Kind.torrent.rawValue),
+            URLQueryItem(name: "paged", value: "1"),
         ]
+        if let cursor { components.queryItems?.append(URLQueryItem(name: "cursor", value: cursor)) }
         return components.url
     }
 
@@ -1464,6 +1495,9 @@ enum SourceIndexClient {
     private struct SourcesResponse: Decodable {
         let sources: [PooledSource]?
         let reason: String?
+        let paginationVersion: Int?
+        let nextCursor: String?
+        let hasMore: Bool?
     }
 }
 

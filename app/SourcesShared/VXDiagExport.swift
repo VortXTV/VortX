@@ -3,6 +3,7 @@ import Network
 import CoreImage
 import SwiftUI
 import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IPv4 discovery
+import os
 
 /// One-shot LAN export for the rolling diagnostic log (`VXProbe.logFileURL`). Apple TV has no share
 /// sheet, so the owner cannot AirDrop or email the log off the box directly. Instead this stands up a
@@ -243,8 +244,11 @@ final class VXDiagExport: @unchecked Sendable {
             }
         }
         connection.start(queue: queue)
-        let deadline = DispatchWorkItem { connection.cancel() }
-        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadline)
+        let deadline = VXDiagExportStartCancellation()
+        let deadlineWork = DispatchWorkItem {
+            if !deadline.isCancelled { connection.cancel() }
+        }
+        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadlineWork)
         readRequest(connection, buffer: Data(), deadline: deadline)
     }
 
@@ -254,7 +258,7 @@ final class VXDiagExport: @unchecked Sendable {
     /// peer more room to send bytes we do not read. Anything the policy rejects is closed WITHOUT a reply,
     /// so a scanner probing the port learns nothing from us, not even a 404. The read is bounded and the
     /// deadline force-cancels a client that never completes a line.
-    private func readRequest(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
+    private func readRequest(_ connection: NWConnection, buffer: Data, deadline: VXDiagExportStartCancellation) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] chunk, _, isComplete, error in
             guard let self else { return }
             if error != nil {
@@ -401,17 +405,19 @@ final class VXDiagExport: @unchecked Sendable {
     private static let peerCloseTimeout: TimeInterval = 30
 
     private func waitForPeerClose(_ connection: NWConnection) {
-        let timeout = DispatchWorkItem {
+        let timeout = VXDiagExportStartCancellation()
+        let timeoutWork = DispatchWorkItem {
+            guard !timeout.isCancelled else { return }
             NSLog("[diag] export: peer-close timeout; preserved rolling log")
             connection.cancel()
         }
-        queue.asyncAfter(deadline: .now() + Self.peerCloseTimeout, execute: timeout)
+        queue.asyncAfter(deadline: .now() + Self.peerCloseTimeout, execute: timeoutWork)
         receiveUntilPeerClose(connection, timeout: timeout)
     }
 
     private func receiveUntilPeerClose(
         _ connection: NWConnection,
-        timeout: DispatchWorkItem
+        timeout: VXDiagExportStartCancellation
     ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1_024) {
             [weak self] _, _, isComplete, error in
@@ -492,7 +498,8 @@ final class VXDiagExport: @unchecked Sendable {
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let ip = String(cString: host)
+            let terminator = host.firstIndex(of: 0) ?? host.endIndex
+            let ip = String(decoding: host[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
             guard !ip.isEmpty, !ip.hasPrefix("169.254") else { continue }   // skip link-local
 
             if name == "en0" {
@@ -520,12 +527,11 @@ final class VXDiagExport: @unchecked Sendable {
 
 /// Cancellation crosses from a Swift task to the blocking Network-framework bring-up worker. It must
 /// not read UI state off-thread or block the main actor waiting for that worker's semaphore.
-private final class VXDiagExportStartCancellation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
+private final class VXDiagExportStartCancellation: Sendable {
+    private let cancelled = OSAllocatedUnfairLock(initialState: false)
 
-    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
-    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { cancelled.withLock { $0 } }
+    func cancel() { cancelled.withLock { $0 = true } }
 }
 
 #if os(macOS)

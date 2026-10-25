@@ -18,15 +18,10 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     printf '%s\n' 'import Foundation'
     sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
 } > "$preference_test_dir/Discovery.swift"
-# Compile the exact worker-safe Bridge authority with a synthetic lock-backed identity registry.
-# This is not a real credential integration or a compile of the full application target.
+# Compile the actual in-memory credential registry and exact worker-safe Bridge authority with
+# the synthetic installation/Facade seam. This is not a full application target integration.
 {
     printf '%s\n' 'import Foundation' \
-        'final class CredentialScopeRegistry: @unchecked Sendable {' \
-        'struct Capture: Equatable, Sendable { let generation: UInt64 }' \
-        'static let shared = CredentialScopeRegistry()' 'private let lock = NSLock(); private var generation: UInt64 = 1' \
-        'func isCurrent(_ capture: Capture) -> Bool { lock.withLock { capture.generation == generation } }' \
-        'func rotate() { lock.withLock { generation += 1 } }' '}' \
         'final class CoreBridge {' \
         'private let nativeFacadeLock = NSLock()' 'private var nativeFacadeStorage: VortxNativeCoreFacade?' \
         'private var nativeCredentialCapture: CredentialScopeRegistry.Capture?' 'private var nativeInstallGeneration = UUID()' \
@@ -39,13 +34,14 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     sed -n '/^    private final class NativeProfilePreferenceAuthority:/,/^    }/p' app/SourcesShared/CoreBridge.swift
     printf '%s\n' '}'
 } > "$preference_test_dir/BridgeAuthority.swift"
-xcrun swiftc -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-extension "$preference_test_dir/NativeSubtitleProofHosts.swift" > "$preference_test_dir/native-subtitle-proof-hosts.json"
+xcrun swiftc -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
     -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -D VORTX_NATIVE_DATA_ENGINE -I "$preference_headers" \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift \
+    app/SourcesShared/CredentialScope.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift \
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
-    "$preference_test_dir/UserProfile.swift" "$preference_test_dir/Discovery.swift" "$preference_test_dir/BridgeAuthority.swift" app/Tests/NativeProfilePreferenceAdmissionLiveTests.swift \
+    "$preference_test_dir/UserProfile.swift" "$preference_test_dir/Discovery.swift" "$preference_test_dir/BridgeAuthority.swift" "$preference_test_dir/NativeSubtitleProofHosts.swift" app/Tests/NativeProfilePreferenceAdmissionLiveTests.swift \
     "$preference_library" -framework Security -framework SystemConfiguration -o "$preference_test_dir/preference-admission"
 "$preference_test_dir/preference-admission" "$preference_test_dir/checkpoints"
 test "$preference_library_hash" = "$(shasum -a 256 "$preference_library" | awk '{print $1}')"

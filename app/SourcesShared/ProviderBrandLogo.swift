@@ -265,7 +265,13 @@ enum BundledLogo {
     #if canImport(UIKit)
     /// Draw the mark centered on the warm rounded plate (iOS / iPadOS / tvOS).
     private static func platedLogo(_ logo: UIImage) -> UIImage {
+        #if os(tvOS)
+        // UIKit's supported replacement for defaultFormat on TV. Keep the plate's explicit
+        // scale/transparency below; do not change the iPhone/iPad renderer in this migration.
+        let format = UIGraphicsImageRendererFormat.preferred()
+        #else
         let format = UIGraphicsImageRendererFormat.default()
+        #endif
         format.scale = Plate.scale
         format.opaque = false
         let bounds = CGRect(x: 0, y: 0, width: Plate.width, height: Plate.height)

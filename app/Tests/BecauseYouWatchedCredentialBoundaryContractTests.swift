@@ -25,6 +25,21 @@ private struct BecauseYouWatchedCredentialBoundaryContractTests {
         )
     }
 
+    private static func observesCredentialRefresh(_ source: String) -> Bool {
+        let marker = ".onReceive(account.$credentialBoundaryGeneration) { _ in"
+        return source.components(separatedBy: marker).dropFirst().contains { suffix in
+            var depth = 1
+            var body = ""
+            for character in suffix {
+                if character == "{" { depth += 1 }
+                if character == "}" { depth -= 1 }
+                if depth == 0 { return body.contains("refreshTopPicks()") }
+                body.append(character)
+            }
+            return false
+        }
+    }
+
     static func main() {
         let root = CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath
         guard let account = read(root, "app/SourcesShared/StremioAccount.swift"),
@@ -100,13 +115,14 @@ private struct BecauseYouWatchedCredentialBoundaryContractTests {
         // iOS also refreshes Continue Watching on the next main turn; what matters is that each Home observes
         // the boundary and rebuilds Top Picks from it.
         for (name, source) in [("tvOS", tv), ("iOS", ios)] {
-            let observes: Bool = {
-                guard let start = source.range(of: ".onReceive(account.$credentialBoundaryGeneration) { _ in") else { return false }
-                let body = source[start.upperBound...].prefix(240)
-                return body.contains("refreshTopPicks()")
-            }()
-            check(observes, "\(name) Home observes the same-slot credential generation")
+            check(observesCredentialRefresh(source), "\(name) Home observes the same-slot credential generation")
         }
+        let unrelatedRefresh = """
+        .onReceive(account.$credentialBoundaryGeneration) { _ in homeSurpriseRoute = nil }
+        .onReceive(account.$email) { _ in refreshTopPicks() }
+        """
+        check(!observesCredentialRefresh(unrelatedRefresh),
+              "an unrelated subscriber cannot satisfy the credential-boundary refresh contract")
 
         if failures == 0 {
             print("ALL TESTS PASSED")

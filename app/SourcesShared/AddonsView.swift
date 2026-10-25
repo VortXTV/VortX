@@ -39,9 +39,9 @@ final class AddonHealthStore: ObservableObject {
     private var lastProbe: Date?
     private init() {}
 
-    private static let okThresholdMs = 1500
-    private static let timeout: TimeInterval = 6
-    private static let rateLimit: TimeInterval = 20
+    nonisolated private static let okThresholdMs = 1500
+    nonisolated private static let timeout: TimeInterval = 6
+    nonisolated private static let rateLimit: TimeInterval = 20
 
     /// Probe every add-on concurrently. Debounced to once per `rateLimit` seconds unless `force`.
     func probe(_ transportUrls: [String], force: Bool = false) {
@@ -159,6 +159,9 @@ struct AddonsView: View {
     @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
     @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
     @State private var showPairing = false         // the Install-by-QR "pair once, add many" sheet
+    @State private var visibilityUpdate: String?
+    @State private var visibilityOperation = UUID()
+    @State private var visibilityMessages: [String: String] = [:]
     // Observed + READ in body (see `let _ = orderObserver.revision`) so the list re-sorts LIVE after a
     // reorder. appliedAddonOrder is a plain UserDefaults static, not @Published, so this is SwiftUI's only
     // signal to re-run orderedByApplied; without it the new order showed only on the next cold launch.
@@ -200,7 +203,7 @@ struct AddonsView: View {
                             installSection
                             discoverLink
                         }
-                        if core.addons.isEmpty {
+                        if core.addonsForManagement.isEmpty {
                             hint("No add-ons yet. Paste an add-on's manifest URL above to install one.")
                         } else {
                             NavigationLink {
@@ -228,7 +231,7 @@ struct AddonsView: View {
                             .vortxCardButton()
                             // Both drag and remote-button reorder go through the same profile boundary:
                             // Main edits account order; a shared profile writes only its personal ranking.
-                            if core.addons.count > 1 {
+                            if core.addonsForManagement.count > 1 {
                                 NavigationLink {
                                     #if os(tvOS)
                                     AddonReorderTVView()
@@ -270,7 +273,7 @@ struct AddonsView: View {
                                 #if !os(tvOS)
                                 Spacer()
                                 #endif
-                                Button { health.probe(core.addons.map(\.transportUrl), force: true) } label: {
+                                Button { health.probe(core.addonsForManagement.map(\.transportUrl), force: true) } label: {
                                     Label("Re-check status", systemImage: "arrow.clockwise")
                                 }
                                 .buttonStyle(ChipButtonStyle(selected: false))
@@ -279,7 +282,7 @@ struct AddonsView: View {
                                 Spacer()
                                 #endif
                             }
-                            ForEach(Array(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl }).enumerated()), id: \.element.id) { index, addon in
+                            ForEach(Array(VortXSyncManager.orderedByApplied(core.addonsForManagement, url: { $0.transportUrl }).enumerated()), id: \.element.id) { index, addon in
                                 addonRow(addon, position: index + 1)
                             }
                         }
@@ -289,11 +292,14 @@ struct AddonsView: View {
                 .padding(.vertical, usesCompactAddonLayout ? Theme.Space.md : Theme.Space.xl)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
-            .onChange(of: profiles.activeID) { _ in
+            .task(id: core.addonsForManagement.count) { health.probe(core.addonsForManagement.map(\.transportUrl)) }
+            .onValueChange(of: profiles.activeID) { _ in
                 addonSheet = nil
                 showPairing = false
                 showUpdateConfirm = false
+                visibilityOperation = UUID()
+                visibilityUpdate = nil
+                visibilityMessages = [:]
             }
             .sheet(item: $addonSheet) { sheet in
                 switch sheet {
@@ -304,6 +310,7 @@ struct AddonsView: View {
             .sheet(isPresented: $showPairing) { AddonPairingView() }
             .confirmationDialog("Add-on already installed", isPresented: $showUpdateConfirm, titleVisibility: .visible) {
                 Button("Update") { runInstall(replacingExisting: true) }
+                    .disabled(installing)
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("This add-on is already installed. Update it to its latest manifest?")
@@ -379,7 +386,7 @@ struct AddonsView: View {
         }
         // Already installed? Offer to UPDATE (re-fetch the manifest) instead of erroring (owner request).
         if let normalized = core.normalizedAddonURL(newAddonURL),
-           core.addons.contains(where: { $0.transportUrl == normalized }) {
+           core.addonsForManagement.contains(where: { $0.transportUrl == normalized }) {
             showUpdateConfirm = true
             return
         }
@@ -387,6 +394,7 @@ struct AddonsView: View {
     }
 
     private func runInstall(replacingExisting: Bool) {
+        guard !installing else { return }
         installing = true
         installMessage = nil
         let url = newAddonURL
@@ -495,6 +503,11 @@ struct AddonsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)   // the text column owns the row width
             }
             addonActions(addon, isOff: isOff)
+            if let message = visibilityMessages[addon.transportUrl] {
+                Text(message).font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -548,12 +561,33 @@ struct AddonsView: View {
 
     /// Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
     private func visibilityToggle(_ addon: CoreDescriptor, isOff: Bool) -> some View {
-        Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
-            Image(systemName: isOff ? "eye.slash" : "eye")
+        let working = visibilityUpdate == addon.transportUrl
+        return Button { updateVisibility(addon, disabled: !isOff) } label: {
+            Image(systemName: working ? "hourglass" : (isOff ? "eye.slash" : "eye"))
         }
         .buttonStyle(ChipButtonStyle(selected: !isOff))
         .fixedSize()
-        .accessibilityLabel(isOff ? "Show \(addon.manifest.name) for this profile" : "Hide \(addon.manifest.name) for this profile")
+        .disabled(visibilityUpdate != nil)
+        .accessibilityLabel(working ? "Saving add-on visibility" : (isOff ? "Show \(addon.manifest.name) for this profile" : "Hide \(addon.manifest.name) for this profile"))
+    }
+
+    private func updateVisibility(_ addon: CoreDescriptor, disabled: Bool) {
+        guard visibilityUpdate == nil else { return }
+        let admission = core.captureNativeProfileActionAdmission()
+        let operation = UUID()
+        visibilityOperation = operation
+        visibilityUpdate = addon.transportUrl
+        visibilityMessages[addon.transportUrl] = nil
+        Task { @MainActor in
+            let accepted = await profiles.setAddonDisabledForActive(base: addon.transportUrl,
+                disabled: disabled, admission: admission)
+            guard visibilityOperation == operation, profiles.activeID == admission.profileID else { return }
+            visibilityUpdate = nil
+            if !accepted {
+                visibilityMessages[addon.transportUrl] = profiles.nativeProfileError
+                    ?? "Couldn't change this add-on's visibility. Try again."
+            }
+        }
     }
 
     private func hint(_ text: String) -> some View {
@@ -680,16 +714,16 @@ struct AddonReorderView: View {
         #endif
         .macBackAffordance()
         .onAppear { reload() }
-        .onChange(of: profiles.activeID) { _ in reload() }
-        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
-        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
+        .onValueChange(of: profiles.activeID) { _ in reload() }
+        .onValueChange(of: core.addonsForManagement.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
+        .onValueChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
     }
 
     /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
     /// in any add-on installed since (appended at the end by orderedByApplied).
     private func reload() {
         editorProfileID = profiles.activeID
-        ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
+        ordered = VortXSyncManager.orderedByApplied(core.addonsForManagement, url: { $0.transportUrl })
     }
 
     private func move(from source: IndexSet, to destination: Int) {
@@ -734,9 +768,9 @@ struct AddonReorderTVView: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { reload() }
-        .onChange(of: profiles.activeID) { _ in reload() }
-        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds
-        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
+        .onValueChange(of: profiles.activeID) { _ in reload() }
+        .onValueChange(of: core.addonsForManagement.count) { _ in reload() }        // an install/remove elsewhere re-seeds
+        .onValueChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
     }
 
     private func reorderRow(_ addon: CoreDescriptor, index: Int) -> some View {
@@ -779,7 +813,7 @@ struct AddonReorderTVView: View {
     /// in any add-on installed since (appended at the end by `orderedByApplied`).
     private func reload() {
         editorProfileID = profiles.activeID
-        ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
+        ordered = VortXSyncManager.orderedByApplied(core.addonsForManagement, url: { $0.transportUrl })
     }
 
     /// Move through the profile boundary and follow focus to the still-enabled control.
@@ -897,12 +931,12 @@ private struct EditAddonURLView: View {
     var body: some View {
         VStack(spacing: Theme.Space.lg) {
             VStack(spacing: Theme.Space.xs) {
-                Text("Change add-on URL").font(.title2).fontWeight(.bold)
+                Text("Update add-on").font(.title2).fontWeight(.bold)
                     .foregroundStyle(Theme.Palette.textPrimary)
                 Text(addon.manifest.name).font(.subheadline)
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
-            Text("Replace this add-on's manifest URL, for example after reconfiguring it. The new URL is installed first, then the old one removed.")
+            Text("Keep the current URL to refresh this add-on's latest manifest, or paste a new URL after reconfiguring it. Your existing add-on stays until the update confirms.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 520)
             TextField("https://…/manifest.json", text: $url)
@@ -918,9 +952,9 @@ private struct EditAddonURLView: View {
                     .buttonStyle(.bordered)
                     .tint(Theme.Palette.textPrimary)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                Button(working ? "Updating…" : "Update") { update() }
+                Button(working ? "Updating…" : (url.trimmingCharacters(in: .whitespacesAndNewlines) == addon.transportUrl ? "Refresh manifest" : "Update URL")) { update() }
                     .buttonStyle(PrimaryActionStyle())
-                    .disabled(working || url.trimmingCharacters(in: .whitespaces).isEmpty || url == addon.transportUrl)
+                    .disabled(working || url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(Theme.Space.xl)
@@ -934,9 +968,10 @@ private struct EditAddonURLView: View {
     }
 
     private func update() {
+        guard !working else { return }
         working = true
         message = nil
-        let newURL = url.trimmingCharacters(in: .whitespaces)
+        let newURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
         Task { @MainActor in
             if let error = await CoreBridge.shared.installAddon(urlString: newURL,
                                                                  replacingExisting: true,

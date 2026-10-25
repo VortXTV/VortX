@@ -73,9 +73,26 @@ bash -e ../include/download-libunibreak.sh "$v_libunibreak" "$v_libunibreak_sha2
 # Never silently reuse an old unverified source directory or pipe a response to tar.
 bash -e ../include/download-lua.sh "$v_lua" "$v_lua_sha256"
 
-[ ! -d libplacebo ] && git clone --depth 1 --branch v$v_libplacebo --recurse-submodules https://code.videolan.org/videolan/libplacebo.git libplacebo
+# Exact shared custom commits; no moving branch or older stable-tag fallback.
+fetch_commit() {
+    local dir=$1 url=$2 sha=$3
+    if [ ! -d "$dir" ]; then
+        git init -q "$dir"
+        git -C "$dir" remote add origin "$url"
+        git -C "$dir" fetch -q --depth 1 origin "$sha"
+        git -C "$dir" checkout -q --detach FETCH_HEAD
+    fi
+    [ "$(git -C "$dir" rev-parse HEAD)" = "$sha" ] || {
+        echo "$dir source does not match the reviewed commit pin; refusing reuse" >&2
+        exit 1
+    }
+}
+
+# libplacebo
+fetch_commit libplacebo https://code.videolan.org/videolan/libplacebo.git "$v_libplacebo_sha"
+git -C libplacebo submodule update -q --init --recursive --depth 1
 
 # mpv
-[ ! -d mpv ] && git clone --depth 1 --branch v$v_mpv https://github.com/mpv-player/mpv.git mpv
+fetch_commit mpv https://github.com/mpv-player/mpv.git "$v_mpv_sha"
 
 cd ..

@@ -212,13 +212,14 @@ private let crashInstall = section(
     crashReporter,
     from: "static func install()",
     to: "// MARK: - Next-launch fold") ?? ""
+let crashSnapshotRead = crashInstall.range(of: "let pending = hasNonemptyCrashMarker(at: marker)")?.lowerBound ?? crashInstall.endIndex
+let crashSnapshotWrite = crashInstall.range(of: "launchHadPendingCrashMarker.withLock { $0 = pending }")?.lowerBound ?? crashInstall.endIndex
+let crashSnapshotFold = crashInstall.range(of: "let preserveExisting = foldPreviousCrash(marker)")?.lowerBound ?? crashInstall.startIndex
 check("crash evidence is snapshotted before folding or pre-opening the marker",
-      crashInstall.range(of: "launchHadPendingCrashMarker = hasNonemptyCrashMarker(at: marker)")?.lowerBound
-        ?? crashInstall.endIndex
-      < crashInstall.range(of: "let preserveExisting = foldPreviousCrash(marker)")?.lowerBound
-        ?? crashInstall.startIndex)
+      crashSnapshotRead < crashSnapshotWrite && crashSnapshotWrite < crashSnapshotFold
+        && !crashInstall.contains("FileManager.default.fileExists"))
 check("termination classification reads the launch snapshot, not live file existence",
-      crashReporter.contains("static var pendingCrashMarkerExists: Bool {\n        launchHadPendingCrashMarker\n    }")
+      crashReporter.contains("static var pendingCrashMarkerExists: Bool {\n        launchHadPendingCrashMarker.withLock { $0 }\n    }")
         && !crashReporter.contains("static var pendingCrashMarkerExists: Bool {\n        FileManager.default.fileExists"))
 
 if failures > 0 {

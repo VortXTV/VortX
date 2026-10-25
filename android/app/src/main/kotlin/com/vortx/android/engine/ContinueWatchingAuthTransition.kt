@@ -18,6 +18,9 @@ internal class ContinueWatchingAuthTransition {
         check(activeGeneration == null) { "An account transition is already in progress." }
         check(lastGeneration < Long.MAX_VALUE) { "Auth transition generation exhausted." }
         val generation = ++lastGeneration
+        // An explicit authentication handoff retires the old player before its owner may move.
+        // Generic Continue Watching resource/projection revisions do not have this meaning.
+        com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
         activeGeneration = generation
         ContinueWatchingOwnerGate.advance()
         generation

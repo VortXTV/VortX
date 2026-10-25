@@ -135,7 +135,7 @@ enum DebridPublicURLPolicy {
             var numericHost = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             if getnameinfo(socketAddress, info.ai_addrlen, &numericHost, socklen_t(numericHost.count),
                            nil, 0, NI_NUMERICHOST) == 0 {
-                values.append(String(cString: numericHost))
+                values.append(String(decoding: numericHost.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
             }
             node = info.ai_next
         }

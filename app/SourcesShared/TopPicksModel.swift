@@ -106,6 +106,15 @@ final class TopPicksModel: ObservableObject {
         }
     }
 
+    /// Explicit Home actions must not borrow a previous viewer's still-visible row before
+    /// the Home change observer has refreshed it. This checks ownership without starting a fetch.
+    func currentItems(profileID: UUID?, ownerKey: String) -> [MetaPreview] {
+        guard let signature = lastSignature, signature.profileID == profileID,
+              signature.ownerKey == ownerKey, CredentialScopeRegistry.shared.isCurrent(signature.owner),
+              ApiKeys.tmdbKey() == signature.key else { return [] }
+        return items
+    }
+
     /// Clear when the profile signs out or switches to one with no eligible history.
     func clear() {
         requestGeneration &+= 1

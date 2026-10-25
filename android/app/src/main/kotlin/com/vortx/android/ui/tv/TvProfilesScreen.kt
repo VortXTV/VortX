@@ -124,9 +124,11 @@ internal class StoreTvProfileGateway(
     }
 }
 
+internal data class TvProfileGatewayPresentation(val gateway: TvProfileGateway?, val loading: Boolean)
+
 /** Same native capture/commit admission as the phone editor. A missing mount never borrows a legacy roster. */
 @Composable
-internal fun rememberTvProfileGateway(): TvProfileGateway? {
+internal fun rememberTvProfileGateway(): TvProfileGatewayPresentation {
     val store = ProfileStore.sharedOrNull()
     val native: NativeStreamingAccountViewModel? = run {
         val app = LocalContext.current.applicationContext as? VortXApplication
@@ -137,16 +139,18 @@ internal fun rememberTvProfileGateway(): TvProfileGateway? {
     val state = native?.state?.collectAsState()?.value
     // Observe active edits as well as selection; native roster updates are observed above.
     store?.activeProfile?.collectAsState()?.value
-    if (store == null || state?.mounted != true) return null
-    return remember(store, native, state) { StoreTvProfileGateway(store, native) }
+    if (store == null || state?.mounted != true) return TvProfileGatewayPresentation(null, state?.loading == true)
+    val gateway = remember(store, native, state) { StoreTvProfileGateway(store, native) }
+    return TvProfileGatewayPresentation(gateway, false)
 }
 
 @Composable
 fun TvProfilesScreen(onBack: () -> Unit, onSelected: (ProfileSelectionRequest) -> Unit, modifier: Modifier = Modifier) {
-    val gateway = rememberTvProfileGateway()
+    val (gateway, loading) = rememberTvProfileGateway()
     if (gateway == null) {
         Column(modifier.fillMaxSize().padding(TvDimens.edge), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text("Profiles are unavailable. Open account setup, then try again.", style = VortXTheme.type.body)
+            Text(if (loading) "Opening profiles…" else "Profiles are unavailable. Open account setup, then try again.",
+                style = VortXTheme.type.body)
             TvProfileButton("Back", onClick = onBack)
         }
         BackHandler(onBack = onBack)

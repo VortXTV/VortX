@@ -512,6 +512,12 @@ data class StreamSource(
     /** Ordered addon NZB mirrors and NNTP URLs. Transient only; may contain configured credentials. */
     val nzbUrls: List<String> = emptyList(),
     val usenetServers: List<String> = emptyList(),
+    /**
+     * Transient list-only cache evidence, stamped with the process-monotonic provider event revision after
+     * real current-owner torrent hits. Consumers require the SAME current event revision (not the secure
+     * vault revision). Never provider-decoded, persisted, inferred from text, or used as play authority.
+     */
+    @Transient val accountConfirmedCacheRevision: Long? = null,
 ) {
     override fun toString(): String =
         "StreamSource(id=${if (isUsenet) "<usenet>" else id}, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
@@ -613,7 +619,12 @@ data class StreamGroup(
     /// CoreBridge.swift:984) -- [addon] is a display label (host string) and is not unique enough
     /// to filter by. Empty for a group whose request carried no base (kept, never filtered).
     val base: String = "",
-)
+) {
+    /// Exact configured transport identity, including configuration path/query. Never render or log it.
+    /// Older local/synthetic groups without a base retain label-scoped identity; equal such labels cannot
+    /// be distinguished until their producer supplies a stable base.
+    val sourceInstanceId: String get() = base.ifEmpty { "label:$addon" }
+}
 
 /// A resolved, directly-playable handle for the player. The engine turns a [StreamSource] (which may
 /// be a torrent infohash, a debrid lock, or an HTTP link) into one of these: a concrete [url] the

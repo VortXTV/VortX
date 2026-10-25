@@ -152,13 +152,13 @@ private struct AppleSearchSubmissionExtract {
                 anchor: ".onReceive(MacSearchBridge.shared.$pending) { pending in", occurrence: 0
             ),
             "/*__DEDICATED_CHANGE_BODY__*/": extractor.closureBody(
-                anchor: ".onChange(of: query) { value in"
+                anchor: ".onValueChange(of: query) { value in"
             ),
             "/*__MERGED_HANDOFF_BODY__*/": extractor.closureBody(
                 anchor: ".onReceive(MacSearchBridge.shared.$pending) { pending in", occurrence: 1
             ),
             "/*__MERGED_CHANGE_BODY__*/": extractor.closureBody(
-                anchor: ".onChange(of: searchQuery) { value in"
+                anchor: ".onValueChange(of: searchQuery) { value in"
             ),
             "/*__SUBMIT_TOUCH_SEARCH__*/": extractor.function(anchor: "private func submitTouchSearch("),
             "/*__SCHEDULE_SEARCH__*/": extractor.function(anchor: "private func scheduleSearch("),

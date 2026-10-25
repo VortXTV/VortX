@@ -3,7 +3,7 @@ import Foundation
 /// Pure ownership gate for player callbacks. It is deliberately independent of SwiftUI and the
 /// engine so the profile-switch cases can be tested without a running player.
 enum PlaybackMutationOwnershipPolicy {
-    enum Target: Hashable {
+    enum Target: Hashable, Sendable {
         /// `historyCapture` is present only for the canonical owner player session.  It is
         /// deliberately part of the target captured at player mount, rather than acquired when
         /// a delayed progress callback happens to run.
@@ -15,7 +15,7 @@ enum PlaybackMutationOwnershipPolicy {
         case native(NativeBinding?)
     }
 
-    struct NativeBinding: Hashable {
+    struct NativeBinding: Hashable, Sendable {
         let profileID: UUID
         let credential: CredentialScopeRegistry.Capture
         let sessionGeneration: UUID

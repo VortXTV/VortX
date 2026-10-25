@@ -25,7 +25,7 @@ import Foundation
 ///     timestamps change nothing, so a re-pull can never flap.
 ///
 /// A cleared rating is a TOMBSTONE (`rating == nil`), not a deletion, so rule 4 can compare against it.
-struct SIMKLRatingsCore: Equatable {
+struct SIMKLRatingsCore: Equatable, Sendable {
     /// Valid SIMKL rating range. A value outside this is refused rather than clamped.
     static let validRange = 1...10
     /// Bound the file. Only PUSHED TOMBSTONES are ever pruned (oldest first): a real rating is the user's own

@@ -114,32 +114,22 @@ struct VXProbeLogSnapshot: Sendable {
 /// background queue, so callers (the main/render thread, player callbacks, the engine worker) never block
 /// on disk I/O or NSLog. A persistent file handle is kept open so each line is a single write() syscall
 /// instead of open+seek+close, and the front is trimmed only occasionally (once the file passes maxBytes)
-/// rather than on every line. The serial queue is the synchronization, so no separate lock is needed.
-final class VXProbeFileLog {
+/// rather than on every line. Every append/snapshot/consume operation is ordered on the dedicated serial
+/// queue; the checked lock owns the mutable writer state for Swift concurrency as well.
+final class VXProbeFileLog: Sendable {
     static let shared = VXProbeFileLog()
 
-    /// Trim once the file passes this size, keeping roughly the last `keepBytes`. ~3 MiB cap, ~2 MiB
-    /// retained, so the tail the owner actually needs survives without the file growing without bound.
     private static let maxBytes = 3 * 1024 * 1024
     private static let keepBytes = 2 * 1024 * 1024
-
-    /// Dedicated serial queue: serializes every write AND keeps all logging off the caller's thread.
-    /// Utility QoS so it never contends with the main/render thread.
     private let queue = DispatchQueue(label: "stremiox.vxprobe.filelog", qos: .utility)
-
-    /// caches/vortx-diag.log in the app container. Computed once; the caches dir always exists.
     let fileURL: URL
 
-    /// Persistent write handle, opened lazily on the queue and reused. Queue-only; never touched off `queue`.
-    private var handle: FileHandle?
-    private var bytesWritten = 0
-
-    private lazy var formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
+    private struct State {
+        var handle: FileHandle?
+        var bytesWritten = 0
+        var formatter: DateFormatter?
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     private init() {
         let caches = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
@@ -148,70 +138,65 @@ final class VXProbeFileLog {
         fileURL = caches.appendingPathComponent("vortx-diag.log")
     }
 
-    /// Record one line: NSLog + file append, both dispatched ASYNC to the serial queue so the caller
-    /// returns immediately. The timestamp is captured on the caller so it stays accurate even if the queue
-    /// is momentarily backed up. Fail-soft: any file error is swallowed so logging never destabilizes the app.
     func record(category: String, message: String) {
         let now = Date()
         queue.async { [weak self] in
             guard let self else { return }
-            // FORM THE WHOLE LINE THROUGH THE SHARED FORMATTER, then use those same bytes for both sinks, so
-            // there is exactly ONE place where a probe line becomes durable and it is downstream of the
-            // scrubber. NSLog gets the identical text (a device console log is shared just as casually as the
-            // file). Category is scrubbed too, and the cap covers the COMPLETE line rather than the message
-            // alone, so nothing can be appended after the cap to exceed it.
-            //
-            // This is a BACKSTOP, not the fix: the producers that build identifier-bearing strings are
-            // corrected at their own call sites. It is here because the producer set is open, and a new one
-            // must not be able to reintroduce the class. See VXProbeRedaction for what it does and, more
-            // importantly, what it cannot do.
-            let line = VXProbeRedaction.durableLine(timestamp: self.formatter.string(from: now),
-                                                    category: category, message: message)
-            NSLog("%@", String(line.dropLast()))
-            guard let data = line.data(using: .utf8) else { return }
-            self.write(data)
+            self.state.withLock { state in
+                // Use one scrubbed line for both sinks. The cap applies to the complete durable line,
+                // including its timestamp and category, rather than only to the producer's message.
+                let formatter: DateFormatter
+                if let cached = state.formatter {
+                    formatter = cached
+                } else {
+                    let created = DateFormatter()
+                    created.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+                    created.locale = Locale(identifier: "en_US_POSIX")
+                    state.formatter = created
+                    formatter = created
+                }
+                let line = VXProbeRedaction.durableLine(
+                    timestamp: formatter.string(from: now),
+                    category: category,
+                    message: message
+                )
+                NSLog("%@", String(line.dropLast()))
+                guard let data = line.data(using: .utf8) else { return }
+                self.write(data, state: &state)
+            }
         }
     }
 
-    /// Back-compat alias for existing call sites; enqueues exactly like `record`.
     func append(category: String, message: String) { record(category: category, message: message) }
 
-    /// Write one line via the persistent handle, opening/creating it on first use, then trim the front only
-    /// if the file has passed the cap. Queue-only.
-    private func write(_ data: Data) {
-        if handle == nil {
+    private func write(_ data: Data, state: inout State) {
+        if state.handle == nil {
             if !FileManager.default.fileExists(atPath: fileURL.path) {
                 FileManager.default.createFile(atPath: fileURL.path, contents: nil)
             }
-            handle = try? FileHandle(forWritingTo: fileURL)
-            if let h = handle { bytesWritten = Int((try? h.seekToEnd()) ?? 0) }
+            state.handle = try? FileHandle(forWritingTo: fileURL)
+            if let handle = state.handle { state.bytesWritten = Int((try? handle.seekToEnd()) ?? 0) }
         }
-        guard let handle else { return }
+        guard let handle = state.handle else { return }
         do {
             try handle.write(contentsOf: data)
-            bytesWritten += data.count
+            state.bytesWritten += data.count
         } catch {
-            // The persistent handle went bad (file removed out from under us, disk pressure). Drop it so the
-            // NEXT line reopens a fresh handle instead of reusing the dead one and silently losing every probe
-            // line for the rest of the session.
             try? handle.close()
-            self.handle = nil
+            state.handle = nil
             return
         }
-        if bytesWritten > Self.maxBytes { trimFront() }
+        if state.bytesWritten > Self.maxBytes { trimFront(state: &state) }
     }
 
-    /// Rewrite the file keeping ~the last `keepBytes`, rounded up to a clean line. Runs rarely (only once
-    /// the file passes the cap) and only on the queue, so the whole-file rewrite never touches a hot thread.
-    private func trimFront() {
-        try? handle?.close()
-        handle = nil
-        guard let data = try? Data(contentsOf: fileURL) else { bytesWritten = 0; return }
+    private func trimFront(state: inout State) {
+        try? state.handle?.close()
+        state.handle = nil
+        guard let data = try? Data(contentsOf: fileURL) else { state.bytesWritten = 0; return }
         let dropCount = data.count - Self.keepBytes
         guard dropCount > 0, dropCount < data.count else {
-            // Reopen and continue appending if the drop math does not apply.
-            handle = try? FileHandle(forWritingTo: fileURL)
-            _ = try? handle?.seekToEnd()
+            state.handle = try? FileHandle(forWritingTo: fileURL)
+            _ = try? state.handle?.seekToEnd()
             return
         }
         var tail = data.subdata(in: dropCount..<data.count)
@@ -219,64 +204,64 @@ final class VXProbeFileLog {
             tail = tail.subdata(in: (newline + 1)..<tail.count)
         }
         try? tail.write(to: fileURL, options: .atomic)
-        handle = try? FileHandle(forWritingTo: fileURL)
-        _ = try? handle?.seekToEnd()
-        bytesWritten = tail.count
+        state.handle = try? FileHandle(forWritingTo: fileURL)
+        _ = try? state.handle?.seekToEnd()
+        state.bytesWritten = tail.count
     }
 
-    /// Serialize behind every pending async record, flush the persistent handle, then read one coherent file
-    /// image for export. The queue is never a caller queue for export, so queue.sync cannot recurse.
     func snapshot() -> VXProbeLogSnapshot {
+        // This export-only synchronous hop drains earlier writes and takes one coherent file image.
         queue.sync {
-            try? handle?.synchronize()
-            let bytes = (try? Data(contentsOf: fileURL)) ?? Data()
-            return VXProbeLogSnapshot(
-                contents: String(decoding: bytes, as: UTF8.self),
-                bytes: bytes
-            )
+            state.withLock { state in
+                try? state.handle?.synchronize()
+                let bytes = (try? Data(contentsOf: fileURL)) ?? Data()
+                return VXProbeLogSnapshot(contents: String(decoding: bytes, as: UTF8.self), bytes: bytes)
+            }
         }
     }
 
-    /// Remove a delivered snapshot without erasing lines written after snapshot creation. If front trimming
-    /// or an external replacement changed the prefix while the transfer was in flight, preserve the complete
-    /// current file because there is no safe correspondence to consume.
     func consume(_ snapshot: VXProbeLogSnapshot) {
         queue.async { [weak self] in
             guard let self, !snapshot.bytes.isEmpty else { return }
-            try? self.handle?.synchronize()
-            try? self.handle?.close()
-            self.handle = nil
-            let current = (try? Data(contentsOf: self.fileURL)) ?? Data()
-            guard let remaining = VXDiagExportPolicy.remainingLogAfterSuccessfulSnapshot(
-                snapshot: snapshot.bytes,
-                current: current
-            ) else {
-                self.reopenForAppend(byteCount: current.count)
-                return
-            }
-            do {
-                try remaining.write(to: self.fileURL, options: .atomic)
-                self.reopenForAppend(byteCount: remaining.count)
-            } catch {
-                self.reopenForAppend(byteCount: current.count)
+            self.state.withLock { state in
+                try? state.handle?.synchronize()
+                try? state.handle?.close()
+                state.handle = nil
+                let current = (try? Data(contentsOf: self.fileURL)) ?? Data()
+                // Consume only the exact delivered prefix. A mismatch means trimming/replacement occurred,
+                // so preserve the entire current log rather than risk deleting newer history.
+                guard let remaining = VXDiagExportPolicy.remainingLogAfterSuccessfulSnapshot(
+                    snapshot: snapshot.bytes,
+                    current: current
+                ) else {
+                    self.reopenForAppend(state: &state, byteCount: current.count)
+                    return
+                }
+                do {
+                    try remaining.write(to: self.fileURL, options: .atomic)
+                    self.reopenForAppend(state: &state, byteCount: remaining.count)
+                } catch {
+                    self.reopenForAppend(state: &state, byteCount: current.count)
+                }
             }
         }
     }
 
-    private func reopenForAppend(byteCount: Int) {
-        handle = try? FileHandle(forWritingTo: fileURL)
-        _ = try? handle?.seekToEnd()
-        bytesWritten = byteCount
+    private func reopenForAppend(state: inout State, byteCount: Int) {
+        state.handle = try? FileHandle(forWritingTo: fileURL)
+        _ = try? state.handle?.seekToEnd()
+        state.bytesWritten = byteCount
     }
 
-    /// Empty the log file. Enqueued on the queue so it serializes with writes.
     func clear() {
         queue.async { [weak self] in
             guard let self else { return }
-            try? self.handle?.close()
-            self.handle = nil
-            try? Data().write(to: self.fileURL, options: .atomic)
-            self.bytesWritten = 0
+            self.state.withLock { state in
+                try? state.handle?.close()
+                state.handle = nil
+                try? Data().write(to: self.fileURL, options: .atomic)
+                state.bytesWritten = 0
+            }
         }
     }
 }
@@ -284,67 +269,61 @@ final class VXProbeFileLog {
 /// Thread-safe scratchpad describing what the app is doing right now, sampled by the heartbeat. Held
 /// behind a single lock; setters take it only briefly. Written from wherever the relevant state
 /// changes (screen router, player) and read once a second by the heartbeat.
-final class VXProbeState {
+final class VXProbeState: Sendable {
     static let shared = VXProbeState()
     private init() {}
 
-    private let lock = NSLock()
+    private struct State {
+        var route = "-"
+        var playerState = "idle"
+        var posSec = 0
+        var durSec = 0
+        var sourceLabel = "-"
+        var engine = "-"
+        var buffering = false
+        var lastEvent = "-"
+        var eventSeq = 0
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
-    // All guarded by `lock`.
-    private var route = "-"
-    private var playerState = "idle"
-    private var posSec = 0
-    private var durSec = 0
-    private var sourceLabel = "-"
-    private var engine = "-"
-    private var buffering = false
-    private var lastEvent = "-"
-    private var eventSeq = 0
-
-    /// Current screen / route the user is on.
-    func setRoute(_ s: String) {
-        lock.lock(); defer { lock.unlock() }
-        route = s
+    func setRoute(_ value: String) {
+        state.withLock { $0.route = value }
     }
 
-    /// Update any subset of the player fields. Nil arguments leave the existing value untouched, so a
-    /// caller that only knows the position can pass just `pos:` without clobbering the rest.
-    func setPlayer(state: String? = nil, pos: Int? = nil, dur: Int? = nil,
+    func setPlayer(state playerState: String? = nil, pos: Int? = nil, dur: Int? = nil,
                    source: String? = nil, engine: String? = nil, buffering: Bool? = nil) {
-        lock.lock(); defer { lock.unlock() }
-        if let state { playerState = state }
-        if let pos { posSec = pos }
-        if let dur { durSec = dur }
-        if let source { sourceLabel = source }
-        if let engine { self.engine = engine }
-        if let buffering { self.buffering = buffering }
+        state.withLock { state in
+            if let playerState { state.playerState = playerState }
+            if let pos { state.posSec = pos }
+            if let dur { state.durSec = dur }
+            if let source { state.sourceLabel = source }
+            if let engine { state.engine = engine }
+            if let buffering { state.buffering = buffering }
+        }
     }
 
-    /// A10-i: reset the player fields to idle at a definitive teardown (engine Unload / the player screen's
-    /// real disappearance). The player fields otherwise freeze at their last live values with nothing ever
-    /// clearing them, so the heartbeat kept reporting player=playing for minutes after playback ended. The
-    /// route is owned by `setRoute` and left untouched here.
     func clearPlayer() {
-        lock.lock(); defer { lock.unlock() }
-        playerState = "idle"
-        posSec = 0
-        durSec = 0
-        sourceLabel = "-"
-        engine = "-"
-        buffering = false
+        state.withLock { state in
+            state.playerState = "idle"
+            state.posSec = 0
+            state.durSec = 0
+            state.sourceLabel = "-"
+            state.engine = "-"
+            state.buffering = false
+        }
     }
 
-    /// Record the most recent discrete event and bump the monotonically increasing sequence.
-    func note(_ s: String) {
-        lock.lock(); defer { lock.unlock() }
-        lastEvent = s
-        eventSeq += 1
+    func note(_ value: String) {
+        state.withLock { state in
+            state.lastEvent = value
+            state.eventSeq += 1
+        }
     }
 
-    /// Compact one-line summary for the heartbeat.
     func snapshot() -> String {
-        lock.lock(); defer { lock.unlock() }
-        return "screen=\(route) player=\(playerState) pos=\(posSec)/\(durSec)s src=\(sourceLabel) engine=\(engine) buf=\(buffering ? 1 : 0) last=\(lastEvent)"
+        state.withLock { state in
+            "screen=\(state.route) player=\(state.playerState) pos=\(state.posSec)/\(state.durSec)s src=\(state.sourceLabel) engine=\(state.engine) buf=\(state.buffering ? 1 : 0) last=\(state.lastEvent)"
+        }
     }
 }
 
@@ -353,18 +332,18 @@ final class VXProbeState {
 /// thread. Idempotent to start; keeps a strong reference to the timer so it is not deallocated.
 enum VXProbeHeartbeat {
     private static let queue = DispatchQueue(label: "stremiox.vxprobe.heartbeat", qos: .utility)
-    private static var timer: DispatchSourceTimer?
+    private static let timerState = OSAllocatedUnfairLock<DispatchSourceTimer?>(initialState: nil)
     private static let start0 = ProcessInfo.processInfo.systemUptime
 
     /// Begin the heartbeat. No-op if already running or if probing is disabled.
     static func start() {
         guard VXProbe.enabled else { return }
         queue.sync {
-            guard timer == nil else { return }
+            guard timerState.withLock({ $0 == nil }) else { return }
             let t = DispatchSource.makeTimerSource(queue: queue)
             t.schedule(deadline: .now() + 1.0, repeating: 1.0)
             t.setEventHandler { tick() }
-            timer = t
+            timerState.withLock { $0 = t }
             t.resume()
         }
     }

@@ -23,7 +23,7 @@ function compileRun(name,source,extra=[]) {
  const file=path.join(output,name+'.swift');fs.writeFileSync(file,source);
  for(const version of ['5','6']) {
   const exe=path.join(output,name+'-swift'+version);
-  const compile=spawnSync('xcrun',['swiftc','-swift-version',version,'-strict-concurrency=complete','-warnings-as-errors','-parse-as-library',file,'-o',exe],{encoding:'utf8'});
+  const compile=spawnSync('xcrun',['swiftc','-swift-version',version,'-strict-concurrency=complete','-warnings-as-errors','-j','1','-num-threads','1','-parse-as-library',file,'-o',exe],{encoding:'utf8'});
   fs.writeFileSync(exe+'.compile.log',compile.stdout+compile.stderr);
   if(compile.status!==0)throw Error(compile.stderr);
   const run=spawnSync(exe,extra,{encoding:'utf8',timeout:30000});
@@ -34,7 +34,7 @@ function compileRun(name,source,extra=[]) {
 }
 function sdkCheck(file,sdk,target,flags=[]) {
  const sdkPath=execFileSync('xcrun',['--sdk',sdk,'--show-sdk-path'],{encoding:'utf8'}).trim();
- const compile=spawnSync('xcrun',['swiftc','-swift-version','6','-strict-concurrency=complete','-typecheck',...flags,'-sdk',sdkPath,'-target',target,file],{encoding:'utf8'});
+ const compile=spawnSync('xcrun',['swiftc','-swift-version','6','-strict-concurrency=complete','-j','1','-num-threads','1','-typecheck',...flags,'-sdk',sdkPath,'-target',target,file],{encoding:'utf8'});
  fs.writeFileSync(path.join(output,path.basename(file)+'.'+sdk+'.compile.log'),compile.stdout+compile.stderr);
  if(compile.status!==0)throw Error(compile.stderr);
  console.log('REAL_SDK_PRODUCTION_EXTRACT_TYPECHECKED '+sdk);
@@ -46,7 +46,7 @@ const markers=['private func scheduleHide()','private var controlsAutoHideEligib
  'private func setVolumeEditing(','private func macPointerMoved()'];
 const holder=block(source,'private final class ControlsHideClock');
 const methods=markers.map(m=>block(source,m)).join('\n');
-if(!source.includes('.onChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }'))throw Error('Eligibility observer disconnected');
+if(!source.includes('.onValueChange(of: controlsAutoHideEligible) { _ in refreshControlsAutoHide() }'))throw Error('Eligibility observer disconnected');
 if(!source.includes('if case .active = phase { macPointerMoved() }'))throw Error('Pointer input disconnected');
 if(!source.includes('onEditingChanged: setVolumeEditing'))throw Error('Volume hold disconnected');
 for(const line of source.split('\n'))if(line.includes('hideTask?.cancel()')&&!line.includes('hideTask = nil'))throw Error('Cancelled timer handle retained');
@@ -62,11 +62,12 @@ const runtime=harness.replace('    // __PRODUCTION_CLOCK_HOLDER__',holder.replac
  .replace('    // __PRODUCTION_CONTROL_METHODS__',controlled);
 if(runtime.includes('__PRODUCTION_'))throw Error('Unfilled production marker');
 compileRun('player-controls-auto-hide',runtime);
-const observer=source.match(/        \.onChange\(of: controlsAutoHideEligible\)[^\n]+/)[0];
+const observer=source.match(/        \.onValueChange\(of: controlsAutoHideEligible\)[^\n]+/)[0];
 const pointer=source.match(/        \.onContinuousHover \{ phase in\n[^\n]+\n        \}/)[0];
 const volume=source.slice(source.indexOf('    private var volumeControl:'),source.indexOf('    private var centerTransport:'));
 const slider=block(read('app/SourcesShared/VortXControls.swift'),'struct VortXSlider:');
-const sdkFixture='import SwiftUI\n'+
+const valueChangeObservation=read('app/SourcesShared/ValueChangeObservation.swift');
+const sdkFixture=valueChangeObservation+'\n'+
 'enum Theme { enum Palette { static let textPrimary=Color.white; static let accent=Color.orange }; enum Motion { static let state=Animation.easeOut(duration: 0.18) } }\n'+
 '@propertyWrapper struct ReducedMotion: DynamicProperty { var wrappedValue: Bool { false } }\n'+slider+'\n'+
 '@MainActor struct ModifierProbe: View {\n'+
