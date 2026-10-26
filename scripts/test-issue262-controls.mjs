@@ -9,9 +9,17 @@ import { join, resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..');
 process.chdir(root);
 const args = process.argv.slice(2);
-assert(args.length === 0 || (args.length === 2 && args[0] === '--baseline-ref'));
-const read = path => args.length
-  ? execFileSync('git', ['show', `${args[1]}:${path}`], { encoding: 'utf8' })
+let baselineRef = null, selectedMode = 'all';
+for (let index = 0; index < args.length; index += 2) {
+  const option = args[index], value = args[index + 1];
+  assert(value !== undefined, `missing value for ${option}`);
+  if (option === '--baseline-ref') { assert.equal(baselineRef, null); baselineRef = value; }
+  else if (option === '--mode') { assert(['native', 'legacy', 'all'].includes(value)); selectedMode = value; }
+  else { assert.fail(`unknown option ${option}`); }
+}
+const modes = selectedMode === 'all' ? ['native', 'legacy'] : [selectedMode];
+const read = path => baselineRef !== null
+  ? execFileSync('git', ['show', `${baselineRef}:${path}`], { encoding: 'utf8' })
   : readFile(path, 'utf8');
 const paths = {
   qr: 'app/SourcesShared/LinkLoginView.swift', account: 'app/SourcesShared/StremioAccount.swift',
@@ -85,12 +93,14 @@ const extracted = {
   qr: ['private func start()', 'private func stop()'].map(s => member(inputs.qr, s)).join('\n'),
   account: ['private struct AuthOperationContext:', 'private func captureAuthOperationContext()',
     'private func beginAuthOperation()', 'private func authOperationStillCurrent(',
-    'func captureLinkLoginAdmission()', 'func reloadForActiveProfile(', 'enum LinkSignInOutcome:', 'func signInWithAuthKey(']
+    'func captureLinkLoginAdmission()', 'func reloadForActiveProfile(', 'enum LinkSignInOutcome:', 'func signInWithAuthKey(',
+    'func retryCurrentConnection()']
     .map(s => member(inputs.account, s)).join('\n'),
   override: member(inputs.manager, '@discardableResult func keepThisDeviceOverridingAccount()'),
   tv: member(inputs.tvLogin, 'private func handleStremioSignIn('),
   ios: member(inputs.iosLogin, 'private func handleStremioSignIn('),
-  card: member(inputs.card, 'private func handleStremioSignIn(')
+  card: ['private func handleStremioSignIn(', 'private func refreshStremioImport()', 'private func cancelStremioImport()']
+    .map(s => member(inputs.card, s)).join('\n')
 };
 for (const key of ['card', 'tvLogin', 'iosLogin']) {
   const observer = key === 'tvLogin' ? '.onChange' : '.onValueChange';
@@ -102,6 +112,9 @@ for (const key of ['card', 'tvLogin', 'iosLogin']) {
 }
 assert(inputs.card.includes('if connecting {') && inputs.card.includes('} else if account.isSignedIn {'), 'partial card must keep retry UI mounted');
 assert(inputs.card.includes('Button("Retry connection")') && inputs.card.includes('if let warning = account.signInError'), 'partial saved connection needs a visible warning and retry');
+const signedInCard = inputs.card.slice(inputs.card.indexOf('} else if account.isSignedIn {'), inputs.card.indexOf('\n            } else {', inputs.card.indexOf('} else if account.isSignedIn {')));
+assert(signedInCard.includes('"Refresh Stremio import"') && signedInCard.includes('refreshStremioImport()'), 'saved connection needs an explicit import action after its in-memory warning is lost');
+assert(inputs.card.includes('.onDisappear { cancelStremioImport() }'), 'unmounted import control must retire its original task');
 const template = await readFile('app/Tests/Issue262ControlTests.swift', 'utf8');
 let combined = template;
 for (const [key, source] of Object.entries(extracted)) {
@@ -114,15 +127,15 @@ const directory = await mkdtemp(join(root, 'app/build/issue262-controls.'));
 const swift = join(directory, 'Combined.swift');
 await writeFile(swift, combined);
 await writeFile(join(directory, 'source-receipt.json'), JSON.stringify({
-  sourceRoot: root, baseline: args[1] ?? null,
+  sourceRoot: root, baseline: baselineRef, modes,
   inputs: Object.fromEntries(Object.entries(inputs).map(([key, source]) => [paths[key], createHash('sha256').update(source).digest('hex')])),
   extracts: Object.fromEntries(Object.entries(extracted).map(([key, source]) => [key, createHash('sha256').update(source).digest('hex')])),
   methodTransformations: [],
   boundary: 'Exact methods, inert dependency graph and accelerated polling clock. No native SDK, Keychain, defaults, HTTP, UI runtime, app build, installation or launch.'
 }, null, 2) + '\n');
-for (const mode of ['native', 'legacy']) {
+for (const mode of modes) {
   const output = join(directory, `${mode}-controls`);
-  execFileSync('xcrun', ['swiftc', '-swift-version', '6', '-parse-as-library', '-strict-concurrency=complete',
+  execFileSync('xcrun', ['swiftc', '-j', '1', '-num-threads', '1', '-swift-version', '6', '-parse-as-library', '-strict-concurrency=complete',
     '-warnings-as-errors', ...(mode === 'native' ? ['-D', 'VORTX_NATIVE_DATA_ENGINE'] : []), swift, '-o', output], { stdio: 'inherit' });
   const result = spawnSync(output, [], { encoding: 'utf8' });
   const log = (result.stdout ?? '') + (result.stderr ?? '');

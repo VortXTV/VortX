@@ -2565,7 +2565,8 @@ actor VortxNativeSession {
         return Double(offset) / 1000
     }
     /// The kernel materializes membership/order; hosts do not reproduce its merge reducer.
-    func addonSnapshot() throws -> (state: VortxJSON, inventories: [String: [VortxJSON]]) {
+    func addonSnapshot() throws -> (state: VortxJSON, inventories: [String: [VortxJSON]],
+                                   ownerHistoryLibrary: OwnerHistorySessionPublication.Presentation?) {
         let state = try presentationState()
         guard case .object(let profiles) = state["roster"]?["profiles"] else { throw VortxNativeError.invalidSnapshot }
         var inventories: [String: [VortxJSON]] = [:]
@@ -2582,7 +2583,22 @@ actor VortxNativeSession {
             }
             inventories[id] = rows
         }
-        return (state, inventories)
+        // The raw checkpoint's base libraries do not materialize imported owner-history sources.
+        // Sample their composed native VIEW in this same actor turn. This disposable UI value never
+        // becomes a checkpoint/export carrier, and native holds/removals stay authoritative.
+        let ownerLibrary: OwnerHistorySessionPublication.Presentation?
+        if let ownerHistory {
+            let capture = try ownerHistory.capture(target: currentOwnerHistoryTarget(requireCredential: false),
+                sourceAuthority: OwnerHistoryLeaseAuthority(lease: lease), queueAuthority: OwnerHistoryLeaseAuthority(lease: lease))
+            let view = try OwnerHistorySessionPublication.Presentation(
+                view: ownerHistory.read(kind: "view", capture: capture), expectedFence: capture.fence)
+            guard state["activeProfileId"] == .string(view.profileID),
+                  view.scope == scope.account, view.ownerProfileID == scope.ownerProfileID else {
+                throw VortxNativeError.superseded
+            }
+            ownerLibrary = view
+        } else { ownerLibrary = nil }
+        return (state, inventories, ownerLibrary)
     }
     func resourceRegistry() throws -> [VortxResourceAddon] {
         let state = try presentationState()
