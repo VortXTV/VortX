@@ -14,10 +14,11 @@ struct StremioConnectCard: View {
 
     /// Reveals the shared QR/code panel inline while a connect is in flight.
     @State private var connecting = false
-    /// Run the post-sign-in engine seed + owned-addon snapshot exactly once (parity with LoginView's
-    /// latch): `@Published isSignedIn` re-publishes on every assignment, so an unlatched sink could
-    /// re-enter on a later republish.
+    /// Handle each acknowledged connection once, including a deliberate true -> true retry.
     @State private var didHandleSignIn = false
+    @State private var handledCredentialBoundaryGeneration: UInt64?
+    @State private var importTask: Task<Void, Never>?
+    @State private var importGeneration = UUID()
 
     var body: some View {
         StremioProviderCard {
@@ -40,6 +41,11 @@ struct StremioConnectCard: View {
                 }
                 Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                // The saved credential and pending import can survive a launch that loses the warning.
+                // This explicit action re-enters the authenticated coordinator; mounting the card does not.
+                Button(importTask == nil ? "Refresh Stremio import" : "Refreshing import…") { refreshStremioImport() }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .disabled(importTask != nil)
                 Button("Disconnect") { disconnect() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             } else {
@@ -63,22 +69,51 @@ struct StremioConnectCard: View {
             // Re-arm the one-shot latch after a disconnect so a later reconnect runs the handoff again.
             if !signedIn { didHandleSignIn = false }
         }
+        .onDisappear { cancelStremioImport() }
     }
 
     @MainActor
     private func handleStremioSignIn(signedIn: Bool) {
-        guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
+        guard signedIn, account.signInError == nil,
+              !didHandleSignIn || handledCredentialBoundaryGeneration != account.credentialBoundaryGeneration else { return }
         didHandleSignIn = true
+        handledCredentialBoundaryGeneration = account.credentialBoundaryGeneration
         connecting = false
         core.signedInWithLegacyAuthKey()
+        let admission = account.captureLinkLoginAdmission()
         Task { @MainActor in
+            guard admission() else { return }
             await core.awaitAddonsHydrated()
+            guard admission() else { return }
             await VortXSyncManager.shared.snapshotOwnedFromEngine()
         }
     }
 
     @MainActor
+    private func refreshStremioImport() {
+        guard importTask == nil else { return }
+        // Capture at the click, before the Task gets its first actor turn. A profile/account change
+        // in that gap must not turn the old viewer's click into an import for the replacement viewer.
+        let admission = account.captureLinkLoginAdmission()
+        let generation = UUID()
+        importGeneration = generation
+        importTask = Task { @MainActor in
+            if admission() { _ = await account.retryCurrentConnection() }
+            guard importGeneration == generation else { return }
+            importTask = nil
+        }
+    }
+
+    @MainActor
+    private func cancelStremioImport() {
+        importGeneration = UUID()
+        importTask?.cancel()
+        importTask = nil
+    }
+
+    @MainActor
     private func disconnect() {
+        cancelStremioImport()
         account.signOut()
         core.logOut()
         connecting = false

@@ -5,12 +5,13 @@ projection_ref=working-tree
 projection_mode=run
 if (( $# > 0 )); then projection_ref=$1; fi
 if (( $# > 1 )); then projection_mode=$2; fi
-case "$projection_mode" in run|--prepare-only|--functional-only) ;; *) exit 2 ;; esac
+case "$projection_mode" in run|--prepare-only|--functional-only|--owner-history-red) ;; *) exit 2 ;; esac
 mkdir -p app/build
 projection_dir=$(mktemp -d "$PWD/app/build/native-library-projection.XXXXXX")
 projection_phase=source-extraction
 projection_inputs=(app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxResourceBridge.swift
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativePreviouslyWatched.swift
+  app/SourcesShared/VortxNativeSession.swift app/SourcesShared/OwnerHistoryExactJSON.swift app/SourcesShared/OwnerHistorySessionPublication.swift
   app/Tests/NativeLibraryProjectionTests.swift
   scripts/test-native-library-projection-perf.sh)
 projection_finish() {
@@ -31,9 +32,9 @@ projection_finish() {
 }
 trap projection_finish EXIT
 shasum -a 256 "${projection_inputs[@]}" > "$projection_dir/source-before.sha256"
-node - "$projection_dir" "$projection_ref" <<'NODE'
+node - "$projection_dir" "$projection_ref" "$projection_mode" <<'NODE'
 const fs = require('node:fs'), cp = require('node:child_process'), crypto = require('node:crypto'), assert = require('node:assert/strict');
-const [out, ref] = process.argv.slice(2);
+const [out, ref, mode] = process.argv.slice(2);
 const baseline = '82cc8387222469d36dfbb7fc09881c375e36de45';
 const read = (path, revision = ref) => revision === 'working-tree' ? fs.readFileSync(path, 'utf8') : cp.execFileSync('git', ['show', revision + ':' + path], {encoding: 'utf8', maxBuffer: 8 * 1024 * 1024});
 function member(source, marker) {
@@ -60,6 +61,13 @@ const watched = read('app/SourcesShared/VortxNativePreviouslyWatched.swift');
 const membership = member(current, 'struct VortxLibraryMembership: Sendable {');
 const oldWatched = read('app/SourcesShared/VortxNativePreviouslyWatched.swift', baseline);
 const fixture = fs.readFileSync('app/Tests/NativeLibraryProjectionTests.swift', 'utf8');
+// The behavioral red uses the exact older projection body with today's optional composed VIEW
+// present but ignored. Its failure must come from missing imported rows, not missing new methods.
+const publication = fs.readFileSync('app/SourcesShared/OwnerHistorySessionPublication.swift', 'utf8');
+const exact = fs.readFileSync('app/SourcesShared/OwnerHistoryExactJSON.swift', 'utf8');
+const exactPrefixEnd = exact.indexOf('    /// Complete native ENGINE output only,');
+assert.ok(exactPrefixEnd > 0);
+const pureExact = exact.slice(0, exactPrefixEnd) + member(exact, 'private struct Parser {') + '\n}';
 const markers = ['private func string(', 'private func projectedLibraryItems(', 'private func libraryRow(', 'private func libraryProjection(', 'private func localSearchProjection(', 'private func stateFields(', 'private func metaWithPlayback(', 'private func isoTimestamp(', 'private func playbackRow('];
 const managementHelpers = ['private func addonOwner(', 'private func addonManagementProjection(']
   .map(marker => member(current, marker)).join('\n');
@@ -69,6 +77,8 @@ const sourceChangedHook = current.split('\n').filter(line => line.trim()
   === 'private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?');
 assert.equal(sourceChangedHook.length, 1, 'unique exact production generic source-delivery property');
 const combined = fixture
+  .replace('// PRODUCTION_EXACT_JSON', pureExact)
+  .replace('// PRODUCTION_OWNER_LIBRARY', member(publication, 'struct Presentation: Sendable {'))
   .replace('// PRODUCTION_JSON', member(resource, 'indirect enum VortxJSON:'))
   .replace('// PRODUCTION_MEMBERSHIP', membership)
   .replace('// PRODUCTION_LOCK', member(current, 'final class VortxNativeFacadeLock:'))
@@ -105,6 +115,27 @@ function verifyMembershipSource(source) {
   assert.ok(close.includes('metadataLibraryMembership = VortxLibraryMembership()') && close.indexOf('metadataLibraryMembership = VortxLibraryMembership()') < close.indexOf('lock.unlock()'), 'Close clears membership while holding the facade lock');
 }
 verifyMembershipSource(current);
+if (mode !== '--owner-history-red') {
+  const session = fs.readFileSync('app/SourcesShared/VortxNativeSession.swift', 'utf8');
+  const snapshot = member(session, 'func addonSnapshot()');
+  assert.ok(snapshot.includes('ownerHistory.read(kind: "view", capture: capture)')
+    && snapshot.includes('expectedFence: capture.fence') && snapshot.includes('ownerLibrary = view')
+    && !snapshot.includes('try?'), 'one synchronous actor snapshot must require its original fenced composed view without fallback');
+  assert.equal((current.match(/ownerHistoryLibrary = addonSnapshot\.ownerHistoryLibrary/g) || []).length, 2,
+    'creation and locked acknowledged mutation must replace the composed view with their own snapshot');
+  assert.equal((current.match(/ownerLibrary\.playback/g) || []).length, 2,
+    'creation and acknowledged mutation must use playback from the same composed view');
+  const projection = member(current, 'private func projectedLibraryItems(');
+  assert.ok(projection.includes('view.profileID == active') && projection.includes('view.scope == string(state["nativeSync"]?["scope"])')
+    && projection.includes('view.ownerProfileID == string(state["nativeSync"]?["ownerProfileId"])'), 'cached VIEW must reject replacement account/owner/profile');
+  assert.ok(current.includes('self.playback = previousPlayback; self.ownerHistoryLibrary = previousOwnerLibrary')
+    && current.includes('self.addonInventories = previousAddonInventories'),
+    'projection failure must restore the previous paired playback/VIEW/inventory cache');
+} else {
+  assert.notEqual(ref, 'working-tree', 'red must name an immutable older revision');
+  assert.ok(!member(current, 'private func projectedLibraryItems(').includes('ownerHistoryLibrary'),
+    'behavioral red must compile the real old body that ignores composed source membership');
+}
 for (const fragment of ['library: metadataLibraryMembership', 'let membership = VortxLibraryMembership(projected)',
                         'metadataLibraryMembership = membership', 'metadataLibraryMembership = VortxLibraryMembership();']) {
   assert.ok(current.includes(fragment), 'missing negative control target');
@@ -119,7 +150,7 @@ shasum -a 256 "$projection_dir/Combined.swift" > "$projection_dir/generated-befo
 projection_phase=strict-swift6-compile
 /usr/bin/nice -n 15 xcrun swiftc -O -j 1 -num-threads 1 -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     -module-cache-path "$projection_dir/module-cache" "$projection_dir/Combined.swift" -o "$projection_dir/native-library-projection" > "$projection_dir/compiler.log" 2>&1
-if [[ "$projection_mode" == --functional-only ]]; then
+if [[ "$projection_mode" == --functional-only || "$projection_mode" == --owner-history-red ]]; then
   export VORTX_LIBRARY_PROJECTION_FUNCTIONAL_ONLY=1
 else
   unset VORTX_LIBRARY_PROJECTION_FUNCTIONAL_ONLY

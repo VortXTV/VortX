@@ -41,8 +41,16 @@ private enum LegacyWatchOwnership {
     static func invalidateSession() {}
 }
 @MainActor private enum Keychain {
+    enum Confirmed { case value(String), missing, failure }
     static var token: String?
+    static var readFailure = false
+    static var confirmedReads: [String] = []
     static func string(_ slot: String) -> String? { token }
+    static func confirmedString(_ slot: String) -> Confirmed {
+        confirmedReads.append(slot)
+        if readFailure { return .failure }
+        return token.map(Confirmed.value) ?? .missing
+    }
 }
 private struct Log { func info(_ message: String) {} }
 @MainActor private final class CoreBridge {
@@ -52,11 +60,14 @@ private struct Log { func info(_ message: String) {} }
     var admission = true
     var installs = 0
     var handoffs = 0
+    var hydrationGate: Gate?
+    var installedTokens: [String] = []
     func signedInWithLegacyAuthKey() { handoffs += 1 }
-    func awaitAddonsHydrated() async {}
+    func awaitAddonsHydrated() async { if let hydrationGate { await hydrationGate.wait() } }
     func captureNativeAccountLogin(importOwnerAddons: Bool) throws -> Int? { admission ? 1 : nil }
     func authenticateNativeOwnAccount(token: String, target: Int) async throws {
         installs += 1
+        installedTokens.append(token)
         if let gate { await gate.wait() }
         if let error {
             if error is VortxNativeOwnerAddonImport.Incomplete || error is VortxNativeAccountCredentials.OwnerPublicationUncertain
@@ -67,7 +78,7 @@ private struct Log { func info(_ message: String) {} }
         }
         Keychain.token = "persisted-fixture-only"
     }
-    func reset() { gate = nil; error = nil; admission = true; installs = 0; handoffs = 0 }
+    func reset() { gate = nil; error = nil; admission = true; installs = 0; handoffs = 0; hydrationGate = nil; installedTokens = [] }
 }
 @MainActor private final class StremioAccount {
     var signInError: String?
@@ -144,7 +155,8 @@ private struct Log { func info(_ message: String) {} }
 }
 @MainActor private final class VortXSyncManager {
     static let shared = VortXSyncManager()
-    func snapshotOwnedFromEngine() async {}
+    var snapshotCalls = 0
+    func snapshotOwnedFromEngine() async { snapshotCalls += 1 }
     struct Account { let id: String }
     struct AddonOrderIntent: Equatable { let accountID: String; let order: [String] }
     var account: Account? = .init(id: "fixture")
@@ -178,7 +190,12 @@ private struct Log { func info(_ message: String) {} }
     /* PRODUCTION_IOS */
 }
 @MainActor private final class CardHandoffFixture: HandoffFixture {
+    var handledCredentialBoundaryGeneration: UInt64?
+    var importTask: Task<Void, Never>?
+    var importGeneration = UUID()
     override func run(_ signedIn: Bool) { handleStremioSignIn(signedIn: signedIn) }
+    func refreshImport() { refreshStremioImport() }
+    func cancelImport() { cancelStremioImport() }
     /* PRODUCTION_CARD */
 }
 @main private enum Issue262ControlTests {
@@ -194,6 +211,8 @@ private struct Log { func info(_ message: String) {} }
         ProfileStore.shared.active = .init(id: UUID()); CredentialScopeRegistry.shared.generation += 1
         StremioAccount.storedTokens = []
         Keychain.token = nil
+        Keychain.readFailure = false; Keychain.confirmedReads = []
+        VortXSyncManager.shared.snapshotCalls = 0
     }
     @MainActor static func main() async {
         reset()
@@ -204,6 +223,93 @@ private struct Log { func info(_ message: String) {} }
         check(!qrSuccess.busy && !qrSuccess.signingIn, "successful completion retires busy state")
 
         #if VORTX_NATIVE_DATA_ENGINE
+        // #267 recovery: real extracted account/card methods, inert storage/native collaborators.
+        // This fixture proves user-intent and ownership controls, not native import durability.
+        reset()
+        Keychain.token = "persisted-fixture-only"
+        let relaunched = StremioAccount()
+        relaunched.reloadForActiveProfile() // pending credential survives, transient warning does not
+        let recoveryCard = CardHandoffFixture(relaunched)
+        recoveryCard.run(relaunched.isSignedIn)
+        await drain()
+        check(relaunched.isSignedIn && relaunched.signInError == nil && CoreBridge.shared.installs == 0,
+              "warning-free relaunch and card mount never automatically re-import")
+        for _ in 0..<2 {
+            let priorInstalls = CoreBridge.shared.installs, priorHandoffs = CoreBridge.shared.handoffs
+            recoveryCard.refreshImport(); recoveryCard.refreshImport()
+            await recoveryCard.importTask?.value
+            recoveryCard.run(relaunched.isSignedIn); recoveryCard.run(relaunched.isSignedIn)
+            check(CoreBridge.shared.installs == priorInstalls + 1 && CoreBridge.shared.installedTokens.last == "persisted-fixture-only",
+                  "one explicit click retries the confirmed saved credential without duplicate tasks or QR auth")
+            check(CoreBridge.shared.handoffs == priorHandoffs + 1 && recoveryCard.importTask == nil,
+                  "each acknowledged same-account retry refreshes screens once while signedIn stays true")
+        }
+        check(LinkAuthService.createCount == 0 && Keychain.confirmedReads.count == 2,
+              "saved-connection retries read confirmed storage once per user action")
+        recoveryCard.cancelImport()
+
+        for reason in [OwnerHistoryLoginPreparation.Incomplete.Reason.pendingMetadata, .importUnavailable] {
+            reset(); Keychain.token = "persisted-fixture-only"
+            let account = StremioAccount(); account.reloadForActiveProfile()
+            let card = CardHandoffFixture(account)
+            CoreBridge.shared.error = OwnerHistoryLoginPreparation.Incomplete(reason: reason)
+            card.refreshImport(); await card.importTask?.value
+            card.run(account.isSignedIn)
+            check(account.isSignedIn && Keychain.token != nil && account.signInError != nil
+                  && account.publications == 0 && CoreBridge.shared.handoffs == 0,
+                  "partial explicit re-import retains saved credential and warning without fabricating an import ACK")
+            CoreBridge.shared.error = nil
+            card.refreshImport(); await card.importTask?.value
+            card.run(account.isSignedIn)
+            check(account.signInError == nil && account.publications == 1 && CoreBridge.shared.handoffs == 1,
+                  "partial retained connection remains explicitly recoverable on the next attempt")
+        }
+
+        for unavailable in ["missing", "empty", "failure"] {
+            reset(); let account = StremioAccount()
+            Keychain.token = unavailable == "missing" ? nil : unavailable == "empty" ? "  " : "fixture-only"
+            Keychain.readFailure = unavailable == "failure"
+            let outcome = await account.retryCurrentConnection()
+            if case .failed = outcome {} else { check(false, "unavailable saved credential must fail") }
+            check(CoreBridge.shared.installs == 0 && account.publications == 0 && account.signInError != nil,
+                  "\(unavailable) confirmed credential never falls back to a new native import")
+        }
+
+        for retired in ["profileABA", "credentialABA"] {
+            reset(); Keychain.token = "persisted-fixture-only"
+            let account = StremioAccount(); account.reloadForActiveProfile()
+            let card = CardHandoffFixture(account)
+            card.refreshImport()
+            if retired == "profileABA" {
+                let original = ProfileStore.shared.active!.id
+                ProfileStore.shared.active = .init(id: UUID()); account.reloadForActiveProfile()
+                ProfileStore.shared.active = .init(id: original); account.reloadForActiveProfile()
+            } else { CredentialScopeRegistry.shared.generation += 2 }
+            await card.importTask?.value
+            check(CoreBridge.shared.installs == 0 && account.publications == 0,
+                  "old viewer click cannot begin importing after \(retired) before Task admission")
+        }
+
+        reset(); Keychain.token = "persisted-fixture-only"
+        let suspendedRetry = StremioAccount(); suspendedRetry.reloadForActiveProfile()
+        let retryGate = Gate(); CoreBridge.shared.gate = retryGate
+        let retryTask = Task { await suspendedRetry.retryCurrentConnection() }
+        await drain()
+        ProfileStore.shared.active = .init(id: UUID()); suspendedRetry.reloadForActiveProfile()
+        retryGate.release()
+        check(await retryTask.value == .superseded && suspendedRetry.publications == 0,
+              "replacement profile retires an already-running retry before success publication")
+
+        reset(); Keychain.token = "persisted-fixture-only"
+        let delayedHandoff = StremioAccount(); delayedHandoff.reloadForActiveProfile()
+        let handoffGate = Gate(); CoreBridge.shared.hydrationGate = handoffGate
+        let delayedCard = CardHandoffFixture(delayedHandoff)
+        delayedCard.run(true); await drain()
+        ProfileStore.shared.active = .init(id: UUID()); delayedHandoff.reloadForActiveProfile()
+        handoffGate.release(); await drain()
+        check(VortXSyncManager.shared.snapshotCalls == 0,
+              "delayed old-account handoff cannot snapshot replacement profile addons")
+
         for error in [VortxNativeError.closed as any Error, VortxNativeOwnerAddonImport.Incomplete(),
                       VortxNativeAccountCredentials.OwnerPublicationUncertain(),
                       OwnerHistoryLoginPreparation.Incomplete(reason: .pendingMetadata),
@@ -344,21 +450,17 @@ private struct Log { func info(_ message: String) {} }
 
         let manager = VortXSyncManager()
         let accepted = await manager.keepThisDeviceOverridingAccount()
-        #if VORTX_NATIVE_DATA_ENGINE
+        // The retired production override is fail-closed in both compile configurations.
+        // A compatibility-mode fixture must not retain the removed legacy overwrite authority.
         check(!accepted && !manager.hasAppliedAccountDoc && manager.pendingAddonOrderIntent == nil,
-              "native unsupported override has zero restore/order side effects")
-        check(manager.uploadCalls == 0, "native override cannot start an upload")
+              "unsupported override has zero restore/order side effects")
+        check(manager.uploadCalls == 0, "retired override cannot start an upload")
         manager.hasAppliedAccountDoc = true
         let retained = VortXSyncManager.AddonOrderIntent(accountID: "prior", order: ["prior"])
         manager.pendingAddonOrderIntent = retained
         _ = await manager.keepThisDeviceOverridingAccount()
         check(manager.hasAppliedAccountDoc && manager.pendingAddonOrderIntent == retained,
-              "native prevention preserves existing acknowledgement and legacy intent")
-        #else
-        check(accepted && manager.hasAppliedAccountDoc && manager.uploadCalls == 1 && manager.lastOverride == true,
-              "legacy explicit override retains its authorized behavior")
-        check(manager.pendingAddonOrderIntent?.order == ["existing"], "legacy order intent unchanged")
-        #endif
+              "override prevention preserves existing acknowledgement and legacy intent")
         print("PASS \(checks) exact-source #262 control checks")
     }
 }

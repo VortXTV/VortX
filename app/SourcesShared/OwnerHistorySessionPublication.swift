@@ -25,6 +25,9 @@ struct OwnerHistorySessionPublication: Sendable {
     /// nativeSync, ownerHistory, source archives or unknown account siblings into VortxJSON.
     struct Presentation: Sendable {
         let fence: Data
+        let scope: String
+        let ownerProfileID: String
+        let profileID: String
         let items: [VortxJSON]
         let watchedOnlyLibrary: [VortxJSON]
         let playback: VortxJSON
@@ -38,10 +41,17 @@ struct OwnerHistorySessionPublication: Sendable {
             }
             let decoder = JSONDecoder()
             fence = try object.required("fence")
+            let owner = try OwnerHistoryExactJSON.Object(fence)
+            scope = try owner.text("scope")
+            ownerProfileID = try owner.text("ownerProfileId")
+            profileID = try owner.text("profileId")
             items = try decoder.decode([VortxJSON].self, from: object.required("items"))
             watchedOnlyLibrary = try decoder.decode([VortxJSON].self, from: object.required("watchedOnlyLibrary"))
             playback = try decoder.decode(VortxJSON.self, from: object.required("playback"))
-            guard case .object = playback else { throw VortxNativeError.invalidResponse }
+            guard case .object = playback,
+                  playback["continueWatching"]?.array != nil, playback["history"]?.array != nil,
+                  case .object = playback["watchedVideoIdsByTitle"], case .object = playback["watchedTitles"],
+                  case .object = playback["resumeById"] else { throw VortxNativeError.invalidResponse }
             holds = try decoder.decode([String].self, from: object.required("holds"))
         }
     }

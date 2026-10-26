@@ -432,6 +432,25 @@ final class StremioAccount: ObservableObject {
         return .signedIn
     }
 
+    /// A deliberate retry of this profile's saved optional Stremio import. A partial import can
+    /// outlive its in-memory warning, so recovery must not require another QR sign-in. Reuse the
+    /// real login coordinator: it verifies identity again and retains all native ACK/ownership fences.
+    func retryCurrentConnection() async -> LinkSignInOutcome {
+        guard !Task.isCancelled else { return .superseded }
+        switch Keychain.confirmedString(tokenKey) {
+        case .value(let token) where !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            return await signInWithAuthKey(token)
+        case .missing, .value:
+            let message = "The saved Stremio connection is unavailable. Reconnect Stremio to retry the import."
+            signInError = message
+            return .failed(message)
+        case .failure:
+            let message = "Secure account storage is unavailable. Retry when storage is available. Saved library and history are unchanged."
+            signInError = message
+            return .failed(message)
+        }
+    }
+
     func signOut() {
         LegacyWatchOwnership.invalidateSession()
         VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)

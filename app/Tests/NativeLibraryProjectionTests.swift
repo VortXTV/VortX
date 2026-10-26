@@ -52,6 +52,12 @@ private enum ManagementFixture {
 }
 private struct FixtureProjectionScope { let ownerProfileID = "owner" }
 private struct FixtureProjectionSession { let scope = FixtureProjectionScope() }
+// Actual pure exact JSON parser and native VIEW decoder are extracted alongside the projection.
+// No native ABI, source import, durable receipt or checkpoint is fabricated by this fixture.
+// PRODUCTION_EXACT_JSON
+private enum OwnerHistorySessionPublication {
+    // PRODUCTION_OWNER_LIBRARY
+}
 
 private final class CurrentProjection {
     private let lock = VortxNativeFacadeLock()
@@ -69,6 +75,7 @@ private final class CurrentProjection {
     private var registryGeneration = UUID()
     private let resourceRegistryValid = true
     private var playback: VortxJSON?
+    private var ownerHistoryLibrary: OwnerHistorySessionPublication.Presentation?
     private var libraryRequest: VortxJSON?
     private var values: [String: VortxJSON]
     private var metadataLibraryMembership = VortxLibraryMembership()
@@ -81,8 +88,9 @@ private final class CurrentProjection {
     private let changed: @Sendable ([String]) -> Void
     private func observeExternalMetadata(_ value: VortxJSON) {}
     init(playback: VortxJSON?, request: VortxJSON? = nil, detailID: String = "dup",
-         recorder: PublicationRecorder? = nil) {
+         recorder: PublicationRecorder? = nil, ownerHistoryLibrary: OwnerHistorySessionPublication.Presentation? = nil) {
         self.playback = playback
+        self.ownerHistoryLibrary = ownerHistoryLibrary
         libraryRequest = request
         values = [
             "native_state": .object(["activeProfileId": .string("ram-fixture")]),
@@ -161,12 +169,103 @@ private final class BaselineProjection {
         .object(["activeProfileId": .string("owner"),
                  "roster": .object(["profiles": .object(["owner": .object(["addons": .string("own")])])]),
                  "libraries": .object(["owner": .object(["items": .array(saved)])]),
-                 "nativeSync": .object(["libraries": .object(["owner": .object(["records": .object(removals)])])])])
+                 "nativeSync": .object(["scope": .string("fixture-account"), "ownerProfileId": .string("owner"),
+                    "libraries": .object(["owner": .object(["records": .object(removals)])])])])
     }
     static func request(_ sort: String, type: String?) -> VortxJSON {
         .object(["sort": .string(sort), "type": type.map(VortxJSON.string) ?? .null, "page": .integer(1)])
     }
     static func main() throws {
+        // #267: base native membership stays empty after a source import. Only the genuine native
+        // composed VIEW owns imported membership and source-aware watched-only tombstone masking.
+        let importedPlayback: VortxJSON = .object([
+            "continueWatching": .array([row("imported-resume", "series", offset: 250, at: .unsigned(300))]),
+            "history": .array([row("removed-source", at: .unsigned(900)), row("history-visible", at: .unsigned(400))]),
+            "watchedTitles": .object(["history-visible": .unsigned(1)]),
+            "watchedVideoIdsByTitle": .object([:]), "resumeById": .object([:])])
+        let ownerFence: VortxJSON = .object(["scope": .string("fixture-account"), "ownerProfileId": .string("owner"),
+            "profileId": .string("owner"), "mutationGeneration": .string("accepted-source-generation")])
+        let fenceBytes = try JSONEncoder().encode(ownerFence)
+        let viewJSON: VortxJSON = .object(["kind": .string("view"), "fence": ownerFence,
+            "items": .array([saved("membership-only"), saved("imported-resume", "series")]),
+            "watchedOnlyLibrary": .array([row("history-visible", at: .unsigned(400))]),
+            "playback": importedPlayback, "holds": .array([.string("unresolved-held-unit")])])
+        let nativeView = try OwnerHistorySessionPublication.Presentation(view: JSONEncoder().encode(viewJSON), expectedFence: fenceBytes)
+        let baseSnapshot = state([], removals: ["movie:removed-source": .object(["removedAt": .unsigned(200)])])
+        let imported = CurrentProjection(playback: nativeView.playback, ownerHistoryLibrary: nativeView)
+        let importedFields = try imported.fields(baseSnapshot)
+        let importedRows = importedFields["library"]?["catalog"]?.array ?? []
+        check(importedRows.compactMap { $0["_id"] } == [.string("membership-only"), .string("imported-resume"), .string("history-visible")],
+              "imported native VIEW membership and allowed watched-only rows reach the actual Library projection")
+        check(importedRows[0]["state"]?["flaggedWatched"] == .integer(0)
+              && importedRows[0]["state"]?["timeOffset"] == .integer(0)
+              && importedRows[1]["state"]?["video_id"] == .string("imported-resume:1:2")
+              && importedRows[1]["state"]?["timeOffset"] == .integer(250),
+              "membership alone does not fabricate watched state; exact composed resume stays paired")
+        check(importedRows[2]["previouslyWatched"] == .bool(true)
+              && importedRows.allSatisfy { $0["_id"] != .string("removed-source") },
+              "source history never bypasses native VIEW tombstone masking even with a newer source clock")
+        check(importedFields["continue_watching_preview"]?["items"]?.array?.count == 1
+              && imported.resourceDetail("membership-only")?["libraryItem"]?["_id"] == .string("membership-only"),
+              "Continue Watching and detail membership consume the same acknowledged full projection")
+        check(imported.library(baseSnapshot, request: request("notwatched", type: nil))?["catalog"]?.array?.contains {
+            $0["_id"] == .string("membership-only")
+        } == true, "explicit Library reload/filter retains composed imported membership")
+        check(imported.search(baseSnapshot, query: "membership", limit: 10)?["searchResults"]?.array?.count == 1,
+              "local search uses imported native VIEW membership without persisting it")
+        check(nativeView.holds == ["unresolved-held-unit"], "composed VIEW holds remain explicit and do not fabricate data")
+        for changedFence in [
+            VortxJSON.object(["scope": .string("replacement-account"), "ownerProfileId": .string("owner"), "profileId": .string("owner")]),
+            .object(["scope": .string("fixture-account"), "ownerProfileId": .string("other-owner"), "profileId": .string("owner")]),
+            .object(["scope": .string("fixture-account"), "ownerProfileId": .string("owner"), "profileId": .string("replacement-profile")]),
+            .object(["scope": .string("fixture-account"), "ownerProfileId": .string("owner"), "profileId": .string("owner"),
+                     "mutationGeneration": .string("stale-source-generation")])
+        ] {
+            do {
+                _ = try OwnerHistorySessionPublication.Presentation(view: JSONEncoder().encode(viewJSON),
+                    expectedFence: JSONEncoder().encode(changedFence))
+                check(false, "stale/wrong account/owner/profile VIEW must reject")
+            } catch {}
+        }
+        let failedViews: [VortxJSON] = [
+            .object(["kind": .string("error")]),
+            .object(["kind": .string("view"), "fence": ownerFence, "items": .array([]), "watchedOnlyLibrary": .array([]),
+                     "playback": .object([:]), "holds": .array([])])]
+        for failed in failedViews {
+            do {
+                _ = try OwnerHistorySessionPublication.Presentation(view: JSONEncoder().encode(failed), expectedFence: fenceBytes)
+                check(false, "failed/incomplete native VIEW must not turn into a successful empty Library")
+            } catch {}
+        }
+        for wrongOwner in [
+            VortxJSON.object(["scope": .string("fixture-account"), "ownerProfileId": .string("owner"), "profileId": .string("replacement-profile")]),
+            .object(["scope": .string("replacement-account"), "ownerProfileId": .string("owner"), "profileId": .string("owner")]),
+            .object(["scope": .string("fixture-account"), "ownerProfileId": .string("replacement-owner"), "profileId": .string("owner")])
+        ] {
+            let wrongView: VortxJSON = .object(["kind": .string("view"), "fence": wrongOwner,
+                "items": .array([saved("foreign-membership")]), "watchedOnlyLibrary": .array([]), "playback": importedPlayback, "holds": .array([])])
+            let wrongFence = try JSONEncoder().encode(wrongOwner)
+            let mismatched = try OwnerHistorySessionPublication.Presentation(view: JSONEncoder().encode(wrongView), expectedFence: wrongFence)
+            do {
+                _ = try CurrentProjection(playback: mismatched.playback, ownerHistoryLibrary: mismatched).fields(baseSnapshot)
+                check(false, "accepted VIEW cannot project into a replacement account/owner/profile")
+            } catch {}
+        }
+        let crossPlayback: VortxJSON = .object([
+            "continueWatching": .array([row("shared-id", "series", offset: 500)]), "history": .array([]),
+            "watchedTitles": .object([:]), "watchedVideoIdsByTitle": .object([:]), "resumeById": .object([:])])
+        let crossViewJSON: VortxJSON = .object(["kind": .string("view"), "fence": ownerFence,
+            "items": .array([saved("shared-id", "movie")]),
+            "watchedOnlyLibrary": .array([row("shared-id", "series", offset: 500)]),
+            "playback": crossPlayback, "holds": .array([])])
+        let crossView = try OwnerHistorySessionPublication.Presentation(view: JSONEncoder().encode(crossViewJSON), expectedFence: fenceBytes)
+        let crossRows = try CurrentProjection(playback: crossView.playback, ownerHistoryLibrary: crossView)
+            .fields(baseSnapshot)["library"]?["catalog"]?.array ?? []
+        check(crossRows.count == 2 && crossRows[0]["type"] == .string("movie") && crossRows[1]["type"] == .string("series")
+              && crossRows[0]["state"]?["timeOffset"] == .integer(0) && crossRows[1]["state"]?["timeOffset"] == .integer(500),
+              "typed native VIEW retains movie membership plus same-ID series history without crossing resume identity")
+        print("PASS #267 composed native owner-history Library, CW, detail/filter/search and tombstone regressions")
+
         let savedRows = [
             saved("dup", "series", name: "Alpha"), saved("missing", name: "Twin"),
             saved("tie-b", name: "Twin"), saved("tie-a", name: "Twin"),

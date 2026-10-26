@@ -310,6 +310,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     private var playback: VortxJSON?
     private var libraryRequest: VortxJSON?
+    /// Disposable composed native Library view paired with the acknowledged state below.
+    /// Raw owner-history sources/checkpoints never enter this UI cache.
+    private var ownerHistoryLibrary: OwnerHistorySessionPublication.Presentation?
     var lastFailure: String? { lock.withLock { failure } }
     var isAvailable: Bool { lock.withLock { !closed && !checkpointReopenRequired } }
     var requiresCheckpointReopen: Bool { lock.withLock { !closed && checkpointReopenRequired } }
@@ -376,7 +379,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let addonSnapshot = try await session.addonSnapshot()
         let state = addonSnapshot.state
         facade.addonInventories = addonSnapshot.inventories
-        facade.playback = try await session.playbackProjection()
+        facade.ownerHistoryLibrary = addonSnapshot.ownerHistoryLibrary
+        if let ownerLibrary = addonSnapshot.ownerHistoryLibrary { facade.playback = ownerLibrary.playback }
+        else { facade.playback = try await session.playbackProjection() }
         facade.values = try facade.stateFields(state)
         facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
         facade.values["native_own_overlay_pending"] = try await session.pendingOwnAccountOverlays()
@@ -495,7 +500,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     @discardableResult
     func close() -> CredentialPublicationOutbox.SubtitleRetirement {
         let subtitleRetirement = CredentialPublicationOutbox.beginSubtitleRetirement(domain: sourceID)
-        lock.lock(); closed = true; mutationFIFO.close(); let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); resourceSelections.removeAll(); resourceValueTasks.removeAll(); latestChangeSequence.removeAll(); values.removeAll(); metadataLibraryMembership = VortxLibraryMembership(); addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
+        lock.lock(); closed = true; mutationFIFO.close(); let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); resourceSelections.removeAll(); resourceValueTasks.removeAll(); latestChangeSequence.removeAll(); values.removeAll(); metadataLibraryMembership = VortxLibraryMembership(); ownerHistoryLibrary = nil; addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
         CredentialPublicationOutbox.drainSubtitleRenderers(subtitleRetirement)
         session.revoke()
         old.forEach { $0.cancel() }
@@ -908,7 +913,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 durableCommitted = true
                 let addonSnapshot = try await session.addonSnapshot()
                 let state = addonSnapshot.state
-                let playback = try await session.playbackProjection()
+                let playback: VortxJSON
+                if let ownerLibrary = addonSnapshot.ownerHistoryLibrary { playback = ownerLibrary.playback }
+                else { playback = try await session.playbackProjection() }
                 let host = try await session.hostPreferencesDocument()
                 let website = try await session.websiteEditOutcome()
                 let ownPending = try await session.pendingOwnAccountOverlays()
@@ -927,6 +934,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     // Compare against the acknowledged cache before a resource identity change
                     // clears it. Progress and unchanged sync reads must not synthesize ctx events.
                     let previousValues = self.values
+                    let previousPlayback = self.playback, previousOwnerLibrary = self.ownerHistoryLibrary
+                    let previousAddonInventories = self.addonInventories
                     let identityChanged = self.resourceIdentity(previousValues["native_state"]) != self.resourceIdentity(state)
                     let accountChanged = self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state)
                     if accountChanged { self.accountEpoch = UUID() }
@@ -947,7 +956,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                         else { self.failure = "registry_unavailable" }
                     }
                     self.addonInventories = addonSnapshot.inventories
-                    var fields = try self.stateFields(state)
+                    self.ownerHistoryLibrary = addonSnapshot.ownerHistoryLibrary
+                    var fields: [String: VortxJSON]
+                    do { fields = try self.stateFields(state) }
+                    catch {
+                        // A failed projection must keep the prior complete cached Library packet.
+                        // Never pair new composed source rows with the previous accepted state.
+                        self.playback = previousPlayback; self.ownerHistoryLibrary = previousOwnerLibrary
+                        self.addonInventories = previousAddonInventories
+                        throw error
+                    }
                     fields["native_host_preferences"] = host
                     fields["native_website_edits"] = website
                     fields["native_own_overlay_pending"] = ownPending
@@ -1937,17 +1955,37 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// watch; watching it again brings it back.
     private func projectedLibraryItems(_ state: VortxJSON, formatter: ISO8601DateFormatter = ISO8601DateFormatter()) throws -> [VortxJSON] {
         guard let active = string(state["activeProfileId"]), let library = state["libraries"]?[active] else { throw VortxNativeError.invalidSnapshot }
+        if let view = ownerHistoryLibrary {
+            guard view.profileID == active, view.scope == string(state["nativeSync"]?["scope"]),
+                  view.ownerProfileID == string(state["nativeSync"]?["ownerProfileId"]) else { throw VortxNativeError.superseded }
+        }
         // Preserve the selected-unit, first-match semantics even if an input repeats a title.
         // One index replaces a full Continue Watching scan for every saved/history row.
         var resumeByID: [String: VortxJSON] = [:]
+        var resumeByTypedID: [String: VortxJSON] = [:]
         for row in playback?["continueWatching"]?.array ?? [] {
             if case .string(let id)? = row["metaId"], resumeByID[id] == nil { resumeByID[id] = row }
+            if ownerHistoryLibrary != nil, let id = string(row["metaId"]), let type = string(row["type"]) {
+                let key = type + "\u{1f}" + id
+                if resumeByTypedID[key] == nil { resumeByTypedID[key] = row }
+            }
         }
-        let saved = (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
+        let items = ownerHistoryLibrary?.items ?? library["items"]?.array ?? []
+        let saved = items.filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
             guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
-            return libraryRow(id: id, type: type, name: item["name"] ?? .string(id), poster: item["poster"] ?? .null, resume: resumeByID[id], formatter: formatter)
+            let resume = ownerHistoryLibrary == nil ? resumeByID[id] : resumeByTypedID[type + "\u{1f}" + id]
+            return libraryRow(id: id, type: type, name: item["name"] ?? .string(id), poster: item["poster"] ?? .null, resume: resume, formatter: formatter)
         }
         let savedIDs = Set(saved.compactMap { string($0["_id"]) })
+        if let ownerHistoryLibrary {
+            // Native composition already applies source provenance, exact unit identity, holds and
+            // native membership tombstones. Re-deriving this set from playback would lose that proof.
+            return saved + ownerHistoryLibrary.watchedOnlyLibrary.compactMap { row in
+                guard let id = string(row["metaId"]), let type = string(row["type"]) else { return nil }
+                return libraryRow(id: id, type: type, name: row["name"] ?? .string(id), poster: row["poster"] ?? .null,
+                    previouslyWatched: true, resume: resumeByTypedID[type + "\u{1f}" + id], formatter: formatter)
+            }
+        }
         let records = state["nativeSync"]?["libraries"]?[active]?["records"]
         return saved + VortxNativePreviouslyWatched.titles(playback: playback, excluding: savedIDs) { type, id in
             try? records?[type + ":" + id]?["removedAt"]?.decode(UInt64.self)
