@@ -102,6 +102,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -142,7 +143,7 @@ fun PlayerScreen(
     engineOverride: PlayerEngineRouter.Override = PlayerEngineRouter.Override.AUTO,
     /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
     /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
-    onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    onProgress: (PlayerProgressSnapshot) -> Unit = {},
     /** Fired once only after this screen's final decoder and every bound playback lease are released. */
     onResourcesReleased: () -> Unit = {},
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
@@ -246,8 +247,11 @@ fun PlayerScreen(
             ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         clearWindowBrightness(activity)
     }
+    val preparePlayerExit = remember { AtomicReference<(() -> Unit)?>(null) }
     fun exitPlayer() {
         if (playerExitRequested) return
+        // Preserve/flush an owned receiver synchronously, before invalidating its original history gate.
+        preparePlayerExit.get()?.invoke()
         playerExitRequested = true
         // Restore synchronously as well as from DisposableEffect. This prevents the browse shell from
         // drawing one or more frames in player landscape while navigation is committing.
@@ -974,51 +978,6 @@ fun PlayerScreen(
             stillWatchingPrompt = true
         }
     }
-    // GOOGLE CAST (the CAST lane, Android's AirPlay equivalent). Conceptually mirrors the Apple AirPlay
-    // handoff: while a receiver is connected the local engine YIELDS (pauses, so it stops decoding and
-    // consuming the source), the current stream (URL + subtitles + start position) plays on the receiver,
-    // and on disconnect local playback RESUMES where the receiver left off. Torrents are gated OUT of
-    // casting (loopback streaming-server URLs a receiver cannot reach), exactly as the router keeps them on
-    // libmpv. All cast machinery lives in com.vortx.android.cast; this host block is the minimal seam.
-    val castManager = rememberCastManager()
-    val castState by castManager.state.collectAsStateWithLifecycle()
-    var castChooserOpen by remember(playbackSessionKey) { mutableStateOf(false) }
-    val streamCastable = CastEligibility.isCastable(currentPlayable)
-    // Keep the manager aimed at the current stream with a LIVE position provider, so a session started from
-    // our chooser loads exactly where local playback is, and an in-player episode/source switch reloads the
-    // receiver. A non-castable stream clears it so nothing stale is ever cast.
-    LaunchedEffect(castManager, currentPlayable, streamCastable) {
-        castManager.setNowPlaying(if (streamCastable) currentPlayable else null) {
-            latestState.positionMs.coerceAtLeast(0L)
-        }
-    }
-    // Local playback yields to / resumes from the receiver. The [wasCasting] latch makes resume fire ONLY
-    // after an actual cast, so the initial (disconnected) composition never spuriously seeks or plays.
-    var wasCasting by remember(playbackSessionKey) { mutableStateOf(false) }
-    LaunchedEffect(castState.isConnected) {
-        if (castState.isConnected) {
-            wasCasting = true
-            invalidateAutoSkipPending(engine.state.value.positionMs)
-            playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
-        } else if (wasCasting) {
-            wasCasting = false
-            val resumeAt = castManager.lastKnownPositionMs
-            if (resumeAt > 0L) seekLocalTo(resumeAt)
-            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
-        }
-    }
-    // Record progress WHILE casting through the SAME per-profile onProgress path the local engine uses:
-    // casting must not bypass watch history. The local progress writer is dormant here (its engine is
-    // paused), so this is the only writer while connected, and it never runs for a trailer.
-    LaunchedEffect(castState.isConnected, currentPlayable.isTrailer) {
-        if (!castState.isConnected || currentPlayable.isTrailer) return@LaunchedEffect
-        while (isActive) {
-            val s = castManager.state.value
-            if (!s.isPaused && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) currentOnProgress(s.positionMs, s.durationMs)
-            delay(CAST_PROGRESS_WRITEBACK_MS)
-        }
-    }
-
     // Keying the resolver job by the exact authority cancels it when the outer playback session or request
     // changes. The token check below is the authoritative defense if a resolver ignores cancellation.
     val pendingSourceSwitch = sourceSwitchState.pendingSwitch
@@ -1259,6 +1218,68 @@ fun PlayerScreen(
         }
     }
 
+    // Every transport and history path uses the mounted source/episode owner, not receiver connectivity.
+    val castManager = rememberCastManager()
+    val castState by castManager.state.collectAsStateWithLifecycle()
+    val castOwner = remember(playbackSessionKey) { java.util.UUID.randomUUID().toString() }
+    val currentCastOwner by rememberUpdatedState(castOwner)
+    val castOwned = castState.isConnected && castState.owner == castOwner
+    val progressTimeline = remember(castOwner) {
+        PlayerProgressTimeline(castOwner,
+            admitted = { currentCastOwner == castOwner && withCurrentSubtitleOwnerState { true } },
+            valid = { pos, dur -> !runtimeMismatch && !knownAudioMismatch &&
+                canReportPlayerProgress(currentPlayable, pos, dur) },
+            emit = { currentOnProgress(it) })
+    }
+    var castChooserOpen by remember(playbackSessionKey) { mutableStateOf(false) }
+    val streamCastable = CastEligibility.isCastable(currentPlayable)
+    LaunchedEffect(castManager, castOwner, currentPlayable, streamCastable) {
+        castManager.setNowPlaying(owner = castOwner,
+            playable = if (streamCastable) currentPlayable else null,
+            positionProvider = { latestState.positionMs.coerceAtLeast(0L) },
+            isCurrent = { currentCastOwner == castOwner && withCurrentSubtitleOwnerState { true } },
+            timeline = { point, active, resume -> progressTimeline.remote(point, active, resume) })
+    }
+    DisposableEffect(castManager, castOwner, progressTimeline, playbackIntent) {
+        val beforeExit: () -> Unit = {
+            castManager.leavePlayer(castOwner)
+            progressTimeline.finish(latestState.positionMs, latestState.durationMs)
+            progressTimeline.close()
+        }
+        preparePlayerExit.set(beforeExit)
+        onDispose {
+            preparePlayerExit.compareAndSet(beforeExit, null)
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
+        }
+    }
+    var wasCasting by remember(castOwner) { mutableStateOf(false) }
+    LaunchedEffect(castOwned, castOwner, engine) {
+        if (castOwned) {
+            wasCasting = true
+            invalidateAutoSkipPending(engine.state.value.positionMs)
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
+        } else if (wasCasting) {
+            wasCasting = false
+            val resumeAt = castManager.takeResumePosition(castOwner)
+            if (resumeAt != null && withCurrentSubtitleOwnerState { true }) {
+                progressTimeline.beginLocalResume(engine, engine.state.value)
+                seekLocalTo(resumeAt)
+            }
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
+        }
+    }
+
+    // Seek acceptance is a current-engine telemetry event, not a throttled history tick. The ticket
+    // captures the mounted generation and exact pre-seek state; stale/buffering/old-engine samples fail.
+    LaunchedEffect(progressTimeline, engine, castOwner) {
+        engine.state.collect { sample ->
+            val ticket = progressTimeline.localResumeTicket ?: return@collect
+            if (builtEngine !== engine || engineHolder.get() !== engine || currentCastOwner != castOwner) return@collect
+            progressTimeline.acknowledgeLocalResume(ticket, engine, castOwner, sample,
+                sample.positionMs, sample.durationMs, sample.isBuffering)
+        }
+    }
+
     // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
     // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
     // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
@@ -1309,7 +1330,7 @@ fun PlayerScreen(
             !playerExitRequested &&
             !controlsLocked &&
             !pip.isInPip &&
-            !castState.isConnected &&
+            !castOwned &&
             !effectiveError &&
             !current.hasEnded &&
             AutoSkipCountdownPolicy.isCurrent(
@@ -1664,7 +1685,7 @@ fun PlayerScreen(
         playerState.hasEnded,
         effectiveError,
         sourceSwitchState.isSwitching,
-        castState.isConnected,
+        castOwned,
         pip.isInPip,
         controlsLocked,
         playerExitRequested,
@@ -1680,7 +1701,7 @@ fun PlayerScreen(
             !latestState.hasEnded &&
             !effectiveError &&
             !sourceSwitchState.isSwitching &&
-            !castState.isConnected &&
+            !castOwned &&
             !pip.isInPip &&
             !controlsLocked &&
             !playerExitRequested
@@ -1725,7 +1746,7 @@ fun PlayerScreen(
                 currentPositionSec < activeSegment.end &&
                 !effectiveError &&
                 !sourceSwitchState.isSwitching &&
-                !castState.isConnected &&
+                !castOwned &&
                 !pip.isInPip &&
                 !controlsLocked &&
                 !playerExitRequested &&
@@ -1890,14 +1911,14 @@ fun PlayerScreen(
     LaunchedEffect(engine) {
         while (true) {
             delay(PROGRESS_REPORT_MS)
-            val s = latestState
+            val s = engine.state.value
             if (!s.isPaused && !runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
-                currentOnProgress(s.positionMs, s.durationMs)
+                progressTimeline.local(s.positionMs, s.durationMs, buffering = s.isBuffering)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
                 // A LOCAL session never drives it: warming resolves through the host's detail ViewModel,
                 // which for a download play can belong to an earlier streamed title (AND-DL-01).
-                if (!isLocalSession && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
+                if (!isLocalSession && !castOwned && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1908,10 +1929,8 @@ fun PlayerScreen(
     // mark a 10-second junk file watched, so it is dropped entirely.
     DisposableEffect(engine) {
         onDispose {
-            val s = latestState
-            if (!runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
-                currentOnProgress(s.positionMs, s.durationMs)
-            }
+            val s = engine.state.value
+            progressTimeline.finish(s.positionMs, s.durationMs)
         }
     }
 
@@ -2458,7 +2477,7 @@ fun PlayerScreen(
         if (
             !controlsLocked &&
             !pip.isInPip &&
-            !castState.isConnected &&
+            !castOwned &&
             !effectiveError &&
             !playerState.hasEnded &&
             !sourceSwitchState.isSwitching &&
@@ -2570,9 +2589,12 @@ fun PlayerScreen(
         // transport (play/pause, +/-10s, seek, stop). Withheld in PiP, where the tiny window is video-only.
         if (castManager.isEnabled) {
             if (castChooserOpen) {
-                CastRouteChooserSheet(onDismiss = { castChooserOpen = false })
+                CastRouteChooserSheet(
+                    onDismiss = { castChooserOpen = false },
+                    onRouteSelected = { deviceId, selected -> castManager.requestCast(deviceId, selected) },
+                )
             }
-            if (castState.isConnected && !pip.isInPip) {
+            if (castOwned && !pip.isInPip) {
                 CastOverlay(
                     state = castState,
                     emberAccent = emberAccent,

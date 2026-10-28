@@ -839,9 +839,11 @@ fun VortXApp(
                     Unit
                 }
             }
-            // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. Reset when the history identity changes (new source, or a switched episode).
-            val lastProgress = remember(historyIdentity) { longArrayOf(0L, 0L) }
+            // The final transaction uses the same owner-qualified snapshot as periodic progress.
+            val playbackSession = remember(historyIdentity) { playbackSessions.newHandle() }
+            val lastProgress = remember(historyIdentity) {
+                com.vortx.android.player.PlaybackProgressCache(playbackSessions, playbackSession)
+            }
             // Auto-add-to-Library (D8). One instance per player session; its own SharedPreferences ledger
             // makes the add idempotent ACROSS playbacks (so a later manual removal sticks), while the latch
             // below keeps it to one attempt WITHIN a playback. Reset per source, mirroring Apple's
@@ -900,7 +902,7 @@ fun VortXApp(
                 playing = null
             }
             DisposableEffect(historyIdentity, advanceVm) {
-                onDispose { advanceVm?.recordLastStreamProgress(lastProgress[0], force = true) }
+                onDispose { advanceVm?.recordLastStreamProgress(lastProgress.positionMs, force = true) }
             }
             // Keep the in-player Sources/Quality sheets live as late add-ons settle. The options themselves
             // come from the ViewModel's unified, filtered, ranked assembly, never from an ad-hoc UI sort.
@@ -941,7 +943,6 @@ fun VortXApp(
             // cap per episode) lives in [DetailViewModel], which survives the swaps.
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
-            val playbackSession = remember(historyIdentity) { playbackSessions.newHandle() }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
@@ -961,7 +962,7 @@ fun VortXApp(
                 }
                 onDispose {
                     if (!historyPlayable.isTrailer) {
-                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1]) { receipt ->
+                        lastProgress.end { receipt ->
                             onDurableWatchReceipt(receipt)
                         }
                     }
@@ -1095,12 +1096,11 @@ fun VortXApp(
                     } else {
                         null
                     },
-                    onProgress = { pos, dur ->
-                        lastProgress[0] = pos
-                        lastProgress[1] = dur
+                    onProgress = { point ->
+                        lastProgress.report(point)
+                        val pos = point.positionMs
                         // A trailer reports no progress and never auto-adds to the library (it is not the feature).
                         if (playable.isTrailer) return@PlayerScreen
-                        playbackSessions.report(playbackSession, pos, dur)
                         advanceVm?.recordLastStreamProgress(pos)
                         // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                         // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978

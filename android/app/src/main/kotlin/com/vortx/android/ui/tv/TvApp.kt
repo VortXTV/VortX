@@ -599,8 +599,8 @@ fun TvApp(
                 } else {
                     null
                 },
-                onProgress = { pos, dur ->
-                    playbackHistory.report(pos, dur)
+                onProgress = { point ->
+                    playbackHistory.report(point)
                 },
                 // TV player additions: the per-stream Share QR (a magnet for a torrent, else the raw URL) and
                 // the 10-foot audio/subtitle language + forced-policy sheets and hidden-chrome D-pad skip pill.
@@ -865,24 +865,24 @@ internal class TvPlaybackHistorySession(
     /// shell or engine state changes cannot retarget the session's history writes.
     private val boundContext = if (historyIdentity.playable.isTrailer) null else historyIdentity.playable.playbackContext
 
-    private var lastPositionMs = 0L
-    private var lastDurationMs = 0L
+    private val progress = handle?.let { com.vortx.android.player.PlaybackProgressCache(playbackSessions, it) }
+    private val localProgressOwner = java.util.UUID.randomUUID().toString()
+    internal val lastProgress: com.vortx.android.player.PlayerProgressSnapshot? get() = progress?.snapshot
 
     fun begin() {
         val activeHandle = handle ?: return
         playbackSessions.begin(activeHandle, boundContext, ownerToken)
     }
 
-    fun report(positionMs: Long, durationMs: Long) {
-        val activeHandle = handle ?: return
-        lastPositionMs = positionMs
-        lastDurationMs = durationMs
-        playbackSessions.report(activeHandle, positionMs, durationMs)
+    fun report(positionMs: Long, durationMs: Long) = report(
+        com.vortx.android.player.PlayerProgressSnapshot(localProgressOwner, positionMs, durationMs))
+
+    fun report(point: com.vortx.android.player.PlayerProgressSnapshot) {
+        progress?.report(point)
     }
 
     fun end() {
-        val activeHandle = handle ?: return
-        playbackSessions.end(activeHandle, lastPositionMs, lastDurationMs)
+        progress?.end()
     }
 }
 
