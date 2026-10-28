@@ -54,6 +54,8 @@ data class DiscoverResult(
 data class LibraryResult(
     val items: List<MetaItem> = emptyList(),
     val filters: LibraryFilters = LibraryFilters(),
+    /** Read-only presentation scope from the same admitted Library snapshot; never mutation authority. */
+    val owner: com.vortx.android.data.ContinueWatchingOwner? = null,
 )
 
 /// One installed add-on, parsed from `ctx.profile.addons` (mirrors Apple `CoreDescriptor`).

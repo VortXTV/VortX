@@ -6,7 +6,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 
 /// Pure client-side Library segmentation and smart filtering, shared by phone and TV.
-/// The loaded library payload has no genre field, so refinements use only its existing item metadata.
+/// These refinements use current admitted item metadata; genre refinement is a separate local layer.
 internal enum class LibrarySegment(@param:StringRes val titleResource: Int) {
     ALL(R.string.library_segment_all),
     MOVIES(R.string.library_segment_movies),
@@ -29,6 +29,10 @@ internal enum class LibrarySegment(@param:StringRes val titleResource: Int) {
             return if (present.size >= 2) listOf(ALL) + present else emptyList()
         }
     }
+
+    /** A removed type must not strand the grid after preserving selection across data updates. */
+    fun effective(items: List<MetaItem>): LibrarySegment =
+        if (this == ALL || this in availableSegments(items)) this else ALL
 
     fun filter(items: List<MetaItem>): List<MetaItem> =
         if (this == ALL) items else items.filter { bucket(it) == this }

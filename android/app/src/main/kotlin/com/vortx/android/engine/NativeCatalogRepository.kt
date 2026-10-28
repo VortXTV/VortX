@@ -425,7 +425,7 @@ internal class NativeCatalogRepository(
 
     private fun savedItems(read: VortxNativeRead): List<MetaItem> = library(read).getJSONArray("items").objects().filter {
         it.getString("kind") == "standard"
-    }.map { MetaItem(it.getString("id"), MediaType.fromId(it.getString("type")), it.getString("name"), poster = it.optStringOrNull("poster")) }
+    }.map(::nativeSavedLibraryItem)
     private fun cw(read: VortxNativeRead): List<MetaItem> {
         val saved = savedItems(read)
         return visibleLocal(playback(read).getJSONArray("continueWatching").objects().map { item ->
@@ -896,7 +896,7 @@ internal class NativeCatalogRepository(
         fun wire(t: String = type, s: String = sort) = JSONObject().put("type", t).put("sort", s).toString()
         session.owned(read.owner) { LibraryResult(items, LibraryFilters(
             types = (listOf("all") + all.map { it.type.id }.distinct()).map { LibraryTypeOption(it, it == type, wire(t = it)) },
-            sorts = listOf("recent", "name").map { LibrarySortOption(it, it == sort, wire(s = it)) })) }
+            sorts = listOf("recent", "name").map { LibrarySortOption(it, it == sort, wire(s = it)) }), owner = owner(read.owner)) }
     }
     override suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> = attempt {
         val session = session(); val read = session.read()
@@ -907,8 +907,11 @@ internal class NativeCatalogRepository(
                 progress.timeOffsetMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), progress.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), now, detail.watchedVideoIds.toList())
         } }
     }
-    private fun addAction(item: MetaItem, read: VortxNativeRead) = action("add_library_item").put("profileId", read.owner.profileID)
-        .put("item", JSONObject().put("kind", "standard").put("id", item.id).put("type", item.type.id).put("name", item.name).put("poster", item.poster))
+    private fun addAction(item: MetaItem, read: VortxNativeRead): JSONObject {
+        val cached = synchronized(this) { detailCache[item.type to item.id]?.takeIf { it.first == read.owner }?.second }
+        return action("add_library_item").put("profileId", read.owner.profileID)
+            .put("item", nativeLibraryItemPayload(item, cached))
+    }
     override suspend fun addToLibrary(item: MetaItem) = attempt { val session = session(); val read = session.read(); session.dispatch(listOf(addAction(item, read)), read.owner); Unit }
     // A dispatch returns only after the checkpoint committed, so each mirror below follows a persisted change.
     override suspend fun saveToLibrary(item: MetaItem) = addToLibrary(item).onSuccess { mirrorLibrary(true, item.type, item.id) }

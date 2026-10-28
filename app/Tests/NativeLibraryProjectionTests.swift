@@ -176,6 +176,35 @@ private final class BaselineProjection {
         .object(["sort": .string(sort), "type": type.map(VortxJSON.string) ?? .null, "page": .integer(1)])
     }
     static func main() throws {
+        if let path = ProcessInfo.processInfo.environment["VORTX_GENRE_PUBLIC_FIXTURE"] {
+            let receipt = try JSONDecoder().decode(VortxJSON.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            check(receipt["receipt"] == .string("genre-v2-real-native-roundtrip"), "explicit synthetic native producer receipt")
+            guard let items = receipt["items"]?.array else { check(false, "native producer items missing"); return }
+            let fields = try CurrentProjection(playback: nil).fields(state(items))
+            let rows = fields["library"]?["catalog"]?.array ?? []
+            let item = rows.first { $0["_id"] == .string("same") && $0["type"] == .string("movie") }
+            check(item?["genres"] == .array([.string("Drama")]) && item?["name"] == .string("Sparse B"),
+                  "actual native sparse-peer/cold-state output reaches the production public projection with retained genres and newer descriptor")
+        }
+        let known = VortxJSON.object(["kind": .string("standard"), "id": .string("typed-same"), "type": .string("movie"),
+            "name": .string("Film"), "poster": .null, "genres": .array([.string(" Drama "), .string("drama"), .string("Mystery")])])
+        let otherType = VortxJSON.object(["kind": .string("standard"), "id": .string("typed-same"), "type": .string("series"),
+            "name": .string("Show"), "poster": .null, "genres": .array([.string("Comedy")])])
+        let opaque = VortxJSON.object(["kind": .string("standard"), "id": .string("opaque"), "type": .string("movie"),
+            "name": .string("Future"), "poster": .null, "genres": .object(["future": .unsigned(UInt64.max)])])
+        let genreState = state([known, otherType, opaque, saved("missing")])
+        let genreBefore = genreState
+        let genreProjection = CurrentProjection(playback: nil)
+        let genreRows = try genreProjection.fields(genreState)["library"]?["catalog"]?.array ?? []
+        check(genreRows[0]["genres"] == .array([.string("Drama"), .string("Mystery")])
+              && genreRows[1]["genres"] == .array([.string("Comedy")]), "real typed Library genre facts reach production projection without crossing same-id types")
+        check(genreRows[2]["genres"] == nil && genreRows[3]["genres"] == nil,
+              "opaque or absent genre facts remain unknown without hiding a title")
+        check(genreState == genreBefore && genreState["libraries"]?["owner"]?["items"]?.array?[2]["genres"] == opaque["genres"],
+              "read-only projection never rewrites opaque persisted input")
+        let genreSorted = genreProjection.library(genreState, request: request("name", type: "series"))?["catalog"]?.array ?? []
+        check(genreSorted.count == 1 && genreSorted[0]["genres"] == .array([.string("Comedy")]),
+              "existing sort/type projection preserves the corresponding genre facts")
         // #267: base native membership stays empty after a source import. Only the genuine native
         // composed VIEW owns imported membership and source-aware watched-only tombstone masking.
         let importedPlayback: VortxJSON = .object([

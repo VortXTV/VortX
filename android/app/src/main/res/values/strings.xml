@@ -290,6 +290,8 @@
     <string name="library_filter_in_progress">In Progress</string>
     <string name="library_filter_watched">Watched</string>
     <string name="library_filter_short">Short</string>
+    <string name="library_genre_all">All genres</string>
+    <string name="library_genre_unknown">Unknown genre</string>
     <string name="library_action_mark_watched">Mark as Watched</string>
     <string name="library_action_mark_unwatched">Mark as Unwatched</string>
     <string name="library_action_remove">Remove from Library</string>

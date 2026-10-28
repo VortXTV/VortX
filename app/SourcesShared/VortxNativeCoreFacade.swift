@@ -1447,8 +1447,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                   values["native_state"]?["activeProfileId"] == .string(profileID) else {
                 continuation.resume(throwing: VortxNativeError.superseded); return
             }
-            let item: VortxJSON = .object(["kind": .string("standard"), "id": .string(id), "type": .string(type),
-                                           "name": meta["name"]!, "poster": meta["poster"] ?? .null])
+            var fields: [String: VortxJSON] = ["kind": .string("standard"), "id": .string(id), "type": .string(type),
+                                               "name": meta["name"]!, "poster": meta["poster"] ?? .null]
+            if let genres = LibraryGenreFacts.wire(LibraryGenreFacts.acceptedMetadata(meta, id: id, type: type)) {
+                fields["genres"] = genres
+            }
+            let item = VortxJSON.object(fields)
             let action: VortxJSON = .object(["type": .string("add_library_item"), "profileId": .string(profileID), "item": item])
             do {
                 let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
@@ -1460,7 +1464,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// A manual library gesture is complete only after its checkpoint and accepted projection.
     /// Bind the intent at both enqueue and execution so a queued profile switch cannot redirect it.
-    func setLibraryMembership(id: String, type: String, name: String, poster: String?, present: Bool,
+    func setLibraryMembership(id: String, type: String, name: String, poster: String?, genres: [String]? = nil, present: Bool,
                               profileID: String, expectedAccountGeneration: UUID) async throws {
         guard !id.isEmpty, !type.isEmpty, !name.isEmpty else { throw VortxNativeError.invalidResponse }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1472,10 +1476,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 continuation.resume(throwing: VortxNativeError.superseded); return
             }
             let profileGeneration = watchlistProfileGeneration
+            var item: [String: VortxJSON] = ["kind": .string("standard"), "id": .string(id), "type": .string(type),
+                                            "name": .string(name), "poster": poster.map(VortxJSON.string) ?? .null]
+            if let facts = LibraryGenreFacts.wire(genres) { item["genres"] = facts }
             let action: VortxJSON = present
                 ? .object(["type": .string("add_library_item"), "profileId": .string(profileID),
-                           "item": .object(["kind": .string("standard"), "id": .string(id), "type": .string(type),
-                                            "name": .string(name), "poster": poster.map(VortxJSON.string) ?? .null])])
+                           "item": .object(item)])
                 : .object(["type": .string("remove_library_item"), "profileId": .string(profileID),
                            "key": .string(type + ":" + id)])
             do {
@@ -1545,7 +1551,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             if subaction == "AddToLibrary" {
                 guard let meta = action["args"]?["args"], let id = string(meta["id"]), let type = string(meta["type"]), let title = string(meta["name"]) else { return fail("invalid_library_meta") }
                 native["type"] = .string("add_library_item")
-                native["item"] = .object(["kind": .string("standard"), "id": .string(id), "type": .string(type), "name": .string(title), "poster": meta["poster"] ?? .null])
+                var item: [String: VortxJSON] = ["kind": .string("standard"), "id": .string(id), "type": .string(type),
+                                               "name": .string(title), "poster": meta["poster"] ?? .null]
+                if let facts = LibraryGenreFacts.wire(LibraryGenreFacts.acceptedMetadata(meta, id: id, type: type)) {
+                    item["genres"] = facts
+                }
+                native["item"] = .object(item)
             } else {
                 guard let id = string(action["args"]?["args"]) else { return fail("invalid_library_id") }
                 let matches = state?["libraries"]?[profile]?["items"]?.array?.filter { $0["id"] == .string(id) && $0["kind"] == .string("standard") } ?? []
@@ -1974,7 +1985,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let saved = items.filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
             guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
             let resume = ownerHistoryLibrary == nil ? resumeByID[id] : resumeByTypedID[type + "\u{1f}" + id]
-            return libraryRow(id: id, type: type, name: item["name"] ?? .string(id), poster: item["poster"] ?? .null, resume: resume, formatter: formatter)
+            return libraryRow(id: id, type: type, name: item["name"] ?? .string(id), poster: item["poster"] ?? .null, genres: item["genres"], resume: resume, formatter: formatter)
         }
         let savedIDs = Set(saved.compactMap { string($0["_id"]) })
         if let ownerHistoryLibrary {
@@ -1993,7 +2004,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// `previouslyWatched` marks a watched-only row: listed in the Library, but not saved membership, so Detail
     /// still offers Add to Library and a removal never edits a Trakt/SIMKL watchlist.
-    private func libraryRow(id: String, type: String, name: VortxJSON, poster: VortxJSON, previouslyWatched: Bool = false,
+    private func libraryRow(id: String, type: String, name: VortxJSON, poster: VortxJSON, genres: VortxJSON? = nil, previouslyWatched: Bool = false,
                             resume: VortxJSON?, formatter: ISO8601DateFormatter) -> VortxJSON {
         // Exact native selected-unit projection, never max(old episode offsets). A saved
         // membership without watch evidence stays unwatched and out of Continue Watching.
@@ -2005,6 +2016,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                           "video_id": resume?["videoId"] ?? .null, "lastWatched": isoTimestamp(resume?["updatedAt"], formatter: formatter),
                                           "flaggedWatched": watched, "timesWatched": watched])]
         if previouslyWatched { row["previouslyWatched"] = .bool(true) }
+        if let facts = LibraryGenreFacts.wire(LibraryGenreFacts.projected(genres)) { row["genres"] = facts }
         return .object(row)
     }
     private func libraryProjection(state: VortxJSON, request: VortxJSON?, projected: [VortxJSON]? = nil) -> VortxJSON? {

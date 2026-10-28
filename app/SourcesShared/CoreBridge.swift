@@ -273,11 +273,16 @@ final class CoreBridge: ObservableObject {
     func nativePlaybackTargetIsCurrent(_ target: PlaybackMutationTarget) -> Bool { nativePlaybackBinding(target) != nil }
     /// Manual UI gestures acknowledge persistence, not merely admission to the native FIFO.
     @MainActor
-    func setNativeLibraryMembership(id: String, type: String, name: String, poster: String?, present: Bool,
+    func setNativeLibraryMembership(id: String, type: String, name: String, poster: String?, genres: [String]? = nil, present: Bool,
                                     target: PlaybackMutationTarget) async throws {
         guard let (facade, profile) = nativePlaybackBinding(target),
               case .native(let binding?) = target, let epoch = binding.accountGeneration else { throw VortxNativeError.superseded }
-        try await facade.setLibraryMembership(id: id, type: type, name: name, poster: poster, present: present,
+        let detail = (metaDetails?.meta).flatMap { $0.id == id && $0.type == type ? $0 : nil }
+        let preview = boardRows.flatMap(\.items).first { $0.id == id && $0.type == type }
+        let facts = LibraryGenreFacts.normalized(genres)
+            ?? LibraryGenreFacts.normalized(detail?.genres)
+            ?? LibraryGenreFacts.normalized(preview?.genres)
+        try await facade.setLibraryMembership(id: id, type: type, name: name, poster: poster, genres: facts, present: present,
                                               profileID: profile.uuidString, expectedAccountGeneration: epoch)
         guard nativePlaybackBinding(target)?.0 === facade else { throw VortxNativeError.superseded }
         // Mirror both directions only after the native checkpoint acknowledged persistence,
@@ -4262,15 +4267,16 @@ final class CoreBridge: ObservableObject {
                 guard let id = meta["id"] as? String,
                       let type = meta["type"] as? String,
                       let name = meta["name"] as? String else { continue }
-                ready.append(.init(id: id, type: type, name: name, poster: meta["poster"] as? String))
+                ready.append(.init(id: id, type: type, name: name, poster: meta["poster"] as? String,
+                                   genres: LibraryGenreFacts.acceptedMetadata(data: try? JSONSerialization.data(withJSONObject: meta), id: id, type: type)))
             }
         }
         let catalog = selectedID.flatMap(rawMetaPreview(forId:)).flatMap(Self.mutationPreview)
         let decoded = metaDetails?.meta.map {
-            LibraryWatchedMutationPolicy.MetaPreview(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
+            LibraryWatchedMutationPolicy.MetaPreview(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, genres: LibraryGenreFacts.normalized($0.genres))
         }
         return LibraryWatchedMutationPolicy.detailPreview(
-            targetID: selectedID, ready: ready, catalog: catalog, decoded: decoded
+            targetID: selectedID, targetType: metaDetails?.meta?.type, ready: ready, catalog: catalog, decoded: decoded
         )?.dictionary
     }
 
@@ -4278,7 +4284,8 @@ final class CoreBridge: ObservableObject {
         guard let id = raw["id"] as? String,
               let type = raw["type"] as? String,
               let name = raw["name"] as? String else { return nil }
-        return .init(id: id, type: type, name: name, poster: raw["poster"] as? String)
+        return .init(id: id, type: type, name: name, poster: raw["poster"] as? String,
+                     genres: LibraryGenreFacts.acceptedMetadata(data: try? JSONSerialization.data(withJSONObject: raw), id: id, type: type))
     }
 
     /// Remove the open detail-page title from the library, mirroring the removal to each connected external
@@ -4344,7 +4351,7 @@ final class CoreBridge: ObservableObject {
             Task { @MainActor in
                 do {
                     try await self.setNativeLibraryMembership(id: resident.id, type: resident.type, name: resident.name,
-                                                              poster: resident.poster, present: true, target: target)
+                                                              poster: resident.poster, genres: resident.genres, present: true, target: target)
                 } catch {
                     DiagnosticsLog.log("library", "action=add_saved surface=menu result=failed")
                 }

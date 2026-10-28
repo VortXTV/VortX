@@ -1,6 +1,9 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "All genres": {"comment": "Library genre filter", "extractionState": "manual", "localizations": {"en": {"stringUnit": {"state": "translated", "value": "All genres"}}}},
+    "Unknown genre": {"comment": "Library genre filter", "extractionState": "manual", "localizations": {"en": {"stringUnit": {"state": "translated", "value": "Unknown genre"}}}},
+    "Nothing matches these filters.": {"comment": "Library genre filter", "extractionState": "manual", "localizations": {"en": {"stringUnit": {"state": "translated", "value": "Nothing matches these filters."}}}},
     "Browse by Decade": {
       "localizations": {
         "fr": {

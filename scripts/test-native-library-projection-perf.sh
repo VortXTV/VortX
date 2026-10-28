@@ -9,7 +9,7 @@ case "$projection_mode" in run|--prepare-only|--functional-only|--owner-history-
 mkdir -p app/build
 projection_dir=$(mktemp -d "$PWD/app/build/native-library-projection.XXXXXX")
 projection_phase=source-extraction
-projection_inputs=(app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxResourceBridge.swift
+projection_inputs=(app/SourcesShared/LibraryGenreFacts.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxResourceBridge.swift
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativePreviouslyWatched.swift
   app/SourcesShared/VortxNativeSession.swift app/SourcesShared/OwnerHistoryExactJSON.swift app/SourcesShared/OwnerHistorySessionPublication.swift
   app/Tests/NativeLibraryProjectionTests.swift
@@ -55,6 +55,7 @@ function member(source, marker) {
 }
 const path = 'app/SourcesShared/VortxNativeCoreFacade.swift';
 const current = read(path), prior = read(path, baseline);
+const genreFacts = read('app/SourcesShared/LibraryGenreFacts.swift');
 const resource = read('app/SourcesShared/VortxResourceBridge.swift');
 const runtime = read('app/SourcesShared/VortxNativeRuntime.swift');
 const watched = read('app/SourcesShared/VortxNativePreviouslyWatched.swift');
@@ -76,7 +77,7 @@ assert.equal(presentationFields.length, 1, 'unique actual presentation field dec
 const sourceChangedHook = current.split('\n').filter(line => line.trim()
   === 'private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?');
 assert.equal(sourceChangedHook.length, 1, 'unique exact production generic source-delivery property');
-const combined = fixture
+const combined = (genreFacts + '\n' + fixture)
   .replace('// PRODUCTION_EXACT_JSON', pureExact)
   .replace('// PRODUCTION_OWNER_LIBRARY', member(publication, 'struct Presentation: Sendable {'))
   .replace('// PRODUCTION_JSON', member(resource, 'indirect enum VortxJSON:'))
@@ -95,7 +96,7 @@ const combined = fixture
   .replace('// PRODUCTION_BASELINE', markers.map(m => member(prior, m)).join('\n').replaceAll('VortxNativePreviouslyWatched', 'BaselinePreviouslyWatched'));
 fs.writeFileSync(out + '/Combined.swift', combined);
 const receipt = {sourceRef: ref, baselineRef: baseline, note: 'Exact production declarations; controlled playback/library state only. No SDK, app launch, account, credentials, or network.', sha256: {}};
-for (const [name, value] of Object.entries({CurrentFacade: current, BaselineFacade: prior, ResourceJSON: resource, RuntimeError: runtime, MembershipIndex: membership, CurrentPreviouslyWatched: watched, BaselinePreviouslyWatched: oldWatched, SourceChangedHook: sourceChangedHook[0], ManagementHelpers: managementHelpers, PresentationFields: presentationFields[0], Fixture: fixture, Combined: combined})) {
+for (const [name, value] of Object.entries({LibraryGenreFacts: genreFacts, CurrentFacade: current, BaselineFacade: prior, ResourceJSON: resource, RuntimeError: runtime, MembershipIndex: membership, CurrentPreviouslyWatched: watched, BaselinePreviouslyWatched: oldWatched, SourceChangedHook: sourceChangedHook[0], ManagementHelpers: managementHelpers, PresentationFields: presentationFields[0], Fixture: fixture, Combined: combined})) {
   receipt.sha256[name] = crypto.createHash('sha256').update(value).digest('hex');
 }
 fs.writeFileSync(out + '/source-receipt.json', JSON.stringify(receipt, null, 2) + '\n');

@@ -1193,6 +1193,9 @@ class DiscoverViewModel(
 class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     private val _state = MutableStateFlow<UiState<LibraryResult>>(UiState.Loading)
     val state: StateFlow<UiState<LibraryResult>> = _state.asStateFlow()
+    private var genreProfileID: String? = null
+    private val _genreScope = MutableStateFlow<Pair<String?, ContinueWatchingOwner?>>(null to null)
+    internal val genreScope = _genreScope.asStateFlow()
     private val randomPicker = RandomLibraryPickModel(
         scope = viewModelScope,
         captureOwner = repo::continueWatchingOwner,
@@ -1224,7 +1227,13 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
         }
         viewModelScope.launch {
             // A locked/pending profile handoff can intentionally suppress repository ctx emission.
-            ProfileStore.sharedOrNull()?.activeProfile?.collect { randomPicker.clear() }
+            ProfileStore.sharedOrNull()?.activeProfile?.collect { profile ->
+                if (genreProfileID != profile?.id) {
+                    genreProfileID = profile?.id
+                    _genreScope.value = genreProfileID to null
+                }
+                randomPicker.clear()
+            }
         }
     }
 
@@ -1240,9 +1249,16 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
         loadJob?.cancel()
         if (showLoading) _state.value = UiState.Loading
         loadJob = viewModelScope.launch {
-            _state.value = repo.library(requestJson).toUiState()
+            publishLibrary(repo.library(requestJson))
             everLoaded = true
         }
+    }
+
+    private fun publishLibrary(result: Result<LibraryResult>) {
+        result.getOrNull()?.let { library ->
+            _genreScope.value = library.owner?.let { it.profileId to it } ?: (genreProfileID to null)
+        }
+        _state.value = result.toUiState()
     }
 
     fun retry() = load(currentRequestJson)
@@ -1253,7 +1269,7 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     fun remove(id: String) {
         viewModelScope.launch {
             repo.removeFromLibrary(id)
-            _state.value = repo.library(currentRequestJson).toUiState()
+            publishLibrary(repo.library(currentRequestJson))
         }
     }
 
@@ -1264,7 +1280,7 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     fun markWatched(item: MetaItem, isWatched: Boolean) {
         viewModelScope.launch {
             repo.setCatalogWatched(item, isWatched)
-            _state.value = repo.library(currentRequestJson).toUiState()
+            publishLibrary(repo.library(currentRequestJson))
         }
     }
 }
