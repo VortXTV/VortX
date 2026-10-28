@@ -1,5 +1,28 @@
 import Foundation
 
+/// One initial cloud lookup and two quiet retries per exact content key. Player clock calls may consult
+/// this policy, but never create overlapping requests or a retry timer. The store's epoch owns completion.
+struct TrickplayCommunityFetchPolicy {
+    private var attempts = 0
+    private var inFlight = false
+    private var retryAfter = 0.0
+
+    mutating func begin(now: Double) -> Bool {
+        guard now.isFinite, !inFlight, attempts < 3, now >= retryAfter else { return false }
+        attempts += 1
+        inFlight = true
+        return true
+    }
+
+    mutating func finish(now: Double, succeeded: Bool) {
+        guard inFlight else { return }
+        inFlight = false
+        retryAfter = succeeded ? .infinity : now + (attempts == 1 ? 30 : 120)
+    }
+
+    mutating func reset() { self = Self() }
+}
+
 /// Bounds missing-runtime fallback work independently of the 2–4 Hz player clock. The caller cancels
 /// the old task on identity change; failed lookups may retry only after a quiet interval.
 struct TrickplayRuntimeLookupGate {
@@ -240,7 +263,9 @@ struct TrickplayFrameDiskStore {
             let middle = name.dropFirst(prefix.count).dropLast(4)   // strip "<prefix>-" and ".jpg" -> bucket digits
             guard let bucket = Int(middle) else { continue }
             let distance = abs(bucket - targetBucket)
-            if distance < bestDistance { bestDistance = distance; bestBucket = bucket }
+            if distance < bestDistance || (distance == bestDistance && bucket > (bestBucket ?? -1)) {
+                bestDistance = distance; bestBucket = bucket
+            }
         }
         guard shouldContinue(), let bestBucket,
               let data = data(mediaKey: mediaKey, bucket: bestBucket) else { return nil }

@@ -69,6 +69,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     private enum CommunityRemotePhase { case idle, loading, settled }
     private var communityRemotePhase = CommunityRemotePhase.idle
     private var communityFetchTask: Task<Void, Never>?; private var communityFetchEpoch: UInt64 = 0
+    private var communityFetchPolicy = TrickplayCommunityFetchPolicy()
     private var communityFetchKey: String?; private var activeScrubTime: Double?; private var pendingLocalReadToken: Int?
     private var pendingLocalReadLease: TrickplayLocalReadLease?
     /// The shareable identity for the current title, set by `configureCommunity`. nil for ad-hoc plays.
@@ -148,6 +149,7 @@ final class ScrubThumbnailsStore: ObservableObject {
 
     private func cancelCommunityFetch() {
         communityFetchEpoch &+= 1; communityFetchTask?.cancel(); communityFetchTask = nil; communityFetchKey = nil
+        communityFetchPolicy.reset()
     }
 
     func configure(localCacheKey: String?) {
@@ -221,6 +223,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             // Repeated 2–4 Hz clock configuration is not new evidence. Checking on every tick caused
             // thousands of identical skip logs and work even when no additional frame was captured.
             if durationBecameReal { maybeUploadProgressively() }
+            startCommunityFetchIfNeeded(key: key)
             return
         }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
@@ -241,21 +244,27 @@ final class ScrubThumbnailsStore: ObservableObject {
             communityUnavailableReason = nil
         }
         uploadPolicy.reset(for: key)
-        if !rekeying { communityFetchEpoch &+= 1 }
+        startCommunityFetchIfNeeded(key: key)
+        if rekeying, let activeTime = activeScrubTime { show(time: activeTime) }
+        // A bucket-changing real-duration re-key preserves session frames. They
+        // are now attributable to this exact bucket and may be admitted once.
+        if hasRealDuration { maybeUploadProgressively() }
+    }
+
+    private func startCommunityFetchIfNeeded(key: String) {
+        guard CommunityTrickplay.isEnabled, communityKey == key,
+              communityFetchPolicy.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
+        communityFetchEpoch &+= 1
         let fetchEpoch = communityFetchEpoch
         communityRemotePhase = .loading
-        previewState = activeScrubTime == nil ? .hidden : .loading
+        if image == nil { previewState = activeScrubTime == nil ? .hidden : .loading }
         communityFetchKey = key
-        if rekeying, let activeTime = activeScrubTime { show(time: activeTime) }
         communityFetchTask = Task { [weak self] in
             let result = await CommunityTrickplay.fetch(key: key)
             await MainActor.run {
                 self?.completeCommunityFetch(result, epoch: fetchEpoch, key: key)
             }
         }
-        // A bucket-changing real-duration re-key preserves session frames. They
-        // are now attributable to this exact bucket and may be admitted once.
-        if hasRealDuration { maybeUploadProgressively() }
     }
 
     private func completeCommunityFetch(_ result: CommunityTrickplay.FetchResult, epoch: UInt64, key: String) {
@@ -265,6 +274,9 @@ final class ScrubThumbnailsStore: ObservableObject {
         ), communityKey == key else { return }
         communityFetchTask = nil
         communityFetchKey = nil
+        let succeeded: Bool
+        if case .hit = result { succeeded = true } else { succeeded = false }
+        communityFetchPolicy.finish(now: ProcessInfo.processInfo.systemUptime, succeeded: succeeded)
         let receipt: String
         let diagnosticDetail: String
         let hit: Bool
@@ -353,20 +365,20 @@ final class ScrubThumbnailsStore: ObservableObject {
             if let fallback = nearestCommunityFallback() { image = fallback; previewState = .ready; return }
             previewState = previewStateForRemoteState(); return
         }
-        // In-memory hit resolves synchronously so a warm scrub is instant and never touches disk.
-        if let cached = Self.localFrameCache.memoryImage(for: key, time: time) {
+        // Only an exact resident bucket can rule out a better frame from an earlier watch on disk.
+        if let cached = Self.localFrameCache.exactMemoryImage(for: key, time: time) {
             image = cached; previewState = .ready; return
         }
-        // Past what has been captured (a forward drag into not-yet-watched territory), or a gap wider than the
-        // at-or-before lookback: the nearest RESIDENT frame in either direction still gives an instant
-        // approximate preview - no disk I/O, and no "unavailable" flash while the async read runs. Bounded so
-        // the main-actor probe stays cheap; farther frames fall through to the off-main read below.
-        if let nearest = Self.localFrameCache.nearestResidentImage(
+        // Show a warm approximate frame immediately, but continue the off-main lookup. A pair of new
+        // captures must not conceal the prior session's fuller disk cache across the whole seek bar.
+        if let placeholder = Self.localFrameCache.memoryImage(for: key, time: time)
+            ?? Self.localFrameCache.nearestResidentImage(
             for: key, time: time, maxRadius: Self.localFrameCache.syncNearestRadius
         ) {
-            image = nearest; previewState = .ready; return
+            image = placeholder; previewState = .ready
+        } else {
+            previewState = .loading
         }
-        previewState = .loading
         // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
         let token = showToken
         let lease = TrickplayLocalReadLease()
@@ -385,8 +397,10 @@ final class ScrubThumbnailsStore: ObservableObject {
             self.pendingLocalReadLease = nil
             if resolved == nil, let fallback = self.nearestCommunityFallback() {
                 self.image = fallback; self.previewState = .ready
-            } else {
-                self.image = resolved; self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
+            } else if let resolved {
+                self.image = resolved; self.previewState = .ready
+            } else if self.image == nil {
+                self.previewState = self.previewStateForRemoteState()
             }
         }
     }
@@ -796,24 +810,25 @@ private struct LocalTrickplayDiskWorker: Sendable {
                 guard !lease.isCancelled else { completion(.cancelled); return }
                 completion(.decoded(bucket: bucket, frame: decoded)); return
             }
-            // 2) The full-range nearest resident is selected from live NSCache entries in one bounded
-            // snapshot, not 16,200 actor hops. Its higher-bucket tie wins exactly as in the original scan.
-            guard !lease.isCancelled else { completion(.cancelled); return }
-            if let bucket = resident.nearestBucket {
-                completion(.resident(bucket)); return
-            }
+            // 2) Compare both cache tiers. A warm but farther frame cannot hide a closer disk frame
+            // outside the primary lookback. Higher bucket wins equal-distance ties in both tiers.
             guard !lease.isCancelled else { completion(.cancelled); return }
             if let hit = diskStore.nearest(mediaKey: key, targetBucket: target,
                                             shouldContinue: { !lease.isCancelled }) {
                 guard !lease.isCancelled else { completion(.cancelled); return }
-                guard let decoded = LocalTrickplayDecodedFrame.decode(hit.data) else {
+                let preferDisk = resident.nearestBucket.map { bucket in
+                    abs(hit.bucket - target) < abs(bucket - target)
+                        || (abs(hit.bucket - target) == abs(bucket - target) && hit.bucket > bucket)
+                } ?? true
+                if preferDisk, let decoded = LocalTrickplayDecodedFrame.decode(hit.data) {
                     guard !lease.isCancelled else { completion(.cancelled); return }
-                    completion(.missing); return
+                    completion(.decoded(bucket: hit.bucket, frame: decoded)); return
                 }
-                guard !lease.isCancelled else { completion(.cancelled); return }
-                completion(.decoded(bucket: hit.bucket, frame: decoded)); return
             }
             guard !lease.isCancelled else { completion(.cancelled); return }
+            if let bucket = resident.nearestBucket {
+                completion(.resident(bucket)); return
+            }
             completion(.missing)
         }
     }
@@ -926,7 +941,11 @@ private final class LocalTrickplayFrameCache {
         residentIndex[key, default: [:]][bucket] = WeakResidentFrame(frame)
     }
 
-    /// Synchronous in-memory-only lookup; bucket priority and the primary lookback are unchanged.
+    func exactMemoryImage(for key: String, time: Double) -> ScrubImage? {
+        memory.object(forKey: memKey(key, LocalTrickplayFramePolicy.bucketFor(time)))?.image
+    }
+
+    /// Approximate in-memory placeholder. The disk lookup still checks for a closer at-or-before frame.
     func memoryImage(for key: String, time: Double) -> ScrubImage? {
         let target = LocalTrickplayFramePolicy.bucketFor(time)
         let minBucket = max(0, target - LocalTrickplayFramePolicy.maxLookbackBuckets)
