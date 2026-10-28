@@ -4445,14 +4445,75 @@ final class MPVMetalViewController: PlatformViewController {
         readTracks(matching: { $0 == type })
     }
 
-    /// One scalar inventory walk for both control lists, without caching between refreshes.
-    /// Native fields can still change during the walk; this is not an atomic mpv snapshot.
+    /// One fresh inventory read for both control lists, without caching between refreshes.
+    /// Unexpected native node shapes retain the existing scalar-read fallback.
     func audioAndSubtitleTracks() -> (audio: [MPVTrack], subtitles: [MPVTrack]) {
         let tracks = readTracks(matching: { $0 == "audio" || $0 == "sub" })
         return (tracks.filter { $0.type == "audio" }, tracks.filter { $0.type == "sub" })
     }
 
+    /// Fetch one fresh native value per refresh. No inventory survives a call, so live topology,
+    /// selected flags and late language metadata still converge without a track-list notification.
     private func readTracks(matching matches: (String) -> Bool) -> [MPVTrack] {
+        guard let handle = mpv else { return [] }
+        var node = mpv_node()
+        if mpv_get_property(handle, MPVProperty.trackList, MPV_FORMAT_NODE, &node) >= 0 {
+            defer { mpv_free_node_contents(&node) }
+            if let tracks = Self.decodeTracks(node, matching: matches) { return tracks }
+        }
+        // Preserve the existing scalar behavior when a native build cannot supply the expected
+        // typed shape. Never publish a partial inventory after an unexpected row or field.
+        return readScalarTracks(matching: matches)
+    }
+
+    /// Copy the public track fields while the native node is owned by readTracks. Unknown fields
+    /// are ignored; absent optional fields keep the same defaults as the scalar getters below.
+    private static func decodeTracks(_ node: mpv_node, matching matches: (String) -> Bool) -> [MPVTrack]? {
+        guard node.format == MPV_FORMAT_NODE_ARRAY, let list = node.u.list,
+              list.pointee.num >= 0,
+              list.pointee.num == 0 || list.pointee.values != nil else { return nil }
+        var result: [MPVTrack] = []
+        for index in 0..<Int(list.pointee.num) {
+            let row = list.pointee.values[index]
+            guard row.format == MPV_FORMAT_NODE_MAP, let fields = row.u.list,
+                  fields.pointee.num >= 0,
+                  fields.pointee.num == 0 || (fields.pointee.keys != nil && fields.pointee.values != nil) else { return nil }
+            var id = 0, type = "", title = "", lang = ""
+            var selected = false, forced = false, dependent = false
+            var seen = Set<String>()
+            for field in 0..<Int(fields.pointee.num) {
+                guard let keyPointer = fields.pointee.keys[field] else { return nil }
+                let key = String(cString: keyPointer)
+                let value = fields.pointee.values[field]
+                switch key {
+                case "id":
+                    guard seen.insert(key).inserted, value.format == MPV_FORMAT_INT64,
+                          let integer = Int(exactly: value.u.int64) else { return nil }
+                    id = integer
+                case "type", "title", "lang":
+                    guard seen.insert(key).inserted, value.format == MPV_FORMAT_STRING,
+                          let string = value.u.string else { return nil }
+                    let text = String(cString: string)
+                    if key == "type" { type = text }
+                    else if key == "title" { title = text }
+                    else { lang = text }
+                case "selected", "forced", "dependent":
+                    guard seen.insert(key).inserted, value.format == MPV_FORMAT_FLAG else { return nil }
+                    let flag = value.u.flag > 0
+                    if key == "selected" { selected = flag }
+                    else if key == "forced" { forced = flag }
+                    else { dependent = flag }
+                default: break
+                }
+            }
+            guard matches(type), !dependent else { continue }
+            result.append(MPVTrack(id: id, type: type, title: title, lang: lang,
+                                   selected: selected, forced: forced))
+        }
+        return result
+    }
+
+    private func readScalarTracks(matching matches: (String) -> Bool) -> [MPVTrack] {
         guard mpv != nil else { return [] }
         let count = getInt("track-list/count")
         guard count > 0 else { return [] }
