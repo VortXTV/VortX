@@ -13,7 +13,7 @@
 # Cast/TV/Coil/Work/OkHttp remain plain dependencies in both flavors, never a GPL boundary change.
 
 [versions]
-agp = "9.4.1"
+agp = "9.5.0"
 kotlin = "2.4.21"
 composeBom = "2026.09.00"
 activityCompose = "1.13.0"
