@@ -23,6 +23,20 @@ final class PlaybackTitleQueue: ObservableObject {
         }
     }
 
+    /// Opaque original queue-owner witness. Capture it at the user gesture before any asynchronous playlist
+    /// read. Attachment identity makes A -> B -> A a different target even when the stable partition matches.
+    struct PlaylistImportTarget {
+        fileprivate let owner: PlaybackTitleQueueDurabilityOwner
+        fileprivate let attachment: PlaybackTitleQueueDurability.Attachment
+    }
+
+    /// Catalog-only queue metadata for playlist creation. The target is checked again on every read; callers
+    /// never receive a successor profile's queue merely because it became current after their gesture.
+    struct PlaylistSnapshot: Equatable, Sendable {
+        let candidates: [PlaybackTitleQueuePolicy.Candidate]
+        let remainingCapacity: Int
+    }
+
     private struct MediaIdentity: Equatable {
         let contentID: String
         let videoID: String
@@ -125,6 +139,24 @@ final class PlaybackTitleQueue: ObservableObject {
             && owner.target.stillOwnsCurrentContext(core: core)
     }
 
+    /// Capture only an already restored, usable queue. Import never activates or substitutes a newer owner.
+    func capturePlaylistImportTarget() -> PlaylistImportTarget? {
+        invalidateIfNeeded()
+        guard canUseQueue, let persistenceOwner, let persistenceAttachment,
+              persistenceOwner.isCurrent(profiles: profiles, core: core),
+              durability.canUseAttachment(persistenceAttachment) else { return nil }
+        return .init(owner: persistenceOwner, attachment: persistenceAttachment)
+    }
+
+    func playlistSnapshot(for target: PlaylistImportTarget) -> PlaylistSnapshot? {
+        guard playlistTargetIsCurrent(target, requireWriteSlot: false) else { return nil }
+        let entries = policy.durableEntries
+        return .init(
+            candidates: entries.map(\.candidate),
+            remainingCapacity: max(0, PlaybackTitleQueuePolicy.capacity - entries.count)
+        )
+    }
+
     /// Establish the exact live owner, then queue its bounded disk read behind every previously accepted write.
     /// No edit is admitted until the read result is published back to this same attachment.
     func activateCurrentOwner() {
@@ -154,6 +186,34 @@ final class PlaybackTitleQueue: ObservableObject {
             $0.enqueue(candidate, placement: placement)
         }) else { return false }
         return admitAndCommit(prepared) { self.invalidatePendingRoute() }
+    }
+
+    /// One playlist import is one local queue transaction. True means its immutable local durability write
+    /// was admitted; cloud save/sync has separate truth. Rejection preserves both caller input and live queue.
+    @discardableResult
+    func appendCandidates(
+        _ candidates: [PlaybackTitleQueuePolicy.Candidate],
+        target: PlaylistImportTarget
+    ) -> Bool {
+        invalidateIfNeeded()
+        // This check intentionally precedes UUID generation and canonical encoding.
+        guard playlistTargetIsCurrent(target, requireWriteSlot: true) else { return false }
+        guard !candidates.isEmpty else {
+            lastMutationProblem = "This playlist has no titles to add. Nothing changed."
+            publish()
+            return false
+        }
+        guard candidates.count <= PlaybackTitleQueuePolicy.capacity - policy.count else {
+            lastMutationProblem = "That playlist won’t fit in the queue. Remove titles and try again. Nothing changed."
+            publish()
+            return false
+        }
+        guard let prepared = prepareDurableMutation({
+            $0.appendCandidates(candidates)
+        }) else { return false }
+        return admitAndCommit(prepared, playlistTarget: target) {
+            self.invalidatePendingRoute()
+        }
     }
 
     func remove(_ id: UUID) {
@@ -417,6 +477,17 @@ final class PlaybackTitleQueue: ObservableObject {
         return durability.canAcceptWrite(for: persistenceAttachment)
     }
 
+    private func playlistTargetIsCurrent(
+        _ target: PlaylistImportTarget,
+        requireWriteSlot: Bool
+    ) -> Bool {
+        guard persistenceAttachment == target.attachment,
+              target.owner.isCurrent(profiles: profiles, core: core),
+              persistencePhase.allowsEditing,
+              durability.canUseAttachment(target.attachment) else { return false }
+        return !requireWriteSlot || durability.canAcceptWrite(for: target.attachment)
+    }
+
     private func prepareDurableMutation(
         _ mutation: (inout PlaybackTitleQueuePolicy) -> Bool
     ) -> PlaybackTitleQueuePreparedMutation? {
@@ -437,15 +508,25 @@ final class PlaybackTitleQueue: ObservableObject {
     /// are the staged policy and related live authority published as one coherent state transition.
     private func admitAndCommit(
         _ prepared: PlaybackTitleQueuePreparedMutation,
+        playlistTarget: PlaylistImportTarget? = nil,
         sideEffects: () -> Void = {}
     ) -> Bool {
-        guard let persistenceOwner, let persistenceAttachment else {
+        let admittedOwner: PlaybackTitleQueueDurabilityOwner
+        let admittedAttachment: PlaybackTitleQueueDurability.Attachment
+        if let playlistTarget {
+            guard playlistTargetIsCurrent(playlistTarget, requireWriteSlot: true) else { return false }
+            admittedOwner = playlistTarget.owner
+            admittedAttachment = playlistTarget.attachment
+        } else if let persistenceOwner, let persistenceAttachment {
+            admittedOwner = persistenceOwner
+            admittedAttachment = persistenceAttachment
+        } else {
             lastMutationProblem = "Your profile or playback session changed. Nothing changed."
             publish()
             return false
         }
         switch durability.admit(
-            prepared, attachment: persistenceAttachment, owner: persistenceOwner
+            prepared, attachment: admittedAttachment, owner: admittedOwner
         ) {
         case .accepted(let phase):
             policy = prepared.policy

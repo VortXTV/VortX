@@ -21,10 +21,11 @@ private enum PlaybackTitleQueuePolicyTests {
         validation()
         orderingAndIdentity()
         boundedAdmission()
+        playlistBatchImport()
         staleTickets()
         failureAndRetry()
         finishingAndManualSkip()
-        print("PlaybackTitleQueuePolicy: 6 groups, \(assertions) assertions passed")
+        print("PlaybackTitleQueuePolicy: 7 groups, \(assertions) assertions passed")
     }
 
     private static func validation() {
@@ -70,6 +71,56 @@ private enum PlaybackTitleQueuePolicyTests {
         expect(state.nextTicket() == nil, "cannot admit a second simultaneous queue player")
         state.clearUpcoming()
         expect(state.count == 1 && state.active?.ticket == ticket, "clear upcoming preserves current playback")
+    }
+
+    private static func playlistBatchImport() {
+        var ordered = PlaybackTitleQueuePolicy()
+        let existing = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let first = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let second = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+        expect(ordered.enqueue(movie("existing"), placement: .last, id: existing), "seed batch order")
+        var generated = [first, second][...]
+        expect(ordered.appendCandidates([movie("first"), movie("first")], makeID: {
+            generated.removeFirst()
+        }), "batch accepted")
+        expect(ordered.upcoming.map(\.id) == [existing, first, second], "batch order and duplicates preserved")
+        expect(ordered.upcoming.map(\.candidate.contentID) == ["existing", "first", "first"],
+               "batch catalog candidates stay aligned")
+
+        var nearCapacity = PlaybackTitleQueuePolicy()
+        for index in 0..<(PlaybackTitleQueuePolicy.capacity - 1) {
+            expect(nearCapacity.enqueue(movie("capacity-\(index)"), placement: .last), "seed capacity")
+        }
+        let beforeCapacityIDs = nearCapacity.upcoming.map(\.id)
+        var capacityFactoryCalls = 0
+        expect(!nearCapacity.appendCandidates([movie("overflow-a"), movie("overflow-b")], makeID: {
+            capacityFactoryCalls += 1
+            return UUID()
+        }), "over-capacity batch rejected")
+        expect(capacityFactoryCalls == 0, "capacity rejected before fresh ID generation")
+        expect(nearCapacity.upcoming.map(\.id) == beforeCapacityIDs, "capacity rejection is all-or-nothing")
+
+        var collision = PlaybackTitleQueuePolicy()
+        expect(collision.enqueue(movie("kept"), placement: .last, id: existing), "seed collision")
+        let beforeCollision = collision.upcoming
+        expect(!collision.appendCandidates([movie("rejected")], makeID: { existing }),
+               "generated identity collision rejected")
+        expect(collision.upcoming == beforeCollision, "identity rejection is all-or-nothing")
+
+        var active = PlaybackTitleQueuePolicy()
+        let activeID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
+        let pendingID = UUID(uuidString: "00000000-0000-0000-0000-000000000011")!
+        let addedID = UUID(uuidString: "00000000-0000-0000-0000-000000000012")!
+        expect(active.enqueue(movie("active"), placement: .last, id: activeID), "seed active")
+        expect(active.enqueue(movie("pending"), placement: .last, id: pendingID), "seed pending")
+        guard let ticket = active.nextTicket() else { fatalError("missing batch active ticket") }
+        expect(active.acceptStarted(ticket), "establish active item")
+        let originalActive = active.active
+        expect(active.appendCandidates([movie("added")], makeID: { addedID }),
+               "batch appends around active item")
+        expect(active.active == originalActive, "active entry and ticket ownership preserved")
+        expect(active.upcoming.map(\.id) == [pendingID, addedID], "batch appends after existing pending order")
+        expect(active.count == 3, "active item remains inside capacity accounting")
     }
 
     private static func staleTickets() {

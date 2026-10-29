@@ -85,6 +85,28 @@ struct PlaybackTitleQueuePolicy {
         return true
     }
 
+    /// Atomically append one already-validated catalog batch. IDs are minted locally so a cloud playlist's
+    /// durable item identity can never become queue route/ticket authority. Every candidate and fresh ID is
+    /// staged before live order or revision changes; capacity or identity failure therefore changes nothing.
+    @discardableResult
+    mutating func appendCandidates(
+        _ candidates: [Candidate],
+        makeID: () -> UUID = { UUID() }
+    ) -> Bool {
+        guard !candidates.isEmpty, candidates.count <= Self.capacity - count else { return false }
+        var knownIDs = Set(durableEntries.map(\.id))
+        var appended: [Entry] = []
+        appended.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            let id = makeID()
+            guard knownIDs.insert(id).inserted else { return false }
+            appended.append(.init(id: id, candidate: candidate))
+        }
+        upcoming.append(contentsOf: appended)
+        revision = UUID()
+        return true
+    }
+
     @discardableResult
     mutating func remove(_ id: UUID) -> Bool {
         guard let index = upcoming.firstIndex(where: { $0.id == id }) else { return false }
