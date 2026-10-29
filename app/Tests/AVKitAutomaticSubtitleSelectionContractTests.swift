@@ -8,17 +8,19 @@ enum AVKitAutomaticSubtitleSelectionContractTests {
         let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: app.appendingPathComponent("Sources/Player/AVPlayerEngine.swift"),
             encoding: .utf8)
-        let automatic = try section(source, from: "    func selectExternalSubtitleAutomatically(",
-            to: "    private func awaitAutomaticRawSettlement(")
+        let automaticEntry = try section(source, from: "    func selectExternalSubtitleAutomatically(",
+            to: "    func alignLocalExternalSubtitle(")
+        let automaticImplementation = try section(source, from: "    private func selectAutomaticExternalSubtitle(",
+            to: "    private func awaitExplicitNativeSubtitleSettlement(")
         let settlement = try section(source, from: "    private func awaitAutomaticRawSettlement(",
             to: "    private func finishAutomaticSubtitle(")
         let current = try section(source, from: "    private func ownsAutomaticSubtitle(",
             to: "    /// Normal AVKit add-on selection")
-        let ownerBranch = try section(automatic, from: "            if let owner {",
+        let ownerBranch = try section(automaticImplementation, from: "            if let owner {",
             to: "            // Owner-bearing selection registers")
-        let fallback = try section(automatic, from: "            let mounted = await self.awaitAutomaticRawSettlement(request)",
+        let fallback = try section(automaticImplementation, from: "            let mounted = await self.awaitAutomaticRawSettlement(request)",
             to: "            let timings:")
-        let mount = try section(automatic, from: "            // Owner-bearing selection registers",
+        let mount = try section(automaticImplementation, from: "            // Owner-bearing selection registers",
             to: "            let mounted = await self.awaitAutomaticRawSettlement(request)")
         var count = 0
         func check(_ label: String, _ condition: @autoclosure () -> Bool) {
@@ -26,11 +28,11 @@ enum AVKitAutomaticSubtitleSelectionContractTests {
             count += 1
         }
         check("owner remains optional; ordinary guest/legacy selection is not newly denied",
-            automatic.contains("owner: PlayerSubtitleAlignmentOwner?")
-                && automatic.contains("guard let remote = URL(string: url)")
-                && !automatic.contains("guard let owner, let remote"))
+            automaticEntry.contains("owner: PlayerSubtitleAlignmentOwner?")
+                && automaticEntry.contains("guard let remote = URL(string: url)")
+                && !automaticEntry.contains("guard let owner, let remote"))
         check("reference capture requires an actual original native owner",
-            automatic.contains("let reference = owner != nil &&"))
+            automaticImplementation.contains("let reference = owner != nil &&"))
         check("only owner-bearing mount acquires native effect and registration",
             ownerBranch.contains("tryBeginSubtitleEffect(owner.mount)")
                 && ownerBranch.contains("registerSubtitleRenderer(admitted,")
@@ -45,9 +47,9 @@ enum AVKitAutomaticSubtitleSelectionContractTests {
             fallback.contains("guard mounted.succeeded else")
                 && fallback.contains("guard let reference, let owner,")
                 && fallback.contains("completion(.selectedWithoutAlignment)"))
-        let acquisition = try range(automatic, "timings = try await reference.read")
-        let nativeOwner = try range(automatic, "guard let reference, let owner,")
-        let confirmedMount = try range(automatic, "guard mounted.succeeded else")
+        let acquisition = try range(automaticImplementation, "timings = try await reference.read")
+        let nativeOwner = try range(automaticImplementation, "guard let reference, let owner,")
+        let confirmedMount = try range(automaticImplementation, "guard mounted.succeeded else")
         check("actual reference reading and query follow both settlement and native-owner admission",
             confirmedMount.lowerBound < nativeOwner.lowerBound
                 && nativeOwner.lowerBound < acquisition.lowerBound)
@@ -66,10 +68,10 @@ enum AVKitAutomaticSubtitleSelectionContractTests {
                 && settlement.contains("selectedMediaOption(in: $0) == nil"))
         check("settlement timeout cannot activate a failed or successor request",
             settlement.contains("guard ownsAutomaticSubtitle(request), !Task.isCancelled else")
-                && settlement.contains("retireSubtitleAlignment(revealRequestedFile: false)"))
+                && settlement.contains("retireSubtitleAlignment(revealRequestedFile: false, cause: .successor)"))
         check("final correction uses the original private publication rather than a new receipt",
-            automatic.contains("guard let publication = request.publication,")
-                && automatic.contains("self.alignedSubtitlePublication === publication,"))
+            automaticImplementation.contains("guard let publication = request.publication,")
+                && automaticImplementation.contains("self.alignedSubtitlePublication === publication,"))
         let retirement = try section(source, from: "    private func retireSubtitleAlignment(",
             to: "    func cancelAutomaticSubtitleAlignment(")
         let clearing = try section(retirement, from: "        if !reveal {",
@@ -80,7 +82,7 @@ enum AVKitAutomaticSubtitleSelectionContractTests {
             clear.lowerBound < receipt.lowerBound)
         let teardown = try section(source, from: "    isolated deinit {", to: "\nextension AVPlayerEngineController")
         check("engine release without stop still retires its task and exact registration",
-            teardown.contains("retireSubtitleAlignment(revealRequestedFile: false)"))
+            teardown.contains("retireSubtitleAlignment(revealRequestedFile: false, cause: .engineTeardown)"))
         print("AVKit automatic-selection source contract: \(count) checks passed")
     }
 

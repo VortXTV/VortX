@@ -58,28 +58,47 @@ const automaticPresent = automaticParts.filter(marker => source.includes(marker)
 if (automaticPresent !== 0 && automaticPresent !== automaticParts.length) throw Error('Partial AVKit request capability');
 const automaticRequests = automaticPresent === automaticParts.length;
 if (automaticRequests && !supportsAlignment) throw Error('AVKit request state without alignment retirement');
+const retirementCauseMarker = 'private enum AVSubtitleRequestRetirementCause: Equatable {';
+const typedRetirementCauses = source.includes(retirementCauseMarker);
+if (ref === 'current' && !typedRetirementCauses) throw Error('Current AVKit alignment retirement cause is missing');
+const alignmentRetirement = typedRetirementCauses
+  ? 'retireSubtitleAlignment(cause: .successor)' : 'retireSubtitleAlignment()';
 const contracts = {};
 if (supportsAlignment) {
-  for (const marker of ['    func invalidateLoadToken()', '    func loadFile(', '    func setSubtitleTrack(',
-    '    func addExternalSubtitle(', '    private func disableExternalSubtitle(', '    func setSubDelay(']) {
-    if (!body(marker).startsWith('retireSubtitleAlignment()')) throw Error('Missing entry retirement: ' + marker);
+  const entryMarkers = ['    func invalidateLoadToken()', '    func loadFile(', '    func setSubtitleTrack(',
+    '    func addExternalSubtitle(', '    private func disableExternalSubtitle(', '    func setSubDelay('];
+  const statementLines = marker => body(marker).split(/\n/).map(line => line.trim()).filter(Boolean);
+  const contributionLoadExists = source.includes('    private func retireSubtitleContributionLoad()');
+  for (let index = 0; index < entryMarkers.length; index++) {
+    const marker = entryMarkers[index], lines = statementLines(marker);
+    let expected;
+    if (index < 2 && contributionLoadExists) {
+      expected = ['retireSubtitleContributionLoad()', alignmentRetirement];
+    } else {
+      expected = [alignmentRetirement];
+    }
+    if (lines.length < expected.length || expected.some((line, offset) => lines[offset] !== line)) {
+      throw Error('Missing ordered entry retirement: ' + marker);
+    }
     contracts[marker] = 'entry-retirement-source-contract';
   }
   for (const marker of ['    private func selectNativeSubtitle(', '    private func setExternalSubtitleActive(']) {
     const first = body(marker);
     if (automaticRequests) {
+      const retirement = typedRetirementCauses
+        ? 'retireSubtitleAlignment\\(cause: \\.successor\\)' : 'retireSubtitleAlignment\\(\\)';
       const expected = marker.includes('setExternalSubtitleActive')
-        ? /^if let original \{\s*guard automaticSubtitleRequestIsCurrent\(original\) else \{ return \}\s*automaticSubtitleRequest\?\.rawSettled = active\s*\} else \{ retireSubtitleAlignment\(\) \}/
-        : /^if let original \{\s*guard automaticSubtitleRequestIsCurrent\(original\) else \{ return \}\s*\} else \{ retireSubtitleAlignment\(\) \}/;
+        ? new RegExp(`^if let original \\{\\s*guard automaticSubtitleRequestIsCurrent\\(original\\) else \\{ return \\}\\s*automaticSubtitleRequest\\?\\.rawSettled = active\\s*\\} else \\{ ${retirement} \\}`)
+        : new RegExp(`^if let original \\{\\s*guard automaticSubtitleRequestIsCurrent\\(original\\) else \\{ return \\}\\s*\\} else \\{ ${retirement} \\}`);
       if (!expected.test(first)) throw Error('Missing owned-preservation/manual-retirement branch: ' + marker);
       contracts[marker] = 'owned-preservation/manual-retirement-source-contract-only';
     } else {
-      if (!first.startsWith('retireSubtitleAlignment()')) throw Error('Missing entry retirement: ' + marker);
+      if (!first.startsWith(alignmentRetirement)) throw Error('Missing entry retirement: ' + marker);
       contracts[marker] = 'entry-retirement-source-contract';
     }
   }
   const fallback = once(source, '        let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))');
-  if (!source.slice(fallback - 60, fallback).trimEnd().endsWith('retireSubtitleAlignment()')) throw Error('HDR fallback must retire previous preparation');
+  if (!source.slice(fallback - 90, fallback).trimEnd().endsWith(alignmentRetirement)) throw Error('HDR fallback must retire previous preparation');
   const notification = method(source, '    @objc private func mediaSelectionDidChange(');
   const admission = '              owns(changedItem, loadToken: loadToken) else { return }';
   const afterGuard = withoutComments(notification.slice(once(notification, admission) + admission.length));

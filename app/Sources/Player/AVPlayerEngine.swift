@@ -12,6 +12,10 @@ import os
 import UIKit
 #endif
 
+private enum AVSubtitleRequestRetirementCause: Equatable {
+    case successor, ownerRevoked, uncertainNativeCommit, cancelledNativeCommit, engineTeardown
+}
+
 /// Current-item remux intent published to startup watchdogs. `pendingGeneration` is stamped only after the
 /// matching `loadFile` has decided to enter a remux lane, so intent from a retired item cannot extend a newer
 /// direct load. Mounted state is already current-item-owned by synchronous teardown and guarded async attach.
@@ -883,10 +887,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var externalSubtitleRequestRevision: UInt64 = 0
     /// Subtitle intent/timing authority is independent of fetch and native-legible settlement revisions.
     private var subtitleAlignmentGeneration: UInt64 = 0
-    /// The same original selection owns download, ordinary raw mount, native deselection settlement,
-    /// local reference read and final prepared-presentation publication. No async step recaptures it.
+    /// One original subtitle request owns its guarded bytes, optional raw mount, native deselection
+    /// settlement, local reference read and final prepared-presentation publication. Explicit alignment
+    /// leaves the current subtitle untouched until a prepared result is accepted.
     @MainActor
     private final class AutomaticSubtitleRequest {
+        enum Kind { case automaticSelection, explicitKeepCurrent }
+        let kind: Kind
         let generation: UInt64
         let requestRevision: UInt64
         let item: AVPlayerItem
@@ -896,11 +903,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let owner: PlayerSubtitleAlignmentOwner?
         let permitsUse: @Sendable () -> Bool
         var selectionRevision: UInt64?
+        /// True only when the external overlay's AV native-deselection fence settled. The `kind`
+        /// distinguishes an ordinary raw selection from an explicit prepared keep-current commit.
         var rawSettled = false
+        var nativeCommitStarted = false
+        var retirementCause: AVSubtitleRequestRetirementCause?
         var publication: AVKitSubtitleAlignmentPublication?
         init(generation: UInt64, requestRevision: UInt64, item: AVPlayerItem, load: PlayerLoadToken,
              itemGeneration: UInt64, mountIdentity: UInt64, owner: PlayerSubtitleAlignmentOwner?,
+             kind: Kind = .automaticSelection,
              permitsUse: @escaping @Sendable () -> Bool = { true }) {
+            self.kind = kind
             self.generation = generation; self.requestRevision = requestRevision
             self.item = item; self.load = load; self.itemGeneration = itemGeneration
             self.mountIdentity = mountIdentity; self.owner = owner; self.permitsUse = permitsUse
@@ -1207,7 +1220,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     func invalidateLoadToken() {
         retireSubtitleContributionLoad()
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         replacementReadyDeadlineTask?.cancel()
         replacementReadyDeadlineTask = nil
         cancelColdLocalRemuxPreparation()
@@ -1404,7 +1417,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // Optional donation is retired on intent, including a refused or same-token remount.
         retireSubtitleContributionLoad()
         // A same-logical-token remount still retires preparation made against the previous mount.
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         let carriedSeekTarget = pendingRequestedSourcePositionSeconds
         invalidateSeekRequests()
         eventOwnedRecoveryTask?.cancel()
@@ -2382,7 +2395,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         selectionTopologyGeneration = nil
         selectionRefreshState.reset()
 
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         advanceContributionItemGeneration()
         midPlaybackRecoveryBudget.reset(for: playbackMountIdentity)
@@ -3768,7 +3781,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// detour through an embedded track or Off), which is what makes the external row behave like every other
     /// row in the picker instead of being a one-way door.
     func setSubtitleTrack(_ id: Int) {
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         // This user decision supersedes any in-flight external file fetch for the same item.
         externalSubtitleRequestRevision &+= 1
         let nativeID: Int
@@ -3821,7 +3834,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     ) {
         if let original {
             guard automaticSubtitleRequestIsCurrent(original) else { return }
-        } else { retireSubtitleAlignment() }
+        } else { retireSubtitleAlignment(cause: .successor) }
         invalidateNativeSubtitleOverlay()
         subtitleSelectionRevision &+= 1
         let revision = subtitleSelectionRevision
@@ -3917,7 +3930,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if let original {
             guard automaticSubtitleRequestIsCurrent(original) else { return }
             automaticSubtitleRequest?.rawSettled = active
-        } else { retireSubtitleAlignment() }
+        } else { retireSubtitleAlignment(cause: .successor) }
         if active { invalidateNativeSubtitleOverlay() }
         externalSubActive = active
         guard active else {
@@ -4031,7 +4044,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// AVPlayer-native legible track so subtitles never double up. `completion(true)` once cues are loaded.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         externalSubtitleRequestRevision &+= 1
         let requestRevision = externalSubtitleRequestRevision
         // Keep the current selection during I/O. A failed/empty subtitle must not erase a working native
@@ -4085,7 +4098,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// the chrome has already hidden that add-on's own row (it lives in `addedSubURLs`) on the promise that
     /// the subtitle re-appears in the ordinary track list. `discardingCues: true` is the title-change reset.
     private func disableExternalSubtitle(discardingCues: Bool = false) {
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         // Cancellation is required even when keeping parsed cues for a picker detour: a newer selection may
         // re-activate them, but delayed settlement work from the old one must never do so on its own.
         externalSubtitleSettlement.clear()
@@ -4104,20 +4117,39 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     var subtitleAlignmentRevision: UInt64? { subtitleAlignmentGeneration }
 
-    private func retireSubtitleAlignment(revealRequestedFile: Bool = true) {
+    private func retireSubtitleAlignment(revealRequestedFile: Bool = true,
+        cause: AVSubtitleRequestRetirementCause? = nil) {
+        let resolvedCause: AVSubtitleRequestRetirementCause
+        if let cause {
+            resolvedCause = cause
+        } else if let request = automaticSubtitleRequest,
+                  request.kind == .explicitKeepCurrent, request.nativeCommitStarted,
+                  let publication = request.publication {
+            resolvedCause = publication.claimOwnerRevocationForDefaultRetirement()
+                ? .ownerRevoked : .uncertainNativeCommit
+        } else {
+            resolvedCause = .successor
+        }
+        if let request = automaticSubtitleRequest, request.retirementCause == nil {
+            request.retirementCause = resolvedCause
+        }
         subtitleAlignmentGeneration &+= 1
         automaticSubtitleTask?.cancel()
         automaticSubtitleTask = nil
         automaticSubtitleRequest = nil
         let originalPublication = alignedSubtitlePublication
-        let reveal = revealRequestedFile && originalPublication?.isRevoked != true
+        let denyPendingSettlement = resolvedCause == .ownerRevoked
+            || resolvedCause == .uncertainNativeCommit
+            || resolvedCause == .cancelledNativeCommit
+        let reveal = revealRequestedFile && !denyPendingSettlement
+            && originalPublication?.isRevoked != true
         alignedSubtitlePublication = nil
         alignedSubtitlePresentation = nil
         alignedSubtitleSelection = nil
         alignedSubtitleClock = .init()
         if !reveal {
-            // Owner/account revocation is NOT a new user instruction to reveal an old raw file.
-            // Deny pending native settlement as well as corrected publication; never mount/restore.
+            // Owner revocation and uncertain/canceled native commits are not instructions to
+            // reveal old raw cues. Deny pending settlement as well as corrected publication.
             externalSubtitleSettlement.clear()
             externalSubtitleRequestRevision &+= 1
             subtitleSelectionRevision &+= 1
@@ -4137,8 +4169,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     func cancelAutomaticSubtitleAlignment(ifRequestGeneration original: UInt64) {
-        guard automaticSubtitleRequest?.generation == original else { return }
-        retireSubtitleAlignment()
+        guard let request = automaticSubtitleRequest, request.generation == original else { return }
+        let cause: AVSubtitleRequestRetirementCause = request.kind == .explicitKeepCurrent
+            && request.nativeCommitStarted ? .cancelledNativeCommit : .successor
+        retireSubtitleAlignment(revealRequestedFile: cause != .cancelledNativeCommit, cause: cause)
     }
 
     var alignedExternalSubtitle: PlayerAlignedSubtitleSelection? { alignedSubtitleSelection }
@@ -4182,13 +4216,203 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             owner: owner, localSource: source, completion: completion)
     }
 
+    /// Explicit keep-current alignment consumes only the already guarded bytes. AV can offer this
+    /// action only while one genuine local embedded text track is selected and capturable.
+    func alignLocalExternalSubtitle(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerSubtitleAlignmentResult) -> Void
+    ) -> UInt64? {
+        guard source.permitsUse(), activeLoadToken == expectedLoad,
+              subtitleAlignmentRevision == expectedRevision,
+              let originalItem = item, let originalLoad = activeLoadToken,
+              owns(originalItem, loadToken: originalLoad) else {
+            completion(.superseded)
+            return nil
+        }
+        guard #available(iOS 26.0, tvOS 26.0, macOS 26.0, *),
+              source.format == "srt", source.data.count <= 1_024 * 1_024,
+              !lastLoadLive, !isRemuxMounted, remuxTimelineOrigin == 0,
+              subtitleRenderer.offset == 0, !externalSubActive,
+              !externalSubtitleSettlement.hasPendingIntent,
+              selectionTopologyGeneration == itemGeneration,
+              let group = subGroup,
+              let selectedOption = originalItem.currentMediaSelection.selectedMediaOption(in: group),
+              let reference = AVKitSubtitleReferenceCapture.capture(item: originalItem) else {
+            completion(.unavailable)
+            return nil
+        }
+
+        // A fresh request supersedes stale work without touching the selected native subtitle. The
+        // retained reference and selected option belong to this exact item and are never recaptured.
+        retireSubtitleAlignment(cause: .successor)
+        externalSubtitleRequestRevision &+= 1
+        let request = AutomaticSubtitleRequest(generation: subtitleAlignmentGeneration,
+            requestRevision: externalSubtitleRequestRevision, item: originalItem, load: originalLoad,
+            itemGeneration: itemGeneration, mountIdentity: playbackMountIdentity, owner: owner,
+            kind: .explicitKeepCurrent,
+            permitsUse: source.permitsUse)
+        automaticSubtitleRequest = request
+        automaticSubtitleTask = Task { @MainActor [weak self] in
+            guard let self else {
+                completion(.superseded)
+                return
+            }
+            guard self.ownsAutomaticSubtitle(request), !Task.isCancelled else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+            let timings: [SubtitleReferenceNativeQuery.Timing]
+            do {
+                timings = try await reference.read { [weak self] in
+                    guard let self else { return false }
+                    return self.ownsAutomaticSubtitle(request) && !Task.isCancelled
+                        && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                }
+            } catch {
+                let current = self.ownsAutomaticSubtitle(request) && !Task.isCancelled
+                    && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                self.finishExplicitSubtitlePreparation(request)
+                completion(current ? .unavailable : .superseded)
+                return
+            }
+            guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
+                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+            let job = UUID()
+            let result = await Task.detached(priority: .utility) {
+                () -> (SubtitleReferencePresentation.Prepared?, [SubtitleCue]) in
+                guard let file = SubtitleReferenceNativeQuery.align(externalSRT: source.data,
+                    reference: timings, originalJob: job),
+                      let prepared = try? SubtitleReferencePresentation.prepare(file) else {
+                    return (nil, [])
+                }
+                return (prepared, SubtitleCueRenderer.parse(data: source.data))
+            }.value
+            guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
+                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+            guard let prepared = result.0, !result.1.isEmpty else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.unmatched)
+                return
+            }
+            do {
+                try await reference.validateAfterPreparation { [weak self] in
+                    guard let self else { return false }
+                    return self.ownsAutomaticSubtitle(request) && !Task.isCancelled
+                        && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                }
+            } catch {
+                let current = self.ownsAutomaticSubtitle(request) && !Task.isCancelled
+                    && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                self.finishExplicitSubtitlePreparation(request)
+                completion(current ? .unavailable : .superseded)
+                return
+            }
+            guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
+                  source.permitsUse(), self.player.currentItem === originalItem,
+                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption,
+                  !self.externalSubActive else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+
+            guard let effect = CredentialPublicationOutbox.tryBeginSubtitleEffect(owner.mount) else {
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+            let publication = AVKitSubtitleAlignmentPublication { [weak self] original in
+                guard let self, self.alignedSubtitlePublication === original else { return }
+                self.alignedSubtitlePublication = nil
+                self.retireSubtitleAlignment(revealRequestedFile: false, cause: .ownerRevoked)
+            }
+            guard let registration = CredentialPublicationOutbox.registerSubtitleRenderer(effect,
+                revoke: { publication.revoke() }), publication.install(registration),
+                  self.ownsAutomaticSubtitle(request), !publication.isRevoked else {
+                CredentialPublicationOutbox.endSubtitleEffect(effect)
+                publication.close()
+                self.finishExplicitSubtitlePreparation(request)
+                completion(.superseded)
+                return
+            }
+            request.publication = publication
+            self.alignedSubtitlePublication = publication
+
+            // This is the first mutation of the current subtitle selection. A pending/native
+            // acknowledgement is owned by the same request and cannot publish after retirement.
+            request.nativeCommitStarted = true
+            self.subtitleRenderer.load(cues: result.1)
+            self.externalSubLabel = (title: title, lang: lang)
+            self.updatePendingSelectionIntent { $0.selectExternalSubtitle() }
+            self.selectNativeSubtitle(nil, activatingExternalAfterSettlement: true,
+                preservingAutomaticRequest: request.generation)
+            CredentialPublicationOutbox.endSubtitleEffect(effect)
+
+            let settled = await self.awaitExplicitNativeSubtitleSettlement(request)
+            guard settled, self.ownsAutomaticSubtitle(request), !Task.isCancelled,
+                  request.rawSettled, self.externalSubActive,
+                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == nil else {
+                self.failExplicitSubtitleAfterNativeChange(request, completion: completion)
+                return
+            }
+            guard let finalEffect = CredentialPublicationOutbox.tryBeginSubtitleEffect(owner.mount) else {
+                self.failExplicitSubtitleAfterNativeChange(request, completion: completion)
+                return
+            }
+            guard self.ownsAutomaticSubtitle(request), !publication.isRevoked else {
+                CredentialPublicationOutbox.endSubtitleEffect(finalEffect)
+                self.failExplicitSubtitleAfterNativeChange(request, completion: completion)
+                return
+            }
+            self.alignedSubtitlePresentation = prepared
+            self.alignedSubtitleSelection = .init(url: source.identityURL.absoluteString,
+                title: title, lang: lang)
+            self.alignedSubtitleClock = .init()
+            self.updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
+                playerSeconds: self.player.currentTime().seconds, origin: self.remuxTimelineOrigin))
+            CredentialPublicationOutbox.endSubtitleEffect(finalEffect)
+            guard !publication.isRevoked, self.ownsAutomaticSubtitle(request) else {
+                self.failExplicitSubtitleAfterNativeChange(request, completion: completion)
+                return
+            }
+            self.automaticSubtitleTask = nil
+            completion(.aligned)
+        }
+        return request.generation
+    }
+
+    /// Attempt-capable only: this exact AV item has a capturable local embedded text reference. The
+    /// protected/self-contained/format checks belong to its asynchronous reader; the explicit request
+    /// retains the actual owner and source permission checks before preparation and publication.
+    var automaticSubtitleAlignmentAvailable: Bool {
+        guard #available(iOS 26.0, tvOS 26.0, macOS 26.0, *),
+              !lastLoadLive, !isRemuxMounted, remuxTimelineOrigin == 0,
+              subtitleRenderer.offset == 0, !externalSubActive,
+              !externalSubtitleSettlement.hasPendingIntent,
+              selectionTopologyGeneration == itemGeneration,
+              let current = item, let load = activeLoadToken,
+              owns(current, loadToken: load), let group = subGroup,
+              current.currentMediaSelection.selectedMediaOption(in: group) != nil else { return false }
+        return AVKitSubtitleReferenceCapture.capture(item: current) != nil
+    }
+
     private func selectAutomaticExternalSubtitle(remote: URL, url: String, title: String, lang: String,
         owner: PlayerSubtitleAlignmentOwner?, localSource: PlayerLocalSubtitleSource?,
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
     ) -> UInt64? {
         guard let originalItem = item, let originalLoad = activeLoadToken,
               owns(originalItem, loadToken: originalLoad) else { completion(.superseded); return nil }
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         externalSubtitleRequestRevision &+= 1
         let request = AutomaticSubtitleRequest(generation: subtitleAlignmentGeneration,
             requestRevision: externalSubtitleRequestRevision, item: originalItem, load: originalLoad,
@@ -4231,7 +4455,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 let publication = AVKitSubtitleAlignmentPublication { [weak self] original in
                     guard let self, self.alignedSubtitlePublication === original else { return }
                     self.alignedSubtitlePublication = nil
-                    self.retireSubtitleAlignment(revealRequestedFile: false)
+                    self.retireSubtitleAlignment(revealRequestedFile: false, cause: .ownerRevoked)
                 }
                 guard let registration = CredentialPublicationOutbox.registerSubtitleRenderer(admitted,
                     revoke: { publication.revoke() }), publication.install(registration),
@@ -4308,7 +4532,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                   self.ownsAutomaticSubtitle(request),
                   !publication.isRevoked, !Task.isCancelled else {
                 CredentialPublicationOutbox.endSubtitleEffect(effect)
-                if self.automaticSubtitleRequest === request { self.retireSubtitleAlignment(revealRequestedFile: false) }
+                if self.automaticSubtitleRequest === request {
+                    self.retireSubtitleAlignment(revealRequestedFile: false, cause: .successor)
+                }
                 completion(.superseded); return
             }
             self.alignedSubtitlePresentation = prepared
@@ -4326,8 +4552,75 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return request.generation
     }
 
+    private func awaitExplicitNativeSubtitleSettlement(_ request: AutomaticSubtitleRequest) async -> Bool {
+        guard request.kind == .explicitKeepCurrent else { return false }
+        for _ in 0..<32 {
+            guard ownsAutomaticSubtitle(request), !Task.isCancelled else { return false }
+            if request.rawSettled, externalSubActive,
+               request.selectionRevision == subtitleSelectionRevision,
+               subGroup.map({ request.item.currentMediaSelection.selectedMediaOption(in: $0) == nil }) ?? true {
+                return true
+            }
+            do { try await Task.sleep(nanoseconds: 125_000_000) }
+            catch { return false }
+        }
+        return ownsAutomaticSubtitle(request) && !Task.isCancelled
+            && request.rawSettled && externalSubActive
+            && request.selectionRevision == subtitleSelectionRevision
+            && (subGroup.map({ request.item.currentMediaSelection.selectedMediaOption(in: $0) == nil }) ?? true)
+    }
+
+    /// Once native selection has begun, an uncertain acknowledgement requires a stop. Retire only
+    /// this original request; a newer user subtitle choice owns all later effects and presentation.
+    private func failExplicitSubtitleAfterNativeChange(_ request: AutomaticSubtitleRequest,
+        completion: (PlayerSubtitleAlignmentResult) -> Void) {
+        if request.nativeCommitStarted, request.retirementCause == nil,
+           request.publication?.claimOwnerRevocationForDefaultRetirement() == true {
+            request.retirementCause = .ownerRevoked
+        }
+        if let cause = request.retirementCause {
+            switch cause {
+            case .ownerRevoked, .uncertainNativeCommit, .cancelledNativeCommit:
+                completion(request.nativeCommitStarted ? .needsStop : .superseded)
+            case .successor, .engineTeardown:
+                completion(.superseded)
+            }
+            return
+        }
+        guard automaticSubtitleRequest === request else {
+            completion(request.nativeCommitStarted ? .needsStop : .superseded)
+            return
+        }
+        guard request.nativeCommitStarted else {
+            completion(.superseded)
+            return
+        }
+        retireSubtitleAlignment(revealRequestedFile: false, cause: .uncertainNativeCommit)
+        completion(.needsStop)
+    }
+
+    /// Release only this explicit pre-commit attempt. It has not changed native selection, so cleanup
+    /// leaves the current subtitle, overlay and native reference untouched.
+    private func finishExplicitSubtitlePreparation(_ request: AutomaticSubtitleRequest) {
+        guard automaticSubtitleRequest === request, !request.nativeCommitStarted else { return }
+        automaticSubtitleTask = nil
+        automaticSubtitleRequest = nil
+        subtitleAlignmentGeneration &+= 1
+        externalSubtitleRequestRevision &+= 1
+        if let publication = request.publication {
+            if alignedSubtitlePublication === publication {
+                alignedSubtitlePublication = nil
+                alignedSubtitlePresentation = nil
+                alignedSubtitleSelection = nil
+                alignedSubtitleClock = .init()
+            }
+            publication.close()
+        }
+    }
+
     private func awaitAutomaticRawSettlement(_ request: AutomaticSubtitleRequest) async
         -> PlayerExternalSubtitleSelectionResult {
+        guard request.kind == .automaticSelection else { return .needsStop }
         for _ in 0..<32 {
             guard ownsAutomaticSubtitle(request), !Task.isCancelled else { return .superseded }
             if request.rawSettled, externalSubActive,
@@ -4341,7 +4634,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard ownsAutomaticSubtitle(request), !Task.isCancelled else { return .superseded }
         // A failed request must not activate after its UI was told selection failed. This retires
         // only this original pending acknowledgement; it never restores a different native track.
-        retireSubtitleAlignment(revealRequestedFile: false)
+        retireSubtitleAlignment(revealRequestedFile: false, cause: .successor)
         return .failed
     }
 
@@ -4355,7 +4648,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Manual subtitle sync in seconds (positive = subtitles appear LATER, matching libmpv `sub-delay`). Applied
     /// as the renderer's offset, so the change is live: the next overlay update uses the new offset immediately.
     func setSubDelay(_ seconds: Double) {
-        retireSubtitleAlignment()
+        retireSubtitleAlignment(cause: .successor)
         subtitleRenderer.offset = seconds
         if externalSubActive {
             updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
@@ -6333,7 +6626,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     isolated deinit {
         retireSubtitleContributionLoad()
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
-        retireSubtitleAlignment(revealRequestedFile: false)
+        retireSubtitleAlignment(revealRequestedFile: false, cause: .engineTeardown)
         pipDelegate?.retire()
         replacementReadyDeadlineTask?.cancel()
         coldLocalRemuxPreparation?.cancel()

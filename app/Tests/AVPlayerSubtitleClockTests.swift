@@ -3,19 +3,39 @@
 import Foundation
 
 #if VORTX_AVKIT_ALIGNMENT_REQUEST
+enum AVSubtitleRequestRetirementCause: Equatable {
+    case successor, ownerRevoked, uncertainNativeCommit, cancelledNativeCommit, engineTeardown
+}
 // Nil-only tripwires satisfy the current method dependencies without substituting a successful
 // AVKit request, credential owner, publication receipt or corrected-overlay renderer. Private
 // trapping initializers prevent this fixture from manufacturing either capability.
 @MainActor final class SubtitleClockUnexpectedAutomaticRequest {
+    enum Kind { case automaticSelection, explicitKeepCurrent }
     private init() { preconditionFailure("Automatic request is outside the manual clock fixture") }
+    var kind: Kind { preconditionFailure("Automatic request access is outside the manual clock fixture") }
+    var publication: SubtitleClockUnexpectedPublication? {
+        get { preconditionFailure("Publication access is outside the manual clock fixture") }
+        set { preconditionFailure("Publication mutation is outside the manual clock fixture") }
+    }
     var rawSettled: Bool {
         get { preconditionFailure("Automatic request access is outside the manual clock fixture") }
         set { preconditionFailure("Automatic request mutation is outside the manual clock fixture") }
+    }
+    var nativeCommitStarted: Bool {
+        get { preconditionFailure("Native subtitle commit is outside the manual clock fixture") }
+        set { preconditionFailure("Native subtitle commit is outside the manual clock fixture") }
+    }
+    var retirementCause: AVSubtitleRequestRetirementCause? {
+        get { preconditionFailure("Request retirement is outside the manual clock fixture") }
+        set { preconditionFailure("Request retirement is outside the manual clock fixture") }
     }
 }
 @MainActor final class SubtitleClockUnexpectedPublication {
     private init() { preconditionFailure("Publication is outside the manual clock fixture") }
     var isRevoked: Bool { preconditionFailure("Publication access is outside the manual clock fixture") }
+    func claimOwnerRevocationForDefaultRetirement() -> Bool {
+        preconditionFailure("Owner revocation is outside the manual clock fixture")
+    }
     func close() { preconditionFailure("Publication cleanup is outside the manual clock fixture") }
 }
 #endif

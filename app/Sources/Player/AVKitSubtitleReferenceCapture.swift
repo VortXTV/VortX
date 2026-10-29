@@ -9,6 +9,10 @@ import Foundation
 final class AVKitSubtitleAlignmentPublication: @unchecked Sendable {
     private let lock = NSLock()
     private var revoked = false
+    private var ownerRevoked = false
+    /// The first default AV-selection retirement is serialized with owner revoke. A selected true
+    /// result means the outbox's revoke won; a selected false result means the selection event won.
+    private var defaultRetirementWasOwnerRevoke: Bool?
     private var scheduled = false
     private var completed = false
     private var registration: CredentialPublicationOutbox.SubtitleRendererRegistration?
@@ -19,6 +23,16 @@ final class AVKitSubtitleAlignmentPublication: @unchecked Sendable {
     }
 
     var isRevoked: Bool { lock.lock(); defer { lock.unlock() }; return revoked }
+
+    /// Resolve the original owner's cause atomically against `revoke()`. Ordinary `close()` does
+    /// not set `ownerRevoked`, so manual retirement cannot masquerade as an owner revocation.
+    func claimOwnerRevocationForDefaultRetirement() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let defaultRetirementWasOwnerRevoke { return defaultRetirementWasOwnerRevoke }
+        defaultRetirementWasOwnerRevoke = ownerRevoked
+        return ownerRevoked
+    }
 
     func install(_ value: CredentialPublicationOutbox.SubtitleRendererRegistration) -> Bool {
         lock.lock()
@@ -32,6 +46,8 @@ final class AVKitSubtitleAlignmentPublication: @unchecked Sendable {
 
     func revoke() -> Bool {
         lock.lock()
+        ownerRevoked = true
+        if defaultRetirementWasOwnerRevoke == nil { defaultRetirementWasOwnerRevoke = true }
         revoked = true
         let done = completed
         let enqueue = !completed && !scheduled
