@@ -95,6 +95,9 @@ internal class CastSessionCoordinator(
         val active = load ?: return
         if (!active.confirmed || active.binding.session !== session || active.binding.client !== client) return
         startResume(active, now)
+        // A real suspension retires readiness and any status from before this callback.
+        active.resume?.ready = false
+        active.resume?.proof = null
     }
     private fun startResume(active: Load, now: Long) {
         if (active.resume != null) return // Repeated SDK callbacks never extend the first suspension's bound.
@@ -110,6 +113,9 @@ internal class CastSessionCoordinator(
         if (!active.confirmed || route != active.binding.route) return
         startResume(active, now)
         if (now >= requireNotNull(active.resume).deadline) { retire(false); return }
+        // willResume grants no readiness, including for a repeated or replacement pair.
+        // resumed calls this same preparation, then grants readiness for its actual callback.
+        active.resume?.ready = false
         if (active.binding.session !== session || active.binding.client !== client) {
             active.binding = Binding(session, client, route, ++nextEpoch)
             binding = active.binding

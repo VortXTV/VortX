@@ -126,6 +126,69 @@ class CastSessionCoordinatorTest {
         assertEquals(400_000L, f.coordinator.point!!.positionMs)
     }
 
+    @Test fun `replacement pair cannot inherit an earlier resumed callback in the same attempt`() {
+        for (sameSession in listOf(true, false)) {
+            val f = Fixture().active()
+            f.coordinator.suspended(f.a, f.ca, 100L)
+            f.coordinator.resumed(f.a, f.ca, "A", 200L, f.a)
+            val earlier = f.coordinator.binding!!
+            val session = if (sameSession) f.a else Any()
+            val client = Any()
+            f.coordinator.resuming(session, client, "A", 300L)
+            val replacement = f.coordinator.binding!!
+            assertFalse(earlier.same(replacement))
+            f.status(replacement, "load-A", 350_000L, now = 400L)
+            assertFalse("sameSession=$sameSession", f.coordinator.canControl)
+            assertEquals(300_000L, f.coordinator.point!!.positionMs)
+            // Exact-pair status may be retained, but only this pair's actual resumed admits it.
+            f.coordinator.resumed(session, client, "A", 500L, session)
+            assertTrue("sameSession=$sameSession", f.coordinator.canControl)
+            assertEquals(350_000L, f.coordinator.point!!.positionMs)
+            assertEquals("load-A", f.coordinator.loadId)
+        }
+    }
+
+    @Test fun `repeated resuming retires readiness without extending the first deadline`() {
+        val f = Fixture().active()
+        f.coordinator.suspended(f.a, f.ca, 100L)
+        f.coordinator.resumed(f.a, f.ca, "A", 200L, f.a)
+        f.coordinator.resuming(f.a, f.ca, "A", 14_000L)
+        f.status(f.coordinator.binding!!, "load-A", 350_000L, now = 14_001L)
+        assertFalse(f.coordinator.canControl)
+        assertEquals(300_000L, f.coordinator.point!!.positionMs)
+        assertNull(f.coordinator.tick(true, 15_100L)) // Reconnect expiry returns locally without STOP.
+        assertFalse(f.coordinator.isOwned)
+        assertEquals(300_000L, f.coordinator.takeResume("owner")!!.positionMs)
+    }
+
+    @Test fun `repeated real suspension retires both earlier readiness and earlier proof`() {
+        for (proofBeforeSecondSuspend in listOf(true, false)) {
+            val f = Fixture().active()
+            f.coordinator.suspended(f.a, f.ca, 100L)
+            if (proofBeforeSecondSuspend) {
+                f.status(f.coordinator.binding!!, "load-A", 350_000L, now = 200L)
+            } else {
+                f.coordinator.resumed(f.a, f.ca, "A", 200L, f.a)
+            }
+            f.coordinator.suspended(f.a, f.ca, 300L)
+            if (proofBeforeSecondSuspend) {
+                f.coordinator.resumed(f.a, f.ca, "A", 400L, f.a)
+            } else {
+                f.status(f.coordinator.binding!!, "load-A", 360_000L, now = 400L)
+            }
+            assertFalse("proofBeforeSecondSuspend=$proofBeforeSecondSuspend", f.coordinator.canControl)
+            assertEquals(300_000L, f.coordinator.point!!.positionMs)
+            if (proofBeforeSecondSuspend) {
+                f.status(f.coordinator.binding!!, "load-A", 370_000L, now = 500L)
+                assertEquals(370_000L, f.coordinator.point!!.positionMs)
+            } else {
+                f.coordinator.resumed(f.a, f.ca, "A", 500L, f.a)
+                assertEquals(360_000L, f.coordinator.point!!.positionMs)
+            }
+            assertTrue(f.coordinator.canControl)
+        }
+    }
+
     @Test fun `a different current receiver resume retires old ownership without adopting foreign media`() {
         val f = Fixture().active()
         assertNull(f.coordinator.resumed(f.b, f.cb, "B", 100L, f.b))

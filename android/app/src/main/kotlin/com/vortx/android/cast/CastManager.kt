@@ -250,6 +250,10 @@ class CastManager(appContext: Context) {
         val listener = object : RemoteMediaClient.Callback() {
             override fun onStatusUpdated() {
                 if (preservingExit || observed !== binding) return
+                // CAF may replace its current session/client before lifecycle callbacks catch up.
+                // An old SDK callback must not publish progress for that retired connection.
+                val session = binding.session as? CastSession ?: return
+                if (session !== castContext?.sessionManager?.currentCastSession || session.remoteMediaClient !== client) return
                 handle(coordinator.tick(selectionIsCurrent(), now()))
                 val status = client.mediaStatus ?: return
                 coordinator.freshStatus(binding, CastSessionCoordinator.Status(
