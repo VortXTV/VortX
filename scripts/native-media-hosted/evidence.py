@@ -3242,7 +3242,10 @@ def dv_public(header, pc, prefix, native_libraries, required):
     dv_need(fields.get('Version')=='3.4.0' and variables.get('prefix')==str(prefix),'exact PC version/prefix')
     dv_need(not fields.get('Requires') and not fields.get('Requires.private'),'unexpected PC dependency')
     tokens=shlex.split(fields.get('Libs.private','')); dv_need(len(tokens)==len(set(tokens)) and set(tokens)<=set(native_libraries),'PC SDK static provider set')
-    libs=shlex.split(fields.get('Libs','')); dv_need(libs in (['-L${libdir}','-ldovi'],['-L'+str(prefix/'lib'),'-ldovi']),'exact dovi archive linker selection')
+    libs=shlex.split(fields.get('Libs','')); dv_need(len(libs)>=2 and libs[:2] in (['-L${libdir}','-ldovi'],['-L'+str(prefix/'lib'),'-ldovi']),'exact dovi archive linker selection')
+    public_native=libs[2:]
+    dv_need(len(public_native)==len(set(public_native)) and set(public_native)<=set(native_libraries)
+            and set(public_native)<=set(tokens),'public SDK flags must be unique and already validated privately')
     dv_need(variables.get('libdir') in ('${prefix}/lib',str(prefix/'lib')) and variables.get('includedir') in ('${prefix}/include',str(prefix/'include')),'target PC directory variables')
     dv_need(shlex.split(fields.get('Cflags','')) in (['-I${includedir}'],['-I'+str(prefix/'include')]),'target PC include selection')
     return tokens
@@ -3367,7 +3370,7 @@ def dv_fat(body, expected):
     return result
 
 
-DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '87e893112ef6aa99f0f88326b4b605edb81202dfc73b09e12a9f971ee87db1fe', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
+DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '58b4c20d66fdd6b4f9d2958e12be76f5c078820fda4330053fe5e663bdcadf14', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
 PLACEBO_INSTALLED_HELPERS = {'Sources/BuildScripts/placebo-source-build.py': 'ed2b5b2c2fd45b6c03b6cf0ea5fc707b080f05bdb6f40dd270594ae2acdca617'}
 
 def _dovi_file(path, logical, maximum=16*1024**2):

@@ -4509,7 +4509,7 @@ diff --git a/Sources/BuildScripts/dovi-source-build.py b/Sources/BuildScripts/do
 new file mode 100644
 --- /dev/null
 +++ b/Sources/BuildScripts/dovi-source-build.py
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,957 @@
 +#!/usr/bin/env python3
 +"""Offline libdovi 3.4 producer proposal. No input acquisition or SDK acceptance.
 +
@@ -5249,7 +5249,10 @@ new file mode 100644
 +    dv_need(fields.get('Version')=='3.4.0' and variables.get('prefix')==str(prefix),'exact PC version/prefix')
 +    dv_need(not fields.get('Requires') and not fields.get('Requires.private'),'unexpected PC dependency')
 +    tokens=shlex.split(fields.get('Libs.private','')); dv_need(len(tokens)==len(set(tokens)) and set(tokens)<=set(native_libraries),'PC SDK static provider set')
-+    libs=shlex.split(fields.get('Libs','')); dv_need(libs in (['-L${libdir}','-ldovi'],['-L'+str(prefix/'lib'),'-ldovi']),'exact dovi archive linker selection')
++    libs=shlex.split(fields.get('Libs','')); dv_need(len(libs)>=2 and libs[:2] in (['-L${libdir}','-ldovi'],['-L'+str(prefix/'lib'),'-ldovi']),'exact dovi archive linker selection')
++    public_native=libs[2:]
++    dv_need(len(public_native)==len(set(public_native)) and set(public_native)<=set(native_libraries)
++            and set(public_native)<=set(tokens),'public SDK flags must be unique and already validated privately')
 +    dv_need(variables.get('libdir') in ('${prefix}/lib',str(prefix/'lib')) and variables.get('includedir') in ('${prefix}/include',str(prefix/'include')),'target PC directory variables')
 +    dv_need(shlex.split(fields.get('Cflags','')) in (['-I${includedir}'],['-I'+str(prefix/'include')]),'target PC include selection')
 +    return tokens
