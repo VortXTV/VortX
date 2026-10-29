@@ -58,6 +58,8 @@ enum AddonURLGuard {
     static let maxManifestBytes = 2 * 1024 * 1024
     /// Separate fixed purpose limit so later manifest tuning cannot silently change subtitle index budgets.
     static let maxSubtitleIndexBytes = 2 * 1024 * 1024
+    /// Subtitle payloads share the player parser ceiling and remain raw text only.
+    static let maxSubtitleFileBytes = 8 * 1024 * 1024
 
     /// Callers select a known response purpose; a supplied URL cannot choose an arbitrary body cap.
     enum ResponseContext: Sendable {
@@ -65,6 +67,7 @@ enum AddonURLGuard {
         case xperienceCatalog
         case xperienceArtwork
         case subtitleIndex
+        case subtitleFile
 
         var maximumBytes: Int {
             switch self {
@@ -72,6 +75,7 @@ enum AddonURLGuard {
             case .xperienceCatalog: return 4 * 1024 * 1024
             case .xperienceArtwork: return 8 * 1024 * 1024
             case .subtitleIndex: return AddonURLGuard.maxSubtitleIndexBytes
+            case .subtitleFile: return AddonURLGuard.maxSubtitleFileBytes
             }
         }
 
@@ -79,7 +83,7 @@ enum AddonURLGuard {
         /// Keep QR/manifest admission separate from this bounded subtitle request envelope.
         var maximumURLBytes: Int {
             switch self {
-            case .subtitleIndex: return 128 * 1024
+            case .subtitleIndex, .subtitleFile: return 128 * 1024
             case .manifest, .xperienceCatalog, .xperienceArtwork:
                 return AddonPairingProtocol.maxManifestURLBytes
             }
@@ -88,6 +92,7 @@ enum AddonURLGuard {
         fileprivate var accept: String {
             switch self {
             case .manifest, .xperienceCatalog, .subtitleIndex: return "application/json"
+            case .subtitleFile: return "text/vtt,text/plain,application/x-subrip,text/x-ass,application/x-ass"
             case .xperienceArtwork: return "image/png,image/jpeg,image/webp,image/heic,image/heif"
             }
         }

@@ -7,7 +7,7 @@ extension CoreStreamBehaviorHints {
 }
 
 /// One external subtitle offered by a subtitles add-on (e.g. an OpenSubtitles add-on).
-struct AddonSubtitle: Identifiable, Equatable {
+struct AddonSubtitle: Identifiable, Equatable, Sendable {
     let id: String
     let url: String
     let lang: String
