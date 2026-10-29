@@ -201,7 +201,7 @@ class CastManager(appContext: Context) {
     }
     fun stopCasting() {
         val owned = ownsCurrentMedia()
-        coordinator.retire(stopReceiver = false)
+        handle(coordinator.retire(stopReceiver = !owned))
         publish()
         if (owned) castContext?.sessionManager?.endCurrentSession(true)
     }
