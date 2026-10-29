@@ -39,9 +39,12 @@ import UIKit
     private var item: Item?
     private var policy = GoogleCastPlaybackPolicy()
     private var client: GCKRemoteMediaClient?
+    private var bindingGeneration = UUID()
     private var loadRequest: GCKRequest?
+    private var loadRequestBinding: UUID?
     private var loadPauseGeneration: UInt64?
     private var transportRequest: GCKRequest?
+    private var transportRequestBinding: UUID?
     private var transportPauseGeneration: UInt64?
     private var statusSequence: UInt64 = 0
     private var pauseAckStatusSequence: UInt64?
@@ -53,7 +56,6 @@ import UIKit
     private weak var boundSession: GCKCastSession?
     private weak var pendingSession: GCKSession?
     private weak var resumeCandidate: GCKCastSession?
-    private var resumeCandidateDeadline: Date?
     private var pendingLocalReturn: (() -> Void)?
     private var attached = false
     private var loadIssued = false
@@ -164,7 +166,11 @@ import UIKit
     private var preparedURL: URL?
     private var preparedType: String?
     private func bind(_ session: GCKCastSession) {
-        pendingSession = nil; resumeCandidate = nil; resumeCandidateDeadline = nil
+        // Identical SDK objects can reconnect. Their old failure callbacks still belong to
+        // the preceding binding, while successful ACKs retain their existing pause-generation fence.
+        bindingGeneration = UUID()
+        pendingSession = nil; resumeCandidate = nil
+        policy.resume()
         if client !== session.remoteMediaClient {
             if let client, !retiredLoads.values.contains(where: { $0.client === client }) { client.remove(self) }
             client = session.remoteMediaClient
@@ -188,8 +194,9 @@ import UIKit
         loadPauseGeneration = policy.requestPaused(item.paused)
         state.position = policy.confirmedPosition; state.duration = policy.duration; state.paused = item.paused
         loadIssued = true
+        let requestBinding = bindingGeneration
         let request = client.loadMedia(media.build(), with: options)
-        loadRequest = request; request.delegate = self
+        loadRequest = request; loadRequestBinding = requestBinding; request.delegate = self
         // A matching receiver status, rather than an optimistic load call, pauses the local engine.
     }
     func togglePause() {
@@ -201,7 +208,9 @@ import UIKit
         transportPauseGeneration = policy.requestPaused(paused)
         pauseAckStatusSequence = nil
         transportRequest?.delegate = nil
+        let requestBinding = bindingGeneration
         transportRequest = paused ? client.pause() : client.play()
+        transportRequestBinding = requestBinding
         transportRequest?.delegate = self
     }
     func seek(to position: Double) {
@@ -222,23 +231,31 @@ import UIKit
         return client
     }
     func stopCasting() { finish(resumeLocal: true, stopReceiver: true, message: nil) }
+    private func finishExpiredReconnect(at uptime: TimeInterval) -> Bool {
+        guard policy.reconnectExpired(at: uptime) else { return false }
+        finish(resumeLocal: true, stopReceiver: false,
+               message: "The resumed receiver did not confirm this video. Continuing locally.")
+        return true
+    }
+    @discardableResult private func bindResumedCandidate(at uptime: TimeInterval) -> Bool {
+        guard let item, item.isCurrent(), let candidate = resumeCandidate,
+              let candidateClient = candidate.remoteMediaClient,
+              policy.permitsReconnect(session: candidate, client: candidateClient,
+                echoedOwner: (candidateClient.mediaStatus?.mediaInformation?.customData as? [String: Any])?["vortxLoad"] as? String,
+                onCurrentSession: candidate === GCKCastContext.sharedInstance().sessionManager.currentCastSession,
+                onCurrentClient: candidate.remoteMediaClient === candidateClient, at: uptime) else { return false }
+        bind(candidate); state.suspended = false
+        return true
+    }
     private func tick() {
         observeRetiredLoads()
         guard let item else { return }
         guard item.isCurrent() else { retire(); return }
-        if let candidate = resumeCandidate {
-            let owner = (candidate.remoteMediaClient?.mediaStatus?.mediaInformation?.customData as? [String: Any])?["vortxLoad"] as? String
-            if candidate === GCKCastContext.sharedInstance().sessionManager.currentCastSession, owner == item.owner.uuidString {
-                bind(candidate); resumeCandidate = nil; resumeCandidateDeadline = nil
-                state.suspended = false; policy.resume()
-            }
-        }
-        // willResume arms the real SDK attempt before didResume. The candidate can disappear on a
-        // failed attempt, so the deadline must not depend on retaining that weak session object.
-        if state.suspended, resumeCandidateDeadline.map({ Date() >= $0 }) == true {
-            finish(resumeLocal: true, stopReceiver: false, message: "The resumed receiver did not confirm this video. Continuing locally.")
-            return
-        }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        // Expiry wins even when a matching status arrives on this same tick. Weak candidate loss
+        // and repeated callbacks cannot extend the policy's original monotonic attempt.
+        if finishExpiredReconnect(at: uptime) { return }
+        bindResumedCandidate(at: uptime)
         if !receivedPlayableState, let deadline = loadDeadline, Date() >= deadline {
             finish(resumeLocal: true, stopReceiver: true, message: "Google Cast did not start playback. Check the receiver and source format, then tap Cast to try again.")
             return
@@ -313,10 +330,9 @@ import UIKit
                                                       owner: oldItem.owner, expires: Date().addingTimeInterval(120))
         }
         if let client, !retiredLoads.values.contains(where: { $0.client === client }) { client.remove(self) }
-        client = nil; loadRequest?.delegate = nil; loadRequest?.cancel(); loadRequest = nil
-        transportRequest?.delegate = nil; transportRequest = nil; transportPauseGeneration = nil
-        loadPauseGeneration = nil; pauseAckStatusSequence = nil
-        boundSession = nil; pendingSession = nil; resumeCandidate = nil; resumeCandidateDeadline = nil
+        client = nil
+        retireRequestCallbacks()
+        boundSession = nil; pendingSession = nil; resumeCandidate = nil
         item = nil; preparedURL = nil; preparedType = nil; loadIssued = false; receivedPlayableState = false; seekingUntil = nil
         loadDeadline = nil
         policy.retire(); state = State(message: message)
@@ -329,19 +345,30 @@ import UIKit
         }
     }
 
+    private func retireRequestCallbacks() {
+        let previousLoad = loadRequest, previousTransport = transportRequest
+        // Revoke identities before SDK cancellation can deliver an already queued callback.
+        loadRequest = nil; loadRequestBinding = nil
+        transportRequest = nil; transportRequestBinding = nil
+        loadPauseGeneration = nil; transportPauseGeneration = nil; pauseAckStatusSequence = nil
+        previousLoad?.delegate = nil; previousTransport?.delegate = nil
+        previousLoad?.cancel()
+    }
     func requestDidComplete(_ request: GCKRequest) {
         if loadRequest === request {
-            loadRequest = nil
+            loadRequest = nil; loadRequestBinding = nil
             if let generation = loadPauseGeneration, policy.acknowledgePause(generation: generation) { pauseAckStatusSequence = statusSequence }
             loadPauseGeneration = nil
             observeStatus()
         } else if transportRequest === request {
             if let generation = transportPauseGeneration, policy.acknowledgePause(generation: generation) { pauseAckStatusSequence = statusSequence }
-            transportRequest = nil; transportPauseGeneration = nil
+            transportRequest = nil; transportRequestBinding = nil; transportPauseGeneration = nil
         }
     }
     func request(_ request: GCKRequest, didFailWithError error: GCKError) {
-        guard loadRequest === request || transportRequest === request else { return }
+        let currentLoad = loadRequest === request && loadRequestBinding == bindingGeneration
+        let currentTransport = transportRequest === request && transportRequestBinding == bindingGeneration
+        guard !policy.suspended, currentLoad || currentTransport else { return }
         finish(resumeLocal: true, stopReceiver: true,
                message: "The receiver could not play this source. Choose a compatible SDR MP4 or HLS source; receiver codec support varies.")
     }
@@ -369,33 +396,39 @@ import UIKit
         pendingSession = session
     }
     func sessionManager(_ sessionManager: GCKSessionManager, didStart session: GCKSession) {
-        guard let session = session as? GCKCastSession, session === sessionManager.currentCastSession,
+        guard !loadIssued, let session = session as? GCKCastSession, session === sessionManager.currentCastSession,
               pendingSession == nil || pendingSession === session, item?.isCurrent() == true else { return }
         bind(session); loadExplicitItem()
     }
     func sessionManager(_ sessionManager: GCKSessionManager, willResume session: GCKSession) {
         guard loadIssued, let session = session as? GCKCastSession, item?.isCurrent() == true else { return }
         // This is an actual GCKSessionManagerListener callback. Tracking the attempt grants no media
-        // authority: a replacement object still needs the echoed load UUID before bind/progress.
-        resumeCandidate = session; resumeCandidateDeadline = Date().addingTimeInterval(15)
-        state.suspended = true; policy.suspend()
+        // authority: didResume readiness and the echoed load UUID are both required before bind.
+        resumeCandidate = session
+        state.suspended = true; policy.suspend(at: ProcessInfo.processInfo.systemUptime)
     }
     func sessionManager(_ sessionManager: GCKSessionManager, didResume session: GCKSession) {
         guard loadIssued, let session = session as? GCKCastSession, session === sessionManager.currentCastSession,
               let item, item.isCurrent() else { return }
-        let owner = (session.remoteMediaClient?.mediaStatus?.mediaInformation?.customData as? [String: Any])?["vortxLoad"] as? String
-        if session === boundSession || owner == item.owner.uuidString {
-            bind(session); state.suspended = false; policy.resume(); observeStatus()
-        } else {
-            // CAF may replace the session object during reconnect/transfer. A new object needs its own
-            // matching load receipt; object identity alone cannot authorize or permanently block rebind.
-            resumeCandidate = session; resumeCandidateDeadline = Date().addingTimeInterval(15)
-            state.suspended = true; policy.suspend()
+        let resumedClient = session.remoteMediaClient
+        let echoedOwner = (resumedClient?.mediaStatus?.mediaInformation?.customData as? [String: Any])?["vortxLoad"] as? String
+        if state.owned, !policy.suspended, session === boundSession, resumedClient === client,
+           echoedOwner == item.owner.uuidString {
+            // A duplicate completion for the already-bound load must not reset a newer request's
+            // binding or acknowledgement. A real pending attempt or changed pair still takes the gate below.
+            observeStatus()
+            return
         }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        resumeCandidate = session; state.suspended = true
+        policy.didResume(session: session, client: session.remoteMediaClient, at: uptime)
+        if finishExpiredReconnect(at: uptime) { return }
+        if bindResumedCandidate(at: uptime) { observeStatus() }
         // Resume observes the matching receipt; it never reloads from a stale local playhead.
     }
     func sessionManager(_ sessionManager: GCKSessionManager, didSuspend session: GCKSession, with reason: GCKConnectionSuspendReason) {
-        guard loadIssued, session === boundSession else { return }; state.suspended = true; policy.suspend()
+        guard loadIssued, session === boundSession else { return }
+        state.suspended = true; policy.suspend(at: ProcessInfo.processInfo.systemUptime)
     }
     func sessionManager(_ sessionManager: GCKSessionManager, didEnd session: GCKSession, withError error: Error?) {
         if let candidate = resumeCandidate, candidate !== session, candidate === sessionManager.currentCastSession { return }

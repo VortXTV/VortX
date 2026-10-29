@@ -1,6 +1,7 @@
 import Foundation
 
 @main enum GoogleCastPlaybackPolicyTests {
+    private final class ReconnectEndpoint {}
     static func main() {
         var failures = 0
         func check(_ name: String, _ condition: @autoclosure () -> Bool) {
@@ -106,6 +107,88 @@ import Foundation
         check("retired load denies commands", !state.permitsReceiverCommand(
               echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: true))
         check("retired callback ignored", !state.sample(owner: owner, position: 250, duration: 600))
+        // Actual reconnect policy with synthetic SDK identities and a deterministic monotonic clock.
+        // These cases do not import GoogleCast or establish adapter/receiver callback delivery.
+        var reconnect = GoogleCastPlaybackPolicy()
+        let firstSession = ReconnectEndpoint(), firstClient = ReconnectEndpoint()
+        let nextSession = ReconnectEndpoint(), nextClient = ReconnectEndpoint()
+        reconnect.begin(owner: owner, position: 52, duration: 600)
+        _ = reconnect.seek(200)
+        _ = reconnect.requestPaused(true)
+        reconnect.suspend(at: 100)
+        check("real suspension starts finite reconnect without willResume", reconnect.reconnectDeadline == 115)
+        check("suspension-only reconnect expires", reconnect.reconnectExpired(at: 115))
+        reconnect.suspend(at: 104)
+        check("repeated suspension or willResume cannot extend original attempt", reconnect.reconnectDeadline == 115)
+        check("matching receipt before didResume cannot grant reconnect", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 105))
+        reconnect.didResume(session: firstSession, client: nil, at: 106)
+        check("didResume without a client grants no ready pair", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 106))
+        reconnect.didResume(session: firstSession, client: firstClient, at: 107)
+        check("same bound object with missing receipt cannot clear reconnect", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: nil,
+              onCurrentSession: true, onCurrentClient: true, at: 108) && reconnect.reconnectDeadline == 115)
+        check("same bound object with foreign receipt cannot clear reconnect", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: other.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 108) && reconnect.reconnectDeadline == 115)
+        check("didResume exact current pair with matching receipt is ready", reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 108))
+        check("ready session still must be current", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: false, onCurrentClient: true, at: 108))
+        check("ready client still must be current", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: false, at: 108))
+        check("replacement session requires its own didResume", !reconnect.permitsReconnect(
+              session: nextSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 108))
+        check("replacement client requires its own didResume", !reconnect.permitsReconnect(
+              session: firstSession, client: nextClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 108))
+        reconnect.didResume(session: nextSession, client: nextClient, at: 110)
+        check("replacement readiness keeps earliest deadline", reconnect.reconnectDeadline == 115)
+        check("replacement pair can confirm before original expiry", reconnect.permitsReconnect(
+              session: nextSession, client: nextClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 114))
+        check("old ready pair cannot authorize replacement generation", !reconnect.permitsReconnect(
+              session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 114))
+        check("expiry wins over matching same-tick receipt", !reconnect.permitsReconnect(
+              session: nextSession, client: nextClient, echoedOwner: owner.uuidString,
+              onCurrentSession: true, onCurrentClient: true, at: 115))
+        reconnect.didResume(session: firstSession, client: firstClient, at: 116)
+        check("late didResume cannot reset expired original bound", reconnect.reconnectDeadline == 115 &&
+              !reconnect.permitsReconnect(session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+                onCurrentSession: true, onCurrentClient: true, at: 116))
+        reconnect.resume()
+        check("successful bind clears attempt but preserves seek pause and confirmed point",
+              reconnect.reconnectDeadline == nil && !reconnect.suspended &&
+              reconnect.pendingSeek == 200 && reconnect.pendingPaused == true && reconnect.confirmedPosition == 52)
+        reconnect.didResume(session: firstSession, client: firstClient, at: 200)
+        check("first resume without suspension starts its own finite bound", reconnect.reconnectDeadline == 215)
+        reconnect.suspend(at: 205)
+        check("a later willResume retires prior readiness without extending bound",
+              reconnect.reconnectDeadline == 215 &&
+              !reconnect.permitsReconnect(session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+                onCurrentSession: true, onCurrentClient: true, at: 206))
+        weak var vanishedCandidate: ReconnectEndpoint?
+        do {
+            let candidate = ReconnectEndpoint()
+            vanishedCandidate = candidate
+            reconnect.suspend(at: 207)
+        }
+        check("weak candidate disappearance does not erase timeout", vanishedCandidate == nil &&
+              reconnect.reconnectDeadline == 215 && reconnect.reconnectExpired(at: 215))
+        reconnect.retire()
+        check("retire clears attempt and denies stale ready proof", reconnect.reconnectDeadline == nil &&
+              !reconnect.permitsReconnect(session: firstSession, client: firstClient, echoedOwner: owner.uuidString,
+                onCurrentSession: true, onCurrentClient: true, at: 208))
+        reconnect.begin(owner: other, position: 5, duration: 60)
+        check("fresh explicit load has no previous reconnect attempt", reconnect.reconnectDeadline == nil && !reconnect.suspended)
         let native = URL(string:"http://127.0.0.1:53144")!
         let source = native.appendingPathComponent("\(hash)/0")
         check("relay pins actual native port", CastTorrentRelayPolicy.sourceIsPinned(source, nativeBase:native))

@@ -11,6 +11,9 @@ struct GoogleCastPlaybackPolicy {
     private(set) var pauseGeneration: UInt64 = 0
     private var acknowledgedPauseGeneration: UInt64?
     private(set) var suspended = false
+    private(set) var reconnectDeadline: TimeInterval?
+    private var resumedSession: AnyObject?
+    private var resumedClient: AnyObject?
 
     var resumePosition: Double { pendingSeek ?? confirmedPosition }
 
@@ -29,7 +32,7 @@ struct GoogleCastPlaybackPolicy {
         pendingPaused = nil
         pauseGeneration = 0
         acknowledgedPauseGeneration = nil
-        suspended = false
+        resume()
     }
     @discardableResult mutating func requestPaused(_ paused: Bool) -> UInt64 {
         pauseGeneration &+= 1
@@ -61,9 +64,41 @@ struct GoogleCastPlaybackPolicy {
         if duration > 0 { self.duration = duration }
         return true
     }
-    mutating func suspend() { suspended = true }
-    mutating func resume() { suspended = false }
-    mutating func retire() { owner = nil; pendingSeek = nil; pendingPaused = nil; acknowledgedPauseGeneration = nil; suspended = false }
+    /// Suspension and repeated resume callbacks share the first attempt's monotonic bound.
+    mutating func suspend(at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard owner != nil else { return }
+        armReconnect(at: uptime)
+        resumedSession = nil; resumedClient = nil
+    }
+    /// Only an actual SDK didResume callback may make this exact session/client pair ready.
+    mutating func didResume(session: AnyObject, client: AnyObject?, at uptime: TimeInterval) {
+        guard owner != nil else { return }
+        armReconnect(at: uptime)
+        resumedSession = nil; resumedClient = nil
+        guard !reconnectExpired(at: uptime), let client else { return }
+        resumedSession = session; resumedClient = client
+    }
+    private mutating func armReconnect(at uptime: TimeInterval) {
+        suspended = true
+        if reconnectDeadline == nil { reconnectDeadline = uptime + 15 }
+    }
+    func reconnectExpired(at uptime: TimeInterval) -> Bool {
+        reconnectDeadline.map { uptime >= $0 } == true
+    }
+    func permitsReconnect(session: AnyObject, client: AnyObject, echoedOwner: String?,
+                          onCurrentSession: Bool, onCurrentClient: Bool, at uptime: TimeInterval) -> Bool {
+        guard let owner, suspended, reconnectDeadline != nil, !reconnectExpired(at: uptime) else { return false }
+        return resumedSession === session && resumedClient === client &&
+            onCurrentSession && onCurrentClient && echoedOwner == owner.uuidString
+    }
+    mutating func resume() {
+        suspended = false; reconnectDeadline = nil
+        resumedSession = nil; resumedClient = nil
+    }
+    mutating func retire() {
+        owner = nil; pendingSeek = nil; pendingPaused = nil; acknowledgedPauseGeneration = nil
+        resume()
+    }
 }
 
 enum GoogleCastFormatPolicy {
