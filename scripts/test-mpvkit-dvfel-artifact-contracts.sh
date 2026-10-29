@@ -36,11 +36,12 @@ fail() {
 retired_profile_contracts() (
   fixture="$(mktemp -d)"
   trap 'rm -rf "$fixture"' EXIT
-  for version in v3 v4 v5; do
+  for version in v3 v4 v5 v6; do
     case "$version" in
       v3) profile=native-upgrades-openssl410-v3 ;;
       v4) profile=native-upgrades-openssl410-crypto-v4 ;;
       v5) profile=native-upgrades-openssl410-crypto-subtitles-v5 ;;
+      v6) profile=native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ;;
     esac
     for form in compact complete; do
       args=("$fixture/missing-package" --dependency-profile "$profile")
@@ -52,19 +53,20 @@ retired_profile_contracts() (
         fail "$version/$form historical prototype was accepted"
       fi
       expected="MPVKit-DVFEL ARTIFACT VERIFY FAILED: historical $version prototype requires its frozen historical verifier; select the explicit bluray150 v6 profile for the four-source candidate"
+      if [ "$version" = v6 ]; then expected="MPVKit-DVFEL ARTIFACT VERIFY FAILED: historical v6 requires its frozen reader; select the explicit freetype2150/libdovi340 v7 profile"; fi
       [ "$(cat "$fixture/$version-$form.log")" = "$expected" ] ||
         fail "$version/$form did not retire before artifact, receipt and temporary-file checks"
     done
   done
-  # Retiring prototypes must not intercept the default, v1/v2, or active v6 API.
-  for profile in shipping libplacebo-7.387.0-lcms2.20rc1-source-v1 native-upgrades-dav1d154-shaderc20261-hb150-v2 native-upgrades-openssl410-crypto-subtitles-bluray150-v6; do
+  # Retiring prototypes must not intercept the default, v1/v2, or active v7 API.
+  for profile in shipping libplacebo-7.387.0-lcms2.20rc1-source-v1 native-upgrades-dav1d154-shaderc20261-hb150-v2 native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7; do
     args=("$fixture/missing-package")
     if [ "$profile" != shipping ]; then args+=(--dependency-profile "$profile"); fi
     if [ "$profile" = native-upgrades-dav1d154-shaderc20261-hb150-v2 ] ||
-       [ "$profile" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+       [ "$profile" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
       args+=(--shaderc-inputs "$fixture/missing-shaderc")
     fi
-    if [ "$profile" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+    if [ "$profile" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
       args+=(--openssl-builds "$fixture/missing-openssl.json" --crypto-work "$fixture/missing-crypto")
     fi
     if /bin/bash "$VERIFY" "${args[@]}" >"$fixture/current.log" 2>&1; then
@@ -78,7 +80,7 @@ retired_profile_contracts() (
 if [ "${1:-}" = --retired-profiles-only ]; then
   [ "$#" -eq 1 ] || fail "usage: test-mpvkit-dvfel-artifact-contracts.sh [--retired-profiles-only]"
   retired_profile_contracts
-  echo "PASS: retired v3/v4/v5 reject before artifact checks; shipping/v1/v2/v6 dispatch retained"
+  echo "PASS: retired v3/v4/v5/v6 reject before artifact checks; shipping/v1/v2/v7 dispatch retained"
   exit 0
 fi
 [ "$#" -eq 0 ] || fail "usage: test-mpvkit-dvfel-artifact-contracts.sh [--retired-profiles-only]"
@@ -142,15 +144,15 @@ grep -Fq 'dav1d_version_api' "$VERIFY" || fail "dav1d identity gate missing actu
 
 # The combined crypto profile is opt-in and keeps the helper/source closure explicit. The default
 # shipping branch and v1/v2 candidate APIs retain their existing inputs.
-grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-v6' "$BUILD" || fail "combined source profile missing"
+grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7' "$BUILD" || fail "combined source profile missing"
 grep -Fq 'native-upgrades-openssl410-crypto-v4' "$VERIFY" || fail "combined verifier profile missing"
 grep -Fq 'native-upgrades-crypto-chain-v1' "$BUILD" || fail "subordinate crypto capture profile missing"
 grep -Fq 'crypto-release-sources.py' "$BUILD" || fail "release source helper invocation missing"
 grep -Fq 'crypto-chain-gate.py' "$BUILD" || fail "crypto chain gate invocation missing"
 grep -Fq '3c310499d446eed72eb16521b27c16f718f23e7ab1472dec1fad79cc40ed1537' "$BUILD" || fail "builder helper hash binding missing"
 grep -Fq '041dd13e48e1821f5d7bf049bb8eb097d3772d6ea867c15a3b7646779a3c015d' "$VERIFY" || fail "verifier helper hash binding missing"
-grep -Fq 'be5bc18e00b9b1cb4c4c5889b0935b4cd5d1538a98bcfb985ccbfcb208825a9b' "$BUILD" || fail "v6 GNU optimization gate helper binding missing"
-grep -Fq 'be5bc18e00b9b1cb4c4c5889b0935b4cd5d1538a98bcfb985ccbfcb208825a9b' "$VERIFY" || fail "v6 verifier optimization gate helper binding missing"
+grep -Fq '69a180d417c8295d723ec3eb904d93414d668e55e15d9902f93718bdcfbe0485' "$BUILD" || fail "v6 GNU optimization gate helper binding missing"
+grep -Fq '69a180d417c8295d723ec3eb904d93414d668e55e15d9902f93718bdcfbe0485' "$VERIFY" || fail "v6 verifier optimization gate helper binding missing"
 grep -Fq 'swift run --jobs 1 --build-path' "$BUILD" || fail "SwiftPM jobs-one guard missing"
 grep -Fq 'apple-crypto-source-gmp.tar.xz' "$ROOT/scripts/native-media-hosted/build.sh" || fail "hosted crypto source output missing"
 grep -Fq 'apple-crypto-chain.json' "$ROOT/scripts/native-media-hosted/build.sh" || fail "hosted crypto receipt output missing"
@@ -158,8 +160,8 @@ grep -Fq 'apple-crypto-chain.json' "$ROOT/scripts/native-media-hosted/build.sh" 
 # Subtitle source successor is opt-in and keeps the current crypto/TLS/headroom contract. These
 # checks bind the four source classes and fixed helper/body boundaries without asserting unbuilt
 # ZIP contents or inventing numeric header values.
-grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-v6' "$BUILD" || fail "subtitle candidate profile missing"
-grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-v6' "$VERIFY" || fail "subtitle verifier profile missing"
+grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7' "$BUILD" || fail "subtitle candidate profile missing"
+grep -Fq 'native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7' "$VERIFY" || fail "subtitle verifier profile missing"
 grep -Fq 'subtitle-release-sources.py' "$BUILD" || fail "subtitle release source helper invocation missing"
 grep -Fq 'subtitle-release-sources.py' "$VERIFY" || fail "subtitle verifier helper invocation missing"
 grep -Fq 'apple-subtitle-builds' "$BUILD" || fail "subtitle build receipt producer invocation missing"
@@ -167,8 +169,8 @@ grep -Fq 'apple-subtitle-receipt' "$BUILD" || fail "subtitle build receipt valid
 grep -Fq 'dist/subtitle-builds/vortx-subtitle-builds.json' "$BUILD" || fail "subtitle build receipt output path differs"
 grep -Fq 'apple-subtitle-receipt' "$VERIFY" || fail "subtitle build receipt verifier invocation missing"
 grep -Fq 'dist/subtitle-builds/vortx-subtitle-builds.json' "$VERIFY" || fail "subtitle build receipt path differs"
-grep -Fq 'f082ea41b939e8152a2571636f937e2bb9dcfed57ffd2f1dbe65ed68522800df' "$BUILD" || fail "subtitle helper hash binding missing"
-grep -Fq 'f082ea41b939e8152a2571636f937e2bb9dcfed57ffd2f1dbe65ed68522800df' "$VERIFY" || fail "subtitle verifier helper hash binding missing"
+grep -Fq 'd09496535e49241575093692846de60b9e5948819d6540c4002047d12b5d37f3' "$BUILD" || fail "subtitle helper hash binding missing"
+grep -Fq 'd09496535e49241575093692846de60b9e5948819d6540c4002047d12b5d37f3' "$VERIFY" || fail "subtitle verifier helper hash binding missing"
 grep -Fq '9c4fad6e517338a098373acc9f35579ae2c325e6446666fb9ac2666ba15ceba4' "$BUILD" || fail "Unibreak archive digest missing"
 grep -Fq '1088508' "$BUILD" || fail "Unibreak archive size binding missing"
 grep -Fq '6949dcde27d41cebad1fd741fcafc36d55a1020d2d872d4a6eb3914caabbada2' "$BUILD" || fail "FriBidi archive digest missing"
@@ -1441,5 +1443,16 @@ if run_spike "$FIXTURE_REF" "$FIXTURE/swift-untracked.log"; then
 fi
 grep -Fq 'not owned by the approved patch set' "$FIXTURE/swift-untracked.log" ||
   fail "compiled SpikeGit untracked rejection lacked the ownership diagnostic"
+
+
+# Fifth source route preserves the exact retained wrapper class while requiring
+# complete new source authentication before any compile.
+grep -Fq 'private class BuildFreetypeSource: PinnedSubtitleReleaseBuild' "$PATCH" || fail "FT source class missing"
+grep -Fq 'verify-freetype' "$PATCH" || fail "FT-aware source verifier missing"
+grep -Fq 'd5fb41dd3d66c6e433b389a398571b51b8d65f3f9e81f10ee61d5434a647749e' "$PATCH" || fail "retained FT wrapper guard lost"
+grep -Fq 'SRC_FREETYPE=$subtitle_work/dist/libfreetype-2.15.0-37515cf5' "$BUILD" || fail "FT source readonly root absent"
+grep -Fq 'Libfreetype:Libfreetype' "$ROOT/scripts/assemble-mpvkit-dvfel.sh" || fail "FT local target absent"
+grep -Fq '9efee8b0508e142f38d1c7e2e192d3e5041aa4bbf6c2ab1a901518211f76a914' "$BUILD" || fail "FT raw source body pin absent"
+grep -Fq 'apple-freetype-source.tar.gz' "$ROOT/scripts/native-media-hosted/build.sh" || fail "FT corresponding source output absent"
 
 echo "PASS: compiled production SpikeGit and target pkg-config isolation, MPVKit-DVFEL pin/dirty-state, FFmpeg/Libmpv capability, exact slices, TLS, and post-fetch artifact contracts"
