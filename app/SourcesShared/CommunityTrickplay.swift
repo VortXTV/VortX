@@ -523,6 +523,54 @@ struct TrickplayDownloadBody {
     }
 }
 
+
+/// Exact output of the existing timestamp/gap-aware builder. Hashes are kept only in task memory.
+/// A successful POST is never a reclaim receipt; current bounded GETs must match all of this witness.
+struct TrickplayDurableReadbackWitness: Equatable, Sendable {
+    let key: String
+    let frameCount: Int
+    let cols: Int
+    let tileW: Int
+    let tileH: Int
+    let interval: Double
+    let spriteSHA256: String
+    let vttSHA256: String
+    let cues: [TrickplayTimelineCue]
+
+    func matches(requestedKey: String, frameCount: Int, cols: Int, tileW: Int, tileH: Int,
+                 interval: Double, spriteWidth: Int, spriteHeight: Int,
+                 spriteSHA256: String, vttSHA256: String, cues: [TrickplayTimelineCue]) -> Bool {
+        guard requestedKey == key, frameCount == self.frameCount, cols == self.cols,
+              tileW == self.tileW, tileH == self.tileH, interval == self.interval,
+              frameCount >= 2, cols > 0, tileW > 0, tileH > 0,
+              spriteSHA256 == self.spriteSHA256, vttSHA256 == self.vttSHA256,
+              cues == self.cues, cues.count == frameCount else { return false }
+        let rows = frameCount / cols + (frameCount % cols == 0 ? 0 : 1)
+        let (width, overflowW) = cols.multipliedReportingOverflow(by: tileW)
+        let (height, overflowH) = rows.multipliedReportingOverflow(by: tileH)
+        return !overflowW && !overflowH && spriteWidth == width && spriteHeight == height
+    }
+
+    /// The metadata route and both advertised assets must stay on the configured Worker and exact key.
+    /// Query signatures are permitted in memory; credentials, fragments and cross-origin URLs are rejected.
+    enum AssetKind { case sprite, vtt }
+    static func workerAsset(_ raw: String, endpoint: URL, kind: AssetKind) -> URL? {
+        guard let url = URL(string: raw), url.scheme == "https", endpoint.scheme == "https",
+              url.host?.lowercased() == endpoint.host?.lowercased(),
+              (url.port ?? 443) == (endpoint.port ?? 443),
+              url.user == nil, url.password == nil, url.fragment == nil,
+              let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              !parts.percentEncodedPath.lowercased().contains("%2f"),
+              !parts.percentEncodedPath.lowercased().contains("%5c"),
+              !url.pathComponents.contains(".."), !url.pathComponents.contains(".") else { return nil }
+        switch kind {
+        case .sprite: guard url.path.hasPrefix("/r2/sprites/"), url.path.hasSuffix(".jpg") else { return nil }
+        case .vtt: guard url.path.hasPrefix("/r2/vtt/"), url.path.hasSuffix(".vtt") else { return nil }
+        }
+        return url
+    }
+}
+
 #if !TRICKPLAY_E2E_POLICY_TESTING
 
 /// Community trickplay: scrub-preview thumbnails SHARED across users, like Netflix / Plex storyboards.
@@ -821,14 +869,26 @@ enum CommunityTrickplay {
         return url
     }
 
+    /// Reclaim verification refuses redirects entirely. Ordinary preview fetch behavior is unchanged.
+    private final class ReadbackRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
     private static func request(_ request: URLRequest, maximumBytes: Int,
-                                until deadline: ContinuousClock.Instant) async -> FetchStatus {
+                                until deadline: ContinuousClock.Instant,
+                                rejectRedirects: Bool = false) async -> FetchStatus {
         guard !Task.isCancelled else { return .cancelled }
         // The request owns its session so an early length/stream/deadline rejection cancels the transfer,
         // including when no AsyncBytes iteration has begun. No oversized body enters URLSession's data API.
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForResource = request.timeoutInterval
-        let session = URLSession(configuration: configuration)
+        let delegate: (any URLSessionDelegate)? = rejectRedirects ? ReadbackRedirectGuard() : nil
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         do {
             let (bytes, response) = try await session.bytes(for: request)
@@ -853,32 +913,46 @@ enum CommunityTrickplay {
     }
 
     private static func race(_ request: URLRequest, maximumBytes: Int,
-                             until deadline: ContinuousClock.Instant) async -> FetchStatus {
+                             until deadline: ContinuousClock.Instant, rejectRedirects: Bool = false) async -> FetchStatus {
         await withTaskGroup(of: FetchStatus.self) { group in
-            group.addTask { await self.request(request, maximumBytes: maximumBytes, until: deadline) }
+            group.addTask { await self.request(request, maximumBytes: maximumBytes, until: deadline, rejectRedirects: rejectRedirects) }
             group.addTask { (try? await Task.sleep(until: deadline, clock: ContinuousClock())) == nil ? .cancelled : .unavailable }
             let result = await group.next() ?? .cancelled; group.cancelAll(); return result
         }
     }
 
-    private static func fetchMetadata(at url: URL) async -> FetchStatus {
+    private static func fetchMetadata(at url: URL, rejectRedirects: Bool = false) async -> FetchStatus {
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
         var request = URLRequest(url: url, timeoutInterval: 3)
         request.setValue("application/json", forHTTPHeaderField: "accept")
+        if rejectRedirects {
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        }
         VortXEdgeAuth.sign(&request)
-        return await race(request, maximumBytes: TrickplayDownloadBudget.metadataBytes, until: deadline)
+        return await race(request, maximumBytes: TrickplayDownloadBudget.metadataBytes, until: deadline, rejectRedirects: rejectRedirects)
     }
 
-    private static func fetchAssets(spriteURL: URL, vttURL: URL?) async -> AssetStageResult {
+    private static func assetRequest(_ url: URL, readback: Bool) -> URLRequest {
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        if readback {
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+            VortXEdgeAuth.sign(&request)
+        }
+        return request
+    }
+
+    private static func fetchAssets(spriteURL: URL, vttURL: URL?, readback: Bool = false) async -> AssetStageResult {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         return await withTaskGroup(of: AssetEvent.self) { group in
             var sprite: FetchStatus?
             var vtt: FetchStatus?
-            group.addTask { .sprite(await request(URLRequest(url: spriteURL, timeoutInterval: 5),
-                                                  maximumBytes: TrickplayDownloadBudget.spriteBytes, until: deadline)) }
+            group.addTask { .sprite(await request(assetRequest(spriteURL, readback: readback),
+                                                  maximumBytes: TrickplayDownloadBudget.spriteBytes, until: deadline, rejectRedirects: readback)) }
             if let vttURL {
-                group.addTask { .vtt(await request(URLRequest(url: vttURL, timeoutInterval: 5),
-                                                  maximumBytes: TrickplayDownloadBudget.indexBytes, until: deadline)) }
+                group.addTask { .vtt(await request(assetRequest(vttURL, readback: readback),
+                                                  maximumBytes: TrickplayDownloadBudget.indexBytes, until: deadline, rejectRedirects: readback)) }
             }
             group.addTask { (try? await Task.sleep(until: deadline, clock: ContinuousClock())) == nil ? .cancelled : .deadline }
             while let event = await group.next() {
@@ -986,7 +1060,7 @@ enum CommunityTrickplay {
     // MARK: - Upload-after-generate (sprite-sheet build + POST)
 
     /// One captured local frame: its JPEG bytes and the playback time it was grabbed at.
-    struct CapturedFrame {
+    struct CapturedFrame: Sendable {
         let time: Double
         let jpeg: Data
     }
@@ -995,7 +1069,7 @@ enum CommunityTrickplay {
     /// not `stored` into "failed": `stored` (the Worker kept a NEW set), `rejected` (a 200 the Worker consciously
     /// declined, e.g. below_coverage_threshold or a keep-fuller race, carrying the Worker's reason), or `failed`
     /// (a real transport error, a non-200, or a local build failure that never POSTed).
-    enum UploadOutcome {
+    enum UploadOutcome: Sendable {
         case stored
         case rejected(String)
         case failed
@@ -1011,7 +1085,22 @@ enum CommunityTrickplay {
     /// left-to-right / top-to-bottom into a grid, and each tile is downscaled to ~480x270 (16:9) so the
     /// sheet stays tiny. The WEBVTT maps each tile's time window to `sprite#xywh=x,y,w,h` (Jellyfin/Plex web
     /// convention); the app crops the sub-rect itself, so no native trickplay support is needed.
+    struct UploadAttempt: Sendable {
+        let outcome: UploadOutcome
+        let witness: TrickplayDurableReadbackWitness?
+        static var failed: Self { Self(outcome: .failed, witness: nil) }
+    }
+
     static func buildAndUpload(
+        key: String, imdbId: String, season: Int?, episode: Int?, durationBucket: Int,
+        srcHeight: Int, intervalS: Double, frames: [CapturedFrame]
+    ) async -> UploadOutcome {
+        await buildAndUploadWithReceipt(key: key, imdbId: imdbId, season: season, episode: episode,
+            durationBucket: durationBucket, srcHeight: srcHeight, intervalS: intervalS,
+            frames: frames).outcome
+    }
+
+    static func buildAndUploadWithReceipt(
         key: String,
         imdbId: String,
         season: Int?,
@@ -1020,7 +1109,7 @@ enum CommunityTrickplay {
         srcHeight: Int,
         intervalS: Double,
         frames: [CapturedFrame]
-    ) async -> UploadOutcome {
+    ) async -> UploadAttempt {
         guard isEnabled,
               TrickplayOwnedWorkGate.permitsStage(
                   taskIsCancelled: Task.isCancelled
@@ -1154,7 +1243,53 @@ enum CommunityTrickplay {
         guard TrickplayOwnedWorkGate.permitsStage(
             taskIsCancelled: Task.isCancelled
         ) else { return .failed }
-        return await post(key: key, sprite: picked.jpeg, vtt: vtt, meta: meta)
+        guard let cues = TrickplayTimeline.parseVTT(vtt, frameCount: picked.frames.count,
+            cols: picked.cols, tileW: tileW, tileH: tileH) else { return .failed }
+        let witness = TrickplayDurableReadbackWitness(key: key, frameCount: picked.frames.count,
+            cols: picked.cols, tileW: tileW, tileH: tileH, interval: picked.interval,
+            spriteSHA256: digest(picked.jpeg), vttSHA256: digest(Data(vtt.utf8)), cues: cues)
+        let outcome = await post(key: key, sprite: picked.jpeg, vtt: vtt, meta: meta)
+        return UploadAttempt(outcome: outcome, witness: witness)
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// One bounded, uncached normal-API readback. No retry, discovery, R2 credentials or permission change.
+    /// The exact-key metadata GET plus exact generated asset hashes establishes the association; opaque R2
+    /// filenames need not contain the key. Missing VTT, a race with a fuller contributor or any failure retains local files.
+    static func verifyStoredUpload(_ witness: TrickplayDurableReadbackWitness) async -> Bool {
+        guard isEnabled, !Task.isCancelled,
+              let endpoint = URL(string: baseURL),
+              let url = URL(string: "\(baseURL)/tp/\(witness.key)") else { return false }
+        let metadata = await fetchMetadata(at: url, rejectRedirects: true)
+        guard isEnabled, !Task.isCancelled,
+              case .response(let data, 200) = metadata,
+              let meta = try? JSONDecoder().decode(FetchResponse.self, from: data),
+              let rawVTT = meta.vtt,
+              let spriteURL = TrickplayDurableReadbackWitness.workerAsset(meta.sprite, endpoint: endpoint, kind: .sprite),
+              let vttURL = TrickplayDurableReadbackWitness.workerAsset(rawVTT, endpoint: endpoint, kind: .vtt),
+              meta.frame_count == witness.frameCount, meta.cols == witness.cols,
+              meta.tile_w == witness.tileW, meta.tile_h == witness.tileH,
+              meta.interval_s == witness.interval else { return false }
+        let assets = await fetchAssets(spriteURL: spriteURL, vttURL: vttURL, readback: true)
+        guard isEnabled, !Task.isCancelled,
+              case .ready(.response(let sprite, 200), .some(.response(let vtt, 200))) = assets,
+              let raw = String(data: vtt, encoding: .utf8),
+              let cues = TrickplayTimeline.parseVTT(raw, frameCount: meta.frame_count,
+                  cols: meta.cols, tileW: meta.tile_w, tileH: meta.tile_h),
+              let source = CGImageSourceCreateWithData(sprite as CFData,
+                  [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+              let width = properties[kCGImagePropertyPixelWidth as String] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight as String] as? Int,
+              TrickplayDownloadBudget.permitsSprite(width: width, height: height, frameCount: meta.frame_count,
+                  cols: meta.cols, tileW: meta.tile_w, tileH: meta.tile_h) else { return false }
+        return witness.matches(requestedKey: witness.key, frameCount: meta.frame_count,
+            cols: meta.cols, tileW: meta.tile_w, tileH: meta.tile_h, interval: meta.interval_s,
+            spriteWidth: width, spriteHeight: height, spriteSHA256: digest(sprite),
+            vttSHA256: digest(vtt), cues: cues) && isEnabled && !Task.isCancelled
     }
 
     /// Compose the frames into one sheet bitmap and return the composed CGImage (the caller JPEG-encodes it,
@@ -1176,7 +1311,7 @@ enum CommunityTrickplay {
             guard TrickplayOwnedWorkGate.permitsStage(
                 taskIsCancelled: Task.isCancelled
             ) else { return nil }
-            guard let src = ScrubImage(data: frame.jpeg)?.cgImageForCrop else { continue }
+            guard let src = ScrubImage(data: frame.jpeg)?.cgImageForCrop else { return nil }
             let col = i % cols
             let row = i / cols
             // CGContext origin is bottom-left; lay tiles out top-to-bottom so the index order matches the vtt.
@@ -1249,7 +1384,7 @@ enum CommunityTrickplay {
             let bodyHead = String(bodyStr.prefix(200))
             VXProbe.log("tp", "POST \(Self.endpointLabel(url)) httpStatus=\(code) ok=\(ok ? "true" : "false") stored=\(stored ? "true" : "false") body=\(bodyHead)")
             guard code == 200 else { return .failed }
-            if stored { return .stored }
+            if ok && stored { return .stored }
             // 200 but not stored: the Worker accepted the request and consciously declined it. Surface its `reason`
             // (below_coverage_threshold, a keep-fuller race, a frameBounds drop) so the caller logs "rejected", not
             // "failed". Fall back to a generic label if the Worker omitted a machine reason.

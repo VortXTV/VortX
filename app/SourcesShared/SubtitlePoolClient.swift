@@ -269,6 +269,32 @@ enum SubtitlePoolClient {
         )
     }
 
+    /// Automatic selection consumes this authorized body directly. It neither exposes a shared file
+    /// to a deferred reader nor asks an engine to fetch the gated URL without its moat authorization.
+    static func downloadData(_ pooled: PooledSubtitle, isSignedIn: Bool = false) async -> Data? {
+        await downloadDataUsing(pooled, isSignedIn: isSignedIn,
+            moatProvider: { signedIn in await MoatToken.shared.current(isSignedIn: signedIn) },
+            transport: { request in await liveTransport(request, maxBytes: subtitleBodyMaxBytes) })
+    }
+
+    static func downloadDataUsing(_ pooled: PooledSubtitle, isSignedIn: Bool,
+        moatProvider: @escaping MoatProvider, transport: @escaping Transport
+    ) async -> Data? {
+        guard isValidDownloadURL(pooled.url, contentKey: pooled.contentKey, format: pooled.format),
+              featureCommunitySubtitles, MoatConsent.contributeAndConsume,
+              let authorization = await readAuthorization(isSignedIn: isSignedIn,
+                moatProvider: moatProvider) else { return nil }
+        var request = URLRequest(url: pooled.url,
+            timeoutInterval: RemoteConfig.snapshot.subtitleDownloadTimeout)
+        request.httpMethod = "GET"
+        VortXEdgeAuth.sign(&request)
+        request.setValue(authorization.moat, forHTTPHeaderField: MoatToken.header)
+        guard let data = await performData(request, authorization: authorization,
+            target: .download(contentKey: pooled.contentKey, format: pooled.format),
+            transport: transport), !data.isEmpty else { return nil }
+        return data
+    }
+
     static func downloadUsing(
         _ pooled: PooledSubtitle,
         isSignedIn: Bool,

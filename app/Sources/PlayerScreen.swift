@@ -3221,6 +3221,9 @@ struct PlayerScreen: View {
             )
             if name == MPVProperty.duration, let seconds = data as? Double {
                 completionEvidence.recordDuration(seconds, owner: loadToken)
+                if let source = TrickplayCaptureSource(player: coordinator.player, loadToken: loadToken) {
+                    scrubThumbnails.observeNativeCaptureDuration(seconds, source: source)
+                }
             } else if name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
                       event.loadToken == loadToken {
                 completionEvidence.recordPosition(event.seconds, owner: loadToken)
@@ -4120,6 +4123,7 @@ struct PlayerScreen: View {
         ) else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s"); return }
+        guard let captureSource = TrickplayCaptureSource(player: player, loadToken: player.activeLoadToken) else { return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureGeneration &+= 1
         let captureGeneration = localTrickplayCaptureGeneration
@@ -4154,6 +4158,10 @@ struct PlayerScreen: View {
                     watchdog.cancel()
                     guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    guard let currentSource = TrickplayCaptureSource(
+                        player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
+                    ), currentSource == captureSource,
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
                     if self.localTrickplayCaptureBreaker.recordCapture(hadData: false) {
                         VXProbe.log("tp", "local capture breaker OPEN after 3 consecutive nil frames; preserving remote/community previews")
                     }
@@ -4168,9 +4176,14 @@ struct PlayerScreen: View {
                     watchdog.cancel()
                     guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    guard let currentSource = TrickplayCaptureSource(
+                        player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
+                    ), currentSource == captureSource,
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
                     _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
                     guard let decoded else { return }   // decode failed / near-black: already logged off-actor
-                    self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
+                    self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time,
+                                                            captureSource: captureSource)
                 }
             }
         }
@@ -9884,7 +9897,7 @@ struct PlayerScreen: View {
         if let sub = pooledPick {
             autoAddonSubTried = true
             VXProbe.log("subs", "subs selected \(langName(sub.lang)) (community auto)")
-            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated download -> addExternalSubtitle -> addedPooledIDs; no alert on auto failure
+            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated bytes -> owned automatic selection -> addedPooledIDs; no alert on auto failure
             return
         }
         // No chain match. Latch only once BOTH async lists have arrived (each completion re-calls this), so a
@@ -10227,7 +10240,8 @@ struct PlayerScreen: View {
     /// `auto`: a background language-chain pick (autoSelectAddonSubtitleIfNeeded tier 2), which suppresses the
     /// subtitleLoadFailed alert on failure, matching the add-on auto path and tvOS (the user did not ask).
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
-        if !auto { invalidateSubtitleAlignmentPresentation() }
+        if auto { selectAutomaticPooledSubtitle(sub); return }
+        invalidateSubtitleAlignmentPresentation()
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume,
               VortXSyncManager.shared.isSignedIn else { return }
@@ -10305,6 +10319,92 @@ struct PlayerScreen: View {
                     applyCurrentSubtitleDelayIfReady(force: false)
                 }
                 if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
+            }
+        }
+    }
+
+    /// Preferred-language pool selection preserves the exact pre-download decision. The pool
+    /// supplies immutable authorized bytes; the engine captures its real reference before raw mounting.
+    private func selectAutomaticPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+        guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
+              MoatConsent.contributeAndConsume, VortXSyncManager.shared.isSignedIn,
+              let player = coordinator.player, let load = player.activeLoadToken else { return }
+        restoreSubtitleTimingOffsetIfReady()
+        applyCurrentSubtitleDelayIfReady(force: false)
+        guard let revision = player.subtitleAlignmentRevision else { return }
+        let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget)
+        guard !(player is MPVMetalViewController) || owner != nil else { return }
+        let marker = sub.url.absoluteString
+        let video = curMeta?.videoId
+        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: marker,
+            selectsRequestedFile: true)
+        let admission = PooledSubtitleSelectionPolicy.Admission(engine: ObjectIdentifier(player), load: load,
+            revision: revision, presentation: presentation.id)
+        let fence = SubtitlePoolClient.PublicationFence(contentKey: sub.contentKey)
+        subtitlePresentationEpoch = presentation.id
+        subtitleAlignmentPresentation = presentation
+        subtitlePoolRequests.invalidate()
+        let download = subtitlePoolRequests.beginDownload()
+        subtitleLoadingURL = marker
+        if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
+        Task { @MainActor in
+            let data = await SubtitlePoolClient.downloadData(sub,
+                isSignedIn: VortXSyncManager.shared.isSignedIn)
+            guard subtitleAlignmentPresentation?.id == presentation.id,
+                  subtitlePoolRequests.ownsDownload(download) else {
+                _ = subtitlePoolRequests.finishDownload(download)
+                return
+            }
+            let current = admission.permits(engine: ObjectIdentifier(coordinator.player ?? player),
+                load: coordinator.player?.activeLoadToken, revision: player.subtitleAlignmentRevision,
+                presentation: subtitlePresentationEpoch)
+                && player === coordinator.player
+                && curMeta?.videoId == video
+                && playbackMutationTarget.stillOwnsCurrentContext(core: core)
+                && (owner.map { LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) } ?? true)
+                && fence.permits(currentContentKey: communityContentKey,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn)
+            guard current, let data,
+                  let source = PlayerLocalSubtitleSource(data: data, format: sub.format,
+                    identityURL: sub.url, permitsUse: {
+                        // Load/content and native owner are checked separately by the engine. This
+                        // thread-safe fence preserves the original session/consent generations there.
+                        fence.permits(currentContentKey: sub.contentKey, isSignedIn: true)
+                    }) else {
+                if subtitlePoolRequests.finishDownload(download) {
+                    subtitleAlignmentPresentation = nil
+                    subtitleLoadingURL = nil
+                    if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
+                }
+                return // Automatic failure stays silent and never retries as an ordinary mount.
+            }
+            guard let external = subtitlePoolRequests.beginExternal(after: download) else { return }
+            let request = player.selectLocalExternalSubtitleAutomatically(source,
+                title: pooledLabel(sub), lang: sub.lang, owner: owner,
+                expectedLoad: load, expectedRevision: revision) { result in
+                guard subtitleAlignmentPresentation?.id == presentation.id,
+                      subtitlePoolRequests.finishExternal(external) else { return }
+                subtitleAlignmentPresentation = nil
+                subtitleLoadingURL = nil
+                guard player === coordinator.player,
+                      permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
+                      playbackMutationTarget.stillOwnsCurrentContext(core: core),
+                      owner.map({ LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) }) ?? true,
+                      fence.permits(currentContentKey: communityContentKey,
+                        isSignedIn: VortXSyncManager.shared.isSignedIn) else { if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }; return }
+                if result.succeeded {
+                    addedPooledIDs.insert(sub.id)
+                    if case .aligned = result, subDelay == 0 {
+                        pooledSeededOffset = true
+                        subtitleDelayAppliedLoadToken = load
+                    } else {
+                        applyCurrentSubtitleDelayIfReady(force: false)
+                    }
+                }
+                if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
+            }
+            if subtitleAlignmentPresentation?.id == presentation.id {
+                subtitleAlignmentPresentation?.requestGeneration = request
             }
         }
     }

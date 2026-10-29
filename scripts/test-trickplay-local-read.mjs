@@ -54,6 +54,8 @@ ${show}
 // No cloud requests in this fixture. The real selection branch is compiled, with local reuse exercised.
 enum CommunityTrickplay {
     static let isEnabled = false
+    // Durable export is disabled in this preview-only fixture; retain the production call signature.
+    static func contentKey(imdbId: String, season: Int?, episode: Int?, duration: Double) -> String? { nil }
     struct Sheet {
         func crop(at time: Double) -> ScrubImage? { nil }
         func nearestCrop(at time: Double) -> ScrubImage? { nil }
@@ -62,7 +64,7 @@ enum CommunityTrickplay {
 enum PreviewState { case hidden, loading, ready, unavailable }
 `;
 fs.writeFileSync(path.join(dir,'cache.swift'),
-  'import Foundation\nimport AppKit\nimport os\ntypealias ScrubImage = NSImage\n' + cache + harness);
+  'import Foundation\nimport AppKit\nimport CryptoKit\nimport os\ntypealias ScrubImage = NSImage\n' + cache + harness);
 const binary = path.join(dir,'run');
 const compile = spawnSync('xcrun',['swiftc','-swift-version','6','-strict-concurrency=complete',
   '-warnings-as-errors','-num-threads','1','-j','1','-D','TRICKPLAY_E2E_POLICY_TESTING','-parse-as-library','-o',binary,

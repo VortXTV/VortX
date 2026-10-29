@@ -690,7 +690,9 @@ private enum TrickplayEndToEndCorrectionTests {
         )
         expect(
             store.contains("intervalS: sessionNominalInterval")
-                && store.contains("interval: sessionNominalInterval")
+                && store.contains("interval: durable.map { value in")
+                && store.contains("fallbackInterval: value.snapshot.context.nominalInterval)")
+                && store.contains("} ?? sessionNominalInterval,")
                 && community.contains("let retainedInterval = TrickplayTimeline.nominalCadence(")
                 && community.contains("effectiveInterval = retainedInterval * Double(stride)")
                 && community.contains("TrickplayTimeline.selectedCueEndFences(")

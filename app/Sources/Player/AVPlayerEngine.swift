@@ -852,14 +852,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let itemGeneration: UInt64
         let mountIdentity: UInt64
         let owner: PlayerSubtitleAlignmentOwner?
+        let permitsUse: @Sendable () -> Bool
         var selectionRevision: UInt64?
         var rawSettled = false
         var publication: AVKitSubtitleAlignmentPublication?
         init(generation: UInt64, requestRevision: UInt64, item: AVPlayerItem, load: PlayerLoadToken,
-             itemGeneration: UInt64, mountIdentity: UInt64, owner: PlayerSubtitleAlignmentOwner?) {
+             itemGeneration: UInt64, mountIdentity: UInt64, owner: PlayerSubtitleAlignmentOwner?,
+             permitsUse: @escaping @Sendable () -> Bool = { true }) {
             self.generation = generation; self.requestRevision = requestRevision
             self.item = item; self.load = load; self.itemGeneration = itemGeneration
-            self.mountIdentity = mountIdentity; self.owner = owner
+            self.mountIdentity = mountIdentity; self.owner = owner; self.permitsUse = permitsUse
         }
     }
     private var automaticSubtitleRequest: AutomaticSubtitleRequest?
@@ -4096,7 +4098,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func ownsAutomaticSubtitle(_ original: AutomaticSubtitleRequest) -> Bool {
-        automaticSubtitleRequest === original && subtitleAlignmentGeneration == original.generation
+        original.permitsUse() && automaticSubtitleRequest === original && subtitleAlignmentGeneration == original.generation
             && externalSubtitleRequestRevision == original.requestRevision
             && itemGeneration == original.itemGeneration && playbackMountIdentity == original.mountIdentity
             && owns(original.item, loadToken: original.load)
@@ -4112,14 +4114,35 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         owner: PlayerSubtitleAlignmentOwner?,
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
     ) -> UInt64? {
-        guard let remote = URL(string: url),
-              let originalItem = item, let originalLoad = activeLoadToken,
+        guard let remote = URL(string: url) else { completion(.failed); return nil }
+        return selectAutomaticExternalSubtitle(remote: remote, url: url, title: title, lang: lang,
+            owner: owner, localSource: nil, completion: completion)
+    }
+
+    func selectLocalExternalSubtitleAutomatically(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner?,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
+    ) -> UInt64? {
+        guard source.permitsUse(), activeLoadToken == expectedLoad,
+              subtitleAlignmentRevision == expectedRevision else { completion(.superseded); return nil }
+        return selectAutomaticExternalSubtitle(remote: source.identityURL,
+            url: source.identityURL.absoluteString, title: title, lang: lang,
+            owner: owner, localSource: source, completion: completion)
+    }
+
+    private func selectAutomaticExternalSubtitle(remote: URL, url: String, title: String, lang: String,
+        owner: PlayerSubtitleAlignmentOwner?, localSource: PlayerLocalSubtitleSource?,
+        completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
+    ) -> UInt64? {
+        guard let originalItem = item, let originalLoad = activeLoadToken,
               owns(originalItem, loadToken: originalLoad) else { completion(.superseded); return nil }
         retireSubtitleAlignment()
         externalSubtitleRequestRevision &+= 1
         let request = AutomaticSubtitleRequest(generation: subtitleAlignmentGeneration,
             requestRevision: externalSubtitleRequestRevision, item: originalItem, load: originalLoad,
-            itemGeneration: itemGeneration, mountIdentity: playbackMountIdentity, owner: owner)
+            itemGeneration: itemGeneration, mountIdentity: playbackMountIdentity, owner: owner,
+            permitsUse: localSource?.permitsUse ?? { true })
         automaticSubtitleRequest = request
         // Capture while the real native row is selected. Our subsequent raw mount is expected to
         // deselect it. Off, HLS/remux, protected/nonlocal and unsupported text stay ordinary selection.
@@ -4131,8 +4154,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             && subGroup.map({ originalItem.currentMediaSelection.selectedMediaOption(in: $0) != nil }) == true
             ? AVKitSubtitleReferenceCapture.capture(item: originalItem) : nil
         automaticSubtitleTask = Task { @MainActor [weak self] in
-            let data: Data? = await withCheckedContinuation { continuation in
-                SubtitleFileFetcher.fetch(remote, timeout: 12) { continuation.resume(returning: $0) }
+            let data: Data?
+            if let localSource { data = localSource.data }
+            else {
+                data = await withCheckedContinuation { continuation in
+                    SubtitleFileFetcher.fetch(remote, timeout: 12) { continuation.resume(returning: $0) }
+                }
             }
             guard let self else { completion(.superseded); return }
             guard self.ownsAutomaticSubtitle(request), !Task.isCancelled else {

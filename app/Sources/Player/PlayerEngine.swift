@@ -210,6 +210,12 @@ protocol PlayerEngine: AnyObject {
     func selectExternalSubtitleAutomatically(url: String, title: String, lang: String,
         owner: PlayerSubtitleAlignmentOwner?,
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void) -> UInt64?
+    /// Already-authorized local bytes; expected load/revision were captured before the pool await.
+    /// Unsupported conformers fail without mounting or inventing a cancellation generation.
+    func selectLocalExternalSubtitleAutomatically(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner?,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void) -> UInt64?
     /// Cancel only the original request issued by this same engine, including normal automatic selection.
     func cancelAutomaticSubtitleAlignment(ifRequestGeneration request: UInt64)
     /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
@@ -311,6 +317,15 @@ extension PlayerEngine {
         addExternalSubtitle(url: url, title: title, lang: lang) {
             completion($0 ? .selectedWithoutAlignment : .failed)
         }
+        return nil
+    }
+
+    func selectLocalExternalSubtitleAutomatically(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner?,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
+    ) -> UInt64? {
+        completion(.failed)
         return nil
     }
 

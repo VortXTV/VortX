@@ -38,7 +38,23 @@ enum TrickplayFrameByteFloor {
 // harness, never by any real build) drops the store so the pure floor rule compiles and is unit-tested in
 // isolation. This mirrors CommunityTrickplay.swift's TRICKPLAY_E2E_POLICY_TESTING seam; production never sets it.
 #if !TRICKPLAY_BYTEFLOOR_TESTING
+import CryptoKit
+
 enum PreviewState: Equatable { case hidden, loading, ready, unavailable }
+
+/// In-memory equality witness only. Native object addresses and load tokens are never serialized.
+struct TrickplayCaptureSource: Equatable, Sendable {
+    let loadToken: PlayerLoadToken
+    let engine: ObjectIdentifier
+    let mountGeneration: UInt64
+
+    @MainActor init?(player: (any PlayerEngine)?, loadToken: PlayerLoadToken?) {
+        guard let player, let loadToken, player.activeLoadToken == loadToken else { return nil }
+        self.loadToken = loadToken
+        engine = ObjectIdentifier(player)
+        mountGeneration = (player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+    }
+}
 
 /// Provides scrub-preview thumbnails from locally captured frames.
 /// When no server storyboard is available the player captures a frame every ~10 s of playback
@@ -51,6 +67,20 @@ final class ScrubThumbnailsStore: ObservableObject {
 
     private var localCacheKey: String?
     private static let localFrameCache = LocalTrickplayFrameCache()
+
+    private var captureDurations = TrickplayCaptureDurationEvidence<TrickplayCaptureSource>()
+    private struct DurableCaptureSet {
+        let source: TrickplayCaptureSource
+        let context: TrickplayCaptureContext
+        let lease: TrickplayLocalReadLease
+    }
+    private var durableCaptureSet: DurableCaptureSet?
+    private var durableSelectionTask: Task<Void, Never>?
+    private var durableSelectionID: UUID?
+    private var durableSelectionLease: TrickplayLocalReadLease?
+    private var durableSelectionNeedsFinal = false
+    private var durableProgressiveSelectionAttempted = false
+    private var durableFinalSelectionAttempted = false
 
     // MARK: Community trickplay (shared across users; 100% fail-soft -> local capture)
 
@@ -103,6 +133,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let srcHeight: Int
         let interval: Double
         let frames: [CommunityTrickplay.CapturedFrame]
+        let durable: LocalTrickplayDurableExport?
     }
     private var deferredUploadSnapshots: [UInt64: UploadSnapshot] = [:]
     /// Low-rate playback telemetry reads this to correlate frame drops with a community-sheet build/upload.
@@ -140,6 +171,9 @@ final class ScrubThumbnailsStore: ObservableObject {
     deinit {
         pendingLocalReadLease?.cancel()
         communityFetchTask?.cancel()
+        durableCaptureSet?.lease.cancel()
+        durableSelectionLease?.cancel()
+        durableSelectionTask?.cancel()
     }
 
     private func cancelPendingLocalRead() {
@@ -159,6 +193,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         ) == .reset else { return }
         cancelPendingLocalRead()
         retireCommunityUploadIfNeeded()
+        cancelDurableCaptureSet()
         _ = communityIdentityGeneration.advance()
         cancelCommunityFetch()
         showToken &+= 1
@@ -490,9 +525,11 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// Light main-actor state mutations for an already-decoded (and black-checked) frame: cache the tile and
     /// buffer the raw JPEG for a possible community upload. Keep the heavy decode/black-check in
     /// `decodeCapturedFrame` so only this small tail touches @MainActor state.
-    func recordDecodedFrame(_ decoded: ScrubImage, data: Data, at time: Double) {
+    func recordDecodedFrame(_ decoded: ScrubImage, data: Data, at time: Double,
+                            captureSource: TrickplayCaptureSource? = nil) {
         guard let key = localCacheKey, !key.isEmpty else { return }
-        Self.localFrameCache.store(image: decoded, data: data, for: key, time: time)
+        let capture = durableCaptureWrite(source: captureSource)
+        Self.localFrameCache.store(image: decoded, data: data, for: key, time: time, capture: capture)
         // Keep a bounded sample spanning the whole observed timeline. Once the current validated fleet maximum
         // is full, admit every later capture and remove the most temporally redundant interior frame.
         // Buffer EVEN when a community set already exists, so a fuller local capture can improve a thin one.
@@ -508,8 +545,58 @@ final class ScrubThumbnailsStore: ObservableObject {
                 limit: captureLimit
             )
             sessionFrames = retained.map { candidates[$0] }
-            maybeUploadProgressively()   // upload DURING playback, not only at a teardown that may never fire
+            if !startDurableUploadSelection(kind: .progressive) { maybeUploadProgressively() }
         }
+    }
+
+    /// Called only at the attributed native duration-event boundary, never from catalog/UI duration.
+    /// Keep this raw source observation over a media-key commit: a parked incoming episode can report
+    /// duration before its first-frame commit. Content association is created only by its accepted capture.
+    func observeNativeCaptureDuration(_ seconds: Double, source: TrickplayCaptureSource) {
+        let previous = captureDurations.duration(for: source)
+        captureDurations.observe(seconds, source: source)
+        if durableCaptureSet?.source != source || previous != captureDurations.duration(for: source) {
+            cancelDurableCaptureSet()
+        }
+    }
+
+    private func cancelDurableCaptureSet() {
+        durableCaptureSet?.lease.cancel()
+        durableCaptureSet = nil
+        durableSelectionLease?.cancel()
+        durableSelectionTask?.cancel()
+        durableSelectionTask = nil; durableSelectionLease = nil; durableSelectionID = nil
+        durableSelectionNeedsFinal = false
+        durableProgressiveSelectionAttempted = false; durableFinalSelectionAttempted = false
+    }
+
+    private func durableCaptureWrite(source: TrickplayCaptureSource?) -> LocalTrickplayCaptureWrite? {
+        guard CommunityTrickplay.isEnabled, let source,
+              let realDuration = captureDurations.duration(for: source),
+              let imdb = communityImdb, let key = communityKey,
+              CommunityTrickplay.contentKey(imdbId: imdb, season: communitySeason,
+                  episode: communityEpisode, duration: realDuration) == key else {
+            cancelDurableCaptureSet()
+            return nil
+        }
+        let interval = Self.captureInterval
+        let context = TrickplayCaptureContext(
+            setID: durableCaptureSet?.context.setID ?? UUID(), communityKey: key,
+            imdb: imdb, season: communitySeason, episode: communityEpisode,
+            realDuration: realDuration, nominalInterval: interval
+        )
+        guard context.isValid else { cancelDurableCaptureSet(); return nil }
+        if durableCaptureSet?.source != source || durableCaptureSet?.context != context {
+            cancelDurableCaptureSet()
+            let fresh = TrickplayCaptureContext(
+                setID: UUID(), communityKey: key, imdb: imdb, season: communitySeason,
+                episode: communityEpisode, realDuration: realDuration, nominalInterval: interval
+            )
+            durableCaptureSet = DurableCaptureSet(source: source, context: fresh,
+                                                  lease: TrickplayLocalReadLease())
+        }
+        guard let set = durableCaptureSet else { return nil }
+        return LocalTrickplayCaptureWrite(context: set.context, lease: set.lease)
     }
 
     /// Upload during playback once the local capture is storable. Teardown may replace it once after material
@@ -542,10 +629,80 @@ final class ScrubThumbnailsStore: ObservableObject {
         admitUpload(admission, imdb: imdb)
     }
 
+    /// Select behind the cache FIFO so already accepted stores publish before the snapshot. The bounded
+    /// async selection owns no upload until current consent, source, context and ordinary policy gates pass.
+    /// An invalid/partial/legacy cache falls back to the existing session-only path and stays on disk.
+    @discardableResult
+    private func startDurableUploadSelection(kind: TrickplayUploadPolicy.Kind) -> Bool {
+        guard permitsCommunityUpload, let mediaKey = localCacheKey, let set = durableCaptureSet,
+              !set.lease.isCancelled, communityKey == set.context.communityKey,
+              !uploadPolicy.isTerminal else { return false }
+        if durableSelectionTask != nil {
+            if kind == .final { durableSelectionNeedsFinal = true; durableFinalSelectionAttempted = true }
+            return true
+        }
+        // Spend the progressive disk probe only once the ordinary in-session input is uploadable.
+        // Probing after the first frame would consume it on an unbuildable partial set and let a later
+        // session-only progressive upload make the final terminal before durable reclaim can be attempted.
+        if kind == .progressive {
+            guard sessionFrames.count >= 2,
+                  CommunityTrickplay.uploadCanStore(frameCount: sessionFrames.count,
+                      intervalS: sessionNominalInterval, durationBucket: communityDurationBucket) else { return false }
+        }
+        if kind == .progressive && (uploadPolicy.progressiveAttempted || durableProgressiveSelectionAttempted) { return false }
+        if kind == .final && (uploadPolicy.finalAttempted || durableFinalSelectionAttempted) { return false }
+        // At most one startup probe and one final probe per accepted capture set, never a disk scan per frame.
+        if kind == .progressive { durableProgressiveSelectionAttempted = true }
+        else { durableFinalSelectionAttempted = true }
+        let id = UUID(), lease = TrickplayLocalReadLease()
+        durableSelectionID = id; durableSelectionLease = lease
+        durableSelectionNeedsFinal = kind == .final
+        durableSelectionTask = Task(priority: .utility) { [self] in
+            let selected = await withTaskCancellationHandler {
+                await Self.localFrameCache.export(for: mediaKey, matching: set.context, lease: lease)
+            } onCancel: { lease.cancel() }
+            guard durableSelectionID == id else {
+                if let selected { Self.localFrameCache.releaseExport(selected.snapshot.id) }
+                return
+            }
+            let requestedKind: TrickplayUploadPolicy.Kind = durableSelectionNeedsFinal ? .final : .progressive
+            durableSelectionTask = nil; durableSelectionID = nil; durableSelectionLease = nil
+            durableSelectionNeedsFinal = false
+            guard !Task.isCancelled, !lease.isCancelled, permitsCommunityUpload,
+                  localCacheKey == mediaKey, durableCaptureSet?.source == set.source,
+                  durableCaptureSet?.context == set.context else {
+                if let selected { Self.localFrameCache.releaseExport(selected.snapshot.id) }
+                return
+            }
+            if let selected {
+                let interval = TrickplayTimeline.nominalCadence(
+                    captureTimes: selected.snapshot.frames.map { $0.receipt.captureTime },
+                    fallbackInterval: selected.snapshot.context.nominalInterval)
+                let coverage = CommunityTrickplay.uploadCanStore(frameCount: selected.snapshot.frames.count,
+                    intervalS: interval, durationBucket: communityDurationBucket)
+                if let admission = uploadPolicy.request(key: set.context.communityKey, kind: requestedKind,
+                    frameCount: selected.snapshot.frames.count, existingFrameCount: communityExistingFrameCount,
+                    coverageReady: coverage) {
+                    admitUpload(admission, imdb: set.context.imdb, durable: selected)
+                    return
+                }
+                Self.localFrameCache.releaseExport(selected.snapshot.id)
+            }
+            if requestedKind == .final { finishSessionUploadIfNeeded() }
+            else { maybeUploadProgressively() }
+        }
+        return true
+    }
+
     /// Teardown flush. This is the first attempt when playback ended before a progressive upload, or the single
     /// retry after a transient progressive failure. It never repeats a stored or deliberately declined key.
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
+        if startDurableUploadSelection(kind: .final) { return }
+        finishSessionUploadIfNeeded()
+    }
+
+    private func finishSessionUploadIfNeeded() {
         guard permitsCommunityUpload,
               let key = communityKey,
               let imdb = communityImdb else { return }
@@ -595,7 +752,8 @@ final class ScrubThumbnailsStore: ObservableObject {
 
     private func admitUpload(
         _ admission: TrickplayUploadPolicy.Admission,
-        imdb: String
+        imdb: String,
+        durable: LocalTrickplayDurableExport? = nil
     ) {
         let claim: TrickplayUploadPolicy.Claim
         switch admission {
@@ -609,8 +767,14 @@ final class ScrubThumbnailsStore: ObservableObject {
             episode: communityEpisode,
             durationBucket: communityDurationBucket,
             srcHeight: communitySrcHeight,
-            interval: sessionNominalInterval,
-            frames: Array(sessionFrames.prefix(claim.frameCount))
+            interval: durable.map { value in
+                TrickplayTimeline.nominalCadence(captureTimes: value.snapshot.frames.map { $0.receipt.captureTime },
+                    fallbackInterval: value.snapshot.context.nominalInterval)
+            } ?? sessionNominalInterval,
+            frames: durable.map { value in
+                value.snapshot.frames.map { CommunityTrickplay.CapturedFrame(time: $0.receipt.captureTime, jpeg: $0.jpeg) }
+            } ?? Array(sessionFrames.prefix(claim.frameCount)),
+            durable: durable
         )
         switch admission {
         case .start:
@@ -631,12 +795,30 @@ final class ScrubThumbnailsStore: ObservableObject {
         let key = claim.key
         VXProbe.log("tp", "pushUpload FIRING key=\(VXProbeRedaction.identityToken(key)) imdb=\(VXProbeRedaction.identityToken(snapshot.imdb)) frames=\(snapshot.frames.count)")
         uploadTask = Task(priority: .utility) { [self] in
-            let outcome = await CommunityTrickplay.buildAndUpload(
+            // Every exit releases the process-local claim, including cancellation and stale completion.
+            defer { snapshot.durable?.release() }
+            let attempt = await withTaskCancellationHandler {
+                await CommunityTrickplay.buildAndUploadWithReceipt(
                 key: key, imdbId: snapshot.imdb,
                 season: snapshot.season, episode: snapshot.episode,
                 durationBucket: snapshot.durationBucket,
                 srcHeight: snapshot.srcHeight,
                 intervalS: snapshot.interval, frames: snapshot.frames)
+            } onCancel: { snapshot.durable?.cancel() }
+            let outcome = attempt.outcome
+            if case .stored = outcome, let durable = snapshot.durable, let witness = attempt.witness,
+               uploadPolicy.inFlight == claim, MoatConsent.contributeAndConsume,
+               CommunityTrickplay.isEnabled, !Task.isCancelled, !durable.lease.isCancelled {
+                let verified = await withTaskCancellationHandler {
+                    await CommunityTrickplay.verifyStoredUpload(witness)
+                } onCancel: { durable.cancel() }
+                if verified, uploadPolicy.inFlight == claim, MoatConsent.contributeAndConsume,
+                   CommunityTrickplay.isEnabled, !Task.isCancelled, !durable.lease.isCancelled {
+                    await withTaskCancellationHandler {
+                        await Self.localFrameCache.reclaimExport(durable)
+                    } onCancel: { durable.cancel() }
+                }
+            }
             // Honest result: a 200 the Worker consciously declined (below_coverage_threshold, a keep-fuller race
             // with another contributor, a remote frameBounds drop) is "rejected(reason)", NOT "failed". Reserve
             // "failed" for a real transport error, a non-200, or a local build failure that never POSTed.
@@ -661,6 +843,9 @@ final class ScrubThumbnailsStore: ObservableObject {
                 deferredUploadSnapshots.removeValue(forKey: $0.sequence)
             }
             let queuedSequences = Set(uploadPolicy.deferredFinals.map(\.sequence))
+            for (sequence, retired) in deferredUploadSnapshots where !queuedSequences.contains(sequence) {
+                retired.durable?.cancel()
+            }
             deferredUploadSnapshots = deferredUploadSnapshots.filter {
                 queuedSequences.contains($0.key)
             }
@@ -717,6 +902,22 @@ private enum LocalTrickplayFramePolicy {
     static func bucketFor(_ time: Double) -> Int { Int(max(0, floor(time / bucketSeconds))) }
 }
 
+/// Immutable scalar provenance crosses the existing serial I/O queue. Hashing and JSON/file work
+/// remain there; native source/engine identity never leaves the main actor or reaches disk.
+private struct LocalTrickplayCaptureWrite: Sendable {
+    let context: TrickplayCaptureContext
+    let lease: TrickplayLocalReadLease
+}
+
+/// The immutable export and its cancellation lease cross only the serial worker and upload task.
+private struct LocalTrickplayDurableExport: Sendable {
+    let snapshot: TrickplayDurableExportSnapshot
+    let lease: TrickplayLocalReadLease
+    let worker: LocalTrickplayDiskWorker
+    func release() { worker.releaseExport(snapshot.id) }
+    func cancel() { lease.cancel(); release() }
+}
+
 /// Immutable bucket admission from one main-actor resident snapshot. The worker never reads native images.
 private struct LocalTrickplayResidentPlan: Sendable {
     let buckets: Set<Int>
@@ -768,6 +969,7 @@ private struct LocalTrickplayDiskWorker: Sendable {
     private struct State: Sendable {
         var directory: URL?
         var lastPrune = Date.distantPast
+        var exportClaims = TrickplayDurableExportClaims()
     }
 
     private let state: OSAllocatedUnfairLock<State>
@@ -781,10 +983,28 @@ private struct LocalTrickplayDiskWorker: Sendable {
         ioQueue.async { _ = self.cacheDirectory() }
     }
 
-    func store(data: Data, for key: String, bucket: Int, completion: @escaping @Sendable () -> Void) {
+    func store(data: Data, for key: String, bucket: Int, time: Double,
+               capture: LocalTrickplayCaptureWrite?, completion: @escaping @Sendable () -> Void) {
         ioQueue.async {
             let directory = self.cacheDirectory()
-            try? TrickplayFrameDiskStore(directory: directory).write(data, mediaKey: key, bucket: bucket)
+            let disk = TrickplayFrameDiskStore(directory: directory)
+            self.state.withLock { value in
+                value.exportClaims.willWrite([disk.captureFrameName(mediaKey: key, bucket: bucket),
+                    disk.captureReceiptName(mediaKey: key, bucket: bucket)])
+            }
+            let permits = { @Sendable in
+                capture.map { !$0.lease.isCancelled } == true && CommunityTrickplay.isEnabled
+            }
+            let digest = { (bytes: Data) in SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined() }
+            let receipt = capture.flatMap { value -> TrickplayCaptureReceipt? in
+                guard permits(), data.count <= TrickplayCaptureReceipt.maximumJPEGBytes else { return nil }
+                return TrickplayCaptureReceipt(context: value.context,
+                    frameNameSHA256: digest(Data(disk.captureFrameName(mediaKey: key, bucket: bucket).utf8)), bucket: bucket,
+                    captureTime: time, jpegBytes: data.count, jpegSHA256: digest(data),
+                    mediaKeySHA256: digest(Data(key.utf8)))
+            }
+            try? disk.write(data, mediaKey: key, bucket: bucket, captureReceipt: receipt,
+                            permitsCaptureReceipt: permits)
             self.pruneIfNeeded(directory: directory)
             completion()
         }
@@ -833,6 +1053,49 @@ private struct LocalTrickplayDiskWorker: Sendable {
         }
     }
 
+    func export(for key: String, matching context: TrickplayCaptureContext,
+                lease: TrickplayLocalReadLease,
+                completion: @escaping @Sendable (LocalTrickplayDurableExport?) -> Void) {
+        ioQueue.async {
+            let permits = { @Sendable in !lease.isCancelled && CommunityTrickplay.isEnabled }
+            guard permits(), self.state.withLock({ $0.exportClaims.activeID == nil }) else {
+                completion(nil); return
+            }
+            let disk = TrickplayFrameDiskStore(directory: self.cacheDirectory())
+            guard let snapshot = disk.exportSnapshot(mediaKey: key, matching: context,
+                sha256: { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() },
+                communityKey: { value in CommunityTrickplay.contentKey(imdbId: value.imdb,
+                    season: value.season, episode: value.episode, duration: value.realDuration) },
+                shouldContinue: permits), permits(),
+                self.state.withLock({ $0.exportClaims.begin(snapshot) }) else { completion(nil); return }
+            guard permits() else {
+                self.state.withLock { $0.exportClaims.release(snapshot.id) }
+                completion(nil); return
+            }
+            completion(LocalTrickplayDurableExport(snapshot: snapshot, lease: lease, worker: self))
+        }
+    }
+
+    func releaseExport(_ id: UUID) {
+        ioQueue.async { self.state.withLock { $0.exportClaims.release(id) } }
+    }
+
+    func reclaimExport(_ value: LocalTrickplayDurableExport,
+                       completion: @escaping @Sendable () -> Void) {
+        ioQueue.async {
+            defer {
+                self.state.withLock { $0.exportClaims.release(value.snapshot.id) }
+                completion()
+            }
+            let permits = { @Sendable in
+                !value.lease.isCancelled && CommunityTrickplay.isEnabled
+                    && self.state.withLock { $0.exportClaims.permitsReclaim(value.snapshot.id) }
+            }
+            guard permits() else { return }
+            TrickplayFrameDiskStore(directory: self.cacheDirectory()).reclaim(value.snapshot, permits: permits)
+        }
+    }
+
     private func cacheDirectory() -> URL {
         if let directory = state.withLock({ $0.directory }) { return directory }
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -855,6 +1118,7 @@ private struct LocalTrickplayDiskWorker: Sendable {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]
         ) else { return }
+        let pinned = state.withLock { $0.exportClaims.pinned }
         var retained: [(url: URL, date: Date, size: Int64)] = []
         var total: Int64 = 0
         for file in files {
@@ -862,11 +1126,11 @@ private struct LocalTrickplayDiskWorker: Sendable {
                   vals.isRegularFile == true else { continue }
             let modified = vals.contentModificationDate ?? .distantPast
             let size = Int64(vals.fileSize ?? 0)
-            if now.timeIntervalSince(modified) > LocalTrickplayFramePolicy.ttl {
+            if !pinned.contains(file.lastPathComponent), now.timeIntervalSince(modified) > LocalTrickplayFramePolicy.ttl {
                 try? FileManager.default.removeItem(at: file); continue
             }
             total += size
-            retained.append((file, modified, size))
+            if !pinned.contains(file.lastPathComponent) { retained.append((file, modified, size)) }
         }
         if total > LocalTrickplayFramePolicy.maxDiskBytes {
             for item in retained.sorted(by: { $0.date < $1.date }) {
@@ -910,9 +1174,12 @@ private final class LocalTrickplayFrameCache {
     /// before its successor starts, preserving the original serial worker's read/store ordering without
     /// assuming Task FIFO. In particular an older disk decode cannot overwrite a newer same-bucket capture.
     private enum Operation {
-        case store(image: ScrubImage, data: Data, key: String, bucket: Int)
+        case store(image: ScrubImage, data: Data, key: String, bucket: Int, time: Double,
+                   capture: LocalTrickplayCaptureWrite?)
         case read(key: String, target: Int, lease: TrickplayLocalReadLease,
                   completion: @MainActor (ScrubImage?) -> Void)
+        case export(key: String, context: TrickplayCaptureContext, lease: TrickplayLocalReadLease,
+                    completion: @MainActor @Sendable (LocalTrickplayDurableExport?) -> Void)
     }
     private var operations: [Operation?] = []
     private var operationHead = 0
@@ -925,9 +1192,11 @@ private final class LocalTrickplayFrameCache {
         diskWorker.prepare()
     }
 
-    func store(image: ScrubImage, data: Data, for key: String, time: Double) {
+    func store(image: ScrubImage, data: Data, for key: String, time: Double,
+               capture: LocalTrickplayCaptureWrite? = nil) {
         let bucket = LocalTrickplayFramePolicy.bucketFor(time)
-        operations.append(.store(image: image, data: data, key: key, bucket: bucket))
+        operations.append(.store(image: image, data: data, key: key, bucket: bucket,
+                                 time: time, capture: capture))
         startNextOperation()
     }
 
@@ -1045,14 +1314,41 @@ private final class LocalTrickplayFrameCache {
         startNextOperation()
     }
 
+    func export(for key: String, matching context: TrickplayCaptureContext,
+                lease: TrickplayLocalReadLease) async -> LocalTrickplayDurableExport? {
+        await withCheckedContinuation { continuation in
+            operations.append(.export(key: key, context: context, lease: lease,
+                completion: { continuation.resume(returning: $0) }))
+            startNextOperation()
+        }
+    }
+
+    func releaseExport(_ id: UUID) { diskWorker.releaseExport(id) }
+
+    func reclaimExport(_ value: LocalTrickplayDurableExport) async {
+        await withCheckedContinuation { continuation in
+            diskWorker.reclaimExport(value) { continuation.resume() }
+        }
+    }
+
     private func startNextOperation() {
         guard !operationInFlight else { return }
         while let operation = takeNextOperation() {
             switch operation {
-            case .store(let image, let data, let key, let bucket):
+            case .export(let key, let context, let lease, let completion):
+                // A cancelled operation still resumes its continuation exactly once.
+                operationInFlight = true
+                diskWorker.export(for: key, matching: context, lease: lease) { value in
+                    Task { @MainActor in
+                        completion(value)
+                        self.finishOperation()
+                    }
+                }
+                return
+            case .store(let image, let data, let key, let bucket, let time, let capture):
                 operationInFlight = true
                 insert(image, for: key, bucket: bucket)
-                diskWorker.store(data: data, for: key, bucket: bucket) {
+                diskWorker.store(data: data, for: key, bucket: bucket, time: time, capture: capture) {
                     Task { @MainActor in self.finishOperation() }
                 }
                 return
