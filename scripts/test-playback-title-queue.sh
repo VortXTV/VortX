@@ -12,6 +12,8 @@ queue_inputs=(
   "$queue_root/app/SourcesShared/RandomPickPlayIntent.swift"
   "$queue_root/app/Tests/PlaybackTitleQueuePolicyTests.swift"
   "$queue_root/app/Tests/PlaybackTitleQueueSourceAdmissionTests.swift"
+  "$queue_root/app/SourcesShared/PlaybackTitleQueueArchiveCodec.swift"
+  "$queue_root/app/Tests/PlaybackTitleQueueDurabilityTests.swift"
   "$queue_root/scripts/test-playback-title-queue.sh"
 )
 queue_finish() {
@@ -59,6 +61,14 @@ queue_flags=(-target "$queue_target" -sdk "$queue_sdk" -swift-version 6
   "$queue_out/ActualToken.swift" "$queue_root/app/Tests/PlaybackTitleQueueSourceAdmissionTests.swift" \
   -o "$queue_out/source-tests" > "$queue_out/source-compile.log" 2>&1
 /usr/bin/nice -n 15 "$queue_out/source-tests" > "$queue_out/source-runtime.log" 2>&1
+# These are separate standalone @main programs. Keep the real codec/policy sources,
+# compile them serially, and retain a distinct result; no filesystem/SDK behavior is inferred.
+/usr/bin/nice -n 15 xcrun --toolchain com.apple.dt.toolchain.XcodeDefault --sdk macosx swiftc \
+  "${queue_flags[@]}" "$queue_root/app/SourcesShared/PlaybackTitleQueuePolicy.swift" \
+  "$queue_root/app/SourcesShared/PlaybackTitleQueueArchiveCodec.swift" \
+  "$queue_root/app/Tests/PlaybackTitleQueueDurabilityTests.swift" \
+  -o "$queue_out/durability-tests" > "$queue_out/durability-compile.log" 2>&1
+/usr/bin/nice -n 15 "$queue_out/durability-tests" > "$queue_out/durability-runtime.log" 2>&1
 shasum -a 256 "$queue_out/ActualToken.swift" > "$queue_out/generated-after.sha256"
 cmp -s "$queue_out/generated-before.sha256" "$queue_out/generated-after.sha256"
-cat "$queue_out/policy-runtime.log" "$queue_out/source-runtime.log"
+cat "$queue_out/policy-runtime.log" "$queue_out/source-runtime.log" "$queue_out/durability-runtime.log"
