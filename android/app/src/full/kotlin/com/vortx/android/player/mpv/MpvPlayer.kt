@@ -38,6 +38,7 @@ import com.vortx.android.player.SessionAudioPresetAvailability
 import com.vortx.android.player.SessionAudioPresetSession
 import com.vortx.android.player.SessionAudioRouteRequest
 import com.vortx.android.player.SubtitleStyle
+import com.vortx.android.player.PlayerAddonSubtitleSource
 import com.vortx.android.player.PlayerSubtitleSelection
 import com.vortx.android.player.PlayerExternalSubtitleSelectionResult
 import com.vortx.android.player.subtitles.SubtitleAlignmentFile
@@ -221,7 +222,16 @@ class MpvPlayer private constructor(
         completion
     }
     // Bounded owned raw fallbacks, never deleted by a different request or a cache-wide sweep.
+    // The byte counter covers BOTH the legacy alignment files and canonical add-on SRT files.
+    // It is metadata supplied before this gate; no filesystem call occurs while the gate is held.
     private val alignmentFiles = mutableListOf<File>()
+    private var alignmentFileBytes = 0L
+    private class PreparedAddonSubtitle(
+        val file: File,
+        val byteCount: Long,
+        val alignmentBytes: ByteArray?,
+        val stillCurrent: () -> Boolean,
+    )
     // All mutation/retirement and final local-file/native property admission use the EXISTING gate.
     // The receipt helper itself performs no IO/callback and holds no lock across a native call.
     private val subtitleSelections = SubtitleSelectionAuthority()
@@ -712,6 +722,9 @@ class MpvPlayer private constructor(
     override fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean =
         synchronized(subtitleGenerationGate) { isSubtitleSelectionCurrentLocked(request) }
 
+    override fun isSubtitlePreparationCurrent(request: PlayerSubtitleSelection): Boolean =
+        synchronized(subtitleGenerationGate) { isSubtitleSelectionCurrentLocked(request) }
+
     private fun isSubtitleSelectionCurrentLocked(request: PlayerSubtitleSelection): Boolean =
         !released.get() && originalPlaybackOwner?.isActive == true && subtitleSelections.isCurrent(request) &&
             request.sourceContext == subtitleLoadGeneration.get()
@@ -748,6 +761,7 @@ class MpvPlayer private constructor(
         val opportunity = failureCoordinator.beginOpportunity()
         var mounted = false
         var owned: SubtitleAlignmentFile? = null
+        var ownedBytes: ByteArray? = null
         try {
             val selectedId = withContext(Dispatchers.IO) {
                 if (!isSubtitleSelectionCurrent(request) || !automaticSubtitleAlignment.isCurrent(attempt)) return@withContext null
@@ -758,11 +772,12 @@ class MpvPlayer private constructor(
                     catch (_: SecurityException) { null }
                     ?: return@withContext null
                 owned = file
+                val bytes = file.bytes
+                ownedBytes = bytes
                 currentCoroutineContext().ensureActive()
                 synchronized(subtitleGenerationGate) {
                     if (!isSubtitleSelectionCurrentLocked(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
-                        alignmentFiles.size >= 16) return@synchronized null
-                    alignmentFiles.add(file.file)
+                        !retainAlignmentFileLocked(file.file, bytes.size.toLong())) return@synchronized null
                     mounted = true
                     mpv.command(arrayOf("sub-add", file.file.absolutePath, "select"))
                     uniqueMpvExternalSubtitleId(mpv.getPropertyString(PROP_TRACK_LIST), file.file.absolutePath,
@@ -777,7 +792,7 @@ class MpvPlayer private constructor(
                 }
                 return result
             }
-            val originalBytes = owned?.bytes ?: return PlayerExternalSubtitleSelectionResult.FAILED
+            val originalBytes = ownedBytes ?: return PlayerExternalSubtitleSelectionResult.FAILED
             result = withContext(Dispatchers.IO) {
                 automaticSubtitleAlignment.alignMounted(attempt, originalBytes, language, selectedId,
                     cleanupScope = subtitleLoadScope,
@@ -797,6 +812,150 @@ class MpvPlayer private constructor(
                     EngineFallbackReason.SUBTITLE_RETIREMENT_UNCONFIRMED else null))
             // A mounted raw file remains the native fallback even when matching is unavailable.
             if (!mounted) owned?.file?.delete()
+        }
+    }
+
+    /**
+     * Mount only the producer's canonical cue SRT. The source URL is identity, never a fetch target here:
+     * acquisition, redirect policy, decoding and cue validation already belong to PlayerAddonSubtitleSource.
+     * The exact immutable snapshot and original engine/manual receipt must both survive every async boundary.
+     */
+    override suspend fun selectAddonSubtitle(
+        source: PlayerAddonSubtitleSource,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult {
+        if (!source.isCurrent()) return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val start = synchronized(subtitleGenerationGate) {
+            if (!isSubtitleSelectionCurrentLocked(request) || !source.isCurrent())
+                return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+            automaticSubtitleAlignment.begin(request)
+        }
+        start.second()
+        val attempt = start.first
+        val opportunity = failureCoordinator.beginOpportunity()
+        var result = PlayerExternalSubtitleSelectionResult.FAILED
+        var preparedFile: File? = null
+        var retained = false
+        try {
+            val prepared = withContext(Dispatchers.IO) {
+                currentCoroutineContext().ensureActive()
+                if (!isSubtitlePreparationCurrent(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
+                    !source.isCurrent()) return@withContext null
+                val identity = source.identityUrl
+                if (identity.isEmpty()) return@withContext null
+                val snapshot = source.snapshotIfCurrent() ?: return@withContext null
+                val canonical = try { snapshot.canonicalSrtBytes() }
+                    catch (_: RuntimeException) { return@withContext null }
+                if (canonical.size.toLong() !in 1L..MAX_EXTERNAL_SUBTITLE_BYTES ||
+                    !source.isCurrent() || !snapshot.isCurrent()) return@withContext null
+                val alignment = try { snapshot.alignmentSrtBytes() }
+                    catch (_: RuntimeException) { null }
+                val boundedAlignment = alignment?.takeIf { it.size in 1..SubtitleAlignmentFile.MAX_BYTES }
+                currentCoroutineContext().ensureActive()
+                if (!isSubtitlePreparationCurrent(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
+                    source.identityUrl != identity || !source.isCurrent() || !snapshot.isCurrent()) return@withContext null
+                val file = writeCanonicalAddonSubtitle(canonical) ?: return@withContext null
+                // Publish cleanup ownership before the next cancellation point. withContext has prompt
+                // cancellation on return, so the outer finally must see a file whose value is discarded.
+                preparedFile = file
+                currentCoroutineContext().ensureActive()
+                val stillCurrent = {
+                    source.identityUrl == identity && source.isCurrent() && snapshot.isCurrent()
+                }
+                if (!isSubtitlePreparationCurrent(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
+                    !stillCurrent()) return@withContext null
+                PreparedAddonSubtitle(file, canonical.size.toLong(), boundedAlignment, stillCurrent)
+            }
+            if (prepared == null) {
+                result = if (!isSubtitlePreparationCurrent(request) ||
+                    !automaticSubtitleAlignment.isCurrent(attempt) || !source.isCurrent()) {
+                    PlayerExternalSubtitleSelectionResult.SUPERSEDED
+                } else {
+                    PlayerExternalSubtitleSelectionResult.FAILED
+                }
+                return result
+            }
+            val selectedId = synchronized(subtitleGenerationGate) {
+                if (!isSubtitleSelectionCurrentLocked(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
+                    !prepared.stillCurrent() ||
+                    !retainAlignmentFileLocked(prepared.file, prepared.byteCount)) return@synchronized null
+                retained = true
+                mpv.command(arrayOf("sub-add", prepared.file.absolutePath, "select"))
+                uniqueMpvExternalSubtitleId(mpv.getPropertyString(PROP_TRACK_LIST), prepared.file.absolutePath,
+                    mpv.getPropertyInt(PROP_SID))
+            }
+            if (selectedId == null) {
+                result = if (!isSubtitlePreparationCurrent(request) ||
+                    !automaticSubtitleAlignment.isCurrent(attempt) || !prepared.stillCurrent()) {
+                    PlayerExternalSubtitleSelectionResult.SUPERSEDED
+                } else {
+                    PlayerExternalSubtitleSelectionResult.FAILED
+                }
+                return result
+            }
+            if (!isSubtitlePreparationCurrent(request) || !automaticSubtitleAlignment.isCurrent(attempt) ||
+                !prepared.stillCurrent()) {
+                result = PlayerExternalSubtitleSelectionResult.SUPERSEDED
+                return result
+            }
+            val originalSrt = prepared.alignmentBytes
+            if (originalSrt == null) {
+                result = PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
+                return result
+            }
+            result = withContext(Dispatchers.IO) {
+                automaticSubtitleAlignment.alignMounted(attempt, originalSrt, language, selectedId,
+                    cleanupScope = subtitleLoadScope,
+                    current = { isSubtitlePreparationCurrent(request) && prepared.stillCurrent() },
+                    openOriginal = {
+                        synchronized(subtitleGenerationGate) {
+                            if (!isSubtitleSelectionCurrentLocked(request) ||
+                                !automaticSubtitleAlignment.isCurrent(attempt) || !prepared.stillCurrent()) null
+                            else currentPlayingEntryID()?.let(mpv::openSubtitleReference)
+                        }
+                    })
+            }
+            return result
+        } finally {
+            if (result != PlayerExternalSubtitleSelectionResult.ALIGNED) automaticSubtitleAlignment.discard(attempt)
+            applyFailureResolution(failureCoordinator.completeOpportunity(opportunity,
+                if (result == PlayerExternalSubtitleSelectionResult.NEEDS_STOP)
+                    EngineFallbackReason.SUBTITLE_RETIREMENT_UNCONFIRMED else null))
+            // A file admitted to native may be in use even when selected-id proof failed. Retain it until
+            // mpv.destroy returns; only a never-admitted candidate is safe to unlink here.
+            if (!retained) preparedFile?.delete()
+        }
+    }
+
+    /** Call only under subtitleGenerationGate. Pure metadata accounting; performs no filesystem work. */
+    private fun retainAlignmentFileLocked(file: File, byteCount: Long): Boolean {
+        if (byteCount !in 1L..MAX_EXTERNAL_SUBTITLE_BYTES ||
+            alignmentFiles.size >= MAX_RETAINED_SUBTITLE_FILES ||
+            alignmentFileBytes > MAX_RETAINED_SUBTITLE_BYTES - byteCount) return false
+        alignmentFiles.add(file)
+        alignmentFileBytes += byteCount
+        return true
+    }
+
+    /** Unique private .srt owned by this player. The caller runs this only on Dispatchers.IO. */
+    private fun writeCanonicalAddonSubtitle(bytes: ByteArray): File? {
+        if (bytes.size.toLong() !in 1L..MAX_EXTERNAL_SUBTITLE_BYTES) return null
+        val target = try { File.createTempFile("vortx-addon-sub-", ".srt", appContext.cacheDir) }
+            catch (_: IOException) { return null }
+            catch (_: SecurityException) { return null }
+        var complete = false
+        try {
+            target.outputStream().use { it.write(bytes) }
+            if (!target.setReadOnly()) return null
+            complete = true
+            return target
+        } catch (_: IOException) {
+            return null
+        } catch (_: SecurityException) {
+            return null
+        } finally {
+            if (!complete) target.delete()
         }
     }
 
@@ -1432,8 +1591,15 @@ class MpvPlayer private constructor(
         mpv.removeObserver(observer)
         // Native destruction owns final cleanup of any still-attached surface. SurfaceHolder may deliver
         // surfaceDestroyed before or after this call; both paths are idempotent at the seam.
+        // Retained subtitle files are deliberately collected only AFTER destroy returns successfully.
+        // If native destruction throws, execution never reaches their unlink and native references win.
         mpv.destroy()
-        val retiredFiles = synchronized(subtitleGenerationGate) { alignmentFiles.toList().also { alignmentFiles.clear() } }
+        val retiredFiles = synchronized(subtitleGenerationGate) {
+            alignmentFiles.toList().also {
+                alignmentFiles.clear()
+                alignmentFileBytes = 0L
+            }
+        }
         retiredFiles.forEach { it.delete() }
         // A finished title must not leave a large on-disk cache behind (DiskCacheSetting's second owner
         // guardrail: the cache is wiped on a genuine playback exit). No-op when the disk cache is OFF.
@@ -1659,6 +1825,8 @@ class MpvPlayer private constructor(
         private const val MEMORY_RECOVERY_HEALTHY_MS = 30_000L
         private const val MEMORY_RECOVERY_SAMPLE_MS = 1_000L
         private const val MAX_EXTERNAL_SUBTITLE_BYTES = 8L * BYTES_PER_MIB
+        private const val MAX_RETAINED_SUBTITLE_FILES = 16
+        private const val MAX_RETAINED_SUBTITLE_BYTES = 32L * BYTES_PER_MIB
         private const val EXTERNAL_SUBTITLE_TIMEOUT_MS = 20_000
         private val SUBTITLE_EXTENSIONS = setOf("srt", "vtt", "ass", "ssa", "sub", "smi")
 

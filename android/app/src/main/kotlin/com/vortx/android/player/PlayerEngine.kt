@@ -108,6 +108,8 @@ interface PlayerEngine {
     fun beginSubtitleSelection(): PlayerSubtitleSelection? = null
     fun captureSubtitleSelection(): PlayerSubtitleSelection? = null
     fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean = false
+    /** Background preparation witness only; final commands still require the concrete engine gate. */
+    fun isSubtitlePreparationCurrent(request: PlayerSubtitleSelection): Boolean = false
     fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean = false
     fun addExternalSubtitle(url: String, request: PlayerSubtitleSelection): Boolean = false
 
@@ -118,6 +120,13 @@ interface PlayerEngine {
         request: PlayerSubtitleSelection,
     ): PlayerExternalSubtitleSelectionResult = if (addExternalSubtitle(url, request))
         PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT else PlayerExternalSubtitleSelectionResult.FAILED
+    /** Already-fetched installed add-on bytes. Unsupported engines must never refetch the identity URL. */
+    suspend fun selectAddonSubtitle(
+        source: PlayerAddonSubtitleSource,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult = PlayerExternalSubtitleSelectionResult.FAILED
+
     fun setSubtitleDelay(seconds: Double, request: PlayerSubtitleSelection): Boolean = false
 
     /// Mount and select the exact additional external subtitle file. Re-selecting a mounted file

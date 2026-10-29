@@ -125,7 +125,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private class PendingSidecar(val formatId: String, val original: PlayerSubtitleSelection)
     private var pendingSidecar: PendingSidecar? = null
     private var subtitleReleased = false
-    private var originalPlaybackOwner: PlaybackOwnerToken? = null
+    @Volatile private var originalPlaybackOwner: PlaybackOwnerToken? = null
 
     private var embeddedReference: Media3EmbeddedReferenceCapture? = null
     private var embeddedReferenceLoad: Any? = null
@@ -136,6 +136,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         val capture: Media3EmbeddedReferenceCapture,
         val sourceLoad: Any,
         val rawPresentation: SubtitleCuePresentation,
+        val requiresReferenceTimeline: Boolean = true,
+        val permitsUse: () -> Boolean = { true },
     ) {
         var presentation: SubtitleCuePresentation = rawPresentation
         var reference: Media3EmbeddedReferenceCapture.Snapshot? = null
@@ -150,7 +152,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             if (!ownsSubtitle(owned)) { retireOwnedSubtitle(); return }
             val reference = owned.reference
             val track = owned.referenceTrack
-            if (reference != null && (!owned.capture.isCurrent(reference) || track == null || !exactReferenceStillPresent(track))) {
+            if (reference != null && (!owned.capture.isCurrent(reference) || track == null ||
+                    !exactReferenceStillPresent(track) || !zeroOriginPrimaryPeriod(owned.sourceLoad))) {
                 owned.presentation = owned.rawPresentation
                 owned.reference = null
                 owned.referenceTrack = null
@@ -624,6 +627,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean =
         !subtitleReleased && originalPlaybackOwner?.isActive == true && Looper.myLooper() === player.applicationLooper && subtitleSelections.isCurrent(request)
 
+    // This reads only the published original owner and synchronized authority. No Player/Looper call
+    // is permitted from the guarded download/parser worker; this is not final mount admission.
+    override fun isSubtitlePreparationCurrent(request: PlayerSubtitleSelection): Boolean =
+        originalPlaybackOwner?.isActive == true && subtitleSelections.isCurrent(request)
+
     override fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean {
         if (!isSubtitleSelectionCurrent(request)) return false
         retireOwnedSubtitle()
@@ -712,14 +720,67 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         return PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
     }
 
+    override suspend fun selectAddonSubtitle(
+        source: PlayerAddonSubtitleSource,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult {
+        if (!isSubtitleSelectionCurrent(request) || !source.isCurrent())
+            return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val snapshot = source.snapshotIfCurrent() ?: return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val capture = embeddedReference ?: return PlayerExternalSubtitleSelectionResult.FAILED
+        val sourceLoad = embeddedReferenceLoad ?: return PlayerExternalSubtitleSelectionResult.FAILED
+        // The presentation is already bounded and parsed. There is no Media3 URL datasource, video
+        // remount, installed-origin permission expansion, or second file request at this boundary.
+        if (!isSubtitleSelectionCurrent(request) || !snapshot.isCurrent())
+            return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        retireOwnedSubtitle()
+        pendingSidecar = null
+        val owned = OwnedSubtitle(request, capture, sourceLoad, snapshot.presentation,
+            requiresReferenceTimeline = false, permitsUse = { snapshot.isCurrent() })
+        ownedSubtitle = owned
+        ownedSubtitleClock.reset()
+        playerView?.subtitleView?.visibility = View.INVISIBLE
+        ownedSubtitleView?.visibility = View.VISIBLE
+        applySubtitleStyle()
+        mainHandler.removeCallbacks(ownedSubtitleTicker)
+        ownedSubtitleTicker.run()
+        if (!ownsSubtitle(owned)) return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        // Only original authored SRT occurrences qualify for timing estimation. VTT/ASS and an
+        // unavailable embedded reference keep their ordinary local presentation on the same load.
+        val alignmentBytes = snapshot.alignmentSrtBytes()
+        if (alignmentBytes != null && zeroOriginPrimaryPeriod(sourceLoad)) {
+            alignmentJob = alignmentScope.launch {
+                while (ownsSubtitle(owned) && !capture.isComplete && !capture.isUnavailable) delay(250L)
+                if (!ownsSubtitle(owned) || capture.isUnavailable) return@launch
+                val reference = exactEmbeddedReference(capture, sourceLoad, language) ?: return@launch
+                val file = SubtitleAlignmentWork.align(alignmentBytes, reference.first.occurrences.map {
+                    SubtitleReferenceQuery.Timing(it.startUs / 1000L, it.endUs / 1000L)
+                }) ?: return@launch
+                val corrected = withContext(Dispatchers.Default) { SubtitleReferencePresentation.prepare(file) } ?: return@launch
+                if (!ownsSubtitle(owned) || !capture.isCurrent(reference.first) ||
+                    !exactReferenceStillPresent(reference.second) || !zeroOriginPrimaryPeriod(sourceLoad)) return@launch
+                owned.reference = reference.first
+                owned.referenceTrack = reference.second
+                owned.presentation = corrected
+                ownedSubtitleClock.reset()
+                mainHandler.removeCallbacks(ownedSubtitleTicker)
+                ownedSubtitleTicker.run()
+            }
+        }
+        return PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
+    }
+
     private fun ordinarySubtitle(url: String, request: PlayerSubtitleSelection): PlayerExternalSubtitleSelectionResult =
         if (addExternalSubtitle(url, request)) PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
         else if (isSubtitleSelectionCurrent(request)) PlayerExternalSubtitleSelectionResult.FAILED
         else PlayerExternalSubtitleSelectionResult.SUPERSEDED
 
     private fun ownsSubtitle(owned: OwnedSubtitle): Boolean = ownedSubtitle === owned &&
-        isSubtitleSelectionCurrent(owned.original) && embeddedReference === owned.capture &&
-        embeddedReferenceLoad === owned.sourceLoad && zeroOriginPrimaryPeriod(owned.sourceLoad)
+        isSubtitleSelectionCurrent(owned.original) && owned.permitsUse() && embeddedReference === owned.capture &&
+        embeddedReferenceLoad === owned.sourceLoad &&
+        (if (owned.requiresReferenceTimeline) zeroOriginPrimaryPeriod(owned.sourceLoad)
+         else player.currentMediaItem?.localConfiguration?.tag === owned.sourceLoad)
 
     private fun retireOwnedSubtitle() {
         alignmentJob?.cancel(); alignmentJob = null

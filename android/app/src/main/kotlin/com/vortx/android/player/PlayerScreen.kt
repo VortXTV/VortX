@@ -118,6 +118,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -257,9 +258,18 @@ fun PlayerScreen(
             ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         clearWindowBrightness(activity)
     }
+    var addonSubtitlePreparationJob by remember(outerPlaybackSessionId) { mutableStateOf<Job?>(null) }
+    var addonSubtitlePreparationCancelled by remember(outerPlaybackSessionId) { mutableStateOf<AtomicBoolean?>(null) }
+    fun cancelAddonSubtitlePreparation() {
+        addonSubtitlePreparationCancelled?.set(true)
+        addonSubtitlePreparationCancelled = null
+        addonSubtitlePreparationJob?.cancel()
+        addonSubtitlePreparationJob = null
+    }
     val preparePlayerExit = remember { AtomicReference<(() -> Unit)?>(null) }
     fun exitPlayer() {
         if (playerExitRequested) return
+        cancelAddonSubtitlePreparation()
         // Preserve/flush an owned receiver synchronously, before invalidating its original history gate.
         preparePlayerExit.get()?.invoke()
         playerExitRequested = true
@@ -747,6 +757,9 @@ fun PlayerScreen(
     // wraps this screen). Deliberately AFTER the orientation/immersive effect so the connecting frame is
     // already landscape + edge-to-edge.
     val engine = builtEngine
+    DisposableEffect(playbackSessionKey, engine) {
+        onDispose { cancelAddonSubtitlePreparation() }
+    }
     // One deadline per physical attempt, spanning null -> built publication. Key collection by the
     // actual engine so a replacement cannot consume a retained settled value from its predecessor.
     val startupWindow = remember(engineHolder, subtitleProfileRevision) { StartupCoverWindow(SystemClock.elapsedRealtime()) }
@@ -1013,6 +1026,7 @@ fun PlayerScreen(
     val pendingSourceSwitch = sourceSwitchState.pendingSwitch
     LaunchedEffect(pendingSourceSwitch?.authority) {
         val pending = pendingSourceSwitch ?: return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         val resolver = currentOnSwitchSource
         resolveAndApplyPlayerSourceSwitch(
             coordinator = sourceSwitchCoordinator,
@@ -1034,6 +1048,7 @@ fun PlayerScreen(
     LaunchedEffect(outerPlaybackSessionId, episodeHandoffRequest?.sequence) {
         val request = episodeHandoffRequest ?: return@LaunchedEffect
         if (playerExitRequested) return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
             sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, request.episode, authority, request.automatic)
@@ -1623,7 +1638,24 @@ fun PlayerScreen(
         permitsUse: () -> Boolean = { true }): Job? {
         if (!permitsUse() || !withCurrentSubtitleOwner { engine.isSubtitleSelectionCurrent(original) }) return null
         val timingAttempt = subtitleTiming.beginAlignment() ?: return null
-        return subtitlePoolScope.launch {
+        cancelAddonSubtitlePreparation()
+        val installedAddon = sub.originalInstalledBase != null
+        val syntheticPoolLocal = sub.originalInstalledBase == null && sub.id.startsWith("pool:")
+        if (!installedAddon && !syntheticPoolLocal) {
+            subtitleTiming.finishAlignment(timingAttempt, aligned = false)
+            return null
+        }
+        val originalOwner = if (installedAddon) originalPlaybackOwner ?: run {
+            subtitleTiming.finishAlignment(timingAttempt, aligned = false)
+            return null
+        } else null
+        val preparationCancelled = AtomicBoolean(false)
+        val preparationPermitsUse: () -> Boolean = if (installedAddon) {
+            { originalOwner!!.isActive && engine.isSubtitlePreparationCurrent(original) }
+        } else {
+            permitsUse
+        }
+        val preparation = subtitlePoolScope.launch(start = CoroutineStart.LAZY) {
             var aligned = false
             try {
                 val admitMount: ((() -> Boolean) -> Boolean) = { action ->
@@ -1636,23 +1668,51 @@ fun PlayerScreen(
                         }
                     }) return@launch
                 if (!permitsUse() || !engine.isSubtitleSelectionCurrent(original)) return@launch
-                val result = engine.selectExternalSubtitleAutomatically(sub.url, sub.lang, original)
+                val result = if (installedAddon) {
+                    if (!preparationPermitsUse()) return@launch
+                    val source = AddonSubtitleFileClient.fetch(
+                        sub,
+                        permitsUse = preparationPermitsUse,
+                        isCancelled = { preparationCancelled.get() },
+                    ) ?: return@launch
+                    currentCoroutineContext().ensureActive()
+                    if (preparationCancelled.get() || !preparationPermitsUse() ||
+                        !withCurrentSubtitleOwner {
+                            latestSubtitleEngine === engine && engine.isSubtitleSelectionCurrent(original)
+                        }) return@launch
+                    engine.selectAddonSubtitle(source, sub.lang, original)
+                } else {
+                    engine.selectExternalSubtitleAutomatically(sub.url, sub.lang, original)
+                }
                 currentCoroutineContext().ensureActive()
                 aligned = result == PlayerExternalSubtitleSelectionResult.ALIGNED &&
-                    permitsUse() &&
+                    !preparationCancelled.get() && preparationPermitsUse() &&
                     withCurrentSubtitleOwner { latestSubtitleEngine === engine && engine.isSubtitleSelectionCurrent(original) }
             } catch (cancelled: CancellationException) {
+                preparationCancelled.set(true)
                 throw cancelled
             } catch (_: Exception) {
-                // Errors stay silent; the engine owns any already-mounted requested-file fallback.
+                // Keep errors silent; a guarded installed-add-on fetch never falls back to its raw URL.
             } finally {
                 // Retrying only releases the exact older hold. A newer selection keeps its own hold.
-                if (subtitleTiming.finishAlignment(timingAttempt, aligned) && !aligned && permitsUse() &&
+                if (subtitleTiming.finishAlignment(timingAttempt, aligned) && !aligned &&
+                    !preparationCancelled.get() && preparationPermitsUse() &&
                     withCurrentSubtitleOwner { true }) {
                     subtitlePoolRetry += 1L
                 }
+                if (addonSubtitlePreparationCancelled === preparationCancelled) {
+                    addonSubtitlePreparationCancelled = null
+                    addonSubtitlePreparationJob = null
+                }
             }
         }
+        addonSubtitlePreparationCancelled = preparationCancelled
+        addonSubtitlePreparationJob = preparation
+        preparation.invokeOnCompletion { cause ->
+            if (cause is CancellationException) preparationCancelled.set(true)
+        }
+        preparation.start()
+        return preparation
     }
     LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, needsAutomaticPool,
         poolSignedIn, poolConsent, currentPoolEpoch, subtitlePoolRetry) {
@@ -1698,6 +1758,7 @@ fun PlayerScreen(
         cancelAutomaticPoolSelection()
         if (!replacingAutomatic && poolLoadingId != null &&
             poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) return
+        cancelAddonSubtitlePreparation()
         val original = engine.beginSubtitleSelection() ?: return
         showControls()
         trackSelectionPhases = trackSelectionPhases.holdSubtitle()
@@ -1846,6 +1907,7 @@ fun PlayerScreen(
         playbackIntent.setSourceTerminal(true)
         if (currentOnSwitchSource == null) return@LaunchedEffect
         val alternate = audioAlternates.next(sourceSwitchState.currentSource, sourceOptions) ?: return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
             sourceSwitchState = beginPlayerSourceSwitch(sourceSwitchState, alternate, authority, automatic = true)
         }
@@ -2464,6 +2526,7 @@ fun PlayerScreen(
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
                 cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 subtitleTiming.applyManualAccepted(adjustedPlayerDelay(subtitleDelaySeconds, delta),
                     engine.subtitleDelayAvailable, ::admitCurrentSubtitleEngine) manualDelay@{ seconds ->
@@ -2541,6 +2604,7 @@ fun PlayerScreen(
             },
             onSelectSubtitle = {
                 cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.selectSubtitleTrack(it)
@@ -2556,7 +2620,10 @@ fun PlayerScreen(
                 // Persist under Apple's key so the pick survives this title and rides the cross-device blob.
                 com.vortx.android.player.extras.AspectRatioSetting.setCurrent(context, mode)
             },
-            onErrorRetry = currentOnError,
+            onErrorRetry = {
+                cancelAddonSubtitlePreparation()
+                currentOnError()
+            },
             sourceOptions = if (currentOnSwitchSource != null) sourceOptions else emptyList(),
             qualityOptions = if (currentOnSwitchSource != null) qualityOptions else emptyList(),
             episodeOptions = if (currentOnSwitchEpisode != null) episodeOptions else emptyList(),
@@ -2568,6 +2635,7 @@ fun PlayerScreen(
             onRetryEpisode = {
                 sourceSwitchState.failedEpisode?.let { failed ->
                     if (currentOnSwitchEpisode != null) {
+                        cancelAddonSubtitlePreparation()
                         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                             sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, failed, authority)
@@ -2581,6 +2649,7 @@ fun PlayerScreen(
                     resolver != null &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
+                    cancelAddonSubtitlePreparation()
                     val replacement = requestPlayerSourceSwitch(sourceSwitchState, source, sourceSwitchCoordinator)
                     if (replacement !== sourceSwitchState) {
                         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
@@ -2597,6 +2666,7 @@ fun PlayerScreen(
                         currentRef.season == episode.season &&
                         currentRef.episode == episode.episode)
                 ) {
+                    cancelAddonSubtitlePreparation()
                     sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerEpisodeSwitch(
@@ -2636,6 +2706,7 @@ fun PlayerScreen(
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
                 cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.beginSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
@@ -2647,6 +2718,7 @@ fun PlayerScreen(
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
                 cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.setSecondarySubtitleTrack(id)
@@ -2674,6 +2746,7 @@ fun PlayerScreen(
                     mpvAvailable = MpvEngineFactory.isBundled,
                 )
                 if (effective != enginePreference) {
+                    cancelAddonSubtitlePreparation()
                     engineSwitchResumeMs[0] = latestState.positionMs.coerceAtLeast(0L)
                     enginePreference = effective
                 }

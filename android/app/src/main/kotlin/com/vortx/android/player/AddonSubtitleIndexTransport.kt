@@ -22,12 +22,24 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlin.coroutines.resume
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Bounded index GETs: private DNS is admitted only for the originally installed add-on origin. */
 internal object AddonSubtitleIndexTransport {
     internal data class Result(val status: Int, val finalIndexUri: String, val body: ByteArray?)
+    internal data class FileResult(
+        val status: Int,
+        val finalFileUri: String,
+        val contentType: String?,
+        val contentDisposition: String?,
+        val body: ByteArray?,
+    )
 
     fun deadlineAfterTimeout(): Long = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(TIMEOUT_MS.toLong())
 
@@ -65,15 +77,67 @@ internal object AddonSubtitleIndexTransport {
         return null
     }
 
-    private data class Hop(val status: Int, val location: String?, val body: ByteArray?)
+    /** Fetch one subtitle file under the installed manifest origin's private-address authority. */
+    suspend fun getFile(
+        endpoint: String,
+        originalInstalledBase: String,
+        deadline: Long,
+        permitsUse: () -> Boolean,
+        isCancelled: () -> Boolean,
+    ): FileResult? {
+        fun live() = runCatching { permitsUse() && !isCancelled() }.getOrDefault(false)
+        if (!live()) return null
+        val originalText = originalInstalledBase.trim()
+        if (originalText.toByteArray(Charsets.UTF_8).size > MAX_RESOURCE_URL_BYTES) return null
+        val original = originalText.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build() ?: return null
+        if (!isAllowed(original, original) || !sameRawLiteral(originalText, original)) return null
+        val initialText = endpoint.trim()
+        if (initialText.toByteArray(Charsets.UTF_8).size > MAX_RESOURCE_URL_BYTES) return null
+        var current = initialText.toHttpUrlOrNull()?.newBuilder()?.fragment(null)?.build() ?: return null
+        if (!sameRawLiteral(initialText, current) || !isAllowed(current, original)) return null
+        for (hop in 0..MAX_REDIRECTS) {
+            if (!live()) return null
+            val remainingNanos = deadline - System.nanoTime()
+            if (remainingNanos <= 0L) return null
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1L)
+            val response = execute(current, original, remainingMs, MAX_FILE_BYTES, ::live) ?: return null
+            if (!live() || System.nanoTime() >= deadline) return null
+            if (response.status in REDIRECTS) {
+                if (hop == MAX_REDIRECTS) return null
+                val location = response.location?.takeIf {
+                    it.isNotBlank() && it.none(::isControl) && it.toByteArray(Charsets.UTF_8).size <= MAX_RESOURCE_URL_BYTES
+                } ?: return null
+                val next = current.resolve(location) ?: return null
+                if (!sameRawLiteral(location, next) || !isAllowed(next, original) ||
+                    next.toString().toByteArray(Charsets.UTF_8).size > MAX_RESOURCE_URL_BYTES) return null
+                current = next
+                continue
+            }
+            return FileResult(response.status, current.toString(), response.contentType,
+                response.contentDisposition, response.body)
+        }
+        return null
+    }
 
-    private suspend fun execute(url: HttpUrl, original: HttpUrl, timeoutMs: Long): Hop? =
+    private data class Hop(
+        val status: Int, val location: String?, val body: ByteArray?,
+        val contentType: String? = null, val contentDisposition: String? = null,
+    )
+
+    private suspend fun execute(
+        url: HttpUrl, original: HttpUrl, timeoutMs: Long,
+        maxBytes: Int = MAX_RESPONSE_BYTES, live: () -> Boolean = { true },
+    ): Hop? =
         withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
             CALL_ADMISSION.acquire()
             var leaseTransferredToCall = false
             try {
                 suspendCancellableCoroutine<Hop?> { continuation ->
                     if (!continuation.isActive) return@suspendCancellableCoroutine
+                    if (!live()) {
+                        continuation.resume(null)
+                        return@suspendCancellableCoroutine
+                    }
                     val released = AtomicBoolean(false)
                     fun releaseLease() {
                         if (released.compareAndSet(false, true)) CALL_ADMISSION.release()
@@ -95,7 +159,15 @@ internal object AddonSubtitleIndexTransport {
                         .callTimeout(timeout, TimeUnit.MILLISECONDS)
                         .build()
                     val call = client.newCall(Request.Builder().url(url).get().build())
-                    continuation.invokeOnCancellation { call.cancel() }
+                    // Index callers keep their original behavior. Only selected file preparation has
+                    // an external owner witness to monitor while headers/body are blocked.
+                    val livenessWatcher = if (maxBytes == MAX_FILE_BYTES) CoroutineScope(continuation.context).launch(Dispatchers.Default) {
+                        while (isActive) {
+                            if (!live()) { call.cancel(); break }
+                            delay(LIVENESS_POLL_MS)
+                        }
+                    } else null
+                    continuation.invokeOnCancellation { livenessWatcher?.cancel(); call.cancel() }
                     // From here, the callback owns this permit until response-close/onFailure.
                     leaseTransferredToCall = true
                     try {
@@ -104,6 +176,7 @@ internal object AddonSubtitleIndexTransport {
                                 try {
                                     if (continuation.isActive) runCatching { continuation.resume(null) }
                                 } finally {
+                                    livenessWatcher?.cancel()
                                     releaseLease()
                                 }
                             }
@@ -114,17 +187,23 @@ internal object AddonSubtitleIndexTransport {
                                         val location = reply.header("Location")
                                         if (reply.code in REDIRECTS) Hop(reply.code, location, null)
                                         else if (reply.code !in 200..299) Hop(reply.code, null, null)
-                                        else Hop(reply.code, null, readBounded(reply))
+                                        else if (!live()) null else Hop(reply.code, null,
+                                            readBounded(reply, maxBytes, live),
+                                            reply.header("Content-Type"), reply.header("Content-Disposition"))
                                     }
                                 } catch (_: Exception) {
                                     null
                                 } finally {
+                                    // Structured watcher children must settle on success as well as
+                                    // failure, or withTimeout waits for them until its deadline.
+                                    livenessWatcher?.cancel()
                                     releaseLease()
                                 }
                                 if (continuation.isActive) runCatching { continuation.resume(result) }
                             }
                         })
                     } catch (_: Exception) {
+                        livenessWatcher?.cancel()
                         releaseLease()
                         if (continuation.isActive) runCatching { continuation.resume(null) }
                     }
@@ -135,20 +214,21 @@ internal object AddonSubtitleIndexTransport {
             }
         }
 
-    private fun readBounded(response: Response): ByteArray? {
+    private fun readBounded(response: Response, maxBytes: Int, live: () -> Boolean): ByteArray? {
         val body = response.body ?: return null
-        if (body.contentLength() > MAX_RESPONSE_BYTES) return null
+        if (body.contentLength() > maxBytes) return null
         return try {
             body.byteStream().use { input ->
                 val output = ByteArrayOutputStream()
                 val buffer = ByteArray(16 * 1024)
                 var total = 0
                 while (true) {
+                    if (!live()) return null
                     val count = input.read(buffer)
                     if (count < 0) break
                     if (count == 0) return null
                     total += count
-                    if (total > MAX_RESPONSE_BYTES) return null
+                    if (total > maxBytes) return null
                     output.write(buffer, 0, count)
                 }
                 output.toByteArray()
@@ -206,7 +286,9 @@ internal object AddonSubtitleIndexTransport {
 
     private const val TIMEOUT_MS = 15_000
     private const val MAX_RESPONSE_BYTES = 1024 * 1024
+    private const val MAX_FILE_BYTES = 8 * 1024 * 1024
     private const val MAX_RESOURCE_URL_BYTES = 128 * 1024
     private const val MAX_REDIRECTS = 5
+    private const val LIVENESS_POLL_MS = 100L
     private val REDIRECTS = setOf(301, 302, 303, 307, 308)
 }
