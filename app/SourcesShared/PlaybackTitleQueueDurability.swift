@@ -414,7 +414,17 @@ final class PlaybackTitleQueueDurability {
             state.certified = .bytes(intent.payload)
             state.pendingWrites = max(0, state.pendingWrites - 1)
             if state.pendingWrites == 0 { state.projected = .bytes(intent.payload) }
-            states[intent.key] = state
+            if state.pendingWrites == 0,
+               !activeAttachments.contains(intent.attachmentID),
+               !readyAttachments.values.contains(intent.key),
+               failedWrites[intent.key] == nil {
+                // The accepted save is complete, but its old UI no longer owns this partition.
+                // A returning attachment is still restoring behind these writes and reads disk afresh.
+                // Decide before eventSink: its synchronous callback may attach or detach another owner.
+                states.removeValue(forKey: intent.key)
+            } else {
+                states[intent.key] = state
+            }
             outstandingWrites = max(0, outstandingWrites - 1)
             let phase: PlaybackTitleQueuePersistencePhase =
                 state.pendingWrites == 0 ? .saved : .saving(state.pendingWrites)
