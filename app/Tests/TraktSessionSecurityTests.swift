@@ -1,12 +1,9 @@
-// Standalone adversarial tests for Trakt auth session identity and write leases.
-//
-// Run with:
-//   swiftc -D DEBUG -strict-concurrency=complete -warnings-as-errors -o /tmp/trakt-session-security \
-//     app/SourcesShared/CredentialScope.swift \
-//     app/SourcesShared/TraktScrobbleProgressPolicy.swift \
-//     app/SourcesShared/TraktAuth.swift \
-//     app/SourcesShared/VortXEdgeAuth.swift \
-//     app/Tests/TraktSessionSecurityTests.swift && /tmp/trakt-session-security
+// Shared adversarial Trakt-auth seams and the legacy standalone suite below.
+// Maintained native-integration route: bash scripts/test-native-oauth-intents.sh
+// That route extracts declarations before @main and runs its native-specific test entrypoints.
+// VortxNativeTraktIntentTests explicitly calls the seven decoded-body response checks.
+// It does not execute every assertion in this file's legacy standalone @main.
+// The former five-source /tmp compile recipe is obsolete; do not use it as test coverage.
 
 import Foundation
 
@@ -1455,6 +1452,72 @@ private func testTraktBrokerRedirectAndBounds() async -> (
         redirectDelegateRejected,
         declaredOversizedRejected,
         streamedOversizedRejected
+    )
+}
+
+/// URLProtocol delivers the body URLSession exposes to the caller. The encoded cases model an
+/// already-decoded Foundation response body while retaining the smaller wire Content-Length.
+func testTraktDecodedBodyLengthPolicy() async -> (
+    gzipAccepted: Bool,
+    brotliAccepted: Bool,
+    plainMismatchRefused: Bool,
+    identityMismatchRefused: Bool,
+    encodedDecodedOversizedRefused: Bool,
+    encodedDeclaredOversizedRefused: Bool,
+    malformedLengthRefused: Bool
+) {
+    let validBody = Data(#"{"session":"decoded-body-session","user_code":"decoded","verification_url":"https://trakt.tv/activate","expires_in":600,"interval":1}"#.utf8)
+
+    func accepted(_ encoding: String) async -> Bool {
+        FixtureURLProtocol.fixture.set(status: 200, body: validBody, headers: [
+            "Content-Encoding": encoding,
+            "Content-Length": "12"
+        ])
+        do {
+            let device = try await makeAuth(store: MemoryCredentials()).requestDeviceCode()
+            return device.session == "decoded-body-session"
+        } catch { return false }
+    }
+
+    func refused(_ body: Data, headers: [String: String]) async -> Bool {
+        FixtureURLProtocol.fixture.set(status: 200, body: body, headers: headers)
+        do {
+            _ = try await makeAuth(store: MemoryCredentials()).requestDeviceCode()
+            return false
+        } catch let error as TraktAuthError {
+            if case .transport = error { return true }
+            return false
+        } catch { return false }
+    }
+
+    let plainMismatchRefused = await refused(validBody, headers: [
+        "Content-Length": String(validBody.count + 1)
+    ])
+    let identityMismatchRefused = await refused(validBody, headers: [
+        "Content-Encoding": "identity",
+        "Content-Length": String(validBody.count + 1)
+    ])
+    let oversizedJSON = "{\"session\":\"oversize\",\"user_code\":\"decoded\",\"verification_url\":\"https://trakt.tv/activate\",\"expires_in\":600,\"interval\":1,\"padding\":\"" + String(repeating: "x", count: 64 * 1024) + "\"}"
+    let encodedDecodedOversizedRefused = await refused(Data(oversizedJSON.utf8), headers: [
+        "Content-Encoding": "gzip",
+        "Content-Length": "12"
+    ])
+    let encodedDeclaredOversizedRefused = await refused(validBody, headers: [
+        "Content-Encoding": "gzip",
+        "Content-Length": String(64 * 1024 + 1)
+    ])
+    let malformedLengthRefused = await refused(validBody, headers: [
+        "Content-Encoding": "br",
+        "Content-Length": "not-a-length"
+    ])
+    return (
+        await accepted("gzip"),
+        await accepted("br"),
+        plainMismatchRefused,
+        identityMismatchRefused,
+        encodedDecodedOversizedRefused,
+        encodedDeclaredOversizedRefused,
+        malformedLengthRefused
     )
 }
 
@@ -4889,6 +4952,21 @@ struct TraktSessionSecurityTestRunner {
                "Trakt rejects a declared broker response body larger than 64 KiB")
         expect(brokerBoundary.streamedOversizedRejected,
                "Trakt rejects an undeclared broker body larger than 64 KiB without logging its contents")
+        let decodedBodyPolicy = await testTraktDecodedBodyLengthPolicy()
+        expect(decodedBodyPolicy.gzipAccepted,
+               "Trakt accepts a decoded broker JSON body when gzip wire length differs from delivered bytes")
+        expect(decodedBodyPolicy.brotliAccepted,
+               "Trakt accepts a decoded broker JSON body when Brotli wire length differs from delivered bytes")
+        expect(decodedBodyPolicy.plainMismatchRefused,
+               "Trakt rejects a plain broker body whose declared Content-Length does not match delivered bytes")
+        expect(decodedBodyPolicy.identityMismatchRefused,
+               "Trakt rejects an identity-encoded broker body whose declared Content-Length does not match delivered bytes")
+        expect(decodedBodyPolicy.encodedDecodedOversizedRefused,
+               "Trakt rejects an encoded broker response whose delivered decoded body exceeds 64 KiB")
+        expect(decodedBodyPolicy.encodedDeclaredOversizedRefused,
+               "Trakt retains the declared broker body cap even when content coding is present")
+        expect(decodedBodyPolicy.malformedLengthRefused,
+               "Trakt rejects a malformed declared Content-Length even when content coding is present")
         expect(await testTraktStaleBrokerLoginResponse(),
                "cancelled and superseded Trakt login generations reject delayed and stale broker sessions")
         expect(await testTraktRevokeOwnerSwitchFence(),

@@ -1906,12 +1906,18 @@ actor TraktAuth {
             guard let http = response as? HTTPURLResponse else {
                 throw TraktAuthError.transport("The broker returned an invalid response.")
             }
+            // Content-Length describes encoded HTTP content. URLSession may deliver decoded bytes;
+            // comparing those lengths rejects a valid gzip/br response. Keep declared/streamed caps,
+            // but require exact delivered length only when no actual content coding was applied.
+            let contentCodings = (http.value(forHTTPHeaderField: "Content-Encoding") ?? "")
+                .split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            let hasContentCoding = contentCodings.contains { !$0.isEmpty && $0 != "identity" }
             let expectedLength: Int?
             if let raw = http.value(forHTTPHeaderField: "Content-Length") {
                 guard let length = Int(raw), length >= 0, length <= 64 * 1024 else {
                     throw TraktAuthError.transport("The broker response was invalid.")
                 }
-                expectedLength = length
+                expectedLength = hasContentCoding ? nil : length
             } else {
                 expectedLength = nil
             }
