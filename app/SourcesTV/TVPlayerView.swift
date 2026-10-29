@@ -490,6 +490,8 @@ struct TVPlayerView: View {
     @State private var addedPooledIDs: Set<Int> = []
     @State private var pooledSeededOffset = false
     @State private var embeddedUploadDone = false
+    @State private var embeddedContributionTask: Task<Void, Never>?
+    @State private var embeddedContributionLoad: SubtitlePoolClient.ContributionLoad?
     @State private var langContributeDone = false      // the container language-index contribute ran once this session
     @State private var offsetCaptureTask: Task<Void, Never>?
     /// Debounced persist of the manual subtitle offset (W2-B FIX 2). One write per nudge burst instead of one
@@ -1435,6 +1437,8 @@ struct TVPlayerView: View {
         }
         .onDisappear {
             invalidateWatchParty()
+            embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
+            embeddedContributionTask?.cancel(); embeddedContributionTask = nil
             invalidateSubtitleAlignmentPresentation()
             TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
             cancelEmptySourceRecovery()
@@ -4511,6 +4515,7 @@ struct TVPlayerView: View {
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         invalidateSubtitlePresentationForReplacement()
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         addedPooledIDs = []; embeddedUploadDone = false
         langContributeDone = false
     }
@@ -8412,6 +8417,8 @@ struct TVPlayerView: View {
     }
 
     private func invalidateSubtitlePresentationForReplacement() {
+        embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         invalidateSubtitleAlignmentPresentation()
         subtitlePresentationEpoch = UUID()
         subtitlePoolRequests.invalidate()
@@ -8477,7 +8484,7 @@ struct TVPlayerView: View {
                     // strict retirement reveals the already-selected requested raw subtitle.
                     applyCurrentSubtitleDelayIfReady(force: false)
                 }
-                hoardAddonSubtitle(sub)
+                // Optional donation waits for an owned selected-byte export; never re-fetch the URL.
             }
             if !automatic, let message = result.failureMessage { showEngineNote(message) }
             refreshTracksSoon()
@@ -8841,42 +8848,41 @@ struct TVPlayerView: View {
 
     /// P4: extract the file's own embedded TEXT subtitle tracks off-main and upload each to the pool so users
     /// on a different rip benefit. Best-effort, once per session, never blocks playback; ignores failures.
+    /// Donation has separate 64 MiB file / 128 MiB cumulative read / 8-second cooperative budgets.
+    /// It contributes only after complete EOF; larger or interrupted work is silently omitted.
     /// LOCAL FILES (finished downloads) ONLY: extraction demuxes the whole container, so on a streamed play it
     /// re-downloaded the entire file next to the player - the Apple TV "remux builds up frame drops and
     /// distorted audio" regression, stacking a further never-cancelled full-file read on every restart and
     /// episode switch. The extractor hard-refuses remote inputs too; checking here skips spawning the task.
     private func uploadEmbeddedSubtitlesIfNeeded() {
-        guard !embeddedUploadDone, let contentKey = communityContentKey else { return }
-        embeddedUploadDone = true
+        guard !embeddedUploadDone, playbackMutationTarget.stillOwnsCurrentContext(core: core),
+              let player = coordinator.player, let token = player.activeLoadToken,
+              let originalLoad = player.captureSubtitleContributionLoad(for: token),
+              let contentKey = communityContentKey,
+              let permit = SubtitlePoolClient.contributionPermit(contentKey: contentKey,
+                load: originalLoad) else { return }
         let inputStr = (curURL ?? url).absoluteString
         guard SubtitleEmbeddedExtractor.isLocalFileInput(inputStr) else { return }
+        embeddedUploadDone = true
         refreshSubFingerprint()
         let fp = subFingerprint
-        Task.detached(priority: .utility) {
-            let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
-            for track in tracks where track.cueCount > 0 {
-                await SubtitlePoolClient.upload(contentKey: contentKey, lang: track.lang, fingerprint: fp,
-                                                origin: "embedded", format: track.format, text: track.srt)
+        let cancellation = SubtitleEmbeddedExtractor.TimingWindowCancellation()
+        embeddedContributionTask?.cancel()
+        embeddedContributionLoad = originalLoad
+        embeddedContributionTask = Task.detached(priority: .utility) {
+            await withTaskCancellationHandler {
+                guard !Task.isCancelled, permit.isCurrent else { return }
+                let tracks = SubtitleEmbeddedExtractor.extractContributionText(input: inputStr,
+                    maximumTextBytes: permit.maximumTextBytes, cancellation: cancellation,
+                    permitsUse: { permit.isCurrent })
+                for track in tracks where track.cueCount > 0 {
+                    guard !Task.isCancelled, permit.isCurrent else { return }
+                    await SubtitlePoolClient.upload(contentKey: contentKey, lang: track.lang, fingerprint: fp,
+                        origin: "embedded", format: track.format, text: track.srt, permit: permit)
+                }
+            } onCancel: {
+                cancellation.cancel()
             }
-        }
-    }
-
-    /// Hoard a successfully-loaded ADD-ON subtitle into the community pool (origin "addon") so the next user
-    /// gets it without hitting the add-on. Best-effort, off-main, gated + size-capped + fail-soft inside
-    /// `SubtitlePoolClient.upload`; never blocks playback. The sub text is downloaded once from the add-on URL.
-    private func hoardAddonSubtitle(_ sub: AddonSubtitle) {
-        guard let contentKey = communityContentKey, let subURL = URL(string: sub.url) else { return }
-        refreshSubFingerprint()
-        let fp = subFingerprint
-        let lang = sub.lang
-        let ext = subURL.pathExtension.lowercased()
-        let format = ["srt", "vtt", "ass"].contains(ext) ? ext : "srt"
-        Task.detached(priority: .utility) {
-            guard let data = try? await URLSession.shared.data(from: subURL).0,
-                  let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-                  !text.isEmpty else { return }
-            await SubtitlePoolClient.upload(contentKey: contentKey, lang: lang, fingerprint: fp,
-                                            origin: "addon", format: format, text: text)
         }
     }
 
@@ -10095,6 +10101,7 @@ struct TVPlayerView: View {
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         invalidateSubtitlePresentationForReplacement()
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
         markedWatched = false
         autoAddedThisPlayback = false

@@ -164,6 +164,9 @@ protocol PlayerEngine: AnyObject {
     /// The logical request currently allowed to publish callbacks. nil means callbacks fail closed while
     /// the engine is between requests, was invalidated, or has stopped.
     var activeLoadToken: PlayerLoadToken? { get }
+    /// Optional sharing authority must come from this exact engine's loaded token/mount.
+    /// Unsupported engines fail closed; a UI-created lifetime is never load provenance.
+    func captureSubtitleContributionLoad(for token: PlayerLoadToken) -> SubtitlePoolClient.ContributionLoad?
     func invalidateLoadToken()
     /// Configure the SOURCE-timeline second at which the next logical load should begin. AVPlayer consumes
     /// this before a remux mount is constructed; engines without a remux-origin path use the no-op default.
@@ -272,6 +275,7 @@ protocol PlayerEngine: AnyObject {
 }
 
 extension PlayerEngine {
+    func captureSubtitleContributionLoad(for token: PlayerLoadToken) -> SubtitlePoolClient.ContributionLoad? { nil }
     /// Engines with cached inventories retain their existing per-type behavior. libmpv overrides
     /// this requirement to avoid walking its native track list twice in one chrome refresh.
     func audioAndSubtitleTracks() -> (audio: [MPVTrack], subtitles: [MPVTrack]) {

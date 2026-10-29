@@ -679,10 +679,46 @@ actor RemoteConfig {
     /// imperceptible while making the read/replace correct. Starts baked so a read before bootstrap is
     /// shipping-correct.
     nonisolated(unsafe) private static var _snapshot: ResolvedConfig = .baked
+    nonisolated(unsafe) private static var subtitleContributionRevision: UInt64 = 0
     private static let snapshotLock = NSLock()
     static var snapshot: ResolvedConfig {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
         return _snapshot
+    }
+    struct SubtitleContributionConfiguration: Sendable {
+        let revision: UInt64
+        let maximumTextBytes: Int
+        let baseURL: URL
+    }
+
+    static func subtitleContributionConfiguration() -> SubtitleContributionConfiguration? {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
+        guard subtitleContributionEnabled(_snapshot) else { return nil }
+        let maximum = min(1_048_576, _snapshot.subtitleUploadMaxBytes)
+        guard maximum > 0 else { return nil }
+        return .init(revision: subtitleContributionRevision, maximumTextBytes: maximum,
+            baseURL: _snapshot.endpoint("subtitles") ?? URL(string: RemoteConfigDefaults.endpointSubtitles)!)
+    }
+
+    static func subtitleContributionIsCurrent(_ revision: UInt64) -> Bool {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
+        return subtitleContributionRevision == revision && subtitleContributionEnabled(_snapshot)
+    }
+
+    /// Fixed prepared-task admission. No callback, cancellation, continuation or actor wait under locks.
+    /// Lock order: request -> load lifetime -> config -> lifecycle -> credential -> profile.
+    static func resumeSubtitleContributionTask(_ task: URLSessionTask, revision: UInt64,
+        lifecycle: SourceIndexLifecycleSnapshot, credential: CredentialScopeRegistry.Capture,
+        applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
+        guard subtitleContributionRevision == revision, subtitleContributionEnabled(_snapshot) else { return .stale }
+        return SourceIndexLifecycleClock.resumeContributionTask(task, ifCurrent: lifecycle,
+            credential: credential, applicationEpoch: applicationEpoch)
+    }
+
+    private static func subtitleContributionEnabled(_ config: ResolvedConfig) -> Bool {
+        config.isFeatureOn("communitySubtitles", default: RemoteConfigDefaults.featureCommunitySubtitles) &&
+            config.isFeatureOn("subtitleUpload", default: true) && config.subtitleUploadMaxBytes > 0
     }
     private struct SourceIndexInstallEvent {
         let oldValue: Bool
@@ -700,6 +736,13 @@ actor RemoteConfig {
         let newValue = resolved.isFeatureOn(
             "sourceIndex", default: RemoteConfigDefaults.featureSourceIndex
         )
+        if _snapshot.isFeatureOn("communitySubtitles", default: RemoteConfigDefaults.featureCommunitySubtitles) !=
+                resolved.isFeatureOn("communitySubtitles", default: RemoteConfigDefaults.featureCommunitySubtitles) ||
+            _snapshot.isFeatureOn("subtitleUpload", default: true) != resolved.isFeatureOn("subtitleUpload", default: true) ||
+            _snapshot.subtitleUploadMaxBytes != resolved.subtitleUploadMaxBytes ||
+            _snapshot.endpoint("subtitles") != resolved.endpoint("subtitles") {
+            subtitleContributionRevision &+= 1
+        }
         _snapshot = resolved
         snapshotLock.unlock()
         let transition = oldValue && !newValue ? SourceIndexLifecycleClock.closeSource() : nil

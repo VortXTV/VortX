@@ -592,6 +592,7 @@ private final class MPVNativeState: Sendable {
     struct State: Sendable {
         var context: MPVNativeHandle?
         var loadProvenance = PlayerLoadProvenanceState()
+        var contributionLoad: SubtitlePoolClient.ContributionLoad?
         var initializationFailure = MPVInitializationFailureState<PlayerLoadToken>()
         var requestedFreshOrigin: Double?
         var requestedFreshOriginGeneration: UInt64 = 0
@@ -644,10 +645,31 @@ private final class MPVNativeState: Sendable {
 
     func takeContext() -> MPVNativeHandle? {
         transaction.lock(); defer { transaction.unlock() }
+        retireContributionLoad()
         return storage.withLock { state in
             defer { state.context = nil }
             return state.context
         }
+    }
+
+    /// Engine transaction -> contribution scope; no native operation or cancellation under the scope lock.
+    func retireContributionLoad(ifToken token: PlayerLoadToken? = nil,
+                                ifContext expectedContext: MPVNativeHandle? = nil) {
+        transaction.lock(); defer { transaction.unlock() }
+        // Context publication uses this same transaction. A stale borrowed handle must never
+        // retire a successor scope, even if native playlist-entry IDs are reused by a new context.
+        if let expectedContext, !storage.withLock({ $0.context === expectedContext }) { return }
+        let original = storage.withLock { $0.contributionLoad }
+        if let token, original?.token != token { return }
+        original?.retire()
+        storage.withLock { $0.contributionLoad = nil }
+    }
+
+    func publishContributionLoad(for token: PlayerLoadToken) {
+        transaction.lock(); defer { transaction.unlock() }
+        retireContributionLoad()
+        let fresh = SubtitlePoolClient.ContributionLoad(token: token)
+        storage.withLock { $0.contributionLoad = fresh }
     }
 }
 
@@ -899,6 +921,15 @@ final class MPVMetalViewController: PlatformViewController {
     nonisolated var activeLoadToken: PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return loadProvenance.activeToken ?? initializationFailure.activeToken
+    }
+
+    nonisolated func captureSubtitleContributionLoad(for token: PlayerLoadToken) -> SubtitlePoolClient.ContributionLoad? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard nativeContext?.isRetired == false,
+              loadProvenance.callbackToken(requiresLoadedFile: true) == token,
+              let original = native.read({ $0.contributionLoad }),
+              original.token == token, original.isCurrent else { return nil }
+        return original
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
     private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
@@ -1515,6 +1546,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setupMpv() {
+        native.retireContributionLoad()
         sessionAudioPreset = PlayerSessionAudioPresetState()
         // The in-hero trailer preview (#44) is silent, so it must NOT claim the `.playback` audio
         // session: doing so would interrupt other audio and fight the main player's session. Only the
@@ -2052,6 +2084,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func invalidateLoadToken() {
+        native.retireContributionLoad()
         retireSubtitleAlignment()
         retirePendingTrailerPreparation(invalidateNativeLease: true)
         finishCacheFlushFlight(cacheFlushFlight.reset())
@@ -2206,6 +2239,8 @@ final class MPVMetalViewController: PlatformViewController {
         audioSidecar: URL? = nil,
         reusing loadToken: PlayerLoadToken? = nil
     ) -> PlayerLoadToken {
+        // Optional sharing fails closed on intent, even if the old primary load is later retained.
+        native.retireContributionLoad()
         // A deferred trailer preparation is already a new intent, before its native load can start.
         retireSubtitleAlignment()
         let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
@@ -2250,6 +2285,8 @@ final class MPVMetalViewController: PlatformViewController {
         preparedTrailer: VXTrailerPreparedURLs? = nil,
         preissuedToken: PlayerLoadToken? = nil
     ) -> PlayerLoadToken {
+        // Covers internal reloads and the asynchronous trailer continuation as well as UI loads.
+        native.retireContributionLoad()
         // Even a retry/rejected replacement retires work prepared before this new load intent.
         retireSubtitleAlignment()
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
@@ -2567,6 +2604,9 @@ final class MPVMetalViewController: PlatformViewController {
             entryID: entryID,
             token: issuedToken
         )
+        if loadProvenance.activeToken == issuedToken {
+            native.publishContributionLoad(for: issuedToken)
+        }
         if commandResult >= 0 {
             seekSettlement.reset(owner: issuedToken)
             nativeSeekDiagnostics.reset(owner: issuedToken)
@@ -6373,6 +6413,11 @@ final class MPVMetalViewController: PlatformViewController {
                 // Command admission and dequeue share this boundary; queued main callbacks carry
                 // immutable evidence instead of adopting a newer transport generation.
                 self.loadTokenLock.lock()
+                guard !context.isRetired, self.nativeContext === context else {
+                    self.loadTokenLock.unlock()
+                    previewRelay?.retire()
+                    break
+                }
                 let event = mpv_wait_event(handle, 0)
                 let rawSeekOwner = self.loadProvenance.callbackToken(requiresLoadedFile: true)
                 let eventID = event?.pointee.event_id
@@ -6405,6 +6450,18 @@ final class MPVMetalViewController: PlatformViewController {
                     }
                 }
                 let rawTerminalOwner = eventID == MPV_EVENT_END_FILE ? self.loadProvenance.activeToken : nil
+                if eventID == MPV_EVENT_END_FILE, let data = event?.pointee.data {
+                    let terminal = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
+                    if terminal.reason != MPV_END_FILE_REASON_REDIRECT,
+                       let token = self.loadProvenance.token(forEntryID: terminal.playlist_entry_id),
+                       token == rawTerminalOwner {
+                        // Sharing ends at the owned native terminal receipt, before later UI handling.
+                        // This does not change EOF/seek/history state or stop playback.
+                        self.native.retireContributionLoad(ifToken: token, ifContext: context)
+                    }
+                } else if eventID == MPV_EVENT_SHUTDOWN {
+                    self.native.retireContributionLoad(ifContext: context)
+                }
                 let rawTerminalSeekEvidence = rawTerminalOwner.map {
                     self.seekSettlement.evidence(owner: $0, seeking: nil, eofReached: nil)
                 }
@@ -6435,6 +6492,7 @@ final class MPVMetalViewController: PlatformViewController {
                     cacheSeconds: snapshot.cacheDuration, forwardBytes: snapshot.forwardBytes)) {
                     // Fence admission and the stop command against source replacement. Stop is
                     // a failure containment, not EOF; destruction remains owned by normal stop().
+                    self.native.retireContributionLoad(ifToken: owner, ifContext: context)
                     let status = mpv_command_string(handle, "stop")
                     containedPreview = (owner, status)
                 }

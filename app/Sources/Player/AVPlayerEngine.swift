@@ -481,6 +481,48 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// old watchdog callback is unable to touch the newer item.
     var currentItemGeneration: UInt64 { itemGeneration }
     private(set) var activeLoadToken: PlayerLoadToken?
+    private var contributionLoad: SubtitlePoolClient.ContributionLoad?
+    private var contributionItemGeneration: UInt64?
+
+    func captureSubtitleContributionLoad(for token: PlayerLoadToken) -> SubtitlePoolClient.ContributionLoad? {
+        guard !fatalErrorEmitted, !terminalLatch.hasEmitted,
+              activeLoadToken == token, let item, player.currentItem === item,
+              contributionItemGeneration == itemGeneration,
+              let original = contributionLoad, original.token == token, original.isCurrent else { return nil }
+        return original
+    }
+
+    private func retireSubtitleContributionLoad() {
+        contributionLoad?.retire()
+        contributionLoad = nil; contributionItemGeneration = nil
+    }
+
+    private func advanceContributionItemGeneration() {
+        retireSubtitleContributionLoad()
+        itemGeneration &+= 1
+    }
+
+    private func replaceContributionPlayerItem(with replacement: AVPlayerItem?) {
+        retireSubtitleContributionLoad()
+        player.replaceCurrentItem(with: replacement)
+    }
+
+    private func publishSubtitleContributionLoad(for token: PlayerLoadToken) {
+        guard !fatalErrorEmitted, !terminalLatch.hasEmitted,
+              activeLoadToken == token, let item, player.currentItem === item else { return }
+        retireSubtitleContributionLoad()
+        contributionLoad = .init(token: token)
+        contributionItemGeneration = itemGeneration
+    }
+
+    /// Called only after the branch's existing owned recovery/defer decisions accept a terminal.
+    /// No callback or await occurs between latch admission and irrevocable sharing retirement.
+    private func claimTerminalAndRetireContribution(generation: UInt64) -> Bool {
+        guard generation == itemGeneration,
+              terminalLatch.claim(generation: generation) else { return false }
+        retireSubtitleContributionLoad()
+        return true
+    }
     /// Newest-wins ownership for asynchronous local-HLS seeks. A later scrub/D-pad input invalidates every
     /// older task and completion callback, even when they target the same AVPlayerItem generation.
     private var seekRequestGeneration: UInt64 = 0
@@ -1164,6 +1206,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // MARK: Loading + transport
 
     func invalidateLoadToken() {
+        retireSubtitleContributionLoad()
         retireSubtitleAlignment()
         replacementReadyDeadlineTask?.cancel()
         replacementReadyDeadlineTask = nil
@@ -1248,6 +1291,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func emitUnfinishedSeekFailure(sourceSeconds: Double, loadToken: PlayerLoadToken) {
         guard loadToken == activeLoadToken else { return }
         seekDestination.record(sourceSeconds: sourceSeconds, ownership: seekDestinationOwnership)
+        // Optional sharing fails closed at this owned error; preserve the seek-scoped, nonlatching
+        // delivery so a newer seek can still recover without changing playback terminal policy.
+        retireSubtitleContributionLoad()
         emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.",
              loadToken: loadToken, seekRequestID: seekRequestGeneration)
     }
@@ -1355,6 +1401,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        // Optional donation is retired on intent, including a refused or same-token remount.
+        retireSubtitleContributionLoad()
         // A same-logical-token remount still retires preparation made against the previous mount.
         retireSubtitleAlignment()
         let carriedSeekTarget = pendingRequestedSourcePositionSeconds
@@ -1426,7 +1474,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             return existingToken
         }
         let issuedToken = loadToken ?? PlayerLoadToken()
-        itemGeneration &+= 1
+        advanceContributionItemGeneration()
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         deferredEventOwnedRecovery = nil
@@ -1467,7 +1515,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // the direct replacement. This preserves AVKit's PiP session without weakening the guarded attach.
         player.pause()
         if pictureInPictureReplacement.clearsCurrentItemBeforeAttach {
-            player.replaceCurrentItem(with: nil)
+            replaceContributionPlayerItem(with: nil)
         }
         item = nil
         videoOutput = nil
@@ -1740,7 +1788,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
         DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
         VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
-        guard terminalLatch.claim(generation: generation) else { return }
+        guard claimTerminalAndRetireContribution(generation: generation) else { return }
         fatalErrorEmitted = true
         emit(MPVProperty.endFileError,
              wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable",
@@ -1847,9 +1895,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
         videoOutput = output
         guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
-        player.replaceCurrentItem(with: newItem)
+        replaceContributionPlayerItem(with: newItem)
         guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
               player.currentItem === newItem else { return }
+        publishSubtitleContributionLoad(for: loadToken)
         nativePreflightState.didAttach(
             generation: generation, uptime: ProcessInfo.processInfo.systemUptime)
         observe(newItem, loadToken: loadToken)
@@ -2335,7 +2384,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         retireSubtitleAlignment()
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
-        itemGeneration &+= 1
+        advanceContributionItemGeneration()
         midPlaybackRecoveryBudget.reset(for: playbackMountIdentity)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
@@ -2379,7 +2428,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
         #endif
 
-        player.replaceCurrentItem(with: freshItem)
+        replaceContributionPlayerItem(with: freshItem)
+        publishSubtitleContributionLoad(for: loadToken)
         armReplacementReadyDeadline(for: freshItem, loadToken: loadToken)
         observe(freshItem, loadToken: loadToken)
         if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
@@ -2439,7 +2489,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         disableExternalSubtitle(discardingCues: false)
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: playlistURL))
-        itemGeneration &+= 1
+        advanceContributionItemGeneration()
         mountDVPictureProof.beginItem(
             mountIdentity: playbackMountIdentity,
             itemGeneration: itemGeneration)
@@ -2467,7 +2517,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         ])
         freshItem.add(output)
         videoOutput = output
-        player.replaceCurrentItem(with: freshItem)
+        replaceContributionPlayerItem(with: freshItem)
+        publishSubtitleContributionLoad(for: loadToken)
         armReplacementReadyDeadline(for: freshItem, loadToken: loadToken)
         observe(freshItem, loadToken: loadToken)
         if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
@@ -3314,7 +3365,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         resumeConfiguration.reset()
         currentLoadResumeOrigin = 0
         remuxTimelineOrigin = 0
-        itemGeneration &+= 1
+        advanceContributionItemGeneration()
         mountDVPictureProof = DVPlaybackPolicy.MountDVPictureProof()
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
@@ -3337,7 +3388,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         #endif
         disableExternalSubtitle(discardingCues: true)   // full teardown: nothing survives the session
         player.pause()
-        player.replaceCurrentItem(with: nil)
+        replaceContributionPlayerItem(with: nil)
         videoOutput = nil
         item = nil
         playbackRequested = false
@@ -5159,7 +5210,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             reason: "local remux startup timeout") {
             return
         }
-        guard terminalLatch.claim(generation: itemGeneration) else { return }
+        guard claimTerminalAndRetireContribution(generation: itemGeneration) else { return }
         fatalErrorEmitted = true
         DiagnosticsLog.log(
             "dv", "HLS mount-to-ready deadline expired -> endFileError demote")
@@ -5454,7 +5505,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 VXProbe.log(
                     "dv",
                     "AVPlayer item .failed -> terminal recovery: \(terminalMessage)")
-                guard self.terminalLatch.claim(generation: self.itemGeneration) else { return }
+                guard self.claimTerminalAndRetireContribution(generation: self.itemGeneration) else { return }
                 self.fatalErrorEmitted = true
                 self.emit(
                     MPVProperty.endFileError,
@@ -5557,7 +5608,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             )
         } else {
             guard !fatalErrorEmitted else { return }
-            guard terminalLatch.claim(generation: itemGeneration) else { return }
+            guard claimTerminalAndRetireContribution(generation: itemGeneration) else { return }
             fatalErrorEmitted = true
             DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable and the remux lane is off -> demoting to libmpv HDR10")
             VXProbe.log("dv", "native DV \(fourcc) -> libmpv HDR10 (remux lane off)")
@@ -5621,7 +5672,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // window, and the [dv] trail is triage-critical, so the watchdog must never log a demote claim for
         // a fallback that .failed actually caused.
         guard !fatalErrorEmitted else { return }
-        guard terminalLatch.claim(generation: itemGeneration) else { return }
+        guard claimTerminalAndRetireContribution(generation: itemGeneration) else { return }
         fatalErrorEmitted = true
         let size = item?.presentationSize ?? .zero
         DiagnosticsLog.log("dv", "audio-over-black watchdog: \(Int(audioOverBlackWindowSeconds))s of advancing clock with ZERO video frames (presentationSize=\(Int(size.width))x\(Int(size.height)) pos=\(Int(position))s) -> endFileError demote to libmpv HDR10")
@@ -5753,7 +5804,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                                  loadToken: PlayerLoadToken,
                                  generation: UInt64) {
         guard generation == itemGeneration,
-              terminalLatch.claim(generation: generation) else { return }
+              claimTerminalAndRetireContribution(generation: generation) else { return }
         switch terminal {
         case .eof:
             VXProbe.event("player", "endfile eof")
@@ -5820,7 +5871,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                   self.owns(failedItem, loadToken: loadToken),
                   !self.fatalErrorEmitted else { return }
             let terminalMessage = self.remuxHLSServer?.terminalFailureReason ?? message
-            guard self.terminalLatch.claim(generation: self.itemGeneration) else { return }
+            guard self.claimTerminalAndRetireContribution(generation: self.itemGeneration) else { return }
             self.fatalErrorEmitted = true
             VXProbe.event("player", "endfile error \(terminalMessage)")
             self.emit(
@@ -6013,7 +6064,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                             mountIdentity: selectionMountIdentity
                           ),
                           !fatalErrorEmitted else { return }
-                    guard terminalLatch.claim(generation: itemGeneration) else { return }
+                    guard claimTerminalAndRetireContribution(generation: itemGeneration) else { return }
                     fatalErrorEmitted = true
                     DiagnosticsLog.log(
                         "avplayer",
@@ -6280,6 +6331,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     isolated deinit {
+        retireSubtitleContributionLoad()
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
         retireSubtitleAlignment(revealRequestedFile: false)
         pipDelegate?.retire()

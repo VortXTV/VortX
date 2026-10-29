@@ -34,6 +34,21 @@ enum SourceIndexLifecycleClock {
         }
     }
 
+    /// Linearize a prepared subtitle contribution against consent/session retirement.
+    /// Only task.resume executes below request -> load lifetime -> config -> lifecycle -> credential -> profile.
+    static func resumeContributionTask(_ task: URLSessionTask, ifCurrent original: SourceIndexLifecycleSnapshot,
+                                      credential: CredentialScopeRegistry.Capture,
+                                      applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        lock.withLock {
+            guard sourceGeneration == original.sourceGeneration,
+                  sessionGeneration == original.sessionGeneration,
+                  consentGeneration == original.consentGeneration,
+                  MoatConsent.contributeAndConsume else { return .stale }
+            return CredentialScopeRegistry.shared.resumeContributionTask(task, ifCurrent: credential,
+                                                                         applicationEpoch: applicationEpoch)
+        }
+    }
+
     /// Retire all current Source Index work while leaving the shared moat authorization untouched.
     static func closeSource() -> SourceIndexLifecycleTransition {
         advance(session: false, consent: false)
