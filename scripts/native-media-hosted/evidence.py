@@ -2833,6 +2833,52 @@ DOVI_OUTPUT = 'apple-dovi-builds.json'
 DOVI_VENDOR_OUTPUT = 'apple-dovi-vendor-crates.tar'
 DOVI_LIMIT = 128 * 1024**2
 DOVI_SANDBOX_PROFILE = '(version 1)\n(allow default)\n(deny network*)\n(deny file-write* (subpath (param "SOURCE")) (subpath (param "VENDOR")) (subpath (param "TOOLCHAIN")))\n'
+DOVI_LIBRARY_SANDBOX_PROFILE = '(version 1)\n(allow default)\n(deny network*)\n(deny file-write* (subpath (param "SOURCE")))\n(deny file-write* (subpath (param "VENDOR")))\n(deny file-write* (subpath (param "TOOLCHAIN")))\n(deny file-write* (subpath (param "CARGO_C")))\n(deny file-write* (subpath (param "INPUTS")))\n(deny file-write* (subpath (param "WORK_SOURCES")))\n(deny file-write* (subpath (param "CANONICAL_WRAPPER")))\n(deny file-write* (subpath (param "CANONICAL_DOVI")))\n(deny file-write* (subpath (param "REGISTERED_DOVI")))\n(deny file-write* (subpath (param "PROTECTED_00")))\n(deny file-write* (subpath (param "PROTECTED_01")))\n(deny file-write* (subpath (param "PROTECTED_02")))\n(deny file-write* (subpath (param "PROTECTED_03")))\n(deny file-write* (subpath (param "PROTECTED_04")))\n(deny file-write* (subpath (param "PROTECTED_05")))\n(deny file-write* (subpath (param "PROTECTED_06")))\n(deny file-write* (subpath (param "PROTECTED_07")))\n(deny file-write* (subpath (param "PROTECTED_08")))\n(deny file-write* (subpath (param "PROTECTED_09")))\n(deny file-write* (subpath (param "PROTECTED_10")))\n(deny file-write* (subpath (param "SDK_00")))\n(deny file-write* (subpath (param "SDK_01")))\n(deny file-write* (subpath (param "SDK_02")))\n(deny file-write* (subpath (param "SDK_03")))\n(deny file-write* (subpath (param "SDK_04")))\n(deny file-write* (literal (param "WORK")))\n(deny file-write* (literal (param "APPLE_AR")))\n(deny file-write* (literal (param "APPLE_CLANG")))\n(deny file-write* (literal (param "HOST_CLANGXX")))\n(deny file-write* (literal (param "HOST_CMAKE")))\n(deny file-write* (literal (param "HOST_MAKE")))\n(deny file-write* (literal (param "HOST_PERL")))\n(deny file-write* (literal (param "HOST_RANLIB")))\n'
+
+def dovi_library_bindings(work, pins):
+    """Portable deterministic readonly provider parameters; no filesystem reads."""
+    work = dv_path(str(work), True)
+    source = work / "dist" / DOVI_SOURCE_ROOT
+    dv_need(pins.get("vendorRoot") == str(work / "dist/dovi-inputs/vendor")
+            and pins.get("cargoCRoot") == str(work / "dist/dovi-inputs/cargo-c-install"), "fixed library readonly provider roots")
+    rows = [("WORK", work), ("SOURCE", source),
+            ("VENDOR", dv_path(pins["vendorRoot"], True)),
+            ("TOOLCHAIN", dv_path(pins["toolchainRoot"], True)),
+            ("CARGO_C", dv_path(pins["cargoCRoot"], True)),
+            ("INPUTS", work / "dist/dovi-inputs"), ("WORK_SOURCES", work / "Sources")]
+    if "localSourceProviderReceipt" in pins:
+        receipt = pins["localSourceProviderReceipt"]
+        dv_need(type(receipt) is dict and receipt.get("scope") == "root-local-dovi-git-provider-v1"
+                and work.parent.name == "MPVKit" and work.parent.parent.name == ".worktrees",
+                "fixed registered local canonical-source derivation")
+        workspace = work.parent.parent.parent
+        rows += [("CANONICAL_WRAPPER", workspace / "MPVKit"), ("CANONICAL_DOVI", workspace / "dovi-tool"),
+                 ("REGISTERED_DOVI", workspace / ".worktrees/dovi-tool/beta/libdovi-3.4.0-d1abe0e2")]
+    else:
+        # Hosted genuine-Git mode has no Root-local registered-provider aliases.
+        rows += [("CANONICAL_WRAPPER", work / ".git"), ("CANONICAL_DOVI", source), ("REGISTERED_DOVI", source)]
+    protected = ("gmp", "gnutls", "libbluray", "libfreetype", "libfribidi", "libharfbuzz", "libunibreak", "nettle", "openssl", "libshaderc", "vulkan")
+    rows += [("PROTECTED_" + str(i).zfill(2), work / "dist" / name) for i, name in enumerate(protected)]
+    sdks = pins.get("sdks")
+    dv_need(type(sdks) is dict and set(sdks) == {"appletvos", "appletvsimulator", "iphoneos", "iphonesimulator", "macosx"}, "all five readonly SDK providers")
+    rows += [("SDK_" + str(i).zfill(2), dv_path(sdks[name]["resolvedRoot"], True)) for i, name in enumerate(sorted(sdks))]
+    apple, host = pins.get("appleTools"), pins.get("hostNativeTools")
+    dv_need(type(apple) is dict and set(apple) == {"ar", "clang"}
+            and type(host) is dict and set(host) == {"clangxx", "cmake", "make", "perl", "ranlib"}, "exact readonly Apple/host tools")
+    rows += [("APPLE_" + name.upper(), dv_path(apple[name]["path"], True)) for name in sorted(apple)]
+    rows += [("HOST_" + name.upper(), dv_path(host[name]["path"], True)) for name in sorted(host)]
+    dv_need(len(rows) == 33 and len({key for key, _ in rows}) == 33, "complete deterministic library sandbox parameters")
+    return [(key, str(value)) for key, value in rows]
+
+
+def dovi_library_envelope(work, pins):
+    dv_need(pins.get("sandboxExec", {}).get("path") == "/usr/bin/sandbox-exec", "fixed single library sandbox provider")
+    envelope = [pins["sandboxExec"]["path"]]
+    for name, value in dovi_library_bindings(work, pins):
+        envelope += ["-D", name + "=" + value]
+    return envelope + ["-p", DOVI_LIBRARY_SANDBOX_PROFILE]
+
+
 DOVI_MATRIX = (
  ('ios','arm64','aarch64-apple-ios','iphoneos','IPHONEOS_DEPLOYMENT_TARGET','15.0','arm64-apple-ios15.0','ios-arm64',2),
  ('isimulator','arm64','aarch64-apple-ios-sim','iphonesimulator','IPHONEOS_DEPLOYMENT_TARGET','15.0','arm64-apple-ios15.0-simulator','ios-arm64_x86_64-simulator',7),
@@ -3260,10 +3306,9 @@ def dv_row(value, inputs, policy, work, identity, budget, archive_body=None):
        'sourceInputsSHA256':policy['inputsSHA256'],'sourceMapSHA256':DOVI_MAP_SHA,'command':command,'environment':expected_env,'logSHA256':dv_hash(raw['cargoLog']),
        'compiled':True,'installed':True,'archiveInspectionAccepted':False,'apiAbiAccepted':False,'sdkAccepted':False,'shippingAccepted':False}
     dv_need(all(record.get(key)==item and type(record.get(key)) is type(item) for key,item in fixed.items()),'actual source/command/environment/open-gate correspondence')
-    envelope=[pins['sandboxExec']['path'],'-D','SOURCE='+str(work/'dist'/DOVI_SOURCE_ROOT),'-D','VENDOR='+pins['vendorRoot'],
-              '-D','TOOLCHAIN='+pins['toolchainRoot'],'-p',DOVI_SANDBOX_PROFILE]
+    envelope=dovi_library_envelope(work,pins)
     dv_need(record['executionCommand']==envelope+command and record['executionTimeoutSeconds']==600 and type(record['executionTimeoutSeconds']) is int and
-            record['sandboxProfileSHA256']==dv_hash(DOVI_SANDBOX_PROFILE.encode()),'finite library build network/source-write sandbox')
+            record['sandboxProfileSHA256']==dv_hash(DOVI_LIBRARY_SANDBOX_PROFILE.encode()),'finite library build network/source-write sandbox')
     dv_need(value['record']['path']==str((scratch/'vortx-dovi-build.json').relative_to(work)) and value['cargoLog']['path']==str((scratch/'cargo-cinstall.log').relative_to(work)),'record/log target path')
     expected_out={str((prefix/'include/libdovi/rpu_parser.h').relative_to(work)):raw['header'],str((prefix/'lib/pkgconfig/dovi.pc').relative_to(work)):raw['pkgConfig']}
     archive=value['archive']; dv_need(type(archive) is dict and set(archive)=={'path','bytes','sha256','inspection'},'archive row shape')
@@ -3322,7 +3367,7 @@ def dv_fat(body, expected):
     return result
 
 
-DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '0fd2b23e95e7283971513939159fcee05003243a60fb22c140177259302abbab', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
+DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '87e893112ef6aa99f0f88326b4b605edb81202dfc73b09e12a9f971ee87db1fe', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
 PLACEBO_INSTALLED_HELPERS = {'Sources/BuildScripts/placebo-source-build.py': 'ed2b5b2c2fd45b6c03b6cf0ea5fc707b080f05bdb6f40dd270594ae2acdca617'}
 
 def _dovi_file(path, logical, maximum=16*1024**2):
