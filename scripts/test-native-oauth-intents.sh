@@ -22,7 +22,7 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     printf '%s\n' 'func testProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { try nativeProviderState(capture: capture) }' '}'
 } > "$native_oauth_dir/Journal.swift"
 node scripts/extract-subtitle-proof-hosts.cjs "$PWD" full-shells "$native_oauth_dir/NativeSubtitleProofHosts.swift" > "$native_oauth_dir/native-subtitle-proof-hosts.json"
-xcrun swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+xcrun swiftc -parse-as-library -swift-version 6 -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
     app/SourcesShared/CredentialScope.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/SIMKLAuth.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
     app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
@@ -31,7 +31,7 @@ xcrun swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=c
     app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeOAuthIntentTests.swift -o "$native_oauth_dir/oauth-intents"
 "$native_oauth_dir/oauth-intents"
 sed '/^@main/,$d' app/Tests/TraktSessionSecurityTests.swift > "$native_oauth_dir/TraktSeams.swift"
-xcrun swiftc -parse-as-library -D DEBUG -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+xcrun swiftc -parse-as-library -swift-version 6 -D DEBUG -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
     app/SourcesShared/CredentialScope.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/TraktAuth.swift \
     app/SourcesShared/TraktScrobbleProgressPolicy.swift app/SourcesShared/VortXEdgeAuth.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
