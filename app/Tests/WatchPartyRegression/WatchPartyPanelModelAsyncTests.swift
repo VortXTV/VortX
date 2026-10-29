@@ -152,9 +152,12 @@ private final class PanelModelFixture {
     }
 
     func stalePublicationOutcome(on socket: ControlledSocket) async throws {
-        var frame = SyntheticServerFrame(kind: "error")
-        frame.error = "stale-reservation"
-        try await emit(frame, on: socket)
+        try await asyncEventually("model socket receive ready") { !socket.pending.isEmpty }
+        let calls = socket.receiveCalls
+        try socket.deliverRawJSON(#"{"kind":"error","code":"stale-reservation"}"#)
+        try await asyncEventually("model frame processed") {
+            socket.receiveCalls > calls || socket.closeCount > 0
+        }
     }
 
     func cleanup() {

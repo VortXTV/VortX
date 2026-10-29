@@ -745,9 +745,12 @@ struct WatchPartyClientSessionAsyncTestRunner {
                          socket.publishes.count == 1 && oldSend.result == nil && socket.closeCount == 0,
                          "blocked fresh send emits no reserve or publish before correlated old outcome")
 
-        var outcome = SyntheticServerFrame(kind: "error")
-        outcome.error = "stale-reservation"
-        try await fixture.emit(outcome, on: socket)
+        try await asyncEventually("receive ready") { !socket.pending.isEmpty }
+        let calls = socket.receiveCalls
+        try socket.deliverRawJSON(#"{"kind":"error","code":"stale-reservation"}"#)
+        try await asyncEventually("frame processed") {
+            socket.receiveCalls > calls || socket.closeCount > 0
+        }
         try await asyncEventually("specific old publication outcome consumed") { oldSend.result != nil }
         if case .failure(let error)? = oldSend.result,
            let failure = error as? WatchPartyClientSession.Failure {

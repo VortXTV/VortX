@@ -282,7 +282,6 @@ struct SyntheticServerFrame: Encodable {
     var leaseRemainingMs: Int64? = nil
     var reservationId: String? = nil
     var ciphertext: String? = nil
-    var error: String? = nil
 
     static func proof(_ nonce: String, sequence: Int64, lease: Int64 = 30_000) -> Self {
         Self(kind: "lease.proof", nonce: nonce, serverSequence: sequence, leaseRemainingMs: lease)
@@ -362,6 +361,15 @@ final class ControlledSocket: WatchPartySessionSocket {
 
     func deliver(_ frame: SyntheticServerFrame, to id: Int? = nil) throws {
         let message = URLSessionWebSocketTask.Message.data(try JSONEncoder().encode(frame))
+        try deliverMessage(message, to: id)
+    }
+
+    // Backend-shaped error fixtures bypass SyntheticServerFrame and its encoder.
+    func deliverRawJSON(_ json: String, to id: Int? = nil) throws {
+        try deliverMessage(.string(json), to: id)
+    }
+
+    private func deliverMessage(_ message: URLSessionWebSocketTask.Message, to id: Int?) throws {
         if let id {
             guard let entry = receives.first(where: { $0.id == id }),
                   entry.continuation != nil else { throw AsyncHarnessError.missingHandle }

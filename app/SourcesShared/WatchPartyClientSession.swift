@@ -807,7 +807,7 @@ final class WatchPartyClientSession {
                         continue
                     }
                     if frame.kind == "error" {
-                        if frame.error == "stale-reservation", let publication = self.pendingPublication,
+                        if frame.code == "stale-reservation", let publication = self.pendingPublication,
                            publication.sent, publication.retired, publication.outcome == nil,
                            state.lastServerSequence >= publication.sequence,
                            let retiredAt = self.latestReservationRetirementSequence,
@@ -1259,7 +1259,7 @@ final class WatchPartyClientSession {
     private struct RenewReceipt: Decodable { let expiresAtMs: Int64; let snapshot: Snapshot }
     private struct EmptyReceipt: Decodable {}
     private struct Proof: Sendable { let nonce: String; let roomGeneration: String; let leaderTerm: Int64; let serverSequence: Int64; let leaseRemainingMs: Int64 }
-    private struct ServerFrame: Decodable { let kind: String?; let type: String?; let nonce: String?; let roomGeneration: String?; let leaderTerm: Int64?; let serverSequence: Int64?; let leaseRemainingMs: Int64?; let ciphertext: String?; let reservationId: String?; let error: String? }
+    private struct ServerFrame: Decodable { let kind: String?; let type: String?; let nonce: String?; let roomGeneration: String?; let leaderTerm: Int64?; let serverSequence: Int64?; let leaseRemainingMs: Int64?; let ciphertext: String?; let reservationId: String?; let code: String? }
     private struct Reservation { let reservationId: String; let roomGeneration: String; let leaderTerm: Int64; let serverSequence: Int64 }
     private struct ReserveRequest: Encodable { let kind: String }
     private struct PublishRequest: Encodable { let kind: String; let reservationId: String; let roomGeneration: String; let leaderTerm: Int64; let serverSequence: Int64; let ciphertext: String }
