@@ -75,6 +75,16 @@ enum AddonURLGuard {
             }
         }
 
+        /// A resource path includes encoded metadata in addition to the installed endpoint.
+        /// Keep QR/manifest admission separate from this bounded subtitle request envelope.
+        var maximumURLBytes: Int {
+            switch self {
+            case .subtitleIndex: return 128 * 1024
+            case .manifest, .xperienceCatalog, .xperienceArtwork:
+                return AddonPairingProtocol.maxManifestURLBytes
+            }
+        }
+
         fileprivate var accept: String {
             switch self {
             case .manifest, .xperienceCatalog, .subtitleIndex: return "application/json"
@@ -121,7 +131,8 @@ enum AddonURLGuard {
 
     /// Require HTTP(S) and validate literal/resolved destinations. Public resources reject private ranges;
     /// a selected add-on can use ordinary private addresses only at its selected origin.
-    static func validate(_ url: URL, access: AccessScope = .publicNetwork) async -> Rejection? {
+    static func validate(_ url: URL, access: AccessScope = .publicNetwork,
+                         context: ResponseContext = .manifest) async -> Rejection? {
         guard let scheme = url.scheme?.lowercased(),
               let host = url.host, !host.isEmpty,
               url.user == nil,
@@ -141,14 +152,14 @@ enum AddonURLGuard {
             // well-hosted addons kept working. Public hosts may use http again - every private-address
             // check below still applies to BOTH schemes, so the SSRF posture is unchanged.
             guard scheme == "http" || scheme == "https",
-                  Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+                  url.absoluteString.utf8.count <= context.maximumURLBytes else {
                 return .invalidScheme
             }
             return nil
         }
 
         guard scheme == "http" || scheme == "https",
-              Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+              url.absoluteString.utf8.count <= context.maximumURLBytes else {
             return .invalidScheme
         }
 
@@ -184,7 +195,7 @@ enum AddonURLGuard {
         var current = url
         for _ in 0...maxRedirects {
             try Task.checkCancellation()
-            let validationFailure = await validate(current, access: access)
+            let validationFailure = await validate(current, access: access, context: context)
             try Task.checkCancellation()
             if let validationFailure { throw validationFailure }
             let remaining = deadline.timeIntervalSinceNow
@@ -244,7 +255,7 @@ enum AddonURLGuard {
                 // This is a second resolution check, not connection IP pinning. The accepted
                 // resolve-then-connect rebinding limitation above still applies.
                 let finalURL = http.url ?? current
-                if let rejection = await validate(finalURL, access: access) { throw rejection }
+                if let rejection = await validate(finalURL, access: access, context: context) { throw rejection }
                 try Task.checkCancellation()
                 return Response(data: data, finalURL: finalURL, mimeType: http.mimeType)
             } catch let routeRejection as SubtitleIndexRouteRejection {

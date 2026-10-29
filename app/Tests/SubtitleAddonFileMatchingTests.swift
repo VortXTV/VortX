@@ -139,6 +139,24 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
             sources: [.init(baseUrl: "https://127.0.0.12", name: "Redirect")], type: "series", videoId: "tt123:1:9",
             metadata: .init(filename: "other-file.mkv"), testURLProtocolClasses: fixtures)
         precondition(nonHTTPRedirect.isEmpty, "non-HTTP redirect target must fail guard validation")
+        // A valid installed endpoint may fit the QR envelope while its metadata resource does not.
+        let longBase = "https://127.0.0.15/" + String(repeating: "a", count: 1_950)
+        let longMetadata = SubtitleRequestMetadata(filename: String(repeating: "é", count: 80) + ".mkv")
+        let longRequest = URL(string: longBase + "/" + longMetadata.resourcePath(type: "series", videoID: "tt123:1:9"))!
+        precondition(longBase.utf8.count < AddonPairingProtocol.maxManifestURLBytes &&
+                     longRequest.absoluteString.utf8.count > AddonPairingProtocol.maxManifestURLBytes)
+        let longResult = await SubtitleAddonService.fetch(
+            sources: [.init(baseUrl: longBase, name: "Configured router")], type: "series", videoId: "tt123:1:9",
+            metadata: longMetadata, testURLProtocolClasses: fixtures)
+        precondition(longResult.count == 1 && longResult[0].installedBaseURL.absoluteString == longBase,
+                     "encoded metadata must use the subtitle resource budget, not the QR manifest budget")
+        let normalScope = AddonURLGuard.AccessScope.addon(origin: URL(string: longBase)!)
+        let manifestRejection = await AddonURLGuard.validate(longRequest, access: normalScope)
+        precondition(manifestRejection != nil, "manifest URL budget remains unchanged")
+        let oversizedURL = URL(string: "https://127.0.0.15/" +
+                               String(repeating: "b", count: AddonURLGuard.ResponseContext.subtitleIndex.maximumURLBytes))!
+        let resourceRejection = await AddonURLGuard.validate(oversizedURL, access: normalScope, context: .subtitleIndex)
+        precondition(resourceRejection != nil, "subtitle resource URL budget remains finite")
         let duplicateSources = await SubtitleAddonService.fetch(
             sources: [.init(baseUrl: "https://127.0.0.13", name: "First"),
                       .init(baseUrl: "https://127.0.0.14", name: "Second")],
