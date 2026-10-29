@@ -342,6 +342,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         }
         // Compatibility hook for the closed legacy API. The typed path uses its captured account admission.
         SourceIndexClient.moatTokenProvider = { MoatToken.current(isSignedIn = true) }
+        com.vortx.android.player.subtitles.SubtitlePoolClient.moatTokenProvider = { MoatToken.current(it) }
         val preferences = getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
         sourceIndexConsentObserver = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == com.vortx.android.moat.MoatConsent.KEY) {

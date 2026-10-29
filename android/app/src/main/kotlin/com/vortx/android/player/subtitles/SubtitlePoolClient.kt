@@ -4,15 +4,24 @@ import android.content.Context
 import com.vortx.android.config.RemoteConfig
 import com.vortx.android.config.RemoteConfigDefaults
 import com.vortx.android.model.MediaRef
+import com.vortx.android.moat.MoatConsent
+import com.vortx.android.moat.MoatToken
 import com.vortx.android.net.VortXEdgeAuth
+import com.vortx.android.singularity.SourceIndexLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
+import kotlin.coroutines.resume
 
 /**
  * Client for VortX's community-subtitle pool at `subtitles.vortx.tv`. The Kotlin port of Apple
@@ -28,20 +37,18 @@ import java.net.URLEncoder
  * constant offset is not speech/cue/FPS/drift alignment. Upload/post APIs remain separate helpers; this host
  * integration does not automatically contribute manual adjustments without a consent/eligibility path.
  *
- * FAIL-SOFT CONTRACT (every method): any network / decode / signing / size error returns the empty / null /
- * no-op result. Nothing throws to a caller. A disabled feature (`features.communitySubtitles` off, etc.) is a
- * hard no-op that never touches the network.
+ * Network / decode / signing / size errors fail soft to empty / null / no-op results. Read cancellation
+ * propagates so the original player cannot keep downloading after its coroutine or authorization retires.
+ * A disabled feature (`features.communitySubtitles` off, etc.) never starts a read request.
  *
  * GATING (VortX-only pool): the owner gates this pool to real VortX builds, like trickplay and trailers, so
  * EVERY request to `subtitles.vortx.tv` is HMAC-signed with [VortXEdgeAuth.sign] (the GET reads and the
  * sub-text download as well as the POSTs). Reads carry no ACCOUNT key (still "keyless" that way) but do carry
  * the `X-VX-*` signature so that when the worker flips to enforce mode only VortX clients read the pool. The
- * SERVE-side moat token (`X-VX-Moat`) is stamped when the [moatTokenProvider] hook yields one; Android has no
- * VortX-account moat minting yet, so the hook is null and the header is simply omitted (fail-soft: the worker
- * returns an empty list in enforce mode, and serves in observe mode). This mirrors [com.vortx.android.singularity.SourceIndexClient]'s
- * honest Android adaptation of the same Apple lifecycle: Android lacks the give-to-get consent and moat
- * surfaces the Apple client has, so those gates degrade to the feature flag plus the login flag the caller
- * threads in.
+ * SERVE-side moat token (`X-VX-Moat`) comes from the App's existing account-authenticated MoatToken lane.
+ * Reads require live give-to-get consent, a signed-in caller, the original process authorization epoch and
+ * a nonblank token before network or cached subtitle delivery. A missing provider/token fails closed even
+ * when a worker is in observe mode. Upload/post APIs remain separate, unchanged helpers.
  */
 object SubtitlePoolClient {
 
@@ -63,9 +70,8 @@ object SubtitlePoolClient {
     private const val POST_TIMEOUT_MS = 8_000
 
     /**
-     * Reserved hook for the future signed-off VortX-account moat lane. When wired it mints the short-lived
-     * `X-VX-Moat` token for a signed-in device; null today (Android has no account-moat minting), so reads
-     * degrade to the worker's observe-mode behaviour. Mirrors [com.vortx.android.singularity.SourceIndexClient.moatTokenProvider].
+     * App-owned hook to the existing MoatToken issuer. Missing setup is a closed read gate; this hook
+     * never accepts a streaming-provider credential and no token is persisted by this client.
      */
     @Volatile
     var moatTokenProvider: (suspend (Boolean) -> String?)? = null
@@ -98,6 +104,7 @@ object SubtitlePoolClient {
         durationSecs: Double?,
         isSignedIn: Boolean,
     ): PooledResult {
+        val expectedEpoch = SourceIndexLifecycle.currentEpoch()
         val contentKey = SubtitleReleaseFingerprint.contentKey(ref?.imdb, ref?.season, ref?.episode)
             ?: return PooledResult(emptyList(), null)
         val releaseHint = filename?.takeIf { it.isNotBlank() }
@@ -106,7 +113,8 @@ object SubtitlePoolClient {
             durationSecs = durationSecs,
             releaseName = releaseHint.takeIf { it.isNotBlank() },
         )
-        return fetchPooled(contentKey, fingerprint = fingerprint, isSignedIn = isSignedIn)
+        return fetchPooled(contentKey, fingerprint = fingerprint, isSignedIn = isSignedIn,
+            expectedEpoch = expectedEpoch)
     }
 
     // MARK: - Read: GET /subs
@@ -127,14 +135,18 @@ object SubtitlePoolClient {
         lang: String? = null,
         fingerprint: String? = null,
         isSignedIn: Boolean = false,
+        expectedEpoch: Long = SourceIndexLifecycle.currentEpoch(),
     ): PooledResult {
-        if (!isValidContentKey(contentKey) || !featureCommunitySubtitles || !isSignedIn) {
+        if (!isValidContentKey(contentKey) || !readAllowed(isSignedIn, expectedEpoch)) {
             return PooledResult(emptyList(), null)
         }
-        val moat = runCatching { moatTokenProvider?.invoke(isSignedIn) }.getOrNull()
+        val moat = readMoat(isSignedIn, expectedEpoch) ?: return PooledResult(emptyList(), null)
         val url = indexUrl(contentKey, lang, fingerprint) ?: return PooledResult(emptyList(), null)
-        val body = signedGet(url, moat, INDEX_RESPONSE_MAX_BYTES) ?: return PooledResult(emptyList(), null)
-        return parseSubsResponse(body, contentKey)
+        val body = signedGet(url, moat, INDEX_RESPONSE_MAX_BYTES, isSignedIn, expectedEpoch)
+            ?: return PooledResult(emptyList(), null)
+        if (!readAllowed(isSignedIn, expectedEpoch)) return PooledResult(emptyList(), null)
+        val result = parseSubsResponse(body, contentKey)
+        return if (readAllowed(isSignedIn, expectedEpoch)) result else PooledResult(emptyList(), null)
     }
 
     // MARK: - Download the sub text: GET <pooled.url>
@@ -145,25 +157,60 @@ object SubtitlePoolClient {
      * host), so pool-hosted sub text stays VortX-only. Timeout comes from the RemoteConfig
      * `subtitle.downloadTimeoutMs` tunable (baked 12 s), matching Apple.
      */
-    suspend fun download(context: Context, pooled: PooledSubtitle, isSignedIn: Boolean = false): String? {
-        if (!isValidDownloadURL(pooled.url, pooled.contentKey, pooled.format) || !featureCommunitySubtitles) {
+    suspend fun download(context: Context, pooled: PooledSubtitle, isSignedIn: Boolean = false,
+        expectedEpoch: Long = SourceIndexLifecycle.currentEpoch()): String? {
+        if (!isValidDownloadURL(pooled.url, pooled.contentKey, pooled.format) ||
+            !readAllowed(isSignedIn, expectedEpoch)) {
             return null
         }
+        val moat = readMoat(isSignedIn, expectedEpoch) ?: return null
         val cacheDir = context.applicationContext.cacheDir
         val name = "vortx-poolsub-${stableHash(pooled.url)}.${pooled.format}"
         val target = File(cacheDir, name)
-        // Session-scoped reuse: if we already fetched this URL to a still-present file, hand it back.
-        if (target.exists() && target.length() > 0) return target.absolutePath
+        // Authorization precedes cache reuse too; opt-out/sign-out cannot consume a retained file.
+        val cached = try {
+            withContext(Dispatchers.IO) {
+                currentCoroutineContext().ensureActive()
+                if (readGate(isSignedIn, expectedEpoch) && target.isFile &&
+                    target.length() in 1L..SUBTITLE_BODY_MAX_BYTES.toLong()) target.absolutePath else null
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        if (cached != null) return if (readAllowed(isSignedIn, expectedEpoch)) cached else null
 
-        val moat = runCatching { moatTokenProvider?.invoke(isSignedIn) }.getOrNull()
         val timeout = RemoteConfig.current().subtitleDownloadTimeout
-        val data = signedGetBytes(pooled.url, moat, SUBTITLE_BODY_MAX_BYTES, timeout) ?: return null
-        if (data.isEmpty()) return null
-        return runCatching {
-            val tmp = File.createTempFile("vortx-poolsub-", ".${pooled.format}", cacheDir)
-            tmp.writeBytes(data)
-            if (tmp.renameTo(target)) target.absolutePath else tmp.absolutePath
-        }.getOrNull()
+        val data = signedGetBytes(pooled.url, moat, SUBTITLE_BODY_MAX_BYTES, timeout,
+            isSignedIn, expectedEpoch) ?: return null
+        if (data.isEmpty() || !readAllowed(isSignedIn, expectedEpoch)) return null
+        return withContext(Dispatchers.IO) {
+            var temporary: File? = null
+            try {
+                currentCoroutineContext().ensureActive()
+                if (!readGate(isSignedIn, expectedEpoch)) return@withContext null
+                val tmp = File.createTempFile("vortx-poolsub-", ".${pooled.format}", cacheDir)
+                temporary = tmp
+                tmp.writeBytes(data)
+                currentCoroutineContext().ensureActive()
+                if (!readGate(isSignedIn, expectedEpoch)) return@withContext null
+                val output = if (tmp.renameTo(target)) {
+                    temporary = null
+                    target
+                } else tmp
+                currentCoroutineContext().ensureActive()
+                if (!readGate(isSignedIn, expectedEpoch)) return@withContext null
+                temporary = null
+                output.absolutePath
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            } finally {
+                runCatching { temporary?.delete() }
+            }
+        }
     }
 
     // MARK: - Upload sub text: POST /subs (signed)
@@ -230,6 +277,32 @@ object SubtitlePoolClient {
     private val featureSubtitleUpload: Boolean
         get() = RemoteConfig.isFeatureOn("subtitleUpload", RemoteConfigDefaults.FEATURE_SUBTITLE_UPLOAD)
 
+    /** Live predicates are outside lifecycle/token locks. The captured epoch can only deny, never renew. */
+    private fun readGate(isSignedIn: Boolean, expectedEpoch: Long): Boolean = try {
+        expectedEpoch == SourceIndexLifecycle.currentEpoch() && isSignedIn && featureCommunitySubtitles &&
+            MoatToken.appContext?.let(MoatConsent::contributeAndConsume) == true &&
+            expectedEpoch == SourceIndexLifecycle.currentEpoch()
+    } catch (_: Exception) {
+        false
+    }
+
+    private suspend fun readAllowed(isSignedIn: Boolean, expectedEpoch: Long): Boolean {
+        currentCoroutineContext().ensureActive()
+        return readGate(isSignedIn, expectedEpoch)
+    }
+
+    private suspend fun readMoat(isSignedIn: Boolean, expectedEpoch: Long): String? {
+        if (!readAllowed(isSignedIn, expectedEpoch)) return null
+        val token = try {
+            moatTokenProvider?.invoke(isSignedIn)?.takeIf(String::isNotBlank)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        return if (readAllowed(isSignedIn, expectedEpoch)) token else null
+    }
+
     // MARK: - URL builders + validation (mirrors Apple exactly)
 
     private val baseUrl: String
@@ -279,49 +352,86 @@ object SubtitlePoolClient {
 
     // MARK: - Networking primitives (all fail-soft, bounded, edge-auth signed)
 
-    private suspend fun signedGet(url: String, moat: String?, maxBytes: Int): String? {
-        val bytes = signedGetBytes(url, moat, maxBytes, INDEX_TIMEOUT_MS) ?: return null
+    private suspend fun signedGet(url: String, moat: String, maxBytes: Int,
+        isSignedIn: Boolean, expectedEpoch: Long): String? {
+        val bytes = signedGetBytes(url, moat, maxBytes, INDEX_TIMEOUT_MS, isSignedIn, expectedEpoch) ?: return null
         return bytes.toString(Charsets.UTF_8)
     }
 
     /**
      * Bounded, redirect-refusing, edge-auth signed GET. Reads at most [maxBytes] and returns null if the body
-     * runs over (a hostile Content-Length or a chunked overrun cannot bypass the cap). Never throws.
+     * runs over. Cancellation retires the continuation and disconnects blocking IO off owner locks.
      */
-    private suspend fun signedGetBytes(url: String, moat: String?, maxBytes: Int, timeoutMs: Int): ByteArray? =
+    private suspend fun signedGetBytes(url: String, moat: String, maxBytes: Int, timeoutMs: Int,
+        isSignedIn: Boolean, expectedEpoch: Long): ByteArray? = try {
         withContext(Dispatchers.IO) {
-            var conn: HttpURLConnection? = null
-            try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = timeoutMs
-                    readTimeout = timeoutMs
-                    useCaches = false
-                    instanceFollowRedirects = false
-                    setRequestProperty("accept", "application/json")
+            currentCoroutineContext().ensureActive()
+            if (moat.isBlank() || !readGate(isSignedIn, expectedEpoch)) return@withContext null
+            suspendCancellableCoroutine<ByteArray?> { continuation ->
+                val conn = URL(url).openConnection() as HttpURLConnection
+                val budgetMs = timeoutMs.coerceAtLeast(1)
+                val started = System.nanoTime()
+                fun disconnect() = SourceIndexLifecycle.dispatchTeardown { runCatching { conn.disconnect() } }
+                val registration = SourceIndexLifecycle.onEpochInvalidated(expectedEpoch) {
+                    continuation.cancel(CancellationException("Pooled subtitle authorization retired"))
+                    disconnect()
                 }
-                VortXEdgeAuth.sign(conn) // gated host: stamp X-VX-Ts / X-VX-Sig / X-VX-Kid
-                if (moat != null) conn.setRequestProperty(MOAT_HEADER, moat)
-                if (conn.responseCode !in 200..299) return@withContext null
-                readBounded(conn, maxBytes)
-            } catch (_: Throwable) {
-                null
-            } finally {
-                conn?.disconnect()
+                continuation.invokeOnCancellation { disconnect() }
+                try {
+                    fun requireCurrent() {
+                        if (!continuation.isActive || !readGate(isSignedIn, expectedEpoch)) {
+                            throw CancellationException("Pooled subtitle authorization retired")
+                        }
+                        if (System.nanoTime() - started >= budgetMs.toLong() * 1_000_000L) {
+                            throw IOException("Pooled subtitle read timed out")
+                        }
+                    }
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = budgetMs
+                    conn.readTimeout = budgetMs
+                    conn.useCaches = false
+                    conn.instanceFollowRedirects = false
+                    conn.setRequestProperty("accept", "application/json")
+                    VortXEdgeAuth.sign(conn)
+                    conn.setRequestProperty(MOAT_HEADER, moat)
+                    requireCurrent()
+                    val data = if (conn.responseCode !in 200..299) null else {
+                        requireCurrent()
+                        if (conn.contentLengthLong > maxBytes) null else readBounded(conn, maxBytes, ::requireCurrent)
+                    }
+                    requireCurrent()
+                    if (continuation.isActive) continuation.resume(data)
+                } catch (cancelled: CancellationException) {
+                    continuation.cancel(cancelled)
+                } catch (_: Exception) {
+                    if (!readGate(isSignedIn, expectedEpoch)) {
+                        continuation.cancel(CancellationException("Pooled subtitle authorization retired"))
+                    } else if (continuation.isActive) continuation.resume(null)
+                } finally {
+                    registration.close()
+                    runCatching { conn.disconnect() }
+                }
             }
         }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
 
     /** Read up to [maxBytes] from the connection's input stream; null if the body exceeds the cap. */
-    private fun readBounded(conn: HttpURLConnection, maxBytes: Int): ByteArray? {
+    private fun readBounded(conn: HttpURLConnection, maxBytes: Int, requireCurrent: () -> Unit): ByteArray? {
         conn.inputStream.use { input ->
             val out = java.io.ByteArrayOutputStream()
             val buffer = ByteArray(16 * 1024)
             var total = 0
             while (true) {
+                requireCurrent()
                 val read = input.read(buffer)
+                requireCurrent()
                 if (read < 0) break
+                if (read > maxBytes - total) return null
                 total += read
-                if (total > maxBytes) return null
                 out.write(buffer, 0, read)
             }
             return out.toByteArray()

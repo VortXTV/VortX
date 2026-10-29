@@ -16,13 +16,14 @@ internal data class TrackSelectionPhases(
     val audio: DefaultTrackPhase = DefaultTrackPhase.WAITING_FOR_INVENTORY,
     val subtitle: DefaultTrackPhase = DefaultTrackPhase.WAITING_FOR_INVENTORY,
     val addonAttempted: Boolean = false,
+    val poolAttempted: Boolean = false,
 ) {
     fun automaticDefaults(
         hasSelectableAudio: Boolean,
         hasSelectableSubtitle: Boolean,
     ): AutomaticTrackDefaults = AutomaticTrackDefaults(
         selectAudio = audio == DefaultTrackPhase.WAITING_FOR_INVENTORY && hasSelectableAudio,
-        selectSubtitle = subtitle == DefaultTrackPhase.WAITING_FOR_INVENTORY && hasSelectableSubtitle,
+        selectSubtitle = !poolAttempted && subtitle == DefaultTrackPhase.WAITING_FOR_INVENTORY && hasSelectableSubtitle,
     )
 
     fun apply(defaults: AutomaticTrackDefaults): TrackSelectionPhases = copy(
@@ -40,10 +41,27 @@ internal data class TrackSelectionPhases(
      * is already selectable, its default has to run first; if it is empty, there is nothing to wait for.
      */
     fun mayAttemptAddon(hasSelectableSubtitle: Boolean): Boolean =
-        !addonAttempted &&
+        !poolAttempted && !addonAttempted &&
             audio != DefaultTrackPhase.WAITING_FOR_INVENTORY &&
             subtitle != DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION &&
             (subtitle != DefaultTrackPhase.WAITING_FOR_INVENTORY || !hasSelectableSubtitle)
+
+    /**
+     * Pool fallback is last: wait for the add-on lookup to settle and preserve any matching add-on.
+     * The existing audio/embedded/manual admission remains authoritative.
+     */
+    fun mayAttemptPool(
+        hasSelectableSubtitle: Boolean,
+        addonLookupSettled: Boolean,
+        hasPreferredAddon: Boolean,
+    ): Boolean = !poolAttempted && addonLookupSettled && !hasPreferredAddon &&
+        mayAttemptAddon(hasSelectableSubtitle)
+
+    /**
+     * Reserve once per loaded engine without changing the subtitle phase observed by the effect
+     * that owns the download. A phase change here would cancel that same in-flight effect.
+     */
+    fun recordPoolSelection(): TrackSelectionPhases = copy(poolAttempted = true)
 
     fun recordAddonAttempt(): TrackSelectionPhases = copy(addonAttempted = true)
 

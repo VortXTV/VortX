@@ -87,12 +87,15 @@ import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.moat.MoatConsent
 import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.player.subtitles.SubtitlePoolClient
 import com.vortx.android.player.subtitles.SubtitleTimingSession
+import com.vortx.android.player.subtitles.runAutomaticPooledSubtitleSelection
 import com.vortx.android.player.subtitles.subtitlePoolPlaybackQuery
 import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.singularity.SourceIndexLifecycle
 import com.vortx.android.skip.AutoSkipCountdownDecision
 import com.vortx.android.skip.AutoSkipCountdownPolicy
 import com.vortx.android.skip.AutoSkipCountdownState
@@ -104,8 +107,10 @@ import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.currentCoroutineContext
@@ -1542,14 +1547,28 @@ fun PlayerScreen(
     // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
     // it on the live engine. Each engine selects the exact requested file; the UI never guesses
     // identity from inventory count/order, which can change when unrelated sidecars finish.
-    var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    val trackPreferences = remember(playbackSessionKey) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
+    }
+    val matchAudioSub = remember(playbackSessionKey) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
+    }
+    val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
+    var addonSubtitles by remember(playbackSessionKey, engine) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    var addonLookupSettled by remember(playbackSessionKey, engine) { mutableStateOf(false) }
     var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
     // Shared by phone and TV: pool IO is owned by the exact source/account/profile lifetime.
     // Freeze the first real duration/release query rather than applying a duration-0 pool offset.
     val subtitlePoolScope = rememberCoroutineScope()
     val latestSubtitleEngine by rememberUpdatedState(engine)
     val poolSignedIn = subtitleSyncManager?.isSignedIn == true
+    val poolConsent = MoatConsent.contributeAndConsume(context)
+    // Observation may advance; every request below captures an immutable epoch before its first await.
+    var currentPoolEpoch by remember(playbackSessionKey, engine) { mutableStateOf(SourceIndexLifecycle.currentEpoch()) }
     val poolThin = playerState.subtitleTracks.size + addonSubtitles.size < 2
+    val needsAutomaticPool = !currentPlayable.isTrailer && !currentPlayable.isLive &&
+        TrackSelector.wantsExternalSubtitle(playerState.audioTracks, playerState.subtitleTracks,
+            trackPreferences, preferAddonSubtitles, matchAudioSub)
     val subtitlePoolQuery = remember(playbackSessionKey, playerState.durationMs > 0L) {
         val filename = runCatching { java.net.URI(currentPlayable.url).path?.substringAfterLast('/') }
             .getOrNull()?.takeIf { it.isNotBlank() }
@@ -1557,85 +1576,150 @@ fun PlayerScreen(
             currentPlayable.mediaRef?.year?.toString()).joinToString(" ")
         subtitlePoolPlaybackQuery(subtitleContentKey, playerState.durationMs, releaseName)
     }
-    var pooledSubtitles by remember(playbackSessionKey) {
+    var pooledSubtitles by remember(playbackSessionKey, engine) {
         mutableStateOf(emptyList<SubtitlePoolClient.PooledSubtitle>())
     }
+    var pooledPublicationEpoch by remember(playbackSessionKey, engine) { mutableStateOf<Long?>(null) }
     var poolLoadingId by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
     var poolLoadingSelection by remember(playbackSessionKey, engine) { mutableStateOf<PlayerSubtitleSelection?>(null) }
+    var automaticPoolRequest by remember(playbackSessionKey, engine) { mutableStateOf<Job?>(null) }
+    var poolLookupRequest by remember(playbackSessionKey, engine) { mutableStateOf<Job?>(null) }
+    DisposableEffect(playbackSessionKey, engine) {
+        onDispose { automaticPoolRequest?.cancel(); poolLookupRequest?.cancel() }
+    }
+    fun cancelAutomaticPoolSelection() {
+        automaticPoolRequest?.cancel()
+        poolLookupRequest?.cancel()
+    }
+    DisposableEffect(playbackSessionKey, engine, currentPoolEpoch) {
+        val observedEpoch = currentPoolEpoch
+        val registration = SourceIndexLifecycle.onEpochInvalidated(observedEpoch) {
+            subtitlePoolScope.launch {
+                // Retire old work only. A fresh effect still needs the original live playback owner.
+                if (currentSubtitleSessionKey == playbackSessionKey && latestSubtitleEngine === engine &&
+                    currentPoolEpoch == observedEpoch) {
+                    cancelAutomaticPoolSelection()
+                    pooledSubtitles = emptyList()
+                    pooledPublicationEpoch = null
+                    currentPoolEpoch = SourceIndexLifecycle.currentEpoch()
+                }
+            }
+        }
+        onDispose { registration.close() }
+    }
     fun admitCurrentSubtitleEngine(action: () -> Boolean): Boolean = withCurrentSubtitleOwner {
         latestSubtitleEngine === engine && action()
     }
-    fun mountAddonSubtitle(sub: AddonSubtitle, original: PlayerSubtitleSelection) {
-        if (!withCurrentSubtitleOwner { engine.isSubtitleSelectionCurrent(original) }) return
-        val timingAttempt = subtitleTiming.beginAlignment() ?: return
-        subtitlePoolScope.launch {
+    fun admitCurrentPoolEngine(expectedEpoch: Long, action: () -> Boolean): Boolean =
+        SourceIndexLifecycle.currentEpoch() == expectedEpoch &&
+            subtitleSyncManager?.isSignedIn == true && MoatConsent.contributeAndConsume(context) &&
+            admitCurrentSubtitleEngine(action)
+    suspend fun awaitSubtitleMount(mount: Job?) {
+        if (mount == null) return
+        try { mount.join() }
+        finally { if (!currentCoroutineContext().isActive) mount.cancel() }
+    }
+    fun mountAddonSubtitle(sub: AddonSubtitle, original: PlayerSubtitleSelection,
+        permitsUse: () -> Boolean = { true }): Job? {
+        if (!permitsUse() || !withCurrentSubtitleOwner { engine.isSubtitleSelectionCurrent(original) }) return null
+        val timingAttempt = subtitleTiming.beginAlignment() ?: return null
+        return subtitlePoolScope.launch {
             var aligned = false
             try {
-                if (!subtitleTiming.prepareAlignment(timingAttempt, ::admitCurrentSubtitleEngine) {
+                val admitMount: ((() -> Boolean) -> Boolean) = { action ->
+                    permitsUse() && admitCurrentSubtitleEngine(action)
+                }
+                if (!subtitleTiming.prepareAlignment(timingAttempt, admitMount) {
                         if (!engine.setSubtitleDelay(0.0, original)) false else {
                             subtitleDelaySeconds = 0.0
                             true
                         }
                     }) return@launch
-                if (!engine.isSubtitleSelectionCurrent(original)) return@launch
+                if (!permitsUse() || !engine.isSubtitleSelectionCurrent(original)) return@launch
                 val result = engine.selectExternalSubtitleAutomatically(sub.url, sub.lang, original)
                 currentCoroutineContext().ensureActive()
                 aligned = result == PlayerExternalSubtitleSelectionResult.ALIGNED &&
+                    permitsUse() &&
                     withCurrentSubtitleOwner { latestSubtitleEngine === engine && engine.isSubtitleSelectionCurrent(original) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Errors stay silent; the engine owns any already-mounted requested-file fallback.
             } finally {
                 // Retrying only releases the exact older hold. A newer selection keeps its own hold.
-                if (subtitleTiming.finishAlignment(timingAttempt, aligned) && !aligned &&
+                if (subtitleTiming.finishAlignment(timingAttempt, aligned) && !aligned && permitsUse() &&
                     withCurrentSubtitleOwner { true }) {
                     subtitlePoolRetry += 1L
                 }
             }
         }
     }
-    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, poolSignedIn, subtitlePoolRetry) {
+    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, needsAutomaticPool,
+        poolSignedIn, poolConsent, currentPoolEpoch, subtitlePoolRetry) {
         val query = subtitlePoolQuery ?: return@LaunchedEffect
+        val readEpoch = currentPoolEpoch
         val original = engine.captureSubtitleSelection() ?: return@LaunchedEffect
         val syncEnabled = com.vortx.android.config.RemoteConfig.isFeatureOn("subtitleSync",
             com.vortx.android.config.RemoteConfigDefaults.FEATURE_SUBTITLE_SYNC)
-        if (!poolSignedIn || (!poolThin && !(engine.subtitleDelayAvailable && syncEnabled)) ||
-            !admitCurrentSubtitleEngine { true }) return@LaunchedEffect
-        val result = SubtitlePoolClient.fetchPooled(
-            contentKey = query.contentKey,
-            fingerprint = query.fingerprint,
-            isSignedIn = true,
-        )
-        currentCoroutineContext().ensureActive()
-        admitCurrentSubtitleEngine {
-            pooledSubtitles = if (poolThin) result.subs else emptyList()
-            true
-        }
-        // Offset and subtitle choices came from THIS captured query, not a mutable title lookup.
-        if (syncEnabled && engine.isSubtitleSelectionCurrent(original)) subtitleTiming.applyCommunityAccepted(result.offsetMs, engine.subtitleDelayAvailable,
-            ::admitCurrentSubtitleEngine) { seconds ->
-            if (!engine.setSubtitleDelay(seconds, original)) return@applyCommunityAccepted false
-            subtitleDelaySeconds = seconds
-            true
+        if (!poolSignedIn || !poolConsent ||
+            (!poolThin && !needsAutomaticPool && !(engine.subtitleDelayAvailable && syncEnabled)) ||
+            !admitCurrentPoolEngine(readEpoch) { true }) return@LaunchedEffect
+        val lookup = currentCoroutineContext()[Job] ?: return@LaunchedEffect
+        poolLookupRequest = lookup
+        try {
+            val result = SubtitlePoolClient.fetchPooled(
+                contentKey = query.contentKey,
+                fingerprint = query.fingerprint,
+                isSignedIn = true,
+                expectedEpoch = readEpoch,
+            )
+            currentCoroutineContext().ensureActive()
+            admitCurrentPoolEngine(readEpoch) {
+                pooledSubtitles = if (poolThin || needsAutomaticPool) result.subs else emptyList()
+                pooledPublicationEpoch = readEpoch
+                true
+            }
+            // Offset and subtitle choices came from THIS captured query, not a mutable title lookup.
+            if (syncEnabled && engine.isSubtitleSelectionCurrent(original)) subtitleTiming.applyCommunityAccepted(result.offsetMs, engine.subtitleDelayAvailable,
+                { action -> admitCurrentPoolEngine(readEpoch, action) }) { seconds ->
+                if (!engine.setSubtitleDelay(seconds, original)) return@applyCommunityAccepted false
+                subtitleDelaySeconds = seconds
+                true
+            }
+        } finally {
+            if (poolLookupRequest === lookup) poolLookupRequest = null
         }
     }
     fun selectPooledSubtitle(sub: SubtitlePoolClient.PooledSubtitle) {
-        if ((poolLoadingId != null && poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) ||
-            sub !in pooledSubtitles || !poolSignedIn ||
-            !admitCurrentSubtitleEngine { true }) return
+        val readEpoch = pooledPublicationEpoch ?: return
+        if (sub !in pooledSubtitles || !poolSignedIn ||
+            !admitCurrentPoolEngine(readEpoch) { true }) return
+        val replacingAutomatic = automaticPoolRequest != null
+        cancelAutomaticPoolSelection()
+        if (!replacingAutomatic && poolLoadingId != null &&
+            poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) return
         val original = engine.beginSubtitleSelection() ?: return
         showControls()
         trackSelectionPhases = trackSelectionPhases.holdSubtitle()
         poolLoadingId = sub.id
         poolLoadingSelection = original
         subtitlePoolScope.launch {
+            val job = currentCoroutineContext()[Job] ?: return@launch
+            val registration = SourceIndexLifecycle.onEpochInvalidated(readEpoch) { job.cancel() }
             try {
-                val local = SubtitlePoolClient.download(context, sub, isSignedIn = true)
+                val local = SubtitlePoolClient.download(context, sub, isSignedIn = true, expectedEpoch = readEpoch)
                 currentCoroutineContext().ensureActive()
-                admitCurrentSubtitleEngine {
+                var mount: Job? = null
+                admitCurrentPoolEngine(readEpoch) {
                     if (local != null && engine.isSubtitleSelectionCurrent(original)) {
-                        mountAddonSubtitle(AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), original)
+                        mount = mountAddonSubtitle(AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), original,
+                            permitsUse = { admitCurrentPoolEngine(readEpoch) { true } })
                     }
                     true
                 }
+                awaitSubtitleMount(mount)
             } finally {
+                registration.close()
                 // An older completion/cancellation must not clear a newer choice's loading UI.
                 if (poolLoadingSelection === original) {
                     poolLoadingId = null
@@ -1644,33 +1728,78 @@ fun PlayerScreen(
             }
         }
     }
-    LaunchedEffect(playbackSessionKey) {
-        if (currentPlayable.isTrailer) return@LaunchedEffect
-        val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
-        val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
-        val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
-        val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
-        if (sources.isEmpty()) return@LaunchedEffect
-        val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
-        addonSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
-            items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
-            enabled = store.subtitlesOnlyPreferred,
-            preferredLanguages = store.current.subtitleLanguages,
-            language = AddonSubtitle::lang,
-        )
+    fun selectAutomaticPooledSubtitle(sub: SubtitlePoolClient.PooledSubtitle, readEpoch: Long) {
+        if (automaticPoolRequest != null || !admitCurrentPoolEngine(readEpoch) { true }) return
+        val original = engine.captureSubtitleSelection() ?: return
+        trackSelectionPhases = trackSelectionPhases.recordPoolSelection()
+        poolLoadingId = sub.id
+        poolLoadingSelection = original
+        val request = subtitlePoolScope.launch(start = CoroutineStart.LAZY) {
+            val job = currentCoroutineContext()[Job] ?: return@launch
+            val registration = SourceIndexLifecycle.onEpochInvalidated(readEpoch) { job.cancel() }
+            try {
+                runAutomaticPooledSubtitleSelection(
+                    capture = { original },
+                    permits = { receipt ->
+                        trackSelectionPhases.subtitle != DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION &&
+                            admitCurrentPoolEngine(readEpoch) { engine.isSubtitleSelectionCurrent(receipt) }
+                    },
+                    download = { SubtitlePoolClient.download(context, sub, isSignedIn = true, expectedEpoch = readEpoch) },
+                    mount = { local, receipt ->
+                        awaitSubtitleMount(mountAddonSubtitle(
+                            AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), receipt,
+                            permitsUse = { admitCurrentPoolEngine(readEpoch) { engine.isSubtitleSelectionCurrent(receipt) } }))
+                    },
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Tier-2 failure is silent and never retries as a fresh manual selection.
+            } finally {
+                registration.close()
+                if (automaticPoolRequest === job) automaticPoolRequest = null
+                if (poolLoadingSelection === original) {
+                    poolLoadingId = null
+                    poolLoadingSelection = null
+                }
+            }
+        }
+        automaticPoolRequest = request
+        request.start()
+    }
+    LaunchedEffect(playbackSessionKey, engine) {
+        addonLookupSettled = false
+        try {
+            if (currentPlayable.isTrailer) return@LaunchedEffect
+            val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
+            val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
+            val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+            val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
+            if (sources.isEmpty()) return@LaunchedEffect
+            val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
+            val found = TrackSelector.keepingPreferredSubtitleLanguages(
+                items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
+                enabled = store.subtitlesOnlyPreferred,
+                preferredLanguages = store.current.subtitleLanguages,
+                language = AddonSubtitle::lang,
+            )
+            currentCoroutineContext().ensureActive()
+            admitCurrentSubtitleEngine { addonSubtitles = found; true }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // A terminal lookup failure may use the pool, but canceled old work may not publish.
+        } finally {
+            currentCoroutineContext().ensureActive()
+            admitCurrentSubtitleEngine { addonLookupSettled = true; true }
+        }
     }
     // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
     // inventories can arrive independently, so each type gets one default decision once *its own*
     // selectable inventory appears. A viewer's manual or external subtitle pick holds that type until this
     // loaded engine is replaced; a late inventory must not clobber manual Off or a selected add-on track.
-    val trackPreferences = remember(playbackSessionKey) {
-        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
-    }
     // Read once per load alongside the preferences: when ON, the auto audio pick follows the subtitle chain
     // (Apple `matchAudioSub`). Separate from [trackPreferences] because it is not part of the value struct.
-    val matchAudioSub = remember(playbackSessionKey) {
-        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
-    }
     LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks, trackSelectionPhases) {
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
@@ -1722,7 +1851,6 @@ fun PlayerScreen(
         }
     }
 
-    val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
     LaunchedEffect(playbackSessionKey, engine, trackSelectionPhases, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
         if (addonSubtitles.isEmpty() || !trackSelectionPhases.mayAttemptAddon(latestState.subtitleTracks.isNotEmpty())) {
             return@LaunchedEffect
@@ -1739,6 +1867,24 @@ fun PlayerScreen(
         // this effect. The reservation prevents a second automatic overlay for the same loaded engine.
         trackSelectionPhases = trackSelectionPhases.recordAddonSelection()
         engine.captureSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
+    }
+
+    // Tier 2 follows settled native/add-on decisions. Reserve once, but do not key the
+    // running request to poolAttempted: its own reservation must not cancel its download.
+    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, pooledSubtitles, pooledPublicationEpoch,
+        addonLookupSettled, trackSelectionPhases.audio, trackSelectionPhases.subtitle,
+        poolSignedIn, poolConsent, currentPoolEpoch) {
+        if (!poolSignedIn || !poolConsent || currentPlayable.isTrailer || currentPlayable.isLive ||
+            !trackSelectionPhases.mayAttemptPool(latestState.subtitleTracks.isNotEmpty(), addonLookupSettled,
+                trackPreferences.subtitleLanguages.any { language -> addonSubtitles.any { TrackSelector.matches(it.lang, language) } }) ||
+            !TrackSelector.wantsExternalSubtitle(latestState.audioTracks, latestState.subtitleTracks,
+                trackPreferences, preferAddonSubtitles, matchAudioSub)) return@LaunchedEffect
+        val query = subtitlePoolQuery ?: return@LaunchedEffect
+        val readEpoch = pooledPublicationEpoch?.takeIf { it == currentPoolEpoch } ?: return@LaunchedEffect
+        val sub = trackPreferences.subtitleLanguages.asSequence().mapNotNull { language ->
+            pooledSubtitles.firstOrNull { it.contentKey == query.contentKey && TrackSelector.matches(it.lang, language) }
+        }.firstOrNull() ?: return@LaunchedEffect
+        selectAutomaticPooledSubtitle(sub, readEpoch)
     }
 
     // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
@@ -2317,6 +2463,7 @@ fun PlayerScreen(
             subtitleDelayAvailable = engine.subtitleDelayAvailable,
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
+                cancelAutomaticPoolSelection()
                 showControls()
                 subtitleTiming.applyManualAccepted(adjustedPlayerDelay(subtitleDelaySeconds, delta),
                     engine.subtitleDelayAvailable, ::admitCurrentSubtitleEngine) manualDelay@{ seconds ->
@@ -2383,6 +2530,7 @@ fun PlayerScreen(
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)
                     sourceSwitchState = sourceSwitchState.copy(pendingSwitch = null, errorMessage = null)
                 }
+                cancelAutomaticPoolSelection()
                 trackSelectionPhases = trackSelectionPhases.holdAudio()
                 engine.selectAudioTrack(it)
                 latestState.audioTracks.firstOrNull { track -> track.id == it }?.let { track ->
@@ -2392,6 +2540,7 @@ fun PlayerScreen(
                 }
             },
             onSelectSubtitle = {
+                cancelAutomaticPoolSelection()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.selectSubtitleTrack(it)
@@ -2486,6 +2635,7 @@ fun PlayerScreen(
             },
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
+                cancelAutomaticPoolSelection()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.beginSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
@@ -2496,6 +2646,7 @@ fun PlayerScreen(
             primarySubtitleId = engine.primarySubtitleId,
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
+                cancelAutomaticPoolSelection()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.setSecondarySubtitleTrack(id)
