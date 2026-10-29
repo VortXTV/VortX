@@ -73,6 +73,8 @@ enum AddonSubtitleFileClient {
         }
 
         var selectionIsCurrent: Bool { permit.isCurrent }
+        /// Original request identity only. This does not grant a fetch or player mount.
+        var selectionIdentityURL: URL { requestURL }
         func snapshotIfCurrent() -> Snapshot? {
             guard permit.isCurrent else { return nil }
             return Snapshot(bytes: bytes, format: format, textEncoding: textEncoding, permit: permit)

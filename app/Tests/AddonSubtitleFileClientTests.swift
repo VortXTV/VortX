@@ -36,6 +36,9 @@ private final class SubtitleFileFixture: URLProtocol, @unchecked Sendable {
         case "opaque.json": (mime, bytes) = ("application/x-subrip", Data("1\n00:00:01,000 --> 00:00:02,000\nOpaque\n".utf8))
         case "good.vtt": (mime, bytes) = ("text/vtt", Data("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n".utf8))
         case "good.ass": (mime, bytes) = ("text/x-ass", Data("[Script Info]\nTitle: Fixture\n".utf8))
+        case "styled.ass": (mime, bytes) = ("text/x-ass", Data("[Script Info]\nTitle: Fixture\n[Fonts]\nfontname: https://127.0.0.2/private.ttf\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\fnRemote}Hello\\Nworld\n".utf8))
+        case "playlist.srt": (mime, bytes) = ("application/x-subrip", Data("#EXTM3U\n#EXTINF:2,Private\nhttps://127.0.0.2/private.ts\n".utf8))
+        case "page.srt": (mime, bytes) = ("application/x-subrip", Data("<html><body>Unavailable<iframe src='https://127.0.0.2/private'></iframe></body></html>".utf8))
         case "good.zip": (mime, bytes) = ("application/zip", Data([0x50, 0x4b, 0x03, 0x04]))
         default: (mime, bytes) = ("application/x-subrip", Data("1\n00:00:01,000 --> 00:00:02,000\nHello\n".utf8))
         }
@@ -91,6 +94,41 @@ private final class SubtitleFileFixture: URLProtocol, @unchecked Sendable {
         let httpRow = row("opaque.php", origin: httpOrigin)
         let httpFile = try await AddonSubtitleFileClient.fetch(httpRow,
             permit: .init(for: httpRow) { true }, testURLProtocolClasses: protocols)
+        // Bridge tests compile the actual PlayerLocalSubtitleSource and bounded cue parser too.
+        // A transport receipt, not a caller-supplied HTTP identity or community permit, creates the value.
+        guard let httpSource = PlayerLocalSubtitleSource.installedAddon(httpFile),
+              let httpPrepared = httpSource.preparedNativeSubtitle() else {
+            preconditionFailure("original guarded HTTP receipt normalizes without another fetch")
+        }
+        precondition(httpSource.identityURL.absoluteString == httpRow.url)
+        precondition(httpSource.identityURL.scheme == "http" && httpSource.permitsUse())
+        precondition(httpPrepared.format == "srt" && SubtitleCueRenderer.parse(data: httpPrepared.data).count == 1)
+        precondition(PlayerLocalSubtitleSource(data: httpSource.data, format: "srt",
+            identityURL: httpSource.identityURL, permitsUse: { true }) == nil,
+            "the original pool initializer still rejects caller-supplied HTTP")
+
+        let styled = row("styled.ass")
+        let styledFile = try await AddonSubtitleFileClient.fetch(styled,
+            permit: .init(for: styled) { true }, testURLProtocolClasses: protocols)
+        guard let styledSource = PlayerLocalSubtitleSource.installedAddon(styledFile),
+              let styledPrepared = styledSource.preparedNativeSubtitle(),
+              let styledText = String(data: styledPrepared.data, encoding: .utf8) else {
+            preconditionFailure("actual ASS cue text normalizes to bounded plain SRT")
+        }
+        precondition(styledPrepared.format == "srt" && styledText.contains("Hello\nworld"))
+        precondition(!styledText.contains("[Fonts]") && !styledText.contains("https://") && !styledText.contains("\\fn"))
+        let originalASS = styledSource.data
+        let pool = PlayerLocalSubtitleSource(data: originalASS, format: "ass",
+            identityURL: URL(string: "https://example.invalid/pooled.ass")!, permitsUse: { true })!
+        precondition(pool.preparedNativeSubtitle()?.data == originalASS && pool.preparedNativeSubtitle()?.format == "ass",
+            "existing strict pool source keeps its raw fallback bytes and format")
+        for path in ["playlist.srt", "page.srt"] {
+            let item = row(path)
+            let guarded = try await AddonSubtitleFileClient.fetch(item,
+                permit: .init(for: item) { true }, testURLProtocolClasses: protocols)
+            precondition(PlayerLocalSubtitleSource.installedAddon(guarded)?.preparedNativeSubtitle() == nil,
+                "text transport acceptance cannot turn \(path) into native input")
+        }
         precondition(httpFile.format == .vtt)
 
         let gated = row("good.srt")
@@ -98,8 +136,13 @@ private final class SubtitleFileFixture: URLProtocol, @unchecked Sendable {
         let fetched = try await AddonSubtitleFileClient.fetch(gated,
             permit: .init(for: gated) { gate.read() }, testURLProtocolClasses: protocols)
         guard let snapshot = fetched.snapshotIfCurrent() else { preconditionFailure("current selection gets a byte snapshot") }
+        let originalSource = PlayerLocalSubtitleSource.installedAddon(fetched)
+        precondition(originalSource?.permitsUse() == true)
         precondition(snapshot.selectionIsCurrent && String(data: snapshot.bytes, encoding: .utf8)!.contains("Hello"))
         gate.set(false)
+        precondition(originalSource?.permitsUse() == false && originalSource?.preparedNativeSubtitle() == nil,
+            "retained guarded source rechecks the original pre-fetch selection, not current replacement state")
+        precondition(PlayerLocalSubtitleSource.installedAddon(fetched) == nil)
         precondition(!snapshot.selectionIsCurrent, "snapshot exposes freshness state to the final consumer")
         precondition(!snapshot.bytes.isEmpty, "revocation does not erase bytes already copied into a value snapshot")
         precondition(fetched.snapshotIfCurrent().map { _ in false } ?? true, "no new snapshot after permit revocation")

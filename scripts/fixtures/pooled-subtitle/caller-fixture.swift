@@ -141,6 +141,9 @@ enum SubtitlePoolClient {
     var subtitleLoadingURL: String?
     var subtitlePresentationEpoch = UUID()
     var subtitleAlignmentPresentation: SubtitleAlignmentPresentationRequest?
+    // Task/cancellation storage for the actual shared invalidator. No add-on transport is invoked
+    // by this pooled-caller harness; guarded-file/parser code below is production, not a facade.
+    var addonSubtitlePreparationTask: Task<Void, Never>?
     var subtitlePoolRequests = SubtitlePoolClient.RequestOwnership()
     var addedPooledIDs: Set<Int> = []
     var subtitleLoadFailed = false

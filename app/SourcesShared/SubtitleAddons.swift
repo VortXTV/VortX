@@ -113,12 +113,25 @@ enum SubtitleAddonService {
                         guard let decoded = try? JSONDecoder().decode(SubtitlesResponse.self, from: response.data) else {
                             return (i, [])
                         }
-                        let subs = (decoded.subtitles ?? []).compactMap { sub -> AddonSubtitle? in
-                            guard let url = sub.url, !url.isEmpty else { return nil }
-                            return AddonSubtitle(id: sub.id ?? url, url: url,
-                                                 lang: sub.lang ?? "und", addonName: source.name,
-                                                 installedBaseURL: installedBaseURL,
-                                                 releaseName: sub.subtitleFileName)
+                        var subs: [AddonSubtitle] = []
+                        // Relative links use the actual index location. Private-network permission
+                        // still belongs ONLY to the original installed source, never this redirect.
+                        // Bound expanded URL text too: a long base must not amplify a tiny JSON list.
+                        var remainingURLBytes = AddonURLGuard.ResponseContext.subtitleIndex.maximumBytes
+                        for sub in decoded.subtitles ?? [] {
+                            guard let raw = sub.url, !raw.isEmpty,
+                                  let resolved = URL(string: raw, relativeTo: response.finalURL)?.absoluteURL,
+                                  let scheme = resolved.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                                  let host = resolved.host, !host.isEmpty,
+                                  resolved.user == nil, resolved.password == nil, resolved.fragment == nil else { continue }
+                            let url = resolved.absoluteString
+                            let bytes = url.utf8.count
+                            guard bytes <= AddonURLGuard.ResponseContext.subtitleFile.maximumURLBytes else { continue }
+                            guard bytes <= remainingURLBytes else { break }
+                            remainingURLBytes -= bytes
+                            subs.append(AddonSubtitle(id: sub.id ?? url, url: url,
+                                lang: sub.lang ?? "und", addonName: source.name,
+                                installedBaseURL: installedBaseURL, releaseName: sub.subtitleFileName))
                         }
                         return (i, subs)
                     }

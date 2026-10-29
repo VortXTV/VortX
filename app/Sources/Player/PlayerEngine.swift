@@ -62,6 +62,8 @@ struct PlayerSubtitleAlignmentOwner: Sendable {
 @MainActor
 struct SubtitleAlignmentPresentationRequest {
     let id = UUID()
+    /// Retires pre-engine byte preparation independently from the engine's actual load scope.
+    let preparationCancellation = SubtitleEmbeddedExtractor.TimingWindowCancellation()
     let url: String
     let selectsRequestedFile: Bool
     weak var player: (any PlayerEngine)?
@@ -219,6 +221,11 @@ protocol PlayerEngine: AnyObject {
         title: String, lang: String, owner: PlayerSubtitleAlignmentOwner?,
         expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void) -> UInt64?
+    /// Explicit keep-current alignment from the same guarded bytes; never redownload the identity URL.
+    func alignLocalExternalSubtitle(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerSubtitleAlignmentResult) -> Void) -> UInt64?
     /// Cancel only the original request issued by this same engine, including normal automatic selection.
     func cancelAutomaticSubtitleAlignment(ifRequestGeneration request: UInt64)
     /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
@@ -330,6 +337,15 @@ extension PlayerEngine {
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
     ) -> UInt64? {
         completion(.failed)
+        return nil
+    }
+
+    func alignLocalExternalSubtitle(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerSubtitleAlignmentResult) -> Void
+    ) -> UInt64? {
+        completion(.unavailable)
         return nil
     }
 

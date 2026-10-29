@@ -36,7 +36,11 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
         let host = request.url?.host ?? ""
         let hasMetadata = request.url?.path.contains("/filename=") ?? false
         let body: String
-        if host == "127.0.0.5" && hasMetadata {
+        if host == "127.0.0.16" {
+            body = #"{"subtitles":[{"url":"../captions/en.srt"},{"url":"//127.0.0.99/foreign.srt"},{"url":"file:///private/invalid.srt"},{"url":"bad.srt#fragment"}]}"#
+        } else if host == "127.0.0.20" {
+            body = "{\"subtitles\":[" + (0..<1_024).map { "{\"url\":\"part-\($0).srt\"}" }.joined(separator: ",") + "]}"
+        } else if host == "127.0.0.5" && hasMetadata {
             body = #"{"subtitles":[]}"#
         } else if matchesFile {
             body = #"{"subtitles":[{"id":"matched","url":"https://cdn.invalid/matched.srt","lang":"eng","subtitleFileName":"Episode 9 SiGMA"},17,{"url":null},{"url":"https://cdn.invalid/other.srt","lang":null,"subtitleFileName":8}]}"#
@@ -56,7 +60,10 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
         var headers: [String: String]? = nil
         let responseURL = request.url!
         if request.value(forHTTPHeaderField: "Accept") != "application/json" { status = 500 }
-        if host == "127.0.0.9" && hasMetadata {
+        if host == "127.0.0.16" && hasMetadata {
+            headers = ["Location": "/relocated/deep/index.json"]
+            status = 302
+        } else if host == "127.0.0.9" && hasMetadata {
             headers = ["Location": "https://127.0.0.10/subtitles/series/tt123:1:9/redirected.json"]
             status = 302
         } else if host == "127.0.0.11" && hasMetadata {
@@ -131,6 +138,28 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
             metadata: .init(filename: "other-file.mkv"), testURLProtocolClasses: fixtures)
         precondition(sameOriginRedirect.count == 1 && sameOriginRedirect[0].installedBaseURL.host == "127.0.0.11",
                      "same-origin redirect keeps installed-source provenance")
+        let relativeResult = await SubtitleAddonService.fetch(
+            sources: [.init(baseUrl: "https://127.0.0.16", name: "Relative links")],
+            type: "series", videoId: "tt123:1:9", metadata: .init(filename: "relative.mkv"),
+            testURLProtocolClasses: fixtures)
+        precondition(relativeResult.count == 2,
+                     "relative HTTP(S) links resolve; file/fragment references never become selectable")
+        precondition(relativeResult[0].url == "https://127.0.0.16/relocated/captions/en.srt",
+                     "relative file references use the actual redirected index URL")
+        precondition(relativeResult.allSatisfy { $0.installedBaseURL.absoluteString == "https://127.0.0.16" },
+                     "final index and returned file hosts never replace installed-origin authority")
+        let foreignScope = AddonURLGuard.AccessScope.addon(origin: relativeResult[1].installedBaseURL)
+        let foreignRejection = await AddonURLGuard.validate(URL(string: relativeResult[1].url)!,
+            access: foreignScope, context: .subtitleFile)
+        precondition(foreignRejection != nil, "resolving a scheme-relative URL does not authorize a foreign private file")
+        let expanded = await SubtitleAddonService.fetch(
+            sources: [.init(baseUrl: "https://127.0.0.20/" + String(repeating: "a", count: 4_000), name: "Long origin")],
+            type: "series", videoId: "tt123:1:9", metadata: .init(filename: "large-list.mkv"),
+            testURLProtocolClasses: fixtures)
+        precondition(!expanded.isEmpty && expanded.count < 1_024,
+                     "relative-URL expansion must stop at a finite aggregate budget")
+        precondition(expanded.reduce(0) { $0 + $1.url.utf8.count }
+                     <= AddonURLGuard.ResponseContext.subtitleIndex.maximumBytes)
         let changedOriginRedirect = await SubtitleAddonService.fetch(
             sources: [.init(baseUrl: "https://127.0.0.9", name: "Redirect")], type: "series", videoId: "tt123:1:9",
             metadata: .init(filename: "other-file.mkv"), testURLProtocolClasses: fixtures)

@@ -49,8 +49,30 @@ tv = source('app/SourcesTV/TVPlayerView.swift')
 pool = source('app/SourcesShared/SubtitlePoolClient.swift')
 engine = source('app/Sources/Player/PlayerEngine.swift')
 policy = source('app/SourcesShared/PooledSubtitleSelectionPolicy.swift')
+# Keep the real policy's guarded-file factory compilable; do not replace its receipt or parser
+# with permissive fixture facades. The selected renderer span contains only Foundation value work.
+renderer = source('app/Sources/Player/SubtitleCueRenderer.swift')
+renderer_start = 'enum SubtitleFileBudget {'
+renderer_end = '\n/// Downloads external subtitle bytes'
+assert renderer.count(renderer_start) == 1 and renderer.count(renderer_end) == 1
+renderer_value_source = renderer[renderer.index(renderer_start):renderer.index(renderer_end)]
+assert 'final class SubtitleCueRenderer {' in renderer_value_source
+assert 'SubtitleFileFetcher' not in renderer_value_source
+extractor = source('app/SourcesShared/SubtitleEmbeddedExtractor.swift')
+actual_cancellation = declaration(extractor, '    final class TimingWindowCancellation: Sendable {')
+actual_dependencies = '\n'.join([
+    'import os',
+    source('app/SourcesShared/AddonPairingProtocol.swift'),
+    source('app/SourcesShared/SubtitleRequestMetadata.swift'),
+    source('app/SourcesShared/AddonURLGuard.swift'),
+    source('app/Tests/AddonSubtitleFileClientFixtures.swift'),
+    source('app/SourcesShared/SubtitleAddons.swift'),
+    renderer_value_source,
+    source('app/SourcesShared/AddonSubtitleFileClient.swift'),
+    'enum SubtitleEmbeddedExtractor {\n' + actual_cancellation + '\n}',
+])
 replacements = {
-    '// INSERT_POLICY': policy,
+    '// INSERT_POLICY': actual_dependencies + '\n' + policy,
     '// INSERT_PRESENTATION': '@MainActor\n' + declaration(engine, 'struct SubtitleAlignmentPresentationRequest {'),
     '// INSERT_FENCE': declaration(pool, '    struct PublicationFence: Sendable {'),
     '// INSERT_LEDGER': declaration(pool, '    struct RequestOwnership: Sendable {'),

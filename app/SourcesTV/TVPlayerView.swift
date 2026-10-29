@@ -469,6 +469,7 @@ struct TVPlayerView: View {
     @State private var addedSubURLs: Set<String> = []
     @State private var subtitleLoadingURL: String?     // an add-on subtitle is downloading (shows Loading… in its row)
     @State private var subtitleAlignmentPresentation: SubtitleAlignmentPresentationRequest?
+    @State private var addonSubtitlePreparationTask: Task<Void, Never>?
     @State private var subtitlePresentationEpoch = UUID()
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
     // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
@@ -8404,10 +8405,103 @@ struct TVPlayerView: View {
         subtitleDelayAppliedLoadToken = loadToken
     }
 
-    /// Retire only the pending alignment's UI and original engine. Ordinary downloads keep
-    /// their existing latch when no alignment owns it; same-URL successor work is never cleared.
+    /// Clear only the request whose presentation UUID still owns the shared loading row.
+    private func clearAddonSubtitlePreparation(presentationID: UUID, url: String) -> Bool {
+        guard subtitleAlignmentPresentation?.id == presentationID else { return false }
+        // Do not cancel the source permit after a successful mount; the engine owns its revision lifetime.
+        addonSubtitlePreparationTask = nil
+        subtitleAlignmentPresentation = nil
+        if subtitleLoadingURL == url { subtitleLoadingURL = nil }
+        return true
+    }
+
+    private func refreshAddonSubtitleRows() {
+        if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
+    }
+
+    private func startAddonSubtitlePreparation(
+        _ subtitle: AddonSubtitle,
+        presentation: SubtitleAlignmentPresentationRequest,
+        player: any PlayerEngine,
+        load: PlayerLoadToken,
+        loadLifetime: SubtitlePoolClient.ContributionLoad,
+        revision: UInt64,
+        target: PlaybackMutationTarget,
+        owner: PlayerSubtitleAlignmentOwner?,
+        videoID: String?,
+        credential: CredentialScopeRegistry.Capture,
+        applicationEpoch: UUID,
+        failure: (@MainActor () -> Void)?,
+        onPrepared: @escaping @MainActor (PlayerLocalSubtitleSource,
+            SubtitleEmbeddedExtractor.TimingWindowCancellation) -> Void
+    ) {
+        let cancellation = presentation.preparationCancellation
+        let permit = AddonSubtitleFileClient.FreshnessPermit(for: subtitle) {
+            !cancellation.isCancelled && loadLifetime.isCurrent
+                && CredentialScopeRegistry.shared.isCurrent(credential)
+                && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+        }
+        let task = Task { @MainActor in
+            do {
+                let file = try await AddonSubtitleFileClient.fetch(subtitle, permit: permit)
+                let current = !cancellation.isCancelled
+                    && subtitleAlignmentPresentation?.id == presentation.id
+                    && subtitlePresentationEpoch == presentation.id
+                    && subtitleLoadingURL == subtitle.url
+                    && player === coordinator.player
+                    && player.activeLoadToken == load
+                    && loadLifetime.isCurrent
+                    && player.subtitleAlignmentRevision == revision
+                    && target.stillOwnsCurrentContext(core: core)
+                    && curMeta?.videoId == videoID
+                    && CredentialScopeRegistry.shared.isCurrent(credential)
+                    && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                    && (owner.map { $0.applicationEpoch == applicationEpoch && $0.account == credential } ?? true)
+                guard current else {
+                    presentation.preparationCancellation.cancel()
+                    if clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) {
+                        refreshAddonSubtitleRows()
+                    }
+                    return
+                }
+                guard let source = PlayerLocalSubtitleSource.installedAddon(file) else {
+                    presentation.preparationCancellation.cancel()
+                    guard clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) else { return }
+                    failure?()
+                    refreshAddonSubtitleRows()
+                    return
+                }
+                addonSubtitlePreparationTask = nil
+                onPrepared(source, cancellation)
+            } catch {
+                guard subtitleAlignmentPresentation?.id == presentation.id else { return }
+                let current = !cancellation.isCancelled
+                    && subtitlePresentationEpoch == presentation.id
+                    && subtitleLoadingURL == subtitle.url
+                    && player === coordinator.player
+                    && player.activeLoadToken == load
+                    && loadLifetime.isCurrent
+                    && player.subtitleAlignmentRevision == revision
+                    && target.stillOwnsCurrentContext(core: core)
+                    && curMeta?.videoId == videoID
+                    && CredentialScopeRegistry.shared.isCurrent(credential)
+                    && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                    && (owner.map { $0.applicationEpoch == applicationEpoch && $0.account == credential } ?? true)
+                if !current { presentation.preparationCancellation.cancel() }
+                guard clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) else { return }
+                if current { failure?() }
+                refreshAddonSubtitleRows()
+            }
+        }
+        addonSubtitlePreparationTask = task
+    }
+
+    /// Retire only the pending presentation and original engine request. Same-URL successor work is never cleared.
     private func invalidateSubtitleAlignmentPresentation() {
+        addonSubtitlePreparationTask?.cancel()
+        addonSubtitlePreparationTask = nil
         guard let original = subtitleAlignmentPresentation else { return }
+        original.preparationCancellation.cancel()
         subtitleAlignmentPresentation = nil
         subtitlePresentationEpoch = UUID()
         if subtitleLoadingURL == original.url { subtitleLoadingURL = nil }
@@ -8435,71 +8529,88 @@ struct TVPlayerView: View {
         }
         guard subtitleLoadingURL == nil, let player = coordinator.player,
               let load = player.activeLoadToken else { return }
-        // Establish saved timing before this operation captures its manual generation.
-        // A late automatic restore is deferred by applyCurrentSubtitleDelayIfReady while pending.
         restoreSubtitleTimingOffsetIfReady()
         applyCurrentSubtitleDelayIfReady(force: false)
-        let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget)
-        // MPV automatic/fallback publication requires the original Bridge-issued mount owner.
-        guard !(player is MPVMetalViewController) || owner != nil else {
-            if !automatic { showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? "") }
+        let target = playbackMutationTarget
+        guard target.stillOwnsCurrentContext(core: core) else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+            return
+        }
+        guard let loadLifetime = player.captureSubtitleContributionLoad(for: load),
+              let revision = player.subtitleAlignmentRevision,
+              let applicationEpoch = LegacyWatchOwnership.captureApplicationEpoch() else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+            return
+        }
+        let credential = CredentialScopeRegistry.shared.capture()
+        let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: target)
+        guard !(player is MPVMetalViewController) || owner != nil,
+              owner.map({ $0.applicationEpoch == applicationEpoch && $0.account == credential }) ?? true else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
             return
         }
         if automatic { autoAddonSubTried = true } else { userPickedSubtitle = true }
         let video = curMeta?.videoId
-        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: sub.url, selectsRequestedFile: true)
+        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: sub.url,
+            selectsRequestedFile: true)
         subtitlePresentationEpoch = presentation.id
         subtitleAlignmentPresentation = presentation
         subtitlePoolRequests.invalidate()
         if !automatic { suppressRapidBufferingRecovery(reason: "user external subtitle") }
         subtitleLoadingURL = sub.url
-        refreshTracksSoon()
-        let request = player.selectExternalSubtitleAutomatically(url: sub.url, title: sub.displayTitle,
-            lang: sub.lang, owner: owner) { result in
-            guard subtitleAlignmentPresentation?.id == presentation.id,
-                  player === coordinator.player,
-                  permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
-                  subtitleLoadingURL == sub.url else { return }
-            subtitleAlignmentPresentation = nil
-            subtitleLoadingURL = nil
-            guard playbackMutationTarget.stillOwnsCurrentContext(core: core),
-                  owner.map({ LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) }) ?? true else { return }
-            if result.succeeded {
-                if case .selectedWithoutAlignment = result {
-                    addedSubURLs.insert(sub.url)
-                    applyCurrentSubtitleDelayIfReady(force: false)
-                    // A pool result that arrived while this selection was pending was held out
-                    // of its timing transaction. Retry under the now-mounted raw selection.
-                    subtitlePoolRequests.invalidate()
-                    fetchPooledSubtitles()
-                } else if subDelay == 0 {
-                    // Real cue alignment already corrected timing. A later community constant
-                    // must not retire its renderer or silently change that accepted result.
-                    pooledSeededOffset = true
-                    subDelay = 0
-                    subtitleDelayAppliedLoadToken = load
-                } else {
-                    // A saved manual offset may become knowable after the admission (for
-                    // example when release metadata arrives). Preserve that viewer preference;
-                    // strict retirement reveals the already-selected requested raw subtitle.
-                    applyCurrentSubtitleDelayIfReady(force: false)
+        refreshAddonSubtitleRows()
+        startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
+            loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
+            videoID: video, credential: credential, applicationEpoch: applicationEpoch,
+            failure: automatic ? nil : {
+                self.showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }) { source, cancellation in
+                let request = player.selectLocalExternalSubtitleAutomatically(source,
+                    title: sub.displayTitle, lang: sub.lang, owner: owner,
+                    expectedLoad: load, expectedRevision: revision) { result in
+                    guard self.subtitleAlignmentPresentation?.id == presentation.id else { return }
+                    let mayPublish = !cancellation.isCancelled
+                        && player === self.coordinator.player
+                        && self.permitsSubtitlePublication(loadToken: load, videoID: video,
+                            presentationID: presentation.id)
+                        && loadLifetime.isCurrent
+                        && target.stillOwnsCurrentContext(core: self.core)
+                        && CredentialScopeRegistry.shared.isCurrent(credential)
+                        && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                        && (owner.map { LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) && $0.account == credential } ?? true)
+                    guard self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url) else { return }
+                    guard mayPublish else { self.refreshAddonSubtitleRows(); return }
+                    if result.succeeded {
+                        if case .selectedWithoutAlignment = result {
+                            self.addedSubURLs.insert(sub.url)
+                            self.applyCurrentSubtitleDelayIfReady(force: false)
+                            self.subtitlePoolRequests.invalidate()
+                            self.fetchPooledSubtitles()
+                        } else if self.subDelay == 0 {
+                            self.pooledSeededOffset = true
+                            self.subDelay = 0
+                            self.subtitleDelayAppliedLoadToken = load
+                        } else {
+                            self.applyCurrentSubtitleDelayIfReady(force: false)
+                        }
+                        // Successful UI completion does not revoke the source permit held by the engine.
+                    }
+                    if !automatic, let message = result.failureMessage { self.showEngineNote(message) }
+                    self.refreshAddonSubtitleRows()
                 }
-                // Optional donation waits for an owned selected-byte export; never re-fetch the URL.
+                if self.subtitleAlignmentPresentation?.id == presentation.id {
+                    self.subtitleAlignmentPresentation?.requestGeneration = request
+                    self.addonSubtitlePreparationTask = nil
+                }
             }
-            if !automatic, let message = result.failureMessage { showEngineNote(message) }
-            refreshTracksSoon()
-        }
-        // Nil also means AVKit's ordinary asynchronous load, which retains its existing revision guard.
-        // Do not clear a still-active presentation simply because that engine has no MPV cancel token.
-        if subtitleAlignmentPresentation?.id == presentation.id {
-            subtitleAlignmentPresentation?.requestGeneration = request
-        }
     }
 
-    /// A subtitle request may finish after an episode load or same-episode reload replaced the player item.
-    /// Require both its opaque load token and its content identity before publishing completion state.
-    /// Keep ordinary subtitle selection separate from this explicit automatic timing request.
-    /// Its mounted owner is captured before the first asynchronous operation, never on completion.
     private func alignAddonSubtitle(_ sub: AddonSubtitle) {
         invalidateSubtitleAlignmentPresentation()
         guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
@@ -8507,7 +8618,20 @@ struct TVPlayerView: View {
             showEngineNote(PlayerSubtitleAlignmentResult.unavailable.failureMessage ?? "")
             return
         }
-        guard let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget) else {
+        let target = playbackMutationTarget
+        guard target.stillOwnsCurrentContext(core: core) else {
+            showEngineNote(PlayerSubtitleAlignmentResult.superseded.failureMessage ?? "")
+            return
+        }
+        guard let loadLifetime = player.captureSubtitleContributionLoad(for: load),
+              let revision = player.subtitleAlignmentRevision,
+              let applicationEpoch = LegacyWatchOwnership.captureApplicationEpoch() else {
+            showEngineNote(PlayerSubtitleAlignmentResult.unavailable.failureMessage ?? "")
+            return
+        }
+        let credential = CredentialScopeRegistry.shared.capture()
+        guard let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: target),
+              owner.applicationEpoch == applicationEpoch, owner.account == credential else {
             showEngineNote(PlayerSubtitleAlignmentResult.superseded.failureMessage ?? "")
             return
         }
@@ -8518,32 +8642,42 @@ struct TVPlayerView: View {
         subtitleAlignmentPresentation = presentation
         subtitlePoolRequests.invalidate()
         subtitleLoadingURL = sub.url
-        refreshTracksSoon()
-        let requestGeneration = player.alignExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang, owner: owner) { result in
-            guard subtitleAlignmentPresentation?.id == presentation.id,
-                  player === coordinator.player,
-                  permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
-                  subtitleLoadingURL == sub.url else { return }
-            subtitleAlignmentPresentation = nil
-            subtitleLoadingURL = nil
-            guard playbackMutationTarget.stillOwnsCurrentContext(core: core),
-                  LegacyWatchOwnership.applicationEpochIsCurrent(owner.applicationEpoch) else { return }
-            if let message = result.failureMessage {
-                showEngineNote(message)
+        refreshAddonSubtitleRows()
+        startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
+            loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
+            videoID: video, credential: credential, applicationEpoch: applicationEpoch,
+            failure: {
+                self.showEngineNote(PlayerSubtitleAlignmentResult.failed.failureMessage ?? "")
+            }) { source, cancellation in
+                let request = player.alignLocalExternalSubtitle(source,
+                    title: sub.displayTitle, lang: sub.lang, owner: owner,
+                    expectedLoad: load, expectedRevision: revision) { result in
+                    guard self.subtitleAlignmentPresentation?.id == presentation.id else { return }
+                    let mayPublish = !cancellation.isCancelled
+                        && player === self.coordinator.player
+                        && self.permitsSubtitlePublication(loadToken: load, videoID: video,
+                            presentationID: presentation.id)
+                        && loadLifetime.isCurrent
+                        && target.stillOwnsCurrentContext(core: self.core)
+                        && CredentialScopeRegistry.shared.isCurrent(credential)
+                        && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                        && owner.applicationEpoch == applicationEpoch
+                        && owner.account == credential
+                    guard self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url) else { return }
+                    guard mayPublish else { self.refreshAddonSubtitleRows(); return }
+                    if let message = result.failureMessage { self.showEngineNote(message) }
+                    self.refreshAddonSubtitleRows()
+                }
+                if self.subtitleAlignmentPresentation?.id == presentation.id {
+                    if let request {
+                        self.subtitleAlignmentPresentation?.requestGeneration = request
+                        self.addonSubtitlePreparationTask = nil
+                    } else {
+                        _ = self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url)
+                        self.refreshAddonSubtitleRows()
+                    }
+                }
             }
-            refreshTracksSoon()
-        }
-        // The callee returns its original request, never a later sampled generation.
-        // A synchronous rejection may already have completed and cleared this presentation.
-        if subtitleAlignmentPresentation?.id == presentation.id {
-            if let requestGeneration {
-                subtitleAlignmentPresentation?.requestGeneration = requestGeneration
-            } else {
-                subtitleAlignmentPresentation = nil
-                if subtitleLoadingURL == sub.url { subtitleLoadingURL = nil }
-                refreshTracksSoon()
-            }
-        }
     }
 
     private func permitsSubtitlePublication(loadToken: PlayerLoadToken?, videoID: String?,

@@ -5037,7 +5037,11 @@ final class MPVMetalViewController: PlatformViewController {
                 }
             }
             if let localSource {
-                consume(Self.snapshotAutomaticSubtitle(bytes: localSource.data, suffix: localSource.format,
+                guard self?.permitsOriginalSubtitleSelection(original) == true,
+                      let prepared = localSource.preparedNativeSubtitle() else {
+                    finish.finish(localSource.permitsUse() ? .failed : .superseded); return
+                }
+                consume(Self.snapshotAutomaticSubtitle(bytes: prepared.data, suffix: prepared.format,
                     permitsUse: localSource.permitsUse))
             } else {
                 let downloaded: @Sendable (URL?) -> Void = { local in
@@ -5182,15 +5186,51 @@ final class MPVMetalViewController: PlatformViewController {
         return original.request
     }
 
+    /// Keep-current alignment consumes the SAME guarded local value without selecting its raw track.
+    /// The identity URL is never a fallback fetch instruction, including the remote-reference branch.
+    func alignLocalExternalSubtitle(_ source: PlayerLocalSubtitleSource,
+        title: String, lang: String, owner: PlayerSubtitleAlignmentOwner,
+        expectedLoad: PlayerLoadToken, expectedRevision: UInt64,
+        completion: @escaping (PlayerSubtitleAlignmentResult) -> Void
+    ) -> UInt64? {
+        guard source.permitsUse(), activeLoadToken == expectedLoad,
+              subtitleAlignmentRevision == expectedRevision,
+              let context = nativeContext else { completion(.superseded); return nil }
+        let original = beginOriginalSubtitleAlignment(context: context, load: expectedLoad,
+            permitsUse: source.permitsUse)
+        let finish = MPVMainCompletion(completion, subtitleLifetime: original.lifetime)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, self.permitsOriginalSubtitleSelection(original) else {
+                finish.finish(.superseded); return
+            }
+            guard let prepared = source.preparedNativeSubtitle(),
+                  let snapshot = Self.snapshotAutomaticSubtitle(bytes: prepared.data,
+                    suffix: prepared.format, permitsUse: source.permitsUse) else {
+                finish.finish(source.permitsUse() ? .unavailable : .superseded); return
+            }
+            Task { @MainActor [weak self] in
+                guard let self, self.permitsOriginalSubtitleSelection(original) else {
+                    finish.finish(.superseded); return
+                }
+                self.prepareOriginalSubtitleAlignment(remote: source.identityURL,
+                    url: source.identityURL.absoluteString, title: title, lang: lang,
+                    owner: owner, original: original, normalMount: nil, localSnapshot: snapshot, finish: finish)
+            }
+        }
+        return original.request
+    }
+
     private func prepareOriginalSubtitleAlignment(remote: URL, url: String, title: String, lang: String,
         owner: PlayerSubtitleAlignmentOwner, original: OriginalSubtitleAlignmentAdmission,
-        normalMount: AutomaticSubtitleMountReceipt?, finish: MPVMainCompletion<PlayerSubtitleAlignmentResult>
+        normalMount: AutomaticSubtitleMountReceipt?, localSnapshot: AutomaticSubtitleSnapshot? = nil,
+        finish: MPVMainCompletion<PlayerSubtitleAlignmentResult>
     ) {
         let context = original.context
         let load = original.load
         let generation = (request: original.request, manual: original.manual, remotePredecessor: original.predecessor)
         let cancellation = original.cancellation
         let requestLifetime = original.lifetime
+        let permitsUse = original.permitsUse
         let retirementStopper = MPVSubtitleRetirementStopper(controller: self, context: context)
         queue.async { [weak self, context] in
             guard let self, self.permitsOriginalSubtitleSelection(original) else { finish.finish(.superseded); return }
@@ -5234,16 +5274,18 @@ final class MPVMetalViewController: PlatformViewController {
                     predecessor: generation.remotePredecessor,
                     remoteCancellation: requestLifetime,
                     capture: remoteCapture, cancellation: cancellation, normalMount: normalMount,
+                    localSnapshot: localSnapshot, permitsUse: permitsUse,
                     retirementStopper: retirementStopper, finish: finish)
                 return
             }
             DispatchQueue.global(qos: .utility).async { [weak self, context] in
-                guard let self, !cancellation.isCancelled,
+                guard let self, permitsUse(), !cancellation.isCancelled,
                       let source = try? SubtitleEmbeddedExtractor.LocalTimingSource.open(input: capture.input),
                       capture.localFile.matches(source.identity) else { finish.finish(.unavailable); return }
                 let consume: @Sendable (URL?) -> Void = { [weak self, context] local in
-                    guard let self, let local, !cancellation.isCancelled,
-                          let bytes = normalMount?.externalBytes ?? MPVOwnedSubtitleTransport.externalSRT(local),
+                    guard let self, let local, permitsUse(), !cancellation.isCancelled,
+                          let bytes = normalMount?.externalBytes ?? localSnapshot?.bytes
+                            ?? MPVOwnedSubtitleTransport.externalSRT(local),
                           let window = try? SubtitleEmbeddedExtractor.TimingWindow(
                             startSeconds: 0, endSeconds: 1_080, purpose: .reference) else { finish.finish(.unavailable); return }
                     let identity = SubtitleReferencePreparation.Identity(originalJob: UUID(), originalLoad: load,
@@ -5265,7 +5307,7 @@ final class MPVMetalViewController: PlatformViewController {
                     Task.detached(priority: .utility) { [weak self, context, prepared] in
                         if let predecessor = generation.remotePredecessor { await predecessor.waitForCompletion() }
                         guard let self, !cancellation.isCancelled,
-                              normalMount?.snapshot.permitsUse() ?? true,
+                              permitsUse(),
                               self.nativeContext === context,
                               self.callbackLoadToken(requiresLoadedFile: true) == load,
                               self.externalSubtitleRequestGeneration == generation.0,
@@ -5288,7 +5330,7 @@ final class MPVMetalViewController: PlatformViewController {
                             _ = CredentialPublicationOutbox.unregisterSubtitleRenderer(registration)
                         }
                         let preparedReply: MPVOwnedSubtitleTransport.PreparationResult
-                        if cancellation.isCancelled || cleanup.retirementRequested
+                        if !permitsUse() || cancellation.isCancelled || cleanup.retirementRequested
                             || (try? prepared.originalSource.validateUnchanged()) == nil {
                             preparedReply = .rejected
                         } else {
@@ -5314,7 +5356,7 @@ final class MPVMetalViewController: PlatformViewController {
                                         // Original descriptor is held through native preparation and
                                         // checked again after its worker finishes; no owner lock is held.
                                         guard !cancellation.isCancelled, !cleanup.retirementRequested,
-                                              normalMount?.snapshot.permitsUse() ?? true,
+                                              permitsUse(),
                                               (try? prepared.originalSource.validateUnchanged()) != nil,
                                               prepared.originalSourceIdentity == prepared.originalSource.identity,
                                               self.nativeContext === context,
@@ -5356,6 +5398,7 @@ final class MPVMetalViewController: PlatformViewController {
                     }
                 }
                 if let normalMount { consume(normalMount.localFile) }
+                else if let localSnapshot { consume(localSnapshot.url) }
                 else if let cached = Self.cachedSubtitleFile(for: remote) { consume(cached) }
                 else { Self.downloadSubtitle(remote, timeout: Self.subtitleDownloadTimeout,
                                                retriesLeft: Self.subtitleDownloadRetries, done: consume) }
@@ -5373,6 +5416,7 @@ final class MPVMetalViewController: PlatformViewController {
         capture: MPVRemoteReferenceTransport.Capture,
         cancellation: SubtitleEmbeddedExtractor.TimingWindowCancellation,
         normalMount: AutomaticSubtitleMountReceipt?,
+        localSnapshot: AutomaticSubtitleSnapshot?, permitsUse: @escaping @Sendable () -> Bool,
         retirementStopper: MPVSubtitleRetirementStopper,
         finish: MPVMainCompletion<PlayerSubtitleAlignmentResult>
     ) {
@@ -5387,7 +5431,7 @@ final class MPVMetalViewController: PlatformViewController {
         Task.detached(priority: .utility) { [weak self, context] in
             if let predecessor { await predecessor.waitForCompletion() }
             guard let self, !cancellation.isCancelled, !remoteCancellation.isCancelled,
-                  normalMount?.snapshot.permitsUse() ?? true,
+                  permitsUse(),
                   self.nativeContext === context, self.callbackLoadToken(requiresLoadedFile: true) == load,
                   self.externalSubtitleRequestGeneration == generation.request,
                   self.native.read({ $0.subtitleAlignmentGeneration }) == generation.manual,
@@ -5397,7 +5441,8 @@ final class MPVMetalViewController: PlatformViewController {
             let result = await self.prepareAndMountRemoteSubtitle(remote: remote, url: url, title: title,
                 lang: lang, owner: owner, context: context, load: load, generation: generation,
                 capture: capture, cancellation: cancellation, remoteCancellation: remoteCancellation,
-                normalMount: normalMount, retirementStopper: retirementStopper, effect: effect)
+                normalMount: normalMount, localSnapshot: localSnapshot, permitsUse: permitsUse,
+                retirementStopper: retirementStopper, effect: effect)
             CredentialPublicationOutbox.endSubtitleEffect(effect)
             finish.finish(result)
         }
@@ -5410,6 +5455,7 @@ final class MPVMetalViewController: PlatformViewController {
         cancellation: SubtitleEmbeddedExtractor.TimingWindowCancellation,
         remoteCancellation: MPVRemoteReferenceCancellation,
         normalMount: AutomaticSubtitleMountReceipt?,
+        localSnapshot: AutomaticSubtitleSnapshot?, permitsUse: @escaping @Sendable () -> Bool,
         retirementStopper: MPVSubtitleRetirementStopper,
         effect: CredentialPublicationOutbox.SubtitleEffectLease
     ) async -> PlayerSubtitleAlignmentResult {
@@ -5430,7 +5476,7 @@ final class MPVMetalViewController: PlatformViewController {
             CredentialPublicationOutbox.unregisterSubtitleRenderer(registration) ? desired : .needsStop
         }
         func current() -> Bool {
-            (normalMount?.snapshot.permitsUse() ?? true)
+            permitsUse()
                 && !cancellation.isCancelled && !remoteCancellation.isCancelled && !cleanup.retirementRequested
                 && nativeContext === context && callbackLoadToken(requiresLoadedFile: true) == load
                 && externalSubtitleRequestGeneration == generation.request
@@ -5438,6 +5484,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         // READ captures its owned original resource before any external subtitle fetch starts.
         // Its utility work and later final-owner validation never occupy the MPV event queue.
+        guard current() else { return close(.superseded) }
         let read = await context.referenceCommand(.read(capture), cancellation: remoteCancellation)
         cleanup.receivedRead(read)
         guard case .read(let reference) = read else {
@@ -5446,6 +5493,7 @@ final class MPVMetalViewController: PlatformViewController {
         guard current() else { return close(.superseded) }
         let bytes: Data?
         if let normalMount { bytes = normalMount.externalBytes }
+        else if let localSnapshot { bytes = localSnapshot.bytes }
         else {
             let local: URL? = await withCheckedContinuation { continuation in
                 if let cached = Self.cachedSubtitleFile(for: remote) { continuation.resume(returning: cached) }
@@ -5482,7 +5530,7 @@ final class MPVMetalViewController: PlatformViewController {
                     let closed = CredentialPublicationOutbox.unregisterSubtitleRenderer(registration)
                     continuation.resume(returning: closed ? .superseded : .needsStop); return
                 }
-                guard normalMount?.snapshot.permitsUse() ?? true else {
+                guard permitsUse() else {
                     let closed = CredentialPublicationOutbox.unregisterSubtitleRenderer(registration)
                     continuation.resume(returning: closed ? .superseded : .needsStop); return
                 }
