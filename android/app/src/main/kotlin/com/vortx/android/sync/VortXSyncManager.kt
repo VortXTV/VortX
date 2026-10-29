@@ -328,6 +328,10 @@ internal class SessionOperationCoordinator {
         read(sessionGeneration)
     }
 
+    /** Capture both authorities without changing auth or durable-session transition semantics. */
+    fun <T> snapshotAuthority(read: (authGeneration: Long, sessionGeneration: Long) -> T): T =
+        synchronized(lock) { read(authGeneration, sessionGeneration) }
+
     fun isCurrent(expectedGeneration: Long): Boolean = synchronized(lock) {
         sessionGeneration == expectedGeneration
     }
@@ -1194,6 +1198,44 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     /** True whenever a session is present (a token + data key were adopted and persisted). */
     val isSignedIn: Boolean get() = session != null
+
+    /**
+     * An in-memory bearer bound to the account, selected profile and current auth intent. The original
+     * owner token is captured BEFORE reading any state. No encrypted-store read or data-key copy occurs.
+     * A transition in flight, unknown session truth, or an unbound profile fails closed.
+     */
+    internal fun captureWatchPartyAuth(): WatchPartyAuthSnapshot? {
+        val owner = com.vortx.android.player.PlaybackOwnerEpoch.capture() ?: return null
+        val captured = operations.snapshotAuthority { authGeneration, sessionGeneration ->
+            sessionState.serialized {
+                val current = sessionState.value ?: return@serialized null
+                val published = _sessionUiState.value as? SessionUiState.SignedIn
+                    ?: return@serialized null
+                if (published.account != current.account || _account.value != current.account) {
+                    return@serialized null
+                }
+                // activeProfileId has an Owner fallback while a roster is absent. A party must bind
+                // to an actual selected profile rather than adopting that temporary fallback.
+                val selected = profileStore?.active ?: return@serialized null
+                WatchPartyAuthSnapshot.capture(
+                    bearer = current.token,
+                    accountId = current.account.id,
+                    profileId = selected.id,
+                    authGeneration = authGeneration,
+                    sessionGeneration = sessionGeneration,
+                    ownerEpoch = sessionState.ownerEpoch,
+                    ownerToken = owner,
+                )
+            }
+        }
+        return captured?.takeIf { com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(owner) }
+    }
+
+    /** Revalidate after EVERY suspension; this is proof of authority, not a player-mutation lock. */
+    internal fun isCurrentWatchPartyAuth(snapshot: WatchPartyAuthSnapshot): Boolean {
+        if (!com.vortx.android.player.PlaybackOwnerEpoch.isCurrent(snapshot.ownerToken)) return false
+        return captureWatchPartyAuth()?.let(snapshot::sameAuthorityAs) == true
+    }
 
     init {
         operations.snapshot { bindLibraryAccount(session?.account?.id) }

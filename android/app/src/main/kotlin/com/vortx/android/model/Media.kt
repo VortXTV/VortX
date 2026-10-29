@@ -670,6 +670,8 @@ data class Playable(
     /// meta id + chosen episode); [com.vortx.android.integrations.ScrobbleService] consumes it on the
     /// play/pause/stop transitions. Mirrors the Apple `ExternalMediaRef`.
     val mediaRef: MediaRef? = null,
+    /** Exact selected catalog video ID for encrypted party matching; never sent to the relay in clear. */
+    val watchPartyVideoId: String? = null,
     /// A SECOND, audio-only URL to merge with [url] at load, non-null ONLY for a client-resolved YouTube
     /// trailer whose modern InnerTube answer is ADAPTIVE (a video-only leg + a separate audio leg, the
     /// norm at every height on the app clients). The mpv engine mounts it via `audio-add`; the ExoPlayer

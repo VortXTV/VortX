@@ -68,6 +68,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import com.vortx.android.party.WatchPartyButton
+import com.vortx.android.party.WatchPartyClientSession
+import com.vortx.android.party.WatchPartyOwnerStamp
+import com.vortx.android.party.WatchPartyPanel
+import com.vortx.android.party.WatchPartyWire
 import com.vortx.android.VortXApplication
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.ui.theme.VortXTheme
@@ -293,6 +298,10 @@ fun PlayerScreen(
                 },
             ),
         )
+    }
+    // Explicit user controls publish through the current room only; remote/automatic effects do not recurse.
+    val partyPublisher = remember(playbackSessionKey) {
+        java.util.concurrent.atomic.AtomicReference<((String, Long) -> Unit)?>(null)
     }
     // A successful inner replacement gets a fresh source terminal verdict while retaining the intent
     // above. Initial playback is harmless (the controller starts non-terminal); failed sources remain
@@ -888,9 +897,25 @@ fun PlayerScreen(
         engine.seekTo(positionMs)
     }
 
-    fun seekLocalBy(deltaMs: Long) {
-        invalidateAutoSkipPending(engine.state.value.positionMs)
+    fun userSeekLocalBy(deltaMs: Long) {
+        val state = engine.state.value
+        val boundedDelta = deltaMs.coerceIn(-86_400_000L, 86_400_000L)
+        val predicted = (state.positionMs.coerceIn(0, 86_400_000) + boundedDelta)
+            .coerceIn(0, state.durationMs.takeIf { it > 0L }?.coerceAtMost(86_400_000) ?: 86_400_000)
+        invalidateAutoSkipPending(state.positionMs)
         engine.seekBy(deltaMs)
+        partyPublisher.get()?.invoke("seek", predicted)
+    }
+    fun userSeekLocalTo(positionMs: Long) {
+        seekLocalTo(positionMs)
+        partyPublisher.get()?.invoke("seek", positionMs)
+    }
+    fun userSetPlaying(playing: Boolean) {
+        if (playing) playbackIntent.userPlay() else playbackIntent.userPause()
+        partyPublisher.get()?.invoke(if (playing) "play" else "pause", engine.state.value.positionMs)
+    }
+    fun userTogglePlayback() {
+        userSetPlaying(engine.state.value.isPaused || !playbackIntent.snapshot().shouldPlay)
     }
 
     // Settings can change while the player remains mounted (including profile sync/restore). Keep one
@@ -1280,6 +1305,82 @@ fun PlayerScreen(
         }
     }
 
+    // One room is owned by the actual mounted engine/source and permanent account/profile lifetime.
+    // Android has no activeLoadToken: this uses the real engine identity + source session/revision.
+    val partyGeneration = remember(engine, playbackSessionKey, sourceSwitchState.revision) {
+        java.util.UUID.randomUUID().toString()
+    }
+    val partyVideoId = currentPlayable.playbackContext?.videoId ?: currentPlayable.watchPartyVideoId
+    val partyTitleToken = remember(partyVideoId) { partyVideoId?.let(WatchPartyWire::titleToken) }
+    val currentPartyOwner by rememberUpdatedState(newValue = {
+        val auth = subtitleSyncManager?.captureWatchPartyAuth()
+        if (auth == null || partyTitleToken == null || currentPlayable.isTrailer || currentPlayable.isLive ||
+            playerExitRequested || castOwned || sourceSwitchState.isSwitching || effectiveError ||
+            speed != 1.0f || engine.state.value.durationMs <= 0L || engine.state.value.hasEnded || engine.state.value.hasError ||
+            !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) ||
+            builtEngine !== engine || engineHolder.get() !== engine || !withCurrentSubtitleOwnerState { true }
+        ) null else WatchPartyOwnerStamp(partyGeneration, playbackSessionKey.outerSessionId, sourceSwitchState.revision,
+            partyTitleToken, auth.accountId, auth.profileId, auth.ownerEpoch)
+    })
+    val applyPartyControl by rememberUpdatedState<(WatchPartyWire.Control,
+        com.vortx.android.party.WatchPartyApplyPermit, com.vortx.android.party.WatchPartyClientPolicy) -> Boolean>(
+        newValue = { control, permit, policy ->
+            // Consume once as STATE under the existing real account/profile admission. Native calls
+            // remain outside owner monitors and retain the engine's original one-way liveness cell.
+            val captured = currentPartyOwner()
+            val consumed = captured != null && withCurrentSubtitleOwnerState {
+                policy.consume(permit, captured, SystemClock.elapsedRealtime())
+            }
+            consumed && currentPartyOwner() == captured && withCurrentSubtitleOwner {
+                val current = engine.state.value
+                if (current.hasEnded || current.hasError || control.mediaId != partyTitleToken) false else {
+                    val target = control.positionMs.coerceIn(0L,
+                        current.durationMs.takeIf { it > 0L } ?: 86_400_000L)
+                    if (control.action == "seek" || kotlin.math.abs(current.positionMs - target) > 1500L) seekLocalTo(target)
+                    when (control.action) {
+                        "play" -> playbackIntent.userPlay()
+                        "pause" -> playbackIntent.userPause()
+                    }
+                    true
+                }
+            }
+        },
+    )
+    val captureCurrentPartyLeaderControl by rememberUpdatedState(newValue = {
+        val current = currentPartyOwner()
+        val state = engine.state.value
+        if (current == null || state.durationMs <= 0L || state.hasEnded || state.hasError) null
+        else WatchPartyWire.Control(
+            if (state.isPaused || state.isBuffering || !playbackIntent.snapshot().shouldPlay) "pause" else "play",
+            current.titleToken, state.positionMs.coerceIn(0L, 86_400_000L))
+    })
+    val partySession = remember(engine, playbackSessionKey, sourceSwitchState.revision, subtitleSyncManager) {
+        subtitleSyncManager?.let { manager -> WatchPartyClientSession(manager,
+            currentOwner = { currentPartyOwner() },
+            apply = { control, permit, policy -> applyPartyControl(control, permit, policy) },
+            currentLeaderControl = { captureCurrentPartyLeaderControl() }) }
+    }
+    var partyPanelOpen by remember(partySession) { mutableStateOf(false) }
+    DisposableEffect(partySession, partyPublisher) {
+        val publish: (String, Long) -> Unit = { action, position -> partySession?.publish(action, position) }
+        partyPublisher.set(publish)
+        onDispose {
+            partyPublisher.compareAndSet(publish, null)
+            partySession?.close()
+        }
+    }
+    // Small leader snapshots reconcile a host's automatic skip without publishing source/end-of-file
+    // transitions or watched/next-episode mutations. Guests never echo received commands back.
+    LaunchedEffect(partySession, engine) {
+        while (true) {
+            delay(5000)
+            val state = engine.state.value
+            if (currentPartyOwner() != null && state.durationMs > 0L && !state.isBuffering && !state.hasEnded) {
+                partySession?.publish(if (state.isPaused || !playbackIntent.snapshot().shouldPlay) "pause" else "play", state.positionMs)
+            }
+        }
+    }
+
     // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
     // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
     // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
@@ -1290,9 +1391,7 @@ fun PlayerScreen(
     val pip = rememberPlayerPip(
         engine = engine,
         onToggleUserPlayback = {
-            playbackIntent.userToggle(
-                currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-            )
+            userTogglePlayback()
         },
         isActivelyPlaying = !playerState.isPaused && !playerState.hasEnded && !effectiveError,
         isPaused = playerState.isPaused,
@@ -1354,6 +1453,7 @@ fun PlayerScreen(
         AutoSkipCountdownPolicy.complete(next, segment)
         AutoSkipCountdownPolicy.invalidatePending(next, latestState.positionMs)
         engine.seekTo(target)
+        partyPublisher.get()?.invoke("seek", target)
         autoSkipCountdown = next
         autoSkipDecision = AutoSkipCountdownDecision.Idle
         skipPillFocusedCancel = false
@@ -1380,7 +1480,7 @@ fun PlayerScreen(
         engine = engine,
         playable = currentPlayable,
         speed = speed,
-        setUserPlaying = { playing -> if (playing) playbackIntent.userPlay() else playbackIntent.userPause() },
+        setUserPlaying = ::userSetPlaying,
     )
 
     // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
@@ -2008,29 +2108,27 @@ fun PlayerScreen(
                 when (event.key) {
                     Key.MediaPlayPause -> {
                         showControls()
-                        playbackIntent.userToggle(
-                            currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-                        )
+                        userTogglePlayback()
                         return@onKeyEvent true
                     }
                     Key.MediaPlay -> {
                         showControls()
-                        playbackIntent.userPlay()
+                        userSetPlaying(true)
                         return@onKeyEvent true
                     }
                     Key.MediaPause -> {
                         showControls()
-                        playbackIntent.userPause()
+                        userSetPlaying(false)
                         return@onKeyEvent true
                     }
                     Key.MediaFastForward -> {
                         showControls()
-                        seekLocalBy(seekStepMs)
+                        userSeekLocalBy(seekStepMs)
                         return@onKeyEvent true
                     }
                     Key.MediaRewind -> {
                         showControls()
-                        seekLocalBy(-seekStepMs)
+                        userSeekLocalBy(-seekStepMs)
                         return@onKeyEvent true
                     }
                     else -> Unit
@@ -2106,7 +2204,7 @@ fun PlayerScreen(
                     if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
                         val forward = event.key == Key.DirectionRight
                         val delta = if (forward) seekStepMs else -seekStepMs
-                        seekLocalBy(delta)
+                        userSeekLocalBy(delta)
                         // The pill shows the predicted target; the engine clamps the real seek to the file.
                         seekNudgeTargetMs = (latestState.positionMs + delta).coerceAtLeast(0L)
                         seekNudgeTick++
@@ -2159,7 +2257,7 @@ fun PlayerScreen(
                             onDoubleTap = { offset ->
                                 val forward = offset.x >= size.width / 2
                                 // The double-tap step follows the viewer's Skip step (Apple `stremiox.seekStep`).
-                                seekLocalBy(if (forward) seekStepMs else -seekStepMs)
+                                userSeekLocalBy(if (forward) seekStepMs else -seekStepMs)
                                 showControls()
                             },
                         )
@@ -2179,7 +2277,7 @@ fun PlayerScreen(
                         onVolumeFraction = { setPlayerVolume((it * 100.0)) },
                         onSeekCommit = { target ->
                             showControls()
-                            seekLocalTo(target)
+                            userSeekLocalTo(target)
                         },
                         onHud = { gestureHud = it },
                     )
@@ -2274,12 +2372,10 @@ fun PlayerScreen(
             onBack = ::exitPlayer,
             onTogglePause = {
                 showControls()
-                playbackIntent.userToggle(
-                    currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-                )
+                userTogglePlayback()
             },
-            onSeek = { showControls(); seekLocalTo(it) },
-            onSeekBy = { showControls(); seekLocalBy(it) },
+            onSeek = { showControls(); userSeekLocalTo(it) },
+            onSeekBy = { showControls(); userSeekLocalBy(it) },
             onSelectAudio = {
                 showControls()
                 knownAudioMismatch = false
@@ -2373,16 +2469,14 @@ fun PlayerScreen(
             // current stream is castable (a direct/HLS/debrid URL, never a loopback torrent); the button
             // itself further self-hides when no receivers are on the network. Opening it shows the device
             // chooser. Withheld while locked or in PiP (the cluster is unreachable then anyway).
-            castButton = if (castManager.isEnabled && streamCastable) {
-                {
-                    CastButton(
-                        state = castState,
-                        emberAccent = emberAccent,
-                        onClick = { showControls(); castChooserOpen = true },
-                    )
+            castButton = {
+                Row {
+                    WatchPartyButton(partySession, open = { showControls(); partyPanelOpen = true })
+                    if (castManager.isEnabled && streamCastable) {
+                        CastButton(state = castState, emberAccent = emberAccent,
+                            onClick = { showControls(); castChooserOpen = true })
+                    }
                 }
-            } else {
-                null
             },
             onLock = {
                 controlsLocked = true
@@ -2587,6 +2681,9 @@ fun PlayerScreen(
         // The chooser is a dialog the cast button opens. The overlay takes over the surface while a receiver
         // is connected (the local video is paused underneath), naming the device and hosting the cast
         // transport (play/pause, +/-10s, seek, stop). Withheld in PiP, where the tiny window is video-only.
+        if (partyPanelOpen && partySession != null && !pip.isInPip) {
+            WatchPartyPanel(partySession, onDismiss = { partyPanelOpen = false })
+        }
         if (castManager.isEnabled) {
             if (castChooserOpen) {
                 CastRouteChooserSheet(

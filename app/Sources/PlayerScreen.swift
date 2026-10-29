@@ -618,6 +618,7 @@ private struct PlayerTransportToolbar: View {
     let sources: PlayerControlButton?
     let episodes: PlayerControlButton?
     let chapters: PlayerControlButton?
+    let watchParty: PlayerControlButton?
     let grab: PlayerControlButton
     let sleep: PlayerControlButton
 
@@ -632,6 +633,7 @@ private struct PlayerTransportToolbar: View {
                 if let episodes { episodes }
                 if let quality { quality }
                 if let chapters { chapters }
+                if let watchParty { watchParty }
             }
         }
         .accessibilityLabel("Playback controls")
@@ -648,6 +650,7 @@ private struct PlayerTransportToolbar: View {
             if let sources { Spacer(); sources }
             if let episodes { Spacer(); episodes }
             if let chapters { Spacer(); chapters }
+            if let watchParty { Spacer(); watchParty }
             Spacer()
             grab
             Spacer()
@@ -1760,6 +1763,10 @@ struct PlayerScreen: View {
     @State private var nextEpisodePreparationGeneration = 0
     @State private var nextEpisodeAttemptPolicy = PreparedEpisodeAttemptPolicy()
     @State private var showShare = false             // system share sheet
+    @State private var showWatchParty = false
+    @State private var watchPartyOwnerGeneration = UUID()
+    @State private var watchPartyPanelModel: WatchPartyPanelModel?
+    @ObservedObject private var watchPartyAuthOwner = VortXSyncManager.shared
     @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
     // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
     // every Next/Prev/list switch so progress, the watched marker, Continue-Watching, skip timestamps,
@@ -2177,6 +2184,19 @@ struct PlayerScreen: View {
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
         .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(playbackGateToken); LoopbackPlaybackAssertion.begin(for: url) }
+        .onValueChange(of: curMeta?.videoId) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: playbackSessionID) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: coordinator.player?.activeLoadToken) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: playbackMutationTarget) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: playbackExited) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: switchingEpisode) { value in if value { invalidateWatchPartyOwner() } }
+        .onValueChange(of: pendingAdvance != nil) { value in if value { invalidateWatchPartyOwner() } }
+        .onValueChange(of: reconnecting) { value in if value { invalidateWatchPartyOwner() } }
+        .onValueChange(of: episodeSwitchGeneration) { _ in invalidateWatchPartyOwner() }
+        .onValueChange(of: sourceSwitchGeneration) { _ in invalidateWatchPartyOwner() }
+        .onReceive(ProfileStore.shared.$activeID) { _ in invalidateWatchPartyOwner() }
+        .onReceive(watchPartyAuthOwner.$account) { _ in invalidateWatchPartyOwner() }
+        .onReceive(watchPartyAuthOwner.$isSignedIn) { _ in invalidateWatchPartyOwner() }
         // Panels and the failure screen list sources, so they follow every engine change.
         .onValueChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
         // A first frame, remote resume or dismissed dialog re-arms a visible bar. The original
@@ -2199,7 +2219,11 @@ struct PlayerScreen: View {
             episodeInventoryUnavailable = false
             hydrateDirectResumeSeriesInventory()
         }
-        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(playbackGateToken); LoopbackPlaybackAssertion.end() }
+        .onDisappear {
+            invalidateWatchPartyOwner()
+            FullscreenPlaybackGate.shared.playerDidDisappear(playbackGateToken)
+            LoopbackPlaybackAssertion.end()
+        }
     }
 
     #if os(iOS) || os(macOS)
@@ -2683,6 +2707,7 @@ struct PlayerScreen: View {
             }
         }
         .onDisappear {
+            invalidateWatchPartyOwner()
             #if os(iOS) && !CINEMA_UI_SMOKE_RENDERER
             googleCast.detach()
             #endif
@@ -2854,6 +2879,9 @@ struct PlayerScreen: View {
             Text(subtitleAlignmentNotice ?? String(localized: "That subtitle source did not respond in time. Try another one."))
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
+        .sheet(isPresented: $showWatchParty, onDismiss: { invalidateWatchPartyOwner() }) {
+            if let watchPartyPanelModel { WatchPartyRoomPanel(model: watchPartyPanelModel) }
+        }
         .sheet(item: $grabbedFrame) { ShareSheet(items: [$0.url]) }
     }
 
@@ -3436,20 +3464,29 @@ struct PlayerScreen: View {
                     // DISTINCT from the toggle now: the system sends the command it wants, so routing an
                     // explicit "play" into a toggle paused a playing film (#157).
                     NowPlayingCenter.wireCommands(
-                        play: { viewerPlay() },
-                        pause: { viewerPause() },
-                        togglePause: { viewerToggle() },
+                        play: {
+                            viewerPlay()
+                            publishWatchPartyControl("play", position: currentTime)
+                        },
+                        pause: {
+                            viewerPause()
+                            publishWatchPartyControl("pause", position: currentTime)
+                        },
+                        togglePause: { viewerToggleFromWatchPartyInput() },
                         seekBy: { delta in
                             AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingResumeForUserSeek()
+                            let target = currentTime + delta
                             coordinator.player?.seek(by: delta)
+                            if target.isFinite { publishWatchPartyControl("seek", position: max(0, target)) }
                         },
                         seekTo: { position in
                             AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.absolute(position)) { return }
                             cancelPendingResumeForUserSeek()
                             coordinator.player?.seek(to: position)
+                            publishWatchPartyControl("seek", position: position)
                         },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
@@ -5226,6 +5263,80 @@ struct PlayerScreen: View {
         // The old controller cannot echo transport while it is being replaced.
         let paused = engineSurfaceTransfer != nil ? playbackDeadlineClock.isPaused : isPaused
         if paused { viewerPlay() } else { viewerPause() }
+    }
+
+    /// Only explicit viewer input publishes. Recovery/autoplay/system calls keep using viewerToggle().
+    private func viewerToggleFromWatchPartyInput() {
+        let wasPaused = engineSurfaceTransfer != nil ? playbackDeadlineClock.isPaused : isPaused
+        viewerToggle()
+        publishWatchPartyControl(wasPaused ? "play" : "pause", position: currentTime)
+    }
+
+    private var currentWatchPartyContext: WatchPartyClientSession.ApplyContext? {
+        guard !effectivelyLive, !playbackExited, !loadFailed, !switchingEpisode,
+              hasStartedPlaying, pendingAdvance == nil, !reconnecting,
+              let meta = curMeta, let loadToken = coordinator.player?.activeLoadToken,
+              let auth = watchPartyAuthOwner.captureWatchPartyAuth(),
+              let titleToken = WatchPartyClientSession.canonicalTitleToken(forPlaybackVideoID: meta.videoId),
+              playbackMutationTarget.stillOwnsCurrentContext(core: core) else { return nil }
+        return WatchPartyClientSession.ApplyContext(target: playbackMutationTarget, auth: auth,
+            titleToken: titleToken, playbackSessionID: playbackSessionID, loadToken: loadToken,
+            localOwnerGeneration: watchPartyOwnerGeneration)
+    }
+
+    private func makeWatchPartyPanelModel() -> WatchPartyPanelModel {
+        WatchPartyPanelModel(performControl: { [self] control in applyWatchPartyControl(control) },
+            currentAuth: { watchPartyAuthOwner.captureWatchPartyAuth() },
+            currentContext: { [self] in currentWatchPartyContext },
+            currentPlaybackSnapshot: { [self] in currentWatchPartyPlaybackSnapshot },
+            ownerGeneration: { [self] in watchPartyOwnerGeneration },
+            ownerWillReconnect: { [self] in watchPartyOwnerGeneration = UUID() })
+    }
+
+    private var currentWatchPartyPlaybackSnapshot: WatchPartyWire.Control? {
+        guard let context = currentWatchPartyContext, currentTime.isFinite,
+              currentTime >= 0, currentTime <= 86_400 else { return nil }
+        return WatchPartyWire.Control(action: playbackDeadlineClock.isPaused ? "pause" : "play",
+            mediaId: context.titleToken, positionMs: Int64((currentTime * 1_000).rounded()))
+    }
+
+    private func beginWatchParty() {
+        guard currentWatchPartyContext != nil else { return }
+        watchPartyPanelModel = makeWatchPartyPanelModel()
+        showWatchParty = true
+    }
+
+    private func invalidateWatchPartyOwner() {
+        watchPartyOwnerGeneration = UUID()
+        watchPartyPanelModel?.cancelAndDisconnect()
+        watchPartyPanelModel = nil
+        showWatchParty = false
+    }
+
+    /// Called synchronously by V5 after admission. Do not await, enqueue, or publish this action again.
+    private func applyWatchPartyControl(_ control: WatchPartyWire.Control) -> Bool {
+        guard let context = currentWatchPartyContext, control.mediaId == context.titleToken,
+              (0...86_400_000).contains(control.positionMs) else { return false }
+        switch control.action {
+        case "play", "pause":
+            let target = Double(control.positionMs) / 1_000
+            if abs(currentTime - target) > 1.5 {
+                guard !effectivelyLive else { return false }
+                issueSeek(to: target, reason: "watch-party-sync")
+            }
+            if control.action == "play" { viewerPlay() } else { viewerPause() }
+        case "seek":
+            guard !effectivelyLive else { return false }
+            issueSeek(to: Double(control.positionMs) / 1_000, reason: "watch-party")
+        default: return false
+        }
+        return true
+    }
+
+    private func publishWatchPartyControl(_ action: String, position: Double) {
+        guard let model = watchPartyPanelModel, position.isFinite, position >= 0,
+              position <= 86_400 else { return }
+        model.send(action, positionMs: Int64((position * 1_000).rounded()))
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -8757,7 +8868,7 @@ struct PlayerScreen: View {
                 } : nil,
             backward: { seekBy(-seekStepSeconds) },
             forward: { seekBy(seekStepSeconds) },
-            toggle: { Haptics.tap(); viewerToggle(); scheduleHide() })
+            toggle: { Haptics.tap(); viewerToggleFromWatchPartyInput(); scheduleHide() })
     }
 
     private var touchPinchEnabled: Bool {
@@ -8960,7 +9071,7 @@ struct PlayerScreen: View {
             if !isLive {
                 seekButton("gobackward.\(seekStep)", by: -seekStepSeconds)
             }
-            Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
+            Button { Haptics.tap(); viewerToggleFromWatchPartyInput(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50))
                     // The inner 84pt glass face is purely visual; the outer 100pt frame keeps the original
@@ -9013,6 +9124,7 @@ struct PlayerScreen: View {
         issueSeek(to: target, reason: "relative")
         currentTime = target
         reportSeek(target)
+        publishWatchPartyControl("seek", position: target)
         scheduleHide()
     }
 
@@ -9079,6 +9191,7 @@ struct PlayerScreen: View {
                         currentTime = target
                         issueSeek(to: target, reason: "scrub")
                         reportSeek(target)
+                        publishWatchPartyControl("seek", position: target)
                         scrubThumbnails.clear()
                         scheduleHide()
                     }
@@ -9122,6 +9235,7 @@ struct PlayerScreen: View {
             sources: PlayerSourceAvailability.hasAlternates(sourceGroups, playable: { playableURL(for: $0) != nil }) ? controlButton("rectangle.stack", "Sources") { openPanel(.sources) } : nil,
             episodes: isEpisodePlaybackContext ? controlButton("list.bullet", "Episodes") { openPanel(.episodes) } : nil,
             chapters: hasChapters ? controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) } : nil,
+            watchParty: currentWatchPartyContext == nil ? nil : controlButton("person.2.wave.2", "Watch Party") { beginWatchParty() },
             grab: controlButton("camera.viewfinder", "Grab") { grabFrame() },
             sleep: controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel, active: sleepArmed) { openPanel(.sleep) }
         )
@@ -11419,6 +11533,7 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        invalidateWatchPartyOwner()
         #if os(iOS) && !CINEMA_UI_SMOKE_RENDERER
         if googleCast.state.owned {
             currentTime = googleCast.state.position; duration = googleCast.state.duration

@@ -1030,6 +1030,17 @@ struct TVPlayerView: View {
     @State private var showStats = false                // live playback info overlay
     @State private var statsRows: [(String, String)] = []
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
+    @State private var showWatchParty = false
+    @State private var watchPartyModel: WatchPartyPanelModel?
+    @StateObject private var watchPartyOwner = TVWatchPartyPlaybackOwner()
+    @State private var watchPartyAuthWitness: VortXWatchPartyAuthSnapshot?
+    @State private var watchPartyTargetWitness: PlaybackMutationTarget?
+    @State private var watchPartyLoadWitness: PlayerLoadToken?
+    @State private var watchPartySourceWitness: Int?
+    @State private var watchPartyEpisodeWitness: Int?
+    @State private var watchPartyRouteWitness: Bool?
+    @State private var watchPartySessionWitness: String?
+    @State private var watchPartyVideoWitness: String?
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
     @State private var localTrickplayCaptureBreaker = TrickplayLocalCaptureBreaker()
     @State private var lastLocalTrickplayCapture = -1000.0
@@ -1141,9 +1152,12 @@ struct TVPlayerView: View {
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
+            // The room panel uses real SwiftUI focus. Removing the catcher retires its held-remote
+            // repeats and callbacks instead of leaving its exclusive UIKit focus lock above the panel.
+            if !showWatchParty {
             RemoteCatcher(
                 onPress: { handlePress($0) },
-                onSwipe: { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } },
+                onSwipe: { if !showWatchParty { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } } },
                 accessibilityItems: remoteAccessibilityItems,
                 accessibilityFocusedID: remoteAccessibilityFocusedID,
                 accessibilityAnnouncement: remoteAccessibilityAnnouncement,
@@ -1152,6 +1166,7 @@ struct TVPlayerView: View {
                 onAccessibilityAdjust: remoteAccessibilityAdjust,
                 onAccessibilityEscape: { handlePress(.menu) }
             )
+            }
 
             if buffering && !loadFailed {
                 VStack(spacing: Theme.Space.md) {
@@ -1206,6 +1221,9 @@ struct TVPlayerView: View {
                     .allowsHitTesting(false)
             }
             if stillWatching { stillWatchingOverlay }
+            if showWatchParty, let model = watchPartyModel {
+                TVWatchPartyRoomPresentation(model: model, onClose: closeWatchPartyPanel)
+            }
         }
         // Every control in the player carries the chosen accent, however it was presented.
         .tint(Theme.Palette.accent)
@@ -1360,8 +1378,31 @@ struct TVPlayerView: View {
         // Quality buttons must appear when they do. `streamsEpoch` bumps ONLY when the engine's ready-stream
         // set actually changed, so this is the exact, cheap edge the cached counts need: no per-body-pass walk,
         // and no waiting for the viewer to open a panel before the buttons show up.
+        .onReceive(WatchPartyPendingInvite.shared.$invite) { invite in
+            // The strict shared holder validates the full fragment URL. Opening the panel never joins.
+            if invite != nil, !showWatchParty { openWatchPartyPanel() }
+        }
+        .onReceive(ProfileStore.shared.$activeID.dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onReceive(VortXSyncManager.shared.$isSignedIn.dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onReceive(VortXSyncManager.shared.$account.map { $0?.id }.removeDuplicates().dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onChange(of: coordinator.player?.activeLoadToken) { invalidateWatchParty() }
+        .onChange(of: playbackMutationTarget) { invalidateWatchParty() }
+        .onChange(of: hasStartedPlaying) { _, ready in
+            if ready, WatchPartyPendingInvite.shared.invite != nil, !showWatchParty { openWatchPartyPanel() }
+        }
+        .onChange(of: playbackSessionID) { invalidateWatchParty() }
+        .onChange(of: curMeta?.videoId) { invalidateWatchParty() }
+        .onChange(of: episodeSwitchGeneration) { invalidateWatchParty() }
+        .onChange(of: isAVPlayerActive) { invalidateWatchParty() }
+        .onChange(of: reconnecting) { _, active in if active { invalidateWatchParty() } }
         .onChange(of: playbackDeadlineClock.isPaused) { refreshPlaybackIdleTimer() }
-        .onChange(of: loadFailed) { refreshPlaybackIdleTimer() }
+        .onChange(of: loadFailed) { if loadFailed { invalidateWatchParty() }; refreshPlaybackIdleTimer() }
         .onChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
@@ -1385,6 +1426,7 @@ struct TVPlayerView: View {
             consumePendingManualEpisodeNavigationIfReady()
         }
         .onChange(of: sourceSwitchGeneration) {
+            invalidateWatchParty()
             fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
@@ -1392,6 +1434,7 @@ struct TVPlayerView: View {
             hydrateDirectResumeSeriesInventory()
         }
         .onDisappear {
+            invalidateWatchParty()
             invalidateSubtitleAlignmentPresentation()
             TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
             cancelEmptySourceRecovery()
@@ -2273,21 +2316,11 @@ struct TVPlayerView: View {
                     // state then ride the ordinary tick / pause handlers below. Seeks go through the engine
                     // RELATIVE/ABSOLUTE calls so they always act on the LIVE position, never a captured one.
                     NowPlayingCenter.wireCommands(
-                        play: { viewerPlay() },
-                        pause: { viewerPause() },
+                        play: { viewerPlay(shareWithParty: true) },
+                        pause: { viewerPause(shareWithParty: true) },
                         togglePause: { viewerToggle() },
-                        seekBy: { delta in
-                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-                            if handleDeferredResumeUserSeek(.relative(delta)) { return }
-                            cancelPendingLibmpvResumeForUserSeek()
-                            coordinator.player?.seek(by: delta)
-                        },
-                        seekTo: { position in
-                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-                            if handleDeferredResumeUserSeek(.absolute(position)) { return }
-                            cancelPendingLibmpvResumeForUserSeek()
-                            coordinator.player?.seek(to: position)
-                        },
+                        seekBy: { delta in seek(delta) },
+                        seekTo: { position in issueSeek(to: position, reason: "system-seek") },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
                     refreshNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
@@ -2731,6 +2764,7 @@ struct TVPlayerView: View {
     // MARK: - Remote handling (all input arrives here from the UIKit catcher)
 
     private func handlePress(_ type: UIPress.PressType) {
+        guard !showWatchParty else { return } // reject a queued catcher callback before dismantle
         noteInteraction()   // any remote press is presence: re-arm the "Still watching?" idle guard
         if stillWatching {
             switch type {
@@ -4043,6 +4077,7 @@ struct TVPlayerView: View {
         var rows: [OptionRow] = []
         if !isTrailer {
             rows.append(OptionRow(label: "Playback queue", detail: "\(PlaybackTitleQueue.shared.count)  ›") { openPanel(.queue) })
+            rows.append(OptionRow(label: "Watch Party", detail: "›") { openWatchPartyPanel() })
         }
         // Handoff only when the URL is self-contained. A header-gated stream needs specific request
         // headers (it is either playing through our embedded /proxy/ on a loopback URL, or as a
@@ -6462,7 +6497,7 @@ struct TVPlayerView: View {
             preventIdle: !leftPlayback && !loadFailed && !playbackDeadlineClock.isPaused)
     }
 
-    private func viewerPause() {
+    private func viewerPause(shareWithParty: Bool = false) {
         watchedDwell.reset()
         // Teardown can temporarily leave no controller; the replacement still owes this input.
         localNNTPStallRecovery.suspend()
@@ -6471,14 +6506,16 @@ struct TVPlayerView: View {
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(true)
         coordinator.player?.pause()
+        if shareWithParty { shareWatchPartyControl("pause", at: currentTime) }
     }
 
-    private func viewerPlay() {
+    private func viewerPlay(shareWithParty: Bool = false) {
         recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(false)
         coordinator.player?.play()
+        if shareWithParty { shareWatchPartyControl("play", at: currentTime) }
     }
 
     private func updateIncomingPauseIntent(_ paused: Bool) {
@@ -6511,7 +6548,8 @@ struct TVPlayerView: View {
     }
 
     private func viewerToggle() {
-        if playbackDeadlineClock.isPaused { viewerPlay() } else { viewerPause() }
+        if playbackDeadlineClock.isPaused { viewerPlay(shareWithParty: true) }
+        else { viewerPause(shareWithParty: true) }
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -11342,6 +11380,7 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        invalidateWatchParty()
         invalidateSubtitlePresentationForReplacement()
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
         curDebridRef?.nativeUsenetLease?.close()
@@ -11616,7 +11655,11 @@ struct TVPlayerView: View {
         // Retire any countdown accumulated against the old playhead before issuing a user or automatic seek;
         // cancellation/completion memory remains keyed to this media identity in the policy state.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-        if handleDeferredResumeUserSeek(.absolute(target)) { return }
+        let sharesUserSeek = ["restart", "scrub", "skip", "chapter", "system-seek"].contains(reason)
+        if handleDeferredResumeUserSeek(.absolute(target)) {
+            if sharesUserSeek { shareWatchPartyControl("seek", at: target) }
+            return
+        }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user seek")
         DiagnosticsLog.log(
@@ -11624,11 +11667,16 @@ struct TVPlayerView: View {
             String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)
         )
         coordinator.player?.seek(to: target)
+        if sharesUserSeek { shareWatchPartyControl("seek", at: target) }
     }
 
     private func seek(_ delta: Double) {
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-        if handleDeferredResumeUserSeek(.relative(delta)) { flashControls(); return }
+        let partyTarget = currentTime.isFinite && delta.isFinite ? max(0, currentTime + delta) : Double.nan
+        if handleDeferredResumeUserSeek(.relative(delta)) {
+            shareWatchPartyControl("seek", at: partyTarget)
+            flashControls(); return
+        }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user relative seek")
         DiagnosticsLog.log(
@@ -11636,6 +11684,7 @@ struct TVPlayerView: View {
             String(format: "seek reason=relative from=%.3f to=%.3f duration=%.3f", currentTime, currentTime + delta, duration)
         )
         coordinator.player?.seek(by: delta)
+        shareWatchPartyControl("seek", at: partyTarget)
         flashControls()
     }
 
@@ -11724,6 +11773,136 @@ struct TVPlayerView: View {
     private func commitScrubIfNeeded() { if scrubbing { commitScrub() } }
     /// Discard the in-progress scrub preview and keep playing where we are (Menu while scrubbing).
     private func cancelScrub() { scrubCommit?.cancel(); scrubbing = false; scrubThumbnails.clear(); flashControls() }
+
+    // MARK: - Watch Party caller ownership
+
+    private func currentWatchPartyAuth() -> VortXWatchPartyAuthSnapshot? {
+        guard let witness = watchPartyAuthWitness,
+              let current = VortXSyncManager.shared.captureWatchPartyAuth(), current == witness,
+              VortXSyncManager.shared.isCurrentWatchPartyAuth(current) else { return nil }
+        return current
+    }
+
+    private func currentWatchPartyContext() -> WatchPartyClientSession.ApplyContext? {
+        // These are live State/controller reads, including between admit and apply. The source/route
+        // witnesses also close the interval before SwiftUI delivers the corresponding onChange.
+        guard !leftPlayback, !loadFailed, !reconnecting, !switchingEpisode, !stillWatching, pendingAdvance == nil,
+              hasStartedPlaying, !isTrailer, !isCurrentLiveStream,
+              playbackMutationTarget.stillOwnsCurrentContext(core: core),
+              watchPartyTargetWitness == playbackMutationTarget,
+              watchPartySourceWitness == sourceSwitchGeneration,
+              watchPartyEpisodeWitness == episodeSwitchGeneration,
+              watchPartyRouteWitness == isAVPlayerActive,
+              watchPartySessionWitness == playbackSessionID,
+              let metadata = curMeta, watchPartyVideoWitness == metadata.videoId,
+              let load = coordinator.player?.activeLoadToken, load == watchPartyLoadWitness,
+              callbackBelongsToCommittedMedia(load), assetSanityAttempt.isAccepted(owner: load),
+              let auth = currentWatchPartyAuth(), auth.profileID == ProfileStore.shared.activeID,
+              let titleToken = WatchPartyClientSession.canonicalTitleToken(forPlaybackVideoID: metadata.videoId) else { return nil }
+        return .init(target: playbackMutationTarget, auth: auth, titleToken: titleToken,
+                     playbackSessionID: playbackSessionID, loadToken: load,
+                     localOwnerGeneration: watchPartyOwner.generation)
+    }
+
+    private func openWatchPartyPanel() {
+        noteInteraction()
+        if watchPartyModel == nil {
+            watchPartyAuthWitness = VortXSyncManager.shared.captureWatchPartyAuth()
+            watchPartyTargetWitness = playbackMutationTarget
+            watchPartyLoadWitness = coordinator.player?.activeLoadToken
+            watchPartySourceWitness = sourceSwitchGeneration
+            watchPartyEpisodeWitness = episodeSwitchGeneration
+            watchPartyRouteWitness = isAVPlayerActive
+            watchPartySessionWitness = playbackSessionID
+            watchPartyVideoWitness = curMeta?.videoId
+            watchPartyOwner.rotate()
+            guard currentWatchPartyContext() != nil else {
+                invalidateWatchParty()
+                showEngineNote("Sign in and start a title before opening Watch Party.")
+                return
+            }
+            let owner = watchPartyOwner
+            watchPartyModel = WatchPartyPanelModel(
+                performControl: { applyWatchPartyControl($0) },
+                currentAuth: { currentWatchPartyAuth() },
+                currentContext: { currentWatchPartyContext() },
+                currentPlaybackSnapshot: { currentWatchPartyPlaybackSnapshot() },
+                ownerGeneration: { owner.generation },
+                ownerWillReconnect: { owner.rotate() }
+            )
+        }
+        cancelScrub()
+        hideTask?.cancel()
+        withAnimation { showOptions = false; showInfo = false; showStreamQR = false; showWatchParty = true }
+    }
+
+    private func closeWatchPartyPanel() {
+        showWatchParty = false
+        // Keep membership while the viewer watches. Re-mounting the catcher restores its root focus.
+        showControls()
+    }
+
+    private func invalidateWatchParty() {
+        // Revoke the local capability before shared transport teardown or any network suspension.
+        watchPartyOwner.rotate()
+        watchPartyModel?.cancelAndDisconnect()
+        watchPartyModel = nil
+        watchPartyAuthWitness = nil
+        watchPartyTargetWitness = nil
+        watchPartyLoadWitness = nil
+        watchPartySourceWitness = nil
+        watchPartyEpisodeWitness = nil
+        watchPartyRouteWitness = nil
+        watchPartySessionWitness = nil
+        watchPartyVideoWitness = nil
+        showWatchParty = false
+    }
+
+    private func currentWatchPartyPlaybackSnapshot() -> WatchPartyWire.Control? {
+        guard let context = currentWatchPartyContext(), currentTime.isFinite,
+              currentTime >= 0, currentTime <= 86_400 else { return nil }
+        return .init(action: playbackDeadlineClock.isPaused ? "pause" : "play",
+                     mediaId: context.titleToken, positionMs: Int64((currentTime * 1_000).rounded()))
+    }
+
+    private func shareWatchPartyControl(_ action: String, at position: Double) {
+        guard !watchPartyOwner.applyingRemote, currentWatchPartyContext() != nil,
+              position.isFinite, position >= 0, position <= 86_400 else { return }
+        watchPartyModel?.send(action, positionMs: Int64((position * 1_000).rounded()))
+    }
+
+    /// Called only by the shared one-use admit/apply boundary. No Task or await may enter this
+    /// function: the fresh owner check and the explicit existing player choke points are atomic.
+    private func applyWatchPartyControl(_ control: WatchPartyWire.Control) -> Bool {
+        guard let current = currentWatchPartyContext(), current.titleToken == control.mediaId,
+              duration.isFinite, duration > 0, control.positionMs >= 0,
+              control.positionMs <= 86_400_000, ["play", "pause", "seek"].contains(control.action) else { return false }
+        let requested = Double(control.positionMs) / 1_000
+        // Preserve the existing scrub EOF margin; a peer cannot mark an unfinished title watched.
+        let ceiling = duration > 30 ? duration - 5 : duration
+        guard requested < duration else { return false }
+        let target = min(requested, ceiling)
+        watchPartyOwner.applyingRemote = true
+        defer { watchPartyOwner.applyingRemote = false }
+        if control.action == "seek" || abs(currentTime - target) >= 1.5 {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            watchedDwell.reset()
+            issueSeek(to: target, reason: "watch-party")
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            currentTime = target
+            inFlightSeekTarget = target
+            inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+        }
+        if control.action == "pause" {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            viewerPause()
+        }
+        if control.action == "play" {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            viewerPlay()
+        }
+        return true
+    }
 
     // MARK: - Local trickplay
 
@@ -12040,7 +12219,7 @@ struct TVPlayerView: View {
     private func maybePromptStillWatching() {
         guard stillWatchingPromptEnabled else { return }   // disabled: never interrupt an idle session
         guard hasStartedPlaying, !stillWatching else { return }
-        guard !isPaused, !showOptions, !buffering, !loadFailed else { return }
+        guard !isPaused, !showOptions, !showWatchParty, !buffering, !loadFailed else { return }
         guard Date() >= idleDeadline else { return }
         presentStillWatching()
     }
@@ -12075,7 +12254,7 @@ struct TVPlayerView: View {
         if advance {
             playNext()
         } else {
-            viewerPlay()
+            viewerPlay(shareWithParty: true)
             showControls()
         }
     }
@@ -12159,6 +12338,7 @@ struct TVPlayerView: View {
     /// Control need individual semantic targets. These virtual rows mirror the same `selected` / `optionRow`
     /// state and call the same activation functions as the Siri Remote, so accessibility never forks behavior.
     private var remoteAccessibilityItems: [RemoteCatcher.AccessibilityItem] {
+        guard !showWatchParty else { return [] }
         if stillWatching {
             return [
                 .init(id: "still-watching.continue", label: "Continue watching", hint: "Resumes playback",
@@ -12322,6 +12502,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityFocus(_ identity: String) {
+        guard !showWatchParty else { return }
         // Delayed accessibility callbacks cannot regain controls hidden by a newer overlay.
         guard remoteAccessibilityItems.contains(where: { $0.id == identity && $0.isEnabled }) else { return }
         if showStreamQR && !stillWatching { return } // The sole QR target is already highlighted.
@@ -12354,6 +12535,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityActivate(_ identity: String) {
+        guard !showWatchParty else { return }
         guard remoteAccessibilityItems.contains(where: { $0.id == identity && $0.isEnabled }) else { return }
         noteInteraction()
         if showStreamQR && !stillWatching {
@@ -12398,6 +12580,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityAdjust(_ identity: String, _ direction: Int) {
+        guard !showWatchParty else { return }
         guard remoteAccessibilityItems.contains(where: {
             $0.id == identity && $0.isEnabled && $0.isAdjustable
         }) else { return }
@@ -12410,6 +12593,61 @@ struct TVPlayerView: View {
         guard t.isFinite, t >= 0 else { return "0:00" }
         let s = Int(t), h = s / 3600, m = (s % 3600) / 60, sec = s % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    }
+}
+
+// MARK: - Native-focus Watch Party presentation
+
+@MainActor
+private final class TVWatchPartyPlaybackOwner: ObservableObject {
+    private(set) var generation = UUID()
+    var applyingRemote = false
+    func rotate() { generation = UUID() }
+}
+
+/// This stays in the player's ZStack. Presenting a full-screen cover would trigger the player's
+/// existing disappear cleanup; removing only RemoteCatcher lets SwiftUI own focus without that.
+private struct TVWatchPartyRoomPresentation: View {
+    @ObservedObject var model: WatchPartyPanelModel
+    let onClose: () -> Void
+    @State private var showInviteQR = false
+
+    var body: some View {
+        ZStack {
+            Theme.Palette.canvas.opacity(0.94).ignoresSafeArea()
+            if showInviteQR, let invite = model.inviteURL {
+                StreamLinkQRView(title: "Watch Party invite", link: invite.absoluteString,
+                    onClose: { showInviteQR = false }, closeHighlighted: false,
+                    instruction: "Scan with your phone to open this private room invite · Press Back to return",
+                    exposesNativeClose: true, handlesExitCommand: false)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        HStack {
+                            Spacer()
+                            Button("Back to player", action: onClose)
+                                .buttonStyle(ChipButtonStyle())
+                        }
+                        WatchPartyRoomPanel(model: model)
+                            .frame(maxWidth: .infinity)
+                        if model.inviteURL != nil {
+                            Button { showInviteQR = true } label: {
+                                Label("Show invite QR", systemImage: "qrcode")
+                            }
+                            .buttonStyle(ChipButtonStyle())
+                        }
+                    }
+                    .frame(maxWidth: 900)
+                    .padding(Theme.Space.screenEdge)
+                    .frame(maxWidth: .infinity)
+                }
+                .focusSection()
+            }
+        }
+        .onChange(of: model.inviteURL) { _, invite in if invite == nil { showInviteQR = false } }
+        .onExitCommand {
+            if showInviteQR { showInviteQR = false } else { onClose() }
+        }
     }
 }
 

@@ -2,11 +2,82 @@ import Foundation
 import CoreFoundation
 #if !CREDENTIAL_RETRY_COORDINATOR_STANDALONE
 import SwiftUI
+import Combine
 import CryptoKit   // Curve25519 for the QR sign-in pairing session (QrJoinSession.ephemeral)
 #if canImport(UIKit) && !os(macOS)
 import UIKit       // UIApplication.beginBackgroundTask for the on-background sync grace window (iOS + tvOS)
 #endif
 #endif
+
+/// Volatile VortX account-session authority for party HTTP and post-await checks.
+/// This contains the manager's account bearer, never a profile's Stremio authKey.
+/// Do not persist, encode, or log it. The client aliases this owner-defined type.
+struct VortXWatchPartyAuthSnapshot: Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
+    let bearer: String
+    let accountID: String
+    let profileID: UUID?
+    let generation: UInt64
+    let credential: CredentialScopeRegistry.Capture
+    let profileGeneration: UUID
+
+    var description: String { "VortXWatchPartyAuthSnapshot(<redacted>)" }
+    var debugDescription: String { description }
+
+    fileprivate init(bearer: String, accountID: String, profileID: UUID?, generation: UInt64,
+                     credential: CredentialScopeRegistry.Capture, profileGeneration: UUID) {
+        self.bearer = bearer
+        self.accountID = accountID
+        self.profileID = profileID
+        self.generation = generation
+        self.credential = credential
+        self.profileGeneration = profileGeneration
+    }
+}
+
+/// Shared capture policy remains available to the existing standalone source harness.
+/// Production callers obtain snapshots only through VortXSyncManager below.
+@MainActor
+enum VortXWatchPartyAuthCapturePolicy {
+    static func capture(
+        isSignedIn: Bool,
+        bearer: String?,
+        accountID: String?,
+        profileID: UUID?,
+        generation: UInt64,
+        credential: CredentialScopeRegistry.Capture,
+        authority: CredentialScopeRegistry,
+        profileGeneration: UUID
+    ) -> VortXWatchPartyAuthSnapshot? {
+        guard isSignedIn, let bearer, !bearer.isEmpty,
+              let accountID, let scope = CredentialScope(canonicalRemoteAccountID: accountID),
+              credential.scope == scope,
+              authority.isCurrent(credential),
+              authority.isMigrationEligible(credential) else { return nil }
+        return VortXWatchPartyAuthSnapshot(
+            bearer: bearer, accountID: accountID, profileID: profileID, generation: generation,
+            credential: credential, profileGeneration: profileGeneration)
+    }
+}
+
+/// The profile publisher delivers synchronously before each assignment. A separate
+/// epoch retains A -> B -> A changes even when no party request runs between them.
+/// The callback needs no actor hop; every access to this small cell is lock-protected.
+final class VortXWatchPartyProfileEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = UUID()
+
+    func capture() -> UUID {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func invalidate() {
+        lock.lock()
+        defer { lock.unlock() }
+        value = UUID()
+    }
+}
 
 #if !CREDENTIAL_RETRY_COORDINATOR_STANDALONE
 
@@ -1788,6 +1859,8 @@ final class VortXSyncManager: ObservableObject {
     /// must still own it before applying a result, so an account switch cannot commit A's pull into B.
     private let credentialAuthority = CredentialScopeRegistry.shared
     private var authOperationGeneration: UInt64 = 0
+    private let watchPartyProfileEpoch = VortXWatchPartyProfileEpoch()
+    private var watchPartyProfileObservation: AnyCancellable?
     private var restoreTaskCapture: CredentialScopeRegistry.Capture?
     private var qrOperation: QrJoinOperation?
 
@@ -2407,6 +2480,36 @@ final class VortXSyncManager: ObservableObject {
 
     private func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool {
         credentialAuthority.isCurrent(capture)
+    }
+
+    /// Capture and re-capture on the main actor around every party suspension.
+    /// This is the manager's already-adopted VortX bearer, with no credential-store read.
+    func captureWatchPartyAuth() -> VortXWatchPartyAuthSnapshot? {
+        observeWatchPartyProfileEpochIfNeeded()
+        // This mirror is a deny-only stability check, never authentication or playback authority.
+        // ProfileStore starts its mutation fence before synchronous Published subscribers run.
+        guard let selection = ProfileSelectionRead.snapshot(),
+              selection.activeID == ProfileStore.shared.activeID else { return nil }
+        let operation = currentCredentialOwnerIntent()
+        return VortXWatchPartyAuthCapturePolicy.capture(
+            isSignedIn: isSignedIn, bearer: token, accountID: account?.id,
+            profileID: selection.activeID, generation: operation.generation,
+            credential: operation.credential, authority: credentialAuthority,
+            profileGeneration: watchPartyProfileEpoch.capture())
+    }
+
+    func isCurrentWatchPartyAuth(_ snapshot: VortXWatchPartyAuthSnapshot) -> Bool {
+        captureWatchPartyAuth() == snapshot
+    }
+
+    private func observeWatchPartyProfileEpochIfNeeded() {
+        guard watchPartyProfileObservation == nil else { return }
+        // Lazily observe after manager construction; ProfileStore startup may use the manager.
+        // Delivery stays synchronous and includes same-ID assignments, retaining profile ABA.
+        let epoch = watchPartyProfileEpoch
+        watchPartyProfileObservation = ProfileStore.shared.$activeID.sink { _ in
+            epoch.invalidate()
+        }
     }
 
     private func logCredentialOwnerAcquisitionDenied(_ operation: String, attempt: Int) {

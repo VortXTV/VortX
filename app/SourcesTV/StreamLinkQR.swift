@@ -12,8 +12,21 @@ struct StreamLinkQRView: View {
     let onClose: () -> Void
     // The player's UIKit catcher owns physical focus; mirror its exclusive virtual target.
     let closeHighlighted: Bool
+    // A party invite carries a room capability, not a playable stream. The existing stream overlay
+    // keeps its virtual catcher target; native-focus callers expose this same Close button directly.
+    var instruction = "Scan with your phone to open this stream there  ·  Press Back to dismiss"
+    var exposesNativeClose = false
+    var handlesExitCommand = true
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        if handlesExitCommand {
+            qrContent.onExitCommand(perform: onClose)
+        } else {
+            qrContent
+        }
+    }
+
+    private var qrContent: some View {
         ZStack {
             Theme.Palette.canvas.opacity(0.94).ignoresSafeArea()
             VStack(spacing: Theme.Space.lg) {
@@ -38,19 +51,18 @@ struct StreamLinkQRView: View {
                     .lineLimit(2)
                     .truncationMode(.middle)
                     .frame(maxWidth: 900)
-                Text("Scan with your phone to open this stream there  ·  Press Back to dismiss")
+                Text(instruction)
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 Button("Close", action: onClose)
                     .buttonStyle(ChipButtonStyle(selected: closeHighlighted))
                     .overlay(Capsule().strokeBorder(Theme.Palette.textPrimary,
                                                    lineWidth: closeHighlighted ? 3 : 0))
-                    .accessibilityHidden(true) // The catcher exposes the same action without a duplicate target.
+                    .accessibilityHidden(!exposesNativeClose) // The stream catcher supplies the legacy virtual target.
             }
             .padding(Theme.Space.screenEdge)
         }
         .transition(.opacity)
-        .onExitCommand(perform: onClose)
     }
 
     static func qrImage(for string: String) -> UIImage? {

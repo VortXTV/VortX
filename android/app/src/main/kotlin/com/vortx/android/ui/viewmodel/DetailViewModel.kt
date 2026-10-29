@@ -1759,6 +1759,7 @@ class DetailViewModel(
                                 playable.startPositionMs, resumeMs, startPositionOverrideMs),
                             userForcedSource = playable.userForcedSource || manualPick,
                             mediaRef = ref,
+                            watchPartyVideoId = episode?.id ?: id,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
                             isLive = isLivePlayback(),
@@ -1809,6 +1810,7 @@ class DetailViewModel(
             PlayerSourceSwitchResolution(
                 playable = resolved.copy(
                     mediaRef = ref,
+                    watchPartyVideoId = episode?.id ?: id,
                     expectedDurationMs = expectedRuntimeMs(),
                     posterUrl = nowPlayingPoster(episode),
                     isLive = isLivePlayback(),
@@ -1945,6 +1947,7 @@ class DetailViewModel(
                     playable = resolved.copy(
                         startPositionMs = 0L,
                         mediaRef = mediaRef,
+                        watchPartyVideoId = target.id,
                         expectedDurationMs = expectedRuntimeMs(),
                         posterUrl = nowPlayingPoster(target),
                         isLive = isLivePlayback(),
@@ -1995,6 +1998,7 @@ class DetailViewModel(
             prepared = prepared,
             playable = prepared.playable.copy(startPositionMs = 0L,
                 mediaRef = buildMediaRef(type, id, target, detail.name, detail.releaseInfo?.take(4)?.toIntOrNull()),
+                watchPartyVideoId = target.id,
                 expectedDurationMs = expectedRuntimeMs(), posterUrl = nowPlayingPoster(target),
                 isLive = isLivePlayback(), episodeTitle = target.title.takeIf { it.isNotBlank() }),
             commitGate = sourceSwitchCommitGate,
@@ -2248,6 +2252,7 @@ class DetailViewModel(
                             startPositionMs = selectedPlaybackStartPosition(nativeEnabled = true,
                                 playable.startPositionMs, resumeMs, startPositionOverrideMs, fromStart),
                             mediaRef = ref,
+                            watchPartyVideoId = episode?.id ?: id,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
                             isLive = isLivePlayback(),
