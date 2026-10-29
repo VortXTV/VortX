@@ -4509,7 +4509,7 @@ diff --git a/Sources/BuildScripts/dovi-source-build.py b/Sources/BuildScripts/do
 new file mode 100644
 --- /dev/null
 +++ b/Sources/BuildScripts/dovi-source-build.py
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,909 @@
 +#!/usr/bin/env python3
 +"""Offline libdovi 3.4 producer proposal. No input acquisition or SDK acceptance.
 +
@@ -4687,6 +4687,46 @@ new file mode 100644
 +    return pins, pin_file, source, tool
 +
 +
++def dovi_sdk_provider_file(root, row):
++    """Authenticate a physical SDK body and the one known Apple stub alias."""
++    real(root)
++    if (type(row) is not dict or set(row) != {"path", "bytes", "sha256"}
++            or type(row["path"]) is not str or not row["path"] or row["path"].startswith("/")
++            or any(part in ("", ".", "..") for part in row["path"].split("/"))
++            or type(row["bytes"]) is not int or not 0 < row["bytes"] <= 4 * 1024**2
++            or type(row["sha256"]) is not str or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
++        fail("SDK provider row differs")
++    selected = root / row["path"]
++    signature = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
++                              info.st_size, info.st_mtime_ns, info.st_ctime_ns)
++    alias_before = selected.lstat()
++    linked = stat.S_ISLNK(alias_before.st_mode)
++    if linked:
++        if (row["path"] != "usr/lib/libSystem.tbd" or alias_before.st_nlink != 1
++                or os.readlink(selected) != "libSystem.B.tbd"):
++            fail("unapproved SDK provider alias")
++        physical = root / "usr/lib/libSystem.B.tbd"
++    else:
++        physical = selected
++    # No alias chain, redirected parent, cross-SDK destination or hard-linked body.
++    before = physical.lstat()
++    if (physical.resolve(strict=True) != physical or not physical.is_relative_to(root)
++            or selected.resolve(strict=True) != physical or not stat.S_ISREG(before.st_mode)
++            or before.st_nlink != 1 or before.st_size != row["bytes"]):
++        fail("SDK provider is not its exact physical regular body")
++    with os.fdopen(os.open(physical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
++        if signature(before) != signature(os.fstat(stream.fileno())):
++            fail("SDK provider changed before read")
++        body = stream.read(4 * 1024**2 + 1)
++        after = os.fstat(stream.fileno())
++    if (len(body) != row["bytes"] or hashlib.sha256(body).hexdigest() != row["sha256"]
++            or signature(before) != signature(after) or signature(after) != signature(physical.lstat())
++            or signature(alias_before) != signature(selected.lstat())
++            or (linked and os.readlink(selected) != "libSystem.B.tbd")):
++        fail("SDK provider body or alias changed during read")
++    return physical
++
++
 +def build(work, platform, arch):
 +    pins, pin_file, source, tool = load(work)
 +    input_sha = digest(pin_file)
@@ -4697,9 +4737,7 @@ new file mode 100644
 +    if selected.resolve() != resolved or selected.suffix != ".sdk":
 +        fail("selected SDK provider differs")
 +    for row in sdk["files"]:
-+        path = resolved / row["path"]
-+        if not path.resolve().is_relative_to(resolved) or not path.is_file() or path.is_symlink() or digest(path) != row["sha256"]:
-+            fail("SDK provider input differs")
++        dovi_sdk_provider_file(resolved, row)
 +    if not sdk["files"]:
 +        fail("SDK identity/provider closure is empty")
 +    tools = pins["appleTools"]

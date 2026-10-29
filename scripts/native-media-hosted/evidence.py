@@ -3322,7 +3322,7 @@ def dv_fat(body, expected):
     return result
 
 
-DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': 'e0266ee333965a5d904ead2c2d8020491e0571a640919477e587ffa6a48ba43e', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
+DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '0fd2b23e95e7283971513939159fcee05003243a60fb22c140177259302abbab', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
 PLACEBO_INSTALLED_HELPERS = {'Sources/BuildScripts/placebo-source-build.py': 'ed2b5b2c2fd45b6c03b6cf0ea5fc707b080f05bdb6f40dd270594ae2acdca617'}
 
 def _dovi_file(path, logical, maximum=16*1024**2):

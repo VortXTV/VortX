@@ -25,7 +25,7 @@ import zipfile
 CHUNK, MIB = 1024 * 1024, 1024 * 1024
 GIT = Path("/usr/bin/git")  # Do not execute a producer-controlled/PATH-selected command.
 PROFILE = "original-http-sparse-native-reference-reader-v2-dependencies-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-candidate"
-PROFILE_MANIFEST_SHA256 = "34c99a985249c9b2e9ff6857b3271bd2383593ab94004423cb9946ee14f78336"
+PROFILE_MANIFEST_SHA256 = "5dc99dccd097129cca4d2c41d9bd626a2572f1ed8ef0c3665b152c4b1c34f356"
 NATIVE_UPGRADES_PROFILE = "native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7"
 SHADERC_WRAPPER_VERSION = "2026.1.0"
 SHADERC_REMOTE_URL = "https://github.com/mpvkit/libshaderc-build/releases/download/2026.1.0/Libshaderc_combined.xcframework.zip"
@@ -4494,7 +4494,7 @@ def dv_fat(body, expected):
     return result
 
 
-DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': 'e0266ee333965a5d904ead2c2d8020491e0571a640919477e587ffa6a48ba43e', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
+DOVI_INSTALLED_HELPERS = {'Sources/BuildScripts/dovi-source-build.py': '0fd2b23e95e7283971513939159fcee05003243a60fb22c140177259302abbab', 'Sources/BuildScripts/dovi-source-map.json': '7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3', 'Sources/BuildScripts/dovi-source-policy.json': 'f46c891c881f05c904acaf8b36e3127935905c23e9f66706fede0548c5a7de90'}
 PLACEBO_INSTALLED_HELPERS = {'Sources/BuildScripts/placebo-source-build.py': 'ed2b5b2c2fd45b6c03b6cf0ea5fc707b080f05bdb6f40dd270594ae2acdca617'}
 
 def dovi_builds_receipt(body, zip_bodies, vendor_tar, native_archive, native_group, package_text):
