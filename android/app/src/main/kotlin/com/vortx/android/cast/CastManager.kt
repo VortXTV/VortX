@@ -223,11 +223,13 @@ class CastManager(appContext: Context) {
         if (!selectionIsCurrent() || !CastEligibility.isCastable(playable) || !coordinator.begin(ticket, id, now())) return
         runCatching { client.load(request) }.onSuccess { pending ->
             pending.setResultCallback { result ->
-                if (coordinator.loadId == id && !result.status.isSuccess) {
+                // Reconnect keeps the media UUID but advances its binding. An old LOAD result
+                // must never retire or stop that resumed generation.
+                if (coordinator.loadId == id && ticket.binding.same(coordinator.binding) && !result.status.isSuccess) {
                     handle(coordinator.retire(stopReceiver = true)); publish()
                 }
             }
-        }.onFailure { if (coordinator.loadId == id) { coordinator.retire(false); publish() } }
+        }.onFailure { if (coordinator.loadId == id && ticket.binding.same(coordinator.binding)) { coordinator.retire(false); publish() } }
         requestStatus()
     }
     private fun handle(stop: CastSessionCoordinator.Stop?) {

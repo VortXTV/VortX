@@ -197,19 +197,29 @@ import UIKit
         setPaused(!(policy.pendingPaused ?? state.paused))
     }
     func setPaused(_ paused: Bool) {
-        guard state.owned, item?.isCurrent() == true else { return }
+        guard let client = currentCommandClient() else { return }
         transportPauseGeneration = policy.requestPaused(paused)
         pauseAckStatusSequence = nil
         transportRequest?.delegate = nil
-        transportRequest = paused ? client?.pause() : client?.play()
+        transportRequest = paused ? client.pause() : client.play()
         transportRequest?.delegate = self
     }
     func seek(to position: Double) {
-        guard state.owned, item?.isCurrent() == true, policy.seek(position) else { return }
+        guard let client = currentCommandClient(), policy.seek(position) else { return }
         let options = GCKMediaSeekOptions(); options.interval = policy.resumePosition
-        client?.seek(with: options)
+        client.seek(with: options)
         seekingUntil = Date().addingTimeInterval(15)
         // Do not persist the requested target as observed receiver progress.
+    }
+    private func currentCommandClient() -> GCKRemoteMediaClient? {
+        guard state.owned, let item, item.isCurrent(), let session = boundSession,
+              let client, let status = client.mediaStatus,
+              [.playing, .paused, .buffering].contains(status.playerState),
+              policy.permitsReceiverCommand(
+                echoedOwner: (status.mediaInformation?.customData as? [String: Any])?["vortxLoad"] as? String,
+                onCurrentSession: session === GCKCastContext.sharedInstance().sessionManager.currentCastSession,
+                onBoundClient: session.remoteMediaClient === client) else { return nil }
+        return client
     }
     func stopCasting() { finish(resumeLocal: true, stopReceiver: true, message: nil) }
     private func tick() {

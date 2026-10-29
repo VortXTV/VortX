@@ -14,6 +14,13 @@ struct GoogleCastPlaybackPolicy {
 
     var resumePosition: Double { pendingSeek ?? confirmedPosition }
 
+    /// A previously owned status does not authorize a later command. The SDK adapter supplies
+    /// the current session/client identities and the receiver's current opaque load receipt.
+    func permitsReceiverCommand(echoedOwner: String?, onCurrentSession: Bool, onBoundClient: Bool) -> Bool {
+        guard let owner else { return false }
+        return !suspended && onCurrentSession && onBoundClient && echoedOwner == owner.uuidString
+    }
+
     mutating func begin(owner: UUID, position: Double, duration: Double) {
         self.owner = owner
         confirmedPosition = position.isFinite ? min(604800, max(0, position)) : 0

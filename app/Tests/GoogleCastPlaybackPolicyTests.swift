@@ -66,6 +66,16 @@ import Foundation
         var state = GoogleCastPlaybackPolicy()
         let owner = UUID(), other = UUID()
         state.begin(owner: owner, position: 50, duration: 600)
+        check("current bound receiver load permits commands", state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: true))
+        check("another sender's current load denies commands despite old owned UI", !state.permitsReceiverCommand(
+              echoedOwner: other.uuidString, onCurrentSession: true, onBoundClient: true))
+        check("missing receiver receipt denies commands", !state.permitsReceiverCommand(
+              echoedOwner: nil, onCurrentSession: true, onBoundClient: true))
+        check("old session cannot command even with the same load receipt", !state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: false, onBoundClient: true))
+        check("replaced client cannot command even with the same load receipt", !state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: false))
         check("unrelated session cannot publish", !state.sample(owner: other, position: 100, duration: 600))
         check("owned position observed", state.sample(owner: owner, position: 52, duration: 600))
         check("explicit seek accepted", state.seek(200))
@@ -85,10 +95,16 @@ import Foundation
         state.observePaused(false, freshAfterAcknowledgement: true)
         check("fresh matching acknowledged Play settles intent", state.pendingPaused == nil)
         state.suspend()
+        check("suspended receiver load denies commands", !state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: true))
         check("suspended sample cannot fabricate progress", !state.sample(owner: owner, position: 0, duration: 0))
         state.resume()
+        check("matching resumed receiver permits commands", state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: true))
         check("huge values rejected", !state.sample(owner: owner, position: 1e300, duration: 1e300))
         state.retire()
+        check("retired load denies commands", !state.permitsReceiverCommand(
+              echoedOwner: owner.uuidString, onCurrentSession: true, onBoundClient: true))
         check("retired callback ignored", !state.sample(owner: owner, position: 250, duration: 600))
         let native = URL(string:"http://127.0.0.1:53144")!
         let source = native.appendingPathComponent("\(hash)/0")
