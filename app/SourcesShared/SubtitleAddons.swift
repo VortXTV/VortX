@@ -12,6 +12,8 @@ struct AddonSubtitle: Identifiable, Equatable {
     let url: String
     let lang: String
     let addonName: String
+    /// Original installed source endpoint; never inferred from the returned subtitle URL or redirect URL.
+    let installedBaseURL: URL
     var releaseName: String? = nil
 
     var displayTitle: String {
@@ -75,7 +77,7 @@ enum SubtitleAddonService {
     /// deduplicated by URL. videoId is a movie id or `id:season:episode`.
     static func fetch(sources: [SubtitleAddonSource], type: String, videoId: String,
                       metadata: SubtitleRequestMetadata = .init(),
-                      session: URLSession = .shared) async -> [AddonSubtitle] {
+                      testURLProtocolClasses: AddonURLGuard.TestURLProtocolClasses? = nil) async -> [AddonSubtitle] {
         guard !sources.isEmpty else { return [] }
         let path = metadata.resourcePath(type: type, videoID: videoId)
         let legacyPath = SubtitleRequestMetadata().resourcePath(type: type, videoID: videoId)
@@ -84,26 +86,38 @@ enum SubtitleAddonService {
         let collected: [[AddonSubtitle]] = await withTaskGroup(of: (Int, [AddonSubtitle]).self) { group in
             for (i, source) in sources.enumerated() {
                 group.addTask {
+                    guard let installedBaseURL = URL(string: source.baseUrl) else { return (i, []) }
+                    let access = AddonURLGuard.AccessScope.addon(origin: installedBaseURL)
+                    // One source gets one operation budget across both metadata and legacy paths.
+                    let deadline = Date().addingTimeInterval(15)
                     for (attempt, resourcePath) in paths.enumerated() {
                         guard !Task.isCancelled,
                               let url = URL(string: "\(source.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/\(resourcePath)") else {
                             return (i, [])
                         }
-                        var req = URLRequest(url: url)
-                        req.timeoutInterval = 15
-                        guard let (data, resp) = try? await session.data(for: req),
-                              let http = resp as? HTTPURLResponse else { return (i, []) }
-                        // Older routers may only implement the ID-only route. Retry it once for a route
-                        // rejection, never for an empty successful result, auth failure or provider outage.
-                        if attempt == 0, paths.count > 1, [404, 405].contains(http.statusCode) { continue }
-                        guard (200..<300).contains(http.statusCode),
-                              let decoded = try? JSONDecoder().decode(SubtitlesResponse.self, from: data) else {
+                        let remaining = deadline.timeIntervalSinceNow
+                        guard remaining > 0 else { return (i, []) }
+                        let response: AddonURLGuard.Response
+                        do {
+                            response = try await AddonURLGuard.fetch(
+                                url, context: .subtitleIndex, access: access, timeout: remaining,
+                                testURLProtocolClasses: testURLProtocolClasses)
+                        } catch let rejection as AddonURLGuard.SubtitleIndexRouteRejection {
+                            // Older routers may only implement the ID-only route. Retry once for route
+                            // rejection only, never for empty success, auth failure or provider outage.
+                            if attempt == 0, paths.count > 1, [404, 405].contains(rejection.statusCode) { continue }
+                            return (i, [])
+                        } catch {
+                            return (i, [])
+                        }
+                        guard let decoded = try? JSONDecoder().decode(SubtitlesResponse.self, from: response.data) else {
                             return (i, [])
                         }
                         let subs = (decoded.subtitles ?? []).compactMap { sub -> AddonSubtitle? in
                             guard let url = sub.url, !url.isEmpty else { return nil }
                             return AddonSubtitle(id: sub.id ?? url, url: url,
                                                  lang: sub.lang ?? "und", addonName: source.name,
+                                                 installedBaseURL: installedBaseURL,
                                                  releaseName: sub.subtitleFileName)
                         }
                         return (i, subs)

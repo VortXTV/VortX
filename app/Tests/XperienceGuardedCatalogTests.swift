@@ -106,7 +106,7 @@ enum XperienceGuardedCatalogTests {
         let components = URLComponents(url: request, resolvingAgainstBaseURL: false)!
         expect(components.percentEncodedPath == "/first/catalog/movie/genre.example/genre=None&skip=20.json", "exact source extras and genre None survive")
         expect(components.percentEncodedQuery == "tenant=one&mode=full", "configured query survives")
-        let contexts: [AddonURLGuard.ResponseContext] = [.manifest, .xperienceCatalog, .xperienceArtwork]
+        let contexts: [AddonURLGuard.ResponseContext] = [.manifest, .xperienceCatalog, .xperienceArtwork, .subtitleIndex]
         for context in contexts {
             let limit = context.maximumBytes
             expect(AddonURLGuard.canAcceptBody(currentBytes: limit - 1, incomingBytes: 1, context: context), "last byte accepted")

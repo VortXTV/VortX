@@ -56,24 +56,28 @@ enum AddonURLGuard {
     /// Hard upper bound for a manifest response. The check is applied to Content-Length when present and again
     /// while consuming the streamed body, so chunked/lying responses cannot grow an unbounded Data buffer.
     static let maxManifestBytes = 2 * 1024 * 1024
+    /// Separate fixed purpose limit so later manifest tuning cannot silently change subtitle index budgets.
+    static let maxSubtitleIndexBytes = 2 * 1024 * 1024
 
     /// Callers select a known response purpose; a supplied URL cannot choose an arbitrary body cap.
     enum ResponseContext: Sendable {
         case manifest
         case xperienceCatalog
         case xperienceArtwork
+        case subtitleIndex
 
         var maximumBytes: Int {
             switch self {
             case .manifest: return AddonURLGuard.maxManifestBytes
             case .xperienceCatalog: return 4 * 1024 * 1024
             case .xperienceArtwork: return 8 * 1024 * 1024
+            case .subtitleIndex: return AddonURLGuard.maxSubtitleIndexBytes
             }
         }
 
         fileprivate var accept: String {
             switch self {
-            case .manifest, .xperienceCatalog: return "application/json"
+            case .manifest, .xperienceCatalog, .subtitleIndex: return "application/json"
             case .xperienceArtwork: return "image/png,image/jpeg,image/webp,image/heic,image/heif"
             }
         }
@@ -83,6 +87,19 @@ enum AddonURLGuard {
         let data: Data
         let finalURL: URL
         let mimeType: String?
+    }
+
+    /// A route rejection is meaningful only to the subtitle index's metadata-to-ID-only fallback.
+    /// It is deliberately separate from the general Rejection cases and their retry policy.
+    struct SubtitleIndexRouteRejection: Error, Equatable, Sendable {
+        let statusCode: Int
+    }
+
+    /// Immutable fixture hook for URLProtocol-based tests. Supplying it does not skip URL validation,
+    /// redirect handling, deadlines, response limits, or the production session delegate.
+    struct TestURLProtocolClasses: @unchecked Sendable {
+        fileprivate let values: [AnyClass]
+        init(_ values: [AnyClass]) { self.values = values }
     }
 
     /// Return whether appending a streamed chunk remains inside this purpose's cap without overflow.
@@ -161,7 +178,8 @@ enum AddonURLGuard {
     /// Resource purpose never grants private access; only the selected add-on origin does.
     static func fetch(_ url: URL, context: ResponseContext,
                       access: AccessScope = .publicNetwork,
-                      timeout: TimeInterval = 15) async throws -> Response {
+                      timeout: TimeInterval = 15,
+                      testURLProtocolClasses: TestURLProtocolClasses? = nil) async throws -> Response {
         let deadline = Date().addingTimeInterval(timeout)
         var current = url
         for _ in 0...maxRedirects {
@@ -186,6 +204,9 @@ enum AddonURLGuard {
             configuration.urlCredentialStorage = nil
             configuration.urlCache = nil
             configuration.timeoutIntervalForResource = remaining
+            if let testURLProtocolClasses {
+                configuration.protocolClasses = testURLProtocolClasses.values
+            }
             let delegate = NoRedirectDelegate()
             let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
             defer { session.invalidateAndCancel() }
@@ -199,6 +220,9 @@ enum AddonURLGuard {
                    let next = redirectTarget(from: current, location: location) {
                     current = next
                     continue
+                }
+                if case .subtitleIndex = context, [404, 405].contains(http.statusCode) {
+                    throw SubtitleIndexRouteRejection(statusCode: http.statusCode)
                 }
                 guard (200...299).contains(http.statusCode),
                       http.expectedContentLength <= Int64(context.maximumBytes) else {
@@ -223,6 +247,8 @@ enum AddonURLGuard {
                 if let rejection = await validate(finalURL, access: access) { throw rejection }
                 try Task.checkCancellation()
                 return Response(data: data, finalURL: finalURL, mimeType: http.mimeType)
+            } catch let routeRejection as SubtitleIndexRouteRejection {
+                throw routeRejection
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
