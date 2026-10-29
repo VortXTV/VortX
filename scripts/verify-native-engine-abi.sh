@@ -9,9 +9,18 @@ platform="${1:?platform required}" artifact="${2:?artifact required}" mode="${3:
 state_symbols=(vortx_init_runtime vortx_init_from_state_json vortx_dispatch_json vortx_resolve_json vortx_get_state_json vortx_get_state_delta_json vortx_string_free vortx_engine_free)
 resource_symbols=(vortx_resource_host_abi_version vortx_resource_host_new vortx_resource_host_load_json vortx_resource_host_free vortx_cancel_new vortx_cancel_cancel vortx_cancel_free)
 owner_history_symbols=(vortx_owner_history_canonicalize_evidence_json vortx_owner_history_session_open vortx_owner_history_session_fork vortx_owner_history_session_json vortx_owner_history_session_free)
-if [[ "$platform" == apple ]]; then
+if [[ "$platform" == apple || "$platform" == apple-macos-arm64-staged ]]; then
+    if [[ "$platform" == apple-macos-arm64-staged ]]; then
+        [[ -d "$artifact/macos-arm64" && ! -L "$artifact/macos-arm64" ]] || { echo "missing staged macos-arm64 slice" >&2; exit 1; }
+        [[ "$(find "$artifact" -type f -name libvortx_ffi.a | wc -l | tr -d ' ')" == 1 ]] || { echo "staged ABI check requires exactly one regular archive" >&2; exit 1; }
+        [[ -z "$(find "$artifact" -type l -print -quit)" ]] || { echo "staged ABI tree may not contain symlinks" >&2; exit 1; }
+        [[ "$mode" == resource-host ]] || { echo "staged macOS mode requires resource-host ABI" >&2; exit 1; }
+        archives=("$artifact/macos-arm64/libvortx_ffi.a")
+    else
+        archives=("$artifact"/*/libvortx_ffi.a)
+    fi
     count=0
-    for archive in "$artifact"/*/libvortx_ffi.a; do
+    for archive in "${archives[@]}"; do
         [[ -f "$archive" ]] || continue
         count=$((count + 1))
         header="$(dirname "$archive")/Headers/vortx/vortx_ffi.h"
@@ -42,7 +51,11 @@ if [[ "$platform" == apple ]]; then
                     -Werror -fsyntax-only -x c -include "$header" -
         done
     done
-    [[ "$count" == 5 ]] || { echo "expected five Apple native slices; found $count" >&2; exit 1; }
+    if [[ "$platform" == apple-macos-arm64-staged ]]; then
+        [[ "$count" == 1 ]] || { echo "expected exactly one staged macOS native slice; found $count" >&2; exit 1; }
+    else
+        [[ "$count" == 5 ]] || { echo "expected five Apple native slices; found $count" >&2; exit 1; }
+    fi
 elif [[ "$platform" == android ]]; then
     readelf="${READELF:-llvm-readelf}"
     exports=$($readelf --dyn-syms --wide "$artifact")

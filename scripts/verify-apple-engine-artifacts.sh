@@ -31,18 +31,30 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ "${1:-}" = "--native-only" ]; then
+STAGED_MACOS=0
+if [ "${1:-}" = "--staged-macos-arm64" ]; then
+  [ "$#" -eq 3 ] || { echo "usage: verify-apple-engine-artifacts.sh --staged-macos-arm64 <xcframework> <prelocalize-root>" >&2; exit 2; }
+  STAGED_MACOS=1
+  FFI_XC="$2"
+  PRELOC="$3"
+  REPO_ROOT=""
+elif [ "${1:-}" = "--native-only" ]; then
   shift
 fi
-REPO_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-VENDOR="$REPO_ROOT/app/Vendor"
-FFI_XC="$VENDOR/VortxEngine.xcframework"
-PRELOC="$VENDOR/engine-prelocalize"
+if [ "$STAGED_MACOS" != 1 ]; then
+  REPO_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+  VENDOR="$REPO_ROOT/app/Vendor"
+  FFI_XC="$VENDOR/VortxEngine.xcframework"
+  PRELOC="$VENDOR/engine-prelocalize"
+fi
 
 die() { echo "APPLE ENGINE ARTIFACT VERIFY: $*" >&2; exit 2; }
 
 command -v otool >/dev/null 2>&1 || die "otool not found (Xcode command line tools required)"
 command -v nm    >/dev/null 2>&1 || die "nm not found (Xcode command line tools required)"
+if [ "$STAGED_MACOS" = 1 ]; then
+  command -v lipo >/dev/null 2>&1 || die "lipo not found (Xcode command line tools required for staged architecture proof)"
+fi
 
 # Apple's nm cannot parse some rust-produced objects (newer LLVM attribute format, e.g. "Unknown
 # attribute kind"); the rust toolchain's own llvm-nm can. Discover it best-effort. If it is absent,
@@ -57,19 +69,47 @@ fi
 [ -d "$FFI_XC" ]  || die "missing $FFI_XC (build-ffi-xcframework.sh did not run / its cache did not restore)"
 [ -d "$PRELOC" ]  || die "missing $PRELOC (retained pre-localization archives absent; the OSO map cannot resolve)"
 
+if [ "$STAGED_MACOS" = 1 ]; then
+  [[ ! -L "$FFI_XC" && ! -L "$PRELOC" ]] || die "staged roots may not be symlinks"
+  /usr/bin/python3 - "$FFI_XC/Info.plist" <<'PY' || die "staged Info.plist is not exactly one macOS arm64 library"
+import plistlib, sys
+with open(sys.argv[1], "rb") as f: p=plistlib.load(f)
+libs=p.get("AvailableLibraries", [])
+assert len(libs)==1
+lib=libs[0]
+assert lib.get("LibraryIdentifier")=="macos-arm64"
+assert lib.get("SupportedPlatform")=="macos"
+assert lib.get("SupportedArchitectures")==["arm64"]
+assert "SupportedPlatformVariant" not in lib
+PY
+  [[ "$(find "$FFI_XC" -type f -name '*.a' | wc -l | tr -d ' ')" == 1 ]] || die "staged XCFramework must contain exactly one regular archive"
+  [[ "$(find "$PRELOC" -type f -name '*.a' | wc -l | tr -d ' ')" == 1 ]] || die "staged retained tree must contain exactly one regular archive"
+  [[ -z "$(find "$FFI_XC" "$PRELOC" -type l -print -quit)" ]] || die "staged archive trees may not contain symlinks"
+  command -v lipo >/dev/null 2>&1 || die "lipo not found (Xcode command line tools required for staged architecture proof)"
+fi
+
 # A partial native SDK is never sufficient, even if the archives that happen to exist pass.
 # These exact target/slice mappings prevent an unrelated retained archive standing in for
 # the input whose localized native debug map will be consumed by the app link.
-while IFS=' ' read -r slice triple; do
-  [ -s "$FFI_XC/$slice/libvortx_ffi.a" ] || die "missing or empty native slice $slice"
-  [ -s "$PRELOC/VortxEngine/$triple/libvortx_ffi.a" ] || die "missing or empty retained native input $triple"
-done <<'NATIVE_SLICES'
-ios-arm64 aarch64-apple-ios
+if [ "$STAGED_MACOS" = 1 ]; then
+  NATIVE_SLICES='macos-arm64 aarch64-apple-darwin'
+else
+  NATIVE_SLICES='ios-arm64 aarch64-apple-ios
 ios-arm64-simulator aarch64-apple-ios-sim
 tvos-arm64 aarch64-apple-tvos
 tvos-arm64-simulator aarch64-apple-tvos-sim
-macos-arm64 aarch64-apple-darwin
-NATIVE_SLICES
+macos-arm64 aarch64-apple-darwin'
+fi
+while IFS=' ' read -r slice triple; do
+  [ -n "$slice" ] || continue
+  [ -s "$FFI_XC/$slice/libvortx_ffi.a" ] || die "missing or empty native slice $slice"
+  if [ "$STAGED_MACOS" = 1 ]; then retained="$PRELOC/VortxEngine/$triple/libvortx_ffi.a"; else retained="$PRELOC/VortxEngine/$triple/libvortx_ffi.a"; fi
+  [ -s "$retained" ] || die "missing or empty retained native input $triple"
+  if [ "$STAGED_MACOS" = 1 ]; then
+    lipo -verify_arch arm64 "$FFI_XC/$slice/libvortx_ffi.a" || die "staged XCFramework archive is not arm64: $slice"
+    lipo -verify_arch arm64 "$retained" || die "staged pre-localization archive is not arm64: $triple"
+  fi
+done <<< "$NATIVE_SLICES"
 
 problems=0
 bad() { printf 'FAIL  %s\n' "$*" >&2; problems=$((problems + 1)); }
@@ -184,15 +224,10 @@ done < <(
   # Enumerate mandatory pairs directly, including valid SDK symlinks. `find -type f`
   # alone would silently omit a symlinked archive/slice that passed the -s preflight.
   while IFS=' ' read -r slice triple; do
+    [ -n "$slice" ] || continue
     printf '%s\n' "$FFI_XC/$slice/libvortx_ffi.a" "$PRELOC/VortxEngine/$triple/libvortx_ffi.a"
-  done <<'NATIVE_SLICES'
-ios-arm64 aarch64-apple-ios
-ios-arm64-simulator aarch64-apple-ios-sim
-tvos-arm64 aarch64-apple-tvos
-tvos-arm64-simulator aarch64-apple-tvos-sim
-macos-arm64 aarch64-apple-darwin
-NATIVE_SLICES
-  find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'
+  done <<< "$NATIVE_SLICES"
+  if [ "$STAGED_MACOS" = 1 ]; then find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'; else find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'; fi
   } | LC_ALL=C sort -u
 )
 
@@ -204,4 +239,8 @@ if [ "$problems" -ne 0 ]; then
   echo "APPLE ENGINE ARTIFACT VERIFY FAILED: $problems newer-minOS/missing-OSO source(s) above" >&2
   exit 1
 fi
-echo "APPLE ENGINE ARTIFACT VERIFY PASSED: zero newer-minOS, zero missing-OSO across all slices + retained archives"
+if [ "$STAGED_MACOS" = 1 ]; then
+  echo "APPLE ENGINE ARTIFACT VERIFY PASSED: staged macOS arm64 only; not a full Apple SDK"
+else
+  echo "APPLE ENGINE ARTIFACT VERIFY PASSED: zero newer-minOS, zero missing-OSO across all slices + retained archives"
+fi
