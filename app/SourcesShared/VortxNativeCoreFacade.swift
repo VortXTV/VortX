@@ -2380,9 +2380,13 @@ extension VortxNativeCoreFacade {
         let registers: [String: VortxJSON]
         let registry: [VortxResourceAddon]
     }
-    private func capturedHostBindingMatches(_ expected: WatchlistBinding, registry expectedRegistry: RegistryBinding) -> Bool {
-        !closed && !checkpointReopenRequired && pendingProfileTransitions == 0
-            && watchlistBinding == expected && registryBinding == expectedRegistry && resourceRegistryValid
+    private func capturedHostBindingMatches(_ expected: WatchlistBinding, registry expectedRegistry: RegistryBinding?) -> Bool {
+        guard !closed, !checkpointReopenRequired, pendingProfileTransitions == 0,
+              watchlistBinding == expected else { return false }
+        // Existing import/curation callers still require their exact registry. Catalog-only
+        // playlists acquire no add-on authority and require only the original profile binding.
+        if let expectedRegistry { return registryBinding == expectedRegistry && resourceRegistryValid }
+        return true
     }
     /// Called under the facade lock. Missing publication is UNKNOWN, not an empty profile.
     /// Registry rebind intentionally retires this carrier until a real get_state ACK restores it.
@@ -2407,11 +2411,11 @@ extension VortxNativeCoreFacade {
     private final class CapturedHostFieldAuthority: VortxMutationAuthority, @unchecked Sendable {
         private let facade: VortxNativeCoreFacade
         private let expected: WatchlistBinding
-        private let registry: RegistryBinding
+        private let registry: RegistryBinding?
         private let edit: VortxNativeHostFieldEdit
         private let source: any VortxMutationAuthority
         private let admission: HostFieldAdmission?
-        init(facade: VortxNativeCoreFacade, expected: WatchlistBinding, registry: RegistryBinding,
+        init(facade: VortxNativeCoreFacade, expected: WatchlistBinding, registry: RegistryBinding?,
              edit: VortxNativeHostFieldEdit, source: any VortxMutationAuthority, admission: HostFieldAdmission?) {
             self.facade = facade; self.expected = expected; self.registry = registry; self.edit = edit; self.source = source
             self.admission = admission
@@ -2429,11 +2433,15 @@ extension VortxNativeCoreFacade {
         }
     }
     private func validateCapturedHostEdit(_ edit: VortxNativeHostFieldEdit, expected: WatchlistBinding,
-                                          registry expectedRegistry: RegistryBinding, admission: HostFieldAdmission?) throws {
+                                          registry expectedRegistry: RegistryBinding?, admission: HostFieldAdmission?) throws {
         guard capturedHostBindingMatches(expected, registry: expectedRegistry) else { throw VortxNativeError.superseded }
-        let fields = try capturedHostProfileFields(expected)
+        let fields = try expectedRegistry == nil
+            ? capturedPlaylistProfileFields(expected) : capturedHostProfileFields(expected)
+        // The dedicated playlist admission bounds the complete observed registers before
+        // their first recursive raw comparison. Preserve the older curation route's order.
+        if expectedRegistry == nil { try admission?(fields) }
         guard edit.baselineMatches(fields[edit.field]) else { throw VortxNativeHostFieldMutationError.staleRegister }
-        try admission?(fields)
+        if expectedRegistry != nil { try admission?(fields) }
     }
     /// Unlike a profile patch, this changes no kernel-owned setting, account binding or add-on.
     /// The exact raw register CAS is checked at enqueue, FIFO admission, inside the session's
@@ -2442,6 +2450,54 @@ extension VortxNativeCoreFacade {
                                      registry expectedRegistry: RegistryBinding, sourceAuthority: any VortxMutationAuthority,
                                      checkpointValidator: any VortxProspectiveCheckpointValidator,
                                      admission: HostFieldAdmission? = nil) async throws -> VortxJSON {
+        try await commitCapturedHostProfileField(edit, expected: expected, registry: expectedRegistry,
+            sourceAuthority: sourceAuthority, checkpointValidator: checkpointValidator, admission: admission)
+    }
+
+    /// The acknowledged Session carrier has already crossed its typed checkpoint validation.
+    /// Currentness needs its exact header/profile shape, not a full decode of every profile and
+    /// register on the caller's actor. Keep the older curation reader's validation unchanged.
+    private func capturedPlaylistProfileFields(_ expected: WatchlistBinding) throws -> [String: VortxJSON] {
+        guard let carrier = values["native_host_preferences"],
+              carrier["schemaVersion"] == .integer(1) || carrier["schemaVersion"] == .unsigned(1),
+              carrier["scope"] == .string(expected.scope.account),
+              carrier["ownerProfileId"] == .string(expected.scope.ownerProfileID),
+              case .object(let profiles) = carrier["profiles"] else { throw VortxNativeError.invalidSnapshot }
+        guard let profile = profiles[expected.profileID] else { return [:] }
+        guard case .object(let fields) = profile["fields"] else { throw VortxNativeError.invalidSnapshot }
+        return fields
+    }
+    func capturedPlaylistBindingIsCurrent(expected: WatchlistBinding) -> Bool {
+        lock.withLock {
+            capturedHostBindingMatches(expected, registry: nil)
+                && (try? capturedPlaylistProfileFields(expected)) != nil
+        }
+    }
+
+    /// No resource-registry authority is acquired by reading catalog-only saved playlists.
+    /// A missing acknowledged host carrier remains unknown, not an empty editable profile.
+    func capturedPlaylistRegisters(expected: WatchlistBinding) -> [String: VortxJSON]? {
+        lock.withLock {
+            guard capturedHostBindingMatches(expected, registry: nil),
+                  let fields = try? capturedPlaylistProfileFields(expected) else { return nil }
+            return fields.filter { $0.key.hasPrefix(VortxNativePlaylist.prefix) }
+        }
+    }
+
+    /// The registry-free mutation route is restricted to the typed playlist family. Its raw
+    /// register admission is repeated at enqueue, FIFO admission and final commit authority.
+    func setCapturedPlaylistField(_ edit: VortxNativeHostFieldEdit, expected: WatchlistBinding,
+                                 sourceAuthority: any VortxMutationAuthority,
+                                 checkpointValidator: any VortxProspectiveCheckpointValidator) async throws -> VortxJSON {
+        try await commitCapturedHostProfileField(edit, expected: expected, registry: nil,
+            sourceAuthority: sourceAuthority, checkpointValidator: checkpointValidator,
+            admission: { fields in try VortxNativePlaylist.validateMutation(edit, fields: fields) })
+    }
+
+    private func commitCapturedHostProfileField(_ edit: VortxNativeHostFieldEdit, expected: WatchlistBinding,
+                                     registry expectedRegistry: RegistryBinding?, sourceAuthority: any VortxMutationAuthority,
+                                     checkpointValidator: any VortxProspectiveCheckpointValidator,
+                                     admission: HostFieldAdmission?) async throws -> VortxJSON {
         guard !edit.field.isEmpty else { throw VortxNativeError.invalidSnapshot }
         let owner = CapturedHostFieldAuthority(facade: self, expected: expected, registry: expectedRegistry, edit: edit, source: sourceAuthority, admission: admission)
         let operation = VortxNativeHostFieldCommitLatch(source: owner)

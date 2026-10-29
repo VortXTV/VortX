@@ -72,6 +72,7 @@ internal object NativeHostPreferences {
     private fun validateFields(fields: JSONObject, profile: Boolean) {
         for (field in fields.keys()) {
             val watchlist = field.startsWith(NativeWatchlistCodec.PREFIX)
+            val playlist = field.startsWith(NativePlaylist.PREFIX)
             require(field.isNotBlank() && field.length <= (if (watchlist) NativeWatchlistCodec.MAX_FIELD_LENGTH else 512))
             require(!watchlist || profile) { "Watchlist is profile-scoped" }
             require(!authority(field)) { "Host field conflicts with native authority" }
@@ -79,6 +80,7 @@ internal object NativeHostPreferences {
             require(entry.keys().asSequence().toSet() == setOf("clock", "actor", "value"))
             clock(entry.get("clock")); actor(entry.getString("actor"))
             val value = entry.get("value")
+            if (playlist) NativePlaylist.validateEnvelope(field, value, global = !profile)
             if (watchlist) NativeWatchlistCodec.validate(field, value)
             if (field.startsWith(com.vortx.android.foryou.ForYouSync.PREFIX)) {
                 require(profile) { "For You is profile-scoped" }
@@ -195,7 +197,8 @@ internal object NativeHostPreferences {
         for (id in nextProfiles.keys().asSequence().filter { it != "modifiedSeconds" }.sorted()) {
             val old = oldProfiles.optJSONObject(id) ?: JSONObject(); val next = nextProfiles.getJSONObject(id)
             for (field in (old.keys().asSequence().toSet() + next.keys().asSequence().toSet()).sorted()) {
-                if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) || equal(old.opt(field), next.opt(field))) continue
+                if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) ||
+                    field.startsWith(NativePlaylist.PREFIX) || equal(old.opt(field), next.opt(field))) continue
                 val bucket = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
                 record(result, bucket.getJSONObject("fields"), field, next.opt(field))
             }
@@ -261,7 +264,8 @@ internal object NativeHostPreferences {
             val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", nativeRoster.getJSONObject(id).getString("name"))
             val fields = profiles.getJSONObject(id).getJSONObject("fields")
             for (field in fields.keys()) {
-                if (field.startsWith(NativeWatchlistCodec.PREFIX)) continue // Separate per-item ledger, not profile DTO attributes.
+                // Dedicated per-item ledgers never become generic profile DTO attributes.
+                if (field.startsWith(NativeWatchlistCodec.PREFIX) || field.startsWith(NativePlaylist.PREFIX)) continue
                 val value = fields.getJSONObject(field).get("value")
                 if (value == JSONObject.NULL) target.remove(field) else target.put(field, value)
             }

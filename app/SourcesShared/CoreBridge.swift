@@ -8064,3 +8064,58 @@ extension CoreBridge {
         return entry
     }
 }
+
+
+// MARK: - Captured encrypted-profile playlists
+extension CoreBridge {
+    struct NativePlaylistTarget {
+        let profileID: UUID
+        fileprivate let owner: NativeWatchlistTarget
+        // These existing lock-only helpers are profile/credential gesture authority, despite
+        // their historical import name; neither carries an add-on registry or import payload.
+        fileprivate let authority: NativeXperienceCommitAuthority
+        fileprivate let lifetime: XperienceImportLifetime
+    }
+    @MainActor func captureNativePlaylistTarget() throws -> NativePlaylistTarget {
+        guard let owner = captureNativeWatchlistTarget(), case .account = owner.owner.credential.scope,
+              let profileID = UUID(uuidString: owner.binding.profileID),
+              owner.facade.capturedPlaylistRegisters(expected: owner.binding) != nil else {
+            throw VortxNativeError.closed
+        }
+        let lifetime = XperienceImportLifetime()
+        return .init(profileID: profileID, owner: owner,
+            authority: .init(core: self, target: owner, lifetime: lifetime), lifetime: lifetime)
+    }
+    @MainActor func retireNativePlaylistTarget(_ target: NativePlaylistTarget) { target.lifetime.revoke() }
+    @MainActor func nativePlaylistContextIsCurrent(_ target: NativePlaylistTarget) -> Bool {
+        nativeWatchlistTargetIsCurrent(target.owner)
+            && target.owner.facade.capturedPlaylistBindingIsCurrent(expected: target.owner.binding)
+    }
+    @MainActor func nativePlaylistTargetIsCurrent(_ target: NativePlaylistTarget) -> Bool {
+        target.lifetime.isActive && nativePlaylistContextIsCurrent(target)
+    }
+    @MainActor func nativePlaylistRegisters(target: NativePlaylistTarget) throws -> [String: VortxJSON] {
+        guard nativePlaylistTargetIsCurrent(target),
+              let fields = target.owner.facade.capturedPlaylistRegisters(expected: target.owner.binding) else {
+            throw VortxNativeError.superseded
+        }
+        return fields
+    }
+    @MainActor func prepareNativePlaylistExportBudget(target: NativePlaylistTarget) async throws -> XperiencePreparedExport {
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        // Reuse the actual complete-account sizing witness and provider/peer reconciliation.
+        // The historical helper name does not make this a new transport or import operation.
+        return try await VortXSyncManager.shared.prepareXperienceExportBudget(capture: target.owner.owner.credential,
+            sourceIsCurrent: { [weak self] in self?.nativePlaylistTargetIsCurrent(target) == true })
+    }
+    @MainActor func saveNativePlaylist(_ edit: VortxNativeHostFieldEdit, target: NativePlaylistTarget,
+                                     validator: XperiencePreparedExport) async throws -> VortxJSON {
+        try Task.checkCancellation()
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        try VortxNativePlaylist.validateMutation(edit, fields: nativePlaylistRegisters(target: target))
+        let accepted = try await target.owner.facade.setCapturedPlaylistField(edit, expected: target.owner.binding,
+            sourceAuthority: target.authority, checkpointValidator: validator)
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        return accepted // Local durable register only; not cloud-acceptance evidence.
+    }
+}

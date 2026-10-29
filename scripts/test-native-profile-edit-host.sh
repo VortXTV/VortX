@@ -37,6 +37,14 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
     "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeProfileEditHostTests.swift \
     -o "$website_host_dir/website-host"
 "$website_host_dir/website-host" "$website_host_dir/vectors.json"
+xcrun swiftc -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+    app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
+    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
+    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxNativeProfiles.swift \
+    "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativePlaylistTests.swift \
+    -o "$website_host_dir/native-playlists"
+"$website_host_dir/native-playlists"
 if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
     website_library_hash=$(shasum -a 256 "$VORTX_FFI_LIBRARY" | awk '{print $1}')
     website_header_hash=$(shasum -a 256 "${VORTX_FFI_HEADER:?exact reviewed header required}" | awk '{print $1}')

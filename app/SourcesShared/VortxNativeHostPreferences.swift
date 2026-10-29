@@ -176,6 +176,9 @@ struct VortxNativeHostPreferences: Sendable {
         try validateField(name, value: value.value, global: global)
     }
     private static func validateField(_ name: String, value: VortxJSON, global: Bool) throws {
+        if name.hasPrefix(VortxNativePlaylist.prefix) {
+            try VortxNativePlaylist.validateEnvelope(name: name, value: value, global: global)
+        }
         if !global, name.hasPrefix(VortxNativeWatchlist.prefix) { try VortxNativeWatchlist.validate(name, value: value) }
         if !global, name.hasPrefix(forYouPrefix) { try validateForYouField(name, value: value) }
         let normalized = name.lowercased()
