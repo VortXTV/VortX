@@ -418,6 +418,16 @@ internal class VortxNativeSession private constructor(
     private var acknowledgedCheckpoint: NativeCheckpointRead? = null
     private val changes = MutableStateFlow(0L)
     val updates: StateFlow<Long> get() = changes
+    private val playlistRevisions = MutableStateFlow(0L)
+    /** Narrow invalidation for exact-target admission/revision loss and playlist projection changes. */
+    internal val playlistUpdates: StateFlow<Long> get() = playlistRevisions
+    /** Emit only after the changed projection or unavailable admission is already observable. */
+    private fun signalPlaylistInvalidation() { playlistRevisions.value += 1 }
+    private fun enterCheckpointUncertainty() {
+        if (checkpointUncertain) return
+        checkpointUncertain = true
+        signalPlaylistInvalidation()
+    }
 
     private fun validatePresentation(snapshot: String): JSONObject = if (runtime.isTyped)
         scope.validateOwnerHistoryPresentation(snapshot) else scope.validateSnapshot(snapshot)
@@ -640,6 +650,33 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun rawAccount(): ByteArray? = ownerHistory?.cloudAccount()
     @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !requiresRecovery() && isAccountCurrent() && read().owner == owner
 
+    private fun requireCompleteAccountExportRoute() {
+        check(!closed && !requiresRecovery() && runtime.isTyped && isAccountCurrent()) {
+            "Complete account export budget unavailable"
+        }
+    }
+
+    /**
+     * Captures one full presentation only after the scalar route/account checks pass. A generic JNI
+     * runtime is rejected without decoding its state. The owner overload additionally rejects a
+     * stale Session revision/scope before that one remaining presentation read; it does not claim
+     * that current-owner publication is O(1).
+     */
+    @Synchronized internal fun <T> withCompleteAccountExportRead(action: (VortxNativeRead) -> T): T {
+        requireCompleteAccountExportRoute()
+        return action(read())
+    }
+    @Synchronized internal fun <T> withCompleteAccountExportOwner(
+        owner: VortxNativeOwner,
+        action: (VortxNativeRead) -> T,
+    ): T {
+        requireCompleteAccountExportRoute()
+        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
+        val read = read()
+        check(read.owner == owner) { "Native owner changed" }
+        return action(read)
+    }
+
     /** One current owner/state capture, kept under Session through the caller's admission.
      * Unlike read followed by owned, no monitor-release window needs a second full snapshot. */
     @Synchronized internal fun <T> withCurrentRead(action: (VortxNativeRead) -> T): T {
@@ -677,7 +714,7 @@ internal class VortxNativeSession private constructor(
                 requireNotNull(ownerHistoryAuthority) { "Original mounted account authority unavailable" }, authority) }
             catch (failure: NativeOwnerHistoryCoordinator.Uncertain) {
                 com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-                checkpointUncertain = true; unconfirmedHistoryRetirement = true
+                enterCheckpointUncertainty(); unconfirmedHistoryRetirement = true
                 slots.values.forEach { it.close() }; slots.clear()
                 throw failure
             }
@@ -706,7 +743,7 @@ internal class VortxNativeSession private constructor(
                 // second live writer can later overwrite the transferred checkpoint.
                 if (newOwner) {
                     try { oldRuntime.close() }
-                    catch (failure: Throwable) { checkpointUncertain = true; throw failure }
+                    catch (failure: Throwable) { enterCheckpointUncertainty(); throw failure }
                 }
             })
             if (newOwner) { runtime = adapter.view(); ownerHistory = adapter }
@@ -714,9 +751,11 @@ internal class VortxNativeSession private constructor(
             nativeHostPreferenceState = host
             invalidate(); changes.value += 1
         } catch (failure: Throwable) {
-            if (newOwner || adapter.requiresRecovery()) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+            if (newOwner || adapter.requiresRecovery()) {
+                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                enterCheckpointUncertainty()
+            }
             if (newOwner) {
-                checkpointUncertain = true
                 // Retain the reservation even if native retirement is uncertain.
                 ownerHistory = adapter
                 runCatching { adapter.close() }
@@ -800,12 +839,18 @@ internal class VortxNativeSession private constructor(
             commitCheckpoint(updated, candidate, playbackState = playbackState)
             check(isAccountCurrent()) { "Native account changed" }
             val profileChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
+            val playlistProfileChanged = profileChanged ||
+                preferences.toString() != hostProfilePreferences.toString() ||
+                state.getString("activeProfileId") != owner.profileID
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             nativeHostPreferenceState = applied.host
             websiteProfileEditPending = pending
             websiteProfileEditCertificates = applied.certificates
-            if (profileChanged || state.getString("activeProfileId") != owner.profileID) invalidate()
+            if (playlistProfileChanged) {
+                if (profileChanged || state.getString("activeProfileId") != owner.profileID) invalidate()
+                else signalPlaylistInvalidation()
+            }
             changes.value += 1
             true
         } finally { if (!installed) candidate.close() }
@@ -911,7 +956,51 @@ internal class VortxNativeSession private constructor(
                               verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
                               beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
                               legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
-                              progressOnly: Boolean = false): List<String> = owned(owner) {
+                              progressOnly: Boolean = false): List<String> = dispatchInternal(
+        actions, owner, hostProfiles, notifyMutation, hostArchive, remoteHostPreferences, globalChanges,
+        acknowledgeHostPreferences, baselineHostProfiles, verifyCandidate, beforeCommit,
+        profileFieldChanges, legacyWatchlists, progressOnly, requireCompleteAccountExportBudget = false)
+
+    /**
+     * Dedicated playlist route. Its JVM/API surface cannot opt out of the complete-account gate,
+     * while the longstanding [dispatch] signature and generated default-call ABI remain unchanged.
+     */
+    @Synchronized internal fun dispatchBudgetedPlaylist(
+        owner: VortxNativeOwner,
+        profileFieldChanges: JSONObject,
+        beforeCommit: () -> Unit,
+    ): List<String> {
+        check(profileFieldChanges.length() == 1 &&
+            profileFieldChanges.keys().asSequence().all { it.startsWith(NativePlaylist.PREFIX) }) {
+            "Budgeted playlist dispatch accepts one playlist profile field"
+        }
+        return dispatchInternal(emptyList(), owner, null, true, null, null, null, null, null, null,
+            beforeCommit, profileFieldChanges, emptyMap(), false,
+            requireCompleteAccountExportBudget = true)
+    }
+
+    private fun dispatchInternal(
+        actions: List<JSONObject>,
+        owner: VortxNativeOwner,
+        hostProfiles: JSONObject?,
+        notifyMutation: Boolean,
+        hostArchive: JSONObject?,
+        remoteHostPreferences: JSONObject?,
+        globalChanges: JSONObject?,
+        acknowledgeHostPreferences: JSONObject?,
+        baselineHostProfiles: JSONObject?,
+        verifyCandidate: ((VortxNativeRuntime) -> Unit)?,
+        beforeCommit: () -> Unit,
+        profileFieldChanges: JSONObject?,
+        legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>>,
+        progressOnly: Boolean,
+        requireCompleteAccountExportBudget: Boolean,
+    ): List<String> = owned(owner) {
+        // This check precedes fork, host Lamport minting and every durable side effect. The later
+        // commit flag prevents a future refactor from falling back to the generic local store.
+        check(!requireCompleteAccountExportBudget || runtime.isTyped) {
+            "Complete account export budget unavailable"
+        }
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
@@ -965,12 +1054,18 @@ internal class VortxNativeSession private constructor(
             val prior = JSONObject(before)
             val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
             beforeCommit()
-            commitCheckpoint(updated, candidate, hostArchive, playbackState)
+            commitCheckpoint(updated, candidate, hostArchive, playbackState,
+                requireCompleteAccountExportBudget = requireCompleteAccountExportBudget)
             check(isAccountCurrent()) { "Native account changed" }
-            val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
+            val rosterChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
+            val profileOrRegistryChanged = rosterChanged ||
                 prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString() ||
                 !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
+            val activeProfileChanged = state.getString("activeProfileId") != owner.profileID
+            val playlistProfileChanged = rosterChanged || hostChanged || activeProfileChanged
+            val playlistFieldChanged = profileFieldChanges?.keys()?.asSequence()
+                ?.any { it.startsWith(NativePlaylist.PREFIX) } == true
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             hostProfileSyncPending = pendingPreferences
@@ -979,9 +1074,15 @@ internal class VortxNativeSession private constructor(
             if (actions.any(NativeLegacyReconciliationPolicy::holdable)) heldLegacyReconciliation = heldReason
             hostDocumentArchive = archive?.let { JSONObject(it.toString()) }
             // Any profile/registry mutation invalidates in-flight resources. Progress does not.
-            if (hostChanged || profileOrRegistryChanged || state.getString("activeProfileId") != owner.profileID || actions.any {
+            val ownerInvalidated = hostChanged || profileOrRegistryChanged || activeProfileChanged || actions.any {
                     it.getString("type") in setOf("patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
-                }) invalidate()
+                }
+            if (ownerInvalidated) invalidate()
+            // Full host merges are infrequent account-sync boundaries. Signal them without a
+            // per-frame/per-resource full-family comparison; local playlist writes and profile
+            // ownership changes signal only after the checkpoint and in-memory swap succeeded.
+            if (!ownerInvalidated && (remoteHostPreferences != null || playlistFieldChanged || playlistProfileChanged))
+                signalPlaylistInvalidation()
             changes.value += 1
             if (notifyMutation) { if (progressOnly) onProgressMutation() else onMutation() }
             results
@@ -998,6 +1099,7 @@ internal class VortxNativeSession private constructor(
         beforeOwnerChange()
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.close() }; slots.clear()
+        signalPlaylistInvalidation()
     }
     /** Only this Session creates it from its actual original runtime and validated candidate.
      * JSON values are caller-owned locals, never exposed to callbacks or stored as a fresh owner oracle. */
@@ -1013,8 +1115,12 @@ internal class VortxNativeSession private constructor(
      * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
      * In particular, old runtime A must never overwrite a possibly installed binding B. */
     private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null,
-                                 playbackState: PlaybackCheckpointState? = null) {
+                                 playbackState: PlaybackCheckpointState? = null,
+                                 requireCompleteAccountExportBudget: Boolean = false) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
+        check(!requireCompleteAccountExportBudget || candidate.isTyped) {
+            "Complete account export budget unavailable"
+        }
         // Resource revisions, ordinary progress/settings, unrelated roster edits and dormant
         // slots are not playback ownership. The active exact binding transaction is.
         val changesPlaybackOwner = if (playbackState == null) {
@@ -1031,7 +1137,11 @@ internal class VortxNativeSession private constructor(
         }
         try {
             val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
-            if (!candidate.commitTypedCheckpoint(snapshot, archiveChanges)) {
+            val committedCompleteAccount = candidate.commitTypedCheckpoint(snapshot, archiveChanges)
+            check(!requireCompleteAccountExportBudget || committedCompleteAccount) {
+                "Complete account export budget unavailable"
+            }
+            if (!committedCompleteAccount) {
                 store.commit(scope, snapshot)
                 check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
                 if (store.supportsCheckpointAuthority) {
@@ -1040,7 +1150,7 @@ internal class VortxNativeSession private constructor(
             }
         } catch (error: Throwable) {
             com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-            checkpointUncertain = true
+            enterCheckpointUncertainty()
             slots.values.forEach { it.close() }; slots.clear()
             changes.value += 1
             throw error

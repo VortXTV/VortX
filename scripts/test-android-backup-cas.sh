@@ -25,10 +25,15 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/BuildConfig*' 'com/vortx
     'com/vortx/android/sync/PendingSync*' 'com/vortx/android/sync/PendingMarkerTruth*' 'com/vortx/android/sync/SessionMutationResult*' \
     'com/vortx/android/sync/VortXSyncDoc*' 'com/vortx/android/sync/BackupRevisionPolicy*' \
     'com/vortx/android/sync/NativeAccountGateway*' 'com/vortx/android/sync/NativeAccountExport*' \
-    'com/vortx/android/sync/NativeAccountMountToken*' 'com/vortx/android/sync/NativeSyncPublicationPolicy*' \
+    'com/vortx/android/sync/NativeAccountMountToken*' 'com/vortx/android/sync/NativePlaylistProfileGateway*' \
+    'com/vortx/android/sync/NativeSyncPublicationPolicy*' \
     'com/vortx/android/sync/VortXSyncRealtime*' 'com/vortx/android/engine/NativeAccountCoordinator*' \
+    'com/vortx/android/engine/VortxAccountScope*' 'com/vortx/android/engine/NativeCheckpointRead*' \
+    'com/vortx/android/engine/VortxCheckpointStore*' 'com/vortx/android/engine/VortxEncryptedCheckpointStore*' \
+    'com/vortx/android/engine/VortxAndroidCheckpointKey*' 'com/vortx/android/engine/VortxNativeOwner*' \
+    'com/vortx/android/engine/VortxNativeRead*' 'com/vortx/android/engine/VortxNativeSession*' \
     'com/vortx/android/engine/NativeWebsiteProfileEdits*' \
-    'com/vortx/android/engine/NativeHostPreferences*' \
+    'com/vortx/android/engine/NativeHostPreferences*' 'com/vortx/android/engine/NativePlaylist*' \
     'com/vortx/android/profile/ProfileStore*' 'com/vortx/android/backup/SettingsBackup*' \
     'com/vortx/android/integrations/NativeProviderCredentials*' 'com/vortx/android/integrations/NativeProviderAccess*' \
     'com/vortx/android/integrations/NativeProviderVault*' 'com/vortx/android/integrations/NativeProviderAdmission*' \
@@ -44,6 +49,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/sync/NativeAccountGateway.kt" "$source_dir/sync/NativeSyncPublicationPolicy.kt" \
     "$source_dir/profile/ProfileStore.kt" "$source_dir/profile/ProfileRestorePolicy.kt" "$source_dir/backup/SettingsBackup.kt" \
     "$source_dir/integrations/NativeProviderCredentials.kt" "$source_dir/integrations/NativeProviderAccess.kt" \
+    "$source_dir/engine/VortxNativeSession.kt" \
     "$source_dir/engine/NativeAccountCoordinator.kt" "$source_dir/engine/NativeLegacyMaterial.kt" \
     "$source_dir/engine/NativeWebsiteProfileEdits.kt" \
     "$source_dir/engine/NativePlaylist.kt" "$source_dir/engine/NativeHostPreferences.kt" \
@@ -54,6 +60,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/integrations/NativeProviderCredentialsTest.kt" \
     "$test_source/engine/NativeWebsiteProfileEditsTest.kt" \
     "$test_source/engine/NativeHostPreferencesTest.kt" "$test_source/engine/NativePlaylistTest.kt" \
+    "$test_source/engine/NativePlaylistProfileGatewayTest.kt" "$test_source/engine/NativeOwnerHistoryJniTest.kt" \
     -d "$test_dir/classes" 2>&1 | tee "$test_dir/compile.log"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx512m -Dvortx.test.native=true -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -61,7 +68,8 @@ cd "$repo_root/android/app"
     com.vortx.android.sync.NativeAccountSyncTest com.vortx.android.sync.AndroidRealtimeSyncTest \
     com.vortx.android.integrations.NativeProviderCredentialsTest \
     com.vortx.android.engine.NativeWebsiteProfileEditsTest com.vortx.android.engine.NativeHostPreferencesTest \
-    com.vortx.android.engine.NativePlaylistTest 2>&1 | tee "$test_dir/native-host.log"
+    com.vortx.android.engine.NativePlaylistTest com.vortx.android.engine.NativePlaylistProfileGatewayTest \
+    com.vortx.android.engine.NativeOwnerHistoryJniTest 2>&1 | tee "$test_dir/native-host.log"
 "$java_bin" -Xmx512m -Dvortx.test.native=false -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
     com.vortx.android.sync.VortXSyncManagerLegacyBackupRevisionTest 2>&1 | tee "$test_dir/legacy-host.log"
 printf 'Retained verification directory: %s\n' "$test_dir"

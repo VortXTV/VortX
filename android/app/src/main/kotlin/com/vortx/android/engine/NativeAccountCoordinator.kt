@@ -6,17 +6,24 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.NativeAccountGateway
 import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
+import com.vortx.android.sync.NativePlaylistProfileGateway
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.sync.VortXSyncDoc
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.json.JSONArray
 
@@ -40,7 +47,7 @@ internal class NativeAccountCoordinator(
     private val historyBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
     /** Read-only metadata admission, captured on IO. Never reused for a native mutation. */
     private val captureProfilePresentationAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = captureOwnAccountAdmission,
-) : NativeAccountGateway {
+) : NativeAccountGateway, NativePlaylistProfileGateway {
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
@@ -63,7 +70,45 @@ internal class NativeAccountCoordinator(
         fun matches(other: OwnerAuthTarget) = account == other.account && session === other.session && owner == other.owner &&
             selection.raw == other.selection.raw && hasCredential == other.hasCredential
     }
+    /** Revocation never calls Session/auth/lifecycle while holding this scalar monitor. */
+    private class PlaylistLifetime {
+        private val lock = Any()
+        private var active = true
+        fun admit(action: () -> Boolean): Boolean = synchronized(lock) { active && action() }
+        fun revoke() = synchronized(lock) { active = false }
+    }
+    private class CapturedPlaylistTarget(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val lifetime: PlaylistLifetime,
+    ) : NativePlaylistProfileGateway.Target {
+        override val accountId get() = account.id
+        override val profileId get() = owner.profileID
+    }
+    private class CapturedPlaylistSnapshot(
+        override val target: CapturedPlaylistTarget,
+        rawRegisters: JSONObject,
+    ) : NativePlaylistProfileGateway.Snapshot {
+        private val acceptedRegisters = JSONObject(rawRegisters.toString())
+        override val registers get() = JSONObject(acceptedRegisters.toString())
+        fun matches(fields: JSONObject) = NativeHostPreferences.equal(acceptedRegisters, fields)
+    }
+    private data class DetachedPlaylistEdit(val field: String, val expectedRegister: JSONObject?, val value: Any)
+
     val changes = MutableStateFlow(0L)
+    private val playlistMountRevisions = MutableStateFlow(0L)
+    override val playlistChanges = channelFlow {
+        playlistMountRevisions.collectLatest {
+            val current = mounted.get()
+            if (current == null || !accountCurrent(current.account)) send(Unit)
+            else current.session.playlistUpdates.collect {
+                if (mounted.get() === current && accountCurrent(current.account)) send(Unit)
+            }
+        }
+    }
 
     internal data class MigrationStatus(val pendingRows: Int, val setupRequired: Boolean, val watchlistPending: Int = 0)
     internal class MigrationTarget internal constructor(internal val account: SessionOwnerSnapshot.Account,
@@ -331,6 +376,164 @@ internal class NativeAccountCoordinator(
     /** Caller already holds ContinueWatchingOwnerGate -> Session, never acquire either inside auth. */
     fun withProfileMutation(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean =
         withAccountAdmission(account, { true }) { withMountedSession(session, account, action) }
+
+    /**
+     * Playlist lock order is Session -> captured authenticated account admission -> mounted
+     * lifecycle -> captured consumer lifetime. Session.dispatch is reentrant at the tail. Target
+     * revocation takes only its lifetime monitor, so a commit already inside that monitor
+     * linearizes before revocation; a revocation that wins first prevents the commit. The admitted
+     * helper is called only while Session is held with its single validated presentation read.
+     */
+    private fun <T> withAdmittedPlaylistTarget(
+        target: CapturedPlaylistTarget,
+        read: VortxNativeRead,
+        action: (VortxNativeRead) -> T,
+    ): T {
+        var result: Result<T>? = null
+        val admitted = target.admission {
+            if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                    if (read.owner != target.owner) false else {
+                        result = runCatching { action(read) }
+                        true
+                    }
+                }
+            }
+        }
+        check(admitted) { "Native playlist target changed" }
+        return requireNotNull(result).getOrThrow()
+    }
+
+    private fun <T> withCapturedPlaylistTarget(target: CapturedPlaylistTarget, action: (VortxNativeRead) -> T): T =
+        target.session.withCompleteAccountExportOwner(target.owner) { read ->
+            withAdmittedPlaylistTarget(target, read, action)
+        }
+
+    /** The acknowledged carrier has already crossed complete host validation. Clone only this
+     * bounded family so callers cannot mutate Session-owned JSON or rewrite unknown siblings. */
+    private fun playlistFields(read: VortxNativeRead, profileID: String): JSONObject {
+        val profiles = read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document")
+            .getJSONObject("profiles")
+        val bucket = profiles.optJSONObject(NativeHostPreferences.canonicalProfileID(profileID)) ?: return JSONObject()
+        val fields = bucket.getJSONObject("fields")
+        return JSONObject().also { detached ->
+            fields.keys().asSequence().filter { it.startsWith(NativePlaylist.PREFIX) }.forEach { field ->
+                detached.put(field, JSONObject(fields.getJSONObject(field).toString()))
+            }
+        }
+    }
+
+    private fun playlistSnapshot(target: CapturedPlaylistTarget, read: VortxNativeRead): CapturedPlaylistSnapshot =
+        CapturedPlaylistSnapshot(target, playlistFields(read, target.profileId))
+
+    private inline fun <T> playlistResult(action: () -> T): Result<T> = try {
+        Result.success(action())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Throwable) {
+        Result.failure(error)
+    }
+
+    override fun capturePlaylistProfile(): Result<NativePlaylistProfileGateway.Snapshot> = playlistResult {
+        val installation = checkNotNull(mounted.get()) { "Native account has not completed authenticated bootstrap" }
+        // This exact closure freezes sync operation generation, account owner epoch and session.
+        // Playlist authority is unavailable rather than falling back to accountCurrent alone.
+        val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) {
+            "Native playlist account admission unavailable"
+        }
+        installation.session.withCompleteAccountExportRead { read ->
+            val target = CapturedPlaylistTarget(installation.account, installation.session, read.owner,
+                installation, admission, PlaylistLifetime())
+            withAdmittedPlaylistTarget(target, read) { playlistSnapshot(target, it) }
+        }
+    }
+
+    override fun playlistTargetIsCurrent(target: NativePlaylistProfileGateway.Target): Boolean {
+        val captured = target as? CapturedPlaylistTarget ?: return false
+        return runCatching { withCapturedPlaylistTarget(captured) { true } }.getOrDefault(false)
+    }
+
+    override fun playlistSnapshot(target: NativePlaylistProfileGateway.Target): Result<NativePlaylistProfileGateway.Snapshot> {
+        val captured = target as? CapturedPlaylistTarget
+            ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
+        return playlistResult { withCapturedPlaylistTarget(captured) { read -> playlistSnapshot(captured, read) } }
+    }
+
+    override fun publishPlaylistIfCurrent(snapshot: NativePlaylistProfileGateway.Snapshot, publication: () -> Unit): Boolean {
+        val capturedSnapshot = snapshot as? CapturedPlaylistSnapshot ?: return false
+        val captured = capturedSnapshot.target
+        return runCatching { withCapturedPlaylistTarget(captured) { read ->
+            if (!capturedSnapshot.matches(playlistFields(read, captured.profileId))) false
+            else { publication(); true }
+        } }.getOrDefault(false)
+    }
+
+    override fun retirePlaylistTarget(target: NativePlaylistProfileGateway.Target) {
+        (target as? CapturedPlaylistTarget)?.lifetime?.revoke()
+    }
+
+    /** Validate before the first JSON serialization, then validate the detached immutable copy
+     * again so a queued operation never observes later caller mutation. */
+    private fun detachPlaylistEdit(field: String, expectedRegister: JSONObject?, value: Any,
+                                   fields: JSONObject): DetachedPlaylistEdit {
+        NativePlaylist.validateMutation(field, expectedRegister, value, fields)
+        val expected = expectedRegister?.let { JSONObject(it.toString()) }
+        val detachedValue = when (value) {
+            JSONObject.NULL -> JSONObject.NULL
+            is JSONObject -> JSONObject(value.toString())
+            else -> throw IllegalArgumentException("Invalid playlist value")
+        }
+        NativePlaylist.validateMutation(field, expected, detachedValue, fields)
+        return DetachedPlaylistEdit(field, expected, detachedValue)
+    }
+
+    override suspend fun compareAndSetPlaylistField(
+        target: NativePlaylistProfileGateway.Target,
+        field: String,
+        expectedRegister: JSONObject?,
+        value: Any,
+    ): Result<NativePlaylistProfileGateway.Snapshot> {
+        val captured = target as? CapturedPlaylistTarget
+            ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
+        val prepared = playlistResult {
+            withCapturedPlaylistTarget(captured) { read ->
+                detachPlaylistEdit(field, expectedRegister, value, playlistFields(read, captured.profileId))
+            }
+        }.getOrElse { return Result.failure(it) }
+        val operationJob = currentCoroutineContext()[Job]
+        return withContext(Dispatchers.IO) {
+            playlistResult {
+                operationJob?.ensureActive()
+                withCapturedPlaylistTarget(captured) { read ->
+                    operationJob?.ensureActive()
+                    val liveFields = playlistFields(read, captured.profileId)
+                    NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value, liveFields)
+                    captured.session.dispatchBudgetedPlaylist(captured.owner,
+                        JSONObject().put(prepared.field, prepared.value), beforeCommit = {
+                            operationJob?.ensureActive()
+                            check(mounted.get() === captured.installation && accountCurrent(captured.account)) {
+                                "Native playlist target changed"
+                            }
+                            // Session is still on the original state here. This is the final raw
+                            // register CAS/domain admission after candidate construction and before
+                            // its complete-account checkpoint is allowed to replace durable state.
+                            NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value,
+                                playlistFields(captured.session.read(), captured.profileId))
+                        })
+                    val acceptedRead = captured.session.read()
+                    check(acceptedRead.owner == captured.owner) { "Native playlist owner changed during commit" }
+                    val accepted = playlistSnapshot(captured, acceptedRead)
+                    val register = accepted.registers.optJSONObject(prepared.field)
+                        ?: error("Native playlist register was not acknowledged")
+                    check(NativeHostPreferences.equal(register.opt("value"), prepared.value)) {
+                        "Native playlist register readback did not match"
+                    }
+                    accepted // Durable local register; cloud acceptance is a separate receipt.
+                }
+            }
+        }
+    }
+
     suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
         val credentials = checkNotNull(ownCredentials) { "Native streaming sign-in unavailable" }
         val admission = checkNotNull(captureOwnAccountAdmission(target.account)) { "Native account authentication changed" }
@@ -376,6 +579,7 @@ internal class NativeAccountCoordinator(
             if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
         }
+        if (old != null) playlistMountRevisions.value += 1
         changes.value += 1
         onRetired()
         if (old != null) {
@@ -505,6 +709,7 @@ internal class NativeAccountCoordinator(
         try {
             project(candidate)
             check(isCurrent() && accountCurrent(account) && mounted.get() === next) { "Native account changed" }
+            playlistMountRevisions.value += 1
             changes.value += 1
             return true
         } catch (error: Throwable) {
