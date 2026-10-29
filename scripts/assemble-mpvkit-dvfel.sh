@@ -9,7 +9,7 @@
 # OpenSSL 4.1.0 is source-built; its two targets are actual local artifacts.
 # Subtitle candidate sources replace the three retained remote libass transitive wrappers;
 # libbluray1.5.0 also uses its authenticated, Apple-adapted source candidate.
-# Everything else (libass, libdovi, MoltenVK, uavs3d, luajit, freetype) is UNCHANGED from
+# Everything else (libass, MoltenVK, uavs3d, luajit) is UNCHANGED from
 # the 0.41.0-n8.1.2 pin and stays an upstream remote binaryTarget with its existing checksum. That
 # keeps the remaining wrappers unchanged while the selected source candidate is evaluated.
 #
@@ -64,9 +64,11 @@ Libunibreak:Libunibreak
 Libfribidi:Libfribidi
 Libharfbuzz:Libharfbuzz
 Libbluray:Libbluray
+Libfreetype:Libfreetype
+Libdovi:Libdovi
 MAP
 
-# Rewrite the twenty-two rebuilt targets to local paths. The inherited root
+# Rewrite the twenty-three rebuilt targets to local paths. The inherited root
 # Package.swift still carries the old bluray1.4 template; it is never shipped here.
 python3 - "$SRC/Package.swift" "$PKG/Package.swift" <<'PY'
 import re, sys
@@ -74,7 +76,7 @@ src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
 local = ["Libmpv-GPL","Libavcodec-GPL","Libavdevice-GPL","Libavfilter-GPL","Libavformat-GPL",
          "Libavutil-GPL","Libswresample-GPL","Libswscale-GPL","Libplacebo","lcms2","Libdav1d","Libssl","Libcrypto",
-         "gmp","nettle","hogweed","gnutls","Libsmbclient","Libunibreak","Libfribidi","Libharfbuzz","Libbluray"]
+         "gmp","nettle","hogweed","gnutls","Libsmbclient","Libunibreak","Libfribidi","Libharfbuzz","Libbluray","Libfreetype","Libdovi"]
 for name in local:
     pat = re.compile(r'\.binaryTarget\(\s*name:\s*"%s",\s*url:\s*"[^"]*",\s*checksum:\s*"[^"]*"\s*\)'
                      % re.escape(name))

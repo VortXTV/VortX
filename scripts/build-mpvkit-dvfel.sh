@@ -139,7 +139,8 @@ run_with_subtitle_sources_readonly() (
     "$subtitle_work/dist/libunibreak-8.0-9c4fad6e" \
     "$subtitle_work/dist/libfribidi-1.0.17-6949dcde" \
     "$subtitle_work/dist/libharfbuzz-15.0.0-968536e9" \
-    "$subtitle_work/dist/libbluray-1.5.0-f676408e"; do
+    "$subtitle_work/dist/libbluray-1.5.0-f676408e" \
+    "$subtitle_work/dist/libfreetype-2.15.0-37515cf5"; do
     [ -d "$subtitle_source" ] && [ ! -L "$subtitle_source" ] &&
       [ "$(cd "$subtitle_source" && pwd -P)" = "$subtitle_source" ] || exit 1
   done
@@ -149,12 +150,14 @@ run_with_subtitle_sources_readonly() (
   (subpath (param "SRC_UNIBREAK"))
   (subpath (param "SRC_FRIBIDI"))
   (subpath (param "SRC_HARFBUZZ"))
-  (subpath (param "SRC_BLURAY")))'
+  (subpath (param "SRC_BLURAY"))
+  (subpath (param "SRC_FREETYPE")))'
   PYTHONDONTWRITEBYTECODE=1 /usr/bin/sandbox-exec \
     -D "SRC_UNIBREAK=$subtitle_work/dist/libunibreak-8.0-9c4fad6e" \
     -D "SRC_FRIBIDI=$subtitle_work/dist/libfribidi-1.0.17-6949dcde" \
     -D "SRC_HARFBUZZ=$subtitle_work/dist/libharfbuzz-15.0.0-968536e9" \
     -D "SRC_BLURAY=$subtitle_work/dist/libbluray-1.5.0-f676408e" \
+    -D "SRC_FREETYPE=$subtitle_work/dist/libfreetype-2.15.0-37515cf5" \
     -p "$subtitle_policy" "$@"
 )
 
@@ -188,7 +191,7 @@ matches_exact_patch_tree() {
   # candidate checkout, the exact approved patch must also create a regular, byte-identical file
   # in the temporary patched tree. This closes the dirty-check gap without admitting arbitrary
   # untracked files or JSON receipts.
-  for helper in Sources/BuildScripts/crypto-release-sources.py Sources/BuildScripts/crypto-chain-gate.py Sources/BuildScripts/subtitle-release-sources.py; do
+  for helper in Sources/BuildScripts/crypto-release-sources.py Sources/BuildScripts/crypto-chain-gate.py Sources/BuildScripts/subtitle-release-sources.py Sources/BuildScripts/dovi-source-build.py Sources/BuildScripts/dovi-source-map.json Sources/BuildScripts/dovi-source-policy.json; do
     if [ -e "$MPVKIT_DIR/$helper" ] || [ -e "$temporary/$helper" ]; then
       if [ ! -f "$MPVKIT_DIR/$helper" ] || [ -L "$MPVKIT_DIR/$helper" ] ||
          [ ! -f "$temporary/$helper" ] || [ -L "$temporary/$helper" ] ||
@@ -249,7 +252,7 @@ PY
 # deliberately fresh and outside every Git source root; no caller-supplied URL, archive, hash or
 # cache is accepted. This function runs before SwiftPM so source selectors and receipts cannot
 # drift after the native build begins.
-prepare_subtitle_sources() {
+prepare_subtitle_sources_v3() {
   local helper="$MPVKIT_DIR/Sources/BuildScripts/subtitle-release-sources.py"
   [ -f "$helper" ] && [ ! -L "$helper" ] || fail "subtitle source helper is missing or linked"
   local python_bin="$(command -v python3)"
@@ -265,10 +268,10 @@ PY
   # v6 never reinterprets or overwrites the legacy schema2/three-source state.
   # A complete current state is reusable only after the helper's strict recheck.
   if [ -e "$WORK/dist/subtitle-sources-v3" ] || [ -L "$WORK/dist/subtitle-sources-v3" ]; then
-    "$python_bin" "$helper" verify "$WORK"
+    "$python_bin" "$helper" verify-v3 "$WORK"
     return
   fi
-  local source_mode=prepare
+  local source_mode=prepare-v3
   local stage="$WORK/dist/subtitle-source-download-v3"
   if [ -e "$WORK/dist/subtitle-sources" ] || [ -L "$WORK/dist/subtitle-sources" ]; then
     source_mode=extend-bluray
@@ -286,7 +289,7 @@ PY
     # The fixed helper requires exact old receipt35c plus all old raw/member/source
     # identities before publishing only fresh bluray/v3 destinations.
     "$python_bin" "$helper" extend-bluray "$WORK" "$stage"
-    "$python_bin" "$helper" verify "$WORK"
+    "$python_bin" "$helper" verify-v3 "$WORK"
     return
   fi
   curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location --retry 3 --max-time 600 --max-filesize 8388608 --output "$stage/libunibreak-8.0.tar.gz" \
@@ -303,8 +306,30 @@ PY
     6949dcde27d41cebad1fd741fcafc36d55a1020d2d872d4a6eb3914caabbada2 "$stage/fribidi-1.0.17.tar.xz" \
     968536e9abd782f07f7954044c0c4020199fcdd39b41d221ec42d2a3be4a44df "$stage/harfbuzz-15.0.0.tar.xz" | shasum -a 256 -c - ||
     fail "subtitle release body digest differs"
-  "$python_bin" "$helper" prepare "$WORK" "$stage"
-  "$python_bin" "$helper" verify "$WORK"
+  "$python_bin" "$helper" prepare-v3 "$WORK" "$stage"
+  "$python_bin" "$helper" verify-v3 "$WORK"
+}
+
+prepare_subtitle_sources() {
+  local helper="$MPVKIT_DIR/Sources/BuildScripts/subtitle-release-sources.py"
+  local python_bin="$(command -v python3)"
+  if [ -e "$WORK/dist/subtitle-sources-v4" ] || [ -L "$WORK/dist/subtitle-sources-v4" ]; then
+    "$python_bin" "$helper" verify-freetype "$WORK"
+    return
+  fi
+  prepare_subtitle_sources_v3
+  local stage="$WORK/dist/subtitle-freetype-download-v4"
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || fail "FreeType source stage must be fresh"
+  mkdir -p "$stage"
+  # Fixed immutable official source GET; redirects are not followed. Source
+  # preparation authenticates every Git body/mode before publishing a tree.
+  curl --proto '=https' --tlsv1.2 --fail --max-time 600 --max-filesize 2594500 \
+    --output "$stage/freetype-37515cf56ba3349656049edbed89ffc6f6466f2d.tar.gz" \
+    'https://gitlab.freedesktop.org/freetype/freetype/-/archive/37515cf56ba3349656049edbed89ffc6f6466f2d/freetype-37515cf56ba3349656049edbed89ffc6f6466f2d.tar.gz'
+  [ "$(wc -c <"$stage/freetype-37515cf56ba3349656049edbed89ffc6f6466f2d.tar.gz" | tr -d ' ')" = 2594500 ] || fail "FreeType raw source size differs"
+  printf '%s  %s\n' 9efee8b0508e142f38d1c7e2e192d3e5041aa4bbf6c2ab1a901518211f76a914 "$stage/freetype-37515cf56ba3349656049edbed89ffc6f6466f2d.tar.gz" | shasum -a 256 -c - || fail "FreeType raw source SHA256 differs"
+  "$python_bin" "$helper" extend-freetype "$WORK" "$stage"
+  "$python_bin" "$helper" verify-freetype "$WORK"
 }
 
 if [ ! -e "$MPVKIT_DIR" ]; then
@@ -336,7 +361,7 @@ else
     [ -z "$line" ] && continue
     case "$line" in
       '?? Sources/BuildScripts/patch/FFmpeg/0005-finite-reference-reader.patch'|'?? Sources/BuildScripts/patch/libmpv/0019-finite-reference-reader.patch') ;;
-      '?? Sources/BuildScripts/crypto-release-sources.py'|'?? Sources/BuildScripts/crypto-chain-gate.py'|'?? Sources/BuildScripts/subtitle-release-sources.py')
+      '?? Sources/BuildScripts/crypto-release-sources.py'|'?? Sources/BuildScripts/crypto-chain-gate.py'|'?? Sources/BuildScripts/subtitle-release-sources.py'|'?? Sources/BuildScripts/dovi-source-build.py'|'?? Sources/BuildScripts/dovi-source-map.json'|'?? Sources/BuildScripts/dovi-source-policy.json')
         helper_path="${line#?? }"
         [ -f "$MPVKIT_DIR/$helper_path" ] && [ ! -L "$MPVKIT_DIR/$helper_path" ] ||
           fail "native source helper must be a regular file: $MPVKIT_DIR/$helper_path" ;;
@@ -466,9 +491,9 @@ fi
 CRYPTO_SOURCE_HELPER="$MPVKIT_DIR/Sources/BuildScripts/crypto-release-sources.py"
 CRYPTO_GATE_HELPER="$MPVKIT_DIR/Sources/BuildScripts/crypto-chain-gate.py"
 CRYPTO_SOURCE_HELPER_SHA256="3c310499d446eed72eb16521b27c16f718f23e7ab1472dec1fad79cc40ed1537"
-CRYPTO_GATE_HELPER_SHA256="be5bc18e00b9b1cb4c4c5889b0935b4cd5d1538a98bcfb985ccbfcb208825a9b"
+CRYPTO_GATE_HELPER_SHA256="69a180d417c8295d723ec3eb904d93414d668e55e15d9902f93718bdcfbe0485"
 SUBTITLE_SOURCE_HELPER="$MPVKIT_DIR/Sources/BuildScripts/subtitle-release-sources.py"
-SUBTITLE_SOURCE_HELPER_SHA256="f082ea41b939e8152a2571636f937e2bb9dcfed57ffd2f1dbe65ed68522800df"
+SUBTITLE_SOURCE_HELPER_SHA256="d09496535e49241575093692846de60b9e5948819d6540c4002047d12b5d37f3"
 [ -f "$CRYPTO_SOURCE_HELPER" ] && [ ! -L "$CRYPTO_SOURCE_HELPER" ] || fail "crypto release-source helper missing"
 [ -f "$CRYPTO_GATE_HELPER" ] && [ ! -L "$CRYPTO_GATE_HELPER" ] || fail "crypto chain gate helper missing"
 [ -f "$SUBTITLE_SOURCE_HELPER" ] && [ ! -L "$SUBTITLE_SOURCE_HELPER" ] || fail "subtitle release-source helper missing"
@@ -481,6 +506,9 @@ SUBTITLE_SOURCE_HELPER_SHA256="f082ea41b939e8152a2571636f937e2bb9dcfed57ffd2f1db
 
 prepare_crypto_sources
 prepare_subtitle_sources
+# Source/toolchain/vendor bodies are staged and independently admitted first.
+# This fixed path contains no resolver/install/download fallback.
+python3 "$MPVKIT_DIR/Sources/BuildScripts/dovi-source-build.py" verify "$MPVKIT_DIR"
 
 # Install our mpv-side patch alongside MPVKit's own libmpv patches. SpikeGit.applyPatches (added by
 # mpvkit-dvfel.patch) applies that directory in sorted order, so the 0004 prefix guarantees it runs
@@ -623,11 +651,11 @@ cmp -s "$FFMPEG_RESPONSE_SOURCE/libavformat/vortx_reference_sparse.h" "$MPV_OBSE
 # shipping and v1/v2 verifier APIs retain their contracts. The unshipped v3/v4/v5
 # cuts remain archival-readable through their own frozen historical verifiers;
 # the current verifier explicitly retires those profiles.
-# This caller selects the explicit four-source bluray v6 contract below.
+# This caller selects the explicit five-source FreeType v7 contract below.
 # Refuse to package a stale ZIP after an interrupted or incorrectly cached run.
 # Libmpv must be fresh too: a rebuilt FFmpeg archive alone cannot carry the
 # CoreAudio lifetime fix. Never silently repackage the old vulnerable player.
-for library in Libmpv Libavcodec Libavdevice Libavfilter Libavformat Libavutil Libswresample Libswscale Libplacebo lcms2 Libdav1d Libssl Libcrypto gmp nettle hogweed gnutls Libsmbclient Libunibreak Libfribidi Libharfbuzz Libbluray; do
+for library in Libmpv Libavcodec Libavdevice Libavfilter Libavformat Libavutil Libswresample Libswscale Libplacebo lcms2 Libdav1d Libssl Libcrypto gmp nettle hogweed gnutls Libsmbclient Libunibreak Libfribidi Libharfbuzz Libbluray Libfreetype Libdovi; do
   library_zip="$WORK/dist/release/$library.xcframework.zip"
   [ -f "$library_zip" ] || {
     echo "missing rebuilt artifact: $library_zip" >&2
@@ -661,6 +689,8 @@ SUBTITLE_CAPTURE="$WORK/dist/subtitle-capture"
 python3 "$HERE/native-media-hosted/evidence.py" apple-shaderc-inputs "$WORK"
 python3 "$HERE/native-media-hosted/evidence.py" apple-openssl-builds "$WORK"
 python3 "$HERE/native-media-hosted/evidence.py" apple-subtitle-builds "$WORK"
+python3 "$HERE/native-media-hosted/evidence.py" apple-dovi-builds "$WORK"
+python3 "$HERE/native-media-hosted/evidence.py" apple-dovi-receipt "$WORK/dist/dovi-builds/vortx-dovi-builds.json"
 python3 "$HERE/native-media-hosted/evidence.py" apple-subtitle-receipt \
   "$WORK/dist/subtitle-builds/vortx-subtitle-builds.json"
 "$HERE/assemble-mpvkit-dvfel.sh" "$WORK" "$STAGED_DEST"
@@ -668,7 +698,7 @@ python3 "$HERE/native-media-hosted/evidence.py" apple-subtitle-receipt \
 "$(command -v python3)" "$CRYPTO_GATE_HELPER" capture "$WORK" "$STAGED_DEST" \
   --dependency-profile native-upgrades-crypto-chain-v1
 "$HERE/verify-mpvkit-dvfel-artifacts.sh" "$STAGED_DEST" \
-  --dependency-profile native-upgrades-openssl410-crypto-subtitles-bluray150-v6 \
+  --dependency-profile native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 \
   --shaderc-inputs "$WORK/dist/libshaderc-2026.1.0" \
   --openssl-builds "$WORK/dist/openssl/vortx-openssl-builds.json" \
   --crypto-work "$WORK"

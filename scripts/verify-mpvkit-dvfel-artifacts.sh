@@ -31,6 +31,10 @@ if [ "${2:-}" = --dependency-profile ] &&
    [ "${3:-}" = native-upgrades-openssl410-crypto-subtitles-v5 ]; then
   fail "historical v5 prototype requires its frozen historical verifier; select the explicit bluray150 v6 profile for the four-source candidate"
 fi
+if [ "${2:-}" = --dependency-profile ] &&
+   [ "${3:-}" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+  fail "historical v6 requires its frozen reader; select the explicit freetype2150/libdovi340 v7 profile"
+fi
 DEPENDENCY_PROFILE=shipping
 SHADERC_INPUTS=
 OPENSSL_BUILDS=
@@ -53,7 +57,7 @@ elif [ "$#" -eq 7 ] && [ "$2" = --dependency-profile ] &&
   [ -n "$SHADERC_INPUTS" ] && [ -n "$OPENSSL_BUILDS" ] || fail "Dependency input receipts are required"
 elif [ "$#" -eq 9 ] && [ "$2" = --dependency-profile ] &&
      { [ "$3" = native-upgrades-openssl410-crypto-v4 ] ||
-       [ "$3" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; } &&
+       [ "$3" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; } &&
      [ "$4" = --shaderc-inputs ] &&
      [ "$6" = --openssl-builds ] && [ "$8" = --crypto-work ]; then
   DEPENDENCY_PROFILE="$3"
@@ -86,8 +90,8 @@ elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-v3 ]; then
   local_targets+=(lcms2 Libdav1d Libssl Libcrypto)
 elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ]; then
   local_targets+=(lcms2 Libdav1d Libssl Libcrypto gmp nettle hogweed gnutls Libsmbclient)
-elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
-  local_targets+=(lcms2 Libdav1d Libssl Libcrypto gmp nettle hogweed gnutls Libsmbclient Libunibreak Libfribidi Libharfbuzz Libbluray)
+elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
+  local_targets+=(lcms2 Libdav1d Libssl Libcrypto gmp nettle hogweed gnutls Libsmbclient Libunibreak Libfribidi Libharfbuzz Libbluray Libfreetype Libdovi)
 fi
 for target in "${local_targets[@]}"; do
   grep -Fq "name: \"$target\"" "$PKG/Package.swift" || fail "manifest is missing local target $target"
@@ -273,7 +277,7 @@ fi
 if [ "$DEPENDENCY_PROFILE" = native-upgrades-dav1d154-shaderc20261-hb150-v2 ] ||
    [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-v3 ] ||
    [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ] ||
-   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
   # dav1d's public API stays 7.0.0 across releases. Bind exact header bytes, actual
   # defined code, and the release-tag/commit descriptor in every thin archive.
   dav1d_pin=54706fc6bc0cdecab7e9593974a4039cc038fca7
@@ -316,7 +320,7 @@ fi
 
 if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-v3 ] ||
    [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ] ||
-   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
   for dependency in Libcrypto Libssl; do
     for slice in "${SLICES[@]}"; do
       framework="$ARTIFACTS/$dependency.xcframework/$slice/$dependency.framework"
@@ -353,13 +357,13 @@ if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-v3 ] ||
 fi
 
 if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ] ||
-   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+   [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
   CRYPTO_SOURCE_HELPER="$CRYPTO_WORK/Sources/BuildScripts/crypto-release-sources.py"
   CRYPTO_GATE_HELPER="$CRYPTO_WORK/Sources/BuildScripts/crypto-chain-gate.py"
   CRYPTO_SOURCE_HELPER_SHA256="3c310499d446eed72eb16521b27c16f718f23e7ab1472dec1fad79cc40ed1537"
   CRYPTO_GATE_HELPER_SHA256="041dd13e48e1821f5d7bf049bb8eb097d3772d6ea867c15a3b7646779a3c015d"
-  if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
-    CRYPTO_GATE_HELPER_SHA256="be5bc18e00b9b1cb4c4c5889b0935b4cd5d1538a98bcfb985ccbfcb208825a9b"
+  if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
+    CRYPTO_GATE_HELPER_SHA256="69a180d417c8295d723ec3eb904d93414d668e55e15d9902f93718bdcfbe0485"
   fi
   [ -f "$CRYPTO_SOURCE_HELPER" ] && [ ! -L "$CRYPTO_SOURCE_HELPER" ] || fail "crypto source helper is missing"
   [ -f "$CRYPTO_GATE_HELPER" ] && [ ! -L "$CRYPTO_GATE_HELPER" ] || fail "crypto gate helper is missing"
@@ -374,9 +378,9 @@ if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ] ||
     --dependency-profile native-upgrades-crypto-chain-v1
 fi
 
-if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
   SUBTITLE_SOURCE_HELPER="$CRYPTO_WORK/Sources/BuildScripts/subtitle-release-sources.py"
-  SUBTITLE_SOURCE_HELPER_SHA256="f082ea41b939e8152a2571636f937e2bb9dcfed57ffd2f1dbe65ed68522800df"
+  SUBTITLE_SOURCE_HELPER_SHA256="d09496535e49241575093692846de60b9e5948819d6540c4002047d12b5d37f3"
   SUBTITLE_CAPTURE="$CRYPTO_WORK/dist/subtitle-capture"
   SUBTITLE_BUILD_RECEIPT="$CRYPTO_WORK/dist/subtitle-builds/vortx-subtitle-builds.json"
   [ -f "$SUBTITLE_SOURCE_HELPER" ] && [ ! -L "$SUBTITLE_SOURCE_HELPER" ] ||
@@ -470,7 +474,34 @@ fi
 # stop after a checksum/unzip or accidentally skip the security backend proof.
 "$REPO/scripts/verify-mpvkit-dvfel-apple-tls.sh" "$PKG"
 
+if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
+  for slice in "${SLICES[@]}"; do
+    framework="$ARTIFACTS/Libfreetype.xcframework/$slice/Libfreetype.framework"
+    binary="$framework/Libfreetype"
+    header="$framework/Headers/freetype2/freetype/freetype.h"
+    [ -f "$binary" ] && [ -f "$header" ] || fail "missing source-built FreeType slice $slice"
+    verify_arches "$binary" "$slice"
+    for macro_value in FREETYPE_MAJOR:2 FREETYPE_MINOR:15 FREETYPE_PATCH:0; do
+      macro="${macro_value%:*}"; value="${macro_value#*:}"
+      grep -Eq "^[[:space:]]*#define[[:space:]]+$macro[[:space:]]+$value([[:space:]]|$)" "$header" || fail "FreeType header release differs"
+    done
+    read -r -a arches <<<"$(lipo -archs "$binary")"
+    for arch in "${arches[@]}"; do
+      thin="$TMP/FreeType-$slice-$arch"
+      if [ "${#arches[@]}" -eq 1 ]; then cp "$binary" "$thin"; else lipo "$binary" -thin "$arch" -output "$thin"; fi
+      symbols="$("${NM[@]}" -gU "$thin" 2>/dev/null)" || fail "cannot inspect source-built FreeType"
+      for code_symbol in FT_Init_FreeType FT_New_Memory_Face FT_Load_Glyph FT_Render_Glyph FT_Library_Version; do
+        grep -Eq "(^|[[:space:]])_?${code_symbol}$" <<<"$symbols" || fail "FreeType public API symbol absent: $code_symbol"
+      done
+    done
+  done
+fi
+
+if [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
+  python3 "$REPO/scripts/native-media-hosted/evidence.py" apple-dovi-receipt "$CRYPTO_WORK/dist/dovi-builds/vortx-dovi-builds.json"
+fi
 echo "MPVKit-DVFEL ARTIFACT VERIFY PASSED: FFmpeg 9.0.2 (libavcodec/libavformat 63.1.102), dovi_split, and Apple TLS gates"
+
 if [ "$DEPENDENCY_PROFILE" = libplacebo-7.387.0-lcms2.20rc1-source-v1 ]; then
   echo "PASS dependency-profile libplacebo-7.387.0-lcms2.20rc1-source-v1"
 elif [ "$DEPENDENCY_PROFILE" = native-upgrades-dav1d154-shaderc20261-hb150-v2 ]; then
@@ -482,9 +513,9 @@ elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-v4 ]; then
   echo "PASS openssl-profile openssl-4.1.0-source-v1"
   echo "PASS crypto-profile gmp-6.3.0-nettle-4.0-gnutls-3.8.13-samba-4.15.13-2512-source-v1"
   echo "PASS dependency-profile native-upgrades-openssl410-crypto-v4"
-elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-v6 ]; then
+elif [ "$DEPENDENCY_PROFILE" = native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7 ]; then
   echo "PASS openssl-profile openssl-4.1.0-source-v1"
   echo "PASS crypto-profile gmp-6.3.0-nettle-4.0-gnutls-3.8.13-samba-4.15.13-2512-source-v1"
-  echo "PASS subtitle-profile unibreak800-fribidi1017-harfbuzz1500-bluray150-release-sources-v3-pax-ns"
-  echo "PASS dependency-profile native-upgrades-openssl410-crypto-subtitles-bluray150-v6"
+  echo "PASS subtitle-profile unibreak800-fribidi1017-harfbuzz1500-bluray150-freetype2150-release-sources-v4-pax-ns"
+  echo "PASS dependency-profile native-upgrades-openssl410-crypto-subtitles-bluray150-freetype2150-libdovi340-v7"
 fi

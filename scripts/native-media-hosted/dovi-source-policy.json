@@ -1,0 +1,245 @@
+{
+  "abiProbeSourceSHA256": "86f693b998a5f2451cc3075d36b3171d870960972ce9cf7029813b80cfce4b38",
+  "bootstrapOperatorSHA256": "fc88799a93fb674a535fc51895b27d9b67c14fda57a05261ce6dcd35218f1906",
+  "cApiFeatures": [
+    "capi",
+    "serde"
+  ],
+  "cargoCCommit": "22591c05bff0f705ef93530e743f2546236544cf",
+  "cargoCLockedCbindgenVersion": "0.29.4",
+  "cargoCNormalizedManifestSHA256": "8e98cc2eca8421eb38dd883b476a9674523fae1947140c5b11426c373fd37326",
+  "cargoCPackagedLockSHA256": "d3cb865d40625de197b71fa591f1f24c0593b5a24b46b7c126eae7fecf7be315",
+  "cargoCSourceBytes": 66232,
+  "cargoCSourceMembers": [
+    {
+      "bytes": 94,
+      "mode": 420,
+      "path": ".cargo_vcs_info.json",
+      "sha256": "4d963f15fbc83ede735629d4266e33d65a26c1f7be68f3261feb7458a62f0993"
+    },
+    {
+      "bytes": 83,
+      "mode": 420,
+      "path": ".github/FUNDING.yml",
+      "sha256": "e6f0afa47cf4e4575e769d100804cfdd8022f0362aabc2627dde0db6117e9e5f"
+    },
+    {
+      "bytes": 54,
+      "mode": 420,
+      "path": ".github/actions-rs/grcov.yml",
+      "sha256": "16a5804349ba7c8be8c9a5d56de4ace92c22f15b7d930bb9cf787b3efef9956f"
+    },
+    {
+      "bytes": 440,
+      "mode": 420,
+      "path": ".github/dependabot.yml",
+      "sha256": "a11b012d9f1d3439e51ecafae0d8c4ccc2600b3d2dfc86a3ba1826de30148021"
+    },
+    {
+      "bytes": 6255,
+      "mode": 420,
+      "path": ".github/workflows/deploy.yml",
+      "sha256": "1bad549566581baa7d6d55e052efad5ebd38cf2d4abe192faaf9c7ee86cdafc0"
+    },
+    {
+      "bytes": 5541,
+      "mode": 420,
+      "path": ".github/workflows/example-project.yml",
+      "sha256": "9f150d9c6b43386370fc3321ab8f5110e90c1baf9338db4a1f4ef452e388bd55"
+    },
+    {
+      "bytes": 2652,
+      "mode": 420,
+      "path": ".github/workflows/rust.yml",
+      "sha256": "0dbb41c6bbbb1dd351f71f2d48596c1d3d2e466e3f0f8d4f97bc41e3fe4348a2"
+    },
+    {
+      "bytes": 95,
+      "mode": 420,
+      "path": ".gitignore",
+      "sha256": "959f18c31fb9dfe8a9c39e7671cd4593036990d738c487e937377faa0225fd5a"
+    },
+    {
+      "bytes": 104788,
+      "mode": 420,
+      "path": "Cargo.lock",
+      "sha256": "d3cb865d40625de197b71fa591f1f24c0593b5a24b46b7c126eae7fecf7be315"
+    },
+    {
+      "bytes": 2605,
+      "mode": 420,
+      "path": "Cargo.toml",
+      "sha256": "8e98cc2eca8421eb38dd883b476a9674523fae1947140c5b11426c373fd37326"
+    },
+    {
+      "bytes": 1586,
+      "mode": 420,
+      "path": "Cargo.toml.orig",
+      "sha256": "22e6e2cc34cb15394889be298f9b54034ae221b20ac3d9c60a2a52ec96667b88"
+    },
+    {
+      "bytes": 1069,
+      "mode": 420,
+      "path": "LICENSE",
+      "sha256": "d69f24ad84ec2ade64c0b68bdb31b41170e997b158370342056918329cc9af1e"
+    },
+    {
+      "bytes": 6487,
+      "mode": 420,
+      "path": "README.md",
+      "sha256": "3250acce09af63c1d4bcb2eadd59889afda8896341b5c3586a660ba1929832e2"
+    },
+    {
+      "bytes": 217,
+      "mode": 420,
+      "path": "codecov.yml",
+      "sha256": "7c4d89a227e0b8e26ec2b4878196e8ddb62d45b29cc037cd8d60f43b9b282567"
+    },
+    {
+      "bytes": 1653,
+      "mode": 420,
+      "path": "coverage.sh",
+      "sha256": "b318e9ee4553da71a69950e0b4f930d982d2d3f3ce98444a662db1b1b1332680"
+    },
+    {
+      "bytes": 5411,
+      "mode": 420,
+      "path": "docs/configuration.md",
+      "sha256": "8f4f1036a362f21f959823f0b8d31df220250253af8d958c0be331a2713482f7"
+    },
+    {
+      "bytes": 2095,
+      "mode": 420,
+      "path": "docs/headers.md",
+      "sha256": "d72cf7a403c21f46d9a2310b4d9a4bc0e5076269fd528a7121275090c32851c8"
+    },
+    {
+      "bytes": 2531,
+      "mode": 420,
+      "path": "docs/plugins.md",
+      "sha256": "5ecb88aec433538d27fbbc72198cb86e9a98c0574f7dc94f3160036cceae189c"
+    },
+    {
+      "bytes": 1426,
+      "mode": 420,
+      "path": "docs/troubleshooting.md",
+      "sha256": "5bdbdfe5f5af4d1007fb04ba157ece873930224b4482fdb5647ad68171091151"
+    },
+    {
+      "bytes": 2325,
+      "mode": 420,
+      "path": "src/bin/capi.rs",
+      "sha256": "16cd1d7dbaf51d2be1ffe077e26d76966b0883fe8e1f94e2c6bc046a12fcc762"
+    },
+    {
+      "bytes": 1122,
+      "mode": 420,
+      "path": "src/bin/cbuild.rs",
+      "sha256": "cfdec33d28d9e2b71eeb8bbbe0c48db933ca6245d16e4043a93d4f7fa5d622df"
+    },
+    {
+      "bytes": 1240,
+      "mode": 420,
+      "path": "src/bin/cinstall.rs",
+      "sha256": "23be49235af5256cd84d2a1c85f98e55147662bc746acba5476c2d1b5c65b0e3"
+    },
+    {
+      "bytes": 1102,
+      "mode": 420,
+      "path": "src/bin/ctest.rs",
+      "sha256": "47164e0ce5221803015d84bc8351a6d5f8cb6795d1eeca5faa82fe25d8cd5663"
+    },
+    {
+      "bytes": 53634,
+      "mode": 420,
+      "path": "src/build.rs",
+      "sha256": "b320d01c43b6d80ce157439324c2f2e2eaeb7d71216a3013e1866c001f55a0c7"
+    },
+    {
+      "bytes": 11807,
+      "mode": 420,
+      "path": "src/build_targets.rs",
+      "sha256": "cea7b33d0ab5ff1821031ebf990899642e087fe0693861d14088c46c060f93bf"
+    },
+    {
+      "bytes": 10251,
+      "mode": 420,
+      "path": "src/cli.rs",
+      "sha256": "53415cd5ec2acb3671f82143857e4b9db9fdb68ae5290d4416046e807aaf121a"
+    },
+    {
+      "bytes": 1262,
+      "mode": 420,
+      "path": "src/config.rs",
+      "sha256": "e89ae23cd9750f1779f5e78b4ce7bde1f86afaac6aa825c3dc22bcb5ce3c803c"
+    },
+    {
+      "bytes": 15283,
+      "mode": 420,
+      "path": "src/install.rs",
+      "sha256": "58b67bfe88e491634f0687eda885982670f4b46f62f7ede47115459e72ae906c"
+    },
+    {
+      "bytes": 124,
+      "mode": 420,
+      "path": "src/lib.rs",
+      "sha256": "0b2c815dc97136e69859f509d284113cb5293577f61a3e69137bd4ce1695006c"
+    },
+    {
+      "bytes": 14144,
+      "mode": 420,
+      "path": "src/pkg_config_gen.rs",
+      "sha256": "cb7c8c358fe0da87f025ab00e2c25863171607bf764f5e2016ccbac7bfaec9d7"
+    },
+    {
+      "bytes": 7535,
+      "mode": 420,
+      "path": "src/target.rs",
+      "sha256": "b4240dd6b864ebbff25064990ff37ed27bd94dcf3c12f06979650f556b4559c7"
+    }
+  ],
+  "cargoCSourceSHA256": "5ff6e05531e58286d3c02ec0adb7f254e5d532a8d4b667f30b9942d802e1db25",
+  "cargoCVersion": "0.10.26+cargo-0.100.0",
+  "component": "libdovi",
+  "edition": "2024",
+  "libraryVersion": "3.4.0",
+  "minimumRust": "1.88.0",
+  "nestedCargoLockSHA256": "5c9f344b8a49f684e409af8304e4e175618098c9b24ed8acafc5f1a469088814",
+  "optionalCatalystVisionOSTargets": "UNRUN; outside this exact nine-leaf receipt profile",
+  "promotionEligible": false,
+  "requiredSymbols": [
+    "dovi_convert_rpu_with_mode",
+    "dovi_data_free",
+    "dovi_generate_from_json",
+    "dovi_parse_itu_t35_dovi_metadata_obu",
+    "dovi_parse_rpu",
+    "dovi_parse_rpu_bin_file",
+    "dovi_parse_unspec62_nalu",
+    "dovi_rpu_add_cmv40_safe_default_metadata",
+    "dovi_rpu_free",
+    "dovi_rpu_free_data_mapping",
+    "dovi_rpu_free_header",
+    "dovi_rpu_free_vdr_dm_data",
+    "dovi_rpu_get_data_mapping",
+    "dovi_rpu_get_error",
+    "dovi_rpu_get_header",
+    "dovi_rpu_get_vdr_dm_data",
+    "dovi_rpu_list_free",
+    "dovi_rpu_remove_cmv40_metadata",
+    "dovi_rpu_remove_mapping",
+    "dovi_rpu_set_active_area_offsets",
+    "dovi_write_av1_rpu_metadata_obu_t35_complete",
+    "dovi_write_av1_rpu_metadata_obu_t35_payload",
+    "dovi_write_rpu",
+    "dovi_write_unspec62_nalu"
+  ],
+  "requiredTargets": 9,
+  "runtimeDolbyVisionTested": false,
+  "rustObjectSDKPolicy": "Only Rust CGU .rcgu.o members may preserve unstamped SDK0; native objects and the C probe require the exact SDK; no SDK27 stamp is inferred from SDK0",
+  "schemaVersion": 1,
+  "selectedHostToolchain": "nightly-2026-07-19-aarch64-apple-darwin",
+  "sourceCommit": "d1abe0e27ff2c7ab3339614d06db9f8a058af6b2",
+  "sourceMapSHA256": "7662a50dee5cf02f35f5da56bed11808fa0e6a7f04c46ddbff05bab8557a30d3",
+  "sourceTag": "libdovi-3.4.0",
+  "sourceTree": "b2183f7cc3d62918ad43b346835a2dab7d2ad875"
+}
