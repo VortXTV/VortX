@@ -7,6 +7,18 @@ struct VortxNativeTraktIntentTests {
         let scope = CredentialScope(canonicalRemoteAccountID: "00000000-0000-0000-0000-000000000123")!
         let capture = CredentialScopeRegistry.shared.bind(scope)
         _ = CredentialScopeRegistry.shared.establishAuthenticatedOwner(capture)
+        // The maintained runner retains this helper in its real Trakt seams instead of stripping
+        // its checks with the legacy standalone @main. Same client, no copied framing policy.
+        let decodedBody = await testTraktDecodedBodyLengthPolicy()
+        check(decodedBody.gzipAccepted)
+        check(decodedBody.brotliAccepted)
+        check(decodedBody.plainMismatchRefused)
+        check(decodedBody.identityMismatchRefused)
+        check(decodedBody.encodedDecodedOversizedRefused)
+        check(decodedBody.encodedDeclaredOversizedRefused)
+        check(decodedBody.malformedLengthRefused)
+        // Keep the original native-intent fixtures' starting response unchanged.
+        FixtureURLProtocol.fixture.set(status: 200)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [FixtureURLProtocol.self]
         let auth = TraktAuth(sessionConfiguration: configuration, credentials: MemoryCredentials().store,
