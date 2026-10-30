@@ -4,6 +4,47 @@ import org.json.JSONObject
 
 /** App-only whole cloud account composition. Never pass its output to JNI or host archives. */
 internal object NativePlaylistAccountComposer {
+    /** Budget the WHOLE genuine Session host, including earlier unsynced namespaces. Only a
+     * currently admitted Session-issued preview may replace this raw host; arbitrary DTOs/raw
+     * arrays never receive that permission. Original account authority stays with the caller. */
+    fun composeXperience(raw: ByteArray, originalNativeProjection: ByteArray, native: ByteArray,
+        preview: VortxNativeSession.XperienceHostPreview, providers: JSONObject): ByteArray {
+        val base = NativeOwnerHistoryAccount(raw)
+        val sourceNative = OHJson.Obj(checkNotNull(base.raw("nativeSync")))
+        val scope = VortxAccountScope(sourceNative.text("scope"), sourceNative.text("ownerProfileId"))
+        return preview.withRawHost(scope) { host ->
+            base.raw("nativeHostPreferences")?.let { source -> requireHostConservation(scope, source, host) }
+            // The original native/root/provider slices remain genuine source material. Ordinary
+            // composition sees the admitted whole raw host as its preview baseline and cannot
+            // launder older A's collections through a normalized JSONObject while editing B.
+            val previewBase = base.replacingOwned(mapOf("nativeHostPreferences" to host)).encoded()
+            try { compose(previewBase, originalNativeProjection, native, host, providers) }
+            finally { previewBase.fill(0) }
+        }
+    }
+
+    private fun requireHostConservation(scope: VortxAccountScope, source: ByteArray, host: ByteArray) {
+        NativeHostPreferences.validate(scope, JSONObject(OHJson.utf8(source)))
+        val original = OHJson.Obj(source); val next = OHJson.Obj(host)
+        fun fields(before: OHJson.Obj, after: OHJson.Obj, profile: Boolean) {
+            for (field in before.keys) {
+                val first = before.raw(field); val second = checkNotNull(after[field]) { "Source host register was omitted" }
+                val a = OHJson.Obj(first); val b = OHJson.Obj(second)
+                val comparison = compareValuesBy(b, a,
+                    { NativeRawHostPreferences.exactClock(it.raw("clock")) }, { it.text("actor") })
+                require(comparison >= 0) { "Source host event regressed" }
+                if (comparison == 0) NativeRawHostPreferences.requireEqualEvent(field, profile, first, second)
+            }
+        }
+        fields(original.obj("globals").obj("fields"), next.obj("globals").obj("fields"), false)
+        val before = original.obj("profiles"); val after = next.obj("profiles")
+        val names = after.keys.associateBy(NativeHostPreferences::canonicalProfileID)
+        for (key in before.keys) {
+            val current = checkNotNull(names[NativeHostPreferences.canonicalProfileID(key)]) { "Source host profile was omitted" }
+            fields(before.obj(key).obj("fields"), after.obj(current).obj("fields"), true)
+        }
+    }
+
     /** The typed Session owns this real prepared account, including schema 6/source history and
      * its exact host/native checkpoint. This method never routes it through the generic patcher. */
     fun composePrepared(raw: ByteArray, prospectiveHost: ByteArray, providers: JSONObject): ByteArray {

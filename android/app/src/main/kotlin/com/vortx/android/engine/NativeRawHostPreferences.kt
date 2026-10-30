@@ -6,6 +6,9 @@ import org.json.JSONObject
  * JSONObject is a disposable reducer projection; no re-encoded projection becomes an original. */
 internal object NativeRawHostPreferences {
     private const val IMPORT_PREFIX = "xperience.import."
+    /** Exact schema-clock semantics for raw domain admission, before any Number projection.
+     * Reuses the bounded digit/exponent scanner; no arbitrary-size decimal/integer allocation. */
+    internal fun exactClock(raw: ByteArray): Long = NumberTokens.clock(raw)
 
     fun captureLocal(scope: VortxAccountScope, original: ByteArray): ByteArray {
         val stable = original.copyOf()

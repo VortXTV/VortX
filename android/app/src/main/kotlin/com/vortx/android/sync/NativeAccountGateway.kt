@@ -138,6 +138,13 @@ internal interface NativePlaylistAccountWrite : AutoCloseable {
     /** Must hold original account/provider/settings witnesses through [commit], without suspension. */
     fun commitCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
         candidateNative: ByteArray, candidateHost: ByteArray, commit: () -> Unit)
+    /** Domain-specific whole-host raw preview, only after the original Session's raw CAS.
+     * Old/fake writers cannot silently fall back to a DTO/playlist composition path. */
+    fun commitXperienceCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
+        candidateNative: ByteArray, host: com.vortx.android.engine.VortxNativeSession.XperienceHostPreview,
+        commit: () -> Unit) {
+        error("Xperience complete-account admission unavailable")
+    }
     /** App-owned typed hook supplies the ACTUAL prepared full account. The separately supplied
      * prospective host includes pending globals only for budget sizing, not durable ack. */
     fun commitPreparedCandidate(raw: ByteArray, prospectiveHost: ByteArray, commit: () -> Unit) {

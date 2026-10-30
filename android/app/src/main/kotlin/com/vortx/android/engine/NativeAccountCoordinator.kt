@@ -8,6 +8,8 @@ import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
 import com.vortx.android.sync.NativePlaylistProfileGateway
+import com.vortx.android.sync.NativeXperienceProfileGateway
+import com.vortx.android.xperience.XperienceImportNamespace
 import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.sync.LocalLibraryMutationAuthority
 import com.vortx.android.sync.VortXSyncDoc
@@ -52,7 +54,7 @@ internal class NativeAccountCoordinator(
     private val captureProfilePresentationAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = captureOwnAccountAdmission,
     /** For You command identity includes auth/session/operation scope, independent of read stamps. */
     private val captureForYouAccountAuthority: (SessionOwnerSnapshot.Account) -> LocalLibraryMutationAuthority? = { null },
-) : NativeAccountGateway, NativePlaylistProfileGateway {
+) : NativeAccountGateway, NativePlaylistProfileGateway, NativeXperienceProfileGateway {
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession) {
         private var retired = false
         private var authenticatedRead: NativeAccountReadCapture? = null
@@ -156,6 +158,29 @@ internal class NativeAccountCoordinator(
         fun matches(fields: JSONObject) = NativeHostPreferences.equal(acceptedRegisters, fields)
     }
     private data class DetachedPlaylistEdit(val field: String, val expectedRegister: JSONObject?, val value: Any)
+    private class CapturedXperienceTarget(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val lifetime: PlaylistLifetime,
+        val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer,
+        val context: String,
+    ) : NativeXperienceProfileGateway.Target {
+        override val accountId get() = account.id
+        override val profileId get() = owner.profileID
+    }
+    private class CapturedXperienceSnapshot(
+        override val target: CapturedXperienceTarget,
+        fields: Map<String, ByteArray>,
+    ) : NativeXperienceProfileGateway.Snapshot {
+        private val raw = fields.mapValues { it.value.copyOf() }
+        override fun registers() = raw.mapValues { it.value.copyOf() }
+        fun matches(fields: Map<String, ByteArray>) = raw.keys == fields.keys &&
+            raw.all { (key, value) -> value.contentEquals(fields.getValue(key)) }
+    }
     private val playlistReceipts = NativePlaylistCloudReceiptLedger()
     override val playlistReceiptChanges = MutableStateFlow(0L)
 
@@ -705,6 +730,105 @@ internal class NativeAccountCoordinator(
                 }
             }
         } } finally { accountWrite?.close() }
+    }
+
+    /** The Session -> original auth admission -> mount -> lifetime order matches other writers.
+     * No callback samples a new account, producer, owner, GET or logical registry on resume. */
+    private fun <T> withCapturedXperienceTarget(target: CapturedXperienceTarget, action: (VortxNativeRead) -> T): T =
+        target.session.withCompleteAccountExportOwner(target.owner, target.originalRead != null) { read ->
+            check(target.installation.readIdentity() === target.originalRead && playlistAccountProducer === target.producer) {
+                "Original Xperience account observation changed"
+            }
+            check(target.session.xperienceContext(read) == target.context) { "Original Xperience context changed" }
+            var result: Result<T>? = null
+            check(target.admission {
+                if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                    if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                        result = runCatching { action(read) }; true
+                    }
+                }
+            }) { "Original Xperience target changed" }
+            requireNotNull(result).getOrThrow()
+        }
+
+    private fun xperienceSnapshot(target: CapturedXperienceTarget) = CapturedXperienceSnapshot(target,
+        target.session.xperienceFields(target.owner))
+
+    override fun captureXperienceProfile(): Result<NativeXperienceProfileGateway.Snapshot> = playlistResult {
+        val installation = checkNotNull(mounted.get()) { "Open the authenticated native account first" }
+        val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) { "Xperience account admission unavailable" }
+        val originalRead = installation.readIdentity()
+        val producer = checkNotNull(playlistAccountProducer) { "Complete account write admission unavailable" }
+        installation.session.withCompleteAccountExportRead(originalRead != null) { read ->
+            val target = CapturedXperienceTarget(installation.account, installation.session, read.owner, installation,
+                admission, PlaylistLifetime(), originalRead, producer, installation.session.xperienceContext(read))
+            withCapturedXperienceTarget(target) { xperienceSnapshot(target) }
+        }
+    }
+    override fun xperienceSnapshot(target: NativeXperienceProfileGateway.Target): Result<NativeXperienceProfileGateway.Snapshot> =
+        playlistResult {
+            val captured = target as? CapturedXperienceTarget ?: error("Invalid Xperience target")
+            withCapturedXperienceTarget(captured) { xperienceSnapshot(captured) }
+        }
+    override fun xperienceTargetIsCurrent(target: NativeXperienceProfileGateway.Target): Boolean =
+        (target as? CapturedXperienceTarget)?.let { runCatching { withCapturedXperienceTarget(it) { true } }.getOrDefault(false) } ?: false
+    override fun publishXperienceIfCurrent(snapshot: NativeXperienceProfileGateway.Snapshot, publication: () -> Unit): Boolean {
+        val captured = snapshot as? CapturedXperienceSnapshot ?: return false
+        return runCatching { withCapturedXperienceTarget(captured.target) {
+            if (!captured.matches(captured.target.session.xperienceFields(captured.target.owner))) false
+            else { publication(); true }
+        } }.getOrDefault(false)
+    }
+    override fun retireXperienceTarget(target: NativeXperienceProfileGateway.Target) {
+        (target as? CapturedXperienceTarget)?.lifetime?.revoke()
+    }
+    override suspend fun writeXperience(target: NativeXperienceProfileGateway.Target,
+        edit: XperienceImportNamespace.Edit): Result<NativeXperienceProfileGateway.Snapshot> =
+        persistXperience(target) { NativeXperienceWrite.Change.edit(edit) }
+    override suspend fun deleteXperience(target: NativeXperienceProfileGateway.Target,
+        saved: XperienceImportNamespace.Saved): Result<NativeXperienceProfileGateway.Snapshot> =
+        persistXperience(target) { NativeXperienceWrite.Change.delete(saved) }
+
+    private suspend fun persistXperience(target: NativeXperienceProfileGateway.Target,
+        change: () -> NativeXperienceWrite.Change): Result<NativeXperienceProfileGateway.Snapshot> {
+        val captured = target as? CapturedXperienceTarget ?: return Result.failure(IllegalArgumentException("Invalid Xperience target"))
+        var accountWrite: com.vortx.android.sync.NativePlaylistAccountWrite? = null
+        val operation = playlistResult {
+            withCapturedXperienceTarget(captured) {
+                // Capture both the actual complete-account producer and exact Session checkpoint
+                // before the first suspension. Typed and generic routes share this requirement.
+                accountWrite = checkNotNull(captured.producer.capture(captured.account)) { "Complete account write admission unavailable" }
+                captured.session.captureXperienceOperation(captured.owner, captured.context, change(), captured.originalRead != null)
+            }
+        }.getOrElse { accountWrite?.close(); return Result.failure(it) }
+        val write = checkNotNull(accountWrite)
+        val operationJob = currentCoroutineContext()[Job]
+        return try { withContext(Dispatchers.IO) {
+            playlistResult {
+                operationJob?.ensureActive()
+                withCapturedXperienceTarget(captured) {
+                    fun recheck() {
+                        operationJob?.ensureActive()
+                        // Re-enter only this target, whose exact original admission/lifetime is
+                        // still held across the full budget preview and durable callback.
+                        withCapturedXperienceTarget(captured) { }
+                    }
+                    captured.session.dispatchXperience(operation, write.pendingGlobalValues(),
+                        genericAdmission = { native, host, commit ->
+                            captured.installation.withRead(checkNotNull(captured.originalRead)) { raw, projection ->
+                                write.commitXperienceCandidate(raw, projection, native, host) { recheck(); commit() }
+                            }
+                        },
+                        typedAdmission = { account, host, commit ->
+                            write.commitPreparedCandidate(account, host) { recheck(); commit() }
+                        }, beforeCommit = { recheck() })
+                    // Session has checked exact raw register readback AFTER the existing
+                    // authenticated checkpoint readback/native acceptance and in-memory swap.
+                    check(captured.session.read().owner == captured.owner) { "Xperience owner changed during commit" }
+                    xperienceSnapshot(captured)
+                }
+            }
+        } } finally { operation.close(); write.close() }
     }
 
     suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {

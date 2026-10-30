@@ -184,7 +184,8 @@ class NativeAccountSyncTest {
     /** Genuine generic export -> real encrypted GET -> manager capture -> actual coordinator mount.
      * Never fabricate a native schema carrier or a verified streaming UID. UNRUN proposal.
      */
-    private inner class GenericPlaylistFixture(val padding: Int = 0) {
+    private inner class GenericPlaylistFixture(val padding: Int = 0,
+        val initialXperience: Pair<String, ByteArray>? = null) {
         val context = TestContext()
         val manager = VortXSyncManager(context)
         val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "generic-playlist-admission-").toFile()
@@ -255,9 +256,17 @@ class NativeAccountSyncTest {
             bucket.getJSONObject("fields").put("playlist.v2.future", JSONObject().put("clock", 1)
                 .put("actor", "00000000-0000-0000-0000-000000000222")
                 .put("value", JSONObject().put("schema", 2).put("future", JSONObject().put("opaque", true))))
+            val rawHost = com.vortx.android.engine.OHJson.Obj(host.toString().toByteArray())
+            initialXperience?.let { (field, register) ->
+                // Explicit synthetic SERVER baseline, installed before the actual authenticated
+                // manager GET. Never a DTO serialized and represented as an original raw record.
+                val groups = rawHost.obj("profiles"); val group = groups.obj(profile)
+                group.set("fields", group.obj("fields").set(field, register).encoded())
+                rawHost.set("profiles", groups.set(profile, group.encoded()).encoded())
+            }
             val root = com.vortx.android.engine.OHJson.Obj(legacy.toString().toByteArray())
                 .set("nativeSync", native).set("futureRoot", unknown)
-                .set("nativeHostPreferences", host.toString().toByteArray())
+                .set("nativeHostPreferences", if (initialXperience == null) host.toString().toByteArray() else rawHost.encoded())
                 .set("apiKeys", "{\"futureKey\":\"preserved\"}".toByteArray())
             if (padding > 0) root.set("padding", com.vortx.android.engine.OHJson.quote("x".repeat(padding)))
             originalRaw = root.encoded()
@@ -287,6 +296,94 @@ class NativeAccountSyncTest {
             if (::originalRaw.isInitialized) originalRaw.fill(0)
             uploaded?.fill(0)
             directory.listFiles()?.forEach { it.delete() }; directory.delete()
+        }
+    }
+
+    /** Additional separately selected Xperience controls reuse the ACTUAL manager/provider/
+     * settings/encrypted-store/JNI fixture. This is not a new @Test in the retained 19/87 roster.
+     * All transport responses and credentials remain synthetic; no live account/network proof. */
+    internal suspend fun verifyXperienceAccountProducerCases() {
+        for (mode in listOf("success", "providerBudget", "settingBudget", "providerAck", "settingsAba")) {
+            providerStore.values.clear()
+            val namespace = java.util.UUID.fromString("00000000-0000-0000-0000-000000000401")
+            fun document(title: String) = com.vortx.android.xperience.XperienceCollections.parse(
+                """[{"id":"c","title":"$title","folders":[],"future":{"n":1.0,"z":-0.0}}]""".toByteArray())
+            fun append(id: java.util.UUID = namespace) = com.vortx.android.xperience.XperienceImportNamespace.append(document("A"), "Saved", id)
+            val originalA = append()
+            val serverEvent = com.vortx.android.engine.OHJson.Obj().set("clock", "1".toByteArray())
+                .set("actor", com.vortx.android.engine.OHJson.quote("00000000-0000-0000-0000-000000000222"))
+                .set("value", originalA.value()).encoded()
+            val fixture = GenericPlaylistFixture(if (mode.endsWith("Budget")) 2_000_000 else 0,
+                if (mode == "success") originalA.field to serverEvent else null)
+            val notifications = mutableListOf<() -> Unit>()
+            NativeSettingsFence.queuedNotificationsForTest = notifications
+            try {
+                fixture.start()
+                if (mode == "success") {
+                    val profiles = NativeProfileAccess { fixture.runtime.session() }
+                    profiles.save(profiles.read().profiles.single().copy(name = "Pending local name"), false)
+                    fixture.context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", true).apply()
+                }
+                if (mode == "providerBudget")
+                    assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "p".repeat(1_200_000))))
+                if (mode == "settingBudget") {
+                    fixture.context.getSharedPreferences("vortx_settings", 0).edit()
+                        .putString("stremiox.languageOverride", "x".repeat(3_700_000)).apply()
+                    assertTrue(notifications.isNotEmpty())
+                }
+                if (mode == "providerAck") {
+                    assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-pending")))
+                    val wire = com.vortx.android.integrations.NativeProviderVault(providerStore).load(fixture.principal).document()
+                    fixture.onFork = { assertTrue(com.vortx.android.integrations.NativeProviderAccess.acknowledge(fixture.principal, wire)) }
+                }
+                if (mode == "settingsAba") fixture.onFork = {
+                    val prefs = fixture.context.getSharedPreferences("vortx_settings", 0)
+                    val old = prefs.getString("stremiox.languageOverride", null)
+                    prefs.edit().putString("stremiox.languageOverride", "intermediate").apply()
+                    prefs.edit().putString("stremiox.languageOverride", old).apply()
+                }
+                val opening = fixture.runtime.captureXperienceProfile().getOrThrow()
+                val target = opening.target
+                val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+                val forks = fixture.forks; val attempts = fixture.checkpointAttempts
+                val proposal = if (mode == "success") {
+                    val old = com.vortx.android.xperience.XperienceImportNamespace.read(originalA.field, opening.registers().getValue(originalA.field))
+                    old.replacement(document("Refreshed"), old.label, old.bindings)
+                } else append()
+                val result = fixture.runtime.writeXperience(target, proposal)
+                assertEquals(forks + 1, fixture.forks) // Reach actual candidate/producer, not an earlier refusal.
+                if (mode != "success") {
+                    val expected = when (mode) {
+                        "providerAck" -> "Pending provider family changed"
+                        "settingsAba" -> "Pending settings changed"
+                        else -> "Complete account exceeds encrypted budget"
+                    }
+                    assertEquals(expected, result.exceptionOrNull()?.message)
+                    assertEquals(attempts, fixture.checkpointAttempts)
+                    assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+                    assertFalse(fixture.runtime.session().requiresRecovery())
+                    if (mode == "providerBudget") assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == true)
+                } else {
+                    val acceptedA = result.getOrThrow()
+                    // The genuine fixture GET contained synthetic old A. Refresh A and append B
+                    // without another GET/upload; only local persistence/readback is asserted.
+                    val rawA = acceptedA.registers().getValue(append().field)
+                    assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-still-pending")))
+                    val second = append(java.util.UUID.fromString("00000000-0000-0000-0000-000000000402"))
+                    val acceptedB = fixture.runtime.writeXperience(opening.target, second).getOrThrow()
+                    assertArrayEquals(rawA, acceptedB.registers().getValue(append().field))
+                    assertNotNull(acceptedB.registers()[second.field])
+                    assertEquals("Pending local name", NativeProfileAccess { fixture.runtime.session() }.read().profiles.single().name)
+                    assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == true)
+                    val local = checkNotNull(fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+                    assertFalse(local.contains("fixture-still-pending")) // Full provider candidate was sized, never leaked into host/JNI.
+                    assertFalse(fixture.runtime.session().requiresRecovery())
+                }
+            } finally {
+                fixture.finish()
+                com.vortx.android.integrations.NativeProviderAccess.unbindForTest()
+                NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+            }
         }
     }
 

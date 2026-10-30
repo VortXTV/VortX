@@ -1258,6 +1258,20 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                             }
                         }) { "Original prepared-account admission changed" }
                     }
+                    override fun commitXperienceCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
+                        candidateNative: ByteArray, host: com.vortx.android.engine.VortxNativeSession.XperienceHostPreview,
+                        commit: () -> Unit) {
+                        check(active)
+                        check(publishIfSyncLeaseCurrent(lease) {
+                            providers.withCurrent(com.vortx.android.engine.NativeProfileOverlayWitness.parseAccountDocument(raw)) { full ->
+                                NativeSettingsFence.withCurrent(hostWitness) {
+                                    val prospective = com.vortx.android.engine.NativePlaylistAccountComposer.composeXperience(
+                                        raw, originalNativeProjection, candidateNative, host, full)
+                                    try { commit() } finally { prospective.fill(0) }
+                                }
+                            }
+                        }) { "Original Xperience account admission changed" }
+                    }
                     override fun close() { active = false; providers.close() }
                 }
             } catch (failure: Throwable) { providers.close(); throw failure }

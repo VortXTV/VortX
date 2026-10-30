@@ -28,6 +28,9 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/BuildConfig*' 'com/vortx
     'com/vortx/android/sync/NativeAccountReadCapture*' 'com/vortx/android/sync/NativeSettingsFence*' \
     'com/vortx/android/sync/NativePlaylistAccountProducer*' 'com/vortx/android/sync/NativePlaylistAccountWrite*' \
     'com/vortx/android/sync/NativeAccountMountToken*' 'com/vortx/android/sync/NativePlaylistProfileGateway*' \
+    'com/vortx/android/sync/NativeXperienceProfileGateway*' 'com/vortx/android/engine/NativeXperienceWrite*' \
+    'com/vortx/android/xperience/XperienceCollections*' 'com/vortx/android/xperience/XperienceImportNamespace*' \
+    'com/vortx/android/xperience/XperienceAddonBinding*' \
     'com/vortx/android/sync/NativeSyncPublicationPolicy*' \
     'com/vortx/android/sync/VortXSyncRealtime*' 'com/vortx/android/engine/NativeAccountCoordinator*' \
     'com/vortx/android/engine/VortxAccountScope*' 'com/vortx/android/engine/NativeCheckpointRead*' \
@@ -79,6 +82,9 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/sync/VortXSyncManager.kt" "$source_dir/sync/VortXSyncRealtime.kt" \
     "$source_dir/sync/VortXSyncDoc.kt" "$source_dir/sync/BackupRevisionPolicy.kt" \
     "$source_dir/sync/NativeAccountGateway.kt" "$source_dir/sync/NativeSyncPublicationPolicy.kt" \
+    "$source_dir/sync/NativeXperienceProfileGateway.kt" "$source_dir/engine/NativeXperienceWrite.kt" \
+    "$source_dir/xperience/XperienceCollections.kt" "$source_dir/xperience/XperienceImportNamespace.kt" \
+    "$source_dir/xperience/XperienceAddonBinding.kt" \
     "$source_dir/sync/NativeSettingsFence.kt" "$source_dir/engine/NativePlaylistAccountComposer.kt" \
     "$source_dir/engine/NativeOwnerHistoryAccount.kt" "$source_dir/engine/NativeOwnAccountSources.kt" \
     "$source_dir/engine/NativeRawHostPreferences.kt" "$source_dir/engine/VortxNativeRuntime.kt" \
@@ -95,7 +101,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/player/queue/PlaybackQueueModel.kt" "$source_dir/player/queue/PlaybackQueueStore.kt" \
     "$source_dir/playlists/SavedPlaylistStore.kt" "$source_dir/ui/viewmodel/VortXAccountViewModel.kt" \
     "$source_dir/VortXApplication.kt" \
-    "$test_source/sync/VortXSyncManagerBackupRevisionTest.kt" "$test_source/sync/VortXSyncManagerLegacyBackupRevisionTest.kt" \
+    "$test_source/sync/VortXSyncManagerBackupRevisionTest.kt" \
     "$test_source/sync/VortXBackupCasContractTest.kt" "$test_source/sync/BackupRevisionPolicyTest.kt" \
     "$test_source/profile/PlaylistScopeTransitionTest.kt" \
     "$test_source/sync/NativeAccountSyncTest.kt" "$test_source/sync/AndroidRealtimeSyncTest.kt" \
@@ -105,6 +111,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/engine/NativeHostPreferencesTest.kt" "$test_source/engine/NativePlaylistTest.kt" "$test_source/engine/NativePlaylistCloudReceiptLedgerTest.kt" \
     "$test_source/engine/NativePlaylistProfileGatewayTest.kt" "$test_source/engine/NativeOwnerHistoryJniTest.kt" \
     "$test_source/engine/NativeRawHostPreferencesTest.kt" "$test_source/engine/NativeOwnerHistoryCompatibilityTest.kt" \
+    "$test_source/engine/NativeXperienceWriteTest.kt" "$test_source/engine/NativeXperiencePreparedAccountJniTest.kt" \
     -d "$test_dir/classes" 2>&1 | tee "$test_dir/compile.log"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx512m -Dvortx.test.native=true -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -119,6 +126,19 @@ cd "$repo_root/android/app"
 "$java_bin" -Xmx512m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
     com.vortx.android.engine.NativeRawHostPreferencesTest \
     com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest 2>&1 | tee "$test_dir/raw-host-prerequisite.log"
-"$java_bin" -Xmx512m -Dvortx.test.native=false -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
-    com.vortx.android.sync.VortXSyncManagerLegacyBackupRevisionTest 2>&1 | tee "$test_dir/legacy-host.log"
+"$java_bin" -Xmx512m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
+    com.vortx.android.engine.NativeXperienceWriteTest 2>&1 | tee "$test_dir/xperience-write-controlled.log"
+# Additional opt-in methods, separate from the strict 87/32 hosted XML roster. No skip is proof.
+if [[ "${VORTX_JNI_SYNC:-}" == "1" ]]; then
+    "$java_bin" -Xmx768m -Djava.library.path="$(dirname "${VORTX_JNI_LIBRARY:?Exact reviewed JNI required}")" \
+        -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
+        com.vortx.android.engine.NativeXperiencePreparedAccountJniTest 2>&1 | tee "$test_dir/xperience-write-jni.log"
+    "$java_bin" -Xmx768m -Dvortx.test.native=true \
+        -Djava.library.path="$(dirname "${VORTX_JNI_LIBRARY:?Exact reviewed JNI required}")" \
+        -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
+        com.vortx.android.sync.VortXSyncManagerBackupRevisionTest 2>&1 | tee "$test_dir/current-backup-revision-jni.log"
+else
+    printf '%s\n' 'UNRUN: exact JNI suites, including current BackupRevision14 and XperiencePreparedAccount3. Any skipped JNI method above is not executed proof.' \
+        | tee "$test_dir/exact-jni-unrun.log"
+fi
 printf 'Retained verification directory: %s\n' "$test_dir"

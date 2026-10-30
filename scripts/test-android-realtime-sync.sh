@@ -32,6 +32,9 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/sync/VortXSyncManager*' 
     'com/vortx/android/sync/SessionOperationCoordinator*' 'com/vortx/android/sync/SessionMutationResult*' \
     'com/vortx/android/sync/SyncSessionLease*' 'com/vortx/android/sync/NativeAccountGateway*' 'com/vortx/android/sync/NativeAccountExport*' \
     'com/vortx/android/sync/NativeAccountReadCapture*' 'com/vortx/android/sync/NativeAccountMountToken*' \
+    'com/vortx/android/sync/NativeXperienceProfileGateway*' 'com/vortx/android/engine/NativeXperienceWrite*' \
+    'com/vortx/android/xperience/XperienceCollections*' 'com/vortx/android/xperience/XperienceImportNamespace*' \
+    'com/vortx/android/xperience/XperienceAddonBinding*' \
     'com/vortx/android/sync/NativeSettingsFence*' 'com/vortx/android/sync/NativeSyncPublicationPolicy*' \
     'com/vortx/android/sync/NativePlaylistAccountProducer*' 'com/vortx/android/sync/NativePlaylistAccountWrite*' \
     'com/vortx/android/engine/NativeAccountCoordinator*' 'com/vortx/android/engine/VortxNativeSession*' \
@@ -82,6 +85,9 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
 "$java_bin" -Xmx1800m -cp "$compiler_cp" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
     -no-stdlib -no-reflect -jvm-target 17 -module-name app -Xfriend-paths="$test_dir/retained-app.jar" -classpath "$test_cp" \
     "$source_dir/sync/VortXSyncManager.kt" "$source_dir/sync/VortXSyncRealtime.kt" "$source_dir/sync/NativeAccountGateway.kt" \
+    "$source_dir/sync/NativeXperienceProfileGateway.kt" "$source_dir/engine/NativeXperienceWrite.kt" \
+    "$source_dir/xperience/XperienceCollections.kt" "$source_dir/xperience/XperienceImportNamespace.kt" \
+    "$source_dir/xperience/XperienceAddonBinding.kt" \
     "$source_dir/sync/NativeSyncPublicationPolicy.kt" "$source_dir/engine/NativeAccountCoordinator.kt" \
     "$source_dir/sync/NativeSettingsFence.kt" "$source_dir/engine/NativePlaylistAccountComposer.kt" \
     "$source_dir/engine/NativeOwnerHistoryAccount.kt" "$source_dir/engine/NativeOwnAccountSources.kt" \
@@ -105,6 +111,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/engine/NativePlaylistTest.kt" "$test_source/engine/NativePlaylistCloudReceiptLedgerTest.kt" \
     "$test_source/engine/NativeHostPreferencesTest.kt" "$test_source/engine/NativeWebsiteProfileEditsTest.kt" \
     "$test_source/engine/NativeRawHostPreferencesTest.kt" "$test_source/engine/NativeOwnerHistoryCompatibilityTest.kt" \
+    "$test_source/engine/NativeXperienceWriteTest.kt" \
     -d "$test_dir/classes"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx768m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -119,5 +126,6 @@ cd "$repo_root/android/app"
     com.vortx.android.engine.NativeHostPreferencesTest \
     com.vortx.android.engine.NativeRawHostPreferencesTest \
     com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
+    com.vortx.android.engine.NativeXperienceWriteTest \
     com.vortx.android.engine.NativeWebsiteProfileEditsTest
 printf 'Retained verification directory: %s\n' "$test_dir"
