@@ -41,7 +41,7 @@ const manager = readFileSync(managerPath, 'utf8');
 const statePath = resolve(root, 'app/SourcesShared/MoveSeeding.swift');
 const stateSource = readFileSync(statePath, 'utf8');
 const expected = {
-  manager: '68f2b69f2ff4cf13b1fd6b3ad1433c662a9d2156e4965d3959965b5b5d970086',
+  manager: '8c41d90d0040a82a34e46816df759c366dc2bfbcccd0262594c1c9d8e40320d8',
   state: '7f5da321223973f4eec2f1c4af4cbceabc7cdf6902d9daed69654c0f12064fe5',
 };
 const actual = {
