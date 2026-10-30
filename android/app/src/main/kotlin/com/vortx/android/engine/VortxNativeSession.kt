@@ -400,7 +400,13 @@ internal class VortxNativeSession private constructor(
     private val onProgressMutation: () -> Unit = onMutation,
     private var ownerHistory: NativeOwnerHistorySessionAdapter? = null,
     private val ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
+    initialRawHostState: ByteArray,
 ) : AutoCloseable {
+    /** Captured before decode from the authenticated local checkpoint, or freshly minted when
+     * there was no local host state. This is persistence material, not a new write capability. */
+    private var rawNativeHostPreferenceState = NativeRawHostPreferences.captureLocal(scope, initialRawHostState)
+    private var rawHostMergeActive = false
+    private var rawHostMerge: ByteArray? = null
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner,
                             val bridges: MutableList<VortxResourceBridge> = mutableListOf(),
                             var completed: List<Pair<String, Long>>? = null) {
@@ -468,12 +474,18 @@ internal class VortxNativeSession private constructor(
                  onProgressMutation: () -> Unit = onMutation,
                  ownerHistoryBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
                  ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
+                 initialRawHostPreferences: ByteArray? = null,
                  isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
             scope.rejectCredentials(initialHostProfiles)
             scope.rejectCredentials(initialHostArchive)
             bootstrapActions.forEach(scope::rejectCredentials)
             val stored = store.readRetained(scope)
+            // Capture the encrypted plaintext slice BEFORE JSONObject/hydration normalization.
+            val storedRawHost = stored?.takeUnless(NativeOwnerHistorySessionAdapter::isEnvelope)?.let {
+                OHJson.Obj(it.toByteArray(Charsets.UTF_8))["nativeHostPreferenceState"]
+            }
+            NativeRawHostPreferences.requireIncomingObservation(scope, initialHostPreferences, initialRawHostPreferences)
             if (stored != null && NativeOwnerHistorySessionAdapter.isEnvelope(stored)) {
                 require(bootstrapActions.isEmpty()) { "Typed peer changes require the raw account route" }
                 val original = store.captureCheckpoint(scope)
@@ -536,6 +548,8 @@ internal class VortxNativeSession private constructor(
                 hostState = NativeHostPreferences.seedWatchlists(scope, hostState, initialLegacyWatchlists.filterKeys {
                     liveRoster.optJSONObject(it)?.optBoolean("deleted") == false
                 })
+                val rawHostState = NativeRawHostPreferences.reconcile(scope, storedRawHost, hostState,
+                    initialHostPreferences, initialRawHostPreferences)
                 hostProfiles = NativeHostPreferences.projectProfiles(hostState, hostProfiles,
                     JSONObject(runtime.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(hostProfiles)
@@ -560,12 +574,13 @@ internal class VortxNativeSession private constructor(
                 NativeWebsiteProfileEdits.validateRetained(scope, pendingWebsiteEdits, websiteCertificates)
                 val pendingAddonEdits = old?.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending()
                 NativeWebsiteAddonEdits.validatePending(scope, pendingAddonEdits)
-                val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
+                val snapshotProjection = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
                     .put("nativeHostPreferenceState", hostState)
                     .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
                     .put("legacyWebsiteBootstrap", legacyBootstrap)
                     .put("websiteProfileEditPending", pendingWebsiteEdits).put("websiteProfileEditCertificates", websiteCertificates)
                     .put("websiteAddonEditPending", pendingAddonEdits).toString()
+                val snapshot = NativeRawHostPreferences.snapshot(snapshotProjection, rawHostState)
                 scope.validateSnapshot(snapshot)
                 verifyCandidate?.invoke(runtime)
                 store.commit(scope, snapshot)
@@ -575,7 +590,8 @@ internal class VortxNativeSession private constructor(
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) },
                     legacyBootstrap?.let { JSONObject(it.toString()) },
                     JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), NativeWebsiteAddonEdits.detached(pendingAddonEdits), onMutation, beforeOwnerChange,
-                    onProgressMutation = onProgressMutation, ownerHistoryAuthority = ownerHistoryAuthority)
+                    onProgressMutation = onProgressMutation, ownerHistoryAuthority = ownerHistoryAuthority,
+                    initialRawHostState = rawHostState)
                     .also {
                         it.heldLegacyReconciliation = heldBootstrapReason
                         if (store.supportsCheckpointAuthority) {
@@ -616,7 +632,8 @@ internal class VortxNativeSession private constructor(
                     state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
                     state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
                     state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
-                    onMutation, beforeOwnerChange, onProgressMutation, adapter, authority)
+                    onMutation, beforeOwnerChange, onProgressMutation, adapter, authority,
+                    initialRawHostState = checkpoint.hostPreferences)
                 session.read() // Real typed-source validation preceded this presentation admission.
                 return session
             } catch (failure: Throwable) { adapter.close(); throw failure }
@@ -638,17 +655,22 @@ internal class VortxNativeSession private constructor(
             val runtime = VortxNativeRuntime.hydrate(bindings, core.toString())
             try {
                 store.requireCurrentCheckpoint(scope, original)
+                val host = NativeHostPreferences.local(scope, state.optJSONObject("nativeHostPreferenceState"))
+                // Absence mints a new local actor; a present original slice is always retained.
+                val rawHost = OHJson.Obj(raw.toByteArray(Charsets.UTF_8))["nativeHostPreferenceState"]
+                    ?: host.toString().toByteArray(Charsets.UTF_8)
                 val archive = state.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", state.getJSONArray("excludedCredentialPaths"))
                 }
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent,
                     state.optJSONObject("hostProfilePreferences") ?: JSONObject(), state.optBoolean("hostProfileSyncPending"),
-                    NativeHostPreferences.local(scope, state.optJSONObject("nativeHostPreferenceState")), state.optJSONObject("legacyImportMaterial"),
+                    host, state.optJSONObject("legacyImportMaterial"),
                     archive, state.optJSONObject("legacyWebsiteBootstrap"),
                     state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
                     state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
                     state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
-                    onMutation, beforeOwnerChange, onProgressMutation, ownerHistoryAuthority = authority)
+                    onMutation, beforeOwnerChange, onProgressMutation, ownerHistoryAuthority = authority,
+                    initialRawHostState = rawHost)
                     .also { it.acknowledgedCheckpoint = original }
             } catch (failure: Throwable) { runtime.close(); throw failure }
         }
@@ -671,6 +693,22 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun requiresRecovery(): Boolean = checkpointUncertain || ownerHistory?.requiresRecovery() == true
     @Synchronized fun hasOwnerHistory(): Boolean = ownerHistory != null
     @Synchronized fun rawAccount(): ByteArray? = ownerHistory?.cloudAccount()
+    /** Detached readonly raw observation. Never accepts an owner or grants mutation authority. */
+    @Synchronized internal fun rawHostPreferences(): ByteArray {
+        check(!closed && !requiresRecovery() && isAccountCurrent())
+        return NativeRawHostPreferences.document(rawNativeHostPreferenceState)
+    }
+
+    /** The coordinator provides the authenticated source slice under its EXISTING account,
+     * Session and mount admission. This synchronous scope carries provenance only; dispatch still
+     * performs all original authority/fork/checkpoint checks. No source is recaptured on resume. */
+    @Synchronized internal fun <T> withRawHostMerge(raw: ByteArray?, action: () -> T): T {
+        check(!rawHostMergeActive) { "Nested raw host observation" }
+        rawHostMergeActive = true; rawHostMerge = raw?.copyOf()
+        return try { action() } finally {
+            rawHostMerge?.fill(0); rawHostMerge = null; rawHostMergeActive = false
+        }
+    }
     @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !requiresRecovery() && isAccountCurrent() && read().owner == owner
 
     private fun requireCompleteAccountExportRoute(genericReadAvailable: Boolean = false) {
@@ -748,7 +786,7 @@ internal class VortxNativeSession private constructor(
             val carrier = requireNotNull(account.raw(NativeOwnerHistoryAccount.ARCHIVE))
             val ownerUID = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
             val checkpoint = NativeOwnerHistoryCoordinator.Checkpoint(scope, retained.toByteArray(Charsets.UTF_8),
-                nativeHostPreferenceState.toString().toByteArray(Charsets.UTF_8), NativeOwnerHistorySources.empty(scope).local(),
+                rawNativeHostPreferenceState, NativeOwnerHistorySources.empty(scope).local(),
                 account.encoded(), ownerUID)
             next = try { NativeOwnerHistorySessionAdapter.open(scope, checkpoint, original, historyBindings, store,
                 requireNotNull(ownerHistoryAuthority) { "Original mounted account authority unavailable" }, authority) }
@@ -763,8 +801,10 @@ internal class VortxNativeSession private constructor(
         val adapter = requireNotNull(next)
         try {
             val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope, nativeHostPreferenceState), remoteHost)
+            val rawHost = NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, host,
+                remoteHost, account.raw("nativeHostPreferences"))
             var projected: JSONObject? = null
-            adapter.receive(account, authority, host.toString().toByteArray(Charsets.UTF_8), local = { bytes ->
+            adapter.receive(account, authority, rawHost, local = { bytes ->
                 val state = JSONObject(OHJson.utf8(bytes))
                 changesReceiptProfile = state.getString("activeProfileId") != originalPlaybackState.getString("activeProfileId")
                 val profiles = NativeHostPreferences.projectProfiles(host, hostProfilePreferences,
@@ -772,10 +812,11 @@ internal class VortxNativeSession private constructor(
                 NativeHostPreferences.validateProjectedProfiles(profiles)
                 changesPlaybackOwner = nativePlaybackOwnerChanged(originalPlaybackState, state)
                 projected = profiles
-                state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
+                val projection = state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
                     .put("nativeHostPreferenceState", host)
                     .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
-                    .put("websiteAddonEditPending", websiteAddonEditPending).toString().toByteArray(Charsets.UTF_8)
+                    .put("websiteAddonEditPending", websiteAddonEditPending).toString()
+                NativeRawHostPreferences.snapshot(projection, rawHost).toByteArray(Charsets.UTF_8)
             }, beforePersist = {
                 // This Session monitor excludes new authenticated owner captures until receive
                 // and its visible projection complete. Revoke BEFORE native/checkpoint acceptance.
@@ -791,6 +832,7 @@ internal class VortxNativeSession private constructor(
             if (changesReceiptProfile) playlistReceiptProfileEpoch += 1
             hostProfilePreferences = requireNotNull(projected)
             nativeHostPreferenceState = host
+            rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = rawHost.copyOf()
             invalidate(); changes.value += 1
         } catch (failure: Throwable) {
             if (newOwner || adapter.requiresRecovery()) {
@@ -1095,17 +1137,20 @@ internal class VortxNativeSession private constructor(
             if (globalChanges != null) hostState = NativeHostPreferences.recordGlobals(scope, hostState, globalChanges)
             if (acknowledgeHostPreferences != null && NativeHostPreferences.equal(hostState.getJSONObject("document"), acknowledgeHostPreferences))
                 hostState.put("pending", false)
+            val rawHostState = NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, hostState,
+                remoteHostPreferences, if (remoteHostPreferences != null) rawHostMerge else null)
             preferences = NativeHostPreferences.projectProfiles(hostState, preferences,
                 JSONObject(candidate.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
             NativeHostPreferences.validateProjectedProfiles(preferences)
             val retained = legacyImportMaterial ?: actions.firstOrNull { it !== heldAction && it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
             val archive = hostArchive ?: hostDocumentArchive
-            val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
+            val updatedProjection = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("nativeHostPreferenceState", hostState)
                 .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
                 .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
                 .put("websiteAddonEditPending", websiteAddonEditPending).toString()
+            val updated = NativeRawHostPreferences.snapshot(updatedProjection, rawHostState)
             val state = validatePresentation(updated)
             val prior = JSONObject(before)
             val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
@@ -1127,9 +1172,10 @@ internal class VortxNativeSession private constructor(
                 val prospectiveHost = prospectiveGlobalChanges?.let {
                     NativeHostPreferences.recordGlobals(scope, hostState, it)
                 } ?: hostState
-                val host = prospectiveHost.getJSONObject("document").toString().toByteArray(Charsets.UTF_8)
+                val prospectiveRawHost = NativeRawHostPreferences.reconcile(scope, rawHostState, prospectiveHost)
+                val host = NativeRawHostPreferences.document(prospectiveRawHost)
                 try { checkNotNull(genericAdmission).invoke(native, host, replace) }
-                finally { native.fill(0); host.fill(0) }
+                finally { native.fill(0); host.fill(0); prospectiveRawHost.fill(0) }
             } else replace()
             check(isAccountCurrent()) { "Native account changed" }
             val rosterChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
@@ -1193,7 +1239,8 @@ internal class VortxNativeSession private constructor(
     private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null,
                                  playbackState: PlaybackCheckpointState? = null,
                                  requireCompleteAccountExportBudget: Boolean = false,
-                                 genericOriginalCheckpoint: NativeCheckpointRead? = null) {
+                                 genericOriginalCheckpoint: NativeCheckpointRead? = null,
+                                 preparedAccountAdmission: NativePreparedAccountAdmission? = null) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
         check(!requireCompleteAccountExportBudget || candidate.isTyped || genericOriginalCheckpoint != null) {
             "Complete account export budget unavailable"
@@ -1214,7 +1261,12 @@ internal class VortxNativeSession private constructor(
         }
         try {
             val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
-            val committedCompleteAccount = candidate.commitTypedCheckpoint(snapshot, archiveChanges)
+            val committedCompleteAccount = if (preparedAccountAdmission == null)
+                candidate.commitTypedCheckpoint(snapshot, archiveChanges)
+            else candidate.commitTypedPreparedCheckpoint(snapshot, archiveChanges, preparedAccountAdmission)
+            check(preparedAccountAdmission == null || committedCompleteAccount) {
+                "Prepared-account admission requires the original typed candidate"
+            }
             check(!requireCompleteAccountExportBudget || committedCompleteAccount || genericOriginalCheckpoint != null) {
                 "Complete account export budget unavailable"
             }
@@ -1232,6 +1284,8 @@ internal class VortxNativeSession private constructor(
                     acknowledgedCheckpoint = store.captureCheckpoint(scope).also { check(it.plaintext == snapshot) }
                 }
             }
+            val acceptedRawHost = OHJson.Obj(snapshot.toByteArray(Charsets.UTF_8)).raw("nativeHostPreferenceState")
+            rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = acceptedRawHost
         } catch (error: Throwable) {
             com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             enterCheckpointUncertainty()
@@ -1241,13 +1295,16 @@ internal class VortxNativeSession private constructor(
         }
     }
     private fun checkpoint(core: String, profiles: JSONObject, pendingProfiles: Boolean, host: JSONObject, material: JSONObject?, archive: JSONObject?, bootstrap: JSONObject?, websitePending: JSONObject, certificates: JSONObject,
-                           addonPending: JSONObject = websiteAddonEditPending): String =
-        JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)
+                           addonPending: JSONObject = websiteAddonEditPending): String {
+        val rawHost = NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, host)
+        val projection = JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)
             .put("nativeHostPreferenceState", host).put("legacyImportMaterial", material)
             .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
             .put("legacyWebsiteBootstrap", bootstrap)
             .put("websiteProfileEditPending", websitePending).put("websiteProfileEditCertificates", certificates)
             .put("websiteAddonEditPending", addonPending).toString()
+        return NativeRawHostPreferences.snapshot(projection, rawHost)
+    }
     @Synchronized override fun close() {
         if (retirementComplete) return
         if (!closed) { closed = true; invalidate() }
@@ -1257,6 +1314,7 @@ internal class VortxNativeSession private constructor(
         runtime.close()
         ownerHistory?.close()
         (transport as? AutoCloseable)?.close()
+        rawNativeHostPreferenceState.fill(0)
         retirementComplete = true
         changes.value += 1
     }

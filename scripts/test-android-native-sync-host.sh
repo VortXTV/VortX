@@ -23,6 +23,8 @@ nice -n 15 ./gradlew :app:testPlayDebugUnitTest \
   --tests com.vortx.android.sync.NativeAccountSyncTest \
   --tests com.vortx.android.integrations.NativeProspectiveProviderTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryJniTest \
+  --tests com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
+  --tests com.vortx.android.engine.NativeRawHostPreferencesTest \
   --no-daemon --max-workers=1 --no-parallel --no-build-cache --no-configuration-cache --stacktrace
 # Exact methods, not a stale aggregate count. No executed receipt is written before XML validation.
 python3 - <<'PY'
@@ -78,6 +80,57 @@ expected = {
         "verifierReentryAndCloseRejectButStatelessCanonicalizerRemainsAvailable",
         "strictUtf8BoundsAndRealCanonicalReceiptAreEnforced",
         "warmSchemaSixReceiveEncryptedColdReopenAndOrdinaryMutationUseRealJni",
+    },
+    "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": {
+        "rawUnknownNumbersAndNegativeZeroSurviveOwnedReplacement",
+        "strictRawAdmissionRejectsDuplicateUnicodeAndMalformedNumbers",
+        "schemaFivePendingCarrierIsLocalOnly",
+        "presentationNeverExposesOrNormalizesUnknownRoots",
+        "witnessBoundDeltaRetainsExactSourceAndUnknowns",
+        "coldNativeNormalizationRetainsOmittedUnknownsAndRejectsKnownOrSourceDrift",
+        "warmPeerUnknownSiblingsSurviveNormalizationAndCollisionsRefuseBeforeFork",
+        "fullAccountUnknownCarrierDoesNotInheritOverlayNodeBudget",
+        "sourceReplayDerivesMovieMembershipAndProgressFromOriginalBytes",
+        "removedSourceDoesNotInventMembershipTombstone",
+        "sourcePrivacyAndRetirementCannotBecomeReceipt",
+        "pendingRecordCannotAcquireNewBindingOnUnion",
+        "exactDurableReadbackPrecedesNativeAcceptance",
+        "persistenceFailureHasNoNativeAcceptAndPoisonsOwner",
+        "staleOriginalReadRefusesBeforePersistence",
+        "explicitActionRejectionDoesNotCheckpointOrAcknowledge",
+        "failedForkRetirementRemainsStickyAfterCurrentCloseSucceeds",
+        "stagedPlaybackProofIsSameTargetAndNeverPublished",
+        "keyedCapabilityArmsBeforeMutationAndKeepsOriginalDurableOrder",
+        "olderRuntimeGetsNoFormatAndNegotiatedRuntimeMayFallBackToCoarse",
+        "malformedRuntimeCapabilitiesAreRejectedAndFailedPersistCannotAcceptKeyed",
+        "preparedAccountAdmissionSeesActualCandidateAndCannotRewriteItsOwnedBytes",
+        "preparedAccountRejectionAndLateCallbackNeverPersistOrAccept",
+        "preparedAccountCallbackCannotMoveToAnotherThreadOrReusePersistence",
+        "preparedAccountRetainsOriginalFileAndAuthorityThroughAdmission",
+    },
+    "com.vortx.android.engine.NativeRawHostPreferencesTest": {
+        "ordinary edit preserves original import tokens and unknown local metadata",
+        "cold raw capture and checkpoint replacement never use a serialized observation",
+        "incoming Lamport winner adopts exact source register and retains local metadata",
+        "opaque future numeric spelling keeps conservative format refusal",
+        "profile spelling is preserved and canonical aliases reject",
+        "opaque imports require original incoming bytes and never become generic DTO edits",
+        "unsupported wrapper extension remains rejected and source bytes remain untouched",
+        "changed opaque arrays with a lossy baseline reject instead of dropping raw tokens",
+        "typed full account preview preserves source archive native and unknown siblings",
+        "prepared account full encrypted budget includes pending provider family before callback",
+        "supported profile numeric edits accept noncanonical baselines and preserve unknown siblings",
+        "schema owned global and integer array edits preserve unrelated raw members",
+        "repeated known clock and numeric events retain original spelling including negative zero",
+        "controlled rounded projections reach immutable event and opaque mutation refusals",
+        "numeric token comparison handles long exponents without arbitrary precision arithmetic",
+        "real ForYou prepare changes rating years and createdAt while retaining unknown raw members",
+        "real ForYou people add rename and remove preserve original row and metadata slices",
+        "ForYou duplicate and reserved identities preserve ambiguity while unrelated append works",
+        "ForYou rounded nonintegral and unsupported people identities never authorize edits",
+        "ForYou immutable numeric and unique people formatting agrees but exact contradictions refuse",
+        "ForYou opaque arrays unsupported containers and altered original people observations refuse",
+        "real collection delete and closed Watchlist removal admit explicit tombstones only",
     },
 }
 # Reviewed source paths for this explicit subset enter real VortxCore bindings and assert native

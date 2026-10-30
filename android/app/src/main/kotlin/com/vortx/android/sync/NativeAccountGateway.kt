@@ -12,7 +12,9 @@ internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: 
     /** Complete raw account from the accepted typed checkpoint, never a reconstructed DTO. */
     val rawAccount: ByteArray? = null,
     /** Actual source-only JNI projection paired with the retained authenticated generic GET. */
-    val genericSourceNativeProjection: ByteArray? = null)
+    val genericSourceNativeProjection: ByteArray? = null,
+    /** Detached original/derived raw host document. Read provenance only, never a write permit. */
+    val rawHostPreferences: ByteArray? = null)
 
 /** Opaque current mount and mutation generation; contains no account document or credentials. */
 internal data class NativeAccountMountToken(val installation: Any, val revision: Long)
@@ -136,6 +138,11 @@ internal interface NativePlaylistAccountWrite : AutoCloseable {
     /** Must hold original account/provider/settings witnesses through [commit], without suspension. */
     fun commitCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
         candidateNative: ByteArray, candidateHost: ByteArray, commit: () -> Unit)
+    /** App-owned typed hook supplies the ACTUAL prepared full account. The separately supplied
+     * prospective host includes pending globals only for budget sizing, not durable ack. */
+    fun commitPreparedCandidate(raw: ByteArray, prospectiveHost: ByteArray, commit: () -> Unit) {
+        error("Prepared complete-account admission unavailable")
+    }
     override fun close()
 }
 

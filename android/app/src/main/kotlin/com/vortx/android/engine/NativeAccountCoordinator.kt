@@ -996,6 +996,8 @@ internal class NativeAccountCoordinator(
         // A later native dispatch/projection/checkpoint failure must not leave old provenance usable.
         mounted.get()?.takeIf { it.account == account }?.clearRead()
         val exact = NativeOwnerHistoryAccount(raw)
+        // Retain the original register bytes BEFORE decoding the account presentation.
+        val originalHostPreferences = exact.raw("nativeHostPreferences")
         val document = NativeProfileOverlayWitness.parseAccountDocument(raw)
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local evidence is not a cloud source" }
         val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
@@ -1007,7 +1009,8 @@ internal class NativeAccountCoordinator(
         val incoming = exact.raw("nativeSync")?.let { OHJson.Obj(it) }
         val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
         if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
-            return@withLock applyDocumentLocked(account, document, isCurrent).let { applied ->
+            return@withLock applyDocumentLocked(account, document, isCurrent,
+                originalHostPreferences = originalHostPreferences).let { applied ->
                 if (!applied) return@let false
                 // The primary sync apply has already succeeded. Baseline retention is optional and
                 // limited to known schema 1–5; it must not make ordinary sync acceptance fail.
@@ -1065,15 +1068,16 @@ internal class NativeAccountCoordinator(
                 val carrier = requireNotNull(exact.raw(NativeOwnerHistoryAccount.ARCHIVE))
                 val uid = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
                 val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope), remoteHost)
+                val rawHost = NativeRawHostPreferences.reconcile(scope, null, host, remoteHost, originalHostPreferences)
                 val archiveInput = JSONObject(document.toString()).also { it.remove("nativeSync"); it.remove(NativeOwnerHistoryAccount.ARCHIVE) }
                 val archive = preflight?.archive ?: NativeHostDocument.archive(archiveInput)
                 val localObject = OHJson.Obj().set("hostDocument", archive.getJSONObject("document").toString().toByteArray(Charsets.UTF_8))
                     .set("excludedCredentialPaths", archive.getJSONArray("excludedCredentialPaths").toString().toByteArray(Charsets.UTF_8))
-                    .set("nativeHostPreferenceState", host.toString().toByteArray(Charsets.UTF_8))
+                    .set("nativeHostPreferenceState", rawHost)
                 preflight?.let { localObject.set("nativeMigrationPreflightRetained", OHJson.quote(it.raw)) }
                 val local = localObject.encoded()
                 val prepared = NativeOwnerHistoryCoordinator.prepareColdPeer(scope,
-                    NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), exact, host.toString().toByteArray(Charsets.UTF_8),
+                    NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), exact, rawHost,
                     historyBindings, original, { NativeOwnerHistoryAccount(it).validateBudget(true) },
                     { NativeOwnerHistorySessionAdapter.projection(scope, it) }, local)
                 val committed = original.withActive {
@@ -1123,7 +1127,8 @@ internal class NativeAccountCoordinator(
     private suspend fun applyDocumentLocked(account: SessionOwnerSnapshot.Account, incomingDocument: JSONObject, isCurrent: () -> Boolean,
                                            suppliedSources: List<NativeOwnAccountSource> = emptyList(),
                                            retainedWatched: JSONObject? = null,
-                                           operationCurrent: () -> Boolean = isCurrent): Boolean {
+                                           operationCurrent: () -> Boolean = isCurrent,
+                                           originalHostPreferences: ByteArray? = null): Boolean {
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native account changed" }
         // All callers share this transaction helper. Revoke the old authenticated baseline before
@@ -1322,10 +1327,12 @@ internal class NativeAccountCoordinator(
             } else host
             old.session.owned(read.owner) { withNativeOwnAccountSources(sources) {
                 withAccountAdmission(account, migrationCurrent) { check(withMountedSession(old.session, account) {
-                    old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
-                        remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources,
-                        beforeCommit = { operationJob?.ensureActive(); check(migrationCurrent()) { "Native migration changed before commit" } },
-                        legacyWatchlists = watchlists.profiles)
+                    old.session.withRawHostMerge(originalHostPreferences) {
+                        old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
+                            remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources,
+                            beforeCommit = { operationJob?.ensureActive(); check(migrationCurrent()) { "Native migration changed before commit" } },
+                            legacyWatchlists = watchlists.profiles)
+                    }
                     reportLegacyReconciliation(old.session, stage = "sync")
                     true
                 }) { "Native account changed" } }
@@ -1361,6 +1368,7 @@ internal class NativeAccountCoordinator(
             VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
             initialHostPreferences = remoteHost, initialLegacyWatchlists = watchlists.profiles,
+            initialRawHostPreferences = originalHostPreferences,
             verifyCandidate = verifySources, onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged,
             onProgressMutation = { onProgressMutation(account) }, ownerHistoryBindings = historyBindings,
             ownerHistoryAuthority = ownerHistoryAuthority(account) { accountCurrent(account) }) { isCurrent() && accountCurrent(account) } } } }
@@ -1444,7 +1452,7 @@ internal class NativeAccountCoordinator(
             NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
                 read.state.getBoolean("hostProfileSyncPending"), read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document"),
                 read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount(),
-                current.sourceProjection())
+                current.sourceProjection(), current.session.rawHostPreferences())
         }
     }
 

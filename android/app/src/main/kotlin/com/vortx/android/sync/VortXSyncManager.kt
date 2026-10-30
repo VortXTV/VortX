@@ -1247,6 +1247,17 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                             }
                         }) { "Original playlist account admission changed" }
                     }
+                    override fun commitPreparedCandidate(raw: ByteArray, prospectiveHost: ByteArray, commit: () -> Unit) {
+                        check(active)
+                        check(publishIfSyncLeaseCurrent(lease) {
+                            providers.withCurrent(com.vortx.android.engine.NativeProfileOverlayWitness.parseAccountDocument(raw)) { full ->
+                                NativeSettingsFence.withCurrent(hostWitness) {
+                                    val prospective = com.vortx.android.engine.NativePlaylistAccountComposer.composePrepared(raw, prospectiveHost, full)
+                                    try { commit() } finally { prospective.fill(0) }
+                                }
+                            }
+                        }) { "Original prepared-account admission changed" }
+                    }
                     override fun close() { active = false; providers.close() }
                 }
             } catch (failure: Throwable) { providers.close(); throw failure }
@@ -2443,6 +2454,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals)) return null
             val exportMount = gateway.currentMountToken(account)
             val exported = gateway.exportDocument(account) ?: return null
+            com.vortx.android.engine.NativeRawHostPreferences.requireRawExport(exported.hostPreferences, exported.rawHostPreferences)
             if (exported.hostProfileSyncPending) return null
             if (!isSyncLeaseCurrent(lease)) return null
             // Preserve the exact legacy baseline. Rewriting the projected roster/settings here
@@ -2461,7 +2473,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             val exactBase = com.vortx.android.engine.NativeOwnerHistoryAccount(exported.rawAccount ?: originalRaw)
             val replacements = linkedMapOf("nativeSync" to exported.nativeSync.toString().toByteArray(Charsets.UTF_8),
                 "nativeProviderCredentials" to withProviders.getJSONObject("nativeProviderCredentials").toString().toByteArray(Charsets.UTF_8))
-            exported.hostPreferences?.let { replacements["nativeHostPreferences"] = it.toString().toByteArray(Charsets.UTF_8) }
+            exported.rawHostPreferences?.let { replacements["nativeHostPreferences"] = it }
+                ?: exported.hostPreferences?.let { replacements["nativeHostPreferences"] = it.toString().toByteArray(Charsets.UTF_8) }
             withProviders.optJSONObject("apiKeys")?.let { replacements["apiKeys"] = it.toString().toByteArray(Charsets.UTF_8) }
             // A typed checkpoint already carries exact native/source slices: never replace that
             // native object with its presentation projection merely to add provider registers.
@@ -2481,7 +2494,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 val sourceProjection = exported.genericSourceNativeProjection ?: return null
                 try { com.vortx.android.engine.NativePlaylistAccountComposer.compose(originalRaw, sourceProjection,
                     exported.nativeSync.toString().toByteArray(Charsets.UTF_8),
-                    checkNotNull(exported.hostPreferences).toString().toByteArray(Charsets.UTF_8), withProviders)
+                    exported.rawHostPreferences ?: checkNotNull(exported.hostPreferences).toString().toByteArray(Charsets.UTF_8), withProviders)
                 } finally { sourceProjection.fill(0) }
             }
             return deriveBackup(lease, withProviders, pulled, gateway, exportMount, rawCandidate)

@@ -222,6 +222,91 @@ class NativeOwnerHistoryCompatibilityTest {
         candidate.close(); fixture.owner.close()
     }
 
+    @Test fun preparedAccountAdmissionSeesActualCandidateAndCannotRewriteItsOwnedBytes() {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var observed: ByteArray? = null
+        val accepted = fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { raw, persist ->
+            assertTrue(fixture.native.order.isEmpty())
+            val account = NativeOwnerHistoryAccount(raw)
+            assertArrayEquals(b("-0.0"), account.raw("future"))
+            assertArrayEquals(b("{}"), account.raw("nativeHostPreferences"))
+            observed = raw
+            raw.fill(0) // The callback sees a copy, not the actual candidate's account/checkpoint.
+            persist()
+        })
+        assertTrue(observed!!.all { it == 0.toByte() })
+        assertArrayEquals(b("-0.0"), NativeOwnerHistoryAccount(accepted.accountBase).raw("future"))
+        assertEquals(listOf("persist", "accept"), fixture.native.order)
+        assertTrue(fixture.owner.close())
+    }
+    @Test fun preparedAccountRejectionAndLateCallbackNeverPersistOrAccept() {
+        for (throwDuringAdmission in listOf(false, true)) {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var late: (() -> Unit)? = null
+        fails { fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+            late = persist
+            if (throwDuringAdmission) error("Synthetic precommit budget refusal")
+        }) }
+        fails { late!!() }
+        assertTrue(fixture.native.order.isEmpty())
+        assertFalse(fixture.owner.requiresAuthenticatedReopen)
+        assertTrue(candidate.close()); assertTrue(fixture.owner.close())
+        }
+    }
+    @Test fun preparedAccountCallbackCannotMoveToAnotherThreadOrReusePersistence() {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var crossThread: Throwable? = null
+        var worker: Thread? = null
+        try {
+            fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+                val thread = Thread { try { persist() } catch (error: Throwable) { crossThread = error } }
+                thread.isDaemon = true; worker = thread
+                thread.start(); thread.join(2_000)
+                assertFalse("Synthetic cross-thread refusal did not finish within two seconds", thread.isAlive)
+                assertNotNull(crossThread)
+                assertTrue(fixture.native.order.isEmpty())
+                persist()
+                fails { persist() }
+            })
+            assertEquals(listOf("persist", "accept"), fixture.native.order)
+        } finally {
+            worker?.takeIf { it.isAlive }?.let { thread -> thread.interrupt(); thread.join(1_000) }
+            val candidateClosed = runCatching { candidate.accepted || candidate.close() }
+            val ownerClosed = runCatching { fixture.owner.close() }
+            assertTrue("Synthetic candidate cleanup failed", candidateClosed.getOrDefault(false))
+            assertTrue("Synthetic owner cleanup failed", ownerClosed.getOrDefault(false))
+            assertFalse("Synthetic callback worker survived bounded cleanup", worker?.isAlive == true)
+        }
+    }
+    @Test fun preparedAccountRetainsOriginalFileAndAuthorityThroughAdmission() {
+        for (failure in listOf("authority", "file", "budget")) for (swallow in listOf(false, true)) {
+            val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+            var budgetCurrent = true
+            val transaction = NativeOwnerHistoryCoordinator.Transaction(fixture.account, fixture.authority) {
+                check(budgetCurrent) { "Synthetic changed precommit budget witness" }
+                NativeOwnerHistoryAccount(it).validateBudget(true)
+            }
+            val candidate = fixture.owner.candidate(capture, transaction)
+            fails { fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+                when (failure) {
+                    "file" -> fixture.read = NativeCheckpointRead(fixture.read.plaintext, fixture.issuer, scope, 0, byteArrayOf(2))
+                    "authority" -> fixture.authority.active = false
+                    "budget" -> budgetCurrent = false
+                }
+                // Swallowing a failed callback must never make the coordinator return a false
+                // accepted checkpoint merely because the callback was invoked.
+                if (swallow) try { persist() } catch (_: Exception) { } else persist()
+            }) }
+            assertTrue(fixture.native.order.isEmpty())
+            assertFalse(fixture.owner.requiresAuthenticatedReopen)
+            fixture.authority.active = true
+            candidate.close(); fixture.owner.close()
+        }
+    }
+
     private fun snapshot() = OHJson.Obj().set("roster", OHJson.Obj().set("profiles", OHJson.Obj().set(scope.ownerProfileID,
         b("{\"id\":\"${scope.ownerProfileID}\",\"owner\":true,\"deleted\":false,\"account\":{\"kind\":\"shared\"}}")).encoded()).encoded())
         .set("libraries", b("{}")).set("activeProfileId", OHJson.quote(scope.ownerProfileID))

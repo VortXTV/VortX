@@ -193,6 +193,12 @@ internal class NativeOwnerHistoryCoordinator private constructor(
         }
     }
     fun commit(candidate: Candidate, hostPreferences: ByteArray): Checkpoint {
+        return commitPrepared(candidate, hostPreferences, NativePreparedAccountAdmission { _, persist -> persist() })
+    }
+    /** The prospective account is built from this original Candidate, its actual checkpoint
+     * delta, source archive, host projection and transaction account. No presentation surrogate. */
+    fun commitPrepared(candidate: Candidate, hostPreferences: ByteArray,
+                       admission: NativePreparedAccountAdmission): Checkpoint {
         val c = candidate.capture; requireCapture(c); check(!candidate.accepted)
         // Even a host-only transaction must obtain a native checkpoint before accept.
         if (candidate.state === state || !OHJson.equal(candidate.state.fence, candidate.fence)) {
@@ -209,20 +215,38 @@ internal class NativeOwnerHistoryCoordinator private constructor(
             tx.authority.withActive {
                 c.authority.withActive {
                     check(c); requireCurrent(installed); tx.budget(next.accountBase)
-                    started = true
-                    val readback = persist(installed, next.envelope())
-                    // The store promises authenticated exact readback; also verify returned raw body.
-                    require(readback.plaintext?.toByteArray(Charsets.UTF_8)?.contentEquals(next.envelope()) == true)
-                    val accept = NativeOwnerHistoryVerifier { bytes -> runCatching {
-                        val wrapper = OHJson.Obj(bytes); val check = wrapper.obj("check")
-                        require(wrapper.text("kind") == "lease" && check.text("contract") == "vortx.owner-history-session-lease/1" &&
-                            check.text("purpose") == "checkpoint_accepted" && OHJson.equal(check.raw("fence"), candidate.fence) &&
-                            OHJson.equal(check.raw("preparedAgainst"), c.fence)); true
-                    }.getOrDefault(false) }
-                    val reply = response(candidate.native.request(request("accept", candidate.fence), 0, accept))
-                    require(reply.text("kind") == "accepted" && OHJson.equal(reply.raw("fence"), candidate.fence) && isFalse(reply, "durableAck"))
-                    old = runtime; runtime = candidate.native; state = candidate.state; current = next
-                    sources = candidate.nextSources; installed = readback; candidate.accepted = true
+                    var active = true; var invoked = false; var completed = false
+                    val committingThread = Thread.currentThread()
+                    val observedAccount = next.accountBase
+                    try {
+                        admission.withCandidate(observedAccount) {
+                            check(Thread.currentThread() === committingThread && active && !invoked) {
+                                "Prepared-account persistence callback expired, repeated or changed thread"
+                            }
+                            invoked = true
+                            tx.authority.withActive {
+                                c.authority.withActive {
+                                    check(c); requireCurrent(installed); tx.budget(next.accountBase)
+                                    started = true
+                                    val readback = persist(installed, next.envelope())
+                                    // The store promises authenticated exact readback; also verify returned raw body.
+                                    require(readback.plaintext?.toByteArray(Charsets.UTF_8)?.contentEquals(next.envelope()) == true)
+                                    val accept = NativeOwnerHistoryVerifier { bytes -> runCatching {
+                                        val wrapper = OHJson.Obj(bytes); val check = wrapper.obj("check")
+                                        require(wrapper.text("kind") == "lease" && check.text("contract") == "vortx.owner-history-session-lease/1" &&
+                                            check.text("purpose") == "checkpoint_accepted" && OHJson.equal(check.raw("fence"), candidate.fence) &&
+                                            OHJson.equal(check.raw("preparedAgainst"), c.fence)); true
+                                    }.getOrDefault(false) }
+                                    val reply = response(candidate.native.request(request("accept", candidate.fence), 0, accept))
+                                    require(reply.text("kind") == "accepted" && OHJson.equal(reply.raw("fence"), candidate.fence) && isFalse(reply, "durableAck"))
+                                    old = runtime; runtime = candidate.native; state = candidate.state; current = next
+                                    sources = candidate.nextSources; installed = readback; candidate.accepted = true
+                                    completed = true
+                                }
+                            }
+                        }
+                    } finally { active = false; observedAccount.fill(0) }
+                    check(invoked && completed && candidate.accepted) { "Prepared-account admission did not complete persistence" }
                 }
             }
             val previous = old; old = null

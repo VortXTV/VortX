@@ -4,6 +4,22 @@ import org.json.JSONObject
 
 /** App-only whole cloud account composition. Never pass its output to JNI or host archives. */
 internal object NativePlaylistAccountComposer {
+    /** The typed Session owns this real prepared account, including schema 6/source history and
+     * its exact host/native checkpoint. This method never routes it through the generic patcher. */
+    fun composePrepared(raw: ByteArray, prospectiveHost: ByteArray, providers: JSONObject): ByteArray {
+        val base = NativeOwnerHistoryAccount(raw)
+        val native = OHJson.Obj(requireNotNull(base.raw("nativeSync")))
+        require(OHJson.integer(native.raw("schemaVersion")) == 6L && native["ownerHistory"] != null &&
+            base.raw(NativeOwnerHistoryAccount.ARCHIVE) != null) { "Original prepared typed account required" }
+        base.validateBudget(writeV2 = true)
+        OHJson.Obj(prospectiveHost)
+        NativeHostPreferences.validate(VortxAccountScope(native.text("scope"), native.text("ownerProfileId")),
+            JSONObject(OHJson.utf8(prospectiveHost)))
+        val replacements = linkedMapOf("nativeHostPreferences" to prospectiveHost)
+        preserveProviders(base, providers, replacements)
+        return base.replacingOwned(replacements).validateBudget(writeV2 = true)
+    }
+
     /** The before projection is the exact JNI normalization of the authenticated source, not the
      * post-merge mount (which can already contain pending native mutations). */
     fun compose(raw: ByteArray, originalNativeProjection: ByteArray, native: ByteArray,
@@ -19,6 +35,12 @@ internal object NativePlaylistAccountComposer {
             "nativeSync" to nativeWire,
             "nativeHostPreferences" to preserveRegisters(base.raw("nativeHostPreferences"), host),
         )
+        preserveProviders(base, providers, replacements)
+        return base.replacingOwned(replacements).validateBudget(writeV2 = true)
+    }
+
+    private fun preserveProviders(base: NativeOwnerHistoryAccount, providers: JSONObject,
+                                  replacements: MutableMap<String, ByteArray>) {
         // Provider mirror is prepared inside its full-record vault fence, without commit/ack.
         // Preserve untouched apiKeys siblings (and their raw numeric/string spelling).
         for (key in listOf("nativeProviderCredentials", "apiKeys")) {
@@ -29,7 +51,6 @@ internal object NativePlaylistAccountComposer {
                     JSONObject(OHJson.utf8(old)).toString().toByteArray(Charsets.UTF_8), encoded)
             }
         }
-        return base.replacingOwned(replacements).validateBudget(writeV2 = true)
     }
 
     /** Apply changes between genuine source projection and prospective projection to raw slices.
@@ -68,6 +89,7 @@ internal object NativePlaylistAccountComposer {
         nextProfiles.keys.forEach { key -> renamed.set(originalNames[NativeHostPreferences.canonicalProfileID(key)] ?: key,
             nextProfiles.raw(key)) }
         next.set("profiles", renamed.encoded())
-        return patch(raw, JSONObject(OHJson.utf8(raw)).toString().toByteArray(Charsets.UTF_8), next.encoded())
+        return NativeRawHostPreferences.patchDocument(raw,
+            JSONObject(OHJson.utf8(raw)).toString().toByteArray(Charsets.UTF_8), next.encoded())
     }
 }

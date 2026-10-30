@@ -25,6 +25,28 @@ import org.json.JSONArray
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+/** Actual editor-owned members, shared with raw conservation. Receive validation remains lenient;
+ * these sets confer neither account authority nor permission to replace unknown objects/arrays. */
+internal object ForYouEditFields {
+    val interests = setOf("genres", "extras", "eras", "people", "decided")
+    val collection = setOf("id", "name", "rules", "home", "createdAt")
+    val rules = setOf("genres", "extras", "people", "yearFrom", "yearTo", "minRating", "type", "hideWatched", "sort")
+    val person = setOf("id", "name", "department")
+    fun numeric(field: String, path: List<String>): Boolean = ForYouSync.isCollectionField(field) &&
+        (path == listOf("createdAt") || path.size == 2 && path[0] == "rules" && path[1] in setOf("yearFrom", "yearTo", "minRating"))
+    fun people(field: String, path: List<String>): Boolean =
+        field == ForYouInterests.FIELD && path == listOf("people") ||
+            ForYouSync.isCollectionField(field) && path == listOf("rules", "people")
+    fun representedId(value: Any?): Int? {
+        val row = value as? JSONObject ?: return null
+        val person = ForYouPerson.fromJson(row) ?: return null
+        val number = row.opt("id") as? Number ?: return null
+        return person.id.takeIf { number.toDouble() == it.toDouble() }
+    }
+    /** Reservation only. A rounded/truncated projection is NEVER original row edit authority. */
+    fun reservedId(value: Any?): Int? = ((value as? JSONObject)?.opt("id") as? Number)?.toInt()?.takeIf { it > 0 }
+}
+
 /** The account's native `forYou.` host fields for the active profile, installed by the application. */
 interface ForYouNativeGateway {
     interface Owner { val profileId: String; val scopeIdentity: Any }
@@ -261,10 +283,10 @@ class ForYouStore internal constructor(
 
     /** Prepare synchronously from what the dialog rendered, before launching any coroutine. */
     fun prepare(edit: ForYouEditSession, interests: ForYouInterests): Result<PreparedForYouWrite> =
-        prepare(edit, ForYouInterests.FIELD, interests.toJson(), setOf("genres", "extras", "eras", "people", "decided"))
+        prepare(edit, ForYouInterests.FIELD, interests.toJson(), ForYouEditFields.interests)
 
     fun prepare(edit: ForYouEditSession, collection: SmartCollection): Result<PreparedForYouWrite> =
-        prepare(edit, collection.field, collection.toJson(), setOf("id", "name", "rules", "home", "createdAt"))
+        prepare(edit, collection.field, collection.toJson(), ForYouEditFields.collection)
 
     fun prepareDelete(edit: ForYouEditSession, collection: SmartCollection): Result<PreparedForYouWrite> =
         prepare(edit, collection.field, JSONObject.NULL, emptySet())
@@ -296,15 +318,13 @@ class ForYouStore internal constructor(
                     val edited = after.optJSONArray("people") ?: JSONArray()
                     fun recognized(array: JSONArray): Map<Int, List<JSONObject>> = (0 until array.length()).mapNotNull { index ->
                         val objectValue = array.optJSONObject(index) ?: return@mapNotNull null
-                        val person = ForYouPerson.fromJson(objectValue) ?: return@mapNotNull null
-                        val rawId = objectValue.opt("id") as? Number ?: return@mapNotNull null
-                        if (rawId.toDouble() != person.id.toDouble()) return@mapNotNull null
-                        person.id to objectValue
+                        val id = ForYouEditFields.representedId(objectValue) ?: return@mapNotNull null
+                        id to objectValue
                     }.groupBy({ it.first }, { it.second })
                     val originals = raw?.let(::recognized).orEmpty()
                     // A future record with a numeric ID but an unknown shape still reserves its ID.
                     val rawIDs = raw?.let { array -> (0 until array.length()).mapNotNull { index ->
-                        (array.optJSONObject(index)?.opt("id") as? Number)?.toInt()?.takeIf { it > 0 }
+                        ForYouEditFields.reservedId(array.opt(index))
                     }.groupingBy { it }.eachCount() }.orEmpty()
                     val decoded = recognized(represented)
                     val proposed = recognized(edited)
@@ -324,7 +344,7 @@ class ForYouStore internal constructor(
                         val resultPerson = JSONObject((entry as JSONObject).toString())
                         val known = replacement.single()
                         val baselinePerson = decoded.getValue(id).single()
-                        setOf("id", "name", "department").forEach { key ->
+                        ForYouEditFields.person.forEach { key ->
                             if (baselinePerson.has(key) != known.has(key) || !forYouJsonEqual(baselinePerson.opt(key), known.opt(key))) {
                                 if (known.has(key)) resultPerson.put(key, known.get(key)) else resultPerson.remove(key)
                             }
@@ -348,7 +368,7 @@ class ForYouStore internal constructor(
                 val rules = previous?.optJSONObject("rules")?.let { JSONObject(it.toString()) } ?: JSONObject()
                 val updated = value.getJSONObject("rules")
                 overlay(rules, baseline?.optJSONObject("rules"), updated,
-                    setOf("genres", "extras", "people", "yearFrom", "yearTo", "minRating", "type", "hideWatched", "sort"))
+                    ForYouEditFields.rules)
                 result.put("rules", rules)
             }
             result

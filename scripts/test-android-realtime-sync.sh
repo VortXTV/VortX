@@ -41,6 +41,19 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/sync/VortXSyncManager*' 
     'com/vortx/android/engine/VortxNativeRead*' 'com/vortx/android/engine/NativePlaylist*' \
     'com/vortx/android/engine/NativeHostPreferences*' 'com/vortx/android/engine/NativeWebsiteProfileEdits*' \
     'com/vortx/android/engine/NativePlaylistAccountComposer*' 'com/vortx/android/engine/NativeOwnerHistoryAccount*' \
+    'com/vortx/android/engine/NativeRawHostPreferences*' 'com/vortx/android/engine/NativePreparedAccountAdmission*' \
+    'com/vortx/android/engine/NativeOwnerHistoryCoordinator*' 'com/vortx/android/engine/NativeOwnerHistorySessionAdapter*' \
+    'com/vortx/android/engine/VortxNativeRuntime*' 'com/vortx/android/engine/VortxRuntimeBindings*' \
+    'com/vortx/android/engine/VortxRuntimeDelegate*' 'com/vortx/android/engine/VortxPreparedAccountDelegate*' \
+    'com/vortx/android/foryou/ForYouPerson*' 'com/vortx/android/foryou/ForYouInterests*' \
+    'com/vortx/android/foryou/SmartCollectionRules*' 'com/vortx/android/foryou/SmartCollection*' \
+    'com/vortx/android/foryou/ForYouSync*' 'com/vortx/android/foryou/ForYouGenre*' \
+    'com/vortx/android/foryou/ForYouExtra*' 'com/vortx/android/foryou/ForYouEra*' 'com/vortx/android/foryou/ForYouModelKt*' \
+    'com/vortx/android/foryou/ForYouNativeGateway*' 'com/vortx/android/foryou/ForYouObservedField*' \
+    'com/vortx/android/foryou/ForYouIdentityRef*' 'com/vortx/android/foryou/ForYouOrigin*' \
+    'com/vortx/android/foryou/ForYouEditSession*' 'com/vortx/android/foryou/PreparedForYouWrite*' \
+    'com/vortx/android/foryou/ForYouState*' 'com/vortx/android/foryou/ForYouStore*' \
+    'com/vortx/android/foryou/ForYouStoreKt*' 'com/vortx/android/foryou/ForYouEditFields*' \
     'com/vortx/android/engine/OHJson*' 'com/vortx/android/engine/OHState*' \
     'com/vortx/android/engine/NativeOwnAccountSource*' 'com/vortx/android/engine/NativeOwnAccountProducer*' \
     'com/vortx/android/engine/NativeOwnAccountBaseline*' 'com/vortx/android/engine/NativeOwnAccountHTTP*' \
@@ -72,6 +85,9 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/sync/NativeSyncPublicationPolicy.kt" "$source_dir/engine/NativeAccountCoordinator.kt" \
     "$source_dir/sync/NativeSettingsFence.kt" "$source_dir/engine/NativePlaylistAccountComposer.kt" \
     "$source_dir/engine/NativeOwnerHistoryAccount.kt" "$source_dir/engine/NativeOwnAccountSources.kt" \
+    "$source_dir/engine/NativeRawHostPreferences.kt" "$source_dir/engine/VortxNativeRuntime.kt" \
+    "$source_dir/engine/NativeOwnerHistoryCoordinator.kt" "$source_dir/engine/NativeOwnerHistorySessionAdapter.kt" \
+    "$source_dir/foryou/ForYouModel.kt" "$source_dir/foryou/ForYouStore.kt" \
     "$source_dir/integrations/NativeProviderCredentials.kt" "$source_dir/integrations/NativeProviderAccess.kt" \
     "$source_dir/integrations/SecureTokenStore.kt" "$source_dir/security/FailClosedCredentialStore.kt" \
     "$source_dir/moat/WatchSignalClient.kt" \
@@ -88,6 +104,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/integrations/NativeProspectiveProviderTest.kt" \
     "$test_source/engine/NativePlaylistTest.kt" "$test_source/engine/NativePlaylistCloudReceiptLedgerTest.kt" \
     "$test_source/engine/NativeHostPreferencesTest.kt" "$test_source/engine/NativeWebsiteProfileEditsTest.kt" \
+    "$test_source/engine/NativeRawHostPreferencesTest.kt" "$test_source/engine/NativeOwnerHistoryCompatibilityTest.kt" \
     -d "$test_dir/classes"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx768m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -100,5 +117,7 @@ cd "$repo_root/android/app"
     com.vortx.android.engine.NativePlaylistTest \
     com.vortx.android.engine.NativePlaylistCloudReceiptLedgerTest \
     com.vortx.android.engine.NativeHostPreferencesTest \
+    com.vortx.android.engine.NativeRawHostPreferencesTest \
+    com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
     com.vortx.android.engine.NativeWebsiteProfileEditsTest
 printf 'Retained verification directory: %s\n' "$test_dir"
