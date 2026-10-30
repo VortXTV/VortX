@@ -9,6 +9,7 @@ on:
       - app/SourcesShared/XperienceCollections.swift
       - app/SourcesShared/VortxResourceBridge.swift
       - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt
+      - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt
       - android/app/src/main/kotlin/com/vortx/android/engine/NativeOwnerHistoryAccount.kt
 
 permissions:

@@ -18,6 +18,17 @@ REF = "refs/heads/beta-xperience-wire-parity-20261030"
 HEX = re.compile(r"[0-9a-f]{64}")
 ID = re.compile(r"[a-z0-9-]{1,80}")
 LOG_LIMIT = 256 * 1024
+NAMESPACE_PRODUCTION_PATH = "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt"
+NAMESPACE_FIXTURE_PATH = "test/xperience-wire-parity/NamespacePublicApiFixture.kt"
+NAMESPACE_MAIN_CLASS = "com.vortx.android.xperience.NamespacePublicApiFixture"
+NAMESPACE_CASE_IDS = (
+    "read-replace-unknown-raw", "semantic-full-register-stale", "detached-observation-bytes",
+    "duplicate-precision-invalid-shortcut", "small-depth-unknown-cas", "exact-integer-unknown-conservation",
+    "actual-canonical-expansion-quota", "concurrent-original-observations", "tombstone-namespace-future-format",
+)
+NAMESPACE_ASSERTION_MINIMUM = 9
+NAMESPACE_ASSERTION_MAXIMUM = 128
+NAMESPACE_MAX_INPUT_BYTES = 16 * 1024
 
 
 def require(condition, message):
@@ -301,6 +312,33 @@ def read_results(directory, cases):
     return results
 
 
+def namespace_results(output, major):
+    require(len(output) <= 4096, "Namespace PASS output byte limit")
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise RuntimeError("Namespace PASS output must be ASCII") from None
+    require(len(lines) == len(NAMESPACE_CASE_IDS) + 1, "Namespace PASS line count mismatch")
+    prefix = "PASS namespace-public-api "
+    passed = []
+    for line in lines[:-1]:
+        require(line.startswith(prefix), "Namespace case PASS format mismatch")
+        name = line[len(prefix):]
+        require(name in NAMESPACE_CASE_IDS and name not in passed, "unknown or duplicate Namespace case ID")
+        passed.append(name)
+    require(set(passed) == set(NAMESPACE_CASE_IDS), "Namespace required case missing")
+    summary = re.fullmatch(r"PASS namespace-public-api assertions=([1-9][0-9]{0,2}) cases=9 maxInputBytes=16384", lines[-1])
+    require(summary, "Namespace PASS summary format mismatch")
+    assertions = int(summary.group(1))
+    require(NAMESPACE_ASSERTION_MINIMUM <= assertions <= NAMESPACE_ASSERTION_MAXIMUM, "Namespace assertion count outside reviewed bound")
+    record = {"caseIds": sorted(passed), "cases": len(passed), "assertions": assertions,
+              "maxInputBytes": NAMESPACE_MAX_INPUT_BYTES, "passed": True}
+    for name in passed:
+        emit("namespace-case", {"id": name, "jdkMajor": major, "passed": True})
+    emit("namespace-summary", {"jdkMajor": major, **record})
+    return record
+
+
 def main():
     # This guard precedes reads, output directories and every child call.
     require(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_REPOSITORY") == REPOSITORY
@@ -316,9 +354,9 @@ def main():
     root = Path(__file__).resolve().parents[2]
     fixture = root / "test/xperience-wire-parity"
     pins = json.loads((fixture / "source-pins.json").read_text(encoding="utf-8"))
-    require(pins["schema"] == 2 and pins["repository"] == REPOSITORY and pins["ref"] == REF, "manifest identity mismatch")
+    require(pins["schema"] == 3 and pins["repository"] == REPOSITORY and pins["ref"] == REF, "manifest identity mismatch")
     require(pins["reviewState"] == "ROOT_AND_INDEPENDENT_SOURCE_SECURITY_REVIEWED", "source/security review remains unfinished")
-    for key in ("appleDomain", "appleJSON", "androidDomain", "androidJSON"):
+    for key in ("appleDomain", "appleJSON", "androidDomain", "androidJSON", "namespaceSource", "namespaceFixture"):
         require(HEX.fullmatch(pins[key]["sha256"]), "unfinished source pin: " + key)
     model = pins["finalModel"]
     require(type(model["version"]) is int and model["version"] > 0
@@ -328,6 +366,23 @@ def main():
             and HEX.fullmatch(model["reviewReceiptSHA256"])
             and model["domainSourceSHA256"] == pins["androidDomain"]["sha256"],
             "actual final-model version/source/frozen/review identity remains unfinished")
+    namespace_check = pins["namespaceCheck"]
+    require(pins["namespaceSource"]["path"] == NAMESPACE_PRODUCTION_PATH
+            and pins["namespaceFixture"]["path"] == NAMESPACE_FIXTURE_PATH,
+            "Namespace implementation/fixture must use their exact real source paths")
+    require(namespace_check["reviewState"] == "SOURCE_AND_FIXTURE_SECURITY_REVIEWED"
+            and re.fullmatch(r"[a-z][a-z0-9-]{1,95}", namespace_check["packet"])
+            and HEX.fullmatch(namespace_check["frozenReceiptSHA256"])
+            and HEX.fullmatch(namespace_check["namespaceReviewReceiptSHA256"])
+            and HEX.fullmatch(namespace_check["fixtureReviewReceiptSHA256"])
+            and namespace_check["namespaceSourceSHA256"] == pins["namespaceSource"]["sha256"]
+            and namespace_check["fixtureSourceSHA256"] == pins["namespaceFixture"]["sha256"]
+            and namespace_check["mainClass"] == NAMESPACE_MAIN_CLASS
+            and namespace_check["caseIds"] == list(NAMESPACE_CASE_IDS)
+            and namespace_check["assertionMinimum"] == NAMESPACE_ASSERTION_MINIMUM
+            and namespace_check["assertionMaximum"] == NAMESPACE_ASSERTION_MAXIMUM
+            and namespace_check["maximumInputBytes"] == NAMESPACE_MAX_INPUT_BYTES,
+            "exact Namespace source/fixture/freeze/review/output identity remains unfinished")
     require(pins["hostToolchain"]["kotlinVersion"] == "2.4.21"
             and pins["hostToolchain"]["requiredJDKMajors"] == [17, 21]
             and pins["hostToolchain"]["requiredJDKEnvironment"] == ["JAVA_HOME_17_arm64", "JAVA_HOME_21_arm64"]
@@ -335,7 +390,11 @@ def main():
             and pins["hostToolchain"]["bytecodeTarget"] == 17
             and pins["hostToolchain"]["downloadOrInstallPermitted"] is False, "unreviewed host toolchain requirements")
     require(HEX.fullmatch(pins["appleJSON"]["spanSHA256"]) and HEX.fullmatch(pins["androidJSON"]["spanSHA256"]), "unfinished literal-span pins")
-    source = {key: read_owner(root, pins[key]) for key in ("appleDomain", "appleJSON", "androidDomain", "androidJSON")}
+    source = {key: read_owner(root, pins[key]) for key in
+              ("appleDomain", "appleJSON", "androidDomain", "androidJSON", "namespaceSource", "namespaceFixture")}
+    require(source["namespaceFixture"].count(b'@file:JvmName("NamespacePublicApiFixture")') == 1
+            and source["namespaceFixture"].count(b'\npackage com.vortx.android.xperience\n') == 1,
+            "Namespace fixture explicit main declaration changed")
     apple_begin, apple_span = literal_span(source["appleJSON"], pins["appleJSON"])
     android_begin, android_span = literal_span(source["androidJSON"], pins["androidJSON"])
     actual_import = pins["appleJSON"]["actualImportPrefix"].encode("utf-8")
@@ -355,22 +414,31 @@ def main():
              "appleExcludedOwnerImport": "VortxEngine (not referenced by the extracted enum)",
              "sources": {key: {"path": pins[key]["path"], "bytes": len(data), "sha256": digest(data)} for key, data in source.items()},
              "literalSpans": {"VortxJSON": digest(apple_span), "OHJson": digest(android_span)},
-             "androidPreambleSHA256": digest(android_preamble), "finalModel": model,
+             "androidPreambleSHA256": digest(android_preamble), "finalModel": model, "namespaceCheck": namespace_check,
              "corpusSHA256": digest(corpus_data), "corpusCases": len(cases), "runDirectory": str(run_dir)}
     generated = {"VortxJSON.swift": actual_import + b"\n" + apple_span,
                  "XperienceCollections.swift": source["appleDomain"],
                  "OHJson.kt": android_preamble + android_span,
-                 "XperienceCollections.kt": source["androidDomain"]}
+                 "XperienceCollections.kt": source["androidDomain"],
+                 "XperienceImportNamespace.kt": source["namespaceSource"],
+                 "NamespacePublicApiFixture.kt": source["namespaceFixture"]}
     for name, data in generated.items():
         (run_dir / name).write_bytes(data)
     # Read back bytes and compare all copied bodies and declaration slices before compiling.
     require((run_dir / "XperienceCollections.swift").read_bytes() == source["appleDomain"]
             and (run_dir / "XperienceCollections.kt").read_bytes() == source["androidDomain"], "domain source equivalence failed")
+    require((run_dir / "XperienceImportNamespace.kt").read_bytes() == source["namespaceSource"]
+            and (run_dir / "NamespacePublicApiFixture.kt").read_bytes() == source["namespaceFixture"],
+            "complete Namespace implementation/fixture source equivalence failed")
     require((run_dir / "VortxJSON.swift").read_bytes()[len(actual_import) + 1:] == apple_span
             and (run_dir / "OHJson.kt").read_bytes()[len(android_preamble):] == android_span, "declaration source equivalence failed")
     graph["compilerInputs"] = {name: digest(data) for name, data in generated.items()}
     graph["fixtureSources"] = {name: digest((fixture / name).read_bytes()) for name in
-                               ("SwiftFixture.swift", "KotlinFixture.kt", "run-hosted.py", "source-pins.json", "corpus.tsv", "test_toolchain_layout.py")}
+                               ("SwiftFixture.swift", "KotlinFixture.kt", "NamespacePublicApiFixture.kt", "run-hosted.py", "source-pins.json", "corpus.tsv", "test_toolchain_layout.py")}
+    graph["kotlinMainClasses"] = ["com.vortx.android.xperience.KotlinFixtureKt", NAMESPACE_MAIN_CLASS]
+    kotlin_inputs = (run_dir / "OHJson.kt", run_dir / "XperienceCollections.kt", fixture / "KotlinFixture.kt",
+                     run_dir / "XperienceImportNamespace.kt", run_dir / "NamespacePublicApiFixture.kt")
+    graph["kotlinCompilerInputOrder"] = [{"path": str(path), "sha256": digest(path.read_bytes())} for path in kotlin_inputs]
     write_json(run_dir / "source-graph.json", graph)
     write_json(run_dir / "corpus-manifest.json", cases)
     emit("source-graph", graph)
@@ -410,19 +478,29 @@ def main():
     run_child("swift-corpus", [str(run_dir / "swift-fixture"), str(fixture / "corpus.tsv"), str(run_dir / "apple")], 30, run_dir, environment)
     require(exact_kotlin_classpath(kotlin) == kotlin_classpath, "Kotlin compiler classpath changed before compilation")
     run_child("kotlin-compile", kotlin_command + ["-Werror", "-Xbackend-threads=1", "-jvm-target", "17", "-include-runtime",
-              "-d", str(run_dir / "kotlin-fixture.jar"), str(run_dir / "OHJson.kt"), str(run_dir / "XperienceCollections.kt"), str(fixture / "KotlinFixture.kt")],
+              "-d", str(run_dir / "kotlin-fixture.jar")] + [str(path) for path in kotlin_inputs],
               240, run_dir, environment)
     jar = run_dir / "kotlin-fixture.jar"
     jar_identity = file_identity(jar, 32 * 1024 * 1024)
     emit("compiled-fixture", {"kotlinJar": jar_identity, "swiftExecutable": file_identity(run_dir / "swift-fixture")})
+    namespace_by_jdk = {}
     for major in (17, 21):
         runtime_environment = environment.copy()
         runtime_environment["JAVA_HOME"] = jdks[major]["home"]
         runtime_java = str(Path(jdks[major]["home"]) / "bin/java")
         require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed before runtime comparison")
-        run_child("kotlin-corpus-jdk" + str(major), [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-jar", str(jar),
+        run_child("kotlin-corpus-jdk" + str(major), [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-cp", str(jar),
+                  "com.vortx.android.xperience.KotlinFixtureKt",
                   str(fixture / "corpus.tsv"), str(run_dir / ("android-jdk" + str(major)))], 30, run_dir, runtime_environment)
         require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed during runtime comparison")
+        require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed before Namespace invocation")
+        namespace_output = run_child("kotlin-namespace-jdk" + str(major),
+                  [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-cp", str(jar), NAMESPACE_MAIN_CLASS],
+                  30, run_dir, runtime_environment)
+        require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed during Namespace invocation")
+        namespace_by_jdk[major] = namespace_results(namespace_output, major)
+        write_json(run_dir / ("namespace-jdk" + str(major) + "-results.json"), namespace_by_jdk[major])
+    require(namespace_by_jdk[17] == namespace_by_jdk[21], "Namespace assertion summaries differ across required JDKs")
     apple = read_results(run_dir / "apple", cases)
     android = {major: read_results(run_dir / ("android-jdk" + str(major)), cases) for major in (17, 21)}
     failures = []
@@ -447,7 +525,9 @@ def main():
                 failed_cases.add(key)
     summary = {"cases": len(cases), "runtimeComparisons": len(cases) * 2,
                "mismatchedCases": len(failed_cases), "mismatchedRuntimeCases": len(failures), "passed": not failures,
-               "scope": "hosted JDK17/JDK21 document admission, canonical bytes and fingerprint only; Android/libcore/device unproven",
+               "scope": "hosted JDK17/JDK21 document wire comparison and pure Namespace public API assertions; Android/libcore/device/native/whole-profile unproven",
+               "namespacePassed": True, "namespaceCases": len(NAMESPACE_CASE_IDS), "namespaceRuntimeCases": len(NAMESPACE_CASE_IDS) * 2,
+               "namespaceAssertionsByJDK": {str(major): namespace_by_jdk[major]["assertions"] for major in (17, 21)},
                "artifactUploads": 0, "downloads": 0, "kotlinCompileCount": 1, "kotlinJarSHA256": jar_identity["sha256"]}
     write_json(run_dir / "comparison.json", {"summary": summary, "failures": failures})
     emit("summary", summary)
