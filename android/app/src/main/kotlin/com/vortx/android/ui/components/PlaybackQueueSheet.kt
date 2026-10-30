@@ -102,6 +102,7 @@ internal fun PlaybackQueueSheet(
     onMove: (String, Int) -> Unit,
     onRemove: (String) -> Unit,
     onRetry: (() -> Unit)? = null,
+    onManageSavedPlaylists: (() -> Unit)? = null,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -154,5 +155,10 @@ internal fun PlaybackQueueSheet(
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+        dismissButton = {
+            onManageSavedPlaylists?.let { openLibrary ->
+                TextButton(onClick = openLibrary) { Text("Saved playlists") }
+            }
+        },
     )
 }

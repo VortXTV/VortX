@@ -31,6 +31,15 @@ const session=read('engine/VortxNativeSession.kt'), coordinator=read('engine/Nat
 const accessExtract=fixture('tests-extracted/NativeProfileAccess.kt');
 const storeExtract=fixture('tests-extracted/ProfileStoreBoundary.kt');
 const bootstrapExtract=fixture('tests-extracted/ProfileBootstrapBoundary.kt');
+const policyEnum='internal enum class PlaylistScopeTransition { PROJECTION_REFRESH, AUTHORITY_BOUNDARY }';
+assert(store.includes(policyEnum) && bootstrapExtract.includes(policyEnum),'Playlist scope reason must be the actual typed declaration');
+const scopeEvidence=store.slice(store.indexOf('internal data class PlaylistScopeEvidence('),store.indexOf('\n\ninternal fun playlistScopeTransition('));
+const fixtureScopeEvidence=bootstrapExtract.slice(bootstrapExtract.indexOf('internal data class PlaylistScopeEvidence('),bootstrapExtract.indexOf('\n\ninternal fun playlistScopeTransition('));
+const scopeClassifier=method(store,'internal fun playlistScopeTransition(');
+assert.equal(fixtureScopeEvidence,scopeEvidence);
+assert.equal(method(bootstrapExtract,'internal fun playlistScopeTransition('),scopeClassifier);
+assert.match(scopeClassifier,/selectedID\.isNullOrBlank\(\)[\s\S]*nativeAccountID\.isNullOrBlank\(\)[\s\S]*nativeAccountGeneration != null[\s\S]*before == after/,
+  'Soft preservation requires a positive, identical admitted Native Account id+generation and full scalar evidence');
 const sessionExtract=fixture('tests-session-fixture.kt');
 const constructor=access.slice(access.indexOf('internal class NativeProfileAccess('),access.indexOf(') : NativeProfileGateway {')+') : NativeProfileGateway {'.length)+'\n';
 const readMethod='    override fun read(): NativeProfileGateway.Projection = projection(session().read())\n';
@@ -76,9 +85,23 @@ assert.match(access,/Open this profile through its PIN gate before editing/);
 assert.match(access,/Profile editor source changed/);
 
 // Final Main effects have no Session/provider/secure access, including switch-hook callers.
+const playlistEvidence=method(store,'    private fun playlistScopeEvidence(');
+assert.equal(method(bootstrapExtract,'    private fun playlistScopeEvidence('),playlistEvidence);
+const adoptRoster=method(store,'    fun adoptRemoteRoster(');
+assert.match(adoptRoster,/ContinueWatchingOwnerGate\.transition\(::captureActiveProfileBinding\) \{[\s\S]*val beforeBinding = captureActiveProfileBinding\(profiles, activeID\)[\s\S]*val beforeAccount = acknowledgedNativeAccount[\s\S]*val beforeTraktEpoch = acknowledgedNativeTraktEpoch[\s\S]*profiles = remote[\s\S]*afterRosterFold\(beforeBinding, beforeAccount, beforeTraktEpoch\)/,
+  'Roster transition evidence must be captured inside the same owner gate and before assignment');
+const synchronousProjection=method(store,'    private fun applyNativeProjectionLocked(');
+assert.match(synchronousProjection,/val beforeBinding = captureActiveProfileBinding\(profiles, activeID\)/);
+assert.match(synchronousProjection,/val beforeAccount = acknowledgedNativeAccount/);
+assert.match(synchronousProjection,/val beforeTraktEpoch = acknowledgedNativeTraktEpoch/);
+assert.match(synchronousProjection,/playlistScopeTransition\([\s\S]*providerGuard\?\.owner, traktEpoch/);
+assert.match(synchronousProjection,/if \(transition == PlaylistScopeTransition\.AUTHORITY_BOUNDARY\) notifyPlaylistScopeListeners\(transition\)/);
+assert.match(synchronousProjection,/activateProfileState\(it, resetUnset = true, playlistTransition = transition\)/);
 const apply=method(store,'    private fun applyPreparedNativeProjection(');
 assert.doesNotMatch(apply,/\.read\(|NativeProviderAccess\.(?:capture|current|guarded)|currentSessionEpoch|\.save\(/);
 assert.match(apply,/withoutNativePreferenceCapture/);
+assert.match(apply,/PlaylistScopeTransition\.AUTHORITY_BOUNDARY/);
+assert.match(apply,/notifyPlaylistScopeListeners\(transition\)/);
 const attach=method(store,'    internal suspend fun attachNativeGateway(');
 assert.match(attach,/withContext\(Dispatchers\.IO\)[\s\S]*gateway\.prepareProjection/);
 assert.match(attach,/prepared\.publishIfCurrent/);
@@ -104,6 +127,17 @@ assert.match(forYou,/captured\?\.publishIfCurrent\(publication\)/);
 const watchlist=read('library/WatchlistStore.kt');
 assert.match(method(watchlist,'    private fun scheduleReload('),/scope\.launch\(ioDispatcher\) \{ reloadAttempt\(attempt\) \}/);
 const app=read('VortXApplication.kt');
+assert.match(app,/addPlaylistScopeTransitionListener \{ transition ->[\s\S]*PROJECTION_REFRESH -> savedPlaylistStore\.nativeProjectionWillChange\(\)[\s\S]*AUTHORITY_BOUNDARY -> savedPlaylistStore\.invalidateAuthority\(\)/,
+  'App must route the typed reason to the matching local-only Store cut');
+const phoneShell=read('ui/VortXApp.kt'), tvShell=read('ui/tv/TvApp.kt');
+for(const [name,shell,owner] of [['phone',phoneShell,'queueOwner == playlistOwner'],['tv',tvShell,'playlistOwner == currentQueueOwner']]) {
+  const start=shell.indexOf('if (playlistOwner != null && playlistStore != null && '+owner+')');
+  const stop=shell.indexOf('if (playable != null) {',start);
+  const overlay=shell.slice(start,stop);
+  assert(start >= 0 && stop > start, `${name} saved playlist overlay branch missing`);
+  assert.match(overlay,/androidx\.compose\.ui\.window\.Dialog/);
+  assert.doesNotMatch(overlay,/return@VortXTheme/,'Opening the playlist overlay must keep PlayerScreen composed');
+}
 assert.match(app,/candidate -> ProfileStore\.sharedOrNull\(\)\?\.attachNativeGateway\(nativeProfiles, candidate\)/);
 assert.doesNotMatch(app,/nativeAccounts\.session\(\)\.also \{ it\.read\(\) \}/);
 const readOnly=app.slice(app.indexOf('captureProfilePresentationAdmission ='),app.indexOf('internal fun nativeStreamingAccounts'));

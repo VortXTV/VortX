@@ -35,6 +35,7 @@ import com.vortx.android.player.queue.PlaybackQueueToken
 import com.vortx.android.player.queue.PlaybackQueueAcceptedTarget
 import com.vortx.android.ui.components.PlaybackQueueSheet
 import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
+import com.vortx.android.ui.screens.SavedPlaylistScreen
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.NextEpisodePreloadPolicy
@@ -132,6 +133,8 @@ fun TvApp(
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
         var showingPlaybackQueueFor by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var showingSavedPlaylistFor by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var savedPlaylistStore by remember { mutableStateOf<com.vortx.android.playlists.SavedPlaylistStore?>(null) }
         var queuePolicyEpoch by remember(repo) { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
@@ -217,6 +220,7 @@ fun TvApp(
                 val owner = repo.continueWatchingOwner()
                 playbackQueue?.bindOwner(owner)
                 if (showingPlaybackQueueFor != null && showingPlaybackQueueFor != owner) showingPlaybackQueueFor = null
+                if (showingSavedPlaylistFor != null && showingSavedPlaylistFor != owner) showingSavedPlaylistFor = null
                 val request = pendingLibraryPlay ?: return
                 if (!isLibraryPlayCurrent(request)) retireLibraryPlayRoute()
             }
@@ -350,10 +354,26 @@ fun TvApp(
             showingPlaybackQueueFor = null
             return true
         }
+        LaunchedEffect(showingSavedPlaylistFor, currentQueueOwner) {
+            if (showingSavedPlaylistFor != null && showingSavedPlaylistFor != currentQueueOwner) {
+                showingSavedPlaylistFor = null
+            }
+        }
         if (showingPlaybackQueueFor == currentQueueOwner && visibleQueueState != null) {
             PlaybackQueueSheet(
                 state = visibleQueueState,
                 onDismiss = { if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = null },
+                onManageSavedPlaylists = {
+                    if (showingPlaybackQueueFor == currentQueueOwner) {
+                        val app = queueApplicationContext as? VortXApplication
+                        val controller = app?.savedPlaylistStore
+                        if (controller != null) {
+                            savedPlaylistStore = controller
+                            showingSavedPlaylistFor = currentQueueOwner
+                            showingPlaybackQueueFor = null
+                        }
+                    }
+                },
                 onPlay = { entry ->
                     if (queueOwnerIsSelected(currentQueueOwner)) {
                         playbackQueue?.capture(currentQueueOwner, entry.id)?.let { openQueuePlay(it) }
@@ -370,6 +390,26 @@ fun TvApp(
                 },
             )
         }
+        val playlistOwner = showingSavedPlaylistFor
+        val playlistStore = savedPlaylistStore
+        if (playlistOwner != null && playlistStore != null && playlistOwner == currentQueueOwner) {
+            BackHandler { showingSavedPlaylistFor = null }
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { showingSavedPlaylistFor = null },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                androidx.compose.runtime.key(playlistOwner) {
+                    SavedPlaylistScreen(
+                        store = playlistStore,
+                        queue = requireNotNull(playbackQueue),
+                        owner = playlistOwner,
+                        ownerIsCurrent = currentQueueOwner == playlistOwner,
+                        onBack = { showingSavedPlaylistFor = null },
+                    )
+                }
+            }
+        }
+
         if (playable != null) {
             // The player is a separate early-return branch, so it must enter the TV Material scope here
             // rather than inheriting the browse shell's scope below. This keeps TV focus surfaces and their

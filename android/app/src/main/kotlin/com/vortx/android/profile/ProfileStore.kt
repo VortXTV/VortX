@@ -34,6 +34,25 @@ internal fun activateProfileInOrder(
     rebuildBoard()
 }
 
+internal enum class PlaylistScopeTransition { PROJECTION_REFRESH, AUTHORITY_BOUNDARY }
+
+/** Immutable, already-admitted scalar witness for playlist receipt ownership decisions. */
+internal data class PlaylistScopeEvidence(
+    val selectedID: String?, val profileID: String?, val accountSlot: String, val usesEngineHistory: Boolean,
+    val nativeAccountID: String?, val nativeAccountGeneration: Long?, val credentialEpoch: Long?,
+)
+
+internal fun playlistScopeTransition(
+    before: PlaylistScopeEvidence, after: PlaylistScopeEvidence,
+): PlaylistScopeTransition {
+    val positivelyKnown = !before.selectedID.isNullOrBlank() && !before.profileID.isNullOrBlank() &&
+        !before.accountSlot.isBlank() && !before.nativeAccountID.isNullOrBlank() && before.nativeAccountGeneration != null &&
+        !after.selectedID.isNullOrBlank() && !after.profileID.isNullOrBlank() && !after.accountSlot.isBlank() &&
+        !after.nativeAccountID.isNullOrBlank() && after.nativeAccountGeneration != null
+    return if (positivelyKnown && before == after) PlaylistScopeTransition.PROJECTION_REFRESH
+    else PlaylistScopeTransition.AUTHORITY_BOUNDARY
+}
+
 /**
  * The profile roster and the active selection, the Android port of Apple `ProfileStore`
  * (`app/SourcesShared/Profiles.swift`). The roster persists as JSON in [SharedPreferences] (the direct
@@ -61,6 +80,7 @@ internal fun activateProfileInOrder(
  * isolation becomes real the moment a switch happens.
  */
 class ProfileStore private constructor(context: Context) {
+
 
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
@@ -123,6 +143,7 @@ class ProfileStore private constructor(context: Context) {
 
     private val switchListeners = mutableListOf<() -> Unit>()
     private val homeTransitionListeners = mutableListOf<() -> Unit>()
+    private val playlistScopeListeners = mutableListOf<(PlaylistScopeTransition) -> Unit>()
     private var applyingDiscoveryProjection = false
     private val continueWatchingMigration = ContinueWatchingMigrationCheckpoint<com.vortx.android.sync.SessionOwnerSnapshot.Account>()
     private var acknowledgedNativeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account? = null
@@ -300,13 +321,20 @@ class ProfileStore private constructor(context: Context) {
 
     /** Only the admitted immutable payload is consumed here. Switch listeners must schedule captures. */
     private fun applyPreparedNativeProjection(value: NativeProfileGateway.Projection, effects: NativeProjectionEffects, forceSettings: Boolean) {
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(value.profiles, value.activeID), effects.account, effects.traktEpoch),
+        )
         continueWatchingMigration.restore(effects.checkpoint)
         withoutNativePreferenceCapture {
             if (effects.clearLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
-            if (forceSettings || profiles != value.profiles || activeID != value.activeID) {
+            if (forceSettings || profiles != value.profiles || activeID != value.activeID ||
+                transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) {
                 ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
                     profiles = value.profiles; activeID = value.activeID
-                    active?.let { activateProfileState(it, resetUnset = true) }
+                    active?.let { activateProfileState(it, resetUnset = true, playlistTransition = transition) }
+                        ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
                 }
             }
         }
@@ -329,7 +357,8 @@ class ProfileStore private constructor(context: Context) {
             }
             if (retireLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
-            notifyHomeTransitionListeners(); publishActiveProfile(); notifySwitchListeners()
+            notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+            publishActiveProfile(); notifySwitchListeners()
         }
     }
     private fun applyNativeProjection(value: NativeProfileGateway.Projection, forceSettings: Boolean = false) = ContinueWatchingOwnerGate.serialized {
@@ -337,6 +366,9 @@ class ProfileStore private constructor(context: Context) {
     }
     private fun applyNativeProjectionLocked(value: NativeProfileGateway.Projection, forceSettings: Boolean) {
         var acknowledged = value
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val previous = active
         val incoming = value.profiles.firstOrNull { it.id == value.activeID }
         val capturedProvider = com.vortx.android.integrations.NativeProviderAccess.capture(
@@ -368,13 +400,19 @@ class ProfileStore private constructor(context: Context) {
             acknowledged = saved
             prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
         }
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(acknowledged.profiles, acknowledged.activeID), providerGuard?.owner, traktEpoch),
+        )
         if (!forceSettings && profiles == acknowledged.profiles && activeID == acknowledged.activeID) {
+            if (transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) notifyPlaylistScopeListeners(transition)
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
             return
         }
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             profiles = acknowledged.profiles; activeID = acknowledged.activeID
-            active?.let { activateProfileState(it, resetUnset = true) }
+            active?.let { activateProfileState(it, resetUnset = true, playlistTransition = transition) }
+                ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
         }
     }
@@ -512,6 +550,23 @@ class ProfileStore private constructor(context: Context) {
         if (!homeTransitionListeners.contains(listener)) homeTransitionListeners.add(listener)
     }
 
+    /** Playlist-specific lifecycle: projection refresh preserves receipt authority; owner changes retire it. */
+    internal fun addPlaylistScopeTransitionListener(listener: (PlaylistScopeTransition) -> Unit) {
+        if (!playlistScopeListeners.contains(listener)) playlistScopeListeners.add(listener)
+    }
+
+    private fun notifyPlaylistScopeListeners(transition: PlaylistScopeTransition) =
+        playlistScopeListeners.forEach { it(transition) }
+
+    private fun playlistScopeEvidence(
+        binding: ActiveProfileBinding,
+        account: com.vortx.android.sync.SessionOwnerSnapshot.Account?,
+        credentialEpoch: Long?,
+    ): PlaylistScopeEvidence {
+        return PlaylistScopeEvidence(binding.selectedID, binding.profileID, binding.accountSlot, binding.usesEngineHistory,
+            account?.id, account?.generation, credentialEpoch)
+    }
+
     internal var selectionRevision = 0L
         private set
 
@@ -525,9 +580,12 @@ class ProfileStore private constructor(context: Context) {
      * Apply every active-profile mutation in privacy-safe order: first invalidate old Home permits,
      * then install the new preferences and watch overlay, then reload dependants and rebuild once.
      */
-    private fun activateProfileState(profile: UserProfile, resetUnset: Boolean = false) {
+    private fun activateProfileState(
+        profile: UserProfile, resetUnset: Boolean = false,
+        playlistTransition: PlaylistScopeTransition = PlaylistScopeTransition.AUTHORITY_BOUNDARY,
+    ) {
         activateProfileInOrder(
-            transitionHome = ::notifyHomeTransitionListeners,
+            transitionHome = { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(playlistTransition) },
             applyPlayback = {
                 applyPlayback(profile, resetUnset = resetUnset, rebuildBoard = false)
                 applyingDiscoveryProjection = true
@@ -597,11 +655,16 @@ class ProfileStore private constructor(context: Context) {
     }
 
     private fun updateLocked(profile: UserProfile, idx: Int, reactivateOverlay: Boolean) {
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         profiles = profiles.toMutableList().also { it[idx] = profile }
         persist()
         if (profile.id == activeID) {
             if (reactivateOverlay) {
-                activateProfileState(profile)
+                val transition = playlistScopeTransition(
+                    playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+                    playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+                )
+                activateProfileState(profile, playlistTransition = transition)
             } else {
                 applyPlayback(profile)
                 publishActiveProfile()
@@ -1007,14 +1070,22 @@ class ProfileStore private constructor(context: Context) {
 
     /** Remove any live profile whose id is tombstoned (never the owner). Apple `pruneTombstonedProfiles`. */
     private fun pruneTombstonedProfiles() = ContinueWatchingOwnerGate.serialized {
-        val before = profiles
+        val beforeProfiles = profiles
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val pruned = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
-        if (pruned == before) return@serialized
+        if (pruned == beforeProfiles) return@serialized
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             profiles = pruned
             if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
             persist(touch = false)
-            active?.let(::activateProfileState)
+            val transition = playlistScopeTransition(
+                playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+                playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+            )
+            active?.let { activateProfileState(it, playlistTransition = transition) }
+                ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
         }
     }
 
@@ -1026,8 +1097,11 @@ class ProfileStore private constructor(context: Context) {
     /** Adopt a remote roster wholesale (newest side wins). Mirrors Apple `adoptRemoteRoster`. */
     fun adoptRemoteRoster(remote: List<UserProfile>) {
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+            val beforeAccount = acknowledgedNativeAccount
+            val beforeTraktEpoch = acknowledgedNativeTraktEpoch
             profiles = remote
-            afterRosterFold()
+            afterRosterFold(beforeBinding, beforeAccount, beforeTraktEpoch)
         }
     }
 
@@ -1051,6 +1125,9 @@ class ProfileStore private constructor(context: Context) {
         incomingModified: Double? = null,
     ) = ContinueWatchingOwnerGate.serialized {
         if (incoming.isEmpty()) return@serialized
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val transition = rosterPullMergeTransition(
             local = profiles,
             incoming = incoming,
@@ -1063,7 +1140,7 @@ class ProfileStore private constructor(context: Context) {
             replaceProfiles = { merged ->
                 ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
                     profiles = merged
-                    afterRosterFold()
+                    afterRosterFold(beforeBinding, beforeAccount, beforeTraktEpoch)
                 }
             },
             // The carrier watermark is state too. Persist it even when the roster payload is identical.
@@ -1079,11 +1156,20 @@ class ProfileStore private constructor(context: Context) {
     /** Shared tail for a wholesale/union fold: heal the owner, keep the active selection if it survived
      *  (else fall to the first), re-apply the active profile's prefs + fire the reload hooks, persist
      *  without pushing, and re-point the watch overlay. */
-    private fun afterRosterFold() {
+    private fun afterRosterFold(
+        beforeBinding: ActiveProfileBinding,
+        beforeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account?,
+        beforeTraktEpoch: Long?,
+    ) {
         normalizeOwner()
         if (profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
         persist(touch = false)
-        active?.let(::activateProfileState)
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+        )
+        active?.let { activateProfileState(it, playlistTransition = transition) }
+            ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
     }
 
     // ---- Owner normalization + duplicate collapse (the hard-won guards) ----

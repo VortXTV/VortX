@@ -109,6 +109,7 @@ import com.vortx.android.player.queue.PlaybackQueueState
 import com.vortx.android.player.queue.PlaybackQueueToken
 import com.vortx.android.player.queue.PlaybackQueueRouteRetirement
 import com.vortx.android.ui.components.PlaybackQueueSheet
+import com.vortx.android.ui.screens.SavedPlaylistScreen
 import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
 import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
@@ -386,6 +387,8 @@ fun VortXApp(
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
         var showPlaybackQueue by remember { mutableStateOf(false) }
+        var savedPlaylistOwner by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var savedPlaylistStore by remember { mutableStateOf<com.vortx.android.playlists.SavedPlaylistStore?>(null) }
         val openDetail: (MetaItem?) -> Unit = open@{ item ->
             if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
             if (item?.continueWatchingUnavailableMessage != null) {
@@ -400,6 +403,7 @@ fun VortXApp(
             pendingQueueAccepted = false
             pendingQueueAutomatic = false
             showPlaybackQueue = false
+            savedPlaylistOwner = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
             liveDetailAdmission = item?.continueWatchingAdmission
@@ -670,6 +674,19 @@ fun VortXApp(
             PlaybackQueueSheet(
                 state = visibleQueue,
                 onDismiss = { showPlaybackQueue = false },
+                onManageSavedPlaylists = queueOwner?.let { owner ->
+                    {
+                        if (queueOwner == owner) {
+                            val app = appContext as? com.vortx.android.VortXApplication
+                            val controller = app?.savedPlaylistStore
+                            if (controller != null) {
+                                savedPlaylistStore = controller
+                                savedPlaylistOwner = owner
+                                showPlaybackQueue = false
+                            }
+                        }
+                    }
+                },
                 onPlay = { entry -> queueOwner?.let { owner ->
                     if (queueOwnerIsSelected(owner)) playbackQueue?.capture(owner, entry.id)?.let { openQueuePlay(it, false) }
                 } },
@@ -677,6 +694,9 @@ fun VortXApp(
                 onRemove = { id -> queueOwner?.let { if (queueOwnerIsSelected(it)) playbackQueue?.remove(it, id) } },
                 onRetry = { queueOwner?.let { if (queueOwnerIsSelected(it)) playbackQueue?.retryLoad(it) } },
             )
+        }
+        LaunchedEffect(savedPlaylistOwner, queueOwner) {
+            if (savedPlaylistOwner != null && savedPlaylistOwner != queueOwner) savedPlaylistOwner = null
         }
         val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
@@ -785,6 +805,26 @@ fun VortXApp(
         // Player is the topmost layer: when a source resolves to a Playable, it covers everything and
         // back returns to the detail page underneath.
         val playable = playing
+        val playlistOwner = savedPlaylistOwner
+        val playlistStore = savedPlaylistStore
+        if (playlistOwner != null && playlistStore != null && queueOwner == playlistOwner) {
+            BackHandler { savedPlaylistOwner = null }
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { savedPlaylistOwner = null },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                key(playlistOwner) {
+                    SavedPlaylistScreen(
+                        store = playlistStore,
+                        queue = requireNotNull(playbackQueue),
+                        owner = playlistOwner,
+                        ownerIsCurrent = queueOwner == playlistOwner,
+                        onBack = { savedPlaylistOwner = null },
+                    )
+                }
+            }
+        }
+
         if (playable != null) {
             // History identity for the engine playback session. An in-player episode switch stays inside
             // the mounted player (it never changes [playing]), so it advances THIS identity instead, which

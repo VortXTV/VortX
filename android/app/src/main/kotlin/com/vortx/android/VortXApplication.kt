@@ -56,6 +56,7 @@ import com.vortx.android.moat.MoatToken
 import com.vortx.android.notifications.NewEpisodeNotifications
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.PlaylistScopeTransition
 import com.vortx.android.update.UpdateChecker
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
@@ -83,6 +84,16 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     }
     internal val playbackQueue: com.vortx.android.player.queue.PlaybackQueueStore
         get() = playbackQueueDelegate.value
+    private val savedPlaylistStoreDelegate = lazy {
+        com.vortx.android.playlists.SavedPlaylistStore(
+            gateway = nativeAccounts,
+            queue = playbackQueue,
+            scope = applicationScope,
+            currentQueueOwner = { catalogRepository.continueWatchingOwner() },
+        )
+    }
+    internal val savedPlaylistStore: com.vortx.android.playlists.SavedPlaylistStore
+        get() = savedPlaylistStoreDelegate.value
 
     private val nativeAccounts: NativeAccountCoordinator by lazy { NativeAccountCoordinator(VortxJniBindings,
         VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
@@ -111,6 +122,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority()
             com.vortx.android.foryou.ForYouStore.shared(this).invalidateNativeAuthority()
             if (playbackQueueDelegate.isInitialized()) playbackQueue.invalidate()
+            if (savedPlaylistStoreDelegate.isInitialized()) savedPlaylistStore.nativeProjectionWillChange()
         },
         onProgressMutation = { origin -> applicationScope.launch { syncManager?.onLocalNativeMutation(origin, progressOnly = true) } },
         captureProfilePresentationAdmission = { captured -> syncManager?.let { manager ->
@@ -194,6 +206,15 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // ProfileStore.shared/activeProfileId available to the source-pin per-profile key.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        // Playlist receipts survive same-owner native metadata/settings refreshes, but not an
+        // admitted profile/account/credential boundary. This callback is local-only on ProfileStore's lane.
+        ProfileStore.sharedOrNull()?.addPlaylistScopeTransitionListener { transition ->
+            if (!savedPlaylistStoreDelegate.isInitialized()) return@addPlaylistScopeTransitionListener
+            when (transition) {
+                PlaylistScopeTransition.PROJECTION_REFRESH -> savedPlaylistStore.nativeProjectionWillChange()
+                PlaylistScopeTransition.AUTHORITY_BOUNDARY -> savedPlaylistStore.invalidateAuthority()
+            }
+        }
         com.vortx.android.library.WatchlistStore.shared(this).installNativeGateway(nativeWatchlist) { true }
         com.vortx.android.foryou.ForYouStore.shared(this).installNativeGateway(nativeForYou)
         // Bootstrap the RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch with ETag/304).

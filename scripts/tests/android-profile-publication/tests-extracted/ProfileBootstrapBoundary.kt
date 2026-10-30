@@ -1,10 +1,31 @@
 package com.vortx.android.profile
+
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import com.vortx.android.sync.SessionOwnerSnapshot
+
+internal enum class PlaylistScopeTransition { PROJECTION_REFRESH, AUTHORITY_BOUNDARY }
+
+/** Immutable, already-admitted scalar witness for playlist receipt ownership decisions. */
+internal data class PlaylistScopeEvidence(
+    val selectedID: String?, val profileID: String?, val accountSlot: String, val usesEngineHistory: Boolean,
+    val nativeAccountID: String?, val nativeAccountGeneration: Long?, val credentialEpoch: Long?,
+)
+
+internal fun playlistScopeTransition(
+    before: PlaylistScopeEvidence, after: PlaylistScopeEvidence,
+): PlaylistScopeTransition {
+    val positivelyKnown = !before.selectedID.isNullOrBlank() && !before.profileID.isNullOrBlank() &&
+        !before.accountSlot.isBlank() && !before.nativeAccountID.isNullOrBlank() && before.nativeAccountGeneration != null &&
+        !after.selectedID.isNullOrBlank() && !after.profileID.isNullOrBlank() && !after.accountSlot.isBlank() &&
+        !after.nativeAccountID.isNullOrBlank() && after.nativeAccountGeneration != null
+    return if (positivelyKnown && before == after) PlaylistScopeTransition.PROJECTION_REFRESH
+    else PlaylistScopeTransition.AUTHORITY_BOUNDARY
+}
+
 
 // Dispatchers are synthetic schedulers only; actual attach/reducer methods below are byte-identical.
 internal object Dispatchers { lateinit var Main: CoroutineDispatcher; lateinit var IO: CoroutineDispatcher }
@@ -36,10 +57,25 @@ internal class ExtractedBootstrapStore {
     }
     private fun captureActiveProfileBinding() = activeID
     private fun notifyHomeTransitionListeners() {}
+    private fun notifyPlaylistScopeListeners(transition: PlaylistScopeTransition) {}
     private fun publishActiveProfile() {}
     private fun notifySwitchListeners() {}
     private fun <T> withoutNativePreferenceCapture(action:()->T):T = action()
-    private fun activateProfileState(profile:UserProfile,resetUnset:Boolean) { applied++;onApply() }
+    private fun captureActiveProfileBinding(sourceProfiles: List<UserProfile>, selectedID: String?) =
+        ActiveProfileBinding(selectedID, sourceProfiles.firstOrNull { it.id == selectedID }?.id,
+            sourceProfiles.firstOrNull { it.id == selectedID }?.id ?: "primary",
+            sourceProfiles.firstOrNull { it.id == selectedID }?.usesEngineHistory ?: true)
+    private data class ActiveProfileBinding(val selectedID:String?,val profileID:String?,val accountSlot:String,val usesEngineHistory:Boolean)
+    private fun playlistScopeEvidence(
+        binding: ActiveProfileBinding,
+        account: com.vortx.android.sync.SessionOwnerSnapshot.Account?,
+        credentialEpoch: Long?,
+    ): PlaylistScopeEvidence {
+        return PlaylistScopeEvidence(binding.selectedID, binding.profileID, binding.accountSlot, binding.usesEngineHistory,
+            account?.id, account?.generation, credentialEpoch)
+    }
+    private fun activateProfileState(profile:UserProfile,resetUnset:Boolean,playlistTransition: PlaylistScopeTransition = PlaylistScopeTransition.AUTHORITY_BOUNDARY) { applied++;onApply() }
+    private val playlistScopeListeners = mutableListOf<(PlaylistScopeTransition) -> Unit>()
     private var nativeProjectionRequest = 0L
     private var nativeProjectionMount: Any? = null
     private var initialNativeMigrationProfile: UserProfile? = null
@@ -175,13 +211,20 @@ internal class ExtractedBootstrapStore {
         return NativeProjectionEffects(guard.owner, epoch, checkpoint.snapshot(), clearLegacy, providerRevision, acknowledgement)
     }
     private fun applyPreparedNativeProjection(value: NativeProfileGateway.Projection, effects: NativeProjectionEffects, forceSettings: Boolean) {
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(value.profiles, value.activeID), effects.account, effects.traktEpoch),
+        )
         continueWatchingMigration.restore(effects.checkpoint)
         withoutNativePreferenceCapture {
             if (effects.clearLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
-            if (forceSettings || profiles != value.profiles || activeID != value.activeID) {
+            if (forceSettings || profiles != value.profiles || activeID != value.activeID ||
+                transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) {
                 ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
                     profiles = value.profiles; activeID = value.activeID
-                    active?.let { activateProfileState(it, resetUnset = true) }
+                    active?.let { activateProfileState(it, resetUnset = true, playlistTransition = transition) }
+                        ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
                 }
             }
         }
@@ -199,7 +242,8 @@ internal class ExtractedBootstrapStore {
             }
             if (retireLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
-            notifyHomeTransitionListeners(); publishActiveProfile(); notifySwitchListeners()
+            notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+            publishActiveProfile(); notifySwitchListeners()
         }
     }
 }

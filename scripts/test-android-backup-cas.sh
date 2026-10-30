@@ -34,10 +34,15 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/BuildConfig*' 'com/vortx
     'com/vortx/android/engine/VortxNativeRead*' 'com/vortx/android/engine/VortxNativeSession*' \
     'com/vortx/android/engine/NativeWebsiteProfileEdits*' \
     'com/vortx/android/engine/NativeHostPreferences*' 'com/vortx/android/engine/NativePlaylist*' \
-    'com/vortx/android/profile/ProfileStore*' 'com/vortx/android/backup/SettingsBackup*' \
+    'com/vortx/android/profile/ProfileStore*' 'com/vortx/android/profile/PlaylistScopeEvidence*' 'com/vortx/android/profile/PlaylistScopeTransition*' 'com/vortx/android/backup/SettingsBackup*' \
     'com/vortx/android/integrations/NativeProviderCredentials*' 'com/vortx/android/integrations/NativeProviderAccess*' \
     'com/vortx/android/integrations/NativeProviderVault*' 'com/vortx/android/integrations/NativeProviderAdmission*' \
-    'com/vortx/android/ui/viewmodel/VortXAccountViewModel*' 'com/vortx/android/VortXApplication*' || test "$?" -eq 12
+    'com/vortx/android/playlists/SavedPlaylist*' 'com/vortx/android/player/queue/PlaybackQueueStore*' \
+    'com/vortx/android/player/queue/PlaybackQueuePersistence*' 'com/vortx/android/player/queue/PlaybackQueueModel*' \
+    'com/vortx/android/player/queue/PlaybackQueueCodec*' 'com/vortx/android/player/queue/PlaybackQueueEntry*' \
+    'com/vortx/android/player/queue/PlaybackQueueState*' 'com/vortx/android/player/queue/PlaybackQueuePlaylistSnapshot*' \
+    'com/vortx/android/player/queue/PlaybackQueueToken*' 'com/vortx/android/ui/viewmodel/VortXAccountViewModel*' \
+    'com/vortx/android/VortXApplication*' || test "$?" -eq 12
 test_cp="$test_dir/retained-app.jar:$stdlib:$annotations:$coroutines:$(jar org.json json 20240303):$android_jar:$dependency_cp"
 source_dir="$repo_root/android/app/src/main/kotlin/com/vortx/android"
 test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
@@ -53,9 +58,12 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/engine/NativeAccountCoordinator.kt" "$source_dir/engine/NativeLegacyMaterial.kt" \
     "$source_dir/engine/NativeWebsiteProfileEdits.kt" \
     "$source_dir/engine/NativePlaylist.kt" "$source_dir/engine/NativePlaylistCloudReceiptLedger.kt" "$source_dir/engine/NativeHostPreferences.kt" \
-    "$source_dir/ui/viewmodel/VortXAccountViewModel.kt" "$source_dir/VortXApplication.kt" \
+    "$source_dir/player/queue/PlaybackQueueModel.kt" "$source_dir/player/queue/PlaybackQueueStore.kt" \
+    "$source_dir/playlists/SavedPlaylistStore.kt" "$source_dir/ui/viewmodel/VortXAccountViewModel.kt" \
+    "$source_dir/VortXApplication.kt" \
     "$test_source/sync/VortXSyncManagerBackupRevisionTest.kt" "$test_source/sync/VortXSyncManagerLegacyBackupRevisionTest.kt" \
     "$test_source/sync/VortXBackupCasContractTest.kt" "$test_source/sync/BackupRevisionPolicyTest.kt" \
+    "$test_source/profile/PlaylistScopeTransitionTest.kt" \
     "$test_source/sync/NativeAccountSyncTest.kt" "$test_source/sync/AndroidRealtimeSyncTest.kt" \
     "$test_source/integrations/NativeProviderCredentialsTest.kt" \
     "$test_source/engine/NativeWebsiteProfileEditsTest.kt" \
@@ -66,6 +74,7 @@ cd "$repo_root/android/app"
 "$java_bin" -Xmx512m -Dvortx.test.native=true -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
     com.vortx.android.sync.VortXBackupCasContractTest com.vortx.android.sync.BackupRevisionPolicyTest \
     com.vortx.android.sync.NativeAccountSyncTest com.vortx.android.sync.AndroidRealtimeSyncTest \
+    com.vortx.android.profile.PlaylistScopeTransitionTest \
     com.vortx.android.integrations.NativeProviderCredentialsTest \
     com.vortx.android.engine.NativeWebsiteProfileEditsTest com.vortx.android.engine.NativeHostPreferencesTest \
     com.vortx.android.engine.NativePlaylistTest com.vortx.android.engine.NativePlaylistCloudReceiptLedgerTest com.vortx.android.engine.NativePlaylistProfileGatewayTest \
