@@ -4,12 +4,12 @@
   "repository": "VortXTV/VortX",
   "ref": "refs/heads/beta-xperience-wire-parity-20261030",
   "finalModel": {
-    "packet": "android-xperience-domain-source-v7",
-    "version": 7,
+    "packet": "android-xperience-domain-source-v9",
+    "version": 9,
     "reviewState": "SOURCE_SECURITY_REVIEWED",
-    "frozenReceiptSHA256": "da8ee9086f737c49125de8bae6f7f2778fe04ab08567aa41a3dd71f47148952d",
-    "reviewReceiptSHA256": "f8886147c304230f2efdab85cb200366c97e993c1ed1c06bca50873d7111ff96",
-    "domainSourceSHA256": "1d2247d6f01bd83464252691ca9a00dca888b67cab753de5f667e8e411d14dae"
+    "frozenReceiptSHA256": "cbfde6f531f0232931cf8e77c8a0b8cfea1b8f81672839a43cc9354ab9616a49",
+    "reviewReceiptSHA256": "25fbb055aa8da56065306ac3d88803297bb8e0e834d6d139ff90e98eca0304d7",
+    "domainSourceSHA256": "7f7cb7a91cf7fcb808e86ca45ae4e381ec7bf302ff8fa7041e89c5c7c188e6f0"
   },
   "appleDomain": {
     "path": "app/SourcesShared/XperienceCollections.swift",
@@ -33,7 +33,7 @@
   },
   "androidDomain": {
     "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt",
-    "sha256": "1d2247d6f01bd83464252691ca9a00dca888b67cab753de5f667e8e411d14dae"
+    "sha256": "7f7cb7a91cf7fcb808e86ca45ae4e381ec7bf302ff8fa7041e89c5c7c188e6f0"
   },
   "hostToolchain": {
     "kotlinVersion": "2.4.21",

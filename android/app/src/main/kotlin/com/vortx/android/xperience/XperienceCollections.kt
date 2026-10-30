@@ -3,6 +3,8 @@ package com.vortx.android.xperience
 import com.vortx.android.engine.OHJson
 import java.io.ByteArrayOutputStream
 import java.math.BigInteger
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.security.MessageDigest
 import java.text.Normalizer
 import java.util.Locale
@@ -135,7 +137,7 @@ internal object XperienceCollections {
         return Document(raw, collections, notices, digest(canonicalData(raw)))
     }
 
-    /** Apple-style collection canonicalization candidate. Double and platform mode parity remains open. */
+    /** Apple-style collection canonicalization candidate. Actual platform golden parity remains open. */
     fun canonicalData(raw: ByteArray): ByteArray {
         val scanned = try { BoundedScanner(raw).scan() } catch (failure: Rejected) { throw failure }
         catch (_: Throwable) { reject(Failure.INVALID_JSON) }
@@ -197,19 +199,7 @@ internal object XperienceCollections {
 
     private fun validateNumber(raw: ByteArray) {
         val text = try { OHJson.utf8(raw).trim() } catch (_: Throwable) { reject(Failure.INVALID_JSON) }
-        val integerToken = INTEGER.matches(text)
-        if (integerToken) {
-            val signed = text.toLongOrNull()
-            if (signed != null) return
-            // UInt64's decimal spelling is at most 20 bytes. Longer lexemes go directly through
-            // the finite-Double preservation check instead of allocating an unbounded BigInteger.
-            if (!text.startsWith("-") && text.length <= 20 &&
-                runCatching { BigInteger(text) <= UINT64_MAX }.getOrDefault(false)) return
-        }
-        val before = normalizedNumber(text)
-        val number = text.toDoubleOrNull()?.takeIf(Double::isFinite) ?: reject(Failure.UNPRESERVABLE_NUMBER)
-        val after = normalizedNumber(java.lang.Double.toString(number))
-        if (before != after) reject(Failure.UNPRESERVABLE_NUMBER)
+        portableSwiftNumber(text)
     }
 
     private fun normalizedNumber(input: String): String {
@@ -312,21 +302,92 @@ internal object XperienceCollections {
         return canonicalNumberText(OHJson.utf8(raw).trim())
     }
 
-    private fun canonicalNumberText(text: String): ByteArray {
-        if (INTEGER.matches(text)) {
-            text.toLongOrNull()?.let { return OHJson.literal(it.toString()) }
-            if (!text.startsWith('-') && text.length <= 20) runCatching { BigInteger(text) }.getOrNull()?.takeIf { it <= UINT64_MAX }
-                ?.let { return OHJson.literal(it.toString()) }
+    private fun canonicalNumberText(text: String): ByteArray = OHJson.literal(portableSwiftNumber(text))
+
+    /** Model VortxJSON's Int64 -> UInt64 -> Double decoding order, then enforce the unchanged
+     * raw numeric-value guard. Integral decimal/exponent tokens can decode as integers too.
+     * The modern Foundation Decimal slow path is a source reference, not this SDK's runtime proof. */
+    private fun portableSwiftNumber(text: String): String {
+        val before = normalizedNumber(text)
+        val encoded = swiftFixedWidthInteger(before) ?: run {
+            val number = text.toDoubleOrNull()?.takeIf(Double::isFinite) ?: reject(Failure.UNPRESERVABLE_NUMBER)
+            swiftShortestDouble(number)
         }
-        val number = text.toDoubleOrNull()?.takeIf(Double::isFinite) ?: reject(Failure.UNPRESERVABLE_NUMBER)
-        if (normalizedNumber(text) != normalizedNumber(java.lang.Double.toString(number))) reject(Failure.UNPRESERVABLE_NUMBER)
-        // Candidate shortest-round-trip representation. Cross-runtime spelling must be compared
-        // with Apple canonicalData fixtures before this source can back a production writer.
-        val shortest = java.lang.Double.toString(number).replace('E', 'e')
-        val e = shortest.indexOf('e')
-        val mantissa = (if (e < 0) shortest else shortest.substring(0, e)).removeSuffix(".0")
-        val exponent = if (e < 0) "" else shortest.substring(e)
-        return OHJson.literal(mantissa + exponent)
+        if (before != normalizedNumber(encoded)) reject(Failure.UNPRESERVABLE_NUMBER)
+        return encoded
+    }
+
+    /** Only a normalized integer whose complete spelling fits <=20 digits reaches BigInteger.
+     * Never allocate a BigInteger/BigDecimal from an arbitrary raw number lexeme. */
+    private fun swiftFixedWidthInteger(normalized: String): String? {
+        if (normalized == "0") return "0" // Int64 also owns every spelling of negative zero.
+        val exponentAt = normalized.lastIndexOf('e')
+        val coefficient = normalized.substring(0, exponentAt)
+        val power = normalized.substring(exponentAt + 1).toInt()
+        if (power < 0) return null
+        val negative = coefficient.startsWith('-')
+        val digits = if (negative) coefficient.substring(1) else coefficient
+        if (digits.length.toLong() + power > 20L) return null
+        val decimal = coefficient + "0".repeat(power)
+        decimal.toLongOrNull()?.let { return it.toString() }
+        if (!negative && runCatching { BigInteger(decimal) <= UINT64_MAX }.getOrDefault(false)) return decimal
+        return null
+    }
+
+    /** Portable shortest-roundtrip search from the exact finite binary64 value, independent of
+     * JDK Double.toString versions. At most 17 precisions x3 adjacent decimal-grid candidates.
+     * Choose minimum digits, then nearest exact value, then an even last digit (Swift's contract).
+     * BigDecimal(Double) is exact and bounded by binary64, even for the smallest subnormal. */
+    private fun swiftShortestDouble(number: Double): String {
+        if (number == 0.0) return "0" // A nonzero lexeme that underflowed still fails the raw guard.
+        val magnitude = kotlin.math.abs(number)
+        val bits = magnitude.toRawBits()
+        val exact = BigDecimal(magnitude)
+        val base10Exponent = exact.precision() - exact.scale() - 1
+        for (precision in 1..17) {
+            val power = base10Exponent - precision + 1
+            val center = exact.scaleByPowerOfTen(-power).setScale(0, RoundingMode.HALF_EVEN).toBigIntegerExact()
+            var best: BigDecimal? = null
+            var bestDistance: BigDecimal? = null
+            for (offset in -1..1) {
+                val coefficient = center.add(BigInteger.valueOf(offset.toLong()))
+                if (coefficient.signum() <= 0) continue
+                val candidate = BigDecimal(coefficient).scaleByPowerOfTen(power).stripTrailingZeros()
+                if (candidate.precision() > precision || candidate.toDouble().toRawBits() != bits) continue
+                val distance = exact.subtract(candidate).abs()
+                val prior = best
+                val closer = if (prior == null) true else {
+                    val comparison = distance.compareTo(checkNotNull(bestDistance))
+                    val even = !candidate.unscaledValue().testBit(0)
+                    val priorEven = !prior.unscaledValue().testBit(0)
+                    comparison < 0 || (comparison == 0 && (even && !priorEven || even == priorEven && candidate < prior))
+                }
+                if (closer) { best = candidate; bestDistance = distance }
+            }
+            best?.let { return formatSwiftDouble(number, it) }
+        }
+        // IEEE binary64 always has a <=17-significant-digit roundtrip. Never fall back to a
+        // platform-dependent spelling if a future refactor violates that invariant.
+        reject(Failure.UNPRESERVABLE_NUMBER)
+    }
+
+    /** Swift _Float64ToASCII/_finishFormatting policy, not a guessed positive decimal threshold.
+     * The preceding fixed-width admission owns representable integral values before this route. */
+    private fun formatSwiftDouble(number: Double, shortest: BigDecimal): String {
+        val magnitudeBits = kotlin.math.abs(number).toRawBits()
+        val exponentBits = ((magnitudeBits ushr 52) and 0x7ffL).toInt()
+        val fractionBits = magnitudeBits and 0x000fffffffffffffL
+        val binaryExponent = if (exponentBits == 0) 1 - 1075 else exponentBits - 1075
+        val forceExponential = binaryExponent > 1 || binaryExponent == 1 && fractionBits != 0L
+        val digits = shortest.unscaledValue().abs().toString()
+        val exponent = digits.length - shortest.scale() - 1
+        val sign = if (number < 0.0) "-" else ""
+        if (exponent < -4 || forceExponential) {
+            val mantissa = if (digits.length == 1) digits else digits.substring(0, 1) + "." + digits.substring(1)
+            val exponentSign = if (exponent < 0) "-" else "+"
+            return sign + mantissa + "e" + exponentSign + kotlin.math.abs(exponent).toString().padStart(2, '0')
+        }
+        return sign + shortest.toPlainString()
     }
 
     private fun objectValue(raw: ByteArray?): Map<String, ByteArray>? {
@@ -654,7 +715,9 @@ internal object XperienceCollections {
             // normalizedNumber/Double parsing can transiently hold several UTF-16 copies of a
             // long token. Reserve before copying/decoding it; very large but otherwise valid
             // tokens fail closed when the shared workspace ceiling cannot cover that peak.
-            val temporary = NUMBER_TEMP_OVERHEAD + 12L * tokenSize
+            // Exact binary64 BigDecimal scratch has a fixed worst case unrelated to raw length;
+            // reserve it before the formatter, including short subnormal tokens such as 5e-324.
+            val temporary = NUMBER_TEMP_OVERHEAD + 12L * tokenSize + XperienceCollections.NUMBER_FORMAT_WORKSPACE_BYTES
             budget.reserve(temporary)
             try {
                 val text = OHJson.utf8(bytes.copyOfRange(start, end))
@@ -765,7 +828,7 @@ internal object XperienceCollections {
         }
     }
 
-    private val INTEGER = Regex("-?(0|[1-9][0-9]*)")
+    private const val NUMBER_FORMAT_WORKSPACE_BYTES = 128L * 1024
     private val UINT64_MAX = BigInteger("18446744073709551615")
     private val WS = intArrayOf(9, 10, 13, 32)
 }

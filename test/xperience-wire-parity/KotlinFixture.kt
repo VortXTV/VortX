@@ -24,6 +24,14 @@ fun main(args: Array<String>) {
         try {
             val document = XperienceCollections.parse(input)
             val canonical = XperienceCollections.canonicalData(document.raw())
+            val registerCanonical = try {
+                XperienceCollections.canonicalRegisterData(document.raw())
+            } catch (failure: XperienceCollections.Rejected) {
+                throw AssertionError("Register canonicalization rejected an accepted document: $id", failure)
+            }
+            check(registerCanonical.contentEquals(canonical)) {
+                "Register canonical bytes differ for an accepted document: $id"
+            }
             val hash = OHJson.sha(canonical)
             Files.write(output.resolve("$id.canonical"), canonical, StandardOpenOption.CREATE_NEW)
             listOf(id, "ACCEPTED", canonical.size.toString(), hash, document.fingerprint, inputHash).joinToString("\t")
