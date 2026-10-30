@@ -9,6 +9,27 @@ import CryptoKit
         }
     }
     static func data(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) }
+    static func strictOpaqueRefusal(_ source: [String: Any]) throws {
+        do {
+            _ = try VortxNativeBootstrapArchive.encode(document: data(source))
+            preconditionFailure("Opaque display carrier passed original-document archive admission")
+        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        do {
+            try VortxNativeBootstrapArchive.validate(data(["schemaVersion": 1, "hostDocument": source,
+                                                         "excludedCredentialPaths": [String]()]))
+            preconditionFailure("Opaque display carrier passed archive validation")
+        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+    }
+    static func taggedDisplayCarrierControls() -> [String] {
+        let secret = #"{"token":"fixture-hidden"}"#
+        return ["[RD] - " + secret, "[RD]: " + secret, "[RD] [4K] - " + secret,
+                "[RD] - " + Data(secret.utf8).base64EncodedString(),
+                "[RD]: \u{FEFF}" + Data(secret.utf8).base64EncodedString(),
+                "[RD] - \"quoted\"", "[RD]: bplist00broken", "[RD] - <?xml broken",
+                "[true] trailing", "[123]: trailing", "[null] trailing",
+                "[RD] [true]", "[RD] [123]", "[RD] [null]",
+                #"["token"] trailing"#, #"[{"token":"fixture-hidden"}] trailing"#]
+    }
     static func main() throws {
         let configured = "https://addon.example/CaseSensitive?secret=fixture-only"
         let preferences: [String: Any] = [
@@ -626,10 +647,16 @@ import CryptoKit
             return ["transportUrl": url, "manifest": manifest]
         }
         func journey(_ document: Object, material: Object? = nil) throws {
+            let original = try data(document)
             var messages: [String] = []
             let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(document, diagnostics: { messages.append($0) })
             check(messages.isEmpty)
             check(NSDictionary(dictionary: try JSONSerialization.jsonObject(with: clean) as! Object).isEqual(to: document))
+            let rawArchive = try VortxNativeBootstrapArchive.encode(document: original, material: material.map { try data($0) })
+            try VortxNativeBootstrapArchive.validate(rawArchive)
+            let rawRoot = try JSONSerialization.jsonObject(with: rawArchive) as! Object
+            check(NSDictionary(dictionary: rawRoot["hostDocument"] as! Object).isEqual(to: document))
+            check((rawRoot["excludedCredentialPaths"] as! [String]).isEmpty)
             let archive = try VortxNativeBootstrapArchive.encode(document: clean, material: material.map { try data($0) })
             try VortxNativeBootstrapArchive.validate(archive)
             let root = try JSONSerialization.jsonObject(with: archive) as! Object
@@ -639,8 +666,10 @@ import CryptoKit
             try VortxNativeBootstrapArchive.validate(retained)
             let retainedRoot = try JSONSerialization.jsonObject(with: retained) as! Object
             check(NSDictionary(dictionary: retainedRoot["authenticatedSourceArchive"] as! Object).isEqual(to: document))
+            check(try data(document) == original)
         }
-        let labels = ["[4K] Community catalog", "[Community]", "{Public} Catalog", " \n[EN] Films and shows.", "[日本語] アニメ", "[true]", "[123]"]
+        let labels = ["[4K] Community catalog", "[Community]", "{Public} Catalog", " \n[EN] Films and shows.", "[日本語] アニメ", "[true]", "[123]",
+                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie"]
         var journeys = 0
         for label in labels {
             let addon = descriptor(label, description: label)
@@ -666,6 +695,7 @@ import CryptoKit
                 _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document)
                 preconditionFailure("Opaque or non-display carrier was admitted")
             } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try strictOpaqueRefusal(document)
         }
         let label = labels[0]
         try refused(["future": label])
@@ -678,7 +708,7 @@ import CryptoKit
         let malformed = [#"{"token":"unfinished"#, #"[{"password":"unfinished"#, #"{'token':'fixture'}"#, "{token=fixture;}",
                          "[[Community]]", "[Community]no separator", "[" + String(repeating: "x", count: 65) + "] Label",
                          #"[true] {"token":"fixture-hidden"}"#, #"[123] {"password":"fixture-hidden"}"#,
-                         #"[ ] {"token":"fixture-hidden"}"#, "[null] trailing"]
+                         #"[ ] {"token":"fixture-hidden"}"#, "[null] trailing"] + taggedDisplayCarrierControls()
         for value in malformed {
             for field in ["name", "description"] {
                 let addon = field == "name" ? descriptor(value) : descriptor("Fixture", description: value)
@@ -780,7 +810,8 @@ import CryptoKit
             }
             check(try data(source) == original && SHA256.hash(data: original) == originalHash)
         }
-        let labels = ["[REC]", "[4K] Fixture title", "{Family} Film", " \n[日本語] アニメ", "[true]", "[123]"]
+        let labels = ["[REC]", "[4K] Fixture title", "{Family} Film", " \n[日本語] アニメ", "[true]", "[123]",
+                      "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie"]
         for label in labels {
             for legacyRoot in [false, true] {
                 try journey(document(row(label), legacyRoot: legacyRoot))
@@ -794,6 +825,7 @@ import CryptoKit
                 _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
                 preconditionFailure("Unrecognized library display context was admitted")
             } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try strictOpaqueRefusal(source)
             check(try data(source) == original)
         }
         let label = "[REC] Fixture title"
@@ -830,7 +862,7 @@ import CryptoKit
                          #"[true] {"token":"fixture-hidden"}"#, #"[123] {"password":"fixture-hidden"}"#,
                          #"[REC] {"token":"fixture-hidden"}"#, #"[REC] ["fixture-hidden"]"#,
                          "[REC] bplist00broken", "[REC] <?xml broken", "[REC] \"quoted\"",
-                         "[null] trailing", "bplist00broken", "<?xml broken"]
+                         "[null] trailing", "bplist00broken", "<?xml broken"] + taggedDisplayCarrierControls()
         for name in malformed { try refused(document(row(name))) }
         // Display roles never flow through a quoted string, base64 or another decoded carrier.
         let quotedLabel = String(decoding: try JSONSerialization.data(withJSONObject: label, options: [.fragmentsAllowed]), as: UTF8.self)
@@ -990,7 +1022,8 @@ import CryptoKit
             check((host["futureHost"] as! [String: Bool])["keep"] == true)
             check((host["ownAccountOverlayPending"] as! [String: [String: String]])["fixture-pending"]?["draft"] == "untouched")
         }
-        for name in [label, "[RD+] Fixture", "{Public} Fixture", " \n[日本語] Fixture", "[true]", "[123]"] {
+        for name in [label, "[RD+] Fixture", "{Public} Fixture", " \n[日本語] Fixture", "[true]", "[123]",
+                     "[RD] [4K] Torrentio", "[TB⚡] Comet", "[Oshi no Ko]: The Movie"] {
             for key in [preference, "stremiox.seriesSourceSticky.default"] {
                 let expected: Object = [series: choice(name)]
                 let raw = try data(expected)
@@ -1032,6 +1065,7 @@ import CryptoKit
                 _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
                 preconditionFailure("Unrecognized or opaque series-choice carrier was admitted")
             } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try strictOpaqueRefusal(source)
             check(try data(source) == original)
         }
         let raw = try data([series: choice(label)])
@@ -1061,7 +1095,7 @@ import CryptoKit
                          "[" + String(repeating: "x", count: 65) + "] Fixture",
                          "[Community] " + secretJSON, "[Community] \"quoted\"", "[Community] bplist00broken",
                          "[Community] <?xml broken", "[true] trailing",
-                         Data(label.utf8).base64EncodedString(), Data([0x7b, 0xff, 0]).base64EncodedString()]
+                         Data(label.utf8).base64EncodedString(), Data([0x7b, 0xff, 0]).base64EncodedString()] + taggedDisplayCarrierControls()
         for name in malformed { try refused(document(data([series: choice(name)]))) }
         for carrier in [Data(secretJSON.utf8).base64EncodedString(), secretPlist.base64EncodedString()] {
             for padding in ["", "\u{FEFF}", String(repeating: " \u{2003}\n", count: 64) + "\u{FEFF}"] {

@@ -228,6 +228,28 @@ enum VortxNativeBootstrapArchive {
               object["type"] is String, object["name"] is String else { return false }
         return true
     }
+    /// Known display fields may lead with tags such as "[RD] [4K] Torrentio",
+    /// "[TB⚡] Comet" or "[Oshi no Ko]: The Movie". Tags never grant carrier authority.
+    private static func hasTaggedDisplayTitle(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tagSyntax = CharacterSet(charactersIn: "[]{}\"'\\:=;<`").union(.controlCharacters)
+        var rest = Substring(trimmed)
+        var tags = 0
+        while let open = rest.first, open == "[" || open == "{" {
+            let close: Character = open == "[" ? "]" : "}"
+            guard let end = rest.firstIndex(of: close) else { return false }
+            let content = rest[rest.index(after: rest.startIndex)..<end]
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty, content.count <= 64,
+                  !content.unicodeScalars.contains(where: tagSyntax.contains),
+                  (try? decodeJSON(with: Data(rest[...end].utf8), options: [.fragmentsAllowed])) == nil else { return false }
+            rest = rest[rest.index(after: end)...]
+            tags += 1
+            guard let next = rest.first else { break }
+            guard next.isWhitespace || ":-.,!?)".contains(next) else { return false }
+            rest = rest.drop(while: \.isWhitespace)
+        }
+        return tags > 0 && !isCarrierRemainder(rest)
+    }
     private static func hasLiteralTaggedDisplayLabel(_ text: String) -> Bool {
         guard hasLiteralDisplayLabel(text) else { return false }
         // A title or add-on display name may have a literal tag. Do not let it conceal
@@ -235,6 +257,9 @@ enum VortxNativeBootstrapArchive {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let closing: Character = trimmed.first == "[" ? "]" : "}"
         guard let end = trimmed.firstIndex(of: closing) else { return false }
+        return !isCarrierRemainder(trimmed[trimmed.index(after: end)...])
+    }
+    private static func isCarrierRemainder(_ remainder: Substring) -> Bool {
         let carrierPadding = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}"))
         func normalizedCarrierText(_ bytes: Data) -> String {
             let view = (try? jsonUTF8View(bytes)) ?? bytes
@@ -242,15 +267,16 @@ enum VortxNativeBootstrapArchive {
         }
         // Normalize the complete padding run before BOTH inspection and base64 decoding.
         // A BOM before encoded text must not make the decoder fail open after a safe sniff.
-        let suffix = normalizedCarrierText(Data(trimmed[trimmed.index(after: end)...].utf8))
+        // Separator punctuation must not hide a carrier: "[RD] - {...}" stays refused.
+        let suffix = normalizedCarrierText(Data(remainder.drop(while: { $0.isWhitespace || $0 == "\u{FEFF}" || ":-.,!?)".contains($0) }).utf8))
         func carrierPrefix(_ bytes: Data) -> Bool {
             let significant = normalizedCarrierText(bytes).unicodeScalars
             let prefix = String(String.UnicodeScalarView(significant.prefix(32)))
             return structuredPrefix(Data(prefix.utf8)) || prefix.hasPrefix("\"")
         }
-        guard !carrierPrefix(Data(suffix.utf8)) else { return false }
-        if let decoded = Data(base64Encoded: suffix), carrierPrefix(decoded) { return false }
-        return true
+        if carrierPrefix(Data(suffix.utf8)) { return true }
+        if let decoded = Data(base64Encoded: suffix), carrierPrefix(decoded) { return true }
+        return false
     }
     private static func isAddonDescriptor(_ object: [String: Any]) -> Bool {
         guard let transport = object["transportUrl"] as? String, let url = URLComponents(string: transport),
@@ -440,10 +466,11 @@ enum VortxNativeBootstrapArchive {
             if structuredPrefix(bytes) { throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .base64Prefix) }
         }
         if let text = value as? String, structuredPrefix(Data(text.utf8)),
-           !(textContext == .addonDisplayText && hasLiteralDisplayLabel(text)),
+           !(textContext == .addonDisplayText && hasLiteralTaggedDisplayLabel(text)),
            !((textContext == .profileName || textContext == .profileAvatar) && (text == "[" || text == "{")),
            !(textContext == .profileName && hasLiteralDisplayLabel(text)),
-           !((textContext == .libraryName || textContext == .seriesAddonName) && hasLiteralTaggedDisplayLabel(text)) {
+           !((textContext == .libraryName || textContext == .seriesAddonName) && hasLiteralTaggedDisplayLabel(text)),
+           !((textContext == .libraryName || textContext == .seriesAddonName || textContext == .addonDisplayText) && hasTaggedDisplayTitle(text)) {
             throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .plainTextPrefix)
         }
         guard value is String || value is NSNumber || value is NSNull || value is Date else { throw rejected(.malformed, path: path, diagnostics: diagnostics) }
