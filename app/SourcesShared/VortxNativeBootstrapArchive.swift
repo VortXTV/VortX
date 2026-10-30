@@ -55,10 +55,13 @@ enum VortxNativeBootstrapArchive {
     /// One unreadable device setting is left out of this capture and logged as held, so it cannot stop
     /// the account from loading. The account's cloud copy keeps it: the settings upload starts from the
     /// pulled cloud blob (SettingsBackup.mergedSyncBlob). Credential and malformed checks still fail.
-    static func credentialFreeDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil) throws -> Data {
+    /// `holdingUnreadableValues: false` keeps the strict check for callers that compare the result
+    /// with their input to prove nothing changed.
+    static func credentialFreeDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil,
+                                       holdingUnreadableValues: Bool = true) throws -> Data {
         var exclusions: [String] = []
         let value = try sanitize(source, path: "", exclusions: &exclusions, diagnostics: diagnostics, textContext: .legacyHost,
-                                 holdsUnreadablePreferences: true)
+                                 holdsUnreadablePreferences: holdingUnreadableValues)
         return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
     }
     static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
@@ -193,6 +196,10 @@ enum VortxNativeBootstrapArchive {
     }
     /// The plain label a loaded copy shows in place of display text that fails every display rule.
     static let replacedDisplayText = "Untitled"
+    /// Recorded in `exclusions` (loading mode only) when a value is held or replaced, so an enclosing
+    /// structured string is rebuilt from the cleaned value. Never a pointer: it cannot reach an archive,
+    /// because the archive writer and validator never hold or replace.
+    private static let heldMarker = "held:"
     private static func isSeriesChoicePreference(_ key: String) -> Bool {
         // SeriesSourceSticky.key writes only the active UUID, or the pre-roster default.
         // In particular, an undecodable quarantine copy is not an active Choice store.
@@ -419,6 +426,7 @@ enum VortxNativeBootstrapArchive {
                         for line in lines { diagnostics?(line) }
                     } catch Failure.opaquePreference {
                         exclusions.removeSubrange(prior...)
+                        exclusions.append(heldMarker + child)
                         for line in lines { diagnostics?(line.replacingOccurrences(of: "result=failed", with: "result=held")) }
                     } catch {
                         for line in lines { diagnostics?(line) }
@@ -508,6 +516,7 @@ enum VortxNativeBootstrapArchive {
             _ = rejected(.opaquePreference, path: path, diagnostics: diagnostics.map { log in
                 { log($0.replacingOccurrences(of: "result=failed reason=opaque_preference", with: "result=replaced reason=display_text")) }
             }, carrier: .plainTextPrefix)
+            exclusions.append(heldMarker + path)
             return replacedDisplayText
         }
         guard value is String || value is NSNumber || value is NSNull || value is Date else { throw rejected(.malformed, path: path, diagnostics: diagnostics) }
@@ -887,7 +896,7 @@ enum VortxLegacyMembershipReceiptArchive {
         default: throw Failure.malformed
         }
         let original = try canonical(row)
-        let safe = try VortxNativeBootstrapArchive.credentialFreeDocument(row)
+        let safe = try VortxNativeBootstrapArchive.credentialFreeDocument(row, holdingUnreadableValues: false)
         guard original == safe else { throw Failure.credentialCarrier }
     }
 

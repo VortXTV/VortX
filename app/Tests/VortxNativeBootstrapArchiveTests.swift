@@ -775,6 +775,25 @@ import CryptoKit
         check(((((replacedAddon["vortx"] as! Object)["addons"] as! [Object])[0]["manifest"] as! Object)["name"] as? String)
               == VortxNativeBootstrapArchive.replacedDisplayText)
         check(messages == ["archive_inspection result=replaced reason=display_text field=/vortx/addons/*/manifest/name carrier=plain_text_prefix"])
+        // A replacement inside an encoded carrier rebuilds that carrier from the cleaned value: the
+        // original text never passes through, and the strict archive writer accepts the result.
+        let nestedResponse = try data(["result": ["addons": [descriptor("[private:token]")]]]).base64EncodedString()
+        let nestedSource = try data(["addonsResponseBase64": nestedResponse]).base64EncodedString()
+        let nestedHost: Object = ["ownAccountSources": [profile: ["sourceDocumentBase64": nestedSource]]]
+        let nestedClean = try VortxNativeBootstrapArchive.credentialFreeDocument(nestedHost)
+        check(!String(decoding: nestedClean, as: UTF8.self).contains(nestedSource))
+        _ = try VortxNativeBootstrapArchive.encode(document: nestedClean)
+        let rebuilt = (((try JSONSerialization.jsonObject(with: nestedClean) as! Object)["ownAccountSources"] as! Object)[profile] as! Object)
+        let rebuiltSource = try JSONSerialization.jsonObject(with: Data(base64Encoded: rebuilt["sourceDocumentBase64"] as! String)!) as! Object
+        let rebuiltResponse = try JSONSerialization.jsonObject(with: Data(base64Encoded: rebuiltSource["addonsResponseBase64"] as! String)!) as! Object
+        check(((((rebuiltResponse["result"] as! Object)["addons"] as! [Object])[0]["manifest"] as! Object)["name"] as? String)
+              == VortxNativeBootstrapArchive.replacedDisplayText)
+        try strictOpaqueRefusal(nestedHost)
+        // A caller that proves its input unchanged keeps the strict check.
+        do {
+            _ = try VortxNativeBootstrapArchive.credentialFreeDocument(nestedHost, holdingUnreadableValues: false)
+            preconditionFailure("Strict capture admitted a nested carrier")
+        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
         print("Issue #263: \(journeys) exact display-text carrier journeys, nested credential inspection and malformed/opaque rejection controls passed")
     }
 
