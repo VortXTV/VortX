@@ -397,6 +397,31 @@ jobs:
           node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" "$renewal_status"
           test "$renewal_status" -eq 0
           node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" 0 normal-exit
+      - name: Verify the current local-installer fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/local-installer-checks
+          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
+          if ! git cat-file -e 82cc8387222469d36dfbb7fc09881c375e36de45^{commit}; then
+            git -c gc.auto=0 fetch --no-tags --depth=1 origin 82cc8387222469d36dfbb7fc09881c375e36de45
+          fi
+          for local_check in bootstrap library diagnostics oauth; do
+            case "$local_check" in
+              bootstrap) local_command=(/bin/bash scripts/test-native-bootstrap-archive.sh) ;;
+              library) local_command=(/bin/bash scripts/test-native-library-projection-perf.sh working-tree --functional-only) ;;
+              diagnostics) local_command=(/usr/bin/env node scripts/test-pre-profile-diagnostic-export.mjs) ;;
+              oauth) local_command=(/bin/bash scripts/test-native-oauth-intents.sh) ;;
+            esac
+            local_status=0
+            nice -n 15 node test/mpv-bounded-child.mjs run 600 "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" -- \
+              "${local_command[@]}" > "app/build/local-installer-checks/$local_check.log" 2>&1 || local_status=$?
+            printf '%s\n' "$local_status" > "app/build/local-installer-checks/$local_check.status.txt"
+            cat "app/build/local-installer-checks/$local_check.log"
+            node test/mpv-bounded-child.mjs check "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" "$local_status"
+            test "$local_status" -eq 0
+            node test/mpv-bounded-child.mjs check "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" 0 normal-exit
+          done
       - name: Retain focused regression outputs and failure receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -405,6 +430,11 @@ jobs:
           path: |
             app/build/auth-recovery/**
             app/build/session-renewal-receipts/**
+            app/build/local-installer-checks/**
+            app/build/native-migration-bootstrap.*/**
+            app/build/native-library-projection.*/**
+            app/build/pre-profile-diagnostic-export.*/**
+            app/build/native-oauth.*/**
             app/build/profile-picker-routing.*/**
             app/build/xperience-export-contracts.*/**
           if-no-files-found: warn

@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/native-watched-swift-inputs.sh
+source scripts/native-owner-history-fixture-inputs.sh
 mkdir -p app/build
 native_oauth_dir=$(mktemp -d app/build/native-oauth.XXXXXX)
 # Compile the real OAuth actor and exact production journal/linearization methods. Reuse the
@@ -22,21 +23,40 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     printf '%s\n' 'func testProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { try nativeProviderState(capture: capture) }' '}'
 } > "$native_oauth_dir/Journal.swift"
 node scripts/extract-subtitle-proof-hosts.cjs "$PWD" full-shells "$native_oauth_dir/NativeSubtitleProofHosts.swift" > "$native_oauth_dir/native-subtitle-proof-hosts.json"
-xcrun swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
-    app/SourcesShared/CredentialScope.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/SIMKLAuth.swift \
-    app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
-    app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
-    "$native_oauth_dir/UserProfile.swift" "$native_oauth_dir/Discovery.swift" "$native_oauth_dir/SIMKLSeams.swift" "$native_oauth_dir/Journal.swift" "$native_oauth_dir/NativeSubtitleProofHosts.swift" \
-    app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeOAuthIntentTests.swift -o "$native_oauth_dir/oauth-intents"
+# The full current Session also owns owner history. Reuse its actual shared declarations and
+# existing verbatim account/peer carriers instead of inventing a smaller owner-history model.
+node test/xperience-harness-inputs.cjs --owner-history-carriers "$native_oauth_dir"
+native_oauth_inputs=(
+    app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift
+    app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}"
+    app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift
+    app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeSession.swift
+    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift
+    "$native_oauth_dir/UserProfile.swift" "$native_oauth_dir/Discovery.swift"
+    "$native_oauth_dir/Journal.swift" "$native_oauth_dir/NativeSubtitleProofHosts.swift"
+    app/SourcesShared/VortxNativeProfileEditHost.swift
+    "${native_owner_history_fixture_swift_inputs[@]}" "$native_oauth_dir/OwnerHistoryFixtureCarriers.swift"
+)
+# Shared closures overlap. The unchanged SIMKL/Trakt seam for each lane supplies its existing
+# injectable Keychain, including confirmedString used by the real Xperience export witness;
+# compiling the production Keychain as well would redeclare that fixture dependency and touch
+# the real secure-store graph. No other owner-history declaration is excluded or replaced.
+native_oauth_unique=("${native_oauth_inputs[0]}")
+for native_oauth_input in "${native_oauth_inputs[@]}"; do
+    [[ "$native_oauth_input" == app/SourcesShared/Keychain.swift ]] && continue
+    native_oauth_seen=0
+    for native_oauth_retained in "${native_oauth_unique[@]}"; do
+        if [[ "$native_oauth_input" == "$native_oauth_retained" ]]; then native_oauth_seen=1; break; fi
+    done
+    if [[ "$native_oauth_seen" -eq 0 ]]; then native_oauth_unique+=("$native_oauth_input"); fi
+done
+xcrun swiftc -parse-as-library -swift-version 6 -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+    "${native_oauth_unique[@]}" app/SourcesShared/SIMKLAuth.swift "$native_oauth_dir/SIMKLSeams.swift" \
+    app/Tests/VortxNativeOAuthIntentTests.swift -o "$native_oauth_dir/oauth-intents"
 "$native_oauth_dir/oauth-intents"
 sed '/^@main/,$d' app/Tests/TraktSessionSecurityTests.swift > "$native_oauth_dir/TraktSeams.swift"
-xcrun swiftc -parse-as-library -D DEBUG -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
-    app/SourcesShared/CredentialScope.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/TraktAuth.swift \
+xcrun swiftc -parse-as-library -swift-version 6 -D DEBUG -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+    "${native_oauth_unique[@]}" app/SourcesShared/TraktAuth.swift \
     app/SourcesShared/TraktScrobbleProgressPolicy.swift app/SourcesShared/VortXEdgeAuth.swift \
-    app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" \
-    app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
-    "$native_oauth_dir/UserProfile.swift" "$native_oauth_dir/Discovery.swift" "$native_oauth_dir/TraktSeams.swift" "$native_oauth_dir/Journal.swift" "$native_oauth_dir/NativeSubtitleProofHosts.swift" \
-    app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeTraktIntentTests.swift -o "$native_oauth_dir/trakt-intents"
+    "$native_oauth_dir/TraktSeams.swift" app/Tests/VortxNativeTraktIntentTests.swift -o "$native_oauth_dir/trakt-intents"
 "$native_oauth_dir/trakt-intents"
