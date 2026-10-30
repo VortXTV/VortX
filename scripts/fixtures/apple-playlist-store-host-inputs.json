@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "scope": "Full unchanged production Store and codecs; host-only synthetic collaborators, no native/UI/cloud proof",
+  "inputs": [
+    {
+      "path": "app/SourcesShared/SavedPlaylistStore.swift",
+      "sha256": "c9a7cd938c4560187c8c0866a5a01d3584349e94190230cfe3b8c2a2ba34eb2f"
+    },
+    {
+      "path": "app/SourcesShared/PlaybackTitleQueuePolicy.swift",
+      "sha256": "5b185a359445777197c4501140860547e4dcbd63e98ed53ba910e1631e989269"
+    },
+    {
+      "path": "app/SourcesShared/VortxNativeHostFieldMutation.swift",
+      "sha256": "feb86e7d098152265abc05273a2091bd76666808f7a87c8b08c9c5f2961edb9e"
+    },
+    {
+      "path": "app/SourcesShared/VortxNativePlaylist.swift",
+      "sha256": "03776e435d442eab3a98d1b8265d9b02d51ec3cb8d9db95762297340575d7c4d"
+    },
+    {
+      "path": "app/SourcesShared/OwnerHistoryExactJSON.swift",
+      "sha256": "84a6a4db137a134ce282e10347ac3537e9591af45adab93cc5efb11727d18c9d"
+    },
+    {
+      "path": "app/SourcesShared/NativePlaylistCloudReceiptLedger.swift",
+      "sha256": "7020b3aa92370ce0411e7ac2dce06c231bd51461bf6c79a788f2c537d2a9ee7c"
+    },
+    {
+      "path": "app/SourcesShared/NativePlaylistCloudReceiptProjectionWorker.swift",
+      "sha256": "878434602fc10c426e671291304976c64b6456234d5526e2fc8da258e86acab2"
+    },
+    {
+      "path": "app/SourcesShared/VortxResourceBridge.swift",
+      "sha256": "0d3f7301a39b74cddd9d5cd81fd630ff0c96147b9034659a04fda5f5ad5b29f0"
+    },
+    {
+      "path": "app/SourcesShared/VortxNativeRuntime.swift",
+      "sha256": "56b07a0dd93dad13eb733a46aa5e19278f41d0c30760cafe4919fe7a1630e60e"
+    },
+    {
+      "path": "app/SourcesShared/VortxNativeHostPreferences.swift",
+      "sha256": "349465f712a20524dc2265a26c35fe1eb72ef10388fd1f0bdffa55304f5cb876"
+    }
+  ],
+  "definitions": [
+    {
+      "name": "VortxJSON",
+      "source": "app/SourcesShared/VortxResourceBridge.swift",
+      "start": "indirect enum VortxJSON: Codable, Equatable, Sendable {\n",
+      "end": "\nstruct VortxResourceRequest:",
+      "sha256": "3f1287e06138d05ee6e9ebaadeb5e55b8c6c70035f476535b1574f266ecb573b",
+      "bytes": 1683
+    },
+    {
+      "name": "VortxNativeError",
+      "source": "app/SourcesShared/VortxNativeRuntime.swift",
+      "start": "enum VortxNativeError: Error, Equatable {\n",
+      "end": "\n/// Per-call locking",
+      "sha256": "ce208e53156e38173e7d17b51c715715c05d0ff97c83ce9ad35d99a232335717",
+      "bytes": 670
+    },
+    {
+      "name": "maxClock",
+      "source": "app/SourcesShared/VortxNativeHostPreferences.swift",
+      "literal": "    static let maxClock: UInt64 = 9_007_199_254_740_991\n",
+      "sha256": "7332cfbe805f26cf3138dac7348a3e9b189b0b9d84dc0386c42fc62cfc6776d1",
+      "bytes": 56
+    },
+    {
+      "name": "validActor",
+      "source": "app/SourcesShared/VortxNativeHostPreferences.swift",
+      "literal": "    static func validActor(_ actor: String) -> Bool { UUID(uuidString: actor)?.uuidString.lowercased() == actor }\n",
+      "sha256": "915ce472ea6e272df79de5c98e9ae22f1e1734610b1a976cdf61d892551d667a",
+      "bytes": 114
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "app/Tests/SavedPlaylistStoreHostCollaborators.swift",
+      "sha256": "aefe2d3919dabec2e4e54628d6b6d6d18a3f519410b03c93a244cfe2c7d0e854"
+    },
+    {
+      "path": "app/Tests/SavedPlaylistStoreHostTests.swift",
+      "sha256": "50399980054d58670ab762cf698adb2e3b8077560625f37a84987678f1769369"
+    }
+  ]
+}
