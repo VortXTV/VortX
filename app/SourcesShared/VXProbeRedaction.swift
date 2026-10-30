@@ -208,6 +208,16 @@ enum VXProbeRedaction {
         // the N16 case in VXProbeRedactionTests, which feeds an unbounded 200 KB line to `redactAll` under a
         // watchdog. No real scheme is longer than a handful of characters, so the bound costs nothing.
         if let r = compile(#"[a-z][a-z0-9+.\-]{0,15}://([^\s/@]+)@"#) { out.append(Rule(tag: "cred", regex: r, group: 1)) }
+        // Add-on configuration in the URL PATH. Add-ons keep their whole setup, debrid keys and login
+        // tokens included, between the host and the resource name: `/sort=size|realdebrid=KEY/manifest.json`,
+        // `/%7B%22auth_token%22...%7D/manifest.json`, `/enc:BLOB/stream/...`. None of those shapes are hex,
+        // JWT or query parameters, so the rules below let them through. Mask everything between the host
+        // and the first add-on resource name. Both runs are bounded, which keeps a long line linear.
+        if let r = compile(#"https?://[^/\s"'<>]{1,253}/([^\s"'<>?#]{1,2048}?)/(?:manifest\.json|stream/|catalog/|meta/|subtitles/|addon_catalog/|configure)"#) {
+            out.append(Rule(tag: "cfg", regex: r, group: 1))
+        }
+        // A percent-encoded JSON object anywhere (`%7B%22...%7D`) is configuration, not a readable value.
+        if let r = compile(#"%7B%22[^\s"'<>]{0,2048}?%7D"#) { out.append(Rule(tag: "cfg", regex: r, group: 0)) }
         // Authorization headers. `Authorization: Bearer <jwt>` had no rule at all, which is how the single
         // most standard way to spell a credential walked through a list of query-parameter names.
         if let r = compile(#"(?:proxy-)?authorization\s*[:=]\s*[a-z]+\s+([^\s"',;]+)"#) {

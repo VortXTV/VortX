@@ -329,5 +329,28 @@ struct VXProbeRedactionTests {
         // ...and it still redacts, so the bound was not bought by breaking the rule.
         expect(!VXProbeRedaction.redactAll("open ftp://user:hunter2@host/f").contains("hunter2"),
                "H-N16: the bounded rule still redacts ordinary URL userinfo")
+
+        // Add-on configuration lives in the URL path. Synthetic keys only.
+        let debridKey = "ABCDEFGHJKLMNPQRSTUVWXYZ234567ABCDEFGHJKLMNPQRSTUV"
+        let addonLines = [
+            "value=https://torrentio.example/sort=qualitysize|realdebrid=\(debridKey)/manifest.json",
+            "value=https://addon.example/%7b%22auth_token%22%3a%22Zx9Qm2LpVt7Rk4Wn8Ys3%22%7d/manifest.json",
+            "value=https://addon.example/enc:Qm9vZ2llV29vZ2llU2VjcmV0S2V5MTIzNDU2Nzg5MA/stream/movie/tt0000001.json",
+            "value=https://addon.example/stremio/0f1e2d3c/Zx9Qm2LpVt7Rk4Wn8Ys3/catalog/movie/top.json",
+        ]
+        for line in addonLines {
+            let out = VXProbeRedaction.scrub(line)
+            expect(out.contains("<cfg:") && !out.contains(debridKey) && !out.contains("Zx9Qm2LpVt7Rk4Wn8Ys3")
+                   && !out.contains("Qm9vZ2ll") && out.contains("https://"),
+                   "H-CFG: add-on configuration in the URL path is masked, host kept: \(out)")
+        }
+        let plain = "value=https://v3-cinemeta.example/catalog/movie/top.json"
+        expect(VXProbeRedaction.scrub(plain) == plain, "H-CFG: an add-on URL without configuration stays readable")
+        let encoded = VXProbeRedaction.scrub("cfg=%7B%22token%22%3A%22Zx9Qm2LpVt7Rk4Wn8Ys3%22%7D end")
+        expect(!encoded.contains("Zx9Qm2LpVt7Rk4Wn8Ys3") && encoded.hasSuffix(" end"),
+               "H-CFG: a percent-encoded JSON object outside a URL path is masked")
+        let cfgStarted = Date()
+        _ = VXProbeRedaction.redactAll(String(repeating: "https://h/a", count: 20_000))
+        expect(Date().timeIntervalSince(cfgStarted) < 10, "H-CFG: the configuration rule stays bounded on a 220 KB line of URLs")
     }
 }
