@@ -1996,6 +1996,19 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         data object Failed : SyncDocPull
     }
 
+    /** Issue read provenance only from this operation's authenticated Doc; payload remains sensitive. */
+    private fun capturedAccountRead(
+        lease: SyncSessionLease,
+        account: SessionOwnerSnapshot.Account,
+        pulled: SyncDocPull.Doc,
+    ): NativeAccountReadCapture? {
+        val read = pulled.witness
+        if (read.lease !== lease || read.baseRevision != pulled.version ||
+            account.id != lease.accountId || account.generation != lease.ownerEpoch) return null
+        return NativeAccountReadCapture.fromAuthenticatedPull(account, lease.operationGeneration,
+            lease.accountId, lease.ownerEpoch, pulled.version, pulled.raw)
+    }
+
     /**
      * Pull the account doc, distinguishing "no backup yet" (safe to seed) from "the pull failed" (must NOT
      * push, or it clobbers the account's existing doc). A non-200/non-404, an undecryptable doc, or a
@@ -2257,9 +2270,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             return isSyncLeaseCurrent(lease)
         }
         val initialMount = gateway.currentMountToken(account)
-        val applied = try { gateway.applyRawDocument(account, pull.raw) { isSyncLeaseCurrent(lease) } }
+        val capturedRead = capturedAccountRead(lease, account, pull) ?: return false
+        val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) } }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
+            finally { capturedRead.retire() }
         if (!applied) return false
         val appliedMount = gateway.currentMountToken(account)
         if (initialMount != null && appliedMount?.installation !== initialMount.installation) return false
@@ -2362,8 +2377,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 pushedProviders = null
                 return deriveBackup(lease, document, pulled, gateway, seedMount)
             }
-            val originalRaw = (pulled as? SyncDocPull.Doc)?.raw ?: return null
-            if (!gateway.applyRawDocument(account, originalRaw) { isSyncLeaseCurrent(lease) }) return null
+            val originalRead = pulled as? SyncDocPull.Doc ?: return null
+            val originalRaw = originalRead.raw
+            val capturedRead = capturedAccountRead(lease, account, originalRead) ?: return null
+            val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) } }
+                finally { capturedRead.retire() }
+            if (!applied) return null
             if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals)) return null
             val exportMount = gateway.currentMountToken(account)
             val exported = gateway.exportDocument(account) ?: return null

@@ -15,8 +15,69 @@ internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: 
 /** Opaque current mount and mutation generation; contains no account document or credentials. */
 internal data class NativeAccountMountToken(val installation: Any, val revision: Long)
 
-/** Only called with a successfully authenticated/decrypted document under a captured session lease.
- * Credentials and the account data key never cross this boundary. */
+/**
+ * Exact bytes and non-secret identity of one authenticated backup GET. The bytes are sensitive:
+ * the full decrypted account may contain provider credentials or API keys. This is provenance,
+ * not a write permit; it must never be logged or exported. Zeroing is best effort for arrays this
+ * object owns and cannot scrub transport, parser, caller, or runtime copies.
+ * Direct construction is private. The production factory is called only by the authenticated
+ * pull adapter in VortXSyncManager; this internal type is not independent authority.
+ */
+internal class NativeAccountReadCapture private constructor(
+    val account: SessionOwnerSnapshot.Account,
+    val operationGeneration: Long,
+    val baseRevision: Long,
+    raw: ByteArray,
+) {
+    private val lock = Any()
+    private var active = true
+    private var rawBytes = raw.copyOf()
+
+    /** The only raw-byte export is a bounded copy for the exact account admission path. */
+    internal fun copyRawForApply(expected: SessionOwnerSnapshot.Account): ByteArray = synchronized(lock) {
+        check(active && expected == account) { "Authenticated account read is stale" }
+        rawBytes.copyOf()
+    }
+
+    /** A private mount copy separates retained provenance from the transient sync-call capture. */
+    internal fun retainedCopyFor(expected: SessionOwnerSnapshot.Account): NativeAccountReadCapture = synchronized(lock) {
+        check(active && expected == account) { "Authenticated account read is stale" }
+        NativeAccountReadCapture(account, operationGeneration, baseRevision, rawBytes)
+    }
+
+    /** Best-effort zeroing of this capture's owned bytes on reject, replacement, or mount retirement. */
+    internal fun retire() = synchronized(lock) {
+        if (active) {
+            active = false
+            rawBytes.fill(0)
+            rawBytes = byteArrayOf()
+        }
+    }
+
+    companion object {
+        /** Called by VortXSyncManager only after matching Doc, lease, account, and version witnesses. */
+        internal fun fromAuthenticatedPull(
+            account: SessionOwnerSnapshot.Account,
+            operationGeneration: Long,
+            leaseAccountId: String,
+            leaseOwnerEpoch: Long,
+            baseRevision: Long,
+            raw: ByteArray,
+        ): NativeAccountReadCapture {
+            require(account.id == leaseAccountId && account.generation == leaseOwnerEpoch)
+            require(operationGeneration >= 0L && baseRevision >= 0L && raw.isNotEmpty())
+            require(raw.size <= com.vortx.android.engine.OHJson.MAX)
+            return NativeAccountReadCapture(account, operationGeneration, baseRevision, raw)
+        }
+    }
+}
+
+/**
+ * Called with a successfully authenticated/decrypted account document under a captured session
+ * lease. The bearer and account data key are not separately passed as authorization material here;
+ * the decrypted payload itself is sensitive and may contain provider credentials or API keys.
+ * Never log or export its raw bytes.
+ */
 internal interface NativeAccountGateway {
     fun retire()
     /** Cheap certification only. Missing/recovering mounts must take the full checkpoint path. */
@@ -33,6 +94,24 @@ internal interface NativeAccountGateway {
             "Typed owner-history gateway required"
         }
         return applyDocument(account, document, isCurrent)
+    }
+    /**
+     * Authenticated read path. Legacy/fake gateways retain their old apply behavior but do not
+     * acquire the captured baseline unless they explicitly override this method.
+     */
+    suspend fun applyRawDocument(
+        account: SessionOwnerSnapshot.Account,
+        captured: NativeAccountReadCapture,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        val raw = captured.copyRawForApply(account)
+        return try {
+            if (!isCurrent()) return false
+            applyRawDocument(account, raw, isCurrent)
+        } finally {
+            raw.fill(0)
+            captured.retire()
+        }
     }
     fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport?
     fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean = false

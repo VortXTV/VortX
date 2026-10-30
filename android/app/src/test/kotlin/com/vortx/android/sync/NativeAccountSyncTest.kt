@@ -54,6 +54,9 @@ class NativeAccountSyncTest {
         var retired = 0
         var reopened = 0
         var last: JSONObject? = null
+        data class AppliedRead(val account: SessionOwnerSnapshot.Account, val operationGeneration: Long,
+                               val baseRevision: Long, val raw: ByteArray)
+        val appliedReads = mutableListOf<AppliedRead>()
         override fun retire() { retired++ }
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
             check(isCurrent()); reopened++; return true
@@ -61,6 +64,21 @@ class NativeAccountSyncTest {
         override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean {
             check(isCurrent()); applied++; last = JSONObject(document.toString()); return true
         }
+        override suspend fun applyRawDocument(
+            account: SessionOwnerSnapshot.Account,
+            captured: NativeAccountReadCapture,
+            isCurrent: () -> Boolean,
+        ): Boolean {
+            val exact = captured.copyRawForApply(account)
+            return try {
+                check(isCurrent())
+                appliedReads += AppliedRead(account, captured.operationGeneration, captured.baseRevision, exact.copyOf())
+                super<NativeAccountGateway>.applyRawDocument(account, captured, isCurrent)
+            } finally {
+                exact.fill(0)
+            }
+        }
+        fun clearReads() { appliedReads.forEach { it.raw.fill(0) }; appliedReads.clear() }
         override fun exportDocument(account: SessionOwnerSnapshot.Account) = NativeAccountExport(
             JSONObject().put("scope", "account.${account.id}").put("fixture", true),
             listOf(UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)), 123.0)
@@ -110,10 +128,16 @@ class NativeAccountSyncTest {
             assertTrue(result.getJSONObject("nativeSync").getBoolean("fixture"))
             assertFalse(result.getJSONObject("nativeSync").has("activeProfileId"))
             assertEquals(doc.getString("settings"), result.getString("settings")); assertEquals(2, gateway.applied)
+            assertTrue(gateway.appliedReads.isNotEmpty())
+            val captured = gateway.appliedReads.first()
+            assertEquals(SessionOwnerSnapshot.Account(account.id, 0L), captured.account)
+            assertEquals(100L, captured.baseRevision)
+            assertTrue(captured.operationGeneration >= 0L)
+            assertArrayEquals(doc.toString().toByteArray(Charsets.UTF_8), captured.raw)
             // The projected export deliberately has a different name and clock. Neither may rewrite
             // the original legacy receipt input; the next native-native pull must see the same input.
             assertEquals(doc.getJSONObject("vortx").toString(), result.getJSONObject("vortx").toString())
-        } finally { manager.cancelSyncTestWork() }
+        } finally { manager.cancelSyncTestWork(); gateway.clearReads() }
     }
 
     @Test fun `native pull preflights exact overlay number tokens before org json rounding`() = runBlocking {
@@ -149,6 +173,104 @@ class NativeAccountSyncTest {
             assertEquals(1, requests)
             assertEquals("{\"stremiox.audioLang\":123.25}", context.getSharedPreferences("vortx_sync_dirty", 0).getString(storageKey, null))
         } finally { manager.cancelSyncTestWork() }
+    }
+
+    private fun coordinatorRead(coordinator: NativeAccountCoordinator): NativeAccountReadCapture? {
+        val mountedField = NativeAccountCoordinator::class.java.getDeclaredField("mounted").also { it.isAccessible = true }
+        val reference = mountedField.get(coordinator) as java.util.concurrent.atomic.AtomicReference<*>
+        val mount = reference.get() ?: return null
+        val readField = mount.javaClass.getDeclaredField("authenticatedRead").also { it.isAccessible = true }
+        return readField.get(mount) as? NativeAccountReadCapture
+    }
+
+    private fun injectCoordinatorRead(coordinator: NativeAccountCoordinator, capture: NativeAccountReadCapture) {
+        val mountedField = NativeAccountCoordinator::class.java.getDeclaredField("mounted").also { it.isAccessible = true }
+        val reference = mountedField.get(coordinator) as java.util.concurrent.atomic.AtomicReference<*>
+        val mount = requireNotNull(reference.get())
+        val readField = mount.javaClass.getDeclaredField("authenticatedRead").also { it.isAccessible = true }
+        readField.set(mount, capture)
+    }
+
+    @Test fun `real coordinator clears prior provenance before failed direct and typed applies and retirement`() = kotlinx.coroutines.test.runTest {
+        org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
+        val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "native-read-capture-").toFile()
+        val checkpoints = VortxEncryptedCheckpointStore(directory) { javax.crypto.spec.SecretKeySpec(key, "AES") }
+        val principal = SessionOwnerSnapshot.Account(account.id, 4)
+        var current = principal
+        var failProjection = false
+        fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { it == current }, { it() },
+            project = { if (failProjection) error("Fixture projection failure") })
+        val runtime = coordinator()
+        val owner = UserProfile(id = "00000000-0000-0000-0000-000000000111", name = "Historical owner", avatar = "star", isOwner = true)
+        val doc = JSONObject().put("vortx", JSONObject().put("roster", org.json.JSONArray().put(owner.encode().put("auth", "fixture-only")))
+            .put("rosterModified", 123.5).put("library", org.json.JSONArray()).put("addons", org.json.JSONArray()))
+        fun syntheticCapture(generation: Long, revision: Long = 100L): NativeAccountReadCapture {
+            val bytes = doc.toString().toByteArray(Charsets.UTF_8)
+            val capturedAccount = SessionOwnerSnapshot.Account(principal.id, generation)
+            return try { NativeAccountReadCapture.fromAuthenticatedPull(capturedAccount, 17L, principal.id, generation, revision, bytes) }
+                finally { bytes.fill(0) }
+        }
+        try {
+            assertTrue(runtime.applyDocument(principal, doc) { current == principal })
+
+            // This test-only injection exercises private real-mount lifecycle behavior; it does not
+            // create a production sync/write authority or replace the authenticated manager test.
+            val baseline = syntheticCapture(principal.generation)
+            injectCoordinatorRead(runtime, baseline)
+            val rejected = syntheticCapture(principal.generation + 1)
+            var rejectedAsStale = false
+            try { runtime.applyRawDocument(principal, rejected) { current == principal } }
+            catch (_: IllegalStateException) { rejectedAsStale = true }
+            assertTrue(rejectedAsStale)
+            rejected.retire()
+            assertSame(baseline, coordinatorRead(runtime))
+            baseline.copyRawForApply(principal).fill(0)
+
+            // The real generic apply dispatches before its projection callback; a later failure
+            // must not leave the previous authenticated bytes on the still-mounted coordinator.
+            failProjection = true
+            var failedAfterApply = false
+            try { runtime.applyDocument(principal, JSONObject(doc.toString()).put("fixtureEdit", true)) { current == principal } }
+            catch (_: IllegalStateException) { failedAfterApply = true }
+            assertTrue(failedAfterApply)
+            assertNull(coordinatorRead(runtime))
+            var retiredReadRejected = false
+            try { baseline.copyRawForApply(principal) } catch (_: IllegalStateException) { retiredReadRejected = true }
+            assertTrue(retiredReadRejected)
+            failProjection = false
+
+            // Even a malformed owner-history attempt enters the typed route only after the exact
+            // generic baseline has been revoked. Successful typed checkpoint transfer remains a
+            // separately gated fixture because it requires a genuine native history carrier.
+            val beforeTyped = syntheticCapture(principal.generation, 101L)
+            injectCoordinatorRead(runtime, beforeTyped)
+            val invalidTyped = """{"nativeSync":{"schemaVersion":6,"scope":"account.${principal.id}","ownerProfileId":"${owner.id}"}}""".toByteArray()
+            var typedRejected = false
+            try { runtime.applyRawDocument(principal, invalidTyped) { current == principal } }
+            catch (_: Exception) { typedRejected = true /* Expected: no genuine history carrier supplied. */ }
+            finally { invalidTyped.fill(0) }
+            assertTrue(typedRejected)
+            assertNull(coordinatorRead(runtime))
+            var typedAttemptRetiredRead = false
+            try { beforeTyped.copyRawForApply(principal) } catch (_: IllegalStateException) { typedAttemptRetiredRead = true }
+            assertTrue(typedAttemptRetiredRead)
+
+            val onRetire = syntheticCapture(principal.generation, 102L)
+            injectCoordinatorRead(runtime, onRetire)
+            runtime.retire()
+            assertNull(coordinatorRead(runtime))
+            var mountRetiredReadRejected = false
+            try { onRetire.copyRawForApply(principal) } catch (_: IllegalStateException) { mountRetiredReadRejected = true }
+            assertTrue(mountRetiredReadRejected)
+
+            // Replacing the mount with the same account id but a new owner generation cannot
+            // resurrect any of the previous mount's raw read evidence.
+            val capturedNewAccount = SessionOwnerSnapshot.Account(principal.id, principal.generation + 1L)
+            current = capturedNewAccount
+            assertTrue(runtime.applyDocument(capturedNewAccount, doc) { current == capturedNewAccount })
+            assertNull(coordinatorRead(runtime))
+        } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
     @Test fun `real native library checkpoint retries past retained theme dirty stamp and receives peer after cold restart`() = kotlinx.coroutines.test.runTest {

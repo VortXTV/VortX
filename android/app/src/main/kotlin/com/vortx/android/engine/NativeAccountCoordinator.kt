@@ -4,6 +4,7 @@ import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.NativeAccountGateway
+import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
 import com.vortx.android.sync.NativePlaylistProfileGateway
@@ -52,7 +53,31 @@ internal class NativeAccountCoordinator(
     /** For You command identity includes auth/session/operation scope, independent of read stamps. */
     private val captureForYouAccountAuthority: (SessionOwnerSnapshot.Account) -> LocalLibraryMutationAuthority? = { null },
 ) : NativeAccountGateway, NativePlaylistProfileGateway {
-    private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
+    private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession) {
+        private var retired = false
+        private var authenticatedRead: NativeAccountReadCapture? = null
+
+        @Synchronized fun retain(read: NativeAccountReadCapture): Boolean {
+            if (retired || read.account != account) return false
+            val old = authenticatedRead
+            authenticatedRead = read
+            if (old !== read) old?.retire()
+            return true
+        }
+
+        @Synchronized fun clearRead(expected: NativeAccountReadCapture? = null) {
+            if (expected == null || authenticatedRead === expected) {
+                authenticatedRead?.retire()
+                authenticatedRead = null
+            }
+        }
+
+        @Synchronized fun retireRead() {
+            retired = true
+            authenticatedRead?.retire()
+            authenticatedRead = null
+        }
+    }
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
     private val lifecycleLock = Any()
@@ -704,7 +729,7 @@ internal class NativeAccountCoordinator(
             playlistReceipts.retire()
             onAuthorityChanged()
             if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-            mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
+            mounted.getAndSet(null).also { if (it != null) { it.retireRead(); retired.add(it.session) } }
         }
         playlistReceiptChanges.update { value -> value + 1 }
         if (old != null) playlistMountRevisions.value += 1
@@ -859,9 +884,55 @@ internal class NativeAccountCoordinator(
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local migration evidence is not an authenticated cloud source" }
         applyDocumentLocked(account, document, isCurrent)
     }
-    override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, raw: ByteArray, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+
+    /** Retain provenance only on the exact accepted generic mount; it is not mutation authority. */
+    private fun retainAuthenticatedRead(
+        account: SessionOwnerSnapshot.Account,
+        captured: NativeAccountReadCapture,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        if (captured.account != account || !isCurrent() || !accountCurrent(account)) return false
+        val current = mounted.get()?.takeIf {
+            it.account == account && !it.session.requiresRecovery() && !it.session.hasOwnerHistory()
+        } ?: return false
+        val retained = runCatching { captured.retainedCopyFor(account) }.getOrNull() ?: return false
+        if (!current.retain(retained)) { retained.retire(); return false }
+        if (mounted.get() !== current || !isCurrent() || !accountCurrent(account)) {
+            current.clearRead(retained)
+            return false
+        }
+        return true
+    }
+
+    override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, raw: ByteArray, isCurrent: () -> Boolean): Boolean =
+        applyRawDocumentInternal(account, raw, null, isCurrent)
+
+    override suspend fun applyRawDocument(
+        account: SessionOwnerSnapshot.Account,
+        captured: NativeAccountReadCapture,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        val raw = captured.copyRawForApply(account)
+        return try {
+            applyRawDocumentInternal(account, raw, captured, isCurrent)
+        } finally {
+            raw.fill(0)
+            captured.retire()
+        }
+    }
+
+    private suspend fun applyRawDocumentInternal(
+        account: SessionOwnerSnapshot.Account,
+        raw: ByteArray,
+        captured: NativeAccountReadCapture?,
+        isCurrent: () -> Boolean,
+    ): Boolean = mutex.withLock {
+        if (captured != null) check(captured.account == account) { "Authenticated account read owner changed" }
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
+        // Revoke the exact current mount's old baseline before parsing into any mutation path.
+        // A later native dispatch/projection/checkpoint failure must not leave old provenance usable.
+        mounted.get()?.takeIf { it.account == account }?.clearRead()
         val exact = NativeOwnerHistoryAccount(raw)
         val document = NativeProfileOverlayWitness.parseAccountDocument(raw)
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local evidence is not a cloud source" }
@@ -874,7 +945,13 @@ internal class NativeAccountCoordinator(
         val incoming = exact.raw("nativeSync")?.let { OHJson.Obj(it) }
         val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
         if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
-            return@withLock applyDocumentLocked(account, document, isCurrent)
+            return@withLock applyDocumentLocked(account, document, isCurrent).let { applied ->
+                if (!applied) return@let false
+                // The primary sync apply has already succeeded. Baseline retention is optional and
+                // limited to known schema 1–5; it must not make ordinary sync acceptance fail.
+                if (captured != null && schema?.let { it in 1L..5L } == true) retainAuthenticatedRead(account, captured, isCurrent)
+                true
+            }
         val native = requireNotNull(incoming) { "Owner-history native carrier missing" }
         require(native.text("scope") == namespace)
         val scope = VortxAccountScope(namespace, native.text("ownerProfileId"))
@@ -900,6 +977,7 @@ internal class NativeAccountCoordinator(
             applyTypedWebsiteEvents(current.session, account, document, active)
             project(current.session)
             check(active() && mounted.get() === current)
+            current.clearRead()
             pendingImport = null
             return@withLock true
         }
@@ -951,6 +1029,7 @@ internal class NativeAccountCoordinator(
             original.withActive { checkpoints.remember(scope) }
             pendingImport = null
             publish(account, session, active)
+            mounted.get()?.takeIf { it.account == account }?.clearRead()
         } catch (failure: Throwable) {
             if (failure is NativeOwnerHistoryCoordinator.Uncertain) uncertainHistoryAccounts.add(account.id)
             candidate?.let { owned -> runCatching { retireUnpublished(account, owned) }.onFailure { failure.addSuppressed(it) } }
@@ -985,6 +1064,9 @@ internal class NativeAccountCoordinator(
                                            operationCurrent: () -> Boolean = isCurrent): Boolean {
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native account changed" }
+        // All callers share this transaction helper. Revoke the old authenticated baseline before
+        // it can dispatch or checkpoint any native mutation, including calls outside raw sync apply.
+        mounted.get()?.takeIf { it.account == account }?.clearRead()
         val operationJob = currentCoroutineContext()[Job]
         val document = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(incomingDocument))
         val parsed = VortXSyncDoc.parse(document)
