@@ -27,6 +27,19 @@ struct XperienceFileImportTicket: Identifiable {
     var generation: UUID { admission.generation }
 }
 
+/// A view may only submit gestures for the exact presentation that rendered them.
+/// Construction stays beside the model; matching IDs never authorize a newer lease.
+struct XperiencePresentationIdentity: Equatable {
+    fileprivate let id = UUID()
+    fileprivate let generation: UUID
+    fileprivate init(generation: UUID) { self.generation = generation }
+}
+
+struct XperienceSaveConfirmation: Identifiable, Equatable {
+    let id: UUID
+    fileprivate init() { id = UUID() }
+}
+
 enum XperienceHomeRoute: Hashable { case browser }
 
 struct XperienceBrowserRoute: Hashable {
@@ -65,8 +78,10 @@ final class XperienceCollectionsViewModel: ObservableObject {
     @Published private(set) var generation = UUID()
     @Published private(set) var busy = false
     @Published private(set) var message: String?
-    @Published var label = "Imported collections"
-    @Published var destination = "append"
+    @Published private(set) var label = "Imported collections"
+    @Published private(set) var destination = "append"
+    @Published private(set) var previewIdentity: XperiencePresentationIdentity?
+    @Published private(set) var savedIdentity: XperiencePresentationIdentity?
 
     private var lease: XperienceImportLease?
     private var installed = XperienceInstalledCatalogs.Snapshot.empty
@@ -81,6 +96,7 @@ final class XperienceCollectionsViewModel: ObservableObject {
     private var saveRequestID = UUID()
     private var pending: Commit?
     private struct Commit {
+        let confirmation = XperienceSaveConfirmation()
         let generation: UUID
         let lease: XperienceImportLease
         let document: XperienceCollections.Document
@@ -109,7 +125,7 @@ final class XperienceCollectionsViewModel: ObservableObject {
     /// Called at the original file/paste gesture, before presenting a chooser or reading asynchronously.
     @discardableResult func beginImport() -> Bool {
         stop()
-        namespaces = []
+        namespaces = []; savedIdentity = nil
         generation = UUID()
         do {
             let captured = try store.capture()
@@ -123,6 +139,7 @@ final class XperienceCollectionsViewModel: ObservableObject {
             lease = captured
             installed = registry
             namespaces = saved
+            savedIdentity = .init(generation: generation)
             message = nil
             return true
         } catch {
@@ -246,9 +263,12 @@ final class XperienceCollectionsViewModel: ObservableObject {
         }
     }
 
-    func reviewSaved(_ field: String) {
-        guard isLive else { retireIfStale(); return }
-        guard beginImport(), let namespace = namespaces.first(where: { $0.field == field }) else { return }
+    func reviewSaved(_ field: String, original: XperiencePresentationIdentity) {
+        // Admit the rendered list before touching work. Keep its original lease and raw CAS;
+        // a delayed row must never authorize itself by capturing the latest profile.
+        guard !busy, savedIdentity == original, accepts(original.generation),
+              let namespace = namespaces.first(where: { $0.field == field }) else { return }
+        stop()
         destination = namespace.field
         label = namespace.label
         installPreview(namespace.document, existingMappings: namespace.bindings)
@@ -274,6 +294,7 @@ final class XperienceCollectionsViewModel: ObservableObject {
             }
         }
         rebuildBindingRows()
+        previewIdentity = .init(generation: generation)
     }
 
     private func rebuildBindingRows() {
@@ -312,28 +333,48 @@ final class XperienceCollectionsViewModel: ObservableObject {
         }
     }
 
-    func chooseInstance(row: String, choice: String) {
-        guard isLive else { retireIfStale(); return }
+    private func acceptsPreview(_ original: XperiencePresentationIdentity) -> Bool {
+        !busy && preview != nil && previewIdentity == original && accepts(original.generation)
+    }
+
+    func setLabel(_ value: String, original: XperiencePresentationIdentity) {
+        guard acceptsPreview(original) else { return }
+        label = value
+    }
+
+    func setDestination(_ field: String, original: XperiencePresentationIdentity) {
+        guard acceptsPreview(original), field == "append" || namespaces.contains(where: { $0.field == field }) else { return }
+        destination = field
+    }
+
+    func chooseInstance(row: String, choice: String, original: XperiencePresentationIdentity) {
+        guard acceptsPreview(original), choices[row] != nil else { return }
         if choice == "unavailable" { mappings.removeValue(forKey: row) }
         else if let mapping = choices[row]?[choice] { mappings[row] = mapping }
         rebuildBindingRows()
     }
 
     /// Capture all commit inputs before the replacement confirmation becomes visible.
-    func stageSave() -> Bool {
-        guard !busy, let lease, store.isCurrent(lease), let preview else { retireIfStale(); return false }
+    func stageSave(_ original: XperiencePresentationIdentity) -> XperienceSaveConfirmation? {
+        guard acceptsPreview(original), let lease, store.isCurrent(lease), let preview else { return nil }
         let replacement = destination == "append" ? nil : namespaces.first { $0.field == destination }
-        guard destination == "append" || replacement != nil else { message = "Choose an available saved import."; return false }
-        pending = Commit(generation: generation, lease: lease, document: preview,
-                         label: label, bindings: mappings, replacement: replacement)
-        if replacement == nil { commitStaged() }
-        return replacement != nil
+        guard destination == "append" || replacement != nil else { message = "Choose an available saved import."; return nil }
+        let commit = Commit(generation: generation, lease: lease, document: preview,
+                            label: label, bindings: mappings, replacement: replacement)
+        pending = commit
+        if replacement == nil { commitStaged(commit.confirmation); return nil }
+        return commit.confirmation
     }
 
-    func cancelStaged() { pending = nil }
+    func cancelStaged(_ original: XperienceSaveConfirmation) {
+        guard pending?.confirmation == original else { return }
+        pending = nil
+    }
 
-    func commitStaged() {
-        guard let commit = pending, accepts(commit.generation), store.isCurrent(commit.lease) else { pending = nil; retireIfStale(); return }
+    func commitStaged(_ original: XperienceSaveConfirmation) {
+        // An old dialog action cannot confirm or clear a successor's pending replacement.
+        guard let commit = pending, commit.confirmation == original else { return }
+        guard accepts(commit.generation), store.isCurrent(commit.lease) else { pending = nil; retireIfStale(); return }
         pending = nil
         let requestID = UUID()
         saveRequestID = requestID
@@ -352,6 +393,7 @@ final class XperienceCollectionsViewModel: ObservableObject {
                 guard !Task.isCancelled, self.saveRequestID == requestID,
                       self.accepts(commit.generation), self.store.isCurrent(commit.lease) else { return }
                 self.namespaces = try self.store.namespaces(commit.lease)
+                self.savedIdentity = .init(generation: self.generation)
                 self.saveTask = nil
                 self.clearPreview()
                 self.message = "Saved this import to the current profile."
@@ -399,13 +441,14 @@ final class XperienceCollectionsViewModel: ObservableObject {
 
     private func clearPreview() {
         cancelRead()
+        previewIdentity = nil
         preview = nil; bindingRows = []; mappings = [:]; sourceOrder = []; choices = [:]
         pending = nil; busy = false; destination = "append"; label = "Imported collections"
     }
 
     private func retire(_ text: String) {
         stop()
-        namespaces = []; installed = .empty; lease = nil
+        namespaces = []; savedIdentity = nil; installed = .empty; lease = nil
         generation = UUID(); message = text
     }
 
