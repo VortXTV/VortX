@@ -24,6 +24,7 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
     typealias ClearLegacyInvalidated = (_ account: String) -> Void
     typealias PurgeAllLegacy = () -> Void
     typealias PurgeLegacy = (_ account: String) -> Void
+    typealias MutationTransaction = (_ operation: () -> MutationResult) -> MutationResult
 
     private enum VolatileValue {
         case value(String)
@@ -38,6 +39,7 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
     private let clearLegacyInvalidated: ClearLegacyInvalidated
     private let purgeAllLegacy: PurgeAllLegacy
     private let purgeLegacy: PurgeLegacy
+    private let mutationTransaction: MutationTransaction
     private let lock = NSLock()
     private var pendingOverrides: [String: VolatileValue] = [:]
     private var lastKnownValues: [String: VolatileValue] = [:]
@@ -55,7 +57,8 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
         isLegacyInvalidated: @escaping IsLegacyInvalidated,
         clearLegacyInvalidated: @escaping ClearLegacyInvalidated,
         purgeAllLegacy: @escaping PurgeAllLegacy,
-        purgeLegacy: @escaping PurgeLegacy
+        purgeLegacy: @escaping PurgeLegacy,
+        mutationTransaction: @escaping MutationTransaction = { operation in operation() }
     ) {
         self.readSecure = readSecure
         self.writeSecure = writeSecure
@@ -65,6 +68,7 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
         self.clearLegacyInvalidated = clearLegacyInvalidated
         self.purgeAllLegacy = purgeAllLegacy
         self.purgeLegacy = purgeLegacy
+        self.mutationTransaction = mutationTransaction
     }
 
     private func beginTransition(_ account: String) -> (generation: UInt64, needSweep: Bool) {
@@ -323,26 +327,96 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
 
     @discardableResult
     func set(_ value: String?, for account: String) -> CredentialMutationResult {
+        // Preserve ordinary setter intent ordering: a newer set retires an older writer before legacy
+        // cleanup, while cleanup itself remains outside every lock. The file transaction is acquired only
+        // around the durable marker/backend sequence. A busy transaction returns failure without entering
+        // that sequence or publishing a volatile replacement.
         let transition = beginTransition(account)
-
-        purgeLegacySlots(for: account, fullSweep: transition.needSweep) // UserDefaults I/O, outside the lock
-        let accountLock = accountLock(for: account)
-        accountLock.lock()
-        defer { accountLock.unlock() }
-        guard isCurrent(account, generation: transition.generation) else {
-            return .failure
-        }
-        guard markInvalidatedDurably(account) == .success else {
-            return finishFailedMutation(value, account: account, generation: transition.generation)
-        }
-        switch writeSecure(value, account) {                   // SecItem write, serialized per account
-        case .success:
-            guard mutationReadBackMatches(value, account: account) else { // SecItem read, serialized per account
+        purgeLegacySlots(for: account, fullSweep: transition.needSweep)
+        return mutationTransaction {
+            let accountLock = accountLock(for: account)
+            accountLock.lock()
+            defer { accountLock.unlock() }
+            guard isCurrent(account, generation: transition.generation) else { return .failure }
+            guard markInvalidatedDurably(account) == .success else {
                 return finishFailedMutation(value, account: account, generation: transition.generation)
             }
-            return finishSuccessfulMutation(value, account: account, generation: transition.generation)
-        case .failure:
-            return finishFailedMutation(value, account: account, generation: transition.generation)
+            switch writeSecure(value, account) {
+            case .success:
+                guard mutationReadBackMatches(value, account: account) else {
+                    return finishFailedMutation(value, account: account, generation: transition.generation)
+                }
+                return finishSuccessfulMutation(value, account: account, generation: transition.generation)
+            case .failure:
+                return finishFailedMutation(value, account: account, generation: transition.generation)
+            }
+        }
+    }
+
+    /// Replace one exact UTF-8 value only if the same backend bytes and store generation remain
+    /// current. A failed compare does not start a transition or publish a volatile replacement.
+    func replaceConfirmedUTF8(
+        expected: Data,
+        with replacement: Data,
+        account: String
+    ) -> CredentialMutationResult {
+        guard let expectedString = String(data: expected, encoding: .utf8),
+              Data(expectedString.utf8) == expected,
+              let replacementString = String(data: replacement, encoding: .utf8),
+              Data(replacementString.utf8) == replacement else { return .failure }
+
+        lock.lock()
+        let observedGeneration = generations[account, default: 0]
+        let needSweep = !didSweepLegacy
+        didSweepLegacy = true
+        if accountLocks[account] == nil { accountLocks[account] = NSLock() }
+        let accountLock = accountLocks[account]!
+        lock.unlock()
+
+        // Legacy defaults cleanup can synchronously notify observers; it must run before either lock.
+        purgeLegacySlots(for: account, fullSweep: needSweep)
+        return mutationTransaction {
+            accountLock.lock()
+            defer { accountLock.unlock() }
+
+            guard isCurrent(account, generation: observedGeneration),
+                  invalidationState(for: account) == .clear,
+                  case .value(let actual) = readSecure(account),
+                  Data(actual.utf8) == expected,
+                  isCurrent(account, generation: observedGeneration) else { return .failure }
+
+            // Only an admitted transaction with a matching compare may claim a new generation.
+            // A normal setter that began since the snapshot wins without a stale renewal retiring it.
+            lock.lock()
+            guard generations[account, default: 0] == observedGeneration else {
+                lock.unlock()
+                return .failure
+            }
+            let generation = observedGeneration &+ 1
+            generations[account] = generation
+            lock.unlock()
+
+            guard markInvalidatedDurably(account) == .success,
+                  isCurrent(account, generation: generation),
+                  case .success = writeSecure(replacementString, account),
+                  case .value(let readBack) = readSecure(account),
+                  Data(readBack.utf8) == replacement,
+                  isCurrent(account, generation: generation),
+                  clearInvalidationDurably(account) == .success,
+                  isCurrent(account, generation: generation) else {
+                // Never put a credential candidate in the ordinary volatile edit fallback. An uncertain
+                // write keeps the durable invalidation marker and remains unavailable to confirmed readers.
+                return .failure
+            }
+
+            lock.lock()
+            let current = generations[account, default: 0] == generation
+            if current {
+                pendingOverrides.removeValue(forKey: account)
+                lastKnownValues[account] = .value(replacementString)
+            }
+            lock.unlock()
+            return current ? .success : .failure
         }
     }
 
@@ -523,6 +597,104 @@ enum KeychainAtomicFileWriter {
 #endif
 }
 
+/// Nonblocking interprocess transaction for the macOS credential plist. The lock file is a sibling of
+/// credentials.plist, in the same owner-only directory. A recursive local lock lets the store's outer
+/// marker/CAS/readback transaction call the adapter's ordinary `write` without opening a second flock fd.
+/// Independent adapters/processes use independent descriptors and therefore contend on the same flock.
+final class KeychainFileMutationTransaction: @unchecked Sendable {
+    private let directoryURL: URL
+    private let lockURL: URL
+    private let fileManager: FileManager
+    private let recursion = NSRecursiveLock()
+    private var depth = 0
+
+    init(fileURL: URL, fileManager: FileManager = .default) {
+        self.directoryURL = fileURL.deletingLastPathComponent()
+        self.lockURL = URL(fileURLWithPath: fileURL.path + ".lock", isDirectory: false)
+        self.fileManager = fileManager
+    }
+
+    func perform(_ operation: () -> CredentialMutationResult) -> CredentialMutationResult {
+#if canImport(Darwin)
+        guard recursion.try() else { return .failure }
+        defer { recursion.unlock() }
+        if depth > 0 {
+            depth += 1
+            defer { depth -= 1 }
+            return operation()
+        }
+        guard let opened = openExclusiveLockFile() else { return .failure }
+        while Darwin.flock(opened, LOCK_EX | LOCK_NB) != 0 {
+            if errno == EINTR { continue }
+            _ = Darwin.close(opened)
+            return .failure
+        }
+        depth = 1
+        defer {
+            depth = 0
+            _ = Darwin.flock(opened, LOCK_UN)
+            _ = Darwin.close(opened)
+        }
+        return operation()
+#else
+        return .failure
+#endif
+    }
+
+#if canImport(Darwin)
+    private func openExclusiveLockFile() -> Int32? {
+        do {
+            if !fileManager.fileExists(atPath: directoryURL.path) {
+                try fileManager.createDirectory(
+                    at: directoryURL,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+            }
+        } catch {
+            return nil
+        }
+        let directoryDescriptor = directoryURL.path.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY)
+        }
+        guard directoryDescriptor >= 0 else { return nil }
+        defer { _ = Darwin.close(directoryDescriptor) }
+        var directoryStatus = stat()
+        guard Darwin.fstat(directoryDescriptor, &directoryStatus) == 0,
+              (directoryStatus.st_mode & S_IFMT) == S_IFDIR,
+              directoryStatus.st_uid == Darwin.geteuid(),
+              (directoryStatus.st_mode & 0o077) == 0 else { return nil }
+
+        let lockName = lockURL.lastPathComponent
+        let created = lockName.withCString {
+            Darwin.openat(directoryDescriptor, $0, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        }
+        let opened: Int32
+        if created >= 0 {
+            opened = created
+        } else {
+            guard errno == EEXIST else { return nil }
+            opened = lockName.withCString {
+                Darwin.openat(directoryDescriptor, $0, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+            }
+            guard opened >= 0 else { return nil }
+        }
+        if created >= 0, Darwin.fchmod(opened, mode_t(0o600)) != 0 {
+            _ = Darwin.close(opened)
+            return nil
+        }
+        var lockStatus = stat()
+        guard Darwin.fstat(opened, &lockStatus) == 0,
+              (lockStatus.st_mode & S_IFMT) == S_IFREG,
+              lockStatus.st_uid == Darwin.geteuid(),
+              (lockStatus.st_mode & 0o777) == 0o600 else {
+            _ = Darwin.close(opened)
+            return nil
+        }
+        return opened
+    }
+#endif
+}
+
 /// Failure-aware adapter for the macOS plist credential backend. The injected closures make the exact
 /// persist/read/decode boundary executable without touching the user's real Application Support file.
 final class KeychainFileAdapter: @unchecked Sendable {
@@ -537,14 +709,25 @@ final class KeychainFileAdapter: @unchecked Sendable {
 
     private let readFile: ReadFile
     private let persistFile: PersistFile
-    private let lock = NSLock()
+    private let localLock = NSLock()
+    private let mutationTransaction: (()->CredentialMutationResult) -> CredentialMutationResult
 
-    init(readFile: @escaping ReadFile, persistFile: @escaping PersistFile) {
+    init(
+        readFile: @escaping ReadFile,
+        persistFile: @escaping PersistFile,
+        mutationTransaction: @escaping (() -> CredentialMutationResult) -> CredentialMutationResult = { operation in operation() }
+    ) {
         self.readFile = readFile
         self.persistFile = persistFile
+        self.mutationTransaction = mutationTransaction
+    }
+
+    func withMutationTransaction(_ operation: () -> CredentialMutationResult) -> CredentialMutationResult {
+        mutationTransaction(operation)
     }
 
     convenience init(fileURL: URL, fileManager: FileManager = .default) {
+        let transaction = KeychainFileMutationTransaction(fileURL: fileURL, fileManager: fileManager)
         self.init(
             readFile: {
                 switch KeychainFileAdapter.readOwnerOnlyFile(at: fileURL) {
@@ -564,7 +747,8 @@ final class KeychainFileAdapter: @unchecked Sendable {
                     fromPropertyList: values, format: .binary, options: 0) else { return .failure }
                 return KeychainAtomicFileWriter.persist(
                     data, to: fileURL, fileManager: fileManager)
-            })
+            },
+            mutationTransaction: { operation in transaction.perform(operation) })
     }
 
     private enum OwnerOnlyFileRead {
@@ -617,8 +801,8 @@ final class KeychainFileAdapter: @unchecked Sendable {
 #endif
 
     func read(_ account: String) -> CredentialDurableReadResult {
-        lock.lock()
-        defer { lock.unlock() }
+        localLock.lock()
+        defer { localLock.unlock() }
         switch readFile() {
         case let .value(values):
             return values[account].map(CredentialDurableReadResult.value) ?? .missing
@@ -631,22 +815,24 @@ final class KeychainFileAdapter: @unchecked Sendable {
 
     @discardableResult
     func write(_ value: String?, for account: String) -> CredentialMutationResult {
-        lock.lock()
-        defer { lock.unlock() }
+        mutationTransaction {
+            localLock.lock()
+            defer { localLock.unlock() }
 
-        let current: [String: String]
-        switch readFile() {
-        case let .value(values): current = values
-        case .missing: current = [:]
-        case .failure: return .failure
+            let current: [String: String]
+            switch readFile() {
+            case let .value(values): current = values
+            case .missing: current = [:]
+            case .failure: return .failure
+            }
+            var next = current
+            if let value {
+                next[account] = value
+            } else {
+                next.removeValue(forKey: account)
+            }
+            return persistFile(next)
         }
-        var next = current
-        if let value {
-            next[account] = value
-        } else {
-            next.removeValue(forKey: account)
-        }
-        return persistFile(next)
     }
 }
 
@@ -725,7 +911,8 @@ enum Keychain {
             if UserDefaults.standard.object(forKey: key) != nil {
                 UserDefaults.standard.removeObject(forKey: key)
             }
-        }
+        },
+        mutationTransaction: { operation in fileAdapter.withMutationTransaction(operation) }
     )
 #else
     // MARK: iOS / tvOS system Keychain
@@ -826,5 +1013,14 @@ enum Keychain {
     @discardableResult
     static func set(_ value: String?, for account: String) -> CredentialMutationResult {
         secureStore.set(value, for: account)
+    }
+
+    @discardableResult
+    static func replaceConfirmedUTF8(
+        expected: Data,
+        with replacement: Data,
+        for account: String
+    ) -> CredentialMutationResult {
+        secureStore.replaceConfirmedUTF8(expected: expected, with: replacement, account: account)
     }
 }

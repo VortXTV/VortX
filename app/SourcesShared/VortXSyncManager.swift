@@ -2850,6 +2850,135 @@ final class VortXSyncManager: ObservableObject {
         return true
     }
 
+    private struct RenewalClaims {
+        let accountID: String
+        let version: UInt64
+        let expiryMilliseconds: UInt64
+    }
+
+    private static func decodeCanonicalBase64URL(_ encoded: Substring, maximumBytes: Int) -> Data? {
+        let raw = String(encoded)
+        guard !raw.isEmpty, raw.utf8.count <= maximumBytes,
+              raw.utf8.allSatisfy({
+                  ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+                    || ($0 >= 48 && $0 <= 57) || $0 == 45 || $0 == 95
+              }) else { return nil }
+        let standard = raw.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let padded = standard + String(repeating: "=", count: (4 - standard.count % 4) % 4)
+        guard let decoded = Data(base64Encoded: padded),
+              decoded.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "") == raw else { return nil }
+        return decoded
+    }
+
+    private static func exactSafeUnsignedInteger(_ raw: Data) -> UInt64? {
+        guard !raw.isEmpty,
+              raw.count <= 16,
+              raw.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              raw.count == 1 || raw.first != 48,
+              let text = String(data: raw, encoding: .ascii),
+              let value = UInt64(text),
+              value <= 9_007_199_254_740_991 else { return nil }
+        return value
+    }
+
+    /// Validate only the custom two-segment payload.signature format. The signature is checked
+    /// for canonical base64url shape and 32-byte length; it is never verified by the client.
+    private static func renewalClaims(
+        _ raw: String,
+        expectedAccountID: String,
+        nowMilliseconds: UInt64
+    ) -> RenewalClaims? {
+        guard raw.utf8.count <= 4096 else { return nil }
+        let segments = raw.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count == 2,
+              let payload = decodeCanonicalBase64URL(segments[0], maximumBytes: 2048),
+              let signature = decodeCanonicalBase64URL(segments[1], maximumBytes: 64),
+              signature.count == 32,
+              let accountScope = CredentialScope(canonicalRemoteAccountID: expectedAccountID),
+              let object = try? OwnerHistoryExactJSON.Object(payload),
+              let accountID = try? object.text("a"),
+              let claimScope = CredentialScope(canonicalRemoteAccountID: accountID),
+              claimScope == accountScope,
+              accountID == expectedAccountID,
+              let versionBytes = try? object.required("v"),
+              let version = exactSafeUnsignedInteger(versionBytes),
+              let expiryBytes = try? object.required("exp"),
+              let expiry = exactSafeUnsignedInteger(expiryBytes),
+              expiry > nowMilliseconds else { return nil }
+
+        let lifetime: UInt64 = 121 * 24 * 60 * 60 * 1000
+        let (latestAllowed, overflow) = nowMilliseconds.addingReportingOverflow(lifetime)
+        guard !overflow, expiry <= latestAllowed else { return nil }
+        return RenewalClaims(accountID: accountID, version: version, expiryMilliseconds: expiry)
+    }
+
+    /// Replace only the token field in the exact persisted raw tuple. Unknown future fields and
+    /// every non-token value remain raw slices; the Keychain CAS compares exact UTF-8 bytes.
+    private func storeSessionRenewal(
+        _ candidate: String?,
+        sentToken: String,
+        capture: CredentialScopeRegistry.Capture
+    ) {
+        let nowMilliseconds = Self.sessionNowMilliseconds()
+        guard nowMilliseconds > 0,
+              let candidate, isSignedIn, isCurrent(capture),
+              accountReconnectFailureCapture != capture,
+              let currentAccount = account, let currentDataKey = dataKey,
+              token == sentToken,
+              let prior = Self.renewalClaims(
+                  sentToken, expectedAccountID: currentAccount.id,
+                  nowMilliseconds: nowMilliseconds),
+              let next = Self.renewalClaims(
+                  candidate, expectedAccountID: currentAccount.id,
+                  nowMilliseconds: nowMilliseconds),
+              prior.version == next.version,
+              next.expiryMilliseconds > prior.expiryMilliseconds else { return }
+
+        guard case .value(let storedRaw) = Keychain.confirmedString(kcAccount) else { return }
+        let storedBytes = Data(storedRaw.utf8)
+        guard let stored = try? OwnerHistoryExactJSON.Object(storedBytes),
+              let storedToken = try? stored.text("token"),
+              storedToken == sentToken,
+              let accountBytes = try? stored.required("account"),
+              let storedAccountObject = try? OwnerHistoryExactJSON.Object(accountBytes),
+              let storedAccountID = try? storedAccountObject.text("id"),
+              storedAccountID == currentAccount.id,
+              CredentialScope(canonicalRemoteAccountID: storedAccountID)
+                == CredentialScope(canonicalRemoteAccountID: currentAccount.id),
+              let storedAccount = try? JSONDecoder().decode(Account.self, from: accountBytes),
+              storedAccount == currentAccount,
+              CredentialScope(canonicalRemoteAccountID: storedAccountID)
+                == CredentialScope(canonicalRemoteAccountID: currentAccount.id),
+              let storedDataKey = try? stored.text("dataKey"),
+              storedDataKey == currentDataKey.base64EncodedString(),
+              Data(base64Encoded: storedDataKey) == currentDataKey,
+              isSignedIn, isCurrent(capture), accountReconnectFailureCapture != capture,
+              token == sentToken, account == currentAccount, dataKey == currentDataKey else { return }
+
+        var replacement = stored
+        guard let tokenBytes = try? OwnerHistoryExactJSON.string(candidate) else { return }
+        replacement.set("token", tokenBytes)
+        guard let replacementBytes = try? replacement.encoded(),
+              Keychain.replaceConfirmedUTF8(
+                  expected: storedBytes, with: replacementBytes, for: kcAccount) == .success,
+              case .value(let confirmedRaw) = Keychain.confirmedString(kcAccount),
+              Data(confirmedRaw.utf8) == replacementBytes,
+              isSignedIn, isCurrent(capture), accountReconnectFailureCapture != capture,
+              token == sentToken, account == currentAccount, dataKey == currentDataKey else { return }
+        token = candidate
+    }
+
+    private static func sessionNowMilliseconds() -> UInt64 {
+        let milliseconds = Date().timeIntervalSince1970 * 1000
+        guard milliseconds.isFinite, milliseconds > 0,
+              milliseconds <= 9_007_199_254_740_991 else { return 0 }
+        return UInt64(milliseconds.rounded(.down))
+    }
+
     private func persist(
         token: String,
         account: Account,
@@ -2919,6 +3048,7 @@ final class VortXSyncManager: ObservableObject {
         receiveETag: ((String?) -> Void)? = nil
     ) async -> (Int, [String: Any]?) {
         if let credentialCapture, !isCurrent(credentialCapture) { return (0, nil) }
+        let sentStoredToken = auth && bearer == nil ? token : nil
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -2945,7 +3075,21 @@ final class VortXSyncManager: ObservableObject {
             )
             if let credentialCapture, !isCurrent(credentialCapture) { return (0, nil) }
             receiveETag?(response.etag)
-            if response.statusCode == 304 { return response.data.isEmpty ? (304, nil) : (0, nil) }
+            if response.statusCode == 304 {
+                guard response.data.isEmpty else { return (0, nil) }
+                if method == "GET", path == "/v1/backup",
+                   let ifNoneMatch, ifNoneMatch >= 0,
+                   response.etag == "\"\(ifNoneMatch)\"",
+                   auth, bearer == nil, let sentStoredToken, let credentialCapture {
+                    storeSessionRenewal(response.sessionRenewal, sentToken: sentStoredToken, capture: credentialCapture)
+                }
+                return (304, nil)
+            }
+            if (200..<300).contains(response.statusCode),
+               auth, bearer == nil, !path.hasPrefix("/v1/auth/"), !path.hasPrefix("/v1/qr/"),
+               let sentStoredToken, let credentialCapture {
+                storeSessionRenewal(response.sessionRenewal, sentToken: sentStoredToken, capture: credentialCapture)
+            }
             let json = (try? AuthenticatedHTTPTransport.jsonObject(from: response.data)) as? [String: Any]
             return (response.statusCode, json)
         } catch { return (0, nil) }

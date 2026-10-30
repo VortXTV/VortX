@@ -32,9 +32,14 @@ struct AuthenticatedHTTPResponse: Sendable {
     let data: Data
     let statusCode: Int
     let etag: String?
+    /// Opaque, bounded renewal candidate. Callers must apply their own credential and account fences.
+    let sessionRenewal: String?
 
-    init(data: Data, statusCode: Int, etag: String? = nil) {
-        self.data = data; self.statusCode = statusCode; self.etag = etag
+    init(data: Data, statusCode: Int, etag: String? = nil, sessionRenewal: String? = nil) {
+        self.data = data
+        self.statusCode = statusCode
+        self.etag = etag
+        self.sessionRenewal = sessionRenewal.flatMap { $0.utf8.count <= 4096 ? $0 : nil }
     }
 }
 
@@ -345,8 +350,12 @@ final class AuthenticatedHTTPTransport: @unchecked Sendable {
                 return
             }
             finish(
-                .success(AuthenticatedHTTPResponse(data: data, statusCode: response.statusCode,
-                                                   etag: response.value(forHTTPHeaderField: "ETag"))),
+                .success(AuthenticatedHTTPResponse(
+                    data: data,
+                    statusCode: response.statusCode,
+                    etag: response.value(forHTTPHeaderField: "ETag"),
+                    sessionRenewal: response.value(forHTTPHeaderField: "X-VortX-Session")
+                )),
                 cancelTask: false
             )
         }

@@ -58,6 +58,7 @@ on:
       - "scripts/test-episode-source-isolation.sh"
       - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
+      - "test/apple-session-renewal/**"
       - "test/native-callback-generation.mjs"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/test-android-native-release-contracts.sh"
@@ -143,6 +144,7 @@ on:
       - "scripts/test-episode-source-isolation.sh"
       - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
+      - "test/apple-session-renewal/**"
       - "test/native-callback-generation.mjs"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/test-android-native-release-contracts.sh"
@@ -379,6 +381,22 @@ jobs:
           test "$auth_status" -eq 0
           node test/mpv-bounded-child.mjs check "$PWD/app/build/auth-recovery/supervisor.json" 0 normal-exit
           bash scripts/test-xperience-export-contracts.sh
+      - name: Session renewal and credential storage regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/session-renewal-receipts
+          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
+          renewal_status=0
+          nice -n 15 node test/mpv-bounded-child.mjs run 600 "$PWD/app/build/session-renewal-receipts/supervisor.json" -- \
+            /bin/bash test/apple-session-renewal/run-hosted.sh "$PWD/app/SourcesShared" \
+            "$PWD/test/apple-session-renewal/source-pins.json" "$PWD" "$PWD/app/build/session-renewal-receipts/scratch" \
+            > app/build/session-renewal-receipts/run.log 2>&1 || renewal_status=$?
+          printf '%s\n' "$renewal_status" > app/build/session-renewal-receipts/status.txt
+          cat app/build/session-renewal-receipts/run.log
+          node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" "$renewal_status"
+          test "$renewal_status" -eq 0
+          node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" 0 normal-exit
       - name: Retain focused regression outputs and failure receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -386,6 +404,7 @@ jobs:
           name: Apple-hotfix-regression-receipts
           path: |
             app/build/auth-recovery/**
+            app/build/session-renewal-receipts/**
             app/build/profile-picker-routing.*/**
             app/build/xperience-export-contracts.*/**
           if-no-files-found: warn

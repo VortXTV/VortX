@@ -1,0 +1,8 @@
+{
+  "AuthenticatedHTTPTransport.swift": "d26b26359a836ca1d018d17ac62f5b0e84391411b2ec8dbd4e5f3a138f8d20cb",
+  "Keychain.swift": "afca0b3c3caf347a287d23fbb8c1aaaa78dc7f6a9ba7810bb9c6146b3730a52e",
+  "VortXSyncManager.swift": "8c41d90d0040a82a34e46816df759c366dc2bfbcccd0262594c1c9d8e40320d8",
+  "CredentialScope.swift": "4a71b1332adba60863fbc1f9e29093dfd76283b3dbabc85bb1450caffbeee28c",
+  "OwnerHistoryExactJSON.swift": "84a6a4db137a134ce282e10347ac3537e9591af45adab93cc5efb11727d18c9d",
+  "KeychainFailureClosedTests.swift": "5f6a10e8fa8e6062bda36906235faa6ca3b5ba48fbf5278086080f6ba21d980e"
+}
