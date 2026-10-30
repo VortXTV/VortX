@@ -7,8 +7,10 @@ on:
       - .github/workflows/xperience-wire-parity.yml
       - test/xperience-wire-parity/**
       - app/SourcesShared/XperienceCollections.swift
+      - app/SourcesShared/XperienceAddonBinding.swift
       - app/SourcesShared/VortxResourceBridge.swift
       - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt
+      - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceAddonBinding.kt
       - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt
       - android/app/src/main/kotlin/com/vortx/android/engine/NativeOwnerHistoryAccount.kt
 

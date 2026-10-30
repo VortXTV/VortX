@@ -25,7 +25,7 @@ struct SwiftFixture {
     }
 
     static func main() throws {
-        guard CommandLine.arguments.count == 3 else { throw FixtureFailure.invalidArguments }
+        guard CommandLine.arguments.count == 5 else { throw FixtureFailure.invalidArguments }
         for token in ["00", "01", "-01", "1.", "1.e1", "+1", ".1", "1e", "1e+", "1e--2"] {
             let input = Data("[{\"id\":\"numeric-grammar\",\"title\":\"Numeric grammar\",\"folders\":[],\"extension\":\(token)}]".utf8)
             do {
@@ -69,5 +69,6 @@ struct SwiftFixture {
         }
         try Data((results.joined(separator: "\n") + "\n").utf8)
             .write(to: output.appendingPathComponent("results.tsv"), options: .withoutOverwriting)
+        try TransportFixture.collect(corpusPath: CommandLine.arguments[3], outputPath: CommandLine.arguments[4])
     }
 }

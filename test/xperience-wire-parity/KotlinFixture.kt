@@ -6,7 +6,7 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 
 fun main(args: Array<String>) {
-    require(args.size == 2)
+    require(args.size == 4)
     for (token in listOf("00", "01", "-01", "1.", "1.e1", "+1", ".1", "1e", "1e+", "1e--2")) {
         val input = """[{"id":"numeric-grammar","title":"Numeric grammar","folders":[],"extension":$token}]""".toByteArray(Charsets.UTF_8)
         try {
@@ -51,4 +51,5 @@ fun main(args: Array<String>) {
         }
     }
     Files.write(output.resolve("results.tsv"), (results.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8), StandardOpenOption.CREATE_NEW)
+    TransportFixture.collect(args[2], args[3])
 }
