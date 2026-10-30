@@ -89,19 +89,19 @@
   },
   "appleBinding": {
     "path": "app/SourcesShared/XperienceAddonBinding.swift",
-    "sha256": "eff14f3b8605cf1bed667bbc2ffed1f62120153e44fc74613bb0e348dfd86171"
+    "sha256": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f"
   },
   "androidBinding": {
     "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceAddonBinding.kt",
-    "sha256": "b49dc2dec79d0c367b363db207ea99193fce29abf8422ea82a73fe263cffc528"
+    "sha256": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268"
   },
   "swiftDocumentFixture": {
     "path": "test/xperience-wire-parity/SwiftFixture.swift",
-    "sha256": "5aadbf06bf95488eca65e7443737f35c23672b34eed730ae322705f54d02edba"
+    "sha256": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732"
   },
   "kotlinDocumentFixture": {
     "path": "test/xperience-wire-parity/KotlinFixture.kt",
-    "sha256": "34b9655cf17767cc4dedb65bfe7564769416a6b68ac10b60025f62d06d2cefac"
+    "sha256": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1"
   },
   "transportSwiftFixture": {
     "path": "test/xperience-wire-parity/TransportFixture.swift",
@@ -124,19 +124,19 @@
     "contractPacket": "xperience-transport-fingerprint-source-v1/final-v2",
     "contractFreezeSHA256": "c74128bf02b58e2bd0a05c3d11a492d3fb693f2c585a7712891e014c2414b0ce",
     "contractReviewReceiptSHA256": "317df0c90f7a3fd6f615ef59ab631b2280b2ef631564d8dc1980a1c05e4041b6",
-    "bindingSourceReviewReceiptSHA256": "317df0c90f7a3fd6f615ef59ab631b2280b2ef631564d8dc1980a1c05e4041b6",
+    "bindingSourceReviewReceiptSHA256": "08f6e784cc849045d59681872e2c9a08660658c1bf3b6b4faf10544d0604b6d2",
     "collectorsPacket": "xperience-transport-collectors-source-v1",
     "collectorsFreezeSHA256": "b43782eb22dfd061eebb007ae34caab55b8107733d3ead0473bdddc560d681c6",
     "collectorsInventorySHA256": "e79afb6cc978f3fe0d0efa9f5e734c6e20f0194b08ebaf56f5b055f951d60806",
     "collectorsReviewReceiptSHA256": "317df0c90f7a3fd6f615ef59ab631b2280b2ef631564d8dc1980a1c05e4041b6",
     "collectorsReviewIdentitySHA256": "87f5ca3fe9757fba8be22f053201268f63531ad4020f90d30dde2870dbe013de",
-    "driverGuardReviewReceiptSHA256": "8b734fa255dffeff84ef2037c025619e7a85bb7340ae5ed2d8e5dcdde0e50f2a",
+    "driverGuardReviewReceiptSHA256": "959fe05a4fffa2abe91283facd6169a0df42e8aaf6e871d1c572e355643afbca",
     "corpusSHA256": "de132e69bd605de930fdbc552534b31216232463e4900de93e4646ec74c1e296",
     "sourceSHA256s": {
-      "appleBinding": "eff14f3b8605cf1bed667bbc2ffed1f62120153e44fc74613bb0e348dfd86171",
-      "androidBinding": "b49dc2dec79d0c367b363db207ea99193fce29abf8422ea82a73fe263cffc528",
-      "swiftDocumentFixture": "5aadbf06bf95488eca65e7443737f35c23672b34eed730ae322705f54d02edba",
-      "kotlinDocumentFixture": "34b9655cf17767cc4dedb65bfe7564769416a6b68ac10b60025f62d06d2cefac",
+      "appleBinding": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f",
+      "androidBinding": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268",
+      "swiftDocumentFixture": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732",
+      "kotlinDocumentFixture": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1",
       "transportSwiftFixture": "1bdd3d8ca1a173da8cce530e592f0f1de8b562a6c74dfb3eadcdaf0cd245efc9",
       "transportKotlinFixture": "978859d1e925fe649ae1d6df244a5bf9502e312c27a0868a4734809e0d3a463b",
       "transportCorpus": "de132e69bd605de930fdbc552534b31216232463e4900de93e4646ec74c1e296",
@@ -149,5 +149,60 @@
     },
     "cases": 52,
     "relations": 6
+  },
+  "normalizationSwiftFixture": {
+    "path": "test/xperience-wire-parity/NormalizationRegressionFixture.swift",
+    "sha256": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd"
+  },
+  "normalizationKotlinFixture": {
+    "path": "test/xperience-wire-parity/NormalizationRegressionFixture.kt",
+    "sha256": "f6c1755df0833a80eee3b2febfa71df32d57dd6c3c3e9807580c80ac31e0a8ce"
+  },
+  "appleCatalogClient": {
+    "path": "app/SourcesShared/XperienceCatalogClient.swift",
+    "sha256": "333a0e787f535770b4731f6385b144d6f50b650aa5393b1bf5b285b915b41144"
+  },
+  "normalizationCheck": {
+    "reviewState": "SOURCE_AND_PORTABLE_REGRESSIONS_SECURITY_REVIEWED",
+    "sourcePacket": "xperience-transport-normalization-source-v2",
+    "sourceFreezeSHA256": "7b1c9bf03dd85557eb18a17a16f1d42806153eefef96c70ffbfcf5cd91bc174e",
+    "sourceInventorySHA256": "c1f0d651012f38d2d9c1ae7eb3ff620282beb940a9ece8adfc587d32c2448858",
+    "originSwiftSHA256": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd",
+    "originKotlinSHA256": "082662d8ec092e6d64256fa9a5af4f841c94a5ff81730f23bb567e5980cd3d22",
+    "sourceReviewReceiptSHA256": "08f6e784cc849045d59681872e2c9a08660658c1bf3b6b4faf10544d0604b6d2",
+    "sourceReviewIdentitySHA256": "924345d2f1ce4aa2d1628c9020e737f6525f604605ded1c44e2d0dceff50065a",
+    "portableHarnessReviewReceiptSHA256": "959fe05a4fffa2abe91283facd6169a0df42e8aaf6e871d1c572e355643afbca",
+    "sourceSHA256s": {
+      "appleBinding": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f",
+      "androidBinding": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268",
+      "swiftDocumentFixture": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732",
+      "kotlinDocumentFixture": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1",
+      "normalizationSwiftFixture": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd",
+      "normalizationKotlinFixture": "f6c1755df0833a80eee3b2febfa71df32d57dd6c3c3e9807580c80ac31e0a8ce",
+      "appleCatalogClient": "333a0e787f535770b4731f6385b144d6f50b650aa5393b1bf5b285b915b41144"
+    },
+    "rosters": {
+      "swift": {
+        "accepted": 15,
+        "rejected": 18,
+        "distinct": 7,
+        "longQueries": 2,
+        "unicodeExpansion": 1,
+        "capacity": 4,
+        "requestProjection": 2,
+        "oldHashRebind": 2,
+        "sourceGuards": 3
+      },
+      "kotlin": {
+        "accepted": 15,
+        "rejected": 19,
+        "distinct": 7,
+        "longQueries": 2,
+        "unicodeExpansion": 1,
+        "capacity": 4,
+        "oldHashRebind": 2,
+        "methods": 4
+      }
+    }
   }
 }

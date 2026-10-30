@@ -52,4 +52,6 @@ fun main(args: Array<String>) {
     }
     Files.write(output.resolve("results.tsv"), (results.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8), StandardOpenOption.CREATE_NEW)
     TransportFixture.collect(args[2], args[3])
+    XperienceTransportIdentityRegression.run()
+    System.err.println("PASS normalization-regressions kotlin accepted=15 rejected=19 distinct=7 longQueries=2 unicodeExpansion=1 capacity=4 oldHashRebind=2 methods=4")
 }

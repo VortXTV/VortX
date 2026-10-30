@@ -70,5 +70,17 @@ struct SwiftFixture {
         try Data((results.joined(separator: "\n") + "\n").utf8)
             .write(to: output.appendingPathComponent("results.tsv"), options: .withoutOverwriting)
         try TransportFixture.collect(corpusPath: CommandLine.arguments[3], outputPath: CommandLine.arguments[4])
+        let sourceDirectory = output.deletingLastPathComponent()
+        let bindingFile = try FileHandle(forReadingFrom: sourceDirectory.appendingPathComponent("XperienceAddonBinding.swift"))
+        defer { try? bindingFile.close() }
+        let clientFile = try FileHandle(forReadingFrom: sourceDirectory.appendingPathComponent("XperienceCatalogClient.swift.readonly"))
+        defer { try? clientFile.close() }
+        let bindingData = try bindingFile.read(upToCount: 256 * 1024 + 1) ?? Data()
+        let clientData = try clientFile.read(upToCount: 256 * 1024 + 1) ?? Data()
+        guard !bindingData.isEmpty, bindingData.count <= 256 * 1024, !clientData.isEmpty, clientData.count <= 256 * 1024,
+              let bindingSource = String(data: bindingData, encoding: .utf8),
+              let catalogClientSource = String(data: clientData, encoding: .utf8) else { throw FixtureFailure.invalidCorpus }
+        try XperienceTransportIdentityRegression.run(bindingSource: bindingSource, catalogClientSource: catalogClientSource)
+        try FileHandle.standardError.write(contentsOf: Data(("PASS normalization-regressions swift accepted=15 rejected=18 distinct=7 longQueries=2 unicodeExpansion=1 capacity=4 requestProjection=2 oldHashRebind=2 sourceGuards=3\n").utf8))
     }
 }

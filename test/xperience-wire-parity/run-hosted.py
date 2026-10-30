@@ -54,6 +54,17 @@ TRANSPORT_RELATIONS = [
     {"kind": "distinct-normalized-bytes-if-admitted", "caseIDs": ["ascii-https", "query-empty"]},
 ]
 TRANSPORT_RUNTIMES = ("apple", "jdk17", "jdk21")
+NORMALIZATION_SOURCE_PATHS = {
+    "normalizationSwiftFixture": "test/xperience-wire-parity/NormalizationRegressionFixture.swift",
+    "normalizationKotlinFixture": "test/xperience-wire-parity/NormalizationRegressionFixture.kt",
+    "appleCatalogClient": "app/SourcesShared/XperienceCatalogClient.swift",
+}
+NORMALIZATION_ROSTERS = {
+    "swift": {"accepted": 15, "rejected": 18, "distinct": 7, "longQueries": 2, "unicodeExpansion": 1,
+              "capacity": 4, "requestProjection": 2, "oldHashRebind": 2, "sourceGuards": 3},
+    "kotlin": {"accepted": 15, "rejected": 19, "distinct": 7, "longQueries": 2, "unicodeExpansion": 1,
+               "capacity": 4, "oldHashRebind": 2, "methods": 4},
+}
 
 
 def require(condition, message):
@@ -585,6 +596,24 @@ def transport_mismatch_witnesses(cases, outputs, report, corpus_sha256):
     return witnesses
 
 
+def normalization_results(output, runtime, cases):
+    require(runtime in TRANSPORT_RUNTIMES and len(output) <= 8192 and len(cases) == 52,
+            "normalization regression output closure/byte limit")
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeError:
+        raise RuntimeError("normalization regression output must be ASCII") from None
+    language = "swift" if runtime == "apple" else "kotlin"
+    summary = "PASS normalization-regressions " + language + " " + " ".join(
+        name + "=" + str(count) for name, count in NORMALIZATION_ROSTERS[language].items())
+    expected = ["transport-case-start\t" + case["id"] for case in cases] + [summary]
+    require(lines == expected, "normalization regression roster/PASS or original collector ID order mismatch")
+    record = {"runtime": runtime, "collectorCases": len(cases), "rosterFields": len(NORMALIZATION_ROSTERS[language]),
+              "roster": NORMALIZATION_ROSTERS[language], "passed": True}
+    emit("normalization-regression-summary", record)
+    return record
+
+
 def main():
     # This guard precedes reads, output directories and every child call.
     require(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_REPOSITORY") == REPOSITORY
@@ -647,6 +676,26 @@ def main():
             and transport_check["modeCounts"] == TRANSPORT_MODE_COUNTS
             and transport_check["cases"] == 52 and transport_check["relations"] == 6,
             "exact transport source/collector/corpus/freeze/review closure remains unfinished")
+    normalization_check = pins["normalizationCheck"]
+    for key, path in NORMALIZATION_SOURCE_PATHS.items():
+        require(pins[key]["path"] == path and type(pins[key]["sha256"]) is str and HEX.fullmatch(pins[key]["sha256"]),
+                "unfinished normalization whole-file pin: " + key)
+    normalization_keys = set(NORMALIZATION_SOURCE_PATHS) | {"appleBinding", "androidBinding", "swiftDocumentFixture", "kotlinDocumentFixture"}
+    require(normalization_check["reviewState"] == "SOURCE_AND_PORTABLE_REGRESSIONS_SECURITY_REVIEWED"
+            and normalization_check["sourcePacket"] == "xperience-transport-normalization-source-v2"
+            and normalization_check["sourceFreezeSHA256"] == "7b1c9bf03dd85557eb18a17a16f1d42806153eefef96c70ffbfcf5cd91bc174e"
+            and normalization_check["sourceInventorySHA256"] == "c1f0d651012f38d2d9c1ae7eb3ff620282beb940a9ece8adfc587d32c2448858"
+            and normalization_check["originSwiftSHA256"] == "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd"
+            and normalization_check["originKotlinSHA256"] == "082662d8ec092e6d64256fa9a5af4f841c94a5ff81730f23bb567e5980cd3d22"
+            and pins["normalizationSwiftFixture"]["sha256"] == normalization_check["originSwiftSHA256"]
+            and pins["appleBinding"]["sha256"] == "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f"
+            and pins["androidBinding"]["sha256"] == "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268"
+            and all(type(normalization_check[key]) is str and HEX.fullmatch(normalization_check[key]) for key in
+                    ("sourceReviewReceiptSHA256", "sourceReviewIdentitySHA256", "portableHarnessReviewReceiptSHA256"))
+            and set(normalization_check["sourceSHA256s"]) == normalization_keys
+            and all(normalization_check["sourceSHA256s"][key] == pins[key]["sha256"] for key in normalization_keys)
+            and normalization_check["rosters"] == NORMALIZATION_ROSTERS,
+            "exact normalization V2 source/portable regression/roster/review join remains unfinished")
     require(pins["hostToolchain"]["kotlinVersion"] == "2.4.21"
             and pins["hostToolchain"]["requiredJDKMajors"] == [17, 21]
             and pins["hostToolchain"]["requiredJDKEnvironment"] == ["JAVA_HOME_17_arm64", "JAVA_HOME_21_arm64"]
@@ -654,7 +703,7 @@ def main():
             and pins["hostToolchain"]["bytecodeTarget"] == 17
             and pins["hostToolchain"]["downloadOrInstallPermitted"] is False, "unreviewed host toolchain requirements")
     require(HEX.fullmatch(pins["appleJSON"]["spanSHA256"]) and HEX.fullmatch(pins["androidJSON"]["spanSHA256"]), "unfinished literal-span pins")
-    source_keys = ("appleDomain", "appleJSON", "androidDomain", "androidJSON", "namespaceSource", "namespaceFixture") + tuple(TRANSPORT_SOURCE_PATHS)
+    source_keys = ("appleDomain", "appleJSON", "androidDomain", "androidJSON", "namespaceSource", "namespaceFixture") + tuple(TRANSPORT_SOURCE_PATHS) + tuple(NORMALIZATION_SOURCE_PATHS)
     source = {key: read_owner(root, pins[key], 128 * 1024 if key == "transportCorpus" else 256 * 1024) for key in source_keys}
     require(source["namespaceFixture"].count(b'@file:JvmName("NamespacePublicApiFixture")') == 1
             and source["namespaceFixture"].count(b'\npackage com.vortx.android.xperience\n') == 1,
@@ -681,7 +730,8 @@ def main():
              "sources": {key: {"path": pins[key]["path"], "bytes": len(data), "sha256": digest(data)} for key, data in source.items()},
              "literalSpans": {"VortxJSON": digest(apple_span), "OHJson": digest(android_span)},
              "androidPreambleSHA256": digest(android_preamble), "finalModel": model, "namespaceCheck": namespace_check,
-             "transportCheck": transport_check, "transportCorpusSHA256": digest(transport_data), "transportCases": len(transport_case_list),
+             "transportCheck": transport_check, "normalizationCheck": normalization_check,
+             "transportCorpusSHA256": digest(transport_data), "transportCases": len(transport_case_list),
              "corpusSHA256": digest(corpus_data), "corpusCases": len(cases), "runDirectory": str(run_dir)}
     generated = {"VortxJSON.swift": actual_import + b"\n" + apple_span,
                  "XperienceCollections.swift": source["appleDomain"],
@@ -693,6 +743,9 @@ def main():
                       "SwiftFixture.swift": "swiftDocumentFixture", "KotlinFixture.kt": "kotlinDocumentFixture",
                       "TransportFixture.swift": "transportSwiftFixture", "TransportFixture.kt": "transportKotlinFixture",
                       "transport-cases.json": "transportCorpus", "test_toolchain_layout.py": "transportGuardTests"}
+    transport_copy.update({"NormalizationRegressionFixture.swift": "normalizationSwiftFixture",
+                           "NormalizationRegressionFixture.kt": "normalizationKotlinFixture",
+                           "XperienceCatalogClient.swift.readonly": "appleCatalogClient"})
     generated.update({name: source[key] for name, key in transport_copy.items()})
     for name, data in generated.items():
         (run_dir / name).write_bytes(data)
@@ -709,13 +762,16 @@ def main():
     graph["generatedInputs"] = {name: digest(data) for name, data in generated.items()}
     graph["fixtureSources"] = {name: digest((fixture / name).read_bytes()) for name in
                                ("SwiftFixture.swift", "KotlinFixture.kt", "NamespacePublicApiFixture.kt", "TransportFixture.swift", "TransportFixture.kt",
+                                "NormalizationRegressionFixture.swift", "NormalizationRegressionFixture.kt",
                                 "transport-cases.json", "run-hosted.py", "source-pins.json", "corpus.tsv", "test_toolchain_layout.py")}
+    graph["readonlySources"] = {"appleCatalogClient": {"path": pins["appleCatalogClient"]["path"],
+        "sha256": digest(source["appleCatalogClient"]), "scratchPath": str(run_dir / "XperienceCatalogClient.swift.readonly"), "compiled": False}}
     graph["kotlinMainClasses"] = ["com.vortx.android.xperience.KotlinFixtureKt", NAMESPACE_MAIN_CLASS]
     swift_inputs = (run_dir / "VortxJSON.swift", run_dir / "XperienceCollections.swift", run_dir / "XperienceAddonBinding.swift",
-                    run_dir / "SwiftFixture.swift", run_dir / "TransportFixture.swift")
+                    run_dir / "SwiftFixture.swift", run_dir / "TransportFixture.swift", run_dir / "NormalizationRegressionFixture.swift")
     kotlin_inputs = (run_dir / "OHJson.kt", run_dir / "XperienceCollections.kt", run_dir / "KotlinFixture.kt",
                      run_dir / "XperienceImportNamespace.kt", run_dir / "NamespacePublicApiFixture.kt",
-                     run_dir / "XperienceAddonBinding.kt", run_dir / "TransportFixture.kt")
+                     run_dir / "XperienceAddonBinding.kt", run_dir / "TransportFixture.kt", run_dir / "NormalizationRegressionFixture.kt")
     graph["compilerInputs"] = {path.name: digest(path.read_bytes()) for path in (*swift_inputs, *kotlin_inputs)}
     graph["swiftCompilerInputOrder"] = [{"path": str(path), "sha256": digest(path.read_bytes())} for path in swift_inputs]
     graph["kotlinCompilerInputOrder"] = [{"path": str(path), "sha256": digest(path.read_bytes())} for path in kotlin_inputs]
@@ -759,8 +815,9 @@ def main():
     run_child("swift-compile", [swiftc, "-swift-version", "6", "-strict-concurrency=complete", "-warnings-as-errors",
               "-j", "1", "-num-threads", "1", "-sdk", sdk, "-o", str(run_dir / "swift-fixture")] + [str(path) for path in swift_inputs],
               240, run_dir, environment)
-    run_child("swift-corpus", [str(run_dir / "swift-fixture"), str(fixture / "corpus.tsv"), str(run_dir / "apple"),
+    swift_output = run_child("swift-corpus", [str(run_dir / "swift-fixture"), str(fixture / "corpus.tsv"), str(run_dir / "apple"),
               str(run_dir / "transport-cases.json"), str(run_dir / "apple-transport")], 30, run_dir, environment)
+    normalization_by_runtime = {"apple": normalization_results(swift_output, "apple", transport_case_list)}
     require(exact_kotlin_classpath(kotlin) == kotlin_classpath, "Kotlin compiler classpath changed before compilation")
     run_child("kotlin-compile", kotlin_command + ["-Werror", "-Xbackend-threads=1", "-jvm-target", "17", "-include-runtime",
               "-d", str(run_dir / "kotlin-fixture.jar")] + [str(path) for path in kotlin_inputs],
@@ -774,11 +831,12 @@ def main():
         runtime_environment["JAVA_HOME"] = jdks[major]["home"]
         runtime_java = str(Path(jdks[major]["home"]) / "bin/java")
         require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed before runtime comparison")
-        run_child("kotlin-corpus-jdk" + str(major), [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-cp", str(jar),
+        kotlin_output = run_child("kotlin-corpus-jdk" + str(major), [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-cp", str(jar),
                   "com.vortx.android.xperience.KotlinFixtureKt",
                   str(fixture / "corpus.tsv"), str(run_dir / ("android-jdk" + str(major))),
                   str(run_dir / "transport-cases.json"), str(run_dir / ("transport-jdk" + str(major)))], 30, run_dir, runtime_environment)
         require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed during runtime comparison")
+        normalization_by_runtime["jdk" + str(major)] = normalization_results(kotlin_output, "jdk" + str(major), transport_case_list)
         require(file_identity(jar, 32 * 1024 * 1024) == jar_identity, "compiled jar changed before Namespace invocation")
         namespace_output = run_child("kotlin-namespace-jdk" + str(major),
                   [runtime_java, "-Xmx256m", "-XX:ActiveProcessorCount=1", "-cp", str(jar), NAMESPACE_MAIN_CLASS],
@@ -787,6 +845,8 @@ def main():
         namespace_by_jdk[major] = namespace_results(namespace_output, major)
         write_json(run_dir / ("namespace-jdk" + str(major) + "-results.json"), namespace_by_jdk[major])
     require(namespace_by_jdk[17] == namespace_by_jdk[21], "Namespace assertion summaries differ across required JDKs")
+    require(normalization_by_runtime["jdk17"]["roster"] == normalization_by_runtime["jdk21"]["roster"], "normalization JDK roster mismatch")
+    write_json(run_dir / "normalization-regressions.json", normalization_by_runtime)
     apple = read_results(run_dir / "apple", cases)
     android = {major: read_results(run_dir / ("android-jdk" + str(major)), cases) for major in (17, 21)}
     failures = []
@@ -835,6 +895,8 @@ def main():
     summary["transportPassed"] = transport_report["summary"]["passed"]
     summary["transportCases"] = len(transport_case_list)
     summary["transportRuntimeComparisons"] = len(transport_case_list) * 2
+    summary["normalizationRegressionsPassed"] = True
+    summary["normalizationRuntimes"] = list(TRANSPORT_RUNTIMES)
     summary["passed"] = not failures and transport_report["summary"]["passed"]
     summary["scope"] = "hosted document/Namespace/transport producer cases only; Android/libcore/device/network/account/UI/native/whole-profile unproven"
     write_json(run_dir / "comparison.json", {"summary": summary, "failures": failures,
