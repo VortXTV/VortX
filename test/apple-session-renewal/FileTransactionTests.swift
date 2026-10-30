@@ -5,7 +5,7 @@ import Darwin
 
 private enum FileTestFailure: Error { case failed }
 @main struct FileTransactionTests {
-    static let fm = FileManager.default
+    static var fm: FileManager { FileManager() }
     static func check(_ value: Bool, _ label: String) throws {
         if !value { print("FAIL " + label); throw FileTestFailure.failed }
     }
