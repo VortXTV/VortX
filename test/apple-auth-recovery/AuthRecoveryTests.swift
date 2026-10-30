@@ -97,7 +97,7 @@ enum ObservedPull: Equatable, Sendable { case doc, ownerHistory, unchanged(Int),
     var ownerAcquisitionCalls = 0
     var lateAuthMarkerDuringOwnerAcquisition = false
     var changeKeyDuringOwnerAcquisition = false
-    var heldRequest: CheckedContinuation<(Int, [String: Any]?, String?), Never>?
+    var heldRequest: CheckedContinuation<(Int, String?), Never>?
     static let xperienceExportObservation = XperienceObservationFixture()
 
     struct Account: Equatable {
@@ -116,13 +116,13 @@ enum ObservedPull: Equatable, Sendable { case doc, ownerHistory, unchanged(Int),
         case .immediate(let status, let body, let etag): receiveETag?(etag); return (status, body)
         case .hold:
             let result = await withCheckedContinuation { heldRequest = $0 }
-            receiveETag?(result.2); return (result.0, result.1)
+            receiveETag?(result.1); return (result.0, nil)
         }
     }
-    func releaseHeldRequest(status: Int, body: [String: Any]? = nil, etag: String? = nil) {
+    func releaseHeldRequest(status: Int, etag: String? = nil) {
         guard let held = heldRequest else { preconditionFailure("no held pull") }
         heldRequest = nil
-        held.resume(returning: (status, body, etag))
+        held.resume(returning: (status, etag))
     }
     func openSyncDocument(_ stored: String, version: Int) -> Data? { openDocumentCalls += 1; return Data(stored.utf8) }
     static func decodeDecryptedSyncDocument(_ plaintext: Data) throws -> [String: Any] { ["decoded": true] }
