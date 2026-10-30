@@ -53,6 +53,12 @@ class StremioXViewModelFactory(
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T = when {
+        modelClass.isAssignableFrom(XperienceCollectionsViewModel::class.java) -> {
+            val app = requireNotNull(appContext?.applicationContext as? com.vortx.android.VortXApplication) {
+                "Xperience requires the actual application account gateway"
+            }
+            XperienceCollectionsViewModel(app.nativeStreamingAccounts(), app.xperienceCatalogGateway()) as T
+        }
         modelClass.isAssignableFrom(HomeViewModel::class.java) -> HomeViewModel(
             repo = repo,
             railPreferences = appContext?.let(HomeRailPreferences::shared),

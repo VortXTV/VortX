@@ -34,6 +34,10 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/sync/VortXSyncManager*' 
     'com/vortx/android/sync/NativeAccountReadCapture*' 'com/vortx/android/sync/NativeAccountMountToken*' \
     'com/vortx/android/sync/NativeHostUploadAcknowledgment*' \
     'com/vortx/android/sync/NativeAccountUploadCurrency*' \
+    'com/vortx/android/engine/NativeCatalogRepository*' 'com/vortx/android/engine/XperienceInstalledCatalogSnapshot*' \
+    'com/vortx/android/engine/XperienceCatalogRequestOutcome*' 'com/vortx/android/engine/XperienceCatalogConsumerID*' \
+    'com/vortx/android/engine/NativeXperienceCatalog*' 'com/vortx/android/xperience/XperienceImportStore*' \
+    'com/vortx/android/ui/viewmodel/XperienceCollectionsViewModel*' 'com/vortx/android/ui/viewmodel/StremioXViewModelFactory*' \
     'com/vortx/android/sync/NativeXperienceProfileGateway*' 'com/vortx/android/engine/NativeXperienceWrite*' \
     'com/vortx/android/xperience/XperienceCollections*' 'com/vortx/android/xperience/XperienceImportNamespace*' \
     'com/vortx/android/xperience/XperienceAddonBinding*' \
@@ -91,6 +95,9 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/xperience/XperienceCollections.kt" "$source_dir/xperience/XperienceImportNamespace.kt" \
     "$source_dir/xperience/XperienceAddonBinding.kt" \
     "$source_dir/sync/NativeSyncPublicationPolicy.kt" "$source_dir/engine/NativeAccountCoordinator.kt" \
+    "$source_dir/engine/NativeCatalogRepository.kt" "$source_dir/engine/NativeXperienceCatalogGateway.kt" \
+    "$source_dir/xperience/XperienceImportStore.kt" "$source_dir/ui/viewmodel/XperienceCollectionsViewModel.kt" \
+    "$source_dir/ui/viewmodel/ViewModelFactory.kt" \
     "$source_dir/sync/NativeSettingsFence.kt" "$source_dir/engine/NativePlaylistAccountComposer.kt" \
     "$source_dir/engine/NativeOwnerHistoryAccount.kt" "$source_dir/engine/NativeOwnAccountSources.kt" \
     "$source_dir/engine/NativeRawHostPreferences.kt" "$source_dir/engine/VortxNativeRuntime.kt" \
@@ -114,6 +121,9 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/engine/NativeHostPreferencesTest.kt" "$test_source/engine/NativeWebsiteProfileEditsTest.kt" \
     "$test_source/engine/NativeRawHostPreferencesTest.kt" "$test_source/engine/NativeOwnerHistoryCompatibilityTest.kt" \
     "$test_source/engine/NativeXperienceWriteTest.kt" \
+    "$test_source/engine/NativeXperienceCatalogSourceTest.kt" \
+    "$test_source/ui/viewmodel/XperienceCollectionsCallerSourceControls.kt" \
+    "$test_source/xperience/XperienceImportStoreSourceControls.kt" \
     -d "$test_dir/classes"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx768m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -131,3 +141,13 @@ cd "$repo_root/android/app"
     com.vortx.android.engine.NativeXperienceWriteTest \
     com.vortx.android.engine.NativeWebsiteProfileEditsTest
 printf 'Retained verification directory: %s\n' "$test_dir"
+if [[ "${VORTX_XPERIENCE_CALLER_CONTROLS:-0}" == 1 ]]; then
+    "$java_bin" -Xmx512m -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
+        com.vortx.android.engine.NativeXperienceCatalogSourceTest 2>&1 | tee "$test_dir/xperience-catalog-controlled.log"
+    "$java_bin" -Xmx512m -cp "$test_dir/classes:$test_cp" com.vortx.android.ui.viewmodel.XperienceCollectionsCallerSourceControls \
+        2>&1 | tee "$test_dir/xperience-caller-controlled.log"
+    "$java_bin" -Xmx512m -cp "$test_dir/classes:$test_cp" com.vortx.android.xperience.XperienceImportStoreSourceControls \
+        2>&1 | tee "$test_dir/xperience-store-controlled.log"
+else
+    printf '%s\n' 'UNRUN: separately opted Xperience catalog5/caller8 and unchanged Store14 controls. Inventory is not an execution result.'
+fi

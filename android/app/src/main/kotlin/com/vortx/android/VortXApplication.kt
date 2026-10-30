@@ -128,6 +128,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && authority.admit(action)
             } }
         } }, onAuthorityChanged = {
+            if (xperienceCatalogDelegate.isInitialized()) xperienceCatalogDelegate.value.invalidateDeferred()
             com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
             com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority()
             com.vortx.android.foryou.ForYouStore.shared(this).invalidateNativeAuthority()
@@ -146,6 +147,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             gate
         } }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator = nativeAccounts
+    private val xperienceCatalogDelegate = lazy {
+        com.vortx.android.engine.NativeXperienceCatalogAccess(nativeAccounts, nativeRepository, applicationScope)
+    }
+    internal fun xperienceCatalogGateway(): com.vortx.android.engine.NativeXperienceCatalogGateway = xperienceCatalogDelegate.value
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess(
         publicationAdmission = { runtime, action ->
             val account = nativeAccounts.accountFor(runtime)
@@ -219,6 +224,8 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // Playlist receipts survive same-owner native metadata/settings refreshes, but not an
         // admitted profile/account/credential boundary. This callback is local-only on ProfileStore's lane.
         ProfileStore.sharedOrNull()?.addPlaylistScopeTransitionListener { transition ->
+            if (transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY && xperienceCatalogDelegate.isInitialized())
+                xperienceCatalogDelegate.value.invalidateDeferred()
             if (!savedPlaylistStoreDelegate.isInitialized()) return@addPlaylistScopeTransitionListener
             when (transition) {
                 PlaylistScopeTransition.PROJECTION_REFRESH -> savedPlaylistStore.nativeProjectionWillChange()

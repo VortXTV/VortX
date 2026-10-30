@@ -29,6 +29,10 @@ internal class XperienceImportStore(
     /** Identity tokens retain no gateway target, raw register or Saved authority. */
     class Opening internal constructor(internal val identity: Any)
     class RecordHandle internal constructor(internal val identity: Any, internal val field: String)
+    /** Local immutable selection only. Capture is cheap and never calls native under monitor.
+     * The catalog adapter must admit this EXACT genuine Snapshot on IO before/after any await. */
+    internal class Observation internal constructor(internal val identity: Any, internal val request: Long,
+        internal val snapshot: NativeXperienceProfileGateway.Snapshot, internal val saved: XperienceImportNamespace.Saved?)
     enum class RecordKind { SUPPORTED, READ_ONLY, TOMBSTONE }
     data class RecordSummary(val handle: RecordHandle, val label: String?, val kind: RecordKind) {
         val editable: Boolean get() = kind == RecordKind.SUPPORTED
@@ -39,7 +43,9 @@ internal class XperienceImportStore(
     enum class Failure { UNAVAILABLE, STALE, STALE_REGISTER, READ_ONLY, MISSING, NAMESPACE_OCCUPIED,
         REJECTED, CANCELLED, SUPERSEDED }
     data class State(val phase: Phase = Phase.IDLE, val opening: Opening? = null,
-                     val records: List<RecordSummary> = emptyList(), val failure: Failure? = null)
+                     val records: List<RecordSummary> = emptyList(), val failure: Failure? = null,
+                     /** Local terminal correlation only; never a live opening or authority. */
+                     internal val terminalOpening: Opening? = null)
 
     private class Source(val snapshot: NativeXperienceProfileGateway.Snapshot) {
         val identity = Any()
@@ -79,11 +85,17 @@ internal class XperienceImportStore(
 
     /** A deliberate user opening. Capture is synchronous BEFORE any child launch/suspension.
      * No completion, retry or failed edit calls this method on the user's behalf. */
-    fun open(): Opening? {
+    fun open(): Opening? = openFrom { gateway.captureXperienceProfile() }
+
+    /** Caller consumed an original cheap opening stage on IO; no fresh account capture here. */
+    internal fun openCaptured(snapshot: NativeXperienceProfileGateway.Snapshot, callerCurrent: () -> Boolean): Opening? =
+        openFrom(callerCurrent) { Result.success(snapshot) }
+
+    private fun openFrom(callerCurrent: () -> Boolean = { true }, capture: () -> Result<NativeXperienceProfileGateway.Snapshot>): Opening? {
         if (Thread.holdsLock(monitor)) return null
         try {
         val cut = synchronized(monitor) {
-            if (closed) return null
+            if (closed || !callerCurrent()) return null
             val previous = active to worker
             active = null; worker = null
             val request = ++generation
@@ -99,7 +111,7 @@ internal class XperienceImportStore(
             openingFailure(cut.first, Failure.UNAVAILABLE)
             return null
         }
-        val captured = try { gateway.captureXperienceProfile() }
+        val captured = try { capture() }
         catch (cancelled: CancellationException) {
             openingFailure(cut.first, Failure.CANCELLED)
             throw cancelled
@@ -115,7 +127,7 @@ internal class XperienceImportStore(
         }
         val source = Source(snapshot)
         val task = synchronized(monitor) {
-            if (closed || generation != cut.first) null else {
+            if (closed || generation != cut.first || !callerCurrent()) null else {
                 active = source
                 mutableState.value = State(Phase.LOADING, source.opening)
                 if (!currentLocked(source, cut.first)) null else {
@@ -128,6 +140,19 @@ internal class XperienceImportStore(
         task.start()
         return source.opening
         } finally { drainRetirements() }
+    }
+
+    internal fun observation(opening: Opening): Observation? = synchronized(monitor) {
+        val source = active?.takeIf { it.identity === opening.identity && it.catalog != null && worker == null } ?: return null
+        if (closed) null else Observation(source.identity, generation, source.snapshot, null)
+    }
+    internal fun observation(handle: RecordHandle): Observation? = synchronized(monitor) {
+        val source = active?.takeIf { it.identity === handle.identity && worker == null } ?: return null
+        val saved = source.catalog?.records?.get(handle.field)?.saved ?: return null
+        if (closed) null else Observation(source.identity, generation, source.snapshot, saved)
+    }
+    internal fun observationIsCurrent(original: Observation): Boolean = synchronized(monitor) {
+        !closed && active?.identity === original.identity && generation == original.request
     }
 
     /** Read-only display data; command methods still require the original opaque record handle. */
@@ -154,8 +179,8 @@ internal class XperienceImportStore(
 
     fun append(opening: Opening, document: XperienceCollections.Document, label: String,
                namespace: UUID = UUID.randomUUID(),
-               bindings: Map<String, XperienceImportNamespace.Binding> = emptyMap()): Job? =
-        submit(opening.identity) { source ->
+               bindings: Map<String, XperienceImportNamespace.Binding> = emptyMap(), caller: Job? = null): Job? =
+        submit(opening.identity, caller) { source ->
             if (XperienceImportNamespace.field(namespace) in checkNotNull(source.catalog).fields) {
                 Action.Denied(Failure.NAMESPACE_OCCUPIED) // Tombstone/future presence is never absence.
             } else Action.Append(document, label, namespace, bindings.toMap())
@@ -164,8 +189,8 @@ internal class XperienceImportStore(
     /** Refresh and label replacement use the exact Saved baseline shown by this handle. */
     fun replace(handle: RecordHandle, document: XperienceCollections.Document,
                 label: String? = null,
-                bindings: Map<String, XperienceImportNamespace.Binding>? = null): Job? =
-        submit(handle.identity) { source ->
+                bindings: Map<String, XperienceImportNamespace.Binding>? = null, caller: Job? = null): Job? =
+        submit(handle.identity, caller) { source ->
             val record = checkNotNull(source.catalog).records[handle.field]
             val saved = record?.saved
             when {
@@ -175,8 +200,8 @@ internal class XperienceImportStore(
             }
         }
 
-    fun rebind(handle: RecordHandle, bindings: Map<String, XperienceImportNamespace.Binding>): Job? =
-        submit(handle.identity) { source ->
+    fun rebind(handle: RecordHandle, bindings: Map<String, XperienceImportNamespace.Binding>, caller: Job? = null): Job? =
+        submit(handle.identity, caller) { source ->
             val record = checkNotNull(source.catalog).records[handle.field]
             val saved = record?.saved
             when {
@@ -187,7 +212,7 @@ internal class XperienceImportStore(
         }
 
     /** Confirmation must call with its original rendered handle. There is no Namespace.delete. */
-    fun delete(handle: RecordHandle): Job? = submit(handle.identity) { source ->
+    fun delete(handle: RecordHandle, caller: Job? = null): Job? = submit(handle.identity, caller) { source ->
         val record = checkNotNull(source.catalog).records[handle.field]
         when {
             record == null -> Action.Denied(Failure.MISSING)
@@ -196,7 +221,7 @@ internal class XperienceImportStore(
         }
     }
 
-    private fun submit(identity: Any, select: (Source) -> Action): Job? {
+    private fun submit(identity: Any, caller: Job?, select: (Source) -> Action): Job? {
         if (Thread.holdsLock(monitor)) return null
         try {
         val cancelled: Job?
@@ -209,11 +234,13 @@ internal class XperienceImportStore(
             if (worker != null || source.catalog == null) {
                 // A new action cannot rebase a pending action. Retire it; a new opening is required.
                 active = null; worker = null; retired = source
-                mutableState.value = State(Phase.RETIRED, failure = Failure.SUPERSEDED)
+                mutableState.value = State(Phase.RETIRED, failure = Failure.SUPERSEDED, terminalOpening = source.opening)
                 null
             } else {
                 val action = select(source) // Immutable Saved/field/namespace/input selection before launch.
-                val task = children.launch(io, start = CoroutineStart.LAZY) { execute(source, request, action) }
+                // Original controller cancellation owns this actual child BEFORE it can start.
+                // Store close still cancels its worker explicitly, regardless of parent choice.
+                val task = children.launch(io + (caller ?: lifetime), start = CoroutineStart.LAZY) { execute(source, request, action) }
                 worker = task
                 Submission(source, request, task, State(Phase.SAVING, source.opening, checkNotNull(source.catalog).summaries))
             }
@@ -299,7 +326,7 @@ internal class XperienceImportStore(
                 synchronized(monitor) {
                     if (currentLocked(source, request)) {
                         active = null; worker = null; generation++
-                        mutableState.value = State(Phase.LOCAL_ACCEPTED)
+                        mutableState.value = State(Phase.LOCAL_ACCEPTED, terminalOpening = source.opening)
                         accepted = true
                     }
                 }
@@ -360,7 +387,8 @@ internal class XperienceImportStore(
                     active = null; worker = null; generation++
                     deferRetirementLocked(source.target)
                     mutableState.value = State(Phase.RETIRED,
-                        failure = if (cause is CancellationException) Failure.CANCELLED else null)
+                        failure = if (cause is CancellationException) Failure.CANCELLED else null,
+                        terminalOpening = source.opening)
                 }
             }
             drainRetirements()
@@ -380,7 +408,7 @@ internal class XperienceImportStore(
             if (!currentLocked(source, request)) return
             val previous = worker
             active = null; worker = null; generation++
-            mutableState.value = State(Phase.RETIRED, failure = Failure.STALE)
+            mutableState.value = State(Phase.RETIRED, failure = Failure.STALE, terminalOpening = source.opening)
             previous
         }
         cancelWorker(cancelled)
@@ -436,7 +464,7 @@ internal class XperienceImportStore(
             generation++
             val result = active to worker
             active = null; worker = null
-            mutableState.value = State(if (closing) Phase.CLOSED else Phase.RETIRED)
+            mutableState.value = State(if (closing) Phase.CLOSED else Phase.RETIRED, terminalOpening = result.first?.opening)
             result
         }
         cancelWorker(previous.second)

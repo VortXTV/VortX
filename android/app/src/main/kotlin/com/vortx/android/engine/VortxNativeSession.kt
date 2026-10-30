@@ -405,6 +405,57 @@ internal class VortxNativeSession private constructor(
     /** Captured before decode from the authenticated local checkpoint, or freshly minted when
      * there was no local host state. This is persistence material, not a new write capability. */
     private var rawNativeHostPreferenceState = NativeRawHostPreferences.captureLocal(scope, initialRawHostState)
+    /** Cheap read-only observation validity, never account/native/load authority or cached health. */
+    internal class XperienceObservation private constructor() : AutoCloseable {
+        private val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        fun isCurrent(): Boolean = live.get()
+        override fun close() { live.set(false) }
+        companion object { internal fun issued() = XperienceObservation() }
+    }
+    private class XperienceObservedProfile(val fields: Map<String, ByteArray>) {
+        val tokens = ArrayList<java.lang.ref.WeakReference<XperienceObservation>>()
+        fun prune() { tokens.removeAll { it.get()?.isCurrent() != true } }
+        fun close() { tokens.forEach { it.get()?.close() }; fields.values.forEach { it.fill(0) }; tokens.clear() }
+    }
+    private val xperienceObservations = linkedMapOf<String, XperienceObservedProfile>()
+    @Synchronized internal fun captureXperienceObservation(owner: VortxNativeOwner): XperienceObservation = owned(owner) {
+        check(!requiresRecovery())
+        pruneXperienceObservations()
+        val profile = NativeHostPreferences.canonicalProfileID(owner.profileID)
+        val observed = xperienceObservations.getOrPut(profile) {
+            XperienceObservedProfile(NativeXperienceWrite.fields(rawNativeHostPreferenceState, profile))
+        }
+        XperienceObservation.issued().also { observed.tokens += java.lang.ref.WeakReference(it) }
+    }
+    private fun pruneXperienceObservations() {
+        val iterator = xperienceObservations.iterator()
+        while (iterator.hasNext()) {
+            val (_, group) = iterator.next(); group.prune()
+            if (group.tokens.isEmpty()) { group.close(); iterator.remove() }
+        }
+    }
+    private fun retireXperienceObservations() {
+        xperienceObservations.values.forEach { it.close() }; xperienceObservations.clear()
+    }
+    /** Both typed receive and ordinary checkpoint installation use this exact raw path.
+     * One retained raw family per actively observed profile; weak tokens never retain callers.
+     * Compare only active profiles and preserve tokens on byte-equal family/progress updates. */
+    private fun replaceRawHostPreferenceState(next: ByteArray) {
+        pruneXperienceObservations()
+        if (!rawNativeHostPreferenceState.contentEquals(next)) {
+            val iterator = xperienceObservations.iterator()
+            while (iterator.hasNext()) {
+                val (profile, group) = iterator.next()
+                val fields = NativeXperienceWrite.fields(next, profile)
+                try {
+                    if (group.fields.keys != fields.keys || group.fields.any { (key, raw) -> !raw.contentEquals(fields[key]) }) {
+                        group.close(); iterator.remove() // Revoke before replacing raw state; ABA cannot resurrect.
+                    }
+                } finally { fields.values.forEach { it.fill(0) } }
+            }
+        }
+        rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = next
+    }
     private var rawHostMergeActive = false
     private var rawHostMerge: ByteArray? = null
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner,
@@ -435,6 +486,7 @@ internal class VortxNativeSession private constructor(
     private fun enterCheckpointUncertainty() {
         if (checkpointUncertain) return
         checkpointUncertain = true
+        retireXperienceObservations()
         signalPlaylistInvalidation()
     }
 
@@ -1027,15 +1079,16 @@ internal class VortxNativeSession private constructor(
                 // The generic engine is retired before typed persistence/native acceptance. No
                 // second live writer can later overwrite the transferred checkpoint.
                 if (newOwner) {
+                    retireXperienceObservations()
                     try { oldRuntime.close() }
                     catch (failure: Throwable) { enterCheckpointUncertainty(); throw failure }
                 }
             })
             if (newOwner) { runtime = adapter.view(); ownerHistory = adapter }
-            if (changesReceiptProfile) playlistReceiptProfileEpoch += 1
+            if (changesReceiptProfile) { playlistReceiptProfileEpoch += 1; retireXperienceObservations() }
             hostProfilePreferences = requireNotNull(projected)
             nativeHostPreferenceState = host
-            rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = rawHost.copyOf()
+            replaceRawHostPreferenceState(rawHost.copyOf())
             invalidate(); changes.value += 1
         } catch (failure: Throwable) {
             if (newOwner || adapter.requiresRecovery()) {
@@ -1129,7 +1182,9 @@ internal class VortxNativeSession private constructor(
             val playlistProfileChanged = profileChanged ||
                 preferences.toString() != hostProfilePreferences.toString() ||
                 state.getString("activeProfileId") != owner.profileID
-            if (state.getString("activeProfileId") != owner.profileID) playlistReceiptProfileEpoch += 1
+            if (state.getString("activeProfileId") != owner.profileID) {
+                playlistReceiptProfileEpoch += 1; retireXperienceObservations()
+            }
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             nativeHostPreferenceState = applied.host
@@ -1418,7 +1473,7 @@ internal class VortxNativeSession private constructor(
                 !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
             val activeProfileChanged = state.getString("activeProfileId") != owner.profileID
-            if (activeProfileChanged) playlistReceiptProfileEpoch += 1
+            if (activeProfileChanged) { playlistReceiptProfileEpoch += 1; retireXperienceObservations() }
             val playlistProfileChanged = rosterChanged || hostChanged || activeProfileChanged
             val playlistFieldChanged = profileFieldChanges?.keys()?.asSequence()
                 ?.any { it.startsWith(NativePlaylist.PREFIX) } == true
@@ -1528,7 +1583,7 @@ internal class VortxNativeSession private constructor(
                 }
             }
             val acceptedRawHost = OHJson.Obj(snapshot.toByteArray(Charsets.UTF_8)).raw("nativeHostPreferenceState")
-            rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = acceptedRawHost
+            replaceRawHostPreferenceState(acceptedRawHost)
         } catch (error: Throwable) {
             if (preparedAccountAdmission != null && typedCheckpointStillCurrent(preparedOriginalCheckpoint)) throw error
             com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
@@ -1551,7 +1606,7 @@ internal class VortxNativeSession private constructor(
     }
     @Synchronized override fun close() {
         if (retirementComplete) return
-        if (!closed) { closed = true; invalidate() }
+        if (!closed) { closed = true; retireXperienceObservations(); invalidate() }
         check(!unconfirmedHistoryRetirement) { "Owner history retirement unconfirmed; writer remains reserved" }
         // Failed retirement keeps the exact owner reachable and all admission quarantined.
         // A second close retries it; it must not silently release the account's writer slot.

@@ -756,6 +756,68 @@ internal class NativeAccountCoordinator(
     private fun xperienceSnapshot(target: CapturedXperienceTarget) = CapturedXperienceSnapshot(target,
         target.session.xperienceFields(target.owner))
 
+    private class XperienceOpening(val issuer: NativeAccountCoordinator, val installation: Mounted,
+        val update: Long, val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer, val admission: (() -> Boolean) -> Boolean) : NativeXperienceCatalogGateway.OpeningStage {
+        val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        val used = java.util.concurrent.atomic.AtomicBoolean(false)
+        override fun close() { live.set(false) }
+    }
+    /** Scalars only on the UI event lane. Do NOT enter Session or durable auth/file admission. */
+    internal fun stageXperienceOpening(): NativeXperienceCatalogGateway.OpeningStage? {
+        val installation = mounted.get() ?: return null
+        val update = installation.session.updates.value
+        val originalRead = installation.readIdentity()
+        val producer = playlistAccountProducer ?: return null
+        val admission = captureOwnAccountAdmission(installation.account) ?: return null
+        return if (mounted.get() === installation && installation.session.updates.value == update &&
+            installation.readIdentity() === originalRead && playlistAccountProducer === producer)
+            XperienceOpening(this, installation, update, originalRead, producer, admission) else null
+    }
+    /** IO caller consumes one original stage. A→B→A, update, mount/read/producer or auth drift
+     * cannot be replaced by whichever account happens to be current after the hop. */
+    internal fun openXperienceSnapshot(stage: NativeXperienceCatalogGateway.OpeningStage): NativeXperienceProfileGateway.Snapshot {
+        val original = stage as? XperienceOpening ?: error("Invalid Xperience opening")
+        check(original.issuer === this && original.live.get() && original.used.compareAndSet(false, true))
+        val installation = original.installation
+        fun current() = original.live.get() && mounted.get() === installation &&
+            installation.session.updates.value == original.update && installation.readIdentity() === original.originalRead &&
+            playlistAccountProducer === original.producer
+        var created: CapturedXperienceTarget? = null
+        var transferred = false
+        return try { installation.session.withCompleteAccountExportRead(original.originalRead != null) { read ->
+            var snapshot: NativeXperienceProfileGateway.Snapshot? = null
+            check(original.admission {
+                if (!current() || !accountCurrent(installation.account)) false else {
+                    val target = CapturedXperienceTarget(installation.account, installation.session, read.owner, installation,
+                        original.admission, PlaylistLifetime(), original.originalRead, original.producer, installation.session.xperienceContext(read))
+                    created = target
+                    snapshot = withCapturedXperienceTarget(target) { xperienceSnapshot(target) }
+                    current()
+                }
+            }) { "Original Xperience opening changed" }
+            check(current()) { "Original Xperience opening changed" }
+            checkNotNull(snapshot).also { transferred = true }
+        } } finally { if (!transferred) created?.lifetime?.revoke() }
+    }
+
+    /** Read-only adapter admission. Target context does NOT contain saved raw registers: the
+     * genuine original Snapshot must also match before and after the synchronous callback. */
+    internal fun <T> withXperienceSnapshotRead(snapshot: NativeXperienceProfileGateway.Snapshot,
+        action: (VortxNativeSession, VortxNativeRead) -> T): T {
+        val original = snapshot as? CapturedXperienceSnapshot ?: error("Invalid Xperience snapshot")
+        return withCapturedXperienceTarget(original.target) { read ->
+            fun current(): Boolean {
+                val fields = original.target.session.xperienceFields(original.target.owner)
+                return try { original.matches(fields) } finally { fields.values.forEach { it.fill(0) } }
+            }
+            check(current()) { "Original Xperience snapshot changed" }
+            action(original.target.session, read).also {
+                check(current()) { "Original Xperience snapshot changed" }
+            }
+        }
+    }
+
     override fun captureXperienceProfile(): Result<NativeXperienceProfileGateway.Snapshot> = playlistResult {
         val installation = checkNotNull(mounted.get()) { "Open the authenticated native account first" }
         val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) { "Xperience account admission unavailable" }

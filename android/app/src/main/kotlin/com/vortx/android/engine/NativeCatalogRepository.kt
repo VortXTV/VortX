@@ -101,6 +101,9 @@ internal sealed interface XperienceCatalogRequestOutcome {
     data class Loaded(
         val candidate: XperienceAddonBinding.Candidate,
         val response: VortxResourceSnapshot,
+        val items: List<MetaItem>,
+        val rawItemCount: Int,
+        val supportsSkip: Boolean,
     ) : XperienceCatalogRequestOutcome
 
     data class Unresolved(val resolution: XperienceAddonBinding.Resolution) : XperienceCatalogRequestOutcome
@@ -447,6 +450,8 @@ internal class NativeCatalogRepository(
         source: com.vortx.android.xperience.XperienceCollections.Source,
         consumer: XperienceCatalogConsumerID,
         mapping: XperienceAddonBinding.Mapping? = null,
+        skip: Int? = null,
+        originalCurrent: () -> Boolean = { true },
     ): Result<XperienceCatalogRequestOutcome> = attempt {
         check(read.owner.scope == session.scope) { "Native owner changed" }
         data class Prepared(
@@ -457,6 +462,7 @@ internal class NativeCatalogRepository(
             val request: VortxResourceRequest? = null,
         )
         val prepared = session.withCurrentRead { currentRead ->
+            check(originalCurrent()) { "Original Xperience snapshot changed" }
             check(currentRead.owner == read.owner) { "Native owner changed" }
             val snapshot = projectXperienceCandidates(currentRead, addonDescriptors(session, currentRead))
             val resolution = snapshot.resolve(source, mapping)
@@ -468,7 +474,10 @@ internal class NativeCatalogRepository(
                 val configuredAddon = snapshot.pairedAddon(resolution.candidate)
                 val type = requireNotNull(source.type)
                 val catalogId = requireNotNull(source.catalogId)
-                val extras = source.genre?.let { listOf("genre" to it) }.orEmpty()
+                val catalog = resolution.candidate.catalogs.single { it.type == type && it.id == catalogId }
+                require(skip == null || (skip >= 0 && catalog.supportsSkip)) { "Catalog does not support this cursor" }
+                val extras = source.genre?.let { listOf("genre" to it) }.orEmpty() +
+                    skip?.let { listOf("skip" to it.toString()) }.orEmpty()
                 Prepared(currentRead, resolution, resolution.candidate, configuredAddon,
                     VortxResourceRequest(VortxResourceRequest.Resource.CATALOG, type, catalogId, extras))
             }
@@ -482,13 +491,21 @@ internal class NativeCatalogRepository(
         // Only a resolved load reaches this stable per-consumer slot. Independent consumers stay
         // isolated even for the same source; unresolved outcomes above do not retire a prior slot.
         val slot = "xperience:${consumer.slotToken}"
+        currentCoroutineContext().ensureActive()
+        check(originalCurrent()) { "Original Xperience snapshot changed" }
         val response = session.load(slot, prepared.read.owner, listOf(request to listOf(addon))).single()
         currentCoroutineContext().ensureActive()
+        check(originalCurrent()) { "Original Xperience snapshot changed" }
         requireSettled(response)
+        val originalCount = rawCount(response) // Before parental filtering; visible count is not a cursor.
         val admitted = policyPage(session, response, prepared.read, slot, listOf(response))
+        val items = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(admitted), listOf(addon)))
+            .flatMap { it.items }.distinctBy { it.type to it.id }
+        val supportsSkip = candidate.catalogs.single { it.type == source.type && it.id == source.catalogId }.supportsSkip
         currentCoroutineContext().ensureActive()
         session.publish(slot, prepared.read.owner, listOf(response)) {
-            XperienceCatalogRequestOutcome.Loaded(candidate, admitted)
+            check(originalCurrent()) { "Original Xperience snapshot changed" }
+            XperienceCatalogRequestOutcome.Loaded(candidate, admitted, items, originalCount, supportsSkip)
         }
     }
 
