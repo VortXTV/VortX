@@ -283,7 +283,8 @@ enum VortxNativeBootstrapArchive {
         }
         // Normalize the complete padding run before BOTH inspection and base64 decoding.
         // A BOM before encoded text must not make the decoder fail open after a safe sniff.
-        let suffix = normalizedCarrierText(Data(remainder.utf8))
+        // Leading separator punctuation must not hide a carrier: "[RD] - {...}" is still refused.
+        let suffix = normalizedCarrierText(Data(remainder.drop(while: { $0.isWhitespace || $0 == "\u{FEFF}" || ":-.,!?)".contains($0) }).utf8))
         func carrierPrefix(_ bytes: Data) -> Bool {
             let significant = normalizedCarrierText(bytes).unicodeScalars
             let prefix = String(String.UnicodeScalarView(significant.prefix(32)))

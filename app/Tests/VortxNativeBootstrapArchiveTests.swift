@@ -978,7 +978,7 @@ import CryptoKit
                         "{token=fixture;}", "{'token':'fixture'}", "[private:token]", "[" + String(repeating: "x", count: 65) + "] Label"]
         // Typed titles also inspect the text after the tags. (Add-on manifest text keeps its
         // existing label-then-whitespace rule, so these three are checked on titles only.)
-        let remainderCarriers = ["[RD] " + secret, #"[RD] "quoted""#, "[RD] " + Data(secret.utf8).base64EncodedString()]
+        let remainderCarriers = ["[RD] " + secret, "[RD]: " + secret, "[RD] - " + secret, #"[RD] "quoted""#, "[RD] " + Data(secret.utf8).base64EncodedString()]
         let preference = "stremiox.seriesSourceSticky.00000000-0000-0000-0000-00000000A11C"
         func libraryHost(_ name: String) -> Object {
             ["vortx": ["library": [["id": "tt-fixture-library", "type": "movie", "name": name]]]]
