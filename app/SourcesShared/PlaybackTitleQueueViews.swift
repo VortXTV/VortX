@@ -41,6 +41,9 @@ struct PlaybackTitleQueueButton: View {
 struct PlaybackTitleQueueEditor: View {
     @ObservedObject private var queue = PlaybackTitleQueue.shared
     @Environment(\.dismiss) private var dismiss
+    #if os(tvOS)
+    @State private var showSavedPlaylists = false
+    #endif
 
     var body: some View {
         ScrollView {
@@ -52,6 +55,19 @@ struct PlaybackTitleQueueEditor: View {
                 }
                 Text("Up to 100 titles. Saved on this device for this profile, not synced between devices.")
                     .font(.callout).foregroundStyle(.secondary)
+                #if os(tvOS)
+                Button { showSavedPlaylists = true } label: {
+                    Label("Saved playlists", systemImage: "music.note.list")
+                }
+                .accessibilityHint("Save and manage playlists for this profile.")
+                #else
+                NavigationLink {
+                    SavedPlaylistLibraryView()
+                } label: {
+                    Label("Saved playlists", systemImage: "music.note.list")
+                }
+                .accessibilityHint("Save and manage playlists for this profile.")
+                #endif
                 Text(queue.persistenceStatusText)
                     .font(.callout)
                     .foregroundStyle({
@@ -117,6 +133,11 @@ struct PlaybackTitleQueueEditor: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
         .onAppear { queue.activateCurrentOwner() }
+        #if os(tvOS)
+        .fullScreenCover(isPresented: $showSavedPlaylists) {
+            NavigationStack { SavedPlaylistLibraryView() }
+        }
+        #endif
     }
 
     private func title(_ entry: PlaybackTitleQueuePolicy.Entry) -> some View {
