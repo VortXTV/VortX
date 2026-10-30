@@ -1,0 +1,58 @@
+{
+  "schema": 2,
+  "reviewState": "ROOT_AND_INDEPENDENT_SOURCE_SECURITY_REVIEWED",
+  "repository": "VortXTV/VortX",
+  "ref": "refs/heads/beta/xperience-wire-parity-20261030",
+  "finalModel": {
+    "packet": "android-xperience-domain-source-v6",
+    "version": 6,
+    "reviewState": "SOURCE_SECURITY_REVIEWED",
+    "frozenReceiptSHA256": "1500001626ed38af035579afb8f38aebd7098278b139d60d0c10a5cc1f5c8851",
+    "reviewReceiptSHA256": "cf81c164ddec3bd5cb0365109a813258649c1779ed24772f90990c91db330ad5",
+    "domainSourceSHA256": "c8d2bc18b2790904ccb0187f1e8ccf07431df68362a9c7312d57c1087d43178d"
+  },
+  "appleDomain": {
+    "path": "app/SourcesShared/XperienceCollections.swift",
+    "sha256": "8088c77ea66fc33a1a50f498c4d4edb92371e9c2dab614db03363f4d3683d675"
+  },
+  "appleJSON": {
+    "path": "app/SourcesShared/VortxResourceBridge.swift",
+    "sha256": "0d3f7301a39b74cddd9d5cd81fd630ff0c96147b9034659a04fda5f5ad5b29f0",
+    "start": "indirect enum VortxJSON: Codable, Equatable, Sendable {",
+    "endBefore": "\n\nstruct VortxResourceRequest: Codable, Equatable, Sendable {",
+    "spanSHA256": "3f1287e06138d05ee6e9ebaadeb5e55b8c6c70035f476535b1574f266ecb573b",
+    "actualImportPrefix": "import Foundation\n"
+  },
+  "androidJSON": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/engine/NativeOwnerHistoryAccount.kt",
+    "sha256": "4127844a42d38562a85789f4f532cc7ea0c9b0a92d2747f91d16839e584c86db",
+    "start": "internal object OHJson {",
+    "endBefore": "\n\n/** No authority is minted by this serializer. Every raw sibling survives unless explicitly owned. */",
+    "spanSHA256": "ea3dd444994b625f2aff82cc34623177a076e4ccdbd953b95b5c8c79e7d2a636",
+    "preambleSHA256": "ae749a041d75632ea97416ba1fb789e57d973b2b199215b0ce3bbc37d9a2b183"
+  },
+  "androidDomain": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt",
+    "sha256": "c8d2bc18b2790904ccb0187f1e8ccf07431df68362a9c7312d57c1087d43178d"
+  },
+  "hostToolchain": {
+    "kotlinVersion": "2.4.21",
+    "requiredJDKMajors": [
+      17,
+      21
+    ],
+    "requiredJDKEnvironment": [
+      "JAVA_HOME_17_arm64",
+      "JAVA_HOME_21_arm64"
+    ],
+    "compileJDKMajor": 21,
+    "bytecodeTarget": 17,
+    "referenceImage": {
+      "source": "https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md",
+      "version": "20261013.0424.1",
+      "rootObservedContents": "Kotlin 2.4.21 and JDK17/JDK21 arm64 environment variables",
+      "provenanceLimit": "Reference image documentation only; actual installed versions and binary/jar hashes must be recorded by the hosted run"
+    },
+    "downloadOrInstallPermitted": false
+  }
+}
