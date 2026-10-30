@@ -9,6 +9,27 @@ import CryptoKit
         }
     }
     static func data(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) }
+    /// Always-load policy for a fresh account capture: the value still fails closed (credentials,
+    /// malformed data, the profile list, unknown non-display fields), or the account loads with one
+    /// logged held setting or replaced display text. The source never changes and the archive
+    /// writer itself stays strict.
+    @discardableResult
+    static func notAdmitted(_ source: [String: Any]) throws -> [String] {
+        let before = try data(source)
+        var messages: [String] = []
+        do {
+            let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(source, diagnostics: { messages.append($0) })
+            check(messages.count == 1 && (messages[0].hasPrefix("archive_inspection result=held reason=opaque_preference")
+                  || messages[0].hasPrefix("archive_inspection result=replaced reason=display_text")))
+            _ = try VortxNativeBootstrapArchive.encode(document: clean)
+            do { _ = try VortxNativeBootstrapArchive.encode(document: before); preconditionFailure("Archive writer admitted a carrier") }
+            catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {
+            check(messages.count == 1 && messages[0].hasPrefix("archive_inspection result=failed"))
+        }
+        check(try data(source) == before)
+        return messages
+    }
     static func strictOpaqueRefusal(_ source: [String: Any]) throws {
         do {
             _ = try VortxNativeBootstrapArchive.encode(document: data(source))
@@ -463,11 +484,7 @@ import CryptoKit
         }
         func refused(_ input: Object) throws {
             let before = try data(input)
-            var messages: [String] = []
-            do {
-                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(input, diagnostics: { messages.append($0) })
-                preconditionFailure("Profile context escaped into an opaque carrier")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            let messages = try notAdmitted(input)
             check(try data(input) == before)
             check(messages.count == 1)
             // Diagnostics may contain only schema words and closed categories, never private inputs.
@@ -619,13 +636,15 @@ import CryptoKit
             ("vortx.forYou.local", try roster(["fixture-private-owner": ["fixture-private-field": "["]]), "for_you_local", "/*/*/*")
         ]
         for (key, value, family, suffix) in classified {
+            // Only the profile list still stops the account; every other device setting is held.
             var messages: [String] = []
             do {
                 _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(value, key: key),
                                                                           diagnostics: { messages.append($0) })
-                preconditionFailure("Diagnostic fixture was unexpectedly accepted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-            check(messages == ["archive_inspection result=failed reason=opaque_preference field=/settings/payloadBase64" + suffix
+                check(family != "profile_roster")
+            } catch VortxNativeBootstrapArchive.Failure.opaquePreference { check(family == "profile_roster") }
+            let result = family == "profile_roster" ? "failed" : "held"
+            check(messages == ["archive_inspection result=" + result + " reason=opaque_preference field=/settings/payloadBase64" + suffix
                                + " carrier=plain_text_prefix preference_family=" + family])
             for hidden in [key, "fixture-private-owner", "fixture-private-series", "fixture-private-field", "bingeGroup"] {
                 check(!messages[0].contains(hidden))
@@ -691,10 +710,7 @@ import CryptoKit
             journeys += 1
         }
         func refused(_ document: Object) throws {
-            do {
-                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document)
-                preconditionFailure("Opaque or non-display carrier was admitted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try notAdmitted(document)
             try strictOpaqueRefusal(document)
         }
         let label = labels[0]
@@ -754,11 +770,11 @@ import CryptoKit
         check(safeSibling["token"] == nil && (safeSibling["manifest"] as! Object)["password"] == nil)
 
         var messages: [String] = []
-        do {
-            _ = try VortxNativeBootstrapArchive.credentialFreeDocument(["vortx": ["addons": [descriptor("[private:token]")]]], diagnostics: { messages.append($0) })
-            preconditionFailure("Malformed display label was admitted")
-        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-        check(messages == ["archive_inspection result=failed reason=opaque_preference field=/vortx/addons/*/manifest/name carrier=plain_text_prefix"])
+        let replacedAddon = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.credentialFreeDocument(
+            ["vortx": ["addons": [descriptor("[private:token]")]]], diagnostics: { messages.append($0) })) as! Object
+        check(((((replacedAddon["vortx"] as! Object)["addons"] as! [Object])[0]["manifest"] as! Object)["name"] as? String)
+              == VortxNativeBootstrapArchive.replacedDisplayText)
+        check(messages == ["archive_inspection result=replaced reason=display_text field=/vortx/addons/*/manifest/name carrier=plain_text_prefix"])
         print("Issue #263: \(journeys) exact display-text carrier journeys, nested credential inspection and malformed/opaque rejection controls passed")
     }
 
@@ -821,10 +837,7 @@ import CryptoKit
         try journey(document(row("[Live] Fixture channel", type: "channel")))
         func refused(_ source: Object) throws {
             let original = try data(source)
-            do {
-                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
-                preconditionFailure("Unrecognized library display context was admitted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try notAdmitted(source)
             try strictOpaqueRefusal(source)
             check(try data(source) == original)
         }
@@ -970,11 +983,11 @@ import CryptoKit
             } catch VortxNativeBootstrapArchive.Failure.malformed {}
         }
         var messages: [String] = []
-        do {
-            _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(row("[private:token]")), diagnostics: { messages.append($0) })
-            preconditionFailure("Malformed library display label was admitted")
-        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-        check(messages == ["archive_inspection result=failed reason=opaque_preference field=/vortx/library/*/name carrier=plain_text_prefix"])
+        let replacedRow = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.credentialFreeDocument(
+            document(row("[private:token]")), diagnostics: { messages.append($0) })) as! Object
+        let keptRow = ((replacedRow["vortx"] as! Object)["library"] as! [Object])[0]
+        check(keptRow["name"] as? String == VortxNativeBootstrapArchive.replacedDisplayText && keptRow["id"] as? String == "tt-fixture-library")
+        check(messages == ["archive_inspection result=replaced reason=display_text field=/vortx/library/*/name carrier=plain_text_prefix"])
         print("Issue #262: typed legacy library labels, exact archive retention and unchanged-source credential/malformed controls passed")
     }
 
@@ -1061,10 +1074,7 @@ import CryptoKit
         }
         func refused(_ source: Object) throws {
             let original = try data(source)
-            do {
-                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
-                preconditionFailure("Unrecognized or opaque series-choice carrier was admitted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            try notAdmitted(source)
             try strictOpaqueRefusal(source)
             check(try data(source) == original)
         }
@@ -1138,11 +1148,8 @@ import CryptoKit
             check(try data(input) == original)
         }
         var messages: [String] = []
-        do {
-            _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(data([series: choice("[private:token]")])), diagnostics: { messages.append($0) })
-            preconditionFailure("Malformed add-on label was admitted")
-        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-        check(messages == ["archive_inspection result=failed reason=opaque_preference field=/settings/payloadBase64/*/*/addon carrier=plain_text_prefix preference_family=series_source_choice"])
+        _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(data([series: choice("[private:token]")])), diagnostics: { messages.append($0) })
+        check(messages == ["archive_inspection result=replaced reason=display_text field=/settings/payloadBase64/*/*/addon carrier=plain_text_prefix preference_family=series_source_choice"])
         print("Series-choice display names: typed preference admission, exact field retention, unchanged source and opaque/credential controls passed")
     }
 
@@ -1165,7 +1172,13 @@ import CryptoKit
         let privateKey = "https://private-user.example/Personal/manifest.json?key=fixture-private-value"
         let preferences = try PropertyListSerialization.data(fromPropertyList: [privateKey: Data([0, 255, 0])], format: .binary, options: 0)
         let backup = try data(["format": "vortx-backup", "schema": 1, "payloadBase64": preferences.base64EncodedString()])
-        try rejected(["settings": backup.base64EncodedString()], field: "/settings/payloadBase64/*", carrier: "opaque_data")
+        // An unreadable ordinary device setting is held so the account still loads; the field is
+        // still logged without the private add-on address that keys it.
+        messages = []
+        _ = try VortxNativeBootstrapArchive.credentialFreeDocument(["settings": backup.base64EncodedString()],
+                                                                 diagnostics: { messages.append($0) })
+        check(messages == ["archive_inspection result=held reason=opaque_preference field=/settings/payloadBase64/* carrier=opaque_data"])
+        try strictOpaqueRefusal(["settings": backup.base64EncodedString()])
 
         let profile = "00000000-0000-0000-0000-00000000B22C"
         let sourceDigest = String(repeating: "a", count: 64)
