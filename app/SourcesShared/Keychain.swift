@@ -624,7 +624,9 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
             return operation()
         }
         guard let opened = openExclusiveLockFile() else { return .failure }
-        while Darwin.flock(opened, LOCK_EX | LOCK_NB) != 0 {
+        // The contextual function type disambiguates libc flock from Darwin.struct flock.
+        let fileLock: (Int32, Int32) -> Int32 = Darwin.flock
+        while fileLock(opened, LOCK_EX | LOCK_NB) != 0 {
             if errno == EINTR { continue }
             _ = Darwin.close(opened)
             return .failure
@@ -632,7 +634,7 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
         depth = 1
         defer {
             depth = 0
-            _ = Darwin.flock(opened, LOCK_UN)
+            _ = fileLock(opened, LOCK_UN)
             _ = Darwin.close(opened)
         }
         return operation()
