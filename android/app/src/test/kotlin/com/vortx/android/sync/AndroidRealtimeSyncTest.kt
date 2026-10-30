@@ -58,6 +58,33 @@ class AndroidRealtimeSyncTest {
         var applyGate: CompletableDeferred<Unit>? = null
         var applyEntered: CompletableDeferred<Unit>? = null
         override fun retire() {}
+        override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
+            object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
+        private fun currency(original: NativeAccountUploadCurrency.Origin): NativeAccountUploadCurrency {
+            val installation = mount
+            // Explicit synthetic installation/health currency; ordinary revisions are permitted.
+            return object : NativeAccountUploadCurrency {
+                override fun isCurrent() = original.isCurrent() && mount === installation
+                override fun <T> withCurrentSession(action: () -> T): T? = if (isCurrent() && !reopenFails) action() else null
+            }
+        }
+        override suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin,
+            isCurrent: () -> Boolean): Pair<JSONObject, NativeAccountUploadCurrency>? {
+            val currency = currency(original)
+            val prepared = prepareEmptyAccount(account) { isCurrent() && currency.isCurrent() }
+            return (prepared to currency).takeIf { isCurrent() && currency.isCurrent() }
+        }
+        override suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
+            original: NativeAccountUploadCurrency, isCurrent: () -> Boolean): NativeAccountUploadCurrency? =
+            if (original.isCurrent() && applyDocument(account, document) { original.isCurrent() && isCurrent() })
+                original.takeIf { isCurrent() && it.isCurrent() } else null
+        override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+            originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+            action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+            val currency = currency(original)
+            val exported = exportDocument(account) ?: return null
+            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, currentMountToken(account), null, null, currency) }
+        }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) =
             if (reopenFails || !provideMountToken) null else NativeAccountMountToken(mount, mountRevision)
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
@@ -85,7 +112,9 @@ class AndroidRealtimeSyncTest {
             return result
         }
         override fun acknowledgeHostPreferences(account: SessionOwnerSnapshot.Account, document: JSONObject): Boolean = !ackFails
-        override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean {
+        override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject,
+            original: NativeAccountUploadCurrency.Origin): Boolean {
+            if (!original.isCurrent()) return false
             val fields = host?.getJSONObject("globals")?.getJSONObject("fields") ?: JSONObject()
             changes.keys().forEach { fields.put(it, JSONObject().put("value", changes.get(it))) }
             host = JSONObject().put("globals", JSONObject().put("fields", fields))

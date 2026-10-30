@@ -36,6 +36,33 @@ class VortXBackupCasContractTest {
             receiptResults += Triple(frozen as List<String>, acceptedCandidate, version)
         }
         override fun retire() { installation = Any() }
+        // Explicit synthetic gateway currency: no Session exists in this contract fixture.
+        private inner class Currency(val expected: Any?, val origin: NativeAccountUploadCurrency.Origin) : NativeAccountUploadCurrency {
+            override fun isCurrent() = origin.isCurrent() && installation === expected
+            override fun <T> withCurrentSession(action: () -> T): T? = if (isCurrent()) action() else null
+        }
+        override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
+            object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
+        override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+            originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+            action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+            val currency = Currency(installation, original)
+            val exported = exportDocument(account)
+            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, currentMountToken(account), null, null, currency) }
+        }
+        override suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin,
+            isCurrent: () -> Boolean): Pair<JSONObject, NativeAccountUploadCurrency>? {
+            val currency = Currency(installation, original)
+            val seed = prepareEmptyAccount(account) { isCurrent() && currency.isCurrent() } ?: return null
+            return (seed to currency).takeIf { isCurrent() && currency.isCurrent() }
+        }
+        override suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
+            original: NativeAccountUploadCurrency, isCurrent: () -> Boolean): NativeAccountUploadCurrency? {
+            val captured = original as? Currency ?: return null
+            if (!captured.isCurrent() || !isCurrent()) return null
+            if (!applyDocument(account, document) { original.isCurrent() && isCurrent() }) return null
+            return Currency(installation, captured.origin).takeIf { isCurrent() && captured.origin.isCurrent() }
+        }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) = installation?.let { NativeAccountMountToken(it, 0) }
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) = isCurrent()
         override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject? {

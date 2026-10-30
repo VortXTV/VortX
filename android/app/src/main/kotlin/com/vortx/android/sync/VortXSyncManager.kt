@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -942,6 +943,13 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     private fun currentSyncableDomain(): Map<String, Any> =
         SettingsBackup.plistSettingsFrom(settingsPrefs.all)
+    private fun nativeGlobalDomain(values: Map<String, Any>): Map<String, Any> = values.filterKeys {
+        it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS
+    }.toMap()
+    private fun nativeGlobalsChanged(before: Map<String, Any>, after: Map<String, Any>): Boolean =
+        SettingsDirtyKeys.changedSyncableKeys(before, after) {
+            it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS
+        }.isNotEmpty()
 
     private val dirtyAccountId: String? get() = session?.account?.id
 
@@ -1019,6 +1027,13 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
         refreshSettingsShadow()
     }
+    /** Keep a queued newer local preference difference intact. This does not manufacture dirty
+     * stamps; it only refuses to clear/rebaseline after the admitted own-apply domain changed. */
+    private fun clearNativePushedDirtySettings(snapshot: Map<String, Double>, applied: Map<String, Any>): Boolean =
+        NativeSettingsFence.mutateBookkeeping {
+            if (applyingRemote || nativeGlobalsChanged(applied, nativeGlobalDomain(currentSyncableDomain()))) false
+            else { clearPushedDirtySettings(snapshot); true }
+        }
 
     init {
         NativeSettingsFence.mutateBookkeeping { settingsShadow = currentSyncableDomain() }
@@ -2109,8 +2124,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         lease: SyncSessionLease,
         allowOlderAddonTombstones: Boolean,
         ifNoneMatch: Long? = null,
+        publicationCurrent: () -> Boolean = { true },
     ): SyncDocPull {
-        if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
+        if (!isSyncLeaseCurrent(lease) || !publicationCurrent()) return SyncDocPull.Failed
         val callPermit = acquireSyncCallPermit(lease) ?: return SyncDocPull.Failed
         var etag: String? = null
         val (code, json) = request(
@@ -2121,8 +2137,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             callPermit = callPermit,
             ifNoneMatch = ifNoneMatch?.let { "\"$it\"" },
             receiveETag = { etag = it },
+            candidateCurrent = publicationCurrent,
         )
-        if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
+        if (!isSyncLeaseCurrent(lease) || !publicationCurrent()) return SyncDocPull.Failed
         if (code == 304) return if (ifNoneMatch != null && etag == "\"$ifNoneMatch\"")
             SyncDocPull.Unchanged(ifNoneMatch) else SyncDocPull.Failed
         if (code == 404) return if (lastSyncedVersion(lease) > 0 || syncState.nativeBackupSeen(lease.accountId)) SyncDocPull.Failed
@@ -2140,8 +2157,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val obj = runCatching { com.vortx.android.engine.NativeProfileOverlayWitness.parseAccountDocument(plaintext) }.getOrNull()
             ?: return SyncDocPull.Failed                          // undecodable plaintext: do not clobber
         var remembered = false
-        if (!publishIfSyncLeaseCurrent(lease) { remembered = syncState.markNativeBackupSeen(lease.accountId) } || !remembered) return SyncDocPull.Failed
-        return if (isSyncLeaseCurrent(lease)) {
+        if (!publishIfSyncLeaseCurrent(lease) { if (publicationCurrent()) remembered = syncState.markNativeBackupSeen(lease.accountId) } || !remembered) return SyncDocPull.Failed
+        return if (isSyncLeaseCurrent(lease) && publicationCurrent()) {
             SyncDocPull.Doc(obj, BackupReadWitness(lease, pulledVersion), plaintext.copyOf())
         } else {
             SyncDocPull.Failed
@@ -2167,7 +2184,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         lease: SyncSessionLease,
         candidate: DerivedBackup,
     ): PushOutcome {
-        if (!candidateIsCurrent(lease, candidate) || requiresUpgrade(lease)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate) || requiresUpgrade(lease)) return PushOutcome.Error
         val version = BackupRevisionPolicy.next(candidate.witness.baseRevision) ?: return PushOutcome.Error
         val plaintext = candidate.plaintext.toByteArray(Charsets.UTF_8)
         val ciphertext = VortXCrypto.sealDocument(
@@ -2178,7 +2195,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             writeSyncDocV2,
         )
             ?: return PushOutcome.Error
-        if (!candidateIsCurrent(lease, candidate)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
         val body = JSONObject().put("document", ciphertext).put("version", version)
             .put("baseRevision", candidate.witness.baseRevision ?: JSONObject.NULL)
         val callPermit = acquireSyncCallPermit(lease) ?: return PushOutcome.Error
@@ -2190,7 +2207,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             callPermit = callPermit,
             candidateCurrent = { candidateIsCurrent(lease, candidate) },
         )
-        if (!candidateIsCurrent(lease, candidate)) return PushOutcome.Error
+        if (!candidateHealthIsCurrent(lease, candidate)) return PushOutcome.Error
         // The terminal status remains authoritative even if its error body was lost/malformed.
         // It never acknowledges this candidate and must not start an infinite conflict retry.
         if (code == 426) {
@@ -2201,7 +2218,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val accepted = json?.opt("accepted") as? Boolean ?: return PushOutcome.Error
         if (accepted) {
             var remembered = false
-            if (!publishIfSyncLeaseCurrent(lease) { remembered = syncState.markNativeBackupSeen(lease.accountId) } || !remembered) return PushOutcome.Error
+            if (withCandidateSession(candidate) { publishIfSyncLeaseCurrent(lease) {
+                if (candidateIsCurrent(lease, candidate)) remembered = syncState.markNativeBackupSeen(lease.accountId)
+            } } != true || !remembered) return PushOutcome.Error
             // Native acceptance is not yet a completed local transaction (seed apply, host and
             // credential receipts can still fail). Its caller stamps only after those all succeed.
             return PushOutcome.Accepted(version)
@@ -2214,7 +2233,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     private class DerivedBackup(val plaintext: String, val witness: BackupReadWitness,
-        val gateway: NativeAccountGateway?, val mount: NativeAccountMountToken?) {
+        val gateway: NativeAccountGateway?, val mount: NativeAccountMountToken?,
+        val hostAcknowledgment: NativeHostUploadAcknowledgment? = null,
+        val currency: NativeAccountUploadCurrency? = null) {
         val baseVersion: Long? get() = witness.baseRevision
         fun document(): JSONObject = JSONObject(plaintext)
     }
@@ -2222,7 +2243,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private fun deriveBackup(lease: SyncSessionLease, document: JSONObject, pull: SyncDocPull,
         gateway: NativeAccountGateway?,
         mount: NativeAccountMountToken? = gateway?.currentMountToken(SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)),
-        rawAccount: ByteArray? = null): DerivedBackup? {
+        rawAccount: ByteArray? = null, hostAcknowledgment: NativeHostUploadAcknowledgment? = null,
+        currency: NativeAccountUploadCurrency? = null): DerivedBackup? {
         val witness = when (pull) {
             is SyncDocPull.Doc -> pull.witness
             is SyncDocPull.Empty -> pull.witness
@@ -2230,7 +2252,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
         if (witness.lease !== lease || !isSyncLeaseCurrent(lease)) return null
         val plaintext = rawAccount?.let { com.vortx.android.engine.OHJson.utf8(it) } ?: document.toString()
-        return DerivedBackup(plaintext, witness, gateway, mount).takeIf { candidateIsCurrent(lease, it) }
+        return DerivedBackup(plaintext, witness, gateway, mount, hostAcknowledgment, currency).takeIf { candidateIsCurrent(lease, it) }
     }
 
     private fun candidateIsCurrent(lease: SyncSessionLease, candidate: DerivedBackup): Boolean {
@@ -2238,21 +2260,24 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (candidate.gateway !== nativeGateway) return false
         // New edits on this same mount remain pending through exact carrier ACK. A replacement
         // installation can never send or acknowledge a candidate captured by the retired mount.
-        return mountIsCurrent(lease, candidate.gateway, candidate.mount)
+        return (candidate.gateway == null || candidate.currency?.isCurrent() == true) && candidate.hostAcknowledgment?.isCurrent() != false
     }
 
-    private fun mountIsCurrent(lease: SyncSessionLease, gateway: NativeAccountGateway?, mount: NativeAccountMountToken?): Boolean {
-        if (gateway !== nativeGateway || !isSyncLeaseCurrent(lease)) return false
-        val current = gateway?.currentMountToken(SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch))
-        return if (mount == null) current == null else current?.installation === mount.installation
-    }
+    private fun <T> withCandidateSession(candidate: DerivedBackup, action: () -> T): T? =
+        if (candidate.gateway == null) action() else candidate.currency?.withCurrentSession(action)
+
+    /** Only called OUTSIDE operations/request publication monitors. The request callback uses
+     * candidateIsCurrent's scalar identity; health is checked Session-first before/after PUT. */
+    private fun candidateHealthIsCurrent(lease: SyncSessionLease, candidate: DerivedBackup): Boolean =
+        candidateIsCurrent(lease, candidate) && withCandidateSession(candidate) { candidateIsCurrent(lease, candidate) } == true
 
     /** Acceptance retains the exact candidate. Only successful seed application may replace its
      * absent mount with the resulting installation; every later local receipt uses that same mount. */
-    private class AcceptedBackup(val candidate: DerivedBackup, val mount: NativeAccountMountToken?)
+    private class AcceptedBackup(val candidate: DerivedBackup, val currency: NativeAccountUploadCurrency)
 
     private fun acceptanceIsCurrent(lease: SyncSessionLease, accepted: AcceptedBackup): Boolean =
-        accepted.candidate.witness.lease === lease && mountIsCurrent(lease, accepted.candidate.gateway, accepted.mount)
+        accepted.candidate.witness.lease === lease && isSyncLeaseCurrent(lease) && accepted.candidate.gateway === nativeGateway && accepted.currency.isCurrent() &&
+            accepted.candidate.hostAcknowledgment?.isCurrent() != false
 
     /**
      * Push a doc DERIVED from a pulled base, with optimistic-concurrency recovery. On a lost race, [rebuild]
@@ -2390,24 +2415,40 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     private suspend fun applyNativeHostSettings(lease: SyncSessionLease, exported: NativeAccountExport?,
-        publicationCurrent: () -> Boolean = { true }): Boolean {
+        publicationCurrent: () -> Boolean = { true }, expectedLocalGlobals: Map<String, Any>? = null,
+        onAppliedGlobals: ((Map<String, Any>) -> Unit)? = null,
+        uploadCurrency: NativeAccountUploadCurrency? = null): Boolean {
         if (exported == null || !publicationCurrent()) return false
         return withContext(Dispatchers.Main) {
             val previousSettings = settingsPrefs.all
             var applied = false
+            fun applyValues() {
+                applyingRemote = true
+                try {
+                    applyDeviceSettings(exported.hostSettingsBaseline)
+                    applyNativeGlobalPreferences(exported.hostPreferences)
+                } finally { applyingRemote = false }
+            }
             fun apply(): Boolean = publishIfSyncLeaseCurrent(lease) {
                 if (publicationCurrent()) {
-                    applyingRemote = true
-                    try {
-                        applyDeviceSettings(exported.hostSettingsBaseline)
-                        applyNativeGlobalPreferences(exported.hostPreferences)
+                    if (expectedLocalGlobals == null) { applyValues(); applied = publicationCurrent() }
+                    else {
+                        NativeSettingsFence.capture {
+                            if (!applyingRemote && !nativeGlobalsChanged(expectedLocalGlobals, nativeGlobalDomain(currentSyncableDomain()))) {
+                                applyValues()
+                                onAppliedGlobals?.invoke(nativeGlobalDomain(currentSyncableDomain()))
+                                applied = true
+                            }
+                        }
+                        // Upload publication is scalar; the enclosing scope already owns Session.
+                        if (applied) applied = publicationCurrent()
                     }
-                    finally { applyingRemote = false }
-                    applied = publicationCurrent()
                 }
             } && applied
+            fun admittedApply(): Boolean = if (uploadCurrency == null) apply()
+                else uploadCurrency.withCurrentSession { apply() } == true
             val profileStore = resolveStore()
-            val result = if (profileStore != null) profileStore.withoutNativePreferenceCapture { apply() } else apply()
+            val result = if (profileStore != null) profileStore.withoutNativePreferenceCapture { admittedApply() } else admittedApply()
             // Re-project profile-owned flat keys only after releasing the auth lock. Remote global
             // settings must not mint local profile edits or introduce auth-lock/runtime-lock inversion.
             if (result && profileStore != null && previousSettings != settingsPrefs.all && isSyncLeaseCurrent(lease) && publicationCurrent()) profileStore.refreshNativeProjectionInBackground(forceSettings = true)
@@ -2418,38 +2459,68 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private suspend fun nativeSyncUp(lease: SyncSessionLease, gateway: NativeAccountGateway): Boolean {
         if (gateway !== nativeGateway) return false
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
-        // Freeze identities before the first pull/PUT suspension; late local edits require a later upload.
+        val operationJob = currentCoroutineContext()[Job]
+        // Original AUTH precedes every GET/prepare/apply suspension and every conflict rebuild.
+        // Installation binding follows the genuine merged checkpoint; it never recaptures auth.
+        val original = gateway.captureUploadOrigin(account) {
+            operationJob?.isActive != false && isSyncLeaseCurrent(lease) && nativeGateway === gateway
+        } ?: return false
         val frozenPlaylistReceipts = gateway.freezePlaylistReceipts(account)
+        var pushedHostAcknowledgment: NativeHostUploadAcknowledgment? = null
         var pushedStamps: Map<String, Double> = emptyMap()
+        var pushedSettingsValues: Map<String, Any> = emptyMap()
         var pushedPreferences: JSONObject? = null
         var pushedProviders: JSONObject? = null
         var acceptedVersion: Long? = null
         var acceptedBackup: AcceptedBackup? = null
+        try {
         fun recordAccepted(candidate: DerivedBackup, version: Long) {
-            acceptedBackup = AcceptedBackup(candidate, candidate.mount)
+            acceptedBackup = AcceptedBackup(candidate, checkNotNull(candidate.currency))
             acceptedVersion = version
         }
         suspend fun derived(): DerivedBackup? {
+            operationJob?.ensureActive()
+            if (!original.isCurrent()) return null
+            // A conflict rebuild has its own fresh authenticated GET and issued export. The old
+            // receipt is never rebound to the next read, version echo, checkpoint or installation.
+            pushedHostAcknowledgment?.close(); pushedHostAcknowledgment = null
             var globals = JSONObject()
             if (!publishIfSyncLeaseCurrent(lease) {
-                val values = currentSyncableDomain()
-                // A retained legacy/profile stamp is not a global register. Keep it in the
-                // durable dirty map, but do not let it block unrelated native edits or receiving.
-                // Only this exact exportable subset may be acknowledged after the PUT succeeds.
-                pushedStamps = readDirtySettings().filterKeys { field ->
-                    field in SettingsBackup.SYNCABLE_SETTING_TYPES && field !in NATIVE_PROFILE_SETTING_KEYS &&
-                        (!settingsPrefs.contains(field) || values.containsKey(field))
+                check(original.isCurrent()) { "Original upload authentication retired" }
+                val (_, captured) = NativeSettingsFence.capture {
+                    check(!applyingRemote) { "Native settings remote application in progress" }
+                    val values = currentSyncableDomain()
+                    // Match the actual producer's strict known dirty schema. Never turn malformed
+                    // pending input into empty data or acknowledge it after a partial candidate.
+                    val dirty = dirtyPrefs.getString(dirtySettingsStorageKey(account.id), null)?.let(::JSONObject) ?: JSONObject()
+                    val stamps = linkedMapOf<String, Double>()
+                    dirty.keys().forEach { field -> stamps[field] = dirty.getDouble(field).also { require(it.isFinite() && it >= 0) } }
+                    val unstamped = SettingsDirtyKeys.changedSyncableKeys(settingsShadow, values) { SettingsBackup.isSyncable(it) }
+                    val fields = (stamps.keys + unstamped).filter { it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS }
+                    require(fields.all { !settingsPrefs.contains(it) || values.containsKey(it) }) { "Pending global setting cannot be exported" }
+                    val changes = JSONObject().also { target -> fields.forEach { field ->
+                        target.put(field, values[field]?.let(JSONObject::wrap) ?: JSONObject.NULL)
+                    } }
+                    // The immutable values cross GET; only REAL captured stamps may later clear.
+                    Triple(stamps.filterKeys { it in fields }.toMap(), changes.toString(), nativeGlobalDomain(values))
                 }
-                globals = JSONObject().also { target -> pushedStamps.keys.forEach { field ->
-                    target.put(field, values[field]?.let(JSONObject::wrap) ?: JSONObject.NULL)
-                } }
+                pushedStamps = captured.first
+                globals = JSONObject(captured.second)
+                pushedSettingsValues = captured.third
             }) return null
-            val pulled = pullSyncDocResult(lease)
+            val pulled = pullSyncDocResult(lease, allowOlderAddonTombstones = false, publicationCurrent = original::isCurrent)
+            if (!original.isCurrent()) return null
             val seed = pulled is SyncDocPull.Empty
-            val seedMount = if (seed) gateway.currentMountToken(account) else null
+            var seedCurrency: NativeAccountUploadCurrency? = null
             val document = when (pulled) {
                 is SyncDocPull.Doc -> pulled.doc
-                is SyncDocPull.Empty -> gateway.prepareEmptyAccount(account) { isSyncLeaseCurrent(lease) && nativeGateway === gateway } ?: return null
+                is SyncDocPull.Empty -> {
+                    val prepared = gateway.prepareUploadSeed(account, original) {
+                        original.isCurrent()
+                    } ?: return null
+                    seedCurrency = prepared.second
+                    prepared.first
+                }
                 SyncDocPull.Failed, is SyncDocPull.Unchanged -> return null
             }
             if (seed) {
@@ -2457,20 +2528,24 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 // setting intent for a subsequent normal transaction, never acknowledge it here.
                 pushedPreferences = null
                 pushedProviders = null
-                return deriveBackup(lease, document, pulled, gateway, seedMount)
+                return deriveBackup(lease, document, pulled, gateway, currency = checkNotNull(seedCurrency))
             }
             val originalRead = pulled as? SyncDocPull.Doc ?: return null
             val originalRaw = originalRead.raw
             val capturedRead = capturedAccountRead(lease, account, originalRead) ?: return null
-            val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) } }
+            val applied = try { gateway.applyRawDocument(account, capturedRead) { original.isCurrent() } }
                 finally { capturedRead.retire() }
             if (!applied) return null
-            if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals)) return null
-            val exportMount = gateway.currentMountToken(account)
-            val exported = gateway.exportDocument(account) ?: return null
+            if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals, original)) return null
+            return gateway.withUploadExport(account, capturedRead, originalRaw, original, {
+                original.isCurrent()
+            }) { exported, exportMount, composeGeneric, acknowledgment, currency ->
+            pushedHostAcknowledgment = acknowledgment
+            try {
             com.vortx.android.engine.NativeRawHostPreferences.requireRawExport(exported.hostPreferences, exported.rawHostPreferences)
-            if (exported.hostProfileSyncPending) return null
-            if (!isSyncLeaseCurrent(lease)) return null
+            if (exported.hostProfileSyncPending) return@withUploadExport null
+            operationJob?.ensureActive()
+            if (!isSyncLeaseCurrent(lease)) return@withUploadExport null
             // Preserve the exact legacy baseline. Rewriting the projected roster/settings here
             // changes the one-time import fingerprint and poisons our own next pull. Native profile,
             // library and watch edits travel only in nativeSync until explicit legacy reconciliation.
@@ -2479,8 +2554,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             pushedPreferences = exported.hostPreferences
             exported.hostPreferences?.let { merged.put("nativeHostPreferences", it) }
             var providerCandidate: JSONObject? = null
-            if (!publishIfSyncLeaseCurrent(lease) { providerCandidate = com.vortx.android.integrations.NativeProviderAccess.merge(account, merged) }) return null
-            val withProviders = providerCandidate ?: return null
+            if (!publishIfSyncLeaseCurrent(lease) { providerCandidate = com.vortx.android.integrations.NativeProviderAccess.merge(account, merged) }) return@withUploadExport null
+            val withProviders = providerCandidate ?: return@withUploadExport null
             pushedProviders = withProviders.getJSONObject("nativeProviderCredentials")
             // Replace only owned wire fields. Unknown raw siblings and numeric spelling survive
             // both a normal upload and every optimistic retry's fresh authenticated GET.
@@ -2496,7 +2571,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 replacements.remove("nativeSync")
                 replacements.remove("nativeHostPreferences")
             }
-            val rawCandidate = if (exported.rawAccount != null || exported.genericSourceNativeProjection == null) {
+            val rawCandidate = if (composeGeneric != null) {
+                // This callback uses only the just-merged, Session-issued raw checkpoint plus
+                // the original retained GET bytes/projection. Readonly rawHostPreferences alone
+                // never enables whole-host replacement, including after a cold reopen.
+                try { composeGeneric(withProviders) } finally { exported.genericSourceNativeProjection?.fill(0) }
+            } else if (exported.rawAccount != null || exported.genericSourceNativeProjection == null) {
                 // Preserve legacy bootstrap, but never downgrade a real generic native source
                 // whose original lossless projection could not be retained.
                 check(exported.rawAccount != null || (document.optJSONObject("nativeSync")?.optInt("schemaVersion") ?: 0) !in 1..5) {
@@ -2505,13 +2585,23 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 exactBase.replacingOwned(replacements).validateBudget(writeV2 = true)
             }
             else {
-                val sourceProjection = exported.genericSourceNativeProjection ?: return null
+                val sourceProjection = exported.genericSourceNativeProjection ?: return@withUploadExport null
                 try { com.vortx.android.engine.NativePlaylistAccountComposer.compose(originalRaw, sourceProjection,
                     exported.nativeSync.toString().toByteArray(Charsets.UTF_8),
                     exported.rawHostPreferences ?: checkNotNull(exported.hostPreferences).toString().toByteArray(Charsets.UTF_8), withProviders)
                 } finally { sourceProjection.fill(0) }
             }
-            return deriveBackup(lease, withProviders, pulled, gateway, exportMount, rawCandidate)
+            try {
+                operationJob?.ensureActive()
+                deriveBackup(lease, withProviders, pulled, gateway, exportMount, rawCandidate, acknowledgment, currency)
+            }
+            finally { rawCandidate.fill(0) }
+            } finally {
+                exported.genericSourceNativeProjection?.fill(0)
+                exported.rawHostPreferences?.fill(0)
+                exported.rawAccount?.fill(0)
+            }
+            }
         }
         val first = derived() ?: return false
         val pushed = if (first.baseVersion == null) {
@@ -2519,10 +2609,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             // A collision or unknown outcome must re-pull the winner before rebuilding.
             when (val outcome = pushSyncDocAt(lease, first)) {
                 is PushOutcome.Accepted -> {
-                    if (!candidateIsCurrent(lease, first)) return false
-                    if (!gateway.applyDocument(account, first.document()) { isSyncLeaseCurrent(lease) && nativeGateway === gateway }) return false
-                    val seededMount = gateway.currentMountToken(account) ?: return false
-                    acceptedBackup = AcceptedBackup(first, seededMount)
+                    if (!candidateHealthIsCurrent(lease, first)) return false
+                    val installed = gateway.applyUploadSeed(account, first.document(), checkNotNull(first.currency)) {
+                        operationJob?.isActive != false && isSyncLeaseCurrent(lease) && nativeGateway === gateway
+                    } ?: return false
+                    acceptedBackup = AcceptedBackup(first, installed)
                     if (!acceptanceIsCurrent(lease, requireNotNull(acceptedBackup))) return false
                     if (pushedStamps.isNotEmpty() || com.vortx.android.integrations.NativeProviderAccess.hasPending(account) != false) return false
                     acceptedVersion = outcome.version
@@ -2543,28 +2634,37 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!receiptCurrent()) return false
         // A PUT ACK alone does not publish the joined host settings to this device. Complete
         // that application before acknowledging registers or retiring the durable dirty marker.
-        if (!applyNativeHostSettings(lease, gateway.exportDocument(account), ::receiptCurrent) || !receiptCurrent()) return false
+        var appliedSettingsValues: Map<String, Any>? = null
+        val receiptExport = accepted.currency.withCurrentSession { gateway.exportDocument(account) } ?: return false
+        if (!applyNativeHostSettings(lease, receiptExport, ::receiptCurrent, pushedSettingsValues,
+                { appliedSettingsValues = it }, accepted.currency) || !receiptCurrent()) return false
         // Only acknowledge the exact carrier accepted by the server. A local edit during the PUT
         // has a different register event and remains pending, including after a cold restart.
-        pushedPreferences?.let {
-            if (!receiptCurrent() || !gateway.acknowledgeHostPreferences(account, it) || !receiptCurrent()) return false
+        val rawAcknowledgment = accepted.candidate.hostAcknowledgment
+        if (rawAcknowledgment != null) {
+            if (accepted.currency.withCurrentSession { receiptCurrent() && rawAcknowledgment.acknowledge(::receiptCurrent) && receiptCurrent() } != true) return false
+        } else pushedPreferences?.let {
+            if (accepted.currency.withCurrentSession { receiptCurrent() && gateway.acknowledgeHostPreferences(account, it) && receiptCurrent() } != true) return false
         }
         pushedProviders?.let { sent ->
             var acknowledged = false
-            if (!publishIfSyncLeaseCurrent(lease) {
+            if (accepted.currency.withCurrentSession { publishIfSyncLeaseCurrent(lease) {
                 if (receiptCurrent()) acknowledged = com.vortx.android.integrations.NativeProviderAccess.acknowledge(account, sent)
-            } || !acknowledged || !receiptCurrent()) return false
+            } } != true || !acknowledged || !receiptCurrent()) return false
         }
         var cleared = false
-        if (!publishIfSyncLeaseCurrent(lease) {
-            if (receiptCurrent()) { clearPushedDirtySettings(pushedStamps); cleared = true }
-        } || !cleared || !receiptCurrent()) return false
+        if (accepted.currency.withCurrentSession { publishIfSyncLeaseCurrent(lease) {
+            if (receiptCurrent()) cleared = clearNativePushedDirtySettings(pushedStamps, checkNotNull(appliedSettingsValues))
+        } } != true || !cleared || !receiptCurrent()) return false
         val version = acceptedVersion ?: return false
-        if (!advanceVersion(lease, version, ::receiptCurrent)) return false
-        if (receiptCurrent()) runCatching {
-            gateway.acceptPlaylistReceipts(account, frozenPlaylistReceipts, accepted.candidate.plaintext, version)
-        }
-        return receiptCurrent()
+        if (accepted.currency.withCurrentSession { advanceVersion(lease, version, ::receiptCurrent) } != true) return false
+        accepted.currency.withCurrentSession {
+            if (receiptCurrent()) runCatching {
+                gateway.acceptPlaylistReceipts(account, frozenPlaylistReceipts, accepted.candidate.plaintext, version)
+            }
+        } ?: return false
+        return accepted.currency.withCurrentSession { receiptCurrent() } == true
+        } finally { pushedHostAcknowledgment?.close() }
     }
 
     private fun applyLibraryTombstonesToVortx(vortx: JSONObject): JSONObject {

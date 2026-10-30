@@ -55,6 +55,11 @@ class NativeAccountSyncTest {
         override fun makeCancellation(): VortxResourceCancellation = error("No provider request permitted")
         override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No provider request permitted")
     }
+    /** Synthetic login/transport, genuine original manager admission for actual JNI upload fixtures. */
+    private fun originalTestAdmission(manager: VortXSyncManager, captured: SessionOwnerSnapshot.Account):
+        ((() -> Boolean) -> Boolean)? = manager.captureLocalLibraryMutationAdmission()?.let { original -> { action ->
+            original { manager.sessionOwnerSnapshot() == captured && action() }
+        } }
     private class Gateway : NativeAccountGateway {
         var applied = 0
         var retired = 0
@@ -64,6 +69,21 @@ class NativeAccountSyncTest {
                                val baseRevision: Long, val raw: ByteArray)
         val appliedReads = mutableListOf<AppliedRead>()
         override fun retire() { retired++ }
+        override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): NativeAccountUploadCurrency.Origin {
+            val capturedRetirement = retired
+            return object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = retired == capturedRetirement && isCurrent.invoke() }
+        }
+        override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+            originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+            action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+            // Explicit synthetic no-Session currency, bounded by this gateway's retirement.
+            val currency = object : NativeAccountUploadCurrency {
+                override fun isCurrent() = original.isCurrent()
+                override fun <T> withCurrentSession(action: () -> T): T? = if (isCurrent()) action() else null
+            }
+            val exported = exportDocument(account)
+            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, null, null, null, currency) }
+        }
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
             check(isCurrent()); reopened++; return true
         }
@@ -204,6 +224,15 @@ class NativeAccountSyncTest {
         lateinit var originalRaw: ByteArray
         var uploaded: ByteArray? = null
         var uploadedVersion: Long? = null
+        var serverVersion = 100L
+        var getCount = 0
+        var beforeGet: (() -> Unit)? = null
+        var controlledAdmissionEpoch = 0L
+        var putCount = 0
+        var rejectNextPut = false
+        var updateServerAfterPut = false
+        var beforePut: (() -> Unit)? = null
+        val sentCandidates = mutableListOf<ByteArray>()
         var onFork: (() -> Unit)? = null
         val field = com.vortx.android.engine.NativePlaylist.field(java.util.UUID.fromString("00000000-0000-0000-0000-000000000101"))
         fun value() = com.vortx.android.engine.NativePlaylist.encodedValue(com.vortx.android.engine.NativePlaylist.Document(
@@ -214,13 +243,30 @@ class NativeAccountSyncTest {
             System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0,
                 transport = { method, _, body, _ ->
-                    if (method == "GET") 200 to JSONObject().put("version", 100).put("document",
-                        VortXCrypto.sealDocument(key, originalRaw, account.id, 100, true))
+                    if (method == "GET") {
+                        getCount++
+                        beforeGet?.invoke()
+                        200 to JSONObject().put("version", serverVersion).put("document",
+                            VortXCrypto.sealDocument(key, originalRaw, account.id, serverVersion, true))
+                    }
                     else {
                         val sent = requireNotNull(body)
                         uploadedVersion = sent.getLong("version")
                         uploaded = VortXCrypto.openDocument(key, sent.getString("document"), account.id, sent.getLong("version"))
-                        200 to JSONObject().put("accepted", true)
+                        sentCandidates += checkNotNull(uploaded).copyOf(); putCount++
+                        beforePut?.also { beforePut = null }?.invoke()
+                        if (rejectNextPut) {
+                            rejectNextPut = false
+                            // Rejection echo is deliberately unrelated to the next real GET.
+                            200 to JSONObject().put("accepted", false).put("version", 999_999).put("document", "not-a-merge-base")
+                        } else {
+                            if (updateServerAfterPut) {
+                                val previous = originalRaw
+                                originalRaw = checkNotNull(uploaded).copyOf(); previous.fill(0)
+                                serverVersion = checkNotNull(uploadedVersion)
+                            }
+                            200 to JSONObject().put("accepted", true)
+                        }
                     }
                 })
             manager.installSessionRestoreTestSeam(manager.currentSession())
@@ -234,8 +280,9 @@ class NativeAccountSyncTest {
             }
             runtime = NativeAccountCoordinator(hooked, checkpoints, { noNetwork() }, { manager.sessionOwnerSnapshot() == it },
                 { it() }, {}, captureOwnAccountAdmission = { captured ->
+                    val originalEpoch = controlledAdmissionEpoch // Explicit controlled credential-admission retirement.
                     manager.captureLocalLibraryMutationAdmission()?.let { admission -> { action ->
-                        admission { manager.sessionOwnerSnapshot() == captured && action() }
+                        admission { controlledAdmissionEpoch == originalEpoch && manager.sessionOwnerSnapshot() == captured && action() }
                     } }
                 })
             val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)
@@ -295,7 +342,23 @@ class NativeAccountSyncTest {
             manager.cancelSyncTestWork()
             if (::originalRaw.isInitialized) originalRaw.fill(0)
             uploaded?.fill(0)
+            sentCandidates.forEach { it.fill(0) }; sentCandidates.clear()
             directory.listFiles()?.forEach { it.delete() }; directory.delete()
+        }
+        suspend fun coldReopen() {
+            runtime.retire()
+            // New Store instance authenticates/decrypts the durable file; no retained runtime,
+            // per-edit receipt or old authenticated-read object is carried across this reopen.
+            val reopened = VortxEncryptedCheckpointStore(directory) { javax.crypto.spec.SecretKeySpec(key, "AES") }
+            runtime = NativeAccountCoordinator(bindings(), reopened, { noNetwork() }, { manager.sessionOwnerSnapshot() == it },
+                { it() }, {}, captureOwnAccountAdmission = { captured ->
+                    manager.captureLocalLibraryMutationAdmission()?.let { admission -> { action ->
+                        admission { manager.sessionOwnerSnapshot() == captured && action() }
+                    } }
+                })
+            installNative(manager, runtime)
+            assertTrue(runtime.reopenCheckpoint(principal) { manager.sessionOwnerSnapshot() == principal })
+            assertNull(coordinatorRead(runtime))
         }
     }
 
@@ -384,6 +447,364 @@ class NativeAccountSyncTest {
                 com.vortx.android.integrations.NativeProviderAccess.unbindForTest()
                 NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
             }
+        }
+    }
+
+    /** Separately selected upload controls; old 19 and domain18/JNI3 methods remain unchanged.
+     * Real manager/crypto/JNI/Session/store bodies, synthetic server/provider inputs only. */
+    private fun issuedTestCurrency(fixture: GenericPlaylistFixture): NativeAccountUploadCurrency {
+        val origin = requireNotNull(fixture.runtime.captureUploadOrigin(fixture.principal) { true })
+        val read = requireNotNull(coordinatorRead(fixture.runtime))
+        val raw = read.copyRawForApply(fixture.principal)
+        return try { requireNotNull(fixture.runtime.withUploadExport(fixture.principal, read, raw, origin, { true }) {
+            exported, _, _, ack, currency ->
+            try { currency } finally {
+                ack?.close(); exported.genericSourceNativeProjection?.fill(0)
+                exported.rawHostPreferences?.fill(0); exported.rawAccount?.fill(0)
+            }
+        }) } finally { raw.fill(0) }
+    }
+
+    /** Controlled two-thread lock test using the ACTUAL manager operations admission and actual
+     * Session/currency. It is not an Android scheduler/deadlock reproduction. Finite release/join
+     * also cleans up the intentionally wrong Session-taking predicate without leaving ABBA. */
+    internal suspend fun verifyUploadCurrencyLockOrder() {
+        val fixture = GenericPlaylistFixture()
+        val held = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val scalarDone = java.util.concurrent.CountDownLatch(1)
+        val publisherDone = java.util.concurrent.CountDownLatch(1)
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        var threads: List<Thread> = emptyList()
+        try {
+            fixture.start()
+            val session = fixture.runtime.session()
+            val currency = issuedTestCurrency(fixture)
+            val original = requireNotNull(fixture.manager.captureLocalLibraryMutationAdmission())
+            fun launch(name: String, body: () -> Unit) = Thread({
+                try { body() } catch (error: Throwable) { failure.compareAndSet(null, error) }
+            }, name).apply { isDaemon = true }
+            val writer = launch("raw-upload-session-owner") {
+                synchronized(session) {
+                    held.countDown()
+                    check(release.await(5, java.util.concurrent.TimeUnit.SECONDS)) { "Owned Session release timed out" }
+                }
+                // Wait outside Session so a deliberately Session-taking broken scalar predicate
+                // can exit after the assertion timeout; cleanup itself must not form ABBA.
+                check(publisherDone.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                check(currency.withCurrentSession {
+                    check(Thread.holdsLock(session))
+                    original { currency.isCurrent() }
+                } == true) { "Session-first original admission failed" }
+            }
+            val publisher = launch("raw-upload-operations-owner") {
+                try {
+                    check(held.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    check(original {
+                        check(currency.isCurrent()) // Actual operations monitor; Session held by writer.
+                        scalarDone.countDown(); true
+                    })
+                } finally { publisherDone.countDown() }
+            }
+            threads = listOf(writer, publisher)
+            threads.forEach { it.start() }
+            assertTrue("Scalar upload currency entered Session while operations were held",
+                scalarDone.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            release.countDown()
+            threads.forEach { it.join(6_000) }
+            check(threads.none { it.isAlive }) { "Owned currency chain did not finish" }
+            failure.get()?.let { throw AssertionError("Upload currency chain failed", it) }
+            // Controlled equal-plaintext encrypted-file replacement, not a natural device repro.
+            // It keeps original scalar identity while forcing the REAL Session CAS uncertainty.
+            val scope = session.scope
+            fixture.disk.commit(scope, checkNotNull(fixture.disk.captureCheckpoint(scope).plaintext))
+            assertTrue(runCatching { session.dispatch(emptyList(), session.read().owner, progressOnly = true) }.isFailure)
+            assertTrue(session.requiresRecovery())
+            assertTrue(currency.isCurrent()) // Deliberately not cached health.
+            assertNull(currency.withCurrentSession { fail("Recovering Session admitted") })
+            assertNull(fixture.runtime.currentMountToken(fixture.principal))
+        } finally {
+            release.countDown()
+            threads.forEach { it.join(6_000) }
+            threads.filter { it.isAlive }.forEach { it.interrupt(); it.join(1_000) }
+            // Do not call Session close while a failed thread still owns it. Retain the fixture
+            // on that exceptional failure rather than turning a bounded assertion into a hang.
+            if (threads.none { it.isAlive }) fixture.finish()
+            check(threads.none { it.isAlive }) { "Owned upload currency threads did not terminate" }
+            failure.get()?.let { throw AssertionError("Upload currency lock control failed", it) }
+        }
+    }
+
+    internal suspend fun verifyRawHostUploadCase(mode: String) {
+        val namespace = java.util.UUID.fromString("00000000-0000-0000-0000-000000000501")
+        fun document(title: String, number: String) = com.vortx.android.xperience.XperienceCollections.parse(
+            """[{"id":"c","title":"$title","folders":[],"future":{"n":$number,"z":-0.0}}]""".toByteArray())
+        val append = com.vortx.android.xperience.XperienceImportNamespace.append(document("Old server A", "1.0"), "A", namespace)
+        val value = com.vortx.android.engine.OHJson.Obj(append.value())
+            .set("futureValue", """{"wide":18446744073709551615,"n":1.2300e+2,"z":-0.0}""".toByteArray())
+        val event = com.vortx.android.engine.OHJson.Obj().set("clock", "1e0".toByteArray())
+            .set("actor", com.vortx.android.engine.OHJson.quote("00000000-0000-0000-0000-000000000222"))
+            .set("value", value.encoded()).encoded()
+        val fixture = GenericPlaylistFixture(if (mode.endsWith("Budget")) 2_000_000 else 0, append.field to event)
+        fixture.updateServerAfterPut = true
+        val notifications = mutableListOf<() -> Unit>()
+        NativeSettingsFence.queuedNotificationsForTest = notifications
+        var remoteFlag: java.lang.reflect.Field? = null
+        try {
+            fixture.start()
+            val profileID = com.vortx.android.engine.NativeHostPreferences.canonicalProfileID(UserProfile.OWNER_ID)
+            fun fields(raw: ByteArray) = com.vortx.android.engine.OHJson.Obj(raw).obj("nativeHostPreferences")
+                .obj("profiles").obj(profileID).obj("fields")
+            fun localFields() = com.vortx.android.engine.OHJson.Obj(fixture.runtime.session().rawHostPreferences())
+                .obj("profiles").obj(profileID).obj("fields")
+            fun replacingServer(register: ByteArray): ByteArray {
+                val root = com.vortx.android.engine.OHJson.Obj(fixture.originalRaw)
+                val host = root.obj("nativeHostPreferences"); val groups = host.obj("profiles"); val group = groups.obj(profileID)
+                group.set("fields", group.obj("fields").set(append.field, register).encoded())
+                host.set("profiles", groups.set(profileID, group.encoded()).encoded())
+                return root.set("nativeHostPreferences", host.encoded())
+                    .set("futureRetry", """{"n":1.000e+3,"zero":-0}""".toByteArray()).encoded()
+            }
+            val opening = fixture.runtime.captureXperienceProfile().getOrThrow()
+            val old = com.vortx.android.xperience.XperienceImportNamespace.read(append.field, opening.registers().getValue(append.field))
+            val changed = fixture.runtime.writeXperience(opening.target,
+                old.replacement(document("Pending A", "2.0"), old.label, old.bindings)).getOrThrow()
+            val pendingA = changed.registers().getValue(append.field)
+            val second = com.vortx.android.xperience.XperienceImportNamespace.append(document("Pending B", "3e0"), "B",
+                java.util.UUID.fromString("00000000-0000-0000-0000-000000000502"))
+            fixture.runtime.writeXperience(opening.target, second).getOrThrow()
+            val pendingB = localFields().raw(second.field)
+            val savedScope = fixture.runtime.session().scope
+            val source = com.vortx.android.engine.OHJson.Obj(fixture.originalRaw)
+            val rootUnknown = source.raw("futureRoot"); val nativeUnknown = source.obj("nativeSync").raw("futureNative")
+            val gets = fixture.getCount
+            if (mode == "cold") fixture.coldReopen()
+            if (mode == "originGlobal") {
+                // Controlled credential-admission retirement DURING the real native fork.
+                // Original admission remains held, but this active predicate can revoke without
+                // taking its monitor (as caller cancellation can). The file barrier must recheck.
+                val origin = requireNotNull(fixture.runtime.captureUploadOrigin(fixture.principal) { true })
+                val session = fixture.runtime.session()
+                val before = session.rawHostPreferences()
+                val diskBefore = fixture.disk.captureCheckpoint(savedScope).plaintext
+                val forks = fixture.forks; val attempts = fixture.checkpointAttempts
+                fixture.onFork = { fixture.controlledAdmissionEpoch++ }
+                val rejected = runCatching { fixture.runtime.recordGlobalPreferences(fixture.principal,
+                    JSONObject().put("stremiox.autoSkip", true), origin) }.exceptionOrNull()
+                assertEquals("Original upload authentication or mount retired", rejected?.message)
+                assertEquals(forks + 1, fixture.forks); assertEquals(attempts, fixture.checkpointAttempts)
+                assertArrayEquals(before, session.rawHostPreferences()); before.fill(0)
+                assertEquals(diskBefore, fixture.disk.captureCheckpoint(savedScope).plaintext)
+                assertFalse(session.requiresRecovery()); assertEquals(0, fixture.putCount)
+                return
+            }
+            if (mode == "originGet" || mode == "originRetry") {
+                // Controlled same-account credential-admission epoch, NOT a natural credential
+                // store/customer reproduction. A post-GET recapture would wrongly adopt it.
+                val originalPrincipal = fixture.manager.sessionOwnerSnapshot()
+                if (mode == "originRetry") fixture.rejectNextPut = true
+                fixture.beforeGet = {
+                    if (fixture.getCount >= gets + if (mode == "originGet") 1 else 2) fixture.controlledAdmissionEpoch++
+                }
+                assertFalse(fixture.manager.syncUp())
+                assertEquals(originalPrincipal, fixture.manager.sessionOwnerSnapshot())
+                assertEquals(if (mode == "originGet") 0 else 1, fixture.putCount)
+                assertEquals(gets + if (mode == "originGet") 1 else 2, fixture.getCount)
+                assertTrue(fixture.runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+                return
+            }
+
+            if (mode == "capture") {
+                val firstRead = requireNotNull(coordinatorRead(fixture.runtime))
+                val copiedRaw = firstRead.copyRawForApply(fixture.principal)
+                val origin = requireNotNull(fixture.runtime.captureUploadOrigin(fixture.principal) { true })
+                var escaped: ((JSONObject) -> ByteArray)? = null
+                var acknowledgment: NativeHostUploadAcknowledgment? = null
+                fixture.runtime.withUploadExport(fixture.principal, firstRead, copiedRaw, origin, { true }) { exported, _, compose, ack, _ ->
+                    val composeRaw = requireNotNull(compose)
+                    escaped = composeRaw; acknowledgment = ack
+                    try {
+                        // DTO/read-only byte mutation cannot replace the private Session snapshot.
+                        exported.nativeSync.put("scope", "wrong-DTO-scope")
+                        exported.rawHostPreferences?.fill(0)
+                        val providers = requireNotNull(com.vortx.android.integrations.NativeProviderAccess.merge(fixture.principal, JSONObject(com.vortx.android.engine.OHJson.utf8(copiedRaw))))
+                        val candidate = composeRaw(providers)
+                        try {
+                            val exact = com.vortx.android.engine.OHJson.Obj(candidate)
+                            assertEquals(savedScope.accountID, exact.obj("nativeSync").text("scope"))
+                            assertArrayEquals(pendingA, fields(candidate).raw(append.field))
+                            assertTrue(runCatching { composeRaw(providers) }.isFailure) // Single consumption.
+                        } finally { candidate.fill(0) }
+                    } finally { exported.genericSourceNativeProjection?.fill(0); exported.rawAccount?.fill(0) }
+                }
+                assertTrue(runCatching { escaped!!(JSONObject()) }.exceptionOrNull()?.message?.contains("expired") == true)
+                acknowledgment?.close()
+                assertTrue(fixture.manager.syncDown(true))
+                val next = requireNotNull(coordinatorRead(fixture.runtime))
+                // A separate explicit test operation, not the production retry's original origin.
+                val nextOrigin = requireNotNull(fixture.runtime.captureUploadOrigin(fixture.principal) { true })
+                assertFalse(next.sameObservation(firstRead))
+                assertTrue(runCatching { firstRead.copyRawForApply(fixture.principal) }.isFailure)
+                assertEquals("Original authenticated upload read changed", runCatching { fixture.runtime.withUploadExport(fixture.principal, firstRead, copiedRaw, nextOrigin, { true }) { _, _, _, _, _ -> fail("Old read admitted") } }.exceptionOrNull()?.message)
+                val equalMetadata = NativeAccountReadCapture.fromAuthenticatedPull(fixture.principal, next.operationGeneration,
+                    fixture.principal.id, fixture.principal.generation, next.baseRevision, fixture.originalRaw)
+                try {
+                    assertFalse(next.sameObservation(equalMetadata))
+                    assertEquals("Original authenticated upload read changed", runCatching { fixture.runtime.withUploadExport(fixture.principal, equalMetadata, fixture.originalRaw, nextOrigin, { true }) { _, _, _, _, _ -> fail("Unrelated read admitted") } }.exceptionOrNull()?.message)
+                } finally { equalMetadata.retire() }
+                assertEquals("Authenticated upload bytes changed", runCatching { fixture.runtime.withUploadExport(fixture.principal, next, fixture.originalRaw + byteArrayOf(32), nextOrigin, { true }) { _, _, _, _, _ -> fail("Wrong exact source admitted") } }.exceptionOrNull()?.message)
+                var current = true
+                assertTrue(runCatching { fixture.runtime.withUploadExport(fixture.principal, next, fixture.originalRaw, nextOrigin, { current }) { _, _, compose, ack, _ ->
+                    try { current = false; requireNotNull(compose)(JSONObject()) } finally { ack?.close() }
+                } }.isFailure)
+                assertTrue(runCatching { fixture.runtime.withUploadExport(fixture.principal, next, fixture.originalRaw, nextOrigin, { true }) { _, _, compose, ack, _ ->
+                    try {
+                        fixture.runtime.session().dispatch(emptyList(), fixture.runtime.session().read().owner, progressOnly = true)
+                        requireNotNull(compose)(JSONObject()) // Original checkpoint cannot rebase.
+                    } finally { ack?.close() }
+                } }.isFailure)
+                copiedRaw.fill(0); assertEquals(0, fixture.putCount)
+                return
+            }
+
+            var remoteWinner: ByteArray? = null
+            if (mode == "retry" || mode == "equalConflict") {
+                fixture.rejectNextPut = true
+                fixture.beforePut = {
+                    val local = com.vortx.android.engine.OHJson.Obj(pendingA)
+                    val updated = if (mode == "retry") {
+                        val saved = com.vortx.android.xperience.XperienceImportNamespace.read(append.field, pendingA)
+                        val newValue = saved.replacement(document("Remote winner", "4.0"), saved.label, saved.bindings).value()
+                        local.set("clock", (com.vortx.android.engine.NativeRawHostPreferences.exactClock(local.raw("clock")) + 10).toString().toByteArray())
+                            .set("value", newValue).encoded()
+                    } else local.set("value", local.obj("value").set("label", com.vortx.android.engine.OHJson.quote("Contradictory same event")).encoded()).encoded()
+                    remoteWinner = updated
+                    val previous = fixture.originalRaw
+                    fixture.originalRaw = replacingServer(updated); previous.fill(0); fixture.serverVersion = 101
+                }
+            }
+            if (mode == "lateEdit") fixture.beforePut = {
+                val profiles = NativeProfileAccess { fixture.runtime.session() }
+                profiles.save(profiles.read().profiles.single().copy(name = "Newer local profile"), false)
+                // A separate explicit local gesture during PUT captures its own current target.
+                runBlocking {
+                    val now = fixture.runtime.captureXperienceProfile().getOrThrow()
+                    val saved = com.vortx.android.xperience.XperienceImportNamespace.read(append.field, now.registers().getValue(append.field))
+                    fixture.runtime.writeXperience(now.target, saved.replacement(document("Later A", "5.0"), saved.label, saved.bindings)).getOrThrow()
+                }
+            }
+            if (mode == "lateSettings") fixture.beforePut = {
+                fixture.context.getSharedPreferences("vortx_settings", 0).edit()
+                    .putString("stremiox.languageOverride", "later-queued-value").apply()
+            }
+            if (mode == "retire") fixture.beforePut = { fixture.runtime.retire() }
+            if (mode == "auth") fixture.beforePut = { fixture.manager.expireSyncOperationTestSeam() }
+            if (mode == "ackFileDrift") fixture.beforePut = {
+                // Same plaintext, new authenticated encrypted-file capability outside Session.
+                fixture.disk.commit(savedScope, checkNotNull(fixture.disk.captureCheckpoint(savedScope).plaintext))
+            }
+            val cancellation = kotlinx.coroutines.SupervisorJob()
+            if (mode == "cancel") fixture.beforePut = { cancellation.cancel() }
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-raw-upload")))
+            if (mode == "providerBudget") assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "p".repeat(1_200_000))))
+            if (mode == "settingBudget") {
+                fixture.context.getSharedPreferences("vortx_settings", 0).edit().putString("stremiox.languageOverride", "x".repeat(3_700_000)).apply()
+                assertTrue(notifications.isNotEmpty())
+            }
+            if (mode == "warm" || mode == "cold") {
+                assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-upload-pending")))
+                fixture.context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", true).apply()
+            }
+            val dirtyBytes = when (mode) { "malformedDirty" -> "{broken"; "negativeStamp" -> "{\"stremiox.autoSkip\":-1}"; else -> null }
+            if (dirtyBytes != null) fixture.context.getSharedPreferences("vortx_sync_dirty", 0).edit()
+                .putString("vortx.sync.dirtySettings.${fixture.principal.id}", dirtyBytes).commit()
+            if (mode == "remoteWindow") {
+                // Controlled remote/suppression frame, not a natural scheduler/device repro.
+                remoteFlag = VortXSyncManager::class.java.getDeclaredField("applyingRemote").apply { isAccessible = true }
+                NativeSettingsFence.mutateBookkeeping { remoteFlag!!.setBoolean(fixture.manager, true) }
+                fixture.context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", true).apply()
+            }
+            if (mode == "clearGuard") {
+                // Controlled post-own-apply domain witness exercises the REAL private clear
+                // body. It is not a natural scheduler reproduction or authored server receipt.
+                val dirty = fixture.context.getSharedPreferences("vortx_sync_dirty", 0)
+                val key = "vortx.sync.dirtySettings.${fixture.principal.id}"
+                val raw = "{\"stremiox.languageOverride\":1.0}"
+                dirty.edit().putString(key, raw).commit()
+                fixture.context.getSharedPreferences("vortx_settings", 0).edit().putString("stremiox.languageOverride", "later-queued-value").apply()
+                val clear = VortXSyncManager::class.java.getDeclaredMethod("clearNativePushedDirtySettings", Map::class.java, Map::class.java)
+                    .apply { isAccessible = true }
+                assertEquals(false, clear.invoke(fixture.manager, mapOf("stremiox.languageOverride" to 1.0), mapOf("stremiox.languageOverride" to "accepted-old-value")))
+                assertEquals(raw, dirty.getString(key, null))
+            }
+            val success = try {
+                if (mode == "cancel") runCatching { kotlinx.coroutines.withContext(cancellation) { fixture.manager.syncUp() } }.getOrDefault(false)
+                else fixture.manager.syncUp()
+            } finally { cancellation.cancel() }
+            if (mode == "lateSettings") {
+                assertFalse(success); assertEquals(1, fixture.putCount) // Older immutable wire PUT was accepted.
+                assertEquals("later-queued-value", fixture.context.getSharedPreferences("vortx_settings", 0).getString("stremiox.languageOverride", null))
+                assertTrue(fixture.runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+                val dirty = fixture.context.getSharedPreferences("vortx_sync_dirty", 0)
+                    .getString("vortx.sync.dirtySettings.${fixture.principal.id}", null)?.let(::JSONObject)
+                assertFalse(dirty?.has("stremiox.languageOverride") == true) // No fabricated stamp.
+                assertTrue(fixture.manager.syncUp())
+                val latest = com.vortx.android.engine.OHJson.Obj(requireNotNull(fixture.uploaded)).obj("nativeHostPreferences")
+                    .obj("globals").obj("fields").obj("stremiox.languageOverride")
+                assertEquals("later-queued-value", com.vortx.android.engine.OHJson.text(latest.raw("value")))
+                assertFalse(fixture.runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+                return
+            }
+            if (mode in setOf("retire", "auth", "cancel", "ackFileDrift", "equalConflict", "providerBudget", "settingBudget", "malformedDirty", "negativeStamp", "remoteWindow")) {
+                assertFalse(success)
+                val durable = com.vortx.android.engine.OHJson.Obj(checkNotNull(fixture.disk.captureCheckpoint(savedScope).plaintext).toByteArray())
+                    .obj("nativeHostPreferenceState")
+                assertEquals("true", com.vortx.android.engine.OHJson.utf8(durable.raw("pending")))
+                if (mode.endsWith("Budget")) assertEquals(0, fixture.putCount)
+                if (mode == "equalConflict") assertEquals(1, fixture.putCount) // First PUT rejected; contradictory GET is never rebuilt.
+                if (mode == "ackFileDrift") {
+                    assertTrue(fixture.runtime.session().requiresRecovery())
+                    assertNull(fixture.runtime.currentMountToken(fixture.principal)) // Original health contract retained.
+                }
+                if (dirtyBytes != null || mode == "remoteWindow") {
+                    assertEquals(gets, fixture.getCount); assertEquals(0, fixture.putCount)
+                    if (dirtyBytes != null) assertEquals(dirtyBytes, fixture.context.getSharedPreferences("vortx_sync_dirty", 0)
+                        .getString("vortx.sync.dirtySettings.${fixture.principal.id}", null))
+                }
+                return
+            }
+            assertTrue(success)
+            val uploaded = requireNotNull(fixture.uploaded)
+            assertArrayEquals(rootUnknown, com.vortx.android.engine.OHJson.Obj(uploaded).raw("futureRoot"))
+            assertArrayEquals(nativeUnknown, com.vortx.android.engine.OHJson.Obj(uploaded).obj("nativeSync").raw("futureNative"))
+            assertArrayEquals(value.raw("futureValue"), com.vortx.android.engine.OHJson.Obj(fields(uploaded).raw(append.field)).obj("value").raw("futureValue"))
+            assertArrayEquals(pendingB, fields(uploaded).raw(second.field))
+            if (mode == "warm" || mode == "cold") assertArrayEquals("true".toByteArray(), com.vortx.android.engine.OHJson.Obj(uploaded)
+                .obj("nativeHostPreferences").obj("globals").obj("fields").obj("stremiox.autoSkip").raw("value"))
+            if (mode == "clearGuard") assertEquals("later-queued-value", com.vortx.android.engine.OHJson.text(com.vortx.android.engine.OHJson.Obj(uploaded)
+                .obj("nativeHostPreferences").obj("globals").obj("fields").obj("stremiox.languageOverride").raw("value")))
+            if (mode == "retry") {
+                assertEquals(2, fixture.putCount); assertTrue(fixture.getCount >= gets + 2)
+                assertEquals(102L, fixture.uploadedVersion)
+                assertArrayEquals(requireNotNull(remoteWinner), fields(uploaded).raw(append.field))
+                assertArrayEquals("""{"n":1.000e+3,"zero":-0}""".toByteArray(), com.vortx.android.engine.OHJson.Obj(uploaded).raw("futureRetry"))
+            } else assertArrayEquals(pendingA, fields(uploaded).raw(append.field))
+            if (mode == "lateEdit") {
+                assertNotEquals("Newer local profile", JSONObject(com.vortx.android.engine.OHJson.utf8(uploaded))
+                    .getJSONObject("nativeSync").getJSONObject("profiles").getJSONObject(UserProfile.OWNER_ID)
+                    .getJSONObject("profile").getString("name"))
+                assertTrue(fixture.runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+                assertFalse(pendingA.contentEquals(localFields().raw(append.field)))
+                assertEquals("Newer local profile", NativeProfileAccess { fixture.runtime.session() }.read().profiles.single().name)
+                assertTrue(fixture.manager.syncUp())
+                assertArrayEquals(localFields().raw(append.field), fields(requireNotNull(fixture.uploaded)).raw(append.field))
+            }
+            assertFalse(fixture.runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            if (mode == "warm" || mode == "cold") assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == false)
+        } finally {
+            remoteFlag?.let { flag -> NativeSettingsFence.mutateBookkeeping { flag.setBoolean(fixture.manager, false) } }
+            fixture.finish()
+            NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
         }
     }
 
@@ -703,7 +1124,8 @@ class NativeAccountSyncTest {
         var manager = VortXSyncManager(context, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() +
             kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)))
         fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { it == principal }, { it() },
-            project = {}, onMutation = { manager.onLocalNativeMutation(it) })
+            project = {}, onMutation = { manager.onLocalNativeMutation(it) },
+            captureOwnAccountAdmission = { originalTestAdmission(manager, it) })
         var runtime = coordinator()
         fun install() {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->
@@ -783,7 +1205,8 @@ class NativeAccountSyncTest {
         val context = TestContext()
         val manager = VortXSyncManager(context, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() +
             kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)))
-        fun coordinator() = NativeAccountCoordinator(bindings, checkpoints, { noNetwork }, { true }, { it() }, {})
+        fun coordinator() = NativeAccountCoordinator(bindings, checkpoints, { noNetwork }, { true }, { it() }, {},
+            captureOwnAccountAdmission = { originalTestAdmission(manager, it) })
         var runtime = coordinator()
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Legacy owner", avatar = "star", isOwner = true)
         var cloud = JSONObject().put("vortx", JSONObject().put("roster", org.json.JSONArray().put(owner.encode()))
@@ -865,7 +1288,8 @@ class NativeAccountSyncTest {
             val checkpointKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
             val checkpoints = VortxEncryptedCheckpointStore(directory) { checkpointKey }
             val context = TestContext(); val manager = VortXSyncManager(context)
-            val runtime = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { true }, { it() }, {})
+            val runtime = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { true }, { it() }, {},
+                captureOwnAccountAdmission = { originalTestAdmission(manager, it) })
             var cloud: JSONObject? = null; var cloudVersion = 0L; val versions = mutableListOf<Long>(); var gets = 0
             try {
                 manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->

@@ -12,15 +12,34 @@ internal object NativePlaylistAccountComposer {
         val base = NativeOwnerHistoryAccount(raw)
         val sourceNative = OHJson.Obj(checkNotNull(base.raw("nativeSync")))
         val scope = VortxAccountScope(sourceNative.text("scope"), sourceNative.text("ownerProfileId"))
-        return preview.withRawHost(scope) { host ->
-            base.raw("nativeHostPreferences")?.let { source -> requireHostConservation(scope, source, host) }
-            // The original native/root/provider slices remain genuine source material. Ordinary
-            // composition sees the admitted whole raw host as its preview baseline and cannot
-            // launder older A's collections through a normalized JSONObject while editing B.
-            val previewBase = base.replacingOwned(mapOf("nativeHostPreferences" to host)).encoded()
-            try { compose(previewBase, originalNativeProjection, native, host, providers) }
-            finally { previewBase.fill(0) }
+        return preview.withRawHost(scope) { host -> composeWholeHost(raw, originalNativeProjection, native, host, providers) }
+    }
+
+    /** Ordinary generic upload uses a newly issued POST-GET Session checkpoint snapshot,
+     * including after cold reopen. No per-edit receipt or prefix permits raw replacement. */
+    fun composeExport(raw: ByteArray, originalNativeProjection: ByteArray,
+        snapshot: VortxNativeSession.RawHostExport, providers: JSONObject): ByteArray {
+        snapshot.requireActive()
+        val native = OHJson.Obj(checkNotNull(NativeOwnerHistoryAccount(raw).raw("nativeSync")))
+        val scope = VortxAccountScope(native.text("scope"), native.text("ownerProfileId"))
+        return snapshot.composeHost(scope, raw, originalNativeProjection) { currentNative, host ->
+            composeWholeHost(raw, originalNativeProjection, currentNative, host, providers)
         }
+    }
+
+    private fun composeWholeHost(raw: ByteArray, originalNativeProjection: ByteArray, native: ByteArray,
+        host: ByteArray, providers: JSONObject): ByteArray {
+        val base = NativeOwnerHistoryAccount(raw)
+        val sourceNative = OHJson.Obj(checkNotNull(base.raw("nativeSync")))
+        val scope = VortxAccountScope(sourceNative.text("scope"), sourceNative.text("ownerProfileId"))
+        NativeHostPreferences.validate(scope, JSONObject(OHJson.utf8(host)))
+        NativeXperienceWrite.maximumClock(host)
+        base.raw("nativeHostPreferences")?.let { source -> requireHostConservation(scope, source, host) }
+        // Only the owned raw host is supplied by Session. Native/root/provider source slices
+        // still cross the original conservative composer and actual encrypted account budget.
+        val previewBase = base.replacingOwned(mapOf("nativeHostPreferences" to host)).encoded()
+        return try { compose(previewBase, originalNativeProjection, native, host, providers) }
+        finally { previewBase.fill(0) }
     }
 
     private fun requireHostConservation(scope: VortxAccountScope, source: ByteArray, host: ByteArray) {

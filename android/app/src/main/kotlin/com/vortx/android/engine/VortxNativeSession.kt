@@ -848,6 +848,85 @@ internal class VortxNativeSession private constructor(
         return accepted
     }
 
+    private val rawHostExportIssuer = Any()
+    /** Fresh post-GET checkpoint provenance. It is unrelated to any old in-memory edit object.
+     * The coordinator supplies the retained authenticated source under its original admission;
+     * arbitrary raw host data cannot construct the Session's private issuer. */
+    internal class RawHostExport internal constructor(
+        private val issuer: Any,
+        internal val session: VortxNativeSession,
+        internal val owner: VortxNativeOwner,
+        internal val runtime: VortxNativeRuntime,
+        internal val checkpoint: NativeCheckpointRead,
+        internal val context: String,
+        internal val sourceCurrent: () -> Boolean,
+        local: ByteArray, source: ByteArray, projection: ByteArray, native: ByteArray,
+    ) : AutoCloseable {
+        private val thread = Thread.currentThread()
+        private var active = true; private var consumed = false
+        private val local = local.copyOf(); private val source = source.copyOf()
+        private val projection = projection.copyOf(); private val native = native.copyOf()
+        internal fun issuedBy(value: Any) = issuer === value
+        internal fun matchesLocal(value: ByteArray) = local.contentEquals(value)
+        fun composeHost(scope: VortxAccountScope, source: ByteArray, projection: ByteArray,
+            action: (ByteArray, ByteArray) -> ByteArray): ByteArray = session.withRawHostExportCurrent(this, scope) {
+            check(active && !consumed && Thread.currentThread() === thread) { "Raw host export expired, repeated or changed thread" }
+            check(this.source.contentEquals(source) && this.projection.contentEquals(projection)) { "Original raw host export source changed" }
+            consumed = true
+            val host = NativeRawHostPreferences.document(local); val native = native.copyOf()
+            try {
+                val result = action(native, host)
+                try { session.requireRawHostExport(this); result }
+                catch (failure: Throwable) { result.fill(0); throw failure }
+            } finally { host.fill(0); native.fill(0) }
+        }
+        internal fun requireActive() { check(active && Thread.currentThread() === thread) { "Raw host export expired or changed thread" } }
+        override fun close() { active = false; local.fill(0); source.fill(0); projection.fill(0); native.fill(0) }
+    }
+    @Synchronized internal fun <T> withRawHostExport(owner: VortxNativeOwner, source: ByteArray,
+        projection: ByteArray, sourceCurrent: () -> Boolean, action: (RawHostExport) -> T): T =
+        withCompleteAccountExportOwner(owner, true) { read ->
+            check(!runtime.isTyped && sourceCurrent()) { "Generic raw host export unavailable" }
+            NativeXperienceWrite.requireClocks(rawNativeHostPreferenceState)
+            val checkpoint = checkNotNull(captureGenericPlaylistCheckpoint(owner))
+            val native = read.state.getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+            val snapshot = RawHostExport(rawHostExportIssuer, this, owner, runtime, checkpoint,
+                xperienceContext(read), sourceCurrent, rawNativeHostPreferenceState, source, projection, native)
+            native.fill(0)
+            try { action(snapshot) } finally { snapshot.close() }
+        }
+    private fun requireRawHostExport(snapshot: RawHostExport) {
+        snapshot.requireActive()
+        check(snapshot.issuedBy(rawHostExportIssuer) && snapshot.session === this && snapshot.runtime === runtime &&
+            accepts(snapshot.owner) && snapshot.matchesLocal(rawNativeHostPreferenceState) &&
+            acknowledgedCheckpoint === snapshot.checkpoint && xperienceContext(read()) == snapshot.context &&
+            snapshot.sourceCurrent()) { "Original raw host export changed" }
+        store.requireCurrentCheckpoint(scope, snapshot.checkpoint)
+    }
+    @Synchronized private fun <T> withRawHostExportCurrent(snapshot: RawHostExport,
+        expectedScope: VortxAccountScope, action: () -> T): T {
+        check(scope == expectedScope) { "Raw host export scope changed" }
+        requireRawHostExport(snapshot)
+        return action()
+    }
+
+    /** The PUT candidate may outlive a newer local checkpoint. Only its exact sent raw carrier
+     * can clear pending; newer events remain pending. This acknowledgement uses today's original
+     * file CAS while the caller holds the ORIGINAL upload account/mount/accepted receipt fence. */
+    @Synchronized internal fun acknowledgeRawHostDocument(sent: ByteArray, isCurrent: () -> Boolean): Boolean {
+        check(isCurrent() && !requiresRecovery()) { "Raw host acknowledgement retired" }
+        val current = NativeRawHostPreferences.document(rawNativeHostPreferenceState)
+        val matches = try { OHJson.equal(current, sent) } finally { current.fill(0) }
+        if (!matches) return true
+        val owner = read().owner
+        val checkpoint = try { checkNotNull(captureGenericPlaylistCheckpoint(owner)) }
+        catch (failure: Throwable) { enterCheckpointUncertainty(); throw failure }
+        dispatchInternal(emptyList(), owner, null, false, null, null, null, JSONObject(OHJson.utf8(sent)),
+            null, null, { check(isCurrent()) { "Raw host acknowledgement retired" } }, null, emptyMap(), false, false,
+            checkpointCASOnly = checkpoint)
+        return isCurrent()
+    }
+
     /** Scalar-only exact captured-owner gate. Revision is advanced for profile/route invalidation. */
     @Synchronized internal fun <T> withCompleteAccountExportOwnerScalar(owner: VortxNativeOwner, action: () -> T): T {
         requireCompleteAccountExportRoute()
@@ -1215,6 +1294,7 @@ internal class VortxNativeSession private constructor(
         xperienceReplacement: NativeXperienceWrite.Replacement? = null,
         typedAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
         xperienceAdmission: ((ByteArray, XperienceHostPreview, () -> Unit) -> Unit)? = null,
+        checkpointCASOnly: NativeCheckpointRead? = null,
     ): List<String> = owned(owner) {
         // This check precedes fork, host Lamport minting and every durable side effect. The later
         // commit flag prevents a future refactor from falling back to the generic local store.
@@ -1227,8 +1307,8 @@ internal class VortxNativeSession private constructor(
         scope.rejectCredentials(hostArchive)
         val originalRuntime = runtime
         val originalRevision = revision
-        val originalCheckpoint = if (requireCompleteAccountExportBudget && !runtime.isTyped)
-            checkNotNull(genericCheckpoint).also {
+        val originalCheckpoint = if (!runtime.isTyped && (requireCompleteAccountExportBudget || checkpointCASOnly != null))
+            checkNotNull(genericCheckpoint ?: checkpointCASOnly).also {
                 check(acknowledgedCheckpoint === it) { "Original playlist checkpoint changed" }
                 store.requireCurrentCheckpoint(scope, it)
             } else null
@@ -1290,7 +1370,7 @@ internal class VortxNativeSession private constructor(
             val state = validatePresentation(updated)
             val prior = JSONObject(before)
             val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
-            val needsPreview = originalCheckpoint != null || xperienceOperation != null
+            val needsPreview = (originalCheckpoint != null && requireCompleteAccountExportBudget) || xperienceOperation != null
             val prospectiveRawHost = if (needsPreview) NativeRawHostPreferences.reconcile(scope, rawHostState,
                 prospectiveGlobalChanges?.let { NativeHostPreferences.recordGlobals(scope, hostState, it) } ?: hostState) else null
             val prospectiveHost = prospectiveRawHost?.let(NativeRawHostPreferences::document)
@@ -1319,7 +1399,7 @@ internal class VortxNativeSession private constructor(
                             }
                         } else null)
             }
-            try { if (originalCheckpoint != null) {
+            try { if (originalCheckpoint != null && requireCompleteAccountExportBudget) {
                 val native = state.getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
                 // Include every captured pending global value in the complete cloud candidate,
                 // but persist only the requested playlist field. This budget preview neither

@@ -32,6 +32,8 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/sync/VortXSyncManager*' 
     'com/vortx/android/sync/SessionOperationCoordinator*' 'com/vortx/android/sync/SessionMutationResult*' \
     'com/vortx/android/sync/SyncSessionLease*' 'com/vortx/android/sync/NativeAccountGateway*' 'com/vortx/android/sync/NativeAccountExport*' \
     'com/vortx/android/sync/NativeAccountReadCapture*' 'com/vortx/android/sync/NativeAccountMountToken*' \
+    'com/vortx/android/sync/NativeHostUploadAcknowledgment*' \
+    'com/vortx/android/sync/NativeAccountUploadCurrency*' \
     'com/vortx/android/sync/NativeXperienceProfileGateway*' 'com/vortx/android/engine/NativeXperienceWrite*' \
     'com/vortx/android/xperience/XperienceCollections*' 'com/vortx/android/xperience/XperienceImportNamespace*' \
     'com/vortx/android/xperience/XperienceAddonBinding*' \

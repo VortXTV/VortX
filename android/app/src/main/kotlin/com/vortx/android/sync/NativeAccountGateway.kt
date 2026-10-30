@@ -32,6 +32,7 @@ internal class NativeAccountReadCapture private constructor(
     val operationGeneration: Long,
     val baseRevision: Long,
     raw: ByteArray,
+    private val readNonce: Any = Any(),
 ) {
     private val lock = Any()
     private var active = true
@@ -46,8 +47,13 @@ internal class NativeAccountReadCapture private constructor(
     /** A private mount copy separates retained provenance from the transient sync-call capture. */
     internal fun retainedCopyFor(expected: SessionOwnerSnapshot.Account): NativeAccountReadCapture = synchronized(lock) {
         check(active && expected == account) { "Authenticated account read is stale" }
-        NativeAccountReadCapture(account, operationGeneration, baseRevision, rawBytes)
+        NativeAccountReadCapture(account, operationGeneration, baseRevision, rawBytes, readNonce)
     }
+
+    /** Non-secret pairing identity survives transient raw-byte retirement. Equal version/bytes
+     * from a different authenticated GET are not this observation and cannot reuse an export. */
+    internal fun sameObservation(other: NativeAccountReadCapture): Boolean = readNonce === other.readNonce &&
+        account == other.account && operationGeneration == other.operationGeneration && baseRevision == other.baseRevision
 
     /** Best-effort zeroing of this capture's owned bytes on reject, replacement, or mount retirement. */
     internal fun retire() = synchronized(lock) {
@@ -88,6 +94,13 @@ internal interface NativeAccountGateway {
     fun installPlaylistAccountProducer(producer: NativePlaylistAccountProducer) {}
     /** Cheap certification only. Missing/recovering mounts must take the full checkpoint path. */
     fun currentMountToken(account: SessionOwnerSnapshot.Account): NativeAccountMountToken? = null
+    /** Scalar currency and Session health are separate lock-order boundaries. Missing original
+     * authentication admission fails closed; readonly exports never manufacture this authority. */
+    fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): NativeAccountUploadCurrency.Origin? = null
+    suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean):
+        Pair<JSONObject, NativeAccountUploadCurrency>? = null
+    suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
+        original: NativeAccountUploadCurrency, isCurrent: () -> Boolean): NativeAccountUploadCurrency? = null
     /** Requires a captured, durably authenticated account lease; never infers a global owner. */
     suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean = false
     /** Called only after an authenticated 404 with no prior backup evidence. */
@@ -120,12 +133,44 @@ internal interface NativeAccountGateway {
         }
     }
     fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport?
-    fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean = false
+    /** Synchronous export/compose scope after this exact authenticated GET has been applied.
+     * No callback suspends. Real generic mounts supply a Session-issued whole-host composer;
+     * legacy/fake gateways retain only the conservative readonly export path. The composer
+     * expires on return. The action owns any supplied acknowledgement and must close it. */
+    fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+        originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+        action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+        // Readonly data cannot manufacture original authentication/installation authority.
+        return null
+    }
+    fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject,
+        original: NativeAccountUploadCurrency.Origin): Boolean = false
     fun acknowledgeHostPreferences(account: SessionOwnerSnapshot.Account, document: JSONObject): Boolean = false
     /** Opaque frozen receipt IDs only; no credential or account document is retained here. */
     fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any? = null
     fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?,
         acceptedCandidate: String, version: Long) {}
+}
+
+/** Original auth/account/installation capability. isCurrent MUST NOT enter a Session monitor:
+ * request/receipt predicates run inside the manager operations monitor. Session health and local
+ * receipt work instead use withCurrentSession, which acquires Session BEFORE the auth monitor.
+ * Neither operation binds a frozen wire candidate to later ordinary checkpoint revisions. */
+internal interface NativeAccountUploadCurrency {
+    /** Authentication/account operation captured before the first GET. No installation is bound
+     * until the same operation has actually merged/reopened its genuine current checkpoint. */
+    interface Origin { fun isCurrent(): Boolean }
+    fun isCurrent(): Boolean
+    fun <T> withCurrentSession(action: () -> T): T?
+}
+
+/** Exact sent-host acknowledgement metadata. It is neither a host-field setter nor server ACK
+ * proof: the manager must supply its original accepted-candidate/lease/mount predicate. */
+internal interface NativeHostUploadAcknowledgment : AutoCloseable {
+    /** Original auth/account/mount only after composition; later local checkpoints are allowed. */
+    fun isCurrent(): Boolean
+    fun acknowledge(isAcceptedCurrent: () -> Boolean): Boolean
+    override fun close()
 }
 
 /** One edit's immutable full-family observations; raw GET operation metadata is not its authority. */

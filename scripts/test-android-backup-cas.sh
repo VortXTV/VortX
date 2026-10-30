@@ -26,6 +26,8 @@ zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/BuildConfig*' 'com/vortx
     'com/vortx/android/sync/VortXSyncDoc*' 'com/vortx/android/sync/BackupRevisionPolicy*' \
     'com/vortx/android/sync/NativeAccountGateway*' 'com/vortx/android/sync/NativeAccountExport*' \
     'com/vortx/android/sync/NativeAccountReadCapture*' 'com/vortx/android/sync/NativeSettingsFence*' \
+    'com/vortx/android/sync/NativeHostUploadAcknowledgment*' \
+    'com/vortx/android/sync/NativeAccountUploadCurrency*' \
     'com/vortx/android/sync/NativePlaylistAccountProducer*' 'com/vortx/android/sync/NativePlaylistAccountWrite*' \
     'com/vortx/android/sync/NativeAccountMountToken*' 'com/vortx/android/sync/NativePlaylistProfileGateway*' \
     'com/vortx/android/sync/NativeXperienceProfileGateway*' 'com/vortx/android/engine/NativeXperienceWrite*' \
@@ -112,6 +114,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$test_source/engine/NativePlaylistProfileGatewayTest.kt" "$test_source/engine/NativeOwnerHistoryJniTest.kt" \
     "$test_source/engine/NativeRawHostPreferencesTest.kt" "$test_source/engine/NativeOwnerHistoryCompatibilityTest.kt" \
     "$test_source/engine/NativeXperienceWriteTest.kt" "$test_source/engine/NativeXperiencePreparedAccountJniTest.kt" \
+    "$test_source/sync/NativeRawHostUploadJniTest.kt" \
     -d "$test_dir/classes" 2>&1 | tee "$test_dir/compile.log"
 cd "$repo_root/android/app"
 "$java_bin" -Xmx512m -Dvortx.test.native=true -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
@@ -133,12 +136,15 @@ if [[ "${VORTX_JNI_SYNC:-}" == "1" ]]; then
     "$java_bin" -Xmx768m -Djava.library.path="$(dirname "${VORTX_JNI_LIBRARY:?Exact reviewed JNI required}")" \
         -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
         com.vortx.android.engine.NativeXperiencePreparedAccountJniTest 2>&1 | tee "$test_dir/xperience-write-jni.log"
+    "$java_bin" -Xmx768m -Djava.library.path="$(dirname "${VORTX_JNI_LIBRARY:?Exact reviewed JNI required}")" \
+        -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
+        com.vortx.android.sync.NativeRawHostUploadJniTest 2>&1 | tee "$test_dir/raw-host-upload-jni.log"
     "$java_bin" -Xmx768m -Dvortx.test.native=true \
         -Djava.library.path="$(dirname "${VORTX_JNI_LIBRARY:?Exact reviewed JNI required}")" \
         -cp "$test_dir/classes:$test_cp" org.junit.runner.JUnitCore \
         com.vortx.android.sync.VortXSyncManagerBackupRevisionTest 2>&1 | tee "$test_dir/current-backup-revision-jni.log"
 else
-    printf '%s\n' 'UNRUN: exact JNI suites, including current BackupRevision14 and XperiencePreparedAccount3. Any skipped JNI method above is not executed proof.' \
+    printf '%s\n' 'UNRUN: exact JNI suites, including current BackupRevision14, XperiencePreparedAccount3 and RawHostUpload12. Any skipped JNI method above is not executed proof.' \
         | tee "$test_dir/exact-jni-unrun.log"
 fi
 printf 'Retained verification directory: %s\n' "$test_dir"
