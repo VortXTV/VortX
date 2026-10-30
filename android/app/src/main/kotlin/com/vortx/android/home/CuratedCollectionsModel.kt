@@ -11,6 +11,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -225,8 +227,12 @@ internal class CinemetaCuratedCatalogSource(
                     setRequestProperty("accept", "application/json")
                 }
                 if (connection.responseCode != HttpURLConnection.HTTP_OK) return@withContext emptyList()
-                val text = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                parseMetas(JSONObject(text).optJSONArray("metas"))
+                if (connection.contentLengthLong > MAX_CURATED_CATALOG_BYTES) return@withContext emptyList()
+                val requestContext = currentCoroutineContext()
+                val bytes = connection.inputStream.use { input ->
+                    readCuratedCatalogBody(input) { requestContext.ensureActive() }
+                } ?: return@withContext emptyList()
+                parseMetas(JSONObject(bytes.toString(Charsets.UTF_8)).optJSONArray("metas"))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Throwable) {
