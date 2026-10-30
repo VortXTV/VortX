@@ -20,7 +20,10 @@ const declarations = 'import Foundation\n' + [
   section('app/SourcesShared/VortxResourceBridge.swift', 'indirect enum VortxJSON:', 'struct VortxResourceRequest:'),
   section('app/SourcesShared/VortxNativeRuntime.swift', 'enum VortxNativeError:', '/// Per-call locking plus one logical reservation'),
   section(persistence, 'enum XperienceExactEvidence {', '/// Uses exactly the current JSONSerialization document serializer'),
-  section(persistence, 'struct XperienceSavedNamespace:', '/// Only installed manifest descriptors become candidates.')
+  section(persistence, 'struct XperienceSavedNamespace:', '/// Only installed manifest descriptors become candidates.'),
+  section('app/SourcesShared/VortxNativeHostPreferences.swift', 'extension VortxRawHostRegister {',
+    'extension VortxNativeHostPreferences {\n    static func validatedLocal'),
+  section(persistence, '// Production raw namespace adapter.', 'extension XperienceNativeHostFieldAdmission {')
 ].join('\n');
 writeFileSync(path.join(output, 'ExactProductionDeclarations.swift'), declarations);
 

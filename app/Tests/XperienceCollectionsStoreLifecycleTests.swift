@@ -240,12 +240,53 @@ import Foundation
         try require(core.syntheticPublications == 0, "UI stop before synthetic checkpoint leaves no publication")
     }
 
+    static func rawObservation() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let source = try XperienceImportNamespace.appendRaw(document: document("raw-observation"), label: "Original", bindings: [:])
+        let exact = Data("340282366920938463463374607431768211455".utf8)
+        var value = try OwnerHistoryExactJSON.Object(source.raw.value); value.set("futureExact", exact)
+        var register = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        register.set("clock", Data("7".utf8))
+        register.set("actor", try OwnerHistoryExactJSON.string("10000000-0000-4000-8000-000000000001"))
+        register.set("value", try value.encoded()); register.set("futureRegister", exact)
+        let original = try register.encoded()
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(original)
+        let lease = try store.capture(), revision = store.revision
+        // Whitespace is not a change in the observed register structure. Exact numeric
+        // tokens and every unknown sibling still participate in the immutable evidence.
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(Data(" \n".utf8) + original + Data(" \n".utf8))
+        await core.observeNotification { core.notify() }
+        try require(store.isCurrent(lease) && store.revision == revision, "raw semantic observation keeps unchanged whitespace publication conflated")
+        let saved = try store.namespaces(lease)[0]
+        let replacement = Task {
+            try await store.replace(namespace: saved, document: document("raw-renamed"), label: "Renamed", bindings: [:], lease: lease)
+        }
+        let id = await core.waitForSave(at: 0)
+        try core.publish(id)
+        await core.observeNotification { core.notify() }
+        try require(store.isCurrent(lease), "complete raw own ACK retains original Store lifetime")
+        core.finish(id)
+        _ = try await replacement.value
+        let acknowledged = core.rawRegisterFixtures[source.field]!
+        let acknowledgedRegister = try OwnerHistoryExactJSON.Object(acknowledged.bytes)
+        let acknowledgedValue = try OwnerHistoryExactJSON.Object(acknowledged.value)
+        try require(acknowledgedRegister["futureRegister"] == exact && acknowledgedValue["futureExact"] == exact,
+                    "actual Store replacement retains complete raw future value and metadata through its synthetic boundary")
+        var changed = acknowledgedRegister
+        changed.set("futureRegister", Data("340282366920938463463374607431768211454".utf8))
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(changed.encoded())
+        await core.observeNotification { core.notify() }
+        try require(!store.isCurrent(lease) && !core.captures[0].lifetime.isActive && core.captures.count == 1,
+                    "unknown raw metadata change retires the actual Store observation without successor recapture")
+    }
+
     static func run() async throws {
         let selected = CommandLine.arguments.dropFirst().first ?? "all"
         let cases: [(String, () async throws -> Void)] = [
             ("own-ack", ownACK), ("changed-registers", changedRegisters), ("profile-aba", profileABA),
             ("context-retirement", contextRetirement), ("pending-identity", pendingIdentity),
-            ("cancellation", cancellation), ("ui-stop", viewModelStop)
+            ("cancellation", cancellation), ("ui-stop", viewModelStop), ("raw-observation", rawObservation)
         ]
         guard selected == "all" || cases.contains(where: { $0.0 == selected }) else { throw Failure.assertion("unknown case") }
         for (name, operation) in cases where selected == "all" || selected == name {

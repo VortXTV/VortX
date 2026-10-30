@@ -87,8 +87,7 @@ extension OwnerHistoryRawAccountPreparationWorker {
     func legacyHostSourceArchive(_ host: Data, scope: VortxAccountScope) throws -> Data? {
         guard !Thread.isMainThread else { throw Failure.mainThreadExecution }
         try Task.checkCancellation()
-        try VortxNativeHostPreferences.validateSealed(host, scope: scope)
-        let local = try JSONDecoder().decode(VortxNativeHostPreferences.Local.self, from: host)
+        let local = try VortxNativeHostPreferences.validatedLocal(host, scope: scope)
         try Task.checkCancellation()
         return local.authenticatedSourceArchive
     }

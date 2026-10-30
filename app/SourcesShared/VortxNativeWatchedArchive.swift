@@ -754,7 +754,7 @@ enum VortxNativeWatchedArchive {
         func authenticatedSourceArchive(_ store: VortxEncryptedCheckpointStore) async throws -> Data? {
             try await cooperation.boundary()
             let host = try store.readHostPreferences(scope: scope)
-            let result = try host.map { try JSONDecoder().decode(VortxNativeHostPreferences.Local.self, from: $0).authenticatedSourceArchive } ?? nil
+            let result = try host.map { try VortxNativeHostPreferences.validatedLocal($0, scope: scope).authenticatedSourceArchive } ?? nil
             try await cooperation.boundary()
             return result
         }

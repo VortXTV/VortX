@@ -18,6 +18,23 @@ enum XperienceExactEvidence {
               json(current[edit.field]?["value"], edit.value) else { return false }
         return registers(baseline.filter { $0.key != edit.field }, current.filter { $0.key != edit.field })
     }
+    static func registers(_ left: [String: VortxRawHostRegister]?, _ right: [String: VortxRawHostRegister]?) -> Bool {
+        switch (left, right) {
+        case (nil, nil): return true
+        case let (a?, b?):
+            return Set(a.keys) == Set(b.keys) && a.allSatisfy { VortxRawHostRegister.same($0.value, b[$0.key]) }
+        default: return false
+        }
+    }
+    static func acknowledges(_ edit: XperienceImportNamespace.RawEdit, baseline: [String: VortxRawHostRegister],
+                             current: [String: VortxRawHostRegister]) -> Bool {
+        let raw = edit.raw
+        guard raw.baselineMatches(baseline[edit.field]),
+              let accepted = current[edit.field], accepted.canonicalValue == raw.canonicalValue,
+              accepted.metadata == (raw.expectedRegister?.metadata ?? Data("{}".utf8)) else { return false }
+        return registers(baseline.filter { $0.key != edit.field }, current.filter { $0.key != edit.field })
+    }
+
 }
 
 /// One original gesture's lifetime. Revocation holds ONLY this lock and never calls Bridge,
@@ -103,6 +120,31 @@ struct XperienceExportBudget: VortxProspectiveCheckpointValidator, Sendable {
             throw XperiencePersistenceFailure.exportTooLarge
         }
     }
+    /// Size the exact prospective raw host carrier against the original complete account.
+    /// A typed base remains the existing compatibility contract; only rawBase is original
+    /// raw account authority. Neither path turns the host presentation DTO into saved data.
+    func validateRawHost(native: VortxJSON, host: Data, profileEditResults: VortxJSON) throws {
+        var complete: OwnerHistoryExactJSON.Object
+        if let rawBase { complete = try OwnerHistoryExactJSON.Object(rawBase) }
+        else if let base { complete = try OwnerHistoryExactJSON.Object(JSONEncoder().encode(base)) }
+        else { throw XperiencePersistenceFailure.exportBaseUnavailable }
+        if rawBase != nil {
+            var nativeBase = try OwnerHistoryExactJSON.Object(complete.required("nativeSync"))
+            let projection = try OwnerHistoryExactJSON.Object(JSONEncoder().encode(native))
+            let owned: Set<String> = ["schemaVersion", "scope", "ownerProfileId", "profiles", "addons",
+                "libraries", "watches", "legacyImport", "accountSlots", "websiteAddonReceipts", "legacyProfileEditReceipts"]
+            guard Set(projection.fields.keys).isSubset(of: owned) else { throw XperiencePersistenceFailure.exportBaseUnavailable }
+            for (key, value) in projection.fields { nativeBase.set(key, value) }
+            complete.set("nativeSync", try nativeBase.encoded())
+        } else { complete.set("nativeSync", try JSONEncoder().encode(native)) }
+        _ = try OwnerHistoryExactJSON.Object(host)
+        complete.set("nativeHostPreferences", host)
+        complete.set("profileEditResults", try JSONEncoder().encode(profileEditResults))
+        let plaintext = try complete.encoded()
+        guard try Self.sealedByteCount(plaintextCount: plaintext.count, writeV2: writeV2) <= maximumSealedBytes else {
+            throw XperiencePersistenceFailure.exportTooLarge
+        }
+    }
     // A constant synthetic budget has no live authority. The production Bridge accepts only
     // XperiencePreparedExport, whose witness remains locked through the durable checkpoint.
     func withActive(_ operation: () throws -> Void) throws { try operation() }
@@ -121,6 +163,7 @@ struct XperienceSavedNamespace: Equatable, Sendable, Identifiable {
     let document: XperienceCollections.Document
     let bindings: [String: XperienceAddonBinding.Mapping]
     fileprivate let register: VortxJSON
+    fileprivate var rawRegister: VortxRawHostRegister? = nil
     var id: String { field }
 
     static func read(field: String, register: VortxJSON) throws -> Self {
@@ -152,6 +195,35 @@ struct XperienceSavedNamespace: Equatable, Sendable, Identifiable {
         return .init(namespace: id, field: field, label: label, document: document, bindings: bindings, register: register)
     }
 
+    /// Disposable DTO projection after retaining full original raw observation. Collections
+    /// are independently admitted from their exact source bytes under the existing lossless
+    /// parser; unknown envelope/register siblings never enter an encoded presentation path.
+    static func read(field: String, register: VortxRawHostRegister) throws -> Self {
+        guard register.canonical != nil else { throw XperienceCollections.Failure.tooLarge }
+        let object = try OwnerHistoryExactJSON.Object(register.bytes)
+        let clock = try JSONDecoder().decode(UInt64.self, from: object.required("clock"))
+        guard clock <= VortxRawHostRegister.maximumClock,
+              UUID(uuidString: try object.text("actor"))?.uuidString.lowercased() == (try object.text("actor")) else {
+            throw XperiencePersistenceFailure.invalidSavedImport
+        }
+        let value = try OwnerHistoryExactJSON.Object(register.value)
+        guard try JSONDecoder().decode(Int.self, from: value.required("schemaVersion")) == 1 else {
+            throw XperiencePersistenceFailure.unsupportedSavedFormat
+        }
+        let document = try XperienceCollections.parse(value.required("collections"))
+        var saved = try read(field: field, register: JSONDecoder().decode(VortxJSON.self, from: register.bytes))
+        guard saved.document.fingerprint == document.fingerprint else { throw XperiencePersistenceFailure.invalidSavedImport }
+        saved.rawRegister = register; return saved
+    }
+    static func readAll(_ registers: [String: VortxRawHostRegister]) throws -> [Self] {
+        try registers.keys.sorted().compactMap { field in
+            guard let register = registers[field] else { return nil }
+            // Absence and a complete tombstone remain different original observations.
+            if register.value == Data("null".utf8) { return nil }
+            return try read(field: field, register: register)
+        }
+    }
+
     static func readAll(_ registers: [String: VortxJSON]) throws -> [Self] {
         // Namespace order is deterministic and unaffected by a replacement register clock.
         // Collection/folder/source order and pinToTop remain exactly the JSON array order.
@@ -166,6 +238,13 @@ struct XperienceSavedNamespace: Equatable, Sendable, Identifiable {
         try XperienceImportNamespace.replace(document: document, label: label, namespace: namespace,
             expectedRegister: register, bindings: bindings)
     }
+    func rawReplacement(document: XperienceCollections.Document, label: String,
+                        bindings: [String: XperienceAddonBinding.Mapping]) throws -> XperienceImportNamespace.RawEdit {
+        guard let rawRegister else { throw XperiencePersistenceFailure.invalidSavedImport }
+        return try XperienceImportNamespace.replaceRaw(document: document, label: label, namespace: namespace,
+            expectedRegister: rawRegister, bindings: bindings)
+    }
+
 }
 
 /// Only installed manifest descriptors become candidates. Collection JSON cannot nominate a host.
@@ -242,6 +321,9 @@ struct XperiencePreparedExport: VortxProspectiveCheckpointValidator, Sendable {
     func validate(native: VortxJSON, host: VortxJSON, profileEditResults: VortxJSON) throws {
         try budget.validate(native: native, host: host, profileEditResults: profileEditResults)
     }
+    func validateRawHost(native: VortxJSON, host: Data, profileEditResults: VortxJSON) throws {
+        try budget.validateRawHost(native: native, host: host, profileEditResults: profileEditResults)
+    }
     func withActive(_ operation: () throws -> Void) throws { try authority.withActive(operation) }
 }
 
@@ -261,5 +343,60 @@ enum XperienceNativeHostFieldAdmission {
             && VortxNativeHostFieldEvidence.json($0.value["value"]?["fingerprint"], fingerprint) }) {
             throw XperiencePersistenceFailure.alreadyImported
         }
+    }
+}
+
+// Production raw namespace adapter. The existing pure typed Namespace/Candidate module is
+// unchanged; a typed caller is never upgraded into original raw observation authority.
+extension XperienceImportNamespace {
+    struct RawEdit: Equatable, Sendable {
+        let presentation: Edit
+        let raw: VortxRawHostFieldEdit
+        var namespace: UUID { presentation.namespace }
+        var field: String { presentation.field }
+        var expectedRegister: VortxJSON? { presentation.expectedRegister }
+        var value: VortxJSON { presentation.value }
+        var nativeEdit: VortxNativeHostFieldEdit {
+            .init(field: field, expectedRegister: expectedRegister, value: value, raw: raw)
+        }
+    }
+    static func appendRaw(document: XperienceCollections.Document, label: String, namespace: UUID = UUID(),
+                          bindings: [String: XperienceAddonBinding.Mapping] = [:]) throws -> RawEdit {
+        let owned = try append(document: document, label: label, namespace: namespace, bindings: bindings)
+        let bytes = try XperienceCollections.canonicalData(owned.value)
+        guard let canonical = try VortxRawHostRegister.boundedCanonical(bytes) else { throw XperienceCollections.Failure.tooLarge }
+        return .init(presentation: owned, raw: .init(expectedRegister: nil, value: bytes, canonicalValue: canonical))
+    }
+    static func replaceRaw(document: XperienceCollections.Document, label: String, namespace: UUID,
+                           expectedRegister: VortxRawHostRegister,
+                           bindings: [String: XperienceAddonBinding.Mapping]) throws -> RawEdit {
+        guard expectedRegister.canonical != nil else { throw XperienceCollections.Failure.tooLarge }
+        let register = try OwnerHistoryExactJSON.Object(expectedRegister.bytes)
+        let clock = try JSONDecoder().decode(UInt64.self, from: register.required("clock"))
+        let actor = try register.text("actor")
+        var value = try OwnerHistoryExactJSON.Object(register.required("value"))
+        guard clock <= VortxRawHostRegister.maximumClock, UUID(uuidString: actor)?.uuidString.lowercased() == actor,
+              try JSONDecoder().decode(Int.self, from: value.required("schemaVersion")) == 1,
+              try value.text("importID") == namespace.uuidString.lowercased() else { throw XperienceCollections.Failure.invalidNamespace }
+        // Reuse the real owned-field admission. Only those six members are replaced; no
+        // future register/envelope member is decoded and then used as saved source data.
+        let owned = try append(document: document, label: label, namespace: namespace, bindings: bindings)
+        let replacement = try OwnerHistoryExactJSON.Object(XperienceCollections.canonicalData(owned.value))
+        for key in ["schemaVersion", "importID", "label", "fingerprint", "collections", "bindings"] {
+            value.set(key, try replacement.required(key))
+        }
+        let bytes = try value.encoded()
+        guard bytes.count <= XperienceCollections.maximumBytes,
+              let canonical = try VortxRawHostRegister.boundedCanonical(bytes) else { throw XperienceCollections.Failure.tooLarge }
+        let presentation = Edit(namespace: namespace, field: field(namespace),
+            expectedRegister: try JSONDecoder().decode(VortxJSON.self, from: expectedRegister.bytes),
+            value: try JSONDecoder().decode(VortxJSON.self, from: bytes))
+        return .init(presentation: presentation,
+            raw: .init(expectedRegister: expectedRegister, value: bytes, canonicalValue: canonical))
+    }
+}
+extension XperienceNativeHostFieldAdmission {
+    static func validate(_ edit: XperienceImportNamespace.RawEdit, fields: [String: VortxJSON]) throws {
+        try validate(edit.presentation, fields: fields)
     }
 }

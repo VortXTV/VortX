@@ -1290,6 +1290,8 @@ actor VortxNativeSession {
     private var ownerHistoryRetirementPending = false
     private let ownerHistoryIdentity = UUID()
     private var hostPreferences: VortxNativeHostPreferences
+    private var hostPublicationCache: (presentation: VortxJSON, rawDocument: Data,
+        rawRegisters: [String: [String: VortxRawHostRegister]])? = nil
     private let externalCWGeneration = VortxNativeExternalCW.Generation()
     private let legacyBaseline: Data?
     private let legacyProfileEdits: VortxJSON?
@@ -1943,22 +1945,15 @@ actor VortxNativeSession {
             let owner = try requireOwnerHistory()
             _ = try owner.capture(target: currentOwnerHistoryTarget(requireCredential: false),
                 sourceAuthority: source, queueAuthority: read.queueAuthority)
-            let remote: VortxJSON?
-            if let rawHost = preparation.hostPreferencesData {
-                let value = try JSONDecoder().decode(VortxJSON.self, from: rawHost)
-                guard try OwnerHistoryExactJSON.canonical(rawHost) ==
-                    OwnerHistoryExactJSON.canonical(VortxNativeHostFieldEvidence.canonicalData(value)) else {
-                    throw VortxNativeError.invalidSnapshot
-                }
-                remote = value
-            } else { remote = nil }
+            // Keep the authenticated original carrier before DTO loss. The typed shadow
+            // remains presentation only; mergeRaw validates headers and complete registers.
             _ = try await dispatch([], now: UInt64(Date().timeIntervalSince1970),
-                legacyMaterial: preparation.legacyMaterial, hostRemote: remote, hostEdits: hostEdits,
+                legacyMaterial: preparation.legacyMaterial, hostEdits: hostEdits,
                 legacyWatchlists: preparation.legacyWatchlists,
                 websiteEvents: preparation.websiteEvents, websiteAddonEvents: preparation.websiteAddonEvents,
                 websiteBaseline: preparation.websiteBaseline, sourceAuthority: read,
                 authenticatedSourceArchive: preparation.authenticatedSourceArchive,
-                fifoAuthority: read.queueAuthority, typedPeer: preparation)
+                fifoAuthority: read.queueAuthority, typedPeer: preparation, hostRemoteRaw: preparation.hostPreferencesData)
             // Fresh AFTER OUR OWN durable ACK, still under this same running original member.
             // Never recheck the old encrypted CAS after that legitimate commit.
             let current = try owner.capture(target: currentOwnerHistoryTarget(requireCredential: false),
@@ -2070,8 +2065,8 @@ actor VortxNativeSession {
                         "legacyImport", "accountSlots", "websiteAddonReceipts", "legacyProfileEditReceipts"] {
                 if let value = original[key] { visible.set(key, value) }
             }
-            try additional.validate(native: JSONDecoder().decode(VortxJSON.self, from: visible.encoded()),
-                host: JSONDecoder().decode(VortxJSON.self, from: checkpoint.nativeHostPreferences),
+            try additional.validateRawHost(native: JSONDecoder().decode(VortxJSON.self, from: visible.encoded()),
+                host: checkpoint.nativeHostPreferences,
                 profileEditResults: JSONDecoder().decode(VortxJSON.self, from: checkpoint.profileEditResults))
         }
         func completeAccount(_ checkpoint: OwnerHistorySessionCoordinator.Checkpoint) throws -> Data {
@@ -2626,6 +2621,18 @@ actor VortxNativeSession {
         }
     }
     /// Native action wire only; full Stremio Ctx/player action compatibility is still an explicit gate.
+    /// Same Session/lease publication as the DTO; raw register evidence is prepared before
+    /// facade locking. It is never sourced from an encoded presentation value.
+    func hostPreferencesPublication() throws
+        -> (presentation: VortxJSON, rawDocument: Data, rawRegisters: [String: [String: VortxRawHostRegister]]) {
+        try requireActiveRoute()
+        return try lease.withActive {
+            if let hostPublicationCache { return hostPublicationCache }
+            let value = (presentation: try hostPreferences.document, rawDocument: try hostPreferences.rawDocumentData(),
+                rawRegisters: try hostPreferences.rawProfileRegisters())
+            hostPublicationCache = value; return value
+        }
+    }
     func hostPreferencesDocument() throws -> VortxJSON {
         try requireActiveRoute()
         return try lease.withActive { try hostPreferences.document }
@@ -2691,7 +2698,8 @@ actor VortxNativeSession {
                                     hostFieldCAS: VortxHostFieldCAS? = nil,
                                     checkpointValidator: (any VortxProspectiveCheckpointValidator)? = nil,
                                     fifoAuthority: (any VortxMutationAuthority)? = nil,
-                                    typedPeer: OwnerHistoryPeerPreparation? = nil) async throws -> [String] {
+                                    typedPeer: OwnerHistoryPeerPreparation? = nil,
+                                    hostRemoteRaw: Data? = nil) async throws -> [String] {
         try requireActiveRoute()
         // Retire at actual execution, not when a later FIFO member is merely enqueued.
         externalCWGeneration.retire()
@@ -2755,7 +2763,8 @@ actor VortxNativeSession {
         try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: state)
         var candidateHost = hostPreferences
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
-        try candidateHost.merge(hostRemote, scope: scope)
+        if let hostRemoteRaw { try candidateHost.mergeRaw(hostRemoteRaw, scope: scope) }
+        else { try candidateHost.merge(hostRemote, scope: scope) }
         for (profile, entries) in legacyWatchlists {
             // The unchanged legacy roster may still carry a profile explicitly deleted by the
             // native peer. Preserve that old array in its source document, never resurrect the
@@ -2763,14 +2772,31 @@ actor VortxNativeSession {
             guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { continue }
             try VortxNativeWatchlist.seed(entries, profileID: profile, into: &candidateHost)
         }
-        if let hostFieldCAS, !hostFieldCAS.matches(try candidateHost.document) {
-            throw VortxNativeHostFieldMutationError.staleRegister
+        if let hostFieldCAS {
+            let matches: Bool
+            if let raw = hostFieldCAS.raw {
+                matches = raw.baselineMatches(try candidateHost.rawProfileRegisters()[hostFieldCAS.profileID]?[hostFieldCAS.field])
+            } else { matches = hostFieldCAS.matches(try candidateHost.document) }
+            guard matches else { throw VortxNativeHostFieldMutationError.staleRegister }
         }
         for edit in hostEdits {
             if let profile = edit.profileID {
                 guard let record = state["roster"]?["profiles"]?[profile], record["deleted"] != .bool(true) else { throw VortxNativeError.invalidSnapshot }
             }
-            try candidateHost.edit(profileID: edit.profileID, fields: edit.fields, scope: scope)
+            guard Set(edit.rawFields.keys).isSubset(of: Set(edit.fields.keys)) else { throw VortxNativeError.invalidSnapshot }
+            if edit.rawFields.isEmpty {
+                try candidateHost.edit(profileID: edit.profileID, fields: edit.fields, scope: scope)
+            } else {
+                guard let profile = edit.profileID else { throw VortxNativeError.invalidSnapshot }
+                for name in edit.fields.keys.sorted() {
+                    if let raw = edit.rawFields[name] {
+                        guard VortxNativeHostFieldEvidence.json(try JSONDecoder().decode(VortxJSON.self, from: raw), edit.fields[name]) else {
+                            throw VortxNativeError.invalidSnapshot
+                        }
+                        try candidateHost.editRaw(profileID: profile, field: name, value: raw, scope: scope)
+                    } else { try candidateHost.edit(profileID: profile, fields: [name: edit.fields[name]!], scope: scope) }
+                }
+            }
         }
         let pending = candidateHost.local.websitePending ?? []
         let hasWebsiteWork = !websiteEvents.isEmpty || !pending.isEmpty
@@ -2873,7 +2899,7 @@ actor VortxNativeSession {
             state = try candidate.state(scope: scope)
         }
         let updated = try candidate.stateJSON()
-        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || hasAddonWork || authenticatedSourceArchive != nil
+        let hasHostChanges = hostRemoteRaw != nil || hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || hasAddonWork || authenticatedSourceArchive != nil
         let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
         if case .owner(let value) = candidate {
             guard let ownerHistory, let typedTransaction, typedCapture != nil else { throw VortxNativeError.superseded }
@@ -2885,7 +2911,7 @@ actor VortxNativeSession {
             }
             // Typed candidates never issue an in-memory durable ACK for uncheckpointed progress.
             // Facade duplicate admission remains unchanged; each admitted typed write is durable.
-            hostPreferences = candidateHost; installed = true
+            hostPreferences = candidateHost; if hasHostChanges { hostPublicationCache = nil }; installed = true
             pendingProgressCommit = false; lastDurableCommit = ProcessInfo.processInfo.systemUptime
             if try JSONDecoder().decode(VortxJSON.self, from: Data(old.utf8))["activeProfileId"] != state["activeProfileId"] {
                 invalidateScreens()
@@ -2936,7 +2962,7 @@ actor VortxNativeSession {
             if progressOnly { writeProgressUntil = 0 }
         }
         guard case .generic(let generic) = candidate else { throw VortxNativeError.invalidSnapshot }
-        let previous = runtime!; runtime = generic; hostPreferences = candidateHost; installed = true; previous.close()
+        let previous = runtime!; runtime = generic; hostPreferences = candidateHost; if hasHostChanges { hostPublicationCache = nil }; installed = true; previous.close()
         if try scope.validateSnapshot(old)["activeProfileId"] != state["activeProfileId"] { invalidateScreens() }
         return results
     }
@@ -2951,7 +2977,7 @@ actor VortxNativeSession {
             throw VortxNativeError.invalidSnapshot
         }
         outcome["addonConflicts"] = try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(candidateHost.local.websiteAddonConflicts ?? []))
-        try validator.validate(native: native, host: candidateHost.document, profileEditResults: .object(outcome))
+        try validator.validateRawHost(native: native, host: candidateHost.rawDocumentData(), profileEditResults: .object(outcome))
     }
 
     /// Write a position the 30 s coalescing held back, and write the next position report at once too (it may

@@ -477,12 +477,22 @@ final class CoreBridge: ObservableObject {
                                     legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
                                     legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
+        try await mergeNativeAccountDocumentReceipt(remote, hostRemote: hostRemote, capture: capture,
+            legacyMaterial: legacyMaterial, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents,
+            legacyWatchlists: legacyWatchlists, sourceAuthority: sourceAuthority,
+            authenticatedSourceArchive: authenticatedSourceArchive).presentation
+    }
+    @MainActor
+    func mergeNativeAccountDocumentReceipt(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
+                                    legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
+                                    legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
+                                    sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil, hostRemoteRaw: Data? = nil) async throws -> VortxNativeCoreFacade.HostAccountReceipt {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
         let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
-        let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
+        let document = try await facade.mergeAccountDocumentReceipt(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
             hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
-            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
+            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive, hostRemoteRaw: hostRemoteRaw)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()
@@ -6501,12 +6511,12 @@ extension CoreBridge {
         return result
     }
     @MainActor func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxJSON], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: [XperienceAddonBinding.Candidate]) {
         guard target.lifetime.isActive, nativeWatchlistTargetIsCurrent(target.owner),
               let snapshot = target.owner.facade.capturedHostProfileSnapshot(expected: target.owner.binding, registry: target.registry) else {
             throw XperiencePersistenceFailure.staleContext
         }
-        return (snapshot.registers.filter { $0.key.hasPrefix("xperience.import.") },
+        return (snapshot.rawRegisters,
                 try XperienceInstalledCatalogs.candidates(snapshot.registry))
     }
     @MainActor func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
@@ -6514,13 +6524,13 @@ extension CoreBridge {
         return try await VortXSyncManager.shared.prepareXperienceExportBudget(capture: target.owner.owner.credential,
             sourceIsCurrent: { [weak self] in self?.nativeXperienceTargetIsCurrent(target) == true })
     }
-    @MainActor func saveNativeXperienceImport(_ edit: XperienceImportNamespace.Edit, target: NativeXperienceTarget,
-                                            validator: XperiencePreparedExport) async throws -> VortxJSON {
+    @MainActor func saveNativeXperienceImport(_ edit: XperienceImportNamespace.RawEdit, target: NativeXperienceTarget,
+                                            validator: XperiencePreparedExport) async throws -> VortxRawHostRegister {
         try Task.checkCancellation()
         guard edit.field == XperienceImportNamespace.field(edit.namespace),
               nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         try XperienceImportPrivacy.validate(edit)
-        let result = try await target.owner.facade.setCapturedHostProfileField(edit.nativeEdit,
+        let result = try await target.owner.facade.setCapturedRawHostProfileField(edit.nativeEdit,
             expected: target.owner.binding, registry: target.registry,
             sourceAuthority: target.authority, checkpointValidator: validator,
             admission: { fields in try XperienceNativeHostFieldAdmission.validate(edit, fields: fields) })

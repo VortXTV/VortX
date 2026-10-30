@@ -39,6 +39,10 @@ struct VortxNativeHostFieldEdit: Sendable {
     let field: String
     let expectedRegister: VortxJSON?
     let value: VortxJSON
+    let raw: VortxRawHostFieldEdit?
+    init(field: String, expectedRegister: VortxJSON?, value: VortxJSON, raw: VortxRawHostFieldEdit? = nil) {
+        self.field = field; self.expectedRegister = expectedRegister; self.value = value; self.raw = raw
+    }
     func baselineMatches(_ current: VortxJSON?) -> Bool {
         VortxNativeHostFieldEvidence.json(current, expectedRegister)
     }
@@ -48,6 +52,10 @@ struct VortxHostFieldCAS: Sendable {
     let profileID: String
     let field: String
     let register: VortxJSON?
+    let raw: VortxRawHostFieldEdit?
+    init(profileID: String, field: String, register: VortxJSON?, raw: VortxRawHostFieldEdit? = nil) {
+        self.profileID = profileID; self.field = field; self.register = register; self.raw = raw
+    }
     func matches(_ host: VortxJSON) -> Bool {
         VortxNativeHostFieldEvidence.json(host["profiles"]?[profileID]?["fields"]?[field], register)
     }
@@ -57,6 +65,43 @@ struct VortxHostFieldCAS: Sendable {
 /// preserves existing Session callers. This core seam never guesses a budget or imports UI data.
 protocol VortxProspectiveCheckpointValidator: VortxMutationAuthority {
     func validate(native: VortxJSON, host: VortxJSON, profileEditResults: VortxJSON) throws
+    func validateRawHost(native: VortxJSON, host: Data, profileEditResults: VortxJSON) throws
+}
+extension VortxProspectiveCheckpointValidator {
+    // Compatibility for validators whose contract is typed. Xperience overrides this
+    // requirement; the raw checkpoint never round-trips through its presentation DTO.
+    func validateRawHost(native: VortxJSON, host: Data, profileEditResults: VortxJSON) throws {
+        try validate(native: native, host: JSONDecoder().decode(VortxJSON.self, from: host), profileEditResults: profileEditResults)
+    }
+}
+
+/// Immutable byte evidence prepared OUTSIDE final authority locks from an acknowledged
+/// Session host carrier. Invalid/oversized semantic evidence has no canonical cache and
+/// is retained as opaque data; it cannot become an editable namespace by decoding a DTO.
+struct VortxRawHostRegister: Equatable, Sendable {
+    static let maximumClock: UInt64 = 9_007_199_254_740_991
+    let bytes: Data
+    let canonical: Data?
+    let value: Data
+    let canonicalValue: Data?
+    let metadata: Data?
+    static func same(_ left: Self?, _ right: Self?) -> Bool {
+        switch (left, right) {
+        case (nil, nil): return true
+        case let (a?, b?):
+            if a.bytes == b.bytes { return true }
+            guard let a = a.canonical, let b = b.canonical else { return false }; return a == b
+        default: return false
+        }
+    }
+}
+struct VortxRawHostFieldEdit: Equatable, Sendable {
+    let expectedRegister: VortxRawHostRegister?
+    let value: Data
+    let canonicalValue: Data
+    func baselineMatches(_ current: VortxRawHostRegister?) -> Bool {
+        VortxRawHostRegister.same(current, expectedRegister)
+    }
 }
 
 /// Cancellation remains attached to the original operation, not the unstructured FIFO task.
