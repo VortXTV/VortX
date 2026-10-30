@@ -2,7 +2,7 @@ name: Xperience wire parity
 
 on:
   push:
-    branches: [beta/xperience-wire-parity-20261030]
+    branches: [beta-xperience-wire-parity-20261030]
     paths:
       - .github/workflows/xperience-wire-parity.yml
       - test/xperience-wire-parity/**
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   document-wire-parity:
-    if: github.event_name == 'push' && github.repository == 'VortXTV/VortX' && github.ref == 'refs/heads/beta/xperience-wire-parity-20261030' && toJSON(github.event.repository.private) == 'false'
+    if: github.event_name == 'push' && github.repository == 'VortXTV/VortX' && github.ref == 'refs/heads/beta-xperience-wire-parity-20261030' && toJSON(github.event.repository.private) == 'false'
     runs-on: macos-26
     timeout-minutes: 15
     steps:

@@ -2,7 +2,7 @@
   "schema": 2,
   "reviewState": "ROOT_AND_INDEPENDENT_SOURCE_SECURITY_REVIEWED",
   "repository": "VortXTV/VortX",
-  "ref": "refs/heads/beta/xperience-wire-parity-20261030",
+  "ref": "refs/heads/beta-xperience-wire-parity-20261030",
   "finalModel": {
     "packet": "android-xperience-domain-source-v6",
     "version": 6,

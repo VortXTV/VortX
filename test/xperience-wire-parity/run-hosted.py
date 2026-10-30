@@ -14,7 +14,7 @@ import tempfile
 import time
 
 REPOSITORY = "VortXTV/VortX"
-REF = "refs/heads/beta/xperience-wire-parity-20261030"
+REF = "refs/heads/beta-xperience-wire-parity-20261030"
 HEX = re.compile(r"[0-9a-f]{64}")
 ID = re.compile(r"[a-z0-9-]{1,80}")
 LOG_LIMIT = 256 * 1024
