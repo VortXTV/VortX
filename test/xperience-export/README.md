@@ -14,7 +14,7 @@ This is a component test harness, not a full application build. It copies curren
 directly from `app/SourcesShared`, records their hashes and checks for drift throughout the run.
 It does not keep implementation snapshots or apply historical parser/controller/Keychain patches.
 Only the complete JSON value, native error, failure-closed credential store, host-field validator
-and synchronous prompt-delivery declarations are extracted from larger source files. Unique
+and synchronous prompt-delivery/artwork-lifetime declarations are extracted from larger source files. Unique
 declaration markers fail closed if those source boundaries change. The real signer, system
 credential adapter, transport, strict parser, models, mapper and controller are current full sources.
 
@@ -25,8 +25,9 @@ credential adapter, transport, strict parser, models, mapper and controller are 
 | `app/Tests/XperienceExportConnectorTests.swift` | Official export URL admission/redaction, injected credential CAS/readback/repair, whole-envelope admission, mapper preservation/admission, synthetic HTTP and explicit controller link/reconnect/refresh flows |
 | `app/Tests/XperienceMapperWireEqualityTests.swift` | Initial-link/refresh numeric wire variants, exact retained raw fields/tombstones, and explicit/nested/encoded/ambiguous credential rejection; invoked by the connector main |
 | `app/Tests/XperienceLifecycleAmendmentTests.swift` | Original credential/native context loss during suspended work, cancellation and unchanged own acknowledgement |
-| `app/Tests/XperienceCurationExportPromptLifecycleTests.swift` | Actual PromptState/dispatcher with same-profile loss, unchanged hints, successful/post-save-credential-failure receipts and dismissal |
+| `app/Tests/XperienceCurationExportPromptLifecycleTests.swift` | Actual default Controller/PromptState NotificationCenter maps built on MainActor, real background posts with posting-turn retirement receipts, identity/context ABA, plus prior injected same-profile/receipt/dismissal controls |
 | `test/xperience-export/fixtures/AppSurfaces.swift` | Synthetic ProfileStore, sign-in publisher and notification-name surface only |
+| `test/xperience-export/fixtures/CurationReadLifetimeHarness.swift` | Full actual CurationReadLifetime, actual lock-backed artwork token and dispatcher; default background notes/identity ABA with injected abstract authority/cache receipts and fail-closed unused import-evidence surfaces |
 
 The connector fixture runs once. Its URLProtocol shared-state fixture uses Swift 5 with warnings
 as errors. The actual production component is separately typechecked with Swift 6, complete strict
@@ -44,9 +45,16 @@ source rather than silently replaced with an old passing implementation.
 
 ## Bounded execution and receipts
 
+The standalone read-lifetime executable also uses Swift 6/complete/WAE and full current
+CurationReadLifetime source. It uses the actual extracted artwork token/dispatcher with small
+authority/cache/app stubs; unused import-evidence stubs fail closed. This lane proves neither the
+native CurationReadAuthority implementation nor raw saved-register matching. The new default-map
+cases use real NotificationCenter background posts, never injected subjects, and inspect retirement
+on the posting queue before resuming MainActor. No background post is driven by blocking MainActor.
+
 All stages are serial at nice 15, WMO, one compiler job and one compiler thread. Generation and
 compiler-version have 30-second deadlines; each compile has 240 seconds; connector runtime has
-60 seconds and lifecycle/prompt runtimes have 30 seconds each. The pinned process-group supervisor
+60 seconds and lifecycle/prompt/read-lifetime runtimes have 30 seconds each. The pinned process-group supervisor
 provides persisted interrupt requests, bounded TERM/KILL cleanup, direct-child reaping and group
 quiescence checks. The wrapper waits for cleanup before releasing its suite slot. An uncertain
 receipt retains the slot for reconciliation; do not remove it while a workload may remain alive.

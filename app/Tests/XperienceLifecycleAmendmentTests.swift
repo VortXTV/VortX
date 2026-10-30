@@ -144,6 +144,7 @@ import Foundation
         var saved: CurationDocument?
         var nativeACKs = 0
         var explicitRetirements = 0
+        var captureCount = 0
         var onNativeACK: (() -> Void)?
 
         init(session: CurationEditSession,
@@ -152,7 +153,8 @@ import Foundation
         }
 
         func captureXperienceExportEdit(_ collection: SmartCollection) throws -> CurationEditSession {
-            session
+            captureCount += 1
+            return session
         }
 
         func xperienceExportEditIsCurrent(_ session: CurationEditSession) -> Bool {

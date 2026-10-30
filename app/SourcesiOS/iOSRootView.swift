@@ -2626,6 +2626,7 @@ struct iOSLibraryView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @EnvironmentObject private var account: StremioAccount  // progress-recording wiring for play-from-local (#30)
+    @EnvironmentObject private var vortxSync: VortXSyncManager
     @ObservedObject private var watchedIndex = WatchedIndex.shared   // read-only watched signal for the smart filters (#143 set refreshes reactively)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
@@ -2636,6 +2637,7 @@ struct iOSLibraryView: View {
     @State private var path = NavigationPath()
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
     @State private var segment: LibrarySegment = .all
+    @State private var showAccountRecovery = false
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
@@ -2836,11 +2838,32 @@ struct iOSLibraryView: View {
                     // can report an over-wide ideal that the LazyVStack adopts, shifting the column left.
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else if !hasDownloads {
-                    // Only show the "Library empty" placeholder when there are ALSO no downloads, a user
-                    // with downloads but no saved titles still sees their offline section above.
-                    ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
-                        message: "Titles you add to your library in Stremio show up here.")
+                    // A rejected VortX session is a terminal recovery state, not an empty account library.
+                    if vortxSync.isSignedIn, vortxSync.accountReconnectRequired {
+                        VStack(spacing: Theme.Space.md) {
+                            ContentUnavailableViewCompat(title: "Reconnect VortX", systemImage: "person.crop.circle",
+                                message: "The server did not accept this VortX session. Open Settings, then VortX account & sync, to sign in again. This device's saved data was not replaced.")
+                            Button("Account settings") { showAccountRecovery = true }
+                                .buttonStyle(ChipButtonStyle())
+                            DiagnosticLogExportButton()
+                        }
                         .frame(minHeight: 420)
+                    } else if vortxSync.isSignedIn, vortxSync.accountRestoreState == .failed {
+                        VStack(spacing: Theme.Space.md) {
+                            ContentUnavailableViewCompat(title: "Couldn't load this library", systemImage: "books.vertical",
+                                message: "Open VortX account & sync in Settings to retry. This device's saved data was not replaced.")
+                            Button("Account settings") { showAccountRecovery = true }
+                                .buttonStyle(ChipButtonStyle())
+                            DiagnosticLogExportButton()
+                        }
+                        .frame(minHeight: 420)
+                    } else {
+                        // Only show the "Library empty" placeholder when there are ALSO no downloads, a user
+                        // with downloads but no saved titles still sees their offline section above.
+                        ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
+                            message: "Titles you add to your library in Stremio show up here.")
+                            .frame(minHeight: 420)
+                    }
                 }
             }
             .scrollDismissesHeroRotation(model: hero)
@@ -2874,6 +2897,10 @@ struct iOSLibraryView: View {
             .iOSPlayerCover($downloadPlayer, account: account, core: core)
             #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
+        }
+
+        .sheet(isPresented: $showAccountRecovery) {
+            ProfileAccountRecoveryView().environmentObject(vortxSync)
         }
 
         // BEGIN RANDOM PICK LIBRARY LIFECYCLE

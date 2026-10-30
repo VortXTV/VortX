@@ -54,8 +54,8 @@ import Foundation
     }
 
     private static func appContextChanges() -> AnyPublisher<Void, Never> {
-        let profile = ProfileStore.shared.$activeID.dropFirst().map { _ in () }.eraseToAnyPublisher()
-        let account = VortXSyncManager.shared.$isSignedIn.dropFirst().map { _ in () }.eraseToAnyPublisher()
+        let profile = ProfileStore.shared.$activeID.dropFirst().map { @Sendable _ in () }.eraseToAnyPublisher()
+        let account = VortXSyncManager.shared.$isSignedIn.dropFirst().map { @Sendable _ in () }.eraseToAnyPublisher()
         // Published identity changes cancel synchronously, before setters finish; A->B->A cannot revive work.
         // Do not predicate this stream on getters: @Published delivers from willSet, before they change.
         return Publishers.Merge(profile, account).eraseToAnyPublisher()
@@ -65,7 +65,7 @@ import Foundation
         var notes = [VortXSyncManager.credentialScopeDidChangeNote]
         notes.append(CoreBridge.xperienceContextChangedNote)
         return Publishers.MergeMany(notes.map { name in
-            NotificationCenter.default.publisher(for: name).map { _ in () }.eraseToAnyPublisher()
+            NotificationCenter.default.publisher(for: name).map { @Sendable _ in () }.eraseToAnyPublisher()
         }).eraseToAnyPublisher()
     }
 

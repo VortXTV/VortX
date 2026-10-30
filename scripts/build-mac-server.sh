@@ -21,7 +21,11 @@ OUT="app/Vendor/vortx-streaming-server"
 
 echo "engine workspace: $ENGINE_DIR"
 
-source "$HOME/.cargo/env" 2>/dev/null || true
+# Rust may already be on PATH without rustup's optional shell initializer.
+# A missing source file is fatal in the system Bash even with `|| true`.
+if [[ -f "$HOME/.cargo/env" ]]; then
+    source "$HOME/.cargo/env"
+fi
 
 echo "Building vortx-streaming-server ($TARGET, release) from $ENGINE_DIR ..."
 (cd "$ENGINE_DIR" && cargo build --locked --release -p vortx-streaming-server --target "$TARGET")

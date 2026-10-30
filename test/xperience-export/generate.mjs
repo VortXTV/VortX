@@ -78,6 +78,13 @@ function generate(repoArgument, runArgument, runnerArgument) {
   const delivery = declaration(donor('CurationReadAuthority.swift'), 'enum CurationReadContextDelivery {');
   extracts.push({declaration: 'CurationReadContextDelivery', sha256: hash(delivery)});
   write('ExactPromptDelivery.swift', 'import Foundation\n' + delivery);
+  // A small standalone lane compiles the COMPLETE current read owner/default publishers, not a
+  // hand-copied implementation. Its token and synchronous dispatcher are actual declarations.
+  write('CurationReadLifetime.swift', donor('CurationReadLifetime.swift'));
+  const artworkLifetime = declaration(donor('CurationStaticArtwork.swift'), 'final class CurationArtworkLifetime:');
+  extracts.push({declaration: 'CurationArtworkLifetime', sha256: hash(artworkLifetime)});
+  write('ExactArtworkLifetime.swift', 'import Foundation\n' + artworkLifetime);
+  write('CurationReadLifetimeHarness.swift', read(path.join(repo, 'test/xperience-export/fixtures/CurationReadLifetimeHarness.swift')));
   write('AppSurfaces.swift', read(path.join(repo, 'test/xperience-export/fixtures/AppSurfaces.swift')));
   let lifecycle;
   for (const name of ['XperienceExportConnectorTests.swift', 'XperienceMapperWireEqualityTests.swift',
@@ -101,7 +108,7 @@ function generate(repoArgument, runArgument, runnerArgument) {
     + ' }\n}\n');
   const manifest = {schema: 1, createdAt: new Date().toISOString(), repo, run, supervisorSHA,
     inputs, outputs, extracts, transforms,
-    systemFrameworks: ['Foundation', 'Combine', 'CryptoKit', 'Security', 'LocalAuthentication'],
+    systemFrameworks: ['Foundation', 'Combine', 'CryptoKit', 'Security', 'LocalAuthentication', 'SwiftUI'],
     excluded: ['Store/CoreBridge/facade/native checkpoint/whole-account budget',
       'runtime Security/installed persistence/private endpoint/DNS/account delivery',
       'SwiftUI rendering/focus/app/device/signing/release']};

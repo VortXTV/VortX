@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Portable component/contract/lifecycle/prompt tests. Actual sources and synthetic fixtures only.
+# Portable component/contract/lifecycle/prompt/read-lifetime tests. Actual sources and synthetic fixtures only.
 export_repo=${1:-"$(cd "$(dirname "$0")/.." && pwd -P)"}
 export_runner="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 cd "$export_repo"
@@ -129,7 +129,7 @@ run_component() {
   return "$status"
 }
 stop_if_interrupted
-expected_input_manifest_sha=c19516e2e2281038598d77009b4dbe20c83ede17ce1932dced6671afdac7f6f8
+expected_input_manifest_sha=24924c0a39673d3ee5b91da8612cb2f498321e3dcf9364f9c0f467b6b7f94166
 observed_input_manifest_sha="$(shasum -a 256 "$repo_root/test/xperience-export/pinned-fixtures.sha256")"
 observed_input_manifest_sha="${observed_input_manifest_sha%% *}"
 [[ "$observed_input_manifest_sha" == "$expected_input_manifest_sha" ]] || exit 90
@@ -143,7 +143,7 @@ normal_exit_receipt "$run_dir/generate.supervisor.json" 0
 shasum -a 256 "$run_dir/manifest.json" > "$run_dir/manifest.sha256"
 printf 'swift=%s\nnode=%s\nsdk=%s\nsdk_version=%s\ntarget=%s\n' \
   "$swift_bin" "$node_bin" "$host_sdk" "$host_sdk_version" "$host_target" > "$run_dir/toolchain.txt"
-printf 'compiler_deadline_seconds=240\ncontract_runtime_deadline_seconds=60\nlifecycle_runtime_deadline_seconds=30\nprompt_runtime_deadline_seconds=30\nnice=15\ncomponent_swift=6\ncontract_fixture_swift=5\nlifecycle_swift=6\nstrict_concurrency=complete_in_swift6_lanes\nwarnings_as_errors=true\nwhole_module_optimization=true\njobs=1\nthreads=1\n' >> "$run_dir/toolchain.txt"
+printf 'compiler_deadline_seconds=240\ncontract_runtime_deadline_seconds=60\nlifecycle_runtime_deadline_seconds=30\nprompt_runtime_deadline_seconds=30\nread_lifetime_runtime_deadline_seconds=30\nnice=15\ncomponent_swift=6\ncontract_fixture_swift=5\nlifecycle_swift=6\nstrict_concurrency=complete_in_swift6_lanes\nwarnings_as_errors=true\nwhole_module_optimization=true\njobs=1\nthreads=1\n' >> "$run_dir/toolchain.txt"
 shasum -a 256 "$swift_bin" "$node_bin" >> "$run_dir/toolchain.txt"
 run_component compiler-version 30 "$swift_bin" --version
 inputs=(
@@ -187,6 +187,13 @@ run_component prompt.compile 240 "$swift_bin" "${compiler_common[@]}" \
  -o "$run_dir/export-prompt-tests"
 run_component prompt.runtime 30 "$run_dir/export-prompt-tests"
 rg -q '^PASS actual prompt lifecycle checks: [1-9][0-9]*$' "$run_dir/prompt.runtime.log"
+run_component read-lifetime.compile 240 "$swift_bin" "${compiler_common[@]}" \
+ -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+ "$run_dir/AppSurfaces.swift" "$run_dir/ExactPromptDelivery.swift" "$run_dir/ExactArtworkLifetime.swift" \
+ "$run_dir/CurationReadLifetime.swift" "$run_dir/CurationReadLifetimeHarness.swift" \
+ -o "$run_dir/curation-read-lifetime-tests"
+run_component read-lifetime.runtime 30 "$run_dir/curation-read-lifetime-tests"
+rg -q '^PASS actual CurationReadLifetime background notification checks: [1-9][0-9]*$' "$run_dir/read-lifetime.runtime.log"
 stop_if_interrupted
 verify_inputs
 shasum -a 256 "$run_dir/manifest.json" "$run_dir/toolchain.txt" \
@@ -194,7 +201,8 @@ shasum -a 256 "$run_dir/manifest.json" "$run_dir/toolchain.txt" \
  "$run_dir/component.strict6.supervisor.json" "$run_dir/contract.compile.supervisor.json" \
  "$run_dir/contract.runtime.supervisor.json" "$run_dir/lifecycle.compile.supervisor.json" \
  "$run_dir/lifecycle.runtime.supervisor.json" "$run_dir/prompt.compile.supervisor.json" \
- "$run_dir/prompt.runtime.supervisor.json" "$run_dir/export-contract-tests" \
- "$run_dir/export-lifecycle-tests" "$run_dir/export-prompt-tests" > "$run_dir/final-receipt.sha256"
-printf '%s\n' 'PASS: actual Xperience component strict6, synthetic Swift5 contract, strict6 lifecycle and prompt lanes'
+ "$run_dir/prompt.runtime.supervisor.json" "$run_dir/read-lifetime.compile.supervisor.json" \
+ "$run_dir/read-lifetime.runtime.supervisor.json" "$run_dir/export-contract-tests" \
+ "$run_dir/export-lifecycle-tests" "$run_dir/export-prompt-tests" "$run_dir/curation-read-lifetime-tests" > "$run_dir/final-receipt.sha256"
+printf '%s\n' 'PASS: actual Xperience component strict6, synthetic Swift5 contract, strict6 lifecycle, prompt and read-lifetime lanes'
 printf '%s\n' 'EXCLUDED: Store/CoreBridge/native checkpoint, runtime Security/persistence, private export, DNS/device/app/release proof.'

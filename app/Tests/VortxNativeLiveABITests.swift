@@ -83,11 +83,24 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         check(libraryChanges.contains("library") && !libraryChanges.contains("ctx"))
         check(try field("library")["catalog"]?.array?.count == 1)
         _ = try await facade.mergeSyncDocument(nil); check(events.drain().isEmpty)
-        // Explicit registry repair remains a context notification even with equal descriptors.
+        // Explicit registry repair republishes both views: ctx uses the caller's replacement,
+        // while management retains the complete accepted kernel descriptors, including normalization.
+        let acceptedSnapshot = try await session.addonSnapshot()
+        guard let acceptedAddons = acceptedSnapshot.inventories[scope.ownerProfileID] else {
+            preconditionFailure("native notification fixture missing accepted owner add-ons")
+        }
+        check(acceptedAddons.count == 1 && acceptedAddons[0]["transportUrl"] == .string(addon.transportUrl)
+              && acceptedAddons[0]["manifest"]?["id"] == .string("fixture.addon"))
+        let expectedManagement = VortxJSON.object(["profile": .object(["addons": .array(acceptedAddons)])])
+        check(try field("addon_management") == expectedManagement)
         try await facade.rebindRegistry([addon], expected: facade.registryBinding!)
-        check(events.drain() == [["ctx"]])
+        check(events.drain() == [["ctx", "addon_management"]])
+        check(try field("ctx") == .object(["profile": .object(["addons": .array([
+            .object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest!])
+        ])])]))
+        check(try field("addon_management") == expectedManagement)
         await facade.shutdown()
-        print("Live native field notifications: no-op acknowledgments quiet; progress changes playback/CW without ctx/search; equal-descriptor profile identity, addon change and explicit rebind each notify ctx; library remains live")
+        print("Live native field notifications: no-op acknowledgments quiet; progress changes playback/CW without ctx/search; equal-descriptor profile identity and addon change notify ctx; explicit rebind publishes exact ctx/management batch and descriptors; library remains live")
     }
     /// Real shared host-field contracts in the NORMAL full ABI module. No Xperience/parser,
     /// Keychain/UI shim, alternate Facade, conditional exclusion or extra compiler list is used.

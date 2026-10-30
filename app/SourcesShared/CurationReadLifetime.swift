@@ -33,9 +33,11 @@ import Combine
         renew()
     }
 
+    // Combine does not hop executors before map. Capture-free callbacks must not inherit
+    // MainActor: native/credential notifications can be posted from a background queue.
     private static func appIdentityChanges() -> AnyPublisher<Void, Never> {
-        Publishers.Merge(ProfileStore.shared.$activeID.dropFirst().map { _ in () },
-                         VortXSyncManager.shared.$isSignedIn.dropFirst().map { _ in () })
+        Publishers.Merge(ProfileStore.shared.$activeID.dropFirst().map { @Sendable _ in () },
+                         VortXSyncManager.shared.$isSignedIn.dropFirst().map { @Sendable _ in () })
             .eraseToAnyPublisher()
     }
 
@@ -45,7 +47,7 @@ import Combine
                      XperienceCollectionsStore.changedNote, LibraryAutoAdd.watchlistChangedNote]
         notes.append(CoreBridge.xperienceContextChangedNote)
         return Publishers.MergeMany(notes.map { name in
-            NotificationCenter.default.publisher(for: name).map { _ in () }.eraseToAnyPublisher()
+            NotificationCenter.default.publisher(for: name).map { @Sendable _ in () }.eraseToAnyPublisher()
         }).eraseToAnyPublisher()
     }
 

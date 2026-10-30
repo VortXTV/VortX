@@ -82,15 +82,18 @@ struct ProfilePickerView: View {
     @State private var pinCredential: CredentialScopeRegistry.Capture?
     @State private var signInCredential: CredentialScopeRegistry.Capture?
     @State private var signInProfileID: UUID?
+    #if os(tvOS)
+    @FocusState private var diagnosticFocused: Bool
+    #endif
 
     private var profilesArePreparing: Bool {
-        nativeSync.nativeCheckpointStatus == "restoring" || nativeSync.accountRestoreState == .restoring
+        !nativeSync.accountReconnectRequired && (nativeSync.nativeCheckpointStatus == "restoring" || nativeSync.accountRestoreState == .restoring)
     }
 
     /// The device log spans every profile's activity. With a PIN-protected profile here, export waits until
     /// a profile is unlocked (Settings has it), unless profiles failed to load, the stuck case it exists for.
     private var exportAllowedBeforeProfile: Bool {
-        if profileAction.errorMessage != nil { return true }
+        if nativeSync.accountReconnectRequired || profileAction.errorMessage != nil { return true }
         if nativeSync.accountRestoreState == .failed { return true }
         return !store.profiles.contains { $0.pin != nil }
     }
@@ -98,6 +101,9 @@ struct ProfilePickerView: View {
     init(core: CoreBridge = .shared) { self.core = core }
 
     private var visibleProfileError: String? {
+        if nativeSync.accountReconnectRequired {
+            return "This device needs to reconnect to your VortX account. Open Account settings and sign in again. Your saved profiles have not been removed."
+        }
         if profilesArePreparing { return nil }
         return profileAction.errorMessage
     }
@@ -172,7 +178,7 @@ struct ProfilePickerView: View {
                                     .tint(.white)
                             }
                             profileGrid(layout: layout)
-                                .disabled(!nativeSync.isSignedIn)
+                                .disabled(!nativeSync.isSignedIn || nativeSync.accountReconnectRequired)
                         }
                         .padding(.horizontal, layout.horizontalInset)
                         .padding(.bottom, layout.isPhone ? 32 : 0)
@@ -186,9 +192,13 @@ struct ProfilePickerView: View {
                     // Outside the disabled picker: a stuck profile/restore must not block its own log.
                     .safeAreaInset(edge: .bottom) {
                         if exportAllowedBeforeProfile {
-                            DiagnosticLogExportButton()
+                            diagnosticRecoveryButton
                                 .padding(.horizontal, 24)
                                 .padding(.vertical, 12)
+                                // The full-width focus section bridges every centered profile row
+                                // to the footer, including tiles away from the middle of the screen.
+                                .frame(maxWidth: .infinity)
+                                .profileFocusSection()
                                 .disabled(pinTarget != nil)
                                 .accessibilityHidden(pinTarget != nil)
                         }
@@ -236,12 +246,22 @@ struct ProfilePickerView: View {
             if !signInNeeded { signInCredential = nil; signInProfileID = nil }
         }
         .onValueChange(of: nativeSync.accountRestoreState) { state in
-            if state == .failed { deferredSelection.cancel() }
+            if state == .failed { deferredSelection.cancel(); focusDiagnosticRecovery() }
             if state == .ready, !profileAction.isRunning { profileAction.cancel() }
             resumeDeferredSelection()
         }
         .onValueChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
-        .onValueChange(of: profileAction.errorMessage) { _ in resumeDeferredSelection() }
+        .onValueChange(of: nativeSync.accountReconnectRequired) { required in
+            if required {
+                deferredSelection.cancel(); profileAction.cancel()
+                pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+                focusDiagnosticRecovery()
+            }
+        }
+        .onValueChange(of: profileAction.errorMessage) { error in
+            if error != nil { focusDiagnosticRecovery() }
+            resumeDeferredSelection()
+        }
         .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
         .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
@@ -249,6 +269,24 @@ struct ProfilePickerView: View {
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
         }
+    }
+
+    @ViewBuilder private var diagnosticRecoveryButton: some View {
+        #if os(tvOS)
+        DiagnosticLogExportButton()
+            .focused($diagnosticFocused)
+            .onAppear { focusDiagnosticRecovery() }
+        #else
+        DiagnosticLogExportButton()
+        #endif
+    }
+
+    private func focusDiagnosticRecovery() {
+        #if os(tvOS)
+        guard pinTarget == nil, exportAllowedBeforeProfile,
+              nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed else { return }
+        diagnosticFocused = true
+        #endif
     }
 
     private var artworkIsVisible: Bool {
@@ -338,6 +376,9 @@ struct ProfilePickerView: View {
     }
 
     private func pick(_ profile: UserProfile) {
+        guard !nativeSync.accountReconnectRequired else {
+            deferredSelection.cancel(); profileAction.cancel(); return
+        }
         let capture = CredentialScopeRegistry.shared.capture()
         if !isEditing, profilesArePreparing || !core.hasCertifiedNativeSession(capture: capture, profileID: store.activeID) {
             profileAction.cancel()
@@ -364,6 +405,7 @@ struct ProfilePickerView: View {
     }
 
     private func resumeDeferredSelection() {
+        guard !nativeSync.accountReconnectRequired else { deferredSelection.cancel(); return }
         deferredSelection.observePreparation(profilesArePreparing,
                                              accountRestorePreparing: nativeSync.accountRestoreState == .restoring)
         // Observer delivery order is not an authority. A failed restore must cancel its
@@ -394,6 +436,10 @@ struct ProfilePickerView: View {
     }
 
     private func finishPIN(_ target: UserProfile) {
+        guard !nativeSync.accountReconnectRequired else {
+            pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+            deferredSelection.cancel(); return
+        }
         guard let capture = pinCredential, CredentialScopeRegistry.shared.isCurrent(capture),
               let current = store.profiles.first(where: { $0.id == target.id }) else {
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
@@ -411,6 +457,9 @@ struct ProfilePickerView: View {
 
     private func commit(_ profile: UserProfile) {
         pinTarget = nil
+        guard !nativeSync.accountReconnectRequired else {
+            deferredSelection.cancel(); profileAction.cancel(); return
+        }
         let admission = core.captureNativeProfileActionAdmission()
         // Keep the parent picker alive until the selected profile is usable. In particular,
         // pending-own setup is a child presentation and must not lose its presenting view.
@@ -937,7 +986,7 @@ private struct ProfilePickerButtonContent: View {
 }
 
 /// A full-screen account form needs its own way back to the picker, including before sign-in.
-private struct ProfileAccountRecoveryView: View {
+struct ProfileAccountRecoveryView: View {
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         VStack(spacing: 0) {

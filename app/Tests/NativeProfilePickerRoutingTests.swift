@@ -80,6 +80,7 @@ struct UserProfile: Equatable {
     @Published var nativeCheckpointStatus = "mounted"
     @Published var accountRestoreState = RestoreState.idle
     var isSignedIn = true
+    var accountReconnectRequired = false
     var preparations = 0
     var continuation: CheckedContinuation<Bool, Never>?
     func prepareNativeProfileSelection(credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
@@ -191,10 +192,34 @@ enum FakeScene { case active, background }
     @MainActor static func main() async {
         var passed = 0
         do {
+            let (h, a, _) = fixture()
+            h.nativeSync.accountReconnectRequired = true
+            h.tap(a); await drain()
+            precondition(h.store.selected.isEmpty && h.nativeSync.preparations == 0
+                         && h.deferredSelection.profileID == nil)
+            h.stop(); passed += 1
+        }
+        do {
+            let (h, a, _) = fixture(); busy(h); h.tap(a)
+            precondition(h.deferredSelection.profileID == a.id)
+            h.nativeSync.accountReconnectRequired = true
+            ready(h); h.resume(); await drain()
+            precondition(h.store.selected.isEmpty && h.deferredSelection.profileID == nil)
+            h.stop(); passed += 1
+        }
+        do {
             let (h, a, _) = fixture(); h.tap(a)
             await until("ready selection") { !h.profileAction.isRunning }
             precondition(h.store.selected == [a.id] && h.account.reloads == 1 && h.deferredSelection.profileID == nil)
             precondition(h.store.pickedThisLaunch && h.store.finishPickerArguments == [false])
+            h.stop(); passed += 1
+        }
+        do {
+            let (h, a, _) = fixture(pin: "1111"); h.tap(a)
+            let original = h.pinTarget!
+            h.nativeSync.accountReconnectRequired = true
+            h.unlock(original); await drain()
+            precondition(h.pinTarget == nil && h.store.selected.isEmpty && !h.store.pickedThisLaunch)
             h.stop(); passed += 1
         }
         do {

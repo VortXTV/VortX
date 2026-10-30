@@ -649,6 +649,17 @@ jobs:
           rustup component add llvm-tools-preview 2>/dev/null || true
           ./scripts/verify-apple-engine-artifacts.sh
 
+      # Persist only the already-proved native SDK component, not an app/test result.
+      # All ABI/runtime/package checks below remain mandatory on restored SDK bytes.
+      - name: Save verified native SDK component before unrelated later gates
+        if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, exact existing cache action source
+        with:
+          path: |
+            app/Vendor/VortxEngine.xcframework
+            app/Vendor/engine-prelocalize/VortxEngine
+          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ env.VORTX_ENGINE_SOURCE_REVISION }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/native-rust-toolchain-env.sh', 'scripts/verify-native-engine-abi.sh') }}
+
       - name: Verify native account and episode ABI against the reviewed engine
         run: |
           set -euo pipefail
@@ -2365,11 +2376,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Set up JDK 21 for read-only Android package verification
+        if: github.event.release.tag_name != 'v0.5.6-beta.8'
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "21"
       - name: Set up Android package inspection tools
+        if: github.event.release.tag_name != 'v0.5.6-beta.8'
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           packages: "platform-tools platforms;android-36 build-tools;36.0.0"
@@ -2383,6 +2396,43 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = VortXTV/VortX
           WORK_DIR="$(mktemp -d "$RUNNER_TEMP/vortx-hosted-beta.XXXXXX")"
+          if [[ "$EVENT_TAG" == v0.5.6-beta.8 ]]; then
+            # This public, body-digest-bound manifest supplies original numeric build pointers.
+            # The successor then reauthenticates all CI, native, package and public-byte evidence.
+            curl --fail --location --proto '=https' --proto-redir '=https' \
+              --connect-timeout 10 --max-time 90 --max-filesize 1048576 \
+              "https://github.com/VortXTV/VortX/releases/download/v0.5.6-beta.8/VortX-Hosted-Direct-Beta-Provenance.json" \
+              --output "$WORK_DIR/provenance.json"
+            python3 - "$GITHUB_EVENT_PATH" "$WORK_DIR/provenance.json" "$GITHUB_SHA" > "$WORK_DIR/apple-pointer.txt" <<'PY'
+          import hashlib, json, pathlib, re, sys
+          event_path, manifest_path, source = sys.argv[1:]
+          manifest_path = pathlib.Path(manifest_path)
+          assert manifest_path.stat().st_size <= 1048576
+          event = json.loads(pathlib.Path(event_path).read_bytes())
+          release = event['release']
+          assert event['action'] == 'published' and event['repository']['full_name'] == 'VortXTV/VortX'
+          assert release['tag_name'] == 'v0.5.6-beta.8' and release['target_commitish'] == source
+          assert release['draft'] is False and release['prerelease'] is True
+          bindings = [line for line in release['body'].splitlines() if 'vortx-ci-provenance-sha256:' in line]
+          assert len(bindings) == 1
+          binding = re.fullmatch(r'<!-- vortx-ci-provenance-sha256: ([0-9a-f]{64}) -->', bindings[0])
+          assert binding and hashlib.sha256(manifest_path.read_bytes()).hexdigest() == binding[1]
+          manifest = json.loads(manifest_path.read_bytes())
+          assert manifest['releaseId'] == release['id'] and manifest['tag'] == release['tag_name']
+          assert manifest['sourceCommit'] == source and set(manifest['builds']) == {'apple'}
+          pointer = manifest['builds']['apple']
+          values = [pointer[key] for key in ('runId', 'attempt', 'artifactId')]
+          assert all(type(value) is int and 0 < value < 2**63 for value in values)
+          print(*values)
+          PY
+            read -r APPLE_RUN APPLE_ATTEMPT APPLE_ARTIFACT < "$WORK_DIR/apple-pointer.txt"
+            python3 scripts/verify-ci-beta8-apple-hotfix.py verify-published \
+              --tag "$EVENT_TAG" --source-commit "$GITHUB_SHA" --release-id "$RELEASE_ID" \
+              --repo-root "$GITHUB_WORKSPACE" --work-dir "$WORK_DIR" \
+              --apple-run "$APPLE_RUN" --apple-attempt "$APPLE_ATTEMPT" --apple-artifact "$APPLE_ARTIFACT" \
+              --event-file "$GITHUB_EVENT_PATH"
+            exit 0
+          fi
           curl --fail --location --connect-timeout 10 --max-time 90 --retry 2 \
             https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
             --output "$WORK_DIR/bundletool.jar"

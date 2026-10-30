@@ -81,6 +81,7 @@ struct LibraryView: View {
     @ObservedObject private var watchedIndex = WatchedIndex.shared   // series-completion badge (#143) refreshes reactively
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
     @State private var segment: LibrarySegment = .all
+    @State private var showAccountRecovery = false
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
@@ -153,6 +154,32 @@ struct LibraryView: View {
                                     smartFilterBar(segmented(library.catalog))
                                     grid(smartFiltered(segmented(library.catalog)))
                                 }
+                            } else if vortxSync.isSignedIn, vortxSync.accountReconnectRequired {
+                                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                                    Text("VortX didn't accept this account session.")
+                                        .font(Theme.Typography.body.weight(.semibold))
+                                    Text("Open Settings, then VortX account & sync, to reconnect. This device's saved data was not replaced.")
+                                        .font(Theme.Typography.label)
+                                    Button("Account settings") { showAccountRecovery = true }
+                                        .buttonStyle(ChipButtonStyle())
+                                    DiagnosticLogExportButton()
+                                }
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .padding(Theme.Space.xxl)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            } else if vortxSync.isSignedIn, vortxSync.accountRestoreState == .failed {
+                                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                                    Text("Couldn't load this library.")
+                                        .font(Theme.Typography.body.weight(.semibold))
+                                    Text("Open VortX account & sync in Settings to retry. This device's saved data was not replaced.")
+                                        .font(Theme.Typography.label)
+                                    Button("Account settings") { showAccountRecovery = true }
+                                        .buttonStyle(ChipButtonStyle())
+                                    DiagnosticLogExportButton()
+                                }
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .padding(Theme.Space.xxl)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             } else if account.isSignedIn || vortxSync.isSignedIn {
                                 BigSpinner()
                                     .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
@@ -182,6 +209,10 @@ struct LibraryView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .navigationDestination(isPresented: randomLibraryPresented) { randomLibraryDestination }
+        }
+
+        .sheet(isPresented: $showAccountRecovery) {
+            ProfileAccountRecoveryView().environmentObject(vortxSync)
         }
 
         // BEGIN RANDOM PICK LIBRARY LIFECYCLE

@@ -16,6 +16,91 @@ import Foundation
         func send() { subject.send(()) }
     }
 
+    final class PostingReceipt: @unchecked Sendable {
+        private let lock = NSLock()
+        private var retired = false
+        func markRetired() { lock.withLock { retired = true } }
+        func snapshot() -> Bool { lock.withLock { retired } }
+    }
+
+    /// The receipt is sampled on the posting queue BEFORE resuming MainActor. An enqueue-only
+    /// implementation cannot pass by processing the invalidation after this background post returns.
+    static func postDefault(_ name: Notification.Name, receipt: PostingReceipt) async -> (Bool, Bool) {
+        let rawName = name.rawValue
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async { @Sendable in
+                NotificationCenter.default.post(name: .init(rawValue: rawName), object: nil)
+                continuation.resume(returning: (!Thread.isMainThread, receipt.snapshot()))
+            }
+        }
+    }
+
+    static func defaultBackgroundNotificationsRevokeBeforePostReturns() async throws {
+        for note in [VortXSyncManager.credentialScopeDidChangeNote, CoreBridge.xperienceContextChangedNote] {
+            let (collection, session) = try Fixture.sessionFixture()
+            let store = Fixture.StoreFixture(session: session)
+            let authority = CredentialScopeRegistry(initialScope: .signedOutDevice)
+            let backend = Fixture.MemoryCredentialBackend()
+            // No injected publisher: both actual controller and prompt build their default maps on MainActor.
+            let controller = XperienceCurationExportController(store: store,
+                vault: .init(store: backend.store(), authority: authority), authority: authority,
+                transport: { _ in throw Failure.assertion("unexpected transport") })
+            let ticket = try controller.beginLink(collection)
+            let input = XperienceCurationExportPromptState(controller: controller, ticket: ticket)
+            input.privateURL = "synthetic input"; input.selectedID = "synthetic selection"
+            let receipt = PostingReceipt()
+            let observer = input.$retired.sink { @Sendable value in if value { receipt.markRetired() } }
+            defer { observer.cancel() }
+            store.contextCurrent = false
+            let (background, revokedAtReturn) = await postDefault(note, receipt: receipt)
+            try require(background && revokedAtReturn,
+                        "default notification maps revoke the actual prompt before background post returns")
+            try require(input.retired && input.privateURL.isEmpty && input.selectedID == nil
+                        && !controller.isCurrentContext(ticket) && store.explicitRetirements == 1,
+                        "default controller and prompt retire the same original attempt and clear sensitive input")
+            store.contextCurrent = true; store.editCurrent = true
+            _ = await postDefault(note, receipt: receipt)
+            try require(input.retired && !controller.isCurrentContext(ticket) && store.captureCount == 1
+                        && store.explicitRetirements == 1,
+                        "default notification context ABA cannot revive or recapture the original attempt")
+        }
+    }
+
+    static func defaultUnchangedBackgroundHintsAndIdentityABA() async throws {
+        let priorProfile = ProfileStore.shared.activeID
+        let priorSignIn = VortXSyncManager.shared.isSignedIn
+        defer { ProfileStore.shared.activeID = priorProfile; VortXSyncManager.shared.isSignedIn = priorSignIn }
+        for identity in ["profile", "account"] {
+            let (collection, session) = try Fixture.sessionFixture()
+            ProfileStore.shared.activeID = session.profileID
+            VortXSyncManager.shared.isSignedIn = false
+            let store = Fixture.StoreFixture(session: session)
+            let authority = CredentialScopeRegistry(initialScope: .signedOutDevice)
+            let backend = Fixture.MemoryCredentialBackend()
+            let controller = XperienceCurationExportController(store: store,
+                vault: .init(store: backend.store(), authority: authority), authority: authority,
+                transport: { _ in throw Failure.assertion("unexpected transport") })
+            let ticket = try controller.beginLink(collection)
+            let input = XperienceCurationExportPromptState(controller: controller, ticket: ticket)
+            input.privateURL = "unchanged original input"
+            let receipt = PostingReceipt()
+            let observer = input.$retired.sink { @Sendable value in if value { receipt.markRetired() } }
+            defer { observer.cancel() }
+            let (background, retiredAtReturn) = await postDefault(CoreBridge.xperienceContextChangedNote, receipt: receipt)
+            try require(background && !retiredAtReturn && !input.retired && controller.isCurrentContext(ticket)
+                        && input.privateURL == "unchanged original input" && store.captureCount == 1,
+                        "unchanged default background hint conserves the actual original prompt")
+            if identity == "profile" { ProfileStore.shared.activeID = UUID() }
+            else { VortXSyncManager.shared.isSignedIn = true }
+            try require(input.retired && !controller.isCurrentContext(ticket) && receipt.snapshot(),
+                        "default Published identity pipeline revokes synchronously during the setter")
+            ProfileStore.shared.activeID = session.profileID; VortXSyncManager.shared.isSignedIn = false
+            try require(input.retired && !controller.isCurrentContext(ticket) && store.captureCount == 1
+                        && store.explicitRetirements == 1,
+                        "default Published identity ABA does not revive or recapture an old ticket")
+        }
+    }
+
     static func contextLossClearsSameProfilePrompt() async throws {
         for cause in ["credential", "native"] {
             let (collection, session) = try Fixture.sessionFixture()
@@ -103,6 +188,8 @@ import Foundation
     }
 
     static func run() async throws {
+        try await defaultBackgroundNotificationsRevokeBeforePostReturns()
+        try await defaultUnchangedBackgroundHintsAndIdentityABA()
         try await contextLossClearsSameProfilePrompt()
         try unchangedACKKeepsOriginalPrompt()
         try await completedSaveReceiptsSurviveAuthorityHints()

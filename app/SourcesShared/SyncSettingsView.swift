@@ -11,6 +11,7 @@ struct SyncSettingsView: View {
 
     enum Mode: String, CaseIterable { case signIn = "Sign in", create = "Create", recover = "Recover" }
     @State private var mode: Mode = .signIn
+    private var effectiveMode: Mode { sync.accountReconnectRequired ? .signIn : mode }
     @State private var email = ""
     @State private var username = ""
     @State private var password = ""
@@ -30,7 +31,7 @@ struct SyncSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("VortX account").screenTitleStyle()
-                if sync.isSignedIn, let account = sync.account {
+                if sync.isSignedIn, !sync.accountReconnectRequired, let account = sync.account {
                     signedIn(account)
                 } else {
                     signedOut
@@ -56,7 +57,13 @@ struct SyncSettingsView: View {
         } message: {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or restore the account's data. Saved data is not overwritten by a legacy device backup.")
         }
-        .task { await sync.refreshAccount() }
+        .task {
+            if sync.accountReconnectRequired { mode = .signIn; email = sync.account?.email ?? "" }
+            await sync.refreshAccount()
+        }
+        .onValueChange(of: sync.accountReconnectRequired) { required in
+            if required { mode = .signIn; email = sync.account?.email ?? "" }
+        }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             // Async outcomes from the previous account must not repaint a replacement session.
             syncNote = nil
@@ -118,25 +125,34 @@ struct SyncSettingsView: View {
         if let code = newRecoveryCode {
             recoveryCodeCard(code)
         } else {
-            Text("Optional. A free, end-to-end-encrypted account keeps your profiles, settings, and library safe across devices.")
-                .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+            if sync.accountReconnectRequired {
+                Text("Reconnect your VortX account")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Text("The server did not accept this device's session. Sign in again to reconnect. Your profiles and pending changes are still saved on this device.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+            } else {
+                Text("Optional. A free, end-to-end-encrypted account keeps your profiles, settings, and library safe across devices.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+            }
 
             Button("Sign in with QR code") { showQRSignIn = true }
                 .buttonStyle(ChipButtonStyle())
                 .disabled(working)
 
-            HStack(spacing: Theme.Space.sm) {
-                ForEach(Mode.allCases, id: \.self) { m in
-                    Button(m.rawValue) { mode = m; message = nil; needsTotp = false }
-                        .buttonStyle(ChipButtonStyle(selected: mode == m))
+            if !sync.accountReconnectRequired {
+                HStack(spacing: Theme.Space.sm) {
+                    ForEach(Mode.allCases, id: \.self) { m in
+                        Button(m.rawValue) { mode = m; message = nil; needsTotp = false }
+                            .buttonStyle(ChipButtonStyle(selected: mode == m))
+                    }
                 }
             }
 
             VStack(spacing: Theme.Space.md) {
-                field(mode == .signIn ? "Email or username" : "Email", text: $email, content: .emailAddress)
-                if mode == .create { field("Username", text: $username) }
-                if mode == .recover { field("Recovery code (VX-…)", text: $recoveryCodeInput) }
-                secureField(mode == .recover ? "New password" : "Password", text: $password)
+                field(effectiveMode == .signIn ? "Email or username" : "Email", text: $email, content: .emailAddress)
+                if effectiveMode == .create { field("Username", text: $username) }
+                if effectiveMode == .recover { field("Recovery code (VX-…)", text: $recoveryCodeInput) }
+                secureField(effectiveMode == .recover ? "New password" : "Password", text: $password)
                 if needsTotp { field("Authenticator code", text: $totp, content: .oneTimeCode) }
             }
 
@@ -180,12 +196,12 @@ struct SyncSettingsView: View {
     }
 
     private var actionLabel: String {
-        switch mode { case .signIn: return "Sign in"; case .create: return "Create account"; case .recover: return "Reset password" }
+        switch effectiveMode { case .signIn: return "Sign in"; case .create: return "Create account"; case .recover: return "Reset password" }
     }
     private var canSubmit: Bool {
         guard !email.isEmpty, !password.isEmpty else { return false }
-        if mode == .create && username.isEmpty { return false }
-        if mode == .recover && recoveryCodeInput.isEmpty { return false }
+        if effectiveMode == .create && username.isEmpty { return false }
+        if effectiveMode == .recover && recoveryCodeInput.isEmpty { return false }
         if needsTotp && totp.isEmpty { return false }
         return true
     }
@@ -272,9 +288,10 @@ struct SyncSettingsView: View {
         working = true; message = nil; failed = false
         let mail = email.trimmingCharacters(in: .whitespaces).lowercased()
         Task { @MainActor in
-            switch mode {
+            switch effectiveMode {
             case .signIn:
-                let r = await sync.signIn(login: mail, password: password, totp: needsTotp ? totp : nil)
+                let r = await sync.signIn(login: mail, password: password, totp: needsTotp ? totp : nil,
+                                          requireCurrentAccount: sync.accountReconnectRequired)
                 handle(r)
             case .create:
                 let (r, code) = await sync.register(email: mail, username: username.trimmingCharacters(in: .whitespaces), password: password)

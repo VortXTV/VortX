@@ -71,6 +71,22 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
+    @Published private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+
+    /// True only for the exact currently adopted account-session epoch that received a backup 401.
+    /// The bearer itself never leaves the manager or appears in this UI-facing state.
+    var accountReconnectRequired: Bool {
+        let current = credentialAuthority.capture()
+        return isSignedIn && accountReconnectFailureCapture == current && isCurrent(current)
+    }
+
+    private func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        accountReconnectFailureCapture == capture && isCurrent(capture)
+    }
+
+    private func clearAccountReconnectFailure(for capture: CredentialScopeRegistry.Capture) {
+        if accountReconnectFailureCapture == capture { accountReconnectFailureCapture = nil }
+    }
     private var nativeCheckpointTask: Task<Bool, Never>?
     private var nativeCheckpointCapture: CredentialScopeRegistry.Capture?
     private var nativeCheckpointProfile: UUID?
@@ -1511,6 +1527,7 @@ final class VortXSyncManager: ObservableObject {
     func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                                  userInitiated: Bool = false) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
+        guard userInitiated || !accountReconnectRequired(for: capture) else { return false }
         let selectedProfile = ProfileStore.shared.activeID
         guard isSignedIn, isCurrent(capture), case .account = capture.scope else {
             DiagnosticsLog.log("native-profiles", "restore result=not_started reason=account_not_ready")
@@ -2641,6 +2658,7 @@ final class VortXSyncManager: ObservableObject {
                 self.restoreTask = nil
                 self.restoreTaskCapture = nil
                 self.accountRestoreState = .idle
+                self.accountReconnectFailureCapture = nil
                 self.token = nil
                 self.account = nil
                 self.dataKey = nil
@@ -2952,12 +2970,22 @@ final class VortXSyncManager: ObservableObject {
             email: email,
             username: username,
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
+        // While this exact adopted owner is rejected, every reauthentication route (password/TOTP
+        // and QR) must prove the same account and data key before persisting or publishing a replacement.
+        if accountReconnectFailureCapture == operation.credential {
+            guard isSignedIn, account?.id == id, self.dataKey == dataKey else { return false }
+        }
         guard let adoptedCapture = await acquireCredentialOwner(
             scope: scope,
             operation: "adopt",
             fence: operation,
             certifying: {
-                self.persist(token: token, account: candidateAccount, dataKey: dataKey)
+                // Owner acquisition can suspend while a current pull reports a rejection.
+                // Revalidate at every actual persistence attempt, not only before that await.
+                if self.accountReconnectFailureCapture == operation.credential {
+                    guard self.isSignedIn, self.account?.id == id, self.dataKey == dataKey else { return .failure }
+                }
+                return self.persist(token: token, account: candidateAccount, dataKey: dataKey)
             }
         ) else { return false }
         guard operation.generation == authOperationGeneration,
@@ -2967,6 +2995,7 @@ final class VortXSyncManager: ObservableObject {
         self.token = token
         self.dataKey = dataKey
         self.account = candidateAccount
+        self.accountReconnectFailureCapture = nil
         self.accountRestoreState = .restoring
         self.isSignedIn = true
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
@@ -3047,8 +3076,21 @@ final class VortXSyncManager: ObservableObject {
         }
     }
 
-    func signIn(login: String, password: String, totp: String? = nil) async -> AuthResult {
+    func signIn(login: String, password: String, totp: String? = nil,
+                requireCurrentAccount: Bool = false) async -> AuthResult {
+        let reconnectCapture = requireCurrentAccount ? credentialAuthority.capture() : nil
+        let reconnectAccountID = requireCurrentAccount ? account?.id : nil
+        let reconnectDataKey = requireCurrentAccount ? dataKey : nil
+        if requireCurrentAccount {
+            guard isSignedIn, let reconnectCapture, reconnectAccountID != nil, reconnectDataKey != nil,
+                  isCurrent(reconnectCapture) else {
+                return .failed("The connected VortX account changed. Try again.")
+            }
+        }
         let operation = beginAuthOperation()
+        if let reconnectCapture, operation.credential != reconnectCapture {
+            return .failed("The connected VortX account changed. Try again.")
+        }
         let (_, pre) = await request(
             "POST", "/v1/auth/prelogin", body: ["login": login],
             credentialCapture: operation.credential
@@ -3071,6 +3113,14 @@ final class VortXSyncManager: ObservableObject {
               let wrappedPw = json?["wrappedKeyPassword"] as? String,
               let dk = VortXSyncCrypto.open(key: masterKey, wrappedPw) else {
             return .failed(code == 401 ? "Wrong login or password." : "Could not sign in.")
+        }
+        if let reconnectCapture {
+            guard isCurrent(operation), operation.credential == reconnectCapture,
+                  let reconnectAccountID, let reconnectDataKey,
+                  account?.id == reconnectAccountID, dataKey == reconnectDataKey,
+                  acct["id"] as? String == reconnectAccountID, dk == reconnectDataKey else {
+                return .failed("That sign-in does not match the connected VortX account.")
+            }
         }
         guard await adopt(token: token, account: acct, dataKey: dk, expectedOperation: operation) else {
             return .failed("Could not sign in.")
@@ -3245,19 +3295,31 @@ final class VortXSyncManager: ObservableObject {
         let (code, json) = await request("GET", "/v1/backup", auth: true, credentialCapture: capture,
                                          ifNoneMatch: ifNoneMatch, receiveETag: { etag = $0 })
         guard isCurrent(capture) else { return failed(.superseded) }
+        if code == 401 {
+            // This route uses the stored adopted token (`auth: true`) and never the one-off QR bearer.
+            // Keep the exact owner epoch so a late response cannot label a replacement session.
+            accountReconnectFailureCapture = capture
+            DiagnosticsLog.log("sync", "operation=pull result=authorization_required httpStatus=401")
+            return .failed(retryable: false)
+        }
         if code == 304 {
             guard let ifNoneMatch, etag == "\"\(ifNoneMatch)\"" else { return failed(.conditionalResponseInvalid) }
+            clearAccountReconnectFailure(for: capture)
             return .unchanged(version: ifNoneMatch)
         }
         // A newly observed source retires an older full-export witness before any mutation.
         let observation: UUID? = (code == 200 || code == 404) ? Self.xperienceExportObservation.observe() : nil
-        if code == 404 { return .empty }                                  // no backup yet
+        if code == 404 {
+            clearAccountReconnectFailure(for: capture)
+            return .empty
+        }
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
         guard code == 200 else {
             DiagnosticsLog.log("sync", "operation=pull result=failed httpStatus=\(code)")
             return .failed(retryable: code == 0 || code >= 500)
         }
+        clearAccountReconnectFailure(for: capture)
         guard let json else { return failed(.responseInvalid) }
         guard let docStr = json["document"] as? String, !docStr.isEmpty else { return failed(.documentMissing) }
         // `version` stays `as? Int` (Swift's Int is 64-bit on every platform this app targets), so an epoch-ms
@@ -3330,7 +3392,7 @@ final class VortXSyncManager: ObservableObject {
                                sourceIsCurrent: () -> Bool = { true }) async -> PushOutcome {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedAccountID = account?.id ?? ""
-        guard isCurrent(capture), sourceIsCurrent(), !Task.isCancelled,
+        guard isCurrent(capture), !accountReconnectRequired(for: capture), sourceIsCurrent(), !Task.isCancelled,
               SyncDocumentRevisionPolicy.next(after: baseRevision) == version,
               !hasPendingAccountDocApply(for: capture), let capturedDataKey = dataKey,
               let pt = plaintextData ?? (try? JSONSerialization.data(withJSONObject: obj)),
@@ -3839,8 +3901,10 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
         let capture = credentialAuthority.capture()
-        guard isSignedIn, isCurrent(capture), backupUploadFailure != .upgradeRequired else { return false }
-        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
+        guard isSignedIn, isCurrent(capture), !accountReconnectRequired(for: capture),
+              backupUploadFailure != .upgradeRequired else { return false }
+        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture),
+              !accountReconnectRequired(for: capture) else { return false }
         guard !hasPendingAccountDocApply(for: capture) else {
             NSLog("[sync] push refused: a remote credential apply is pending certification")
             return false
@@ -4094,7 +4158,7 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func restoreAccountDocIfNeeded(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
-        guard isSignedIn, isCurrent(capture) else { return false }
+        guard isSignedIn, isCurrent(capture), !accountReconnectRequired(for: capture) else { return false }
         // Single-flight: adopt(), startRealtime(), and any blocked syncUp can all arrive at once. Assigning
         // restoreTask before the first await means concurrent callers join this task rather than starting their
         // own forced pulls. Safe on the main actor: the Task body cannot begin until this function suspends.
@@ -4111,7 +4175,7 @@ final class VortXSyncManager: ObservableObject {
                         let documentApplied = self.hasAppliedAccountDoc && !self.hasPendingAccountDocApply(for: capture)
                         let sessionReady = CoreBridge.shared.hasCertifiedNativeSession(
                             capture: capture, profileID: ProfileStore.shared.activeID)
-                        self.accountRestoreState = documentApplied && sessionReady ? .ready : .failed
+                        self.accountRestoreState = documentApplied && sessionReady && !self.accountReconnectRequired(for: capture) ? .ready : .failed
                     }
                 }
             }
@@ -4126,6 +4190,9 @@ final class VortXSyncManager: ObservableObject {
                 guard self.isCurrent(capture), self.isSignedIn else { return false }
                 _ = await self.syncDown(force: true, credentialCapture: capture)
                 guard self.isCurrent(capture) else { return false }
+                // An auth rejection is deterministic for this adopted session. Do not repeat the same
+                // credential five times; the explicit reconnect flow owns the next attempt.
+                if self.accountReconnectRequired(for: capture) { break }
                 if self.hasAppliedAccountDoc, !self.hasPendingAccountDocApply(for: capture) {
                     // A definitively empty account also opens this gate. Mount its native
                     // session before reporting setup/ready, exactly as for a remembered document.
@@ -4141,7 +4208,8 @@ final class VortXSyncManager: ObservableObject {
             if !self.hasAppliedAccountDoc || self.hasPendingAccountDocApply(for: capture) {
                 NSLog("[sync] account doc not restored yet (#145 gate stays shut; pushes refused until it opens)")
             }
-            guard self.hasAppliedAccountDoc, !self.hasPendingAccountDocApply(for: capture), self.isSignedIn else { return false }
+            guard self.hasAppliedAccountDoc, !self.hasPendingAccountDocApply(for: capture), self.isSignedIn,
+                  !self.accountReconnectRequired(for: capture) else { return false }
             let sessionReady = await self.ensureNativeCheckpoint(credentialCapture: capture)
             return sessionReady && self.isCurrent(capture) && self.isSignedIn
         }
@@ -4210,6 +4278,9 @@ final class VortXSyncManager: ObservableObject {
         var outcome: ConflictResolutionOutcome = .failed
         defer { reportOutcome?(isCurrent(capture) && dataKey == capturedDataKey && !Task.isCancelled ? outcome : .failed) }
         guard isSignedIn, isCurrent(capture), backupUploadFailure != .upgradeRequired else { return false }
+        // Background receives stay quiet after this exact session was rejected. A forced, explicit
+        // retry may probe again; a successful authenticated pull clears the marker.
+        guard force || !accountReconnectRequired(for: capture) else { return false }
         // One pulled document may commit at a time, and a pull may not project an older host
         // document over an in-flight export. A refused operation leaves its ACK/version untouched.
         guard activeSyncDown?.capture != capture, activeSyncUp?.capture != capture else {

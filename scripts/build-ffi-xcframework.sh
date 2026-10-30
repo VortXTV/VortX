@@ -64,7 +64,11 @@
 #   3. <canonical-app>/../vortx-core/vortx-core (also from a registered app worktree)
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
-source "$HOME/.cargo/env" 2>/dev/null || true
+# Rust may already be on PATH without rustup's optional shell initializer.
+# A missing source file is fatal in the system Bash even with `|| true`.
+if [[ -f "$HOME/.cargo/env" ]]; then
+    source "$HOME/.cargo/env"
+fi
 REPO_ROOT="$(pwd)"
 
 MODE=server

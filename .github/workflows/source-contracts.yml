@@ -74,6 +74,9 @@ on:
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
+      - "scripts/build-ffi-xcframework.sh"
+      - "scripts/build-mac-server.sh"
+      - "scripts/tests/test_native_builder_startup.py"
       - "scripts/tests/test_release_native_snapshot_argv.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
@@ -156,6 +159,9 @@ on:
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
+      - "scripts/build-ffi-xcframework.sh"
+      - "scripts/build-mac-server.sh"
+      - "scripts/tests/test_native_builder_startup.py"
       - "scripts/tests/test_release_native_snapshot_argv.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
@@ -165,6 +171,10 @@ on:
       - ".github/workflows/**"
   workflow_dispatch:
     inputs:
+      apple_hotfix_checks:
+        description: Run only the focused Apple crash and account recovery regressions
+        type: boolean
+        default: false
       native_media_candidates:
         description: Build only the reviewed secretless native-media candidates
         type: boolean
@@ -186,7 +196,7 @@ concurrency:
   cancel-in-progress: ${{ !inputs.native_media_candidates }}
 jobs:
   apple-policies:
-    if: ${{ !inputs.native_media_candidates }}
+    if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
     # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
     # runner generation as Apple packaging instead of the older default SDK.
     runs-on: macos-26
@@ -228,6 +238,8 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
         run: git fetch --no-tags --depth=1 origin f9c45518ba6b8d779343c076da9f0dbcda129a30
       - run: bash scripts/test-next-preparation-attempt.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/tests/test_native_builder_startup.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_apple_package.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
@@ -317,7 +329,7 @@ jobs:
       - run: swiftc -parse-as-library app/SourcesShared/TabBarPrefs.swift app/Tests/CompactNavigationPolicyTests.swift -o /tmp/compact-navigation-test && /tmp/compact-navigation-test
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
   web:
-    if: ${{ !inputs.native_media_candidates }}
+    if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -332,6 +344,44 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - working-directory: webapp
         run: npm run typecheck && npm test && npm run build
+
+  apple-hotfix-checks:
+    if: github.event_name == 'workflow_dispatch' && inputs.apple_hotfix_checks && !inputs.native_media_candidates
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Focused Apple recovery regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/tests/test_native_builder_startup.py
+          python3 scripts/tests/test_ci_beta8_apple_hotfix.py
+          bash scripts/test-native-profile-picker-routing.sh
+          mkdir -p app/build/auth-recovery
+          echo "c83153feedd91bee93000305604d68772d4b7164716749f0a04605bbb2253f62  test/mpv-bounded-child.mjs" | shasum -a 256 --check
+          auth_status=0
+          nice -n 15 node test/mpv-bounded-child.mjs run 300 "$PWD/app/build/auth-recovery/supervisor.json" -- \
+            /bin/zsh test/apple-auth-recovery/test-auth-recovery.sh "$PWD" "$PWD/app/build/auth-recovery" \
+            > app/build/auth-recovery/run.log 2>&1 || auth_status=$?
+          cat app/build/auth-recovery/run.log
+          node test/mpv-bounded-child.mjs check "$PWD/app/build/auth-recovery/supervisor.json" "$auth_status"
+          test "$auth_status" -eq 0
+          node test/mpv-bounded-child.mjs check "$PWD/app/build/auth-recovery/supervisor.json" 0 normal-exit
+          bash scripts/test-xperience-export-contracts.sh
+      - name: Retain focused regression outputs and failure receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Apple-hotfix-regression-receipts
+          path: |
+            app/build/auth-recovery/**
+            app/build/profile-picker-routing.*/**
+            app/build/xperience-export-contracts.*/**
+          if-no-files-found: warn
+          retention-days: 30
 
   native-media-candidates:
     if: github.event_name == 'workflow_dispatch' && inputs.native_media_candidates
