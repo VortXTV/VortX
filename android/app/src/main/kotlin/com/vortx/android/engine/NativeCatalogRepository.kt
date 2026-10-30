@@ -3,6 +3,7 @@ package com.vortx.android.engine
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.data.*
 import com.vortx.android.model.*
+import com.vortx.android.xperience.XperienceAddonBinding
 import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -49,6 +50,15 @@ internal fun nativeContinueWatchingItem(item: JSONObject, saved: List<MetaItem>)
             // A finished latest episode keeps its series here with no offset, flagged watched: up next.
             ?.let { if (item.optBoolean("watched") && offset == 0L) it.copy(upNext = true) else it },
         continueWatchingActivityAtMillis = item.optLong("updatedAt", 0).takeIf { it > 0 })
+}
+
+/** Immutable installed projection bound to the exact admitted owner and addon bucket; not a capability. */
+internal class XperienceInstalledCatalogSnapshot(
+    val owner: VortxNativeOwner,
+    val installedAddonProfileID: String,
+    candidates: List<XperienceAddonBinding.Candidate>,
+) {
+    val candidates: List<XperienceAddonBinding.Candidate> = candidates.toList()
 }
 
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
@@ -321,25 +331,101 @@ internal class NativeCatalogRepository(
     private fun library(read: VortxNativeRead) = read.state.getJSONObject("libraries").getJSONObject(read.owner.profileID)
     private fun profile(read: VortxNativeRead) = read.state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(read.owner.profileID)
     private fun addonOwner(read: VortxNativeRead): String = if (profile(read).getString("addons") == "share_primary") read.owner.scope.ownerProfileID else read.owner.profileID
-    private fun addonDescriptors(read: VortxNativeRead): List<JSONObject> {
-        val response = session().resolve(JSONObject().put("kind", "installed_addons").put("profileId", addonOwner(read)), read.owner)
-        check(response.getString("kind") == "installed_addons" && response.getString("profileId") == addonOwner(read)) { "Native addon projection unavailable" }
+    private fun addonDescriptors(read: VortxNativeRead): List<JSONObject> = addonDescriptors(session(), read)
+    /** Use the caller's captured Session. Xperience never resolves through a late sessionProvider sample. */
+    private fun addonDescriptors(session: VortxNativeSession, read: VortxNativeRead): List<JSONObject> {
+        require(session.scope == read.owner.scope) { "Native owner changed" }
+        val profileId = addonOwner(read)
+        val response = session.resolve(JSONObject().put("kind", "installed_addons").put("profileId", profileId), read.owner)
+        check(response.getString("kind") == "installed_addons" && response.getString("profileId") == profileId) { "Native addon projection unavailable" }
         return response.getJSONArray("addons").objects()
     }
-    private fun registry(read: VortxNativeRead): List<VortxResourceAddon> {
+    private fun registry(read: VortxNativeRead): List<VortxResourceAddon> = registry(session(), read)
+    private fun registry(session: VortxNativeSession, read: VortxNativeRead): List<VortxResourceAddon> =
+        registry(read, addonDescriptors(session, read))
+    /** Shared installed-snapshot projection; also lets focused tests feed synthetic raw descriptors. */
+    private fun registry(read: VortxNativeRead, descriptors: List<JSONObject>): List<VortxResourceAddon> {
         val disabled = NativeAddonPreferences.disabled(read)
         val order = NativeAddonPreferences.order(read)
-        val descriptors = addonDescriptors(read).let { values -> if (order == null) values else values.sortedBy {
+        val ordered = if (order == null) descriptors else descriptors.sortedBy {
             order.indexOf(AddonOrder.normalize(it.getString("transportUrl"))).let { index -> if (index < 0) Int.MAX_VALUE else index }
-        } }
-        return descriptors.filterNot { AddonOrder.normalize(it.getString("transportUrl")) in disabled }.map {
+        }
+        return ordered.filterNot { AddonOrder.normalize(it.getString("transportUrl")) in disabled }.map {
             // Transport is the stable membership identity; duplicate manifest IDs are valid configurations.
             VortxResourceAddon.fromTransportUrl(it.getString("transportUrl"), it.getJSONObject("manifest").toString())
         }
     }
+    private fun catalogSpecs(addon: VortxResourceAddon, allowMissingCatalogs: Boolean = false): List<CatalogSpec> {
+        val manifest = JSONObject(requireNotNull(addon.manifestJson))
+        if (allowMissingCatalogs && !manifest.has("catalogs")) return emptyList()
+        return manifest.getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
+    }
     private fun catalogs(read: VortxNativeRead) = catalogs(registry(read))
-    private fun catalogs(addons: List<VortxResourceAddon>) = addons.flatMap { addon ->
-        JSONObject(requireNotNull(addon.manifestJson)).getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
+    private fun catalogs(addons: List<VortxResourceAddon>) = addons.flatMap { catalogSpecs(it) }
+
+    /**
+     * Resolve/project from one caller-supplied admitted read and its owning Session. Call only inside
+     * that Session's existing withCurrentRead admission; this method performs the existing
+     * installed_addons native projection but never recaptures Session/current owner or issues a fetch.
+     */
+    internal fun xperienceCandidates(session: VortxNativeSession, read: VortxNativeRead): XperienceInstalledCatalogSnapshot =
+        projectXperienceCandidates(read, registry(session, read))
+
+    /** Snapshot-only projection seam shared with xperienceCandidates; it does not acquire a Session. */
+    internal fun xperienceCandidatesFromDescriptorSnapshot(
+        read: VortxNativeRead,
+        descriptors: List<JSONObject>,
+    ): XperienceInstalledCatalogSnapshot = projectXperienceCandidates(read, registry(read, descriptors))
+
+    private fun projectXperienceCandidates(
+        read: VortxNativeRead,
+        addons: List<VortxResourceAddon>,
+    ): XperienceInstalledCatalogSnapshot {
+        val candidates = addons.map { addon ->
+            val manifest = JSONObject(requireNotNull(addon.manifestJson))
+            val manifestId = manifest.getString("id")
+            val projectedCatalogs = catalogSpecs(addon, allowMissingCatalogs = true).mapNotNull { spec ->
+                val extras = spec.extras
+                // Match Apple's Xperience candidate projection without changing the global Discover
+                // CatalogSpec helpers. Legacy extraRequired is strict; malformed present data fails closed.
+                val supported = extras.mapNotNull { it.opt("name") as? String }.toMutableSet()
+                spec.catalog.optJSONArray("extraSupported")?.let { values ->
+                    for (index in 0 until values.length()) (values.opt(index) as? String)?.let(supported::add)
+                }
+                val required = extras.asSequence()
+                    .filter { it.opt("isRequired") == true }
+                    .mapNotNull { it.opt("name") as? String }
+                    .toMutableSet()
+                if (spec.catalog.has("extraRequired")) {
+                    val legacyRequired = spec.catalog.optJSONArray("extraRequired")
+                        ?: throw IllegalArgumentException("Invalid installed registry")
+                    for (index in 0 until legacyRequired.length()) {
+                        val name = legacyRequired.opt(index) as? String
+                            ?: throw IllegalArgumentException("Invalid installed registry")
+                        require(name.isNotEmpty()) { "Invalid installed registry" }
+                        required.add(name)
+                    }
+                }
+                // Xperience can express genre selection only. Keep raw manifests untouched and omit a
+                // catalog whose required extras cannot be represented by this source format.
+                if (required.any { it != "genre" }) return@mapNotNull null
+                XperienceAddonBinding.Catalog(
+                    type = spec.type,
+                    id = spec.id,
+                    acceptsGenre = "genre" in supported || "genre" in required,
+                    requiresGenre = "genre" in required,
+                    supportsSkip = "skip" in supported,
+                )
+            }
+            XperienceAddonBinding.Candidate.fromInstalled(
+                XperienceAddonBinding.InstalledDescriptor(
+                    manifestID = manifestId,
+                    transportURL = addon.transportUrl,
+                    catalogs = projectedCatalogs,
+                ),
+            )
+        }
+        return XperienceInstalledCatalogSnapshot(read.owner, addonOwner(read), candidates)
     }
     private fun canLoad(spec: CatalogSpec, extras: Set<String>) = spec.extras.none { it.optBoolean("isRequired") && it.getString("name") !in extras }
     private fun parental(read: VortxNativeRead): Boolean = profile(read).getJSONObject("parental").let {
