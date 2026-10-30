@@ -22,6 +22,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
@@ -50,14 +51,24 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 
+@OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 internal fun TvCollectionsHub(
     snapshot: CollectionsHubSnapshot,
     onOpen: (CollectionsHubTarget) -> Unit,
     onRetryProviders: () -> Unit,
     initialFocusRequester: FocusRequester? = null,
+    onImportedCollections: (() -> Unit)? = null,
+    importedReturnSignal: Int = 0,
 ) {
     if (!snapshot.isVisible) return
+    val importedFocus = remember { FocusRequester() }
+    LaunchedEffect(importedReturnSignal) {
+        if (importedReturnSignal > 0) {
+            withFrameNanos { }
+            try { importedFocus.requestFocus() } catch (_: IllegalStateException) { /* Hub may have been hidden. */ }
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg)) {
         Text(
             stringResource(R.string.collections_title),
@@ -80,6 +91,11 @@ internal fun TvCollectionsHub(
         }
         TvHubRow(stringResource(R.string.collections_group_genres), snapshot.genres, onOpen)
         TvHubRow(stringResource(R.string.collections_group_decades), snapshot.decades, onOpen)
+        onImportedCollections?.let { open ->
+            Surface(onClick = open, modifier = Modifier.padding(horizontal = TvDimens.edge).focusRequester(importedFocus)) {
+                Text(stringResource(R.string.xperience_title), modifier = Modifier.padding(16.dp))
+            }
+        }
     }
 }
 

@@ -89,6 +89,8 @@ fun TvHomeScreen(
     // Bumped by the shell when the Home tab is re-selected on the rail, so the rail list scrolls back to the
     // top -- the 10-foot analogue of Apple's `scrollToTopOnBump`.
     reselectSignal: Int = 0,
+    onImportedCollections: (() -> Unit)? = null,
+    importedReturnSignal: Int = 0,
 ) {
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -142,6 +144,8 @@ fun TvHomeScreen(
                     collectionsHubHidden = hubHidden,
                     onCollection = viewModel::openCollection,
                     onRetryCollections = viewModel::retryCollectionsHub,
+                    onImportedCollections = onImportedCollections,
+                    importedReturnSignal = importedReturnSignal,
                     onItem = { item ->
                         if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
                     },
@@ -169,6 +173,8 @@ private fun TvHomeContent(
     collectionsHubHidden: Boolean,
     onCollection: (CollectionsHubTarget) -> Unit,
     onRetryCollections: () -> Unit,
+    onImportedCollections: (() -> Unit)?,
+    importedReturnSignal: Int,
     onItem: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
@@ -308,6 +314,8 @@ private fun TvHomeContent(
                             onCollection,
                             onRetryCollections,
                             if (index == 0) firstCardFocus else null,
+                            onImportedCollections,
+                            importedReturnSignal,
                         )
                         HomeRowItem.ForYouHeader -> TvForYouHeader(onTuneForYou, if (index == 0) firstCardFocus else null)
                         HomeRowItem.ForYouInvite -> TvForYouInvite(onTuneForYou, if (index == 0) firstCardFocus else null)

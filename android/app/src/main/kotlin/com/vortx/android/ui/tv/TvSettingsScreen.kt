@@ -130,6 +130,8 @@ fun TvSettingsScreen(
     // shared detail flow. Default no-op keeps the screen usable in a @Preview / test.
     onItem: (MetaItem) -> Unit = {},
     onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
+    onImportedCollections: (() -> Unit)? = null,
+    importedReturnSignal: Int = 0,
 ) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
@@ -150,6 +152,13 @@ fun TvSettingsScreen(
     val debridServicesFocus = remember { FocusRequester() }
     val addonsFocus = remember { FocusRequester() }
     val profilesFocus = remember { FocusRequester() }
+    val importedFocus = remember { FocusRequester() }
+    LaunchedEffect(importedReturnSignal) {
+        if (importedReturnSignal > 0) {
+            withFrameNanos { }
+            try { importedFocus.requestFocus() } catch (_: IllegalStateException) { /* Filter may remove the row. */ }
+        }
+    }
     var restoreFocusTarget by remember { mutableStateOf<TvDebridFocusTarget?>(null) }
     var restoreAddonsFocus by remember { mutableStateOf(false) }
     var restoreProfilesFocus by remember { mutableStateOf(false) }
@@ -534,8 +543,13 @@ fun TvSettingsScreen(
                 }
             }
 
-            if (show("library", "auto-add", "watched", "new episode", "alerts", "notifications", "upcoming", "coming soon")) item {
+            if (show("library", "auto-add", "watched", "new episode", "alerts", "notifications", "upcoming", "coming soon", "imported", "collections", "xperience")) item {
                 TvSettingsSection("Library") {
+                    onImportedCollections?.let { open ->
+                        TvSettingsNavigationRow(label = stringResource(R.string.xperience_title),
+                            detail = stringResource(R.string.xperience_settings_detail),
+                            onClick = open, focusRequester = importedFocus)
+                    }
                     TvSettingsNavigationRow(
                         label = "Upcoming",
                         detail = "Next-airing episodes and releases from titles in your Library.",

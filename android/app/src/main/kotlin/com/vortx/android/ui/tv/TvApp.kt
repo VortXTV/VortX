@@ -9,6 +9,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -36,6 +37,8 @@ import com.vortx.android.player.queue.PlaybackQueueAcceptedTarget
 import com.vortx.android.ui.components.PlaybackQueueSheet
 import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
 import com.vortx.android.ui.screens.SavedPlaylistScreen
+import com.vortx.android.ui.screens.XperienceCollectionsEntry
+import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.NextEpisodePreloadPolicy
@@ -128,6 +131,13 @@ fun TvApp(
                 confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
+        var importedCollectionsEntry by rememberSaveable { mutableStateOf<String?>(null) }
+        var importedFromHome by rememberSaveable { mutableStateOf(true) }
+        var importedReturnSignal by remember { mutableStateOf(0) }
+        fun openImportedCollections(fromHome: Boolean) {
+            importedFromHome = fromHome
+            importedCollectionsEntry = java.util.UUID.randomUUID().toString()
+        }
         var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
         var pendingQueuePlay by remember { mutableStateOf<PlaybackQueueToken?>(null) }
         var pendingQueueAccepted by remember { mutableStateOf(false) }
@@ -235,6 +245,7 @@ fun TvApp(
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
             retireLibraryPlayRoute()
+            importedCollectionsEntry = null
             showingPlaybackQueueFor = null
             playing = null
             playingMeta = null
@@ -272,6 +283,26 @@ fun TvApp(
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
+        val onImportedItem: (MetaItem) -> Unit = { item ->
+            retireLibraryPlayRoute()
+            if (item.continueWatchingAdmission?.isCurrent() != false) {
+                if (item.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${item.name}\n\n${item.continueWatchingUnavailableMessage}"
+                else { detailGeneration += 1; detail = item }
+            }
+        }
+        // The ordinary shell is removed by Detail and Player. Keep the original import entry ABOVE those
+        // branches, hide only its dialog while covered, and retire only on explicit exit/reload/disposal.
+        importedCollectionsEntry?.let { originalEntry -> key(originalEntry) {
+            TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
+                XperienceCollectionsEntry(entryId = originalEntry,
+                    factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = queueApplicationContext,
+                        homeSurface = HomeRailSurface.TV),
+                    visible = detail == null && playable == null, tv = true, dialog = true,
+                    onBack = { if (importedCollectionsEntry == originalEntry) { importedCollectionsEntry = null; importedReturnSignal++ } },
+                    onReload = { if (importedCollectionsEntry == originalEntry) openImportedCollections(importedFromHome) },
+                    onItem = onImportedItem)
+            }
+        } }
         val playerDetail = detail
         val playerVm: DetailViewModel? = if (playable != null && playerDetail != null && !playable.isTrailer) {
             viewModel(
@@ -857,6 +888,10 @@ fun TvApp(
                     },
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
+                    onImportedCollections = ::openImportedCollections,
+                    importedCollectionsOpen = importedCollectionsEntry != null,
+                    importedFromHome = importedFromHome,
+                    importedReturnSignal = importedReturnSignal,
                     onItem = {
                         retireLibraryPlayRoute()
                         if (it.continueWatchingAdmission?.isCurrent() != false) {

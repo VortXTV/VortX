@@ -90,6 +90,7 @@ fun HomeScreen(
     onBrowseCatalog: ((Catalog) -> Unit)? = null,
     onCatalogItem: ((MetaItem) -> Unit)? = null,
     onQuickView: ((MetaItem) -> Unit)? = null,
+    onImportedCollections: (() -> Unit)? = null,
 ) {
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -137,6 +138,7 @@ fun HomeScreen(
                     onBrowseCatalog,
                     onCatalogItem,
                     onQuickView,
+                    onImportedCollections,
                     lastStreamStore,
                     viewModel,
                     modifier,
@@ -157,6 +159,7 @@ private fun HomeContent(
     onBrowseCatalog: ((Catalog) -> Unit)?,
     onCatalogItem: ((MetaItem) -> Unit)?,
     onQuickView: ((MetaItem) -> Unit)?,
+    onImportedCollections: (() -> Unit)?,
     lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
     modifier: Modifier,
@@ -245,7 +248,8 @@ private fun HomeContent(
         itemsIndexed(rows, key = { _, row -> homeRowKey(row) }) { _, row ->
             when (row) {
                 HomeRowItem.HubRow ->
-                    CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub)
+                    CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub,
+                        onImportedCollections = onImportedCollections)
                 HomeRowItem.ForYouHeader -> com.vortx.android.ui.foryou.ForYouHeaderPhone { openInterests(false) }
                 HomeRowItem.ForYouInvite -> com.vortx.android.ui.foryou.ForYouInvitePhone { openInterests(false) }
                 is HomeRowItem.CatalogRow -> {

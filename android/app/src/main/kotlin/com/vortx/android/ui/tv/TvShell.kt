@@ -110,6 +110,10 @@ fun TvShell(
     syncManager: VortXSyncManager? = null,
     onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
     onDirectResume: (MetaItem) -> Unit = onItem,
+    onImportedCollections: ((Boolean) -> Unit)? = null,
+    importedCollectionsOpen: Boolean = false,
+    importedFromHome: Boolean = true,
+    importedReturnSignal: Int = 0,
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -129,7 +133,7 @@ fun TvShell(
     var homeBrowseSelected by remember { mutableStateOf(false) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val debridLibraryFocus = remember { FocusRequester() }
-    val modalVisible = showPlayLinkSheet || showDebridLibrary
+    val modalVisible = showPlayLinkSheet || showDebridLibrary || importedCollectionsOpen
     fun openLibraryRoute(route: TvLibraryRoute) {
         libraryReturnRoute = route
         libraryRoute = route
@@ -242,7 +246,9 @@ fun TvShell(
                     if (mergeHomeDiscover && homeBrowseSelected && !hiddenTabs.hideDiscover) {
                         TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), signedIn = signedIn, reselectSignal = reselectSignal)
                     } else {
-                        TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal)
+                        TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal,
+                            onImportedCollections = onImportedCollections?.let { open -> { open(true) } },
+                            importedReturnSignal = if (importedFromHome) importedReturnSignal else 0)
                     }
                 }
                 TvDestination.DISCOVER ->
@@ -315,7 +321,9 @@ fun TvShell(
                         onExit = { onDestinationChange(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected)
+                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected,
+                        onImportedCollections = onImportedCollections?.let { open -> { open(false) } },
+                        importedReturnSignal = if (!importedFromHome) importedReturnSignal else 0)
             }
 
             // Quiet "You're offline" chip pinned to the bottom of the active surface while the device has no

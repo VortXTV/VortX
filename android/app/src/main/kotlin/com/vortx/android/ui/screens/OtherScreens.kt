@@ -679,6 +679,7 @@ fun SettingsScreen(
     onOpenGallery: (() -> Unit)? = null,
     onUsenetServersClick: (() -> Unit)? = null,
     onNzbIndexersClick: (() -> Unit)? = null,
+    onImportedCollectionsClick: (() -> Unit)? = null,
 ) {
     val accountValue = when (authState) {
         is AuthState.SignedIn -> authState.email ?: "Signed in"
@@ -794,6 +795,10 @@ fun SettingsScreen(
         // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as
         // the Add-ons and Media servers rows.
         SettingRow(VortXIcons.library, "Library", "Export, import", onClick = onLibraryClick)
+        onImportedCollectionsClick?.let {
+            SettingRow(VortXIcons.library, stringResource(R.string.xperience_title),
+                stringResource(R.string.xperience_settings_detail), onClick = it)
+        }
         // Backup: a device-wide settings backup to a file (profiles included), distinct from the Library
         // export above (which carries saved titles only). Neither routes through account sync.
         SettingRow(VortXIcons.download, "Backup", "Settings to a file", onClick = onBackupClick)

@@ -153,6 +153,7 @@ import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LiveScreen
 import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
+import com.vortx.android.ui.screens.XperienceCollectionsEntry
 import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
@@ -489,6 +490,9 @@ fun VortXApp(
         val debridServicesFocusRequester = remember { FocusRequester() }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
+        // An explicit entry is a new original route. Only this non-authoritative ID survives process death.
+        var importedCollectionsEntry by rememberSaveable { mutableStateOf<String?>(null) }
+        val openImportedCollections = { importedCollectionsEntry = java.util.UUID.randomUUID().toString() }
         var showBackup by remember { mutableStateOf(false) }
         var showDiagnostics by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
@@ -567,6 +571,7 @@ fun VortXApp(
             restoreDebridServicesFocus = false
             showLiveTv = false
             showLibraryTransfer = false
+            importedCollectionsEntry = null
             showBackup = false
             showDiagnostics = false
             showProfiles = false
@@ -805,6 +810,18 @@ fun VortXApp(
         // Player is the topmost layer: when a source resolves to a Playable, it covers everything and
         // back returns to the detail page underneath.
         val playable = playing
+        importedCollectionsEntry?.let { originalEntry -> key(originalEntry) {
+            XperienceCollectionsEntry(
+                entryId = originalEntry,
+                factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext),
+                visible = detail == null && playable == null,
+                tv = false,
+                dialog = true,
+                onBack = { if (importedCollectionsEntry == originalEntry) importedCollectionsEntry = null },
+                onReload = { if (importedCollectionsEntry == originalEntry) openImportedCollections() },
+                onItem = onItem,
+            )
+        } }
         val playlistOwner = savedPlaylistOwner
         val playlistStore = savedPlaylistStore
         if (playlistOwner != null && playlistStore != null && queueOwner == playlistOwner) {
@@ -1983,6 +2000,7 @@ fun VortXApp(
                             },
                             onCatalogItem = onCinemaItem,
                             onQuickView = { item -> quickViewItem = item },
+                            onImportedCollections = openImportedCollections,
                         )
                     }
                 }
@@ -2074,6 +2092,7 @@ fun VortXApp(
                         showDebridKeys = true
                     },
                     onLibraryClick = { showLibraryTransfer = true },
+                    onImportedCollectionsClick = openImportedCollections,
                     onBackupClick = { showBackup = true },
                     onWatchStatsClick = { showWatchStats = true },
                     onWhatsNewClick = { showWhatsNew = true },
