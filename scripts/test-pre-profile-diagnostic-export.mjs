@@ -42,7 +42,12 @@ function member(source, signature) {
 }
 
 const inset = member(picker, '.safeAreaInset(edge: .bottom)');
-assert(inset.includes('DiagnosticLogExportButton()') && !inset.includes('profileAction.isRunning'));
+const recoveryButton = member(picker, '@ViewBuilder private var diagnosticRecoveryButton:');
+assert(inset.includes('diagnosticRecoveryButton') && !inset.includes('profileAction.isRunning'));
+assert((recoveryButton.match(/DiagnosticLogExportButton\(\)/g) ?? []).length === 2
+  && !recoveryButton.includes('profileAction.isRunning'));
+assert(inset.includes('.frame(maxWidth: .infinity)') && inset.includes('.profileFocusSection()'));
+assert(recoveryButton.includes('.focused($diagnosticFocused)') && recoveryButton.includes('focusDiagnosticRecovery()'));
 assert(picker.indexOf('.safeAreaInset(edge: .bottom)') > picker.indexOf('.disabled(pinTarget != nil || profileAction.isRunning)'));
 assert(inset.includes('.disabled(pinTarget != nil)') && inset.includes('.accessibilityHidden(pinTarget != nil)'));
 // A PIN-protected profile keeps the whole-device log behind a profile unlock, except when loading failed.
@@ -67,6 +72,7 @@ function requireSharedPickerMember(source, signature) {
 }
 requireSharedPickerMember(picker, 'private var exportAllowedBeforeProfile: Bool');
 requireSharedPickerMember(picker, '.safeAreaInset(edge: .bottom)');
+requireSharedPickerMember(picker, '@ViewBuilder private var diagnosticRecoveryButton:');
 const nativeOnlyGate = picker.replace('private var exportAllowedBeforeProfile: Bool',
   '#if VORTX_NATIVE_DATA_ENGINE\nprivate var exportAllowedBeforeProfile: Bool');
 assert.throws(() => requireSharedPickerMember(nativeOnlyGate, 'private var exportAllowedBeforeProfile: Bool'),
