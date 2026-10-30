@@ -336,15 +336,14 @@ final class SavedPlaylistStore: ObservableObject {
 
     /// Add is one synchronous admitted queue transaction. The originating detail view's generation is
     /// required so an old detail cannot switch to a successor profile that happens to share this field.
-    func addToQueue(field: String, ownerGeneration expectedGeneration: UUID) {
-        guard let context = capturedWriteContext(expectedGeneration: expectedGeneration),
-              let record = record(field: field), let document = record.document,
-              let queueTarget = queue.capturePlaylistImportTarget() else {
+    func addToQueue(record observedRecord: SavedPlaylistRecord, ownerGeneration expectedGeneration: UUID) {
+        guard let context = capturedWriteContext(observedRecord: observedRecord, expectedGeneration: expectedGeneration) else { return }
+        guard let document = observedRecord.document, let queueTarget = queue.capturePlaylistImportTarget() else {
             message = "This playlist or queue is not available for the original profile. Nothing changed."
             return
         }
-        let latestRegister = try? core.nativePlaylistRegisters(target: context.target)[field]
-        guard core.nativePlaylistTargetIsCurrent(context.target), latestRegister == record.register else {
+        let currentRegister = try? core.nativePlaylistRegisters(target: context.target)[observedRecord.field]
+        guard core.nativePlaylistTargetIsCurrent(context.target), currentRegister == observedRecord.register else {
             message = "This playlist changed. Refresh it before adding it to the queue."
             return
         }
@@ -355,23 +354,23 @@ final class SavedPlaylistStore: ObservableObject {
         message = "Added to the queue. Choose Play queue when you’re ready."
     }
 
-    func prepareRename(field: String, to rawName: String,
+    func prepareRename(record observedRecord: SavedPlaylistRecord, to rawName: String,
                        ownerGeneration expectedGeneration: UUID) -> SavedPlaylistWriteIntent? {
-        guard let context = capturedWriteContext(expectedGeneration: expectedGeneration),
-              let record = record(field: field), let document = record.document else { return nil }
+        guard let context = capturedWriteContext(observedRecord: observedRecord, expectedGeneration: expectedGeneration) else { return nil }
+        guard let document = observedRecord.document else { return nil }
         guard let name = Self.validName(rawName) else {
             message = "Enter a playlist name of up to 160 UTF-8 bytes."
             return nil
         }
         let replacement = VortxNativePlaylist.Document(id: document.id, name: name, entries: document.entries)
-        return makeWriteIntent(document: replacement, field: field, expectedRegister: record.register,
+        return makeWriteIntent(document: replacement, field: observedRecord.field, expectedRegister: observedRecord.register,
             operation: .save, context: context)
     }
 
-    func prepareReplaceFromCurrentQueue(field: String,
+    func prepareReplaceFromCurrentQueue(record observedRecord: SavedPlaylistRecord,
                                         ownerGeneration expectedGeneration: UUID) -> SavedPlaylistWriteIntent? {
-        guard let context = capturedWriteContext(expectedGeneration: expectedGeneration),
-              let record = record(field: field), let document = record.document,
+        guard let context = capturedWriteContext(observedRecord: observedRecord, expectedGeneration: expectedGeneration) else { return nil }
+        guard let document = observedRecord.document,
               let queueTarget = queue.capturePlaylistImportTarget(),
               let snapshot = queue.playlistSnapshot(for: queueTarget),
               context.target.profileID == ProfileStore.shared.activeID else {
@@ -382,15 +381,16 @@ final class SavedPlaylistStore: ObservableObject {
             id: document.id, name: document.name,
             entries: snapshot.candidates.map { .init(id: UUID(), candidate: $0) }
         )
-        return makeWriteIntent(document: replacement, field: field, expectedRegister: record.register,
+        return makeWriteIntent(document: replacement, field: observedRecord.field, expectedRegister: observedRecord.register,
             operation: .save, context: context)
     }
 
-    func prepareDelete(field: String, ownerGeneration expectedGeneration: UUID) -> SavedPlaylistWriteIntent? {
-        guard let context = capturedWriteContext(expectedGeneration: expectedGeneration),
-              let record = record(field: field), let document = record.document else { return nil }
+    func prepareDelete(record observedRecord: SavedPlaylistRecord,
+                       ownerGeneration expectedGeneration: UUID) -> SavedPlaylistWriteIntent? {
+        guard let context = capturedWriteContext(observedRecord: observedRecord, expectedGeneration: expectedGeneration) else { return nil }
+        guard let document = observedRecord.document else { return nil }
         return SavedPlaylistWriteIntent(target: context.target, receiptOwner: context.receiptOwner,
-            ownerGeneration: context.ownerGeneration, field: field, expectedRegister: record.register,
+            ownerGeneration: context.ownerGeneration, field: observedRecord.field, expectedRegister: observedRecord.register,
             document: document, value: .null, operation: .delete, retainedSourceDraft: nil)
     }
 
@@ -549,6 +549,19 @@ final class SavedPlaylistStore: ObservableObject {
             message = "The playlist could not be prepared. The current saved version is unchanged."
             return nil
         }
+    }
+
+    /// Detail gestures are valid only for the exact row snapshot shown when the view was opened.
+    /// A refreshed same-owner row is adopted only by an explicit reopen, never by an old detail action.
+    private func capturedWriteContext(observedRecord: SavedPlaylistRecord,
+                                      expectedGeneration: UUID)
+        -> (target: CoreBridge.NativePlaylistTarget, receiptOwner: NativePlaylistReceiptOwner, ownerGeneration: UUID)? {
+        guard let context = capturedWriteContext(expectedGeneration: expectedGeneration) else { return nil }
+        guard record(field: observedRecord.field, ownerGeneration: expectedGeneration) == observedRecord else {
+            message = "This playlist changed after it was opened. Refresh the library and reopen it before editing."
+            return nil
+        }
+        return context
     }
 
     private func targetForNewGesture() -> CoreBridge.NativePlaylistTarget? {

@@ -35,7 +35,7 @@ struct SavedPlaylistLibraryView: View {
                 ForEach(store.visibleRecords) { record in
                     NavigationLink {
                         if record.isEditable, let ownerGeneration = store.currentOwnerGeneration {
-                            SavedPlaylistDetailView(field: record.field, ownerGeneration: ownerGeneration)
+                            SavedPlaylistDetailView(record: record, ownerGeneration: ownerGeneration)
                         } else {
                             SavedPlaylistUnsupportedView()
                         }
@@ -103,17 +103,51 @@ struct SavedPlaylistLibraryView: View {
 }
 
 @MainActor
-struct SavedPlaylistDetailView: View {
-    let field: String
+private struct SavedPlaylistDetailOpening {
+    let record: SavedPlaylistRecord
     let ownerGeneration: UUID
+}
+
+@MainActor
+struct SavedPlaylistDetailView: View {
+    @State private var opening: SavedPlaylistDetailOpening
     @StateObject private var store = SavedPlaylistStore.shared
     @ObservedObject private var queue = PlaybackTitleQueue.shared
     @State private var editedName = ""
     @State private var confirmDelete = false
     @State private var receiptObservationToken: UUID?
+    @State private var pendingDeleteIntent: SavedPlaylistWriteIntent?
+    @State private var detailVisibilityGeneration = UUID()
 
-    private var record: SavedPlaylistRecord? { store.record(field: field, ownerGeneration: ownerGeneration) }
-    private var document: VortxNativePlaylist.Document? { record?.document }
+    private var observedRecord: SavedPlaylistRecord { opening.record }
+    private var ownerGeneration: UUID { opening.ownerGeneration }
+    private var document: VortxNativePlaylist.Document? { observedRecord.document }
+    private var observedRecordIsCurrent: Bool {
+        store.record(field: observedRecord.field, ownerGeneration: ownerGeneration) == observedRecord
+    }
+
+    init(record: SavedPlaylistRecord, ownerGeneration: UUID) {
+        _opening = State(initialValue: SavedPlaylistDetailOpening(record: record, ownerGeneration: ownerGeneration))
+        _editedName = State(initialValue: record.document?.name ?? "")
+    }
+
+    private var deleteConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { confirmDelete },
+            set: { isPresented in
+                confirmDelete = isPresented
+                if !isPresented { pendingDeleteIntent = nil }
+            }
+        )
+    }
+
+    private func performConfirmedDelete(_ intent: SavedPlaylistWriteIntent?,
+                                        visibilityGeneration: UUID) {
+        guard visibilityGeneration == detailVisibilityGeneration, let intent else { return }
+        pendingDeleteIntent = nil
+        confirmDelete = false
+        Task { await store.perform(intent) }
+    }
 
     var body: some View {
         Form {
@@ -125,34 +159,46 @@ struct SavedPlaylistDetailView: View {
                         .foregroundStyle(.secondary)
                     Button {
                         let value = editedName
-                        if let intent = store.prepareRename(field: field, to: value,
+                        if let intent = store.prepareRename(record: observedRecord, to: value,
                                                            ownerGeneration: ownerGeneration) {
                             Task { await store.perform(intent) }
                         }
                     } label: { Label("Save name", systemImage: "pencil") }
-                    .disabled(editedName == document.name || editedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!observedRecordIsCurrent || editedName == document.name
+                        || editedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Section("Cloud status") {
-                    Text(store.receiptLabel(store.receiptState(field: field, ownerGeneration: ownerGeneration)))
-                        .font(.callout).foregroundStyle(.secondary)
+                    if observedRecordIsCurrent {
+                        Text(store.receiptLabel(store.receiptState(field: observedRecord.field, ownerGeneration: ownerGeneration)))
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        Text("This playlist changed. Refresh the library and reopen it before editing.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                 }
                 Section("Queue") {
                     Button {
-                        store.addToQueue(field: field, ownerGeneration: ownerGeneration)
+                        store.addToQueue(record: observedRecord, ownerGeneration: ownerGeneration)
                     } label: { Label("Add all to queue", systemImage: "text.badge.plus") }
-                    .disabled(!queue.canEditQueue)
+                    .disabled(!observedRecordIsCurrent || !queue.canEditQueue)
                     Button {
                         if let intent = store.prepareReplaceFromCurrentQueue(
-                            field: field, ownerGeneration: ownerGeneration) {
+                            record: observedRecord, ownerGeneration: ownerGeneration) {
                             Task { await store.perform(intent) }
                         }
                     } label: { Label("Replace with current queue", systemImage: "arrow.triangle.2.circlepath") }
-                    .disabled(!queue.canUseQueue)
+                    .disabled(!observedRecordIsCurrent || !queue.canUseQueue)
                     Text("Queue changes are atomic and do not start playback.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
-                    Button("Delete playlist", role: .destructive) { confirmDelete = true }
+                    Button("Delete playlist", role: .destructive) {
+                        guard let intent = store.prepareDelete(record: observedRecord,
+                                                               ownerGeneration: ownerGeneration) else { return }
+                        pendingDeleteIntent = intent
+                        confirmDelete = true
+                    }
+                    .disabled(!observedRecordIsCurrent)
                 }
             } else {
                 Text("This saved playlist is no longer available in the current profile.")
@@ -160,25 +206,32 @@ struct SavedPlaylistDetailView: View {
             }
         }
         .navigationTitle(document?.name ?? "Saved playlist")
-        .confirmationDialog("Delete this playlist?", isPresented: $confirmDelete, titleVisibility: .visible) {
+        .confirmationDialog("Delete this playlist?", isPresented: deleteConfirmationBinding, titleVisibility: .visible) {
+            let intentAtPresentation = pendingDeleteIntent
+            let visibilityAtPresentation = detailVisibilityGeneration
             Button("Delete playlist", role: .destructive) {
-                if let intent = store.prepareDelete(field: field, ownerGeneration: ownerGeneration) {
-                    Task { await store.perform(intent) }
-                }
+                performConfirmedDelete(intentAtPresentation, visibilityGeneration: visibilityAtPresentation)
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) { pendingDeleteIntent = nil }
         } message: {
             Text("The playlist will be removed from this profile. Other devices will update after syncing.")
         }
         .onAppear {
-            editedName = document?.name ?? ""
-            receiptObservationToken = store.beginReceiptObservation(field: field, ownerGeneration: ownerGeneration)
+            detailVisibilityGeneration = UUID()
+            if observedRecordIsCurrent {
+                receiptObservationToken = store.beginReceiptObservation(field: observedRecord.field,
+                    ownerGeneration: ownerGeneration)
+            }
         }
         .onDisappear {
             if let receiptObservationToken {
-                store.endReceiptObservation(field: field, ownerGeneration: ownerGeneration, token: receiptObservationToken)
+                store.endReceiptObservation(field: observedRecord.field, ownerGeneration: ownerGeneration,
+                    token: receiptObservationToken)
             }
             receiptObservationToken = nil
+            detailVisibilityGeneration = UUID()
+            pendingDeleteIntent = nil
+            confirmDelete = false
         }
     }
 }
