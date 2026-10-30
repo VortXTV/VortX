@@ -86,7 +86,7 @@ struct SavedPlaylistLibraryView: View {
                     .disabled(store.isLoading)
             }
         }
-        .overlay(alignment: .bottom) {
+        .safeAreaInset(edge: .bottom) {
             if let message = store.message {
                 Text(message)
                     .font(.callout)

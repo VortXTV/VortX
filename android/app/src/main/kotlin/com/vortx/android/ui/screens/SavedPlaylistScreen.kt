@@ -5,7 +5,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -33,6 +34,11 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.player.queue.PlaybackQueueStore
@@ -184,6 +190,22 @@ internal fun SavedPlaylistScreen(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
             )
         },
+        bottomBar = {
+            if (ownerIsCurrent) {
+                statusMessage?.let { message ->
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(
+                            horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm,
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                    ) {
+                        Text(message, color = VortXTheme.colors.textSecondary,
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                        TextButton(onClick = { statusMessage = null }) { Text("Dismiss message") }
+                    }
+                }
+            }
+        },
     ) { padding ->
         if (!ownerIsCurrent) {
             Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge)) {
@@ -206,7 +228,6 @@ internal fun SavedPlaylistScreen(
                 onDelete = { deleteConfirmationTarget = detail },
                 onImport = { importToQueue(detail.handle) },
                 queueReady = queueState.ready && queueState.owner == owner,
-                statusMessage = statusMessage,
             )
             detail is SavedPlaylistDetail.ReadOnlyFuture -> Column(
                 Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge),
@@ -218,7 +239,6 @@ internal fun SavedPlaylistScreen(
             draft != null -> DraftDetail(
                 draft = draft,
                 scaffoldPadding = padding,
-                statusMessage = statusMessage,
                 onReload = {
                     store.requestReload()
                     statusMessage = "Saved playlists reloaded. Your unresolved edit was kept."
@@ -255,7 +275,6 @@ internal fun SavedPlaylistScreen(
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
             ) {
                 Text("This item is no longer available for the selected profile.")
-                statusMessage?.let { Text(it, color = VortXTheme.colors.textSecondary) }
             }
             catalog != null -> {
                 val renderedCatalog = requireNotNull(catalog)
@@ -268,7 +287,6 @@ internal fun SavedPlaylistScreen(
                 queueReady = queueState.ready && queueState.owner == owner,
                 queueCount = queueState.entries.size.takeIf { queueState.owner == owner },
                 loadError = loadError,
-                statusMessage = statusMessage,
                 statusText = ::statusText,
                 onRefresh = { store.requestReload() },
                 onSaveQueue = {
@@ -290,7 +308,6 @@ internal fun SavedPlaylistScreen(
                     selectedDraft = null
                     statusMessage = null
                 },
-                onClearMessage = { statusMessage = null },
                 )
             }
             loadError != null -> Column(
@@ -350,13 +367,11 @@ private fun PlaylistLibrary(
     queueReady: Boolean,
     queueCount: Int?,
     loadError: String?,
-    statusMessage: String?,
     statusText: (SavedPlaylistStatus) -> String,
     onRefresh: () -> Unit,
     onSaveQueue: () -> Unit,
     onOpen: (SavedPlaylistSummary) -> Unit,
     onOpenDraft: (SavedPlaylistDraftSummary) -> Unit,
-    onClearMessage: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(scaffoldPadding),
@@ -371,17 +386,16 @@ private fun PlaylistLibrary(
                 Button(onClick = onSaveQueue, enabled = queueReady && !newName.isBlank()) {
                     Text(if (queueCount == null) "Save current queue" else "Save current queue ($queueCount titles)")
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
                     TextButton(onClick = onRefresh) { Text("Refresh") }
                     if (loadError != null) Text(loadError, color = VortXTheme.colors.textSecondary)
                 }
-                statusMessage?.let { TextButton(onClick = onClearMessage) { Text(it) } }
             }
         }
         if (catalog.playlists.isEmpty()) item { Text("No saved playlists yet.", color = VortXTheme.colors.textSecondary) }
         items(catalog.playlists, key = { it.handle.field }) { summary ->
             Column(
-                modifier = Modifier.fillMaxWidth().clickable { onOpen(summary) }.padding(vertical = VortXTheme.spacing.sm),
+                modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open saved playlist") { onOpen(summary) }.padding(vertical = VortXTheme.spacing.sm),
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
             ) {
                 Text(summary.name, style = VortXTheme.type.cardTitle)
@@ -390,10 +404,10 @@ private fun PlaylistLibrary(
             }
         }
         drafts?.drafts?.takeIf { it.isNotEmpty() }?.let { rows ->
-            item { Text("Unresolved edits", style = VortXTheme.type.sectionTitle) }
+            item { Text("Unresolved edits", style = VortXTheme.type.sectionTitle, modifier = Modifier.semantics { heading() }) }
             items(rows, key = { "draft:${it.handle.editID}" }) { draft ->
                 Column(
-                    modifier = Modifier.fillMaxWidth().clickable { onOpenDraft(draft) }.padding(vertical = VortXTheme.spacing.sm),
+                    modifier = Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Open unresolved edit") { onOpenDraft(draft) }.padding(vertical = VortXTheme.spacing.sm),
                     verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
                 ) {
                     Text(draft.name, style = VortXTheme.type.cardTitle)
@@ -405,6 +419,7 @@ private fun PlaylistLibrary(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SupportedPlaylistDetail(
     detail: SavedPlaylistDetail.Supported,
@@ -417,7 +432,6 @@ private fun SupportedPlaylistDetail(
     onDelete: () -> Unit,
     onImport: () -> Unit,
     queueReady: Boolean,
-    statusMessage: String?,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(scaffoldPadding),
@@ -429,14 +443,17 @@ private fun SupportedPlaylistDetail(
                 Text("${detail.entries.size} titles · ${statusText(detail.status)}", color = VortXTheme.colors.textSecondary)
                 OutlinedTextField(value = editedName, onValueChange = onNameChange,
                     label = { Text("Playlist name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                    verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                ) {
                     Button(onClick = onRename, enabled = editedName.isNotBlank() && editedName != detail.name) { Text("Save name") }
                     TextButton(onClick = onReplace) { Text("Replace from queue") }
                     TextButton(onClick = onDelete) { Text("Delete") }
                 }
                 Button(onClick = onImport, enabled = queueReady) { Text("Add all to queue") }
                 Text("Adding titles changes the queue only. It does not start playback.", color = VortXTheme.colors.textSecondary)
-                statusMessage?.let { Text(it, color = VortXTheme.colors.textSecondary) }
             }
         }
         items(detail.entries, key = { it.entryID }) { entry ->
@@ -448,11 +465,11 @@ private fun SupportedPlaylistDetail(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DraftDetail(
     draft: SavedPlaylistDraftView,
     scaffoldPadding: PaddingValues,
-    statusMessage: String?,
     onReload: () -> Unit,
     onSaveCopy: () -> Unit,
     onDiscard: () -> Unit,
@@ -467,12 +484,15 @@ private fun DraftDetail(
                 Text(if (draft.stale) "This edit is retained from an earlier session." else "This edit has not been confirmed.")
                 Text("Reload checks the saved version and keeps your edit. Save as copy creates a separate playlist.",
                     color = VortXTheme.colors.textSecondary)
-                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                    verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                ) {
                     TextButton(onClick = onReload) { Text("Reload saved playlists") }
                     if (!draft.deleting) TextButton(onClick = onSaveCopy) { Text("Save as copy") }
                     TextButton(onClick = onDiscard) { Text("Discard edit") }
                 }
-                statusMessage?.let { Text(it, color = VortXTheme.colors.textSecondary) }
             }
         }
         items(draft.entries, key = { it.entryID }) { entry ->
