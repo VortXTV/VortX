@@ -2,8 +2,15 @@ package com.vortx.android.engine
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
@@ -11,6 +18,8 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.xperience.XperienceAddonBinding
+import com.vortx.android.xperience.XperienceCollections
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -569,4 +578,186 @@ class VortxNativeLiveJniTest {
             } finally { release.complete(Unit); runtime.retire() }
         }
     }
+
+    @Test fun `Xperience catalog request stays on original installed addon and owner`() = runBlocking {
+        assumeTrue("Requires reviewed native-sync JNI; resource transport is a local fixture", System.getenv("VORTX_JNI_SYNC") == "1")
+        load()
+        val fixtureURL = listOf("https://one.fixture.invalid/manifest.json", "https://two.fixture.invalid/manifest.json")
+        val calls = CopyOnWriteArrayList<List<String>>()
+        class RequestCancellation : VortxResourceCancellation {
+            val cancelCount = AtomicInteger()
+            @Volatile var releaseGate: CountDownLatch? = null
+            override fun cancel() {
+                cancelCount.incrementAndGet()
+                releaseGate?.countDown()
+            }
+            override fun close() = Unit
+        }
+        class Gate(val entered: CountDownLatch = CountDownLatch(1), val release: CountDownLatch = CountDownLatch(1)) {
+            @Volatile var cancellation: VortxResourceCancellation? = null
+        }
+        val nextGate = AtomicReference<Gate?>(null)
+        val activeGates = CopyOnWriteArrayList<Gate>()
+        val transport = object : VortxResourceTransport {
+            override fun makeCancellation() = RequestCancellation()
+            override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
+                val input = JSONObject(requestJson)
+                val request = input.getJSONObject("request")
+                val addons = input.getJSONArray("addons")
+                calls += (0 until addons.length()).map { addons.getJSONObject(it).getString("transportUrl") }
+                nextGate.getAndSet(null)?.let { gate ->
+                    val token = cancellation as RequestCancellation
+                    token.releaseGate = gate.release
+                    gate.cancellation = token
+                    activeGates += gate
+                    gate.entered.countDown()
+                    try { check(gate.release.await(5, TimeUnit.SECONDS)) { "Fixture transport timed out" } }
+                    finally { activeGates.remove(gate) }
+                }
+                val groups = JSONArray((0 until addons.length()).map { index ->
+                    JSONObject().put("addonId", addons.getJSONObject(index).getString("id"))
+                        .put("status", "ready").put("content", JSONObject().put("metas", JSONArray()))
+                })
+                return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId"))
+                    .put("generation", input.getLong("generation")).put("request", request).put("cancelled", false)
+                    .put("groups", groups).toString()
+            }
+        }
+        val directory = Files.createTempDirectory(File("build").toPath(), "xperience-catalog-request-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        val scope = VortxAccountScope("xperience-request-fixture", "owner")
+        try {
+            VortxNativeSession.open(scope, "Owner", bindings(), store, transport, allowNewAccount = true).use { session ->
+                val manifest = JSONObject().put("id", "org.example.catalogs").put("name", "Fixture catalogs")
+                    .put("version", "1.0.0").put("types", JSONArray().put("movie"))
+                    .put("resources", JSONArray().put("catalog"))
+                    .put("catalogs", JSONArray().put(JSONObject().put("type", "movie").put("id", "popular")
+                        .put("extra", JSONArray().put(JSONObject().put("name", "genre")))))
+                session.dispatch(fixtureURL.map { url -> JSONObject().put("type", "install_addon").put("profileId", "owner")
+                    .put("addon", JSONObject().put("transportUrl", url).put("manifest", manifest)
+                        .put("flags", JSONObject().put("official", false).put("protected", false))) })
+                val repository = NativeCatalogRepository { session }
+                val source = XperienceCollections.parse("""[{"id":"collection","title":"Collection","folders":[{"id":"folder","title":"Folder","sources":[{"provider":"addon","addonId":"org.example.catalogs","type":"movie","catalogId":"popular","url":"https://untrusted.fixture.invalid/manifest.json"}]}]}]""".toByteArray(Charsets.UTF_8))
+                    .collections.single().folders.single().sources.single()
+                val secondSource = XperienceCollections.parse("""[{"id":"collection-2","title":"Collection 2","folders":[{"id":"folder-2","title":"Folder 2","sources":[{"provider":"addon","addonId":"org.example.catalogs","type":"movie","catalogId":"popular","genre":"Drama","url":"https://also-untrusted.fixture.invalid/manifest.json"}]}]}]""".toByteArray(Charsets.UTF_8))
+                    .collections.single().folders.single().sources.single()
+                val original = session.read()
+                val consumerA = XperienceCatalogConsumerID.create()
+                val consumerB = XperienceCatalogConsumerID.create()
+                assertNotEquals(consumerA, consumerB)
+                val candidates = session.withCurrentRead { current -> repository.xperienceCandidates(session, current).candidates }
+                assertEquals(2, candidates.size)
+                val ambiguous = repository.requestXperienceCatalog(session, original, source, consumerA).getOrThrow()
+                assertTrue(ambiguous is XperienceCatalogRequestOutcome.Unresolved &&
+                    ambiguous.resolution is XperienceAddonBinding.Resolution.Ambiguous)
+                assertTrue(calls.isEmpty())
+
+                val selected = candidates.single { it.canonicalTransport == fixtureURL.first() }
+                val loaded = repository.requestXperienceCatalog(session, original, source, consumerA, selected.mapping).getOrThrow()
+                assertTrue(loaded is XperienceCatalogRequestOutcome.Loaded)
+                assertEquals(listOf(fixtureURL.first()), calls.single())
+                val loadedPage = (loaded as XperienceCatalogRequestOutcome.Loaded).response
+                assertEquals(VortxResourceRequest.Resource.CATALOG, loadedPage.request.resource)
+                assertEquals("movie", loadedPage.request.type)
+                assertEquals("popular", loadedPage.request.id)
+
+                // The latch wait is on the test thread; each request runs on a worker dispatcher.
+                // Cancelling consumer A must leave consumer B's same-source request and token intact.
+                val gateA = Gate()
+                nextGate.set(gateA)
+                val requestA = async(Dispatchers.IO) {
+                    repository.requestXperienceCatalog(session, original, source, consumerA, selected.mapping)
+                }
+                assertTrue(gateA.entered.await(5, TimeUnit.SECONDS))
+                val tokenA = requireNotNull(gateA.cancellation) as RequestCancellation
+                val gateB = Gate()
+                nextGate.set(gateB)
+                val requestB = async(Dispatchers.IO) {
+                    repository.requestXperienceCatalog(session, original, source, consumerB, selected.mapping)
+                }
+                assertTrue(gateB.entered.await(5, TimeUnit.SECONDS))
+                val tokenB = requireNotNull(gateB.cancellation) as RequestCancellation
+                requestA.cancel()
+                withTimeout(5_000) { requestA.join() }
+                assertTrue(requestA.isCancelled)
+                assertEquals(1, tokenA.cancelCount.get())
+                assertEquals(0L, gateA.release.count)
+                assertEquals(0, tokenB.cancelCount.get())
+                assertEquals(1L, gateB.release.count)
+                gateB.release.countDown()
+                assertTrue(withTimeout(5_000) { requestB.await() }.getOrThrow() is XperienceCatalogRequestOutcome.Loaded)
+
+                // A different source that resolves successfully under the same consumer ID replaces its prior load.
+                val replacedGate = Gate()
+                nextGate.set(replacedGate)
+                val replaced = async(Dispatchers.IO) {
+                    repository.requestXperienceCatalog(session, original, source, consumerA, selected.mapping)
+                }
+                assertTrue(replacedGate.entered.await(5, TimeUnit.SECONDS))
+                val replacedToken = requireNotNull(replacedGate.cancellation) as RequestCancellation
+                val replacementGate = Gate()
+                nextGate.set(replacementGate)
+                val replacement = async(Dispatchers.IO) {
+                    repository.requestXperienceCatalog(session, original, secondSource, consumerA, selected.mapping)
+                }
+                assertTrue(replacementGate.entered.await(5, TimeUnit.SECONDS))
+                val replacementToken = requireNotNull(replacementGate.cancellation) as RequestCancellation
+                assertEquals(1, replacedToken.cancelCount.get())
+                assertEquals(0L, replacedGate.release.count)
+                assertEquals(0, replacementToken.cancelCount.get())
+                replacementGate.release.countDown()
+                assertTrue(withTimeout(5_000) { replacement.await() }.getOrThrow() is XperienceCatalogRequestOutcome.Loaded)
+                assertTrue(withTimeout(5_000) { replaced.await() }.isFailure)
+
+                val ownerRaceGate = Gate()
+                nextGate.set(ownerRaceGate)
+                val ownerRace = async(Dispatchers.IO) {
+                    repository.requestXperienceCatalog(session, original, source, consumerA, selected.mapping)
+                }
+                assertTrue(ownerRaceGate.entered.await(5, TimeUnit.SECONDS))
+                val ownerRaceToken = requireNotNull(ownerRaceGate.cancellation) as RequestCancellation
+                val beforeDisable = session.read()
+                session.dispatch(listOf(JSONObject().put("type", "patch_profile").put("id", "owner")
+                    .put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons")
+                        .put("value", JSONArray().put(fixtureURL.first()))))), beforeDisable.owner)
+                assertTrue(withTimeout(5_000) { ownerRace.await() }.isFailure)
+                assertEquals(1, ownerRaceToken.cancelCount.get())
+                assertEquals(0L, ownerRaceGate.release.count)
+                val current = session.read()
+                val staleMap = repository.requestXperienceCatalog(session, current, source, consumerA, selected.mapping).getOrThrow()
+                assertTrue(staleMap is XperienceCatalogRequestOutcome.Unresolved &&
+                    staleMap.resolution == XperienceAddonBinding.Resolution.MappingUnavailable)
+                assertTrue(repository.requestXperienceCatalog(session, original, source, consumerA, selected.mapping).isFailure)
+                val secondMapping = candidates.single { it.canonicalTransport == fixtureURL.last() }.mapping
+                session.dispatch(listOf(JSONObject().put("type", "remove_addon").put("profileId", "owner")
+                    .put("transportUrl", fixtureURL.last())), current.owner)
+                val afterRemoval = session.read()
+                val missing = repository.requestXperienceCatalog(session, afterRemoval, source, consumerA, secondMapping).getOrThrow()
+                assertTrue(missing is XperienceCatalogRequestOutcome.Unresolved &&
+                    missing.resolution == XperienceAddonBinding.Resolution.MappingUnavailable)
+                val replacementURL = "https://replacement.fixture.invalid/manifest.json"
+                session.dispatch(listOf(JSONObject().put("type", "install_addon").put("profileId", "owner")
+                    .put("addon", JSONObject().put("transportUrl", replacementURL).put("manifest", manifest)
+                        .put("flags", JSONObject().put("official", false).put("protected", false)))), afterRemoval.owner)
+                val afterReplacement = session.read()
+                val driftedMap = repository.requestXperienceCatalog(session, afterReplacement, source, consumerA, secondMapping).getOrThrow()
+                assertTrue(driftedMap is XperienceCatalogRequestOutcome.Unresolved &&
+                    driftedMap.resolution == XperienceAddonBinding.Resolution.MappingUnavailable)
+                assertEquals(6, calls.size)
+
+                session.dispatch(listOf(JSONObject().put("type", "add_profile").put("id", "guest").put("name", "Guest")), afterReplacement.owner)
+                val beforeProfileSwitch = session.read()
+                session.dispatch(listOf(JSONObject().put("type", "switch_profile").put("id", "guest")), beforeProfileSwitch.owner)
+                assertTrue(repository.requestXperienceCatalog(session, beforeProfileSwitch, source, consumerA, secondMapping).isFailure)
+                assertEquals(6, calls.size)
+            }
+        } finally {
+            activeGates.forEach { it.release.countDown() }
+            nextGate.get()?.release?.countDown()
+            directory.listFiles()?.forEach { it.delete() }
+            directory.delete()
+        }
+    }
+
 }

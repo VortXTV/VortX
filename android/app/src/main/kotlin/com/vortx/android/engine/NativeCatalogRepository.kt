@@ -61,6 +61,27 @@ internal class XperienceInstalledCatalogSnapshot(
     val candidates: List<XperienceAddonBinding.Candidate> = candidates.toList()
 }
 
+/** A live guarded request result. A resolved candidate is paired only for this result; it does not
+ * create a reusable install, fetch, or profile-write capability. */
+internal sealed interface XperienceCatalogRequestOutcome {
+    data class Loaded(
+        val candidate: XperienceAddonBinding.Candidate,
+        val response: VortxResourceSnapshot,
+    ) : XperienceCatalogRequestOutcome
+
+    data class Unresolved(val resolution: XperienceAddonBinding.Resolution) : XperienceCatalogRequestOutcome
+}
+
+/** Opaque fixed-size identity for one long-lived catalog consumer. Reuse it across refreshes;
+ * distinct consumers must allocate distinct IDs. It contains no URL or source authority. */
+@JvmInline
+internal value class XperienceCatalogConsumerID private constructor(val slotToken: String) {
+    companion object {
+        fun create(): XperienceCatalogConsumerID =
+            XperienceCatalogConsumerID(java.util.UUID.randomUUID().toString())
+    }
+}
+
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
  * The authenticated host provides the session; absence/unavailable/migration required is an error.
  * VortX authentication and complete legacy bootstrap are admitted only by the captured account host.
@@ -377,6 +398,69 @@ internal class NativeCatalogRepository(
         descriptors: List<JSONObject>,
     ): XperienceInstalledCatalogSnapshot = projectXperienceCandidates(read, registry(read, descriptors))
 
+    /**
+     * Resolves and requests one imported Xperience source from the exact caller-owned Session/read.
+     * Candidate projection and configured addon pairing happen in one current-read admission. The
+     * request then uses the existing per-Session guarded resource bridge and re-admits the original
+     * owner before the response is returned. Collection URLs never enter this path.
+     * Only a RESOLVED call reaches session.load and can replace a prior request for this consumer.
+     * Missing/ambiguous results return before opening a slot, so the caller must cancel its prior
+     * coroutine and retain a selection-generation fence for every selection outcome.
+     */
+    internal suspend fun requestXperienceCatalog(
+        session: VortxNativeSession,
+        read: VortxNativeRead,
+        source: com.vortx.android.xperience.XperienceCollections.Source,
+        consumer: XperienceCatalogConsumerID,
+        mapping: XperienceAddonBinding.Mapping? = null,
+    ): Result<XperienceCatalogRequestOutcome> = attempt {
+        check(read.owner.scope == session.scope) { "Native owner changed" }
+        data class Prepared(
+            val read: VortxNativeRead,
+            val resolution: XperienceAddonBinding.Resolution,
+            val candidate: XperienceAddonBinding.Candidate? = null,
+            val addon: VortxResourceAddon? = null,
+            val request: VortxResourceRequest? = null,
+        )
+        val prepared = session.withCurrentRead { currentRead ->
+            check(currentRead.owner == read.owner) { "Native owner changed" }
+            val configured = registry(session, currentRead)
+            val snapshot = projectXperienceCandidates(currentRead, configured)
+            val resolution = XperienceAddonBinding.resolve(source, snapshot.candidates, mapping)
+            if (resolution !is XperienceAddonBinding.Resolution.Resolved) {
+                Prepared(currentRead, resolution)
+            } else {
+                // projectXperienceCandidates emits exactly one candidate per configured addon in
+                // order. Pair by object identity so normalized matching can never rebuild transport
+                // authority from imported source fields or select a same-name sibling.
+                val index = snapshot.candidates.indexOfFirst { it === resolution.candidate }
+                check(index in configured.indices) { "Installed addon snapshot changed" }
+                val type = requireNotNull(source.type)
+                val catalogId = requireNotNull(source.catalogId)
+                val extras = source.genre?.let { listOf("genre" to it) }.orEmpty()
+                Prepared(currentRead, resolution, resolution.candidate, configured[index],
+                    VortxResourceRequest(VortxResourceRequest.Resource.CATALOG, type, catalogId, extras))
+            }
+        }
+        if (prepared.resolution !is XperienceAddonBinding.Resolution.Resolved) {
+            return@attempt XperienceCatalogRequestOutcome.Unresolved(prepared.resolution)
+        }
+        val candidate = requireNotNull(prepared.candidate)
+        val addon = requireNotNull(prepared.addon)
+        val request = requireNotNull(prepared.request)
+        // Only a resolved load reaches this stable per-consumer slot. Independent consumers stay
+        // isolated even for the same source; unresolved outcomes above do not retire a prior slot.
+        val slot = "xperience:${consumer.slotToken}"
+        val response = session.load(slot, prepared.read.owner, listOf(request to listOf(addon))).single()
+        currentCoroutineContext().ensureActive()
+        requireSettled(response)
+        val admitted = policyPage(session, response, prepared.read, slot, listOf(response))
+        currentCoroutineContext().ensureActive()
+        session.publish(slot, prepared.read.owner, listOf(response)) {
+            XperienceCatalogRequestOutcome.Loaded(candidate, admitted)
+        }
+    }
+
     private fun projectXperienceCandidates(
         read: VortxNativeRead,
         addons: List<VortxResourceAddon>,
@@ -434,9 +518,22 @@ internal class NativeCatalogRepository(
     private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
                            completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
         if (!parental(read)) return page
+        // Keep the existing generic path's provider resampling behavior unchanged.
+        return policyPageUsing({ session() }, page, read, slot, completed, ticket)
+    }
+
+    /** Exact-session overload for operations that must not sample sessionProvider after suspension. */
+    private fun policyPage(session: VortxNativeSession, page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
+                           completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
+        if (!parental(read)) return page
+        return policyPageUsing({ session }, page, read, slot, completed, ticket)
+    }
+
+    private fun policyPageUsing(currentSession: () -> VortxNativeSession, page: VortxResourceSnapshot, read: VortxNativeRead,
+                                slot: String, completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
         // A completed load can be superseded while its caller parses. Policy evidence is itself
         // publication: fence the complete admission/revocation, including blocked/null outcomes.
-        return session().publish(slot, read.owner, completed, ticket) {
+        return currentSession().publish(slot, read.owner, completed, ticket) {
         val kind = when (page.request.resource) {
             VortxResourceRequest.Resource.CATALOG -> "catalog"
             VortxResourceRequest.Resource.META -> "meta"
@@ -454,7 +551,7 @@ internal class NativeCatalogRepository(
                 require(identities.distinct().size == identities.size) { "Ambiguous parental catalog identity" }
             }
             val response = if (kind == "meta" && raw.isNull("meta")) JSONObject().put("kind", kind).put("meta", JSONObject.NULL)
-            else session().resolve(JSONObject().put("kind", kind).also {
+            else currentSession().resolve(JSONObject().put("kind", kind).also {
                 if (kind == "catalog") it.put("metas", raw.getJSONArray("metas"))
                 else it.put("meta", raw.get("meta"))
             }, read.owner)
@@ -475,7 +572,7 @@ internal class NativeCatalogRepository(
             }
             val observed = if (kind == "meta") setOf(page.request.type to page.request.id) else
                 raw.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet()
-            session().owned(read.owner) { synchronized(this) {
+            currentSession().owned(read.owner) { synchronized(this) {
                 val prior = admittedResources?.takeIf { it.first == read.owner }?.second.orEmpty()
                 admittedResources = read.owner to (prior - observed + admitted).takeLastBounded(20_000)
                 detailCache.entries.removeAll { (identity, entry) -> entry.first == read.owner &&
