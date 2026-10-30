@@ -419,6 +419,9 @@ internal class VortxNativeSession private constructor(
     private val changes = MutableStateFlow(0L)
     val updates: StateFlow<Long> get() = changes
     private val playlistRevisions = MutableStateFlow(0L)
+    // Read-only receipt identity: profile changes, including an ABA, advance this epoch.
+    // Same-profile peer merges may invalidate mutation/resource revisions without replacing it.
+    private var playlistReceiptProfileEpoch = 0L
     /** Narrow invalidation for exact-target admission/revision loss and playlist projection changes. */
     internal val playlistUpdates: StateFlow<Long> get() = playlistRevisions
     /** Emit only after the changed projection or unavailable admission is already observable. */
@@ -427,6 +430,18 @@ internal class VortxNativeSession private constructor(
         if (checkpointUncertain) return
         checkpointUncertain = true
         signalPlaylistInvalidation()
+    }
+
+    @Synchronized internal fun receiptProfileEpoch(owner: VortxNativeOwner): Long {
+        requireCompleteAccountExportRoute()
+        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
+        return playlistReceiptProfileEpoch
+    }
+
+    @Synchronized internal fun <T> withPlaylistReceiptEpoch(owner: VortxNativeOwner, epoch: Long, action: () -> T): T {
+        requireCompleteAccountExportRoute()
+        check(owner.scope == scope && epoch == playlistReceiptProfileEpoch) { "Playlist receipt owner changed" }
+        return action()
     }
 
     private fun validatePresentation(snapshot: String): JSONObject = if (runtime.isTyped)
@@ -656,6 +671,13 @@ internal class VortxNativeSession private constructor(
         }
     }
 
+    /** Scalar-only exact captured-owner gate. Revision is advanced for profile/route invalidation. */
+    @Synchronized internal fun <T> withCompleteAccountExportOwnerScalar(owner: VortxNativeOwner, action: () -> T): T {
+        requireCompleteAccountExportRoute()
+        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
+        return action()
+    }
+
     /**
      * Captures one full presentation only after the scalar route/account checks pass. A generic JNI
      * runtime is rejected without decoding its state. The owner overload additionally rejects a
@@ -692,6 +714,7 @@ internal class VortxNativeSession private constructor(
         val oldRuntime = runtime
         val originalPlaybackState = originalPlaybackRead.state
         var changesPlaybackOwner = false
+        var changesReceiptProfile = false
         var next = ownerHistory
         var newOwner = false
         if (next == null) {
@@ -726,6 +749,7 @@ internal class VortxNativeSession private constructor(
             var projected: JSONObject? = null
             adapter.receive(account, authority, host.toString().toByteArray(Charsets.UTF_8), local = { bytes ->
                 val state = JSONObject(OHJson.utf8(bytes))
+                changesReceiptProfile = state.getString("activeProfileId") != originalPlaybackState.getString("activeProfileId")
                 val profiles = NativeHostPreferences.projectProfiles(host, hostProfilePreferences,
                     state.getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(profiles)
@@ -747,6 +771,7 @@ internal class VortxNativeSession private constructor(
                 }
             })
             if (newOwner) { runtime = adapter.view(); ownerHistory = adapter }
+            if (changesReceiptProfile) playlistReceiptProfileEpoch += 1
             hostProfilePreferences = requireNotNull(projected)
             nativeHostPreferenceState = host
             invalidate(); changes.value += 1
@@ -842,6 +867,7 @@ internal class VortxNativeSession private constructor(
             val playlistProfileChanged = profileChanged ||
                 preferences.toString() != hostProfilePreferences.toString() ||
                 state.getString("activeProfileId") != owner.profileID
+            if (state.getString("activeProfileId") != owner.profileID) playlistReceiptProfileEpoch += 1
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             nativeHostPreferenceState = applied.host
@@ -1063,6 +1089,7 @@ internal class VortxNativeSession private constructor(
                 !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
             val activeProfileChanged = state.getString("activeProfileId") != owner.profileID
+            if (activeProfileChanged) playlistReceiptProfileEpoch += 1
             val playlistProfileChanged = rosterChanged || hostChanged || activeProfileChanged
             val playlistFieldChanged = profileFieldChanges?.keys()?.asSequence()
                 ?.any { it.startsWith(NativePlaylist.PREFIX) } == true

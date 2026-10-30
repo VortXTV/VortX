@@ -206,6 +206,12 @@ internal object NativePlaylist {
     }
 
     /** Check the full observed register before NativeHostPreferences.equal performs raw CAS. */
+    internal fun canonicalReceiptRegister(raw: JSONObject): ByteArray? {
+        if (boundedRegisterValue(raw) == null) return null
+        val bytes = NativeWebsiteProfileEdits.canonical(raw).toByteArray(Charsets.UTF_8)
+        return bytes.takeIf { it.size <= 513 * 1024 }
+    }
+
     private fun boundedRegisterValue(raw: JSONObject): Any? {
         if (boundedJSONCost(raw, MAX_REGISTER_BYTES) == null || raw.keys().asSequence().toSet() != setOf("clock", "actor", "value")) return null
         val clock = raw.opt("clock") as? Number ?: return null

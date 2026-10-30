@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -84,19 +85,32 @@ internal class NativeAccountCoordinator(
         val installation: Mounted,
         val admission: (() -> Boolean) -> Boolean,
         val lifetime: PlaylistLifetime,
+        override val receiptOwner: CapturedReceiptOwner,
     ) : NativePlaylistProfileGateway.Target {
         override val accountId get() = account.id
         override val profileId get() = owner.profileID
     }
+    private class CapturedReceiptOwner(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val profileEpoch: Long,
+        val lifetime: PlaylistLifetime = PlaylistLifetime(),
+    ) : NativePlaylistProfileGateway.ReceiptOwner
     private class CapturedPlaylistSnapshot(
         override val target: CapturedPlaylistTarget,
         rawRegisters: JSONObject,
+        override val receipt: NativePlaylistCloudReceiptLedger.Ticket? = null,
     ) : NativePlaylistProfileGateway.Snapshot {
         private val acceptedRegisters = JSONObject(rawRegisters.toString())
         override val registers get() = JSONObject(acceptedRegisters.toString())
         fun matches(fields: JSONObject) = NativeHostPreferences.equal(acceptedRegisters, fields)
     }
     private data class DetachedPlaylistEdit(val field: String, val expectedRegister: JSONObject?, val value: Any)
+    private val playlistReceipts = NativePlaylistCloudReceiptLedger()
+    override val playlistReceiptChanges = MutableStateFlow(0L)
 
     val changes = MutableStateFlow(0L)
     private val playlistMountRevisions = MutableStateFlow(0L)
@@ -442,8 +456,10 @@ internal class NativeAccountCoordinator(
             "Native playlist account admission unavailable"
         }
         installation.session.withCompleteAccountExportRead { read ->
+            val receiptOwner = CapturedReceiptOwner(installation.account, installation.session, read.owner,
+                installation, admission, installation.session.receiptProfileEpoch(read.owner))
             val target = CapturedPlaylistTarget(installation.account, installation.session, read.owner,
-                installation, admission, PlaylistLifetime())
+                installation, admission, PlaylistLifetime(), receiptOwner)
             withAdmittedPlaylistTarget(target, read) { playlistSnapshot(target, it) }
         }
     }
@@ -471,6 +487,77 @@ internal class NativeAccountCoordinator(
     override fun retirePlaylistTarget(target: NativePlaylistProfileGateway.Target) {
         (target as? CapturedPlaylistTarget)?.lifetime?.revoke()
     }
+    override fun retirePlaylistReceiptOwner(owner: NativePlaylistProfileGateway.ReceiptOwner) {
+        (owner as? CapturedReceiptOwner)?.let {
+            it.lifetime.revoke(); playlistReceipts.retire(it); playlistReceiptChanges.update { value -> value + 1 }
+        }
+    }
+
+    private fun <T> withReceiptOwner(target: CapturedReceiptOwner, action: () -> T): T =
+        target.session.withPlaylistReceiptEpoch(target.owner, target.profileEpoch) {
+            var result: Result<T>? = null
+            check(target.admission {
+                if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                    if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                        result = runCatching(action); true
+                    }
+                }
+            }) { "Native playlist target changed" }
+            requireNotNull(result).getOrThrow()
+        }
+
+    override fun playlistReceiptState(owner: NativePlaylistProfileGateway.ReceiptOwner,
+        ticket: NativePlaylistCloudReceiptLedger.Ticket,
+        current: NativePlaylistCloudReceiptLedger.Fingerprint): NativePlaylistCloudReceiptLedger.State {
+        val captured = owner as? CapturedReceiptOwner ?: return NativePlaylistCloudReceiptLedger.State.Unknown
+        return runCatching { withReceiptOwner(captured) { playlistReceipts.state(captured, ticket, current) } }
+            .getOrDefault(NativePlaylistCloudReceiptLedger.State.Unknown)
+    }
+
+    override fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any? =
+        playlistReceipts.freeze().filter { (playlistReceipts.owner(it) as? CapturedReceiptOwner)?.account == account }
+
+    override fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?,
+        acceptedCandidate: String, version: Long) {
+        if (acceptedCandidate.length > 7 * 1024 * 1024 || version < 0) return
+        val entries = (frozen as? List<*>)?.filterIsInstance<NativePlaylistCloudReceiptLedger.Frozen>() ?: return
+        if (entries.size > 64) return
+        val host = runCatching { JSONObject(acceptedCandidate).getJSONObject("nativeHostPreferences") }.getOrNull() ?: return
+        val firstOwner = entries.firstNotNullOfOrNull { playlistReceipts.owner(it) as? CapturedReceiptOwner } ?: return
+        val scope = firstOwner.owner.scope
+        if (runCatching { NativeHostPreferences.validate(scope, host) }.isFailure) return
+        val profiles = host.getJSONObject("profiles")
+        val profileIndex = NativeHostPreferences.profileKeyIndex(profiles)
+        val groups = entries.mapNotNull { entry ->
+            (playlistReceipts.owner(entry) as? CapturedReceiptOwner)?.let { it to entry }
+        }.groupBy({ it.first }, { it.second })
+        for ((session, owners) in groups.entries.groupBy { it.key.session }) {
+            runCatching {
+                synchronized(session) {
+                    val read = session.read()
+                    val currentFields = playlistFields(read, read.owner.profileID)
+                    for ((target, ownedEntries) in owners) {
+                        if (target.account != account || target.owner.scope != scope) continue
+                        runCatching { withReceiptOwner(target) {
+                            if (read.owner.profileID != target.owner.profileID) return@withReceiptOwner
+                            val profileKey = profileIndex[NativeHostPreferences.canonicalProfileID(target.owner.profileID)]
+                                ?: return@withReceiptOwner
+                            val acceptedFields = profiles.getJSONObject(profileKey).getJSONObject("fields")
+                            for (entry in ownedEntries) {
+                                val accepted = acceptedFields.optJSONObject(entry.field) ?: continue
+                                val current = currentFields.optJSONObject(entry.field) ?: continue
+                                val acceptedBytes = NativePlaylist.canonicalReceiptRegister(accepted) ?: continue
+                                val currentBytes = NativePlaylist.canonicalReceiptRegister(current) ?: continue
+                                if (java.security.MessageDigest.isEqual(acceptedBytes, currentBytes) &&
+                                    playlistReceipts.acknowledge(entry, acceptedBytes, version))
+                                    playlistReceiptChanges.update { value -> value + 1 }
+                            }
+                        } }
+                    }
+                }
+            }
+        }
+    }
 
     /** Validate before the first JSON serialization, then validate the detached immutable copy
      * again so a queued operation never observes later caller mutation. */
@@ -489,12 +576,15 @@ internal class NativeAccountCoordinator(
 
     override suspend fun compareAndSetPlaylistField(
         target: NativePlaylistProfileGateway.Target,
+        editId: String,
         field: String,
         expectedRegister: JSONObject?,
         value: Any,
     ): Result<NativePlaylistProfileGateway.Snapshot> {
         val captured = target as? CapturedPlaylistTarget
             ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
+        val edit = runCatching { UUID.fromString(editId).takeIf { it.toString() == editId } }.getOrNull()
+            ?: return Result.failure(IllegalArgumentException("Invalid playlist edit identity"))
         val prepared = playlistResult {
             withCapturedPlaylistTarget(captured) { read ->
                 detachPlaylistEdit(field, expectedRegister, value, playlistFields(read, captured.profileId))
@@ -522,13 +612,22 @@ internal class NativeAccountCoordinator(
                         })
                     val acceptedRead = captured.session.read()
                     check(acceptedRead.owner == captured.owner) { "Native playlist owner changed during commit" }
-                    val accepted = playlistSnapshot(captured, acceptedRead)
-                    val register = accepted.registers.optJSONObject(prepared.field)
+                    val acceptedFields = playlistFields(acceptedRead, captured.profileId)
+                    val register = acceptedFields.optJSONObject(prepared.field)
                         ?: error("Native playlist register was not acknowledged")
                     check(NativeHostPreferences.equal(register.opt("value"), prepared.value)) {
                         "Native playlist register readback did not match"
                     }
-                    accepted // Durable local register; cloud acceptance is a separate receipt.
+                    val receipt = runCatching { NativePlaylist.canonicalReceiptRegister(register)?.let {
+                        playlistReceipts.register(captured.receiptOwner, edit, prepared.field, it)
+                    } }.getOrNull()
+                    // The ordinary Session notification has already fired. Re-arm after registration
+                    // under this original admission so a fast earlier upload cannot miss this edit.
+                    if (receipt != null) {
+                        playlistReceiptChanges.update { value -> value + 1 }
+                        runCatching { onMutation(captured.account) }
+                    }
+                    CapturedPlaylistSnapshot(captured, acceptedFields, receipt)
                 }
             }
         }
@@ -575,10 +674,14 @@ internal class NativeAccountCoordinator(
     override fun retire() {
         pendingImport = null
         val old = synchronized(lifecycleLock) {
+            // Purge volatile register bytes before authority/retirement callbacks can expose the
+            // transition. Lifecycle -> ledger matches the captured admission lock order.
+            playlistReceipts.retire()
             onAuthorityChanged()
             if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
         }
+        playlistReceiptChanges.update { value -> value + 1 }
         if (old != null) playlistMountRevisions.value += 1
         changes.value += 1
         onRetired()

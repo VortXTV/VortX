@@ -2280,6 +2280,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private suspend fun nativeSyncUp(lease: SyncSessionLease, gateway: NativeAccountGateway): Boolean {
         if (gateway !== nativeGateway) return false
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
+        // Freeze identities before the first pull/PUT suspension; late local edits require a later upload.
+        val frozenPlaylistReceipts = gateway.freezePlaylistReceipts(account)
         var pushedStamps: Map<String, Double> = emptyMap()
         var pushedPreferences: JSONObject? = null
         var pushedProviders: JSONObject? = null
@@ -2399,7 +2401,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!publishIfSyncLeaseCurrent(lease) {
             if (receiptCurrent()) { clearPushedDirtySettings(pushedStamps); cleared = true }
         } || !cleared || !receiptCurrent()) return false
-        return acceptedVersion?.let { advanceVersion(lease, it, ::receiptCurrent) } == true
+        val version = acceptedVersion ?: return false
+        if (!advanceVersion(lease, version, ::receiptCurrent)) return false
+        if (receiptCurrent()) runCatching {
+            gateway.acceptPlaylistReceipts(account, frozenPlaylistReceipts, accepted.candidate.plaintext, version)
+        }
+        return receiptCurrent()
     }
 
     private fun applyLibraryTombstonesToVortx(vortx: JSONObject): JSONObject {

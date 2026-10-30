@@ -3,6 +3,7 @@ package com.vortx.android.sync
 import org.json.JSONObject
 import com.vortx.android.profile.UserProfile
 import kotlinx.coroutines.flow.Flow
+import com.vortx.android.engine.NativePlaylistCloudReceiptLedger
 import org.json.JSONArray
 
 internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: List<UserProfile>, val rosterModifiedSeconds: Double,
@@ -36,6 +37,10 @@ internal interface NativeAccountGateway {
     fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport?
     fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean = false
     fun acknowledgeHostPreferences(account: SessionOwnerSnapshot.Account, document: JSONObject): Boolean = false
+    /** Opaque frozen receipt IDs only; no credential or account document is retained here. */
+    fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any? = null
+    fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?,
+        acceptedCandidate: String, version: Long) {}
 }
 
 /**
@@ -47,20 +52,26 @@ internal interface NativeAccountGateway {
  * cannot recapture a newer account when an operation resumes.
  */
 internal interface NativePlaylistProfileGateway {
+    /** Read-only receipt scope, never mutation authority. */
+    interface ReceiptOwner
     /** Opaque original gesture authority. Display identities are not sufficient for admission. */
     interface Target {
         val accountId: String
         val profileId: String
+        val receiptOwner: ReceiptOwner
     }
 
     /** Detached raw playlist registers, including tombstones and bounded future versions. */
     interface Snapshot {
         val target: Target
         val registers: JSONObject
+        val receipt: NativePlaylistCloudReceiptLedger.Ticket? get() = null
     }
 
     /** Mount, profile, full host-merge and acknowledged playlist-register changes only. */
     val playlistChanges: Flow<Unit>
+    /** Data-free hint that cached receipt metadata may have changed. */
+    val playlistReceiptChanges: Flow<Long>
 
     /** Captures only an active signed-in account/profile with a full-account budgeted checkpoint. */
     fun capturePlaylistProfile(): Result<Snapshot>
@@ -76,6 +87,10 @@ internal interface NativePlaylistProfileGateway {
 
     /** Revokes only this captured consumer lifetime. Stored registers are never deleted. */
     fun retirePlaylistTarget(target: Target)
+    fun retirePlaylistReceiptOwner(owner: ReceiptOwner)
+
+    fun playlistReceiptState(owner: ReceiptOwner, ticket: NativePlaylistCloudReceiptLedger.Ticket,
+                             current: NativePlaylistCloudReceiptLedger.Fingerprint): NativePlaylistCloudReceiptLedger.State
 
     /**
      * Performs one mandatory playlist-domain admission and exact observed-register CAS, then
@@ -84,6 +99,7 @@ internal interface NativePlaylistProfileGateway {
      */
     suspend fun compareAndSetPlaylistField(
         target: Target,
+        editId: String,
         field: String,
         expectedRegister: JSONObject?,
         value: Any,

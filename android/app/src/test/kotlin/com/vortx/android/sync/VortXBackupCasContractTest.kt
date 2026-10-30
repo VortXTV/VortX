@@ -28,6 +28,13 @@ class VortXBackupCasContractTest {
         var document = JSONObject()
         var hostPreferences = JSONObject().put("globals", JSONObject().put("fields", JSONObject()))
         var beforePrepare: (() -> Unit)? = null
+        val pendingReceiptIds = mutableListOf("old")
+        val receiptResults = mutableListOf<Triple<List<String>, String, Long>>()
+        override fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any = pendingReceiptIds.toList()
+        override fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?, acceptedCandidate: String, version: Long) {
+            @Suppress("UNCHECKED_CAST")
+            receiptResults += Triple(frozen as List<String>, acceptedCandidate, version)
+        }
         override fun retire() { installation = Any() }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) = installation?.let { NativeAccountMountToken(it, 0) }
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) = isCurrent()
@@ -145,12 +152,40 @@ class VortXBackupCasContractTest {
         try {
             fixture.loseAcceptedResponse = true
             assertFalse(fixture.manager.syncUp()); assertEquals(0, fixture.gateway.acknowledgments)
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
             assertEquals(0L, fixture.manager.lastAppliedVersion())
             fixture.cloud.put("afterLostResponse", "keep"); fixture.revision = 42
             assertTrue(fixture.manager.syncUp())
             assertEquals(listOf(40L, 42L), fixture.bases); assertEquals(listOf(41L, 43L), fixture.versions)
             assertEquals("keep", fixture.cloud.getString("afterLostResponse"))
             assertEquals(1, fixture.gateway.acknowledgments)
+        } finally { fixture.close(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `receipt uses frozen identities and final accepted retry candidate`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val fixture = Fixture()
+        try {
+            fixture.beforePut = { if (it == 1) {
+                fixture.gateway.pendingReceiptIds += "late"
+                fixture.cloud.put("retryMarker", "winner")
+                fixture.revision = 41
+            } }
+            assertTrue(fixture.manager.syncUp())
+            val receipt = fixture.gateway.receiptResults.single()
+            assertEquals(listOf("old"), receipt.first)
+            assertEquals(42L, receipt.third)
+            assertEquals("winner", JSONObject(receipt.second).getString("retryMarker"))
+        } finally { fixture.close(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `malformed accepted response cannot issue receipt`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val fixture = Fixture()
+        try {
+            fixture.failPut = 200 to JSONObject().put("accepted", "true")
+            assertFalse(fixture.manager.syncUp())
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
         } finally { fixture.close(); Dispatchers.resetMain() }
     }
 
@@ -162,6 +197,7 @@ class VortXBackupCasContractTest {
             fixture.manager.requestSyncSoon()
             fixture.dispatcher.scheduler.advanceTimeBy(2_501); fixture.dispatcher.scheduler.runCurrent()
             assertEquals(1, fixture.puts); assertEquals(0, fixture.gateway.acknowledgments)
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
             assertEquals(0L, fixture.manager.lastAppliedVersion())
             assertEquals("Update VortX to keep syncing. Your changes are still on this device.", fixture.manager.syncProblem.value)
             assertTrue(fixture.context.getSharedPreferences("vortx_sync_state", android.content.Context.MODE_PRIVATE)
@@ -180,6 +216,7 @@ class VortXBackupCasContractTest {
                 fixture.beforePut = { if (reauthenticate) fixture.manager.replaceSyncSessionTestSeam(
                     VortXSyncManager.Session("replacement-token", fixture.account, fixture.key)) else fixture.gateway.retire() }
                 assertFalse(fixture.manager.syncUp()); assertEquals(0, fixture.gateway.acknowledgments)
+                assertTrue(fixture.gateway.receiptResults.isEmpty())
                 assertEquals(0L, fixture.manager.lastAppliedVersion())
             } finally { fixture.close() }
         }
