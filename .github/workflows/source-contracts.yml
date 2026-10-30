@@ -397,7 +397,7 @@ jobs:
           node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" "$renewal_status"
           test "$renewal_status" -eq 0
           node test/mpv-bounded-child.mjs check "$PWD/app/build/session-renewal-receipts/supervisor.json" 0 normal-exit
-      - name: Verify the current local-installer fixes
+      - name: Verify bootstrap, Library and diagnostic installer fixes
         shell: bash
         run: |
           set -euo pipefail
@@ -406,12 +406,12 @@ jobs:
           if ! git cat-file -e 82cc8387222469d36dfbb7fc09881c375e36de45^{commit}; then
             git -c gc.auto=0 fetch --no-tags --depth=1 origin 82cc8387222469d36dfbb7fc09881c375e36de45
           fi
-          for local_check in bootstrap library diagnostics oauth; do
+          # Real native OAuth runs under the protected real-SDK live-ABI parent before app builds.
+          for local_check in bootstrap library diagnostics; do
             case "$local_check" in
               bootstrap) local_command=(/bin/bash scripts/test-native-bootstrap-archive.sh) ;;
               library) local_command=(/bin/bash scripts/test-native-library-projection-perf.sh working-tree --functional-only) ;;
               diagnostics) local_command=(/usr/bin/env node scripts/test-pre-profile-diagnostic-export.mjs) ;;
-              oauth) local_command=(/bin/bash scripts/test-native-oauth-intents.sh) ;;
             esac
             local_status=0
             nice -n 15 node test/mpv-bounded-child.mjs run 600 "$PWD/app/build/local-installer-checks/$local_check.supervisor.json" -- \
@@ -434,7 +434,6 @@ jobs:
             app/build/native-migration-bootstrap.*/**
             app/build/native-library-projection.*/**
             app/build/pre-profile-diagnostic-export.*/**
-            app/build/native-oauth.*/**
             app/build/profile-picker-routing.*/**
             app/build/xperience-export-contracts.*/**
           if-no-files-found: warn

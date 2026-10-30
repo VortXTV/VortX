@@ -29,6 +29,10 @@ shasum -a 256 scripts/native-watched-swift-inputs.sh scripts/native-owner-histor
     test/xperience-harness-inputs.cjs scripts/extract-subtitle-proof-hosts.cjs \
     app/SourcesShared/CoreBridge.swift app/SourcesShared/Profiles.swift \
     app/SourcesShared/LegacyWatchOwnership.swift \
+    scripts/test-native-oauth-intents.sh app/SourcesShared/SIMKLAuth.swift app/SourcesShared/TraktAuth.swift \
+    app/SourcesShared/TraktScrobbleProgressPolicy.swift app/SourcesShared/VortXEdgeAuth.swift \
+    app/Tests/SIMKLSessionSecurityTests.swift app/Tests/TraktSessionSecurityTests.swift \
+    app/Tests/VortxNativeOAuthIntentTests.swift app/Tests/VortxNativeTraktIntentTests.swift \
     app/SourcesShared/ProfileDiscoveryPreferences.swift "$0" app/SourcesShared/VortXSyncManager.swift > "$native_live_dir/carrier-sources.sha256"
 node test/xperience-harness-inputs.cjs --owner-history-carriers "$native_live_dir"
 node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-shell "$native_live_dir/NativeSubtitleProofHosts.swift" > "$native_live_dir/native-subtitle-proof-hosts.json"
@@ -63,6 +67,14 @@ nice -n 15 xcrun swiftc -parse-as-library -swift-version 6 -strict-concurrency=c
     "${native_live_inputs[@]}" "$library" -o "$native_live_dir/live-abi"
 DYLD_LIBRARY_PATH="$(dirname "$library"):$(dirname "$library")/deps" \
     nice -n 15 "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints" "$native_live_dir/delay-meta"
+# OAuth consumes the same real engine only in this protected lane. Both unchanged native
+# entrypoints (including the seven Trakt decoded-body controls) must pass before acceptance.
+native_oauth_status=0
+VORTX_FFI_HEADER="$header" VORTX_FFI_LIBRARY="$library" \
+    bash scripts/test-native-oauth-intents.sh > "$native_live_dir/native-oauth.log" 2>&1 || native_oauth_status=$?
+printf '%s\n' "$native_oauth_status" > "$native_live_dir/native-oauth.status.txt"
+cat "$native_live_dir/native-oauth.log"
+test "$native_oauth_status" -eq 0
 shasum -a 256 --check "$native_live_dir/carrier-sources.sha256"
 test "$library_hash" = "$(shasum -a 256 "$library" | awk '{print $1}')"
 test "$header_hash" = "$(shasum -a 256 "$header" | awk '{print $1}')"
