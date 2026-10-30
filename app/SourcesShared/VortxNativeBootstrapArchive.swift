@@ -52,9 +52,12 @@ enum VortxNativeBootstrapArchive {
     ]
     /// Fresh authenticated capture only. Do not use this to rewrite an archived source. The caller
     /// supplies the strict-decoded object so binary64 provenance is not reparsed by Foundation.
+    /// One unreadable device preference is left out of the capture and logged as held, so it
+    /// cannot stop the whole account from loading. Credential and malformed checks still fail.
     static func credentialFreeDocument(_ source: [String: Any], diagnostics: ((String) -> Void)? = nil) throws -> Data {
         var exclusions: [String] = []
-        let value = try sanitize(source, path: "", exclusions: &exclusions, diagnostics: diagnostics, textContext: .legacyHost)
+        let value = try sanitize(source, path: "", exclusions: &exclusions, diagnostics: diagnostics, textContext: .legacyHost,
+                                 holdsUnreadablePreferences: true)
         return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
     }
     static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
@@ -187,6 +190,14 @@ enum VortxNativeBootstrapArchive {
         case seriesChoiceData, seriesChoices, seriesChoice, seriesAddonName
         case legacyHost, legacyVortx, legacyLibraryRows, legacyLibraryRow, libraryName
     }
+    /// Preferences that carry profiles, Library, add-ons (including ones keyed by an add-on
+    /// address) or watch history are never held: leaving one out could look like the viewer
+    /// removed that data.
+    private static func isProtectedPreference(_ key: String) -> Bool {
+        let name = key.lowercased()
+        return name.hasPrefix("http://") || name.hasPrefix("https://")
+            || ["profiles", "library", "addon", "manifest", "history", "watch"].contains(where: name.contains)
+    }
     private static func isSeriesChoicePreference(_ key: String) -> Bool {
         // SeriesSourceSticky.key writes only the active UUID, or the pre-roster default.
         // In particular, an undecodable quarantine copy is not an active Choice store.
@@ -228,6 +239,32 @@ enum VortxNativeBootstrapArchive {
               object["type"] is String, object["name"] is String else { return false }
         return true
     }
+    /// Titles and add-on names often lead with one or more tags: "[RD] [4K] Torrentio",
+    /// "[TB⚡] Comet", "[Oshi no Ko]: The Movie". Admit a run of short balanced tags with no
+    /// key/value, quoting, escape or nesting syntax, ended by whitespace, sentence punctuation
+    /// or the end of the text, and a remainder that is not itself a carrier. A tag that decodes
+    /// as JSON ([true], [123]) followed by more text is still a malformed container.
+    private static func hasTaggedDisplayTitle(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tagSyntax = CharacterSet(charactersIn: "[]{}\"'\\:=;<`").union(.controlCharacters)
+        var rest = Substring(trimmed)
+        var tags = 0
+        while let open = rest.first, open == "[" || open == "{" {
+            let close: Character = open == "[" ? "]" : "}"
+            guard let end = rest.firstIndex(of: close) else { return false }
+            let content = rest[rest.index(after: rest.startIndex)..<end]
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty, content.count <= 64,
+                  !content.unicodeScalars.contains(where: tagSyntax.contains) else { return false }
+            let tag = rest[...end]
+            rest = rest[rest.index(after: end)...]
+            guard let next = rest.first else { tags += 1; break }
+            guard next.isWhitespace || ":-.,!?)".contains(next),
+                  (try? decodeJSON(with: Data(tag.utf8), options: [.fragmentsAllowed])) == nil else { return false }
+            tags += 1
+            rest = rest.drop(while: \.isWhitespace)
+        }
+        return tags > 0 && !isCarrierRemainder(rest)
+    }
     private static func hasLiteralTaggedDisplayLabel(_ text: String) -> Bool {
         guard hasLiteralDisplayLabel(text) else { return false }
         // A title or add-on display name may have a literal tag. Do not let it conceal
@@ -235,6 +272,10 @@ enum VortxNativeBootstrapArchive {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let closing: Character = trimmed.first == "[" ? "]" : "}"
         guard let end = trimmed.firstIndex(of: closing) else { return false }
+        return !isCarrierRemainder(trimmed[trimmed.index(after: end)...])
+    }
+    /// Whether the text after a display tag is, or base64-decodes to, a JSON/plist/quoted carrier.
+    private static func isCarrierRemainder(_ remainder: Substring) -> Bool {
         let carrierPadding = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}"))
         func normalizedCarrierText(_ bytes: Data) -> String {
             let view = (try? jsonUTF8View(bytes)) ?? bytes
@@ -242,15 +283,15 @@ enum VortxNativeBootstrapArchive {
         }
         // Normalize the complete padding run before BOTH inspection and base64 decoding.
         // A BOM before encoded text must not make the decoder fail open after a safe sniff.
-        let suffix = normalizedCarrierText(Data(trimmed[trimmed.index(after: end)...].utf8))
+        let suffix = normalizedCarrierText(Data(remainder.utf8))
         func carrierPrefix(_ bytes: Data) -> Bool {
             let significant = normalizedCarrierText(bytes).unicodeScalars
             let prefix = String(String.UnicodeScalarView(significant.prefix(32)))
             return structuredPrefix(Data(prefix.utf8)) || prefix.hasPrefix("\"")
         }
-        guard !carrierPrefix(Data(suffix.utf8)) else { return false }
-        if let decoded = Data(base64Encoded: suffix), carrierPrefix(decoded) { return false }
-        return true
+        if carrierPrefix(Data(suffix.utf8)) { return true }
+        if let decoded = Data(base64Encoded: suffix), carrierPrefix(decoded) { return true }
+        return false
     }
     private static func isAddonDescriptor(_ object: [String: Any]) -> Bool {
         guard let transport = object["transportUrl"] as? String, let url = URLComponents(string: transport),
@@ -283,7 +324,8 @@ enum VortxNativeBootstrapArchive {
         return false
     }
     private static func sanitize(_ value: Any, path: String, exclusions: inout [String], depth: Int = 0,
-                                 diagnostics: ((String) -> Void)? = nil, textContext: TextContext = .ordinary) throws -> Any {
+                                 diagnostics: ((String) -> Void)? = nil, textContext: TextContext = .ordinary,
+                                 holdsUnreadablePreferences holding: Bool = false) throws -> Any {
         guard depth <= 64 else { throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .depthLimit) }
         // Typed SHA-256 evidence is hexadecimal, not a base64 JSON carrier. Some valid hashes
         // (for example e9...) decode to a leading brace plus arbitrary bytes under base64 probing.
@@ -306,7 +348,7 @@ enum VortxNativeBootstrapArchive {
                       let domain = try PropertyListSerialization.propertyList(from: bytes, options: [], format: nil) as? [String: Any]
                 else { throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .backupEnvelope) }
                 let safe = try sanitize(domain, path: path + "/payloadBase64", exclusions: &exclusions, depth: depth + 1,
-                                        diagnostics: diagnostics, textContext: .settingsDomain)
+                                        diagnostics: diagnostics, textContext: .settingsDomain, holdsUnreadablePreferences: holding)
                 guard let safe = safe as? [String: Any] else { throw rejected(.malformed, path: path, diagnostics: diagnostics) }
                 inspectedBackupPayload = try PropertyListSerialization.data(fromPropertyList: safe, format: .binary, options: 0).base64EncodedString()
                 object["payloadBase64"] = inspectedBackupPayload
@@ -337,7 +379,8 @@ enum VortxNativeBootstrapArchive {
                     // values, even alongside this identifier, still traverse the complete policy.
                     result[key] = websiteEventID
                 } else if key == "settings", let encoded = object[key] as? String {
-                    result[key] = try settings(encoded, path: child, exclusions: &exclusions, depth: depth + 1, diagnostics: diagnostics)
+                    result[key] = try settings(encoded, path: child, exclusions: &exclusions, depth: depth + 1, diagnostics: diagnostics,
+                                               holding: holding)
                 } else {
                     // Context is one-hop and content-typed, so the same descriptor remains valid in
                     // legacy material, native registers and retained independent-source archives.
@@ -369,8 +412,24 @@ enum VortxNativeBootstrapArchive {
                         context = key == "manifest" && addonDescriptor ? .addonManifest
                             : textContext == .addonManifest && ["name", "description"].contains(key) && object[key] is String ? .addonDisplayText : .ordinary
                     }
-                    result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions, depth: depth + 1,
-                                               diagnostics: diagnostics, textContext: context)
+                    guard holding, textContext == .settingsDomain, !isProtectedPreference(key) else {
+                        result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions, depth: depth + 1,
+                                                   diagnostics: diagnostics, textContext: context, holdsUnreadablePreferences: holding)
+                        continue
+                    }
+                    // Buffer this preference's diagnostics so a held value is logged once, as held.
+                    let prior = exclusions.count
+                    var lines: [String] = []
+                    do {
+                        result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions, depth: depth + 1,
+                                                   diagnostics: diagnostics.map { _ in { lines.append($0) } }, textContext: context)
+                    } catch Failure.opaquePreference {
+                        exclusions.removeSubrange(prior...)
+                        for line in lines { diagnostics?(line.replacingOccurrences(of: "result=failed", with: "result=held")) }
+                    } catch {
+                        for line in lines { diagnostics?(line) }
+                        throw error
+                    }
                 }
             }
             return result
@@ -386,7 +445,7 @@ enum VortxNativeBootstrapArchive {
                     context = .ordinary
                 }
                 return try sanitize($0.element, path: path + "/" + String($0.offset), exclusions: &exclusions, depth: depth + 1,
-                                    diagnostics: diagnostics, textContext: context)
+                                    diagnostics: diagnostics, textContext: context, holdsUnreadablePreferences: holding)
             }
         }
         if let data = value as? Data {
@@ -443,7 +502,8 @@ enum VortxNativeBootstrapArchive {
            !(textContext == .addonDisplayText && hasLiteralDisplayLabel(text)),
            !((textContext == .profileName || textContext == .profileAvatar) && (text == "[" || text == "{")),
            !(textContext == .profileName && hasLiteralDisplayLabel(text)),
-           !((textContext == .libraryName || textContext == .seriesAddonName) && hasLiteralTaggedDisplayLabel(text)) {
+           !((textContext == .libraryName || textContext == .seriesAddonName) && hasLiteralTaggedDisplayLabel(text)),
+           !([.libraryName, .seriesAddonName, .addonDisplayText].contains(textContext) && hasTaggedDisplayTitle(text)) {
             throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .plainTextPrefix)
         }
         guard value is String || value is NSNumber || value is NSNull || value is Date else { throw rejected(.malformed, path: path, diagnostics: diagnostics) }
@@ -687,13 +747,14 @@ enum VortxNativeBootstrapArchive {
         return nil
     }
     private static func settings(_ encoded: String, path: String, exclusions: inout [String], depth: Int,
-                                 diagnostics: ((String) -> Void)?) throws -> String {
+                                 diagnostics: ((String) -> Void)?, holding: Bool) throws -> String {
         guard let bytes = Data(base64Encoded: encoded),
               let envelope = try decodeJSON(with: bytes) as? [String: Any],
               envelope["format"] as? String == "vortx-backup"
         else { throw rejected(.opaquePreference, path: path, diagnostics: diagnostics, carrier: .settingsEnvelope) }
         try requireUnambiguousJSON(bytes)
-        let safeEnvelope = try sanitize(envelope, path: path, exclusions: &exclusions, depth: depth + 1, diagnostics: diagnostics)
+        let safeEnvelope = try sanitize(envelope, path: path, exclusions: &exclusions, depth: depth + 1, diagnostics: diagnostics,
+                                        holdsUnreadablePreferences: holding)
         return try JSONSerialization.data(withJSONObject: safeEnvelope, options: [.sortedKeys, .withoutEscapingSlashes]).base64EncodedString()
     }
 }

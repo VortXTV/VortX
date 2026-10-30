@@ -86,6 +86,8 @@ import CryptoKit
         catch { print("FAIL: literal library title blocked account preparation: \(error)"); exit(1) }
         do { try literalSeriesSourceAddonNames() }
         catch { print("FAIL: literal series source add-on name blocked account preparation: \(error)"); exit(1) }
+        do { try heldPreferencesAndTaggedTitles() }
+        catch { print("FAIL: tagged title or held preference blocked account preparation: \(error)"); exit(1) }
         let unchangedArchive = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.encode(document: data(["future": unchanged]))) as! [String: Any]
         check((unchangedArchive["hostDocument"] as! [String: String])["future"] == unchanged)
         let malformedBackup = try data(["format": "vortx-backup", "schema": 1, "payloadBase64": "opaque"]).base64EncodedString()
@@ -454,6 +456,22 @@ import CryptoKit
                 check(!messages[0].contains(hidden))
             }
         }
+        // An unreadable ordinary device preference is held: left out of the capture and logged
+        // as held, while the rest of the account loads. The archive writer still refuses it.
+        func held(_ input: Object, key: String) throws {
+            let before = try data(input)
+            var messages: [String] = []
+            let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(input, diagnostics: { messages.append($0) })
+            let values = try domain(try JSONSerialization.jsonObject(with: clean) as! Object)
+            check(values[key] == nil && values["fixture-date"] as? Date == Date(timeIntervalSince1970: 42))
+            check(try data(input) == before)
+            check(messages.count == 1 && messages[0].hasPrefix("archive_inspection result=held reason=opaque_preference"))
+            for hidden in [profileID, privateKey, "stremiox.profiles", "fixture-hidden", "bingeGroup"] {
+                check(!messages[0].contains(hidden))
+            }
+            do { _ = try VortxNativeBootstrapArchive.encode(document: before); preconditionFailure("Held preference was archived") }
+            catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        }
         let label = "[Kids] Family viewing"
         for malformed in [#"{'token':'fixture-hidden'}"#, #"{token=fixture-hidden;}"#, #"{"token":"unfinished"#,
                           #"[true] {"token":"fixture-hidden"}"#, "[[Kids]]", "[Kids]no separator",
@@ -473,8 +491,8 @@ import CryptoKit
         try refused(document(roster(["0": row(avatar: "[")])))
         try refused(document(roster([[row(avatar: "[")]])))
         try refused(document(roster([row(avatar: ["avatar": "["])])))
-        try refused(document(roster([row(avatar: "[")]), key: privateKey))
-        try refused(document(["stremiox.profiles": try roster([row(avatar: "[")])], key: privateKey))
+        try held(document(roster([row(avatar: "[")]), key: privateKey), key: privateKey)
+        try held(document(["stremiox.profiles": try roster([row(avatar: "[")])], key: privateKey), key: privateKey)
         // Only the real JSON Data preference carrier establishes the new role.
         let rawRoster = try roster([row(avatar: "[")])
         try refused(document(String(decoding: rawRoster, as: UTF8.self)))
@@ -587,8 +605,10 @@ import CryptoKit
             preconditionFailure("Unknown credential carrier was granted profile display semantics")
         } catch VortxNativeBootstrapArchive.Failure.ambiguousCredentialCarrier {}
         // Provider-authored opaque identities retain their existing fail-closed policy.
-        try refused(document(roster(["global": ["bingeGroup": label]]), key: "stremiox.sourcePins.fixture-profile"))
-        try refused(document(roster(["fixture-series": ["bingeGroup": label]]), key: "stremiox.seriesSourceSticky.fixture-profile"))
+        try held(document(roster(["global": ["bingeGroup": label]]), key: "stremiox.sourcePins.fixture-profile"),
+                 key: "stremiox.sourcePins.fixture-profile")
+        try held(document(roster(["fixture-series": ["bingeGroup": label]]), key: "stremiox.seriesSourceSticky.fixture-profile"),
+                 key: "stremiox.seriesSourceSticky.fixture-profile")
         let classified: [(String, Any, String, String)] = [
             ("stremiox.profiles", try roster([row(avatar: "[ ")]), "profile_roster", "/*/*/*"),
             ("stremiox.profiles.watch.fixture-private-owner", try roster(["fixture-private-series": ["poster": "["]]), "profile_watch", "/*/*/*"),
@@ -597,14 +617,16 @@ import CryptoKit
             ("vortx.owner.history.v1.fixture-private-owner", try roster([["v": "["]]), "owner_history", "/*/*/*"),
             ("vortx.forYou.local", try roster(["fixture-private-owner": ["fixture-private-field": "["]]), "for_you_local", "/*/*/*")
         ]
+        let holdable: Set<String> = ["source_pin", "series_source_choice", "for_you_local"]
         for (key, value, family, suffix) in classified {
             var messages: [String] = []
             do {
                 _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(value, key: key),
                                                                           diagnostics: { messages.append($0) })
-                preconditionFailure("Diagnostic fixture was unexpectedly accepted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-            check(messages == ["archive_inspection result=failed reason=opaque_preference field=/settings/payloadBase64" + suffix
+                check(holdable.contains(family))
+            } catch VortxNativeBootstrapArchive.Failure.opaquePreference { check(!holdable.contains(family)) }
+            let result = holdable.contains(family) ? "held" : "failed"
+            check(messages == ["archive_inspection result=" + result + " reason=opaque_preference field=/settings/payloadBase64" + suffix
                                + " carrier=plain_text_prefix preference_family=" + family])
             for hidden in [key, "fixture-private-owner", "fixture-private-series", "fixture-private-field", "bingeGroup"] {
                 check(!messages[0].contains(hidden))
@@ -946,6 +968,94 @@ import CryptoKit
         print("Issue #262: typed legacy library labels, exact archive retention and unchanged-source credential/malformed controls passed")
     }
 
+    static func heldPreferencesAndTaggedTitles() throws {
+        // Synthetic names in the shape of real titles and add-on names; no customer value.
+        typealias Object = [String: Any]
+        let titles = ["[RD] [4K] Torrentio", "[TB⚡] Comet", "[RD|4K] Torrentio", "[Oshi no Ko]: The Movie",
+                      "{AIO} [Debrid] Streams", "[REC] 2"]
+        let secret = #"{"token":"fixture-hidden"}"#
+        let carriers = ["[Community]no separator", "[[Community]]", "[true] trailing", "[null] trailing",
+                        "{token=fixture;}", "{'token':'fixture'}", "[private:token]", "[" + String(repeating: "x", count: 65) + "] Label"]
+        // Typed titles also inspect the text after the tags. (Add-on manifest text keeps its
+        // existing label-then-whitespace rule, so these three are checked on titles only.)
+        let remainderCarriers = ["[RD] " + secret, #"[RD] "quoted""#, "[RD] " + Data(secret.utf8).base64EncodedString()]
+        let preference = "stremiox.seriesSourceSticky.00000000-0000-0000-0000-00000000A11C"
+        func libraryHost(_ name: String) -> Object {
+            ["vortx": ["library": [["id": "tt-fixture-library", "type": "movie", "name": name]]]]
+        }
+        func addonHost(_ name: String) -> Object {
+            ["addons": [["transportUrl": "https://addon.example/manifest.json",
+                         "manifest": ["id": "fixture.community", "version": "1.0.0", "name": name, "description": "Fixture"]]]]
+        }
+        func settingsHost(_ domain: Object) throws -> Object {
+            let settings = try SettingsBackup.encode(domain: domain.merging(["future.preference": ["keep": "unchanged"]]) { value, _ in value },
+                                                     bundleID: "fixture.bundle", app: "Fixture", now: Date(timeIntervalSince1970: 10))
+            return ["settings": settings.base64EncodedString(), "futureHost": ["keep": true]]
+        }
+        func seriesHost(_ addon: String) throws -> Object {
+            try settingsHost([preference: data(["tt-fixture-series": ["addon": addon, "ts": 125.375]])])
+        }
+        func domain(_ clean: Data) throws -> Object {
+            let host = try JSONSerialization.jsonObject(with: clean) as! Object
+            check((host["futureHost"] as! [String: Bool])["keep"] == true)
+            let envelope = try JSONSerialization.jsonObject(with: Data(base64Encoded: host["settings"] as! String)!) as! Object
+            let values = try PropertyListSerialization.propertyList(from: Data(base64Encoded: envelope["payloadBase64"] as! String)!,
+                                                                    options: [], format: nil) as! Object
+            check((values["future.preference"] as! [String: String])["keep"] == "unchanged")
+            check(envelope["keyCount"] as? Int == values.count)
+            return values
+        }
+        func refused(_ document: Object, as expected: VortxNativeBootstrapArchive.Failure = .opaquePreference) throws {
+            for attempt in [{ _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document) },
+                            { _ = try VortxNativeBootstrapArchive.encode(document: data(document)) }] {
+                do { try attempt(); preconditionFailure("Carrier-shaped value was admitted") }
+                catch let failure as VortxNativeBootstrapArchive.Failure { check(failure == expected) }
+            }
+        }
+        for title in titles {
+            for host in [libraryHost(title), addonHost(title)] {
+                var messages: [String] = []
+                let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(host, diagnostics: { messages.append($0) })
+                check(messages.isEmpty)
+                check(NSDictionary(dictionary: try JSONSerialization.jsonObject(with: clean) as! Object).isEqual(to: host))
+                try VortxNativeBootstrapArchive.validate(VortxNativeBootstrapArchive.encode(document: data(host)))
+            }
+            var messages: [String] = []
+            let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(seriesHost(title), diagnostics: { messages.append($0) })
+            check(messages.isEmpty)
+            let rows = try JSONSerialization.jsonObject(with: domain(clean)[preference] as! Data) as! [String: [String: Any]]
+            check(rows["tt-fixture-series"]?["addon"] as? String == title)
+            try VortxNativeBootstrapArchive.validate(VortxNativeBootstrapArchive.encode(document: data(seriesHost(title))))
+        }
+        for carrier in carriers + remainderCarriers {
+            try refused(libraryHost(carrier))
+            if carriers.contains(carrier) { try refused(addonHost(carrier)) }
+            // A fresh capture holds the one unreadable device preference and keeps the rest of
+            // the account; the archive writer itself stays strict.
+            let host = try seriesHost(carrier)
+            var messages: [String] = []
+            let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(host, diagnostics: { messages.append($0) })
+            check(try domain(clean)[preference] == nil)
+            check(messages == ["archive_inspection result=held reason=opaque_preference field=/settings/payloadBase64/*/*/addon carrier=plain_text_prefix preference_family=series_source_choice"])
+            do { _ = try VortxNativeBootstrapArchive.encode(document: data(host)); preconditionFailure("Opaque preference was archived") }
+            catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        }
+        // Profiles, Library, add-ons and watch history are never held, and the credential
+        // fences still fail the capture even beside a holdable preference.
+        for key in ["stremiox.profiles", "stremiox.profiles.watch.fixture", "vortx.owner.history.v1.fixture",
+                    "stremiox.library.fixture", "vortx.sync.addonOwner.fixture"] {
+            do { _ = try VortxNativeBootstrapArchive.credentialFreeDocument(settingsHost([key: "{broken"])); preconditionFailure("Protected preference was held") }
+            catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        }
+        try refused(settingsHost([preference: "{broken", "future.other": ["fixtureSecret": "x"]]), as: .ambiguousCredentialCarrier)
+        var messages: [String] = []
+        let excluded = try VortxNativeBootstrapArchive.credentialFreeDocument(
+            settingsHost([preference: "{broken", "future.other": ["token": "fixture-hidden", "keep": true]]), diagnostics: { messages.append($0) })
+        let other = try domain(excluded)["future.other"] as! Object
+        check(other["token"] == nil && other["keep"] as? Bool == true && messages.count == 1)
+        print("Held preferences and tagged titles: real-shaped tags admitted, one unreadable device preference held, protected data and credential fences unchanged")
+    }
+
     static func literalSeriesSourceAddonNames() throws {
         // The attachment identifies the field/carrier, not the raw customer name.
         // These synthetic Choice-shaped values exercise the actual shipping inspector
@@ -1028,10 +1138,23 @@ import CryptoKit
         }
         func refused(_ source: Object) throws {
             let original = try data(source)
-            do {
-                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
-                preconditionFailure("Unrecognized or opaque series-choice carrier was admitted")
-            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            if source["settings"] != nil {
+                // A fresh capture holds the one unreadable device preference and keeps the rest;
+                // the archive writer still refuses it.
+                var messages: [String] = []
+                let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(source, diagnostics: { messages.append($0) })
+                check(messages.count == 1 && messages[0].hasPrefix("archive_inspection result=held reason=opaque_preference"))
+                let host = try JSONSerialization.jsonObject(with: clean) as! Object
+                check(Set(try domain(host).keys) == ["future.preference", "fixture.date"])
+                check((host["futureHost"] as! [String: Bool])["keep"] == true)
+                do { _ = try VortxNativeBootstrapArchive.encode(document: original); preconditionFailure("Opaque series-choice carrier was archived") }
+                catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            } else {
+                do {
+                    _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
+                    preconditionFailure("Unrecognized or opaque series-choice carrier was admitted")
+                } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            }
             check(try data(source) == original)
         }
         let raw = try data([series: choice(label)])
@@ -1104,11 +1227,9 @@ import CryptoKit
             check(try data(input) == original)
         }
         var messages: [String] = []
-        do {
-            _ = try VortxNativeBootstrapArchive.credentialFreeDocument(document(data([series: choice("[private:token]")])), diagnostics: { messages.append($0) })
-            preconditionFailure("Malformed add-on label was admitted")
-        } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
-        check(messages == ["archive_inspection result=failed reason=opaque_preference field=/settings/payloadBase64/*/*/addon carrier=plain_text_prefix preference_family=series_source_choice"])
+        let held = try VortxNativeBootstrapArchive.credentialFreeDocument(document(data([series: choice("[private:token]")])), diagnostics: { messages.append($0) })
+        check(try domain(try JSONSerialization.jsonObject(with: held) as! Object)[preference] == nil)
+        check(messages == ["archive_inspection result=held reason=opaque_preference field=/settings/payloadBase64/*/*/addon carrier=plain_text_prefix preference_family=series_source_choice"])
         print("Series-choice display names: typed preference admission, exact field retention, unchanged source and opaque/credential controls passed")
     }
 
