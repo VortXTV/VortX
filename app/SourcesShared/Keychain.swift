@@ -624,17 +624,11 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
             return operation()
         }
         guard let opened = openExclusiveLockFile() else { return .failure }
-        // The contextual function type disambiguates libc flock from Darwin.struct flock.
-        let fileLock: (Int32, Int32) -> Int32 = Darwin.flock
-        while fileLock(opened, LOCK_EX | LOCK_NB) != 0 {
-            if errno == EINTR { continue }
-            _ = Darwin.close(opened)
-            return .failure
-        }
+        // Opening the validated sidecar acquires its exclusive lock without waiting.
         depth = 1
         defer {
             depth = 0
-            _ = fileLock(opened, LOCK_UN)
+            // Closing this outer descriptor releases the lock, including on early failure.
             _ = Darwin.close(opened)
         }
         return operation()
@@ -667,17 +661,23 @@ final class KeychainFileMutationTransaction: @unchecked Sendable {
               (directoryStatus.st_mode & 0o077) == 0 else { return nil }
 
         let lockName = lockURL.lastPathComponent
-        let created = lockName.withCString {
-            Darwin.openat(directoryDescriptor, $0, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        let lockFlags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_EXLOCK
+        func openLock(_ flags: Int32) -> Int32 {
+            lockName.withCString { name in
+                var descriptor: Int32
+                repeat {
+                    descriptor = Darwin.openat(directoryDescriptor, name, flags, mode_t(0o600))
+                } while descriptor < 0 && errno == EINTR
+                return descriptor
+            }
         }
+        let created = openLock(lockFlags | O_CREAT | O_EXCL)
         let opened: Int32
         if created >= 0 {
             opened = created
         } else {
             guard errno == EEXIST else { return nil }
-            opened = lockName.withCString {
-                Darwin.openat(directoryDescriptor, $0, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
-            }
+            opened = openLock(lockFlags)
             guard opened >= 0 else { return nil }
         }
         if created >= 0, Darwin.fchmod(opened, mode_t(0o600)) != 0 {
