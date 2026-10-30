@@ -427,6 +427,46 @@ internal object XperienceImportNamespace {
 
     /** Whole-profile read cap keeps the retained Saved snapshots bounded across the batch. */
     fun readAll(fields: Map<String, ByteArray?>, retainedBudget: RetainedBudget = RetainedBudget()): List<Saved> {
+        val names = readNames(fields, retainedBudget)
+        return names.mapNotNull { field ->
+            val register = fields[field] ?: XperienceImportNamespace.invalid()
+            val namespace = parseField(field) ?: XperienceImportNamespace.invalid()
+            val capture = ValidatedRegister.capture(register, namespace, retainedBudget)
+            if (capture.valueIsNull) null else readCaptured(field, capture)
+        }
+    }
+
+    /** Per-field presentation status, never extra write authority or an absent-register witness. */
+    sealed interface Observation {
+        val field: String
+        data class Supported(val saved: Saved) : Observation { override val field: String get() = saved.field }
+        data class Tombstone(override val field: String) : Observation
+        data class ReadOnly(override val field: String, val reason: XperienceCollections.Failure) : Observation
+    }
+
+    /** Same WHOLE-family preflight and original raw capture as readAll. Unsupported siblings
+     * remain occupied/read-only without hiding valid Saved rows; resource denial stays global. */
+    fun readIsolated(fields: Map<String, ByteArray?>, retainedBudget: RetainedBudget = RetainedBudget()): List<Observation> {
+        val names = readNames(fields, retainedBudget)
+        // Additional result/status objects and references are charged under the existing limit.
+        retainedBudget.reserve(128L * names.size)
+        return names.map { field ->
+            try {
+                val register = fields[field] ?: XperienceImportNamespace.invalid()
+                val namespace = parseField(field) ?: XperienceImportNamespace.invalid()
+                val capture = ValidatedRegister.capture(register, namespace, retainedBudget)
+                if (capture.valueIsNull) Observation.Tombstone(field)
+                else Observation.Supported(readCaptured(field, capture))
+            } catch (rejected: XperienceCollections.Rejected) {
+                if (rejected.reason == XperienceCollections.Failure.TOO_LARGE) throw rejected
+                Observation.ReadOnly(field, rejected.reason)
+            }
+        }
+    }
+
+    /** Shared original preflight. callerInputBytes remains the COMPLETE family during every
+     * canonical pass; neither isolated presentation nor a caller can reset it to one record. */
+    private fun readNames(fields: Map<String, ByteArray?>, retainedBudget: RetainedBudget): List<String> {
         val names = ArrayList<String>()
         for (field in fields.keys) {
             if (!field.startsWith(PREFIX)) continue
@@ -442,12 +482,7 @@ internal object XperienceImportNamespace {
         }
         retainedBudget.setCallerInputBytes(totalBytes)
         retainedBudget.reserve(24L * names.size)
-        return names.mapNotNull { field ->
-            val register = fields[field] ?: XperienceImportNamespace.invalid()
-            val namespace = parseField(field) ?: XperienceImportNamespace.invalid()
-            val capture = ValidatedRegister.capture(register, namespace, retainedBudget)
-            if (capture.valueIsNull) null else readCaptured(field, capture)
-        }
+        return names
     }
 
     private fun envelope(document: XperienceCollections.Document, label: String, namespace: UUID,

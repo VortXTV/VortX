@@ -57,19 +57,19 @@
   },
   "namespaceSource": {
     "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt",
-    "sha256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061"
+    "sha256": "4858fb7ba8bfc0f8cdec92f00ff6eb56a2d5ec216d8546f11d4288a458a727cf"
   },
   "namespaceFixture": {
     "path": "test/xperience-wire-parity/NamespacePublicApiFixture.kt",
     "sha256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0"
   },
   "namespaceCheck": {
-    "packet": "android-xperience-namespace-source-v2",
+    "packet": "android-xperience-store-source-v4",
     "reviewState": "SOURCE_AND_FIXTURE_SECURITY_REVIEWED",
-    "frozenReceiptSHA256": "7557ed3bcd91d4df83466bf6ee7cf7026e9776f1b0f48810f847e47a66ad3e3d",
-    "namespaceReviewReceiptSHA256": "982ebd3b0c2860283d50571eea24813ce4ce005eaa4f24370fd7a9ccb2343efe",
-    "fixtureReviewReceiptSHA256": "8984a58a6aef7116ef0756a0eac8fa1afb8fb51db85705e65892d16a5683c95d",
-    "namespaceSourceSHA256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061",
+    "frozenReceiptSHA256": "a99b62d44ac58580087563488c42ceec46aef67f986dabfcd1e5f99111bdc25f",
+    "namespaceReviewReceiptSHA256": "b27cac29c120995ba32625d569eec9b29d621aa07cc6cd823b7e2e4dfe944568",
+    "fixtureReviewReceiptSHA256": "b27cac29c120995ba32625d569eec9b29d621aa07cc6cd823b7e2e4dfe944568",
+    "namespaceSourceSHA256": "4858fb7ba8bfc0f8cdec92f00ff6eb56a2d5ec216d8546f11d4288a458a727cf",
     "fixtureSourceSHA256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0",
     "mainClass": "com.vortx.android.xperience.NamespacePublicApiFixture",
     "caseIds": [
@@ -204,5 +204,43 @@
         "methods": 4
       }
     }
-  }
+  },
+  "namespaceEvolutionHistory": [
+    {
+      "previousCheck": {
+        "packet": "android-xperience-namespace-source-v2",
+        "reviewState": "SOURCE_AND_FIXTURE_SECURITY_REVIEWED",
+        "frozenReceiptSHA256": "7557ed3bcd91d4df83466bf6ee7cf7026e9776f1b0f48810f847e47a66ad3e3d",
+        "namespaceReviewReceiptSHA256": "982ebd3b0c2860283d50571eea24813ce4ce005eaa4f24370fd7a9ccb2343efe",
+        "fixtureReviewReceiptSHA256": "8984a58a6aef7116ef0756a0eac8fa1afb8fb51db85705e65892d16a5683c95d",
+        "namespaceSourceSHA256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061",
+        "fixtureSourceSHA256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0",
+        "mainClass": "com.vortx.android.xperience.NamespacePublicApiFixture",
+        "caseIds": [
+          "read-replace-unknown-raw",
+          "semantic-full-register-stale",
+          "detached-observation-bytes",
+          "duplicate-precision-invalid-shortcut",
+          "small-depth-unknown-cas",
+          "exact-integer-unknown-conservation",
+          "actual-canonical-expansion-quota",
+          "concurrent-original-observations",
+          "tombstone-namespace-future-format"
+        ],
+        "assertionMinimum": 9,
+        "assertionMaximum": 128,
+        "maximumInputBytes": 16384
+      },
+      "previousSourceSHA256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061",
+      "previousActualProof": {
+        "sourceCommit": "61d2664cd56227e904410e1e996fc13ded26712d",
+        "runId": 41018806840,
+        "attempt": 1,
+        "scope": "historical pure-source proof for previous inputs only"
+      },
+      "currentReviewScope": "Additive isolated reader and byte-conserved legacy readAll/preflight; unchanged nine-case fixture source/API composition reviewed. No old assertion or guard changed.",
+      "currentExecution": "UNRUN for changed Namespace; strict compilation/parity and separate Store controls remain required",
+      "newStoreControls": "14 authored standalone controls, not part of the retained nine-case fixture or prior hosted result"
+    }
+  ]
 }
