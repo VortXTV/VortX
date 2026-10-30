@@ -31,6 +31,8 @@ MARKER = "<!-- vortx-distribution: hosted-direct-beta -->"
 PROVENANCE = "VortX-Hosted-Direct-Beta-Provenance.json"
 SUMS = "SHA256SUMS.txt"
 TAG = "v0.5.6-beta.8"
+# The immutable candidate is built first; the public release tag is created only after acceptance.
+BUILD_TAG = "v0.5.6-beta.8-candidate.1"
 VERSION = "0.5.6"
 BUILD = "281"
 ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
@@ -473,7 +475,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
     require(repository.get("full_name") == head_repository.get("full_name") == REPO and
             head_repository.get("id") == repo_id and run.get("id") == run_id and
             run.get("run_attempt") == attempt and run.get("event") == "workflow_dispatch" and
-            run.get("head_sha") == source and run.get("head_branch") == tag and
+            run.get("head_sha") == source and run.get("head_branch") == BUILD_TAG and
             run.get("path") == workflow_meta.get("path") == f".github/workflows/{workflow}" and
             run.get("workflow_id") == workflow_meta.get("id") and
             run.get("status") == "completed" and run.get("conclusion") == "success",
@@ -498,7 +500,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
             0 < artifact["size_in_bytes"] <= MAX_ARCHIVE and
             re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", "")) and
             workflow_run.get("id") == run_id and workflow_run.get("head_sha") == source and
-            workflow_run.get("head_branch") == tag and workflow_run.get("repository_id") == repo_id and
+            workflow_run.get("head_branch") == BUILD_TAG and workflow_run.get("repository_id") == repo_id and
             workflow_run.get("head_repository_id") == repo_id, "artifact metadata is not the original run's output")
     log = work / f"{lane}.log"
     api_download(f"actions/jobs/{positive(job['id'])}/logs", log, 512 * 1024**2)
@@ -513,7 +515,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
     output = work / lane
     extract_exact(archive, artifact, names, output)
     public = {**pointer, "workflow": f".github/workflows/{workflow}", "workflowId": workflow_meta["id"],
-              "sourceCommit": source, "headBranch": tag, "event": "workflow_dispatch",
+              "sourceCommit": source, "headBranch": BUILD_TAG, "event": "workflow_dispatch",
               "workflowCommit": source, "environment": "engine-ci",
               "repositoryId": repo_id, "jobId": job["id"], "jobName": job_name,
               "requiredSuccessfulSteps": list(required), "artifactName": artifact_name,
@@ -546,7 +548,8 @@ def file_matrix(tag, version):
 
 
 def validate_dispatch(receipt, pointer, tag, source):
-    expected = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": f"refs/tags/{tag}",
+    expected_engine(tag)
+    expected = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": f"refs/tags/{BUILD_TAG}",
                 "sourceCommit": source, "workflowCommit": source, "runId": pointer["runId"],
                 "attempt": pointer["attempt"], "inputs": APPLE_INPUTS}
     require(canonical(receipt) == canonical(expected), "original typed Apple dispatch inputs differ")
@@ -626,6 +629,7 @@ def build_manifest(args, pointers, stable, helper, work):
     source = sha(args.source_commit, 40)
     build, tools = source_contract(args.repo_root, source, version, args.tag)
     check_tag(args.tag, source)
+    check_tag(BUILD_TAG, source)
     apple_names, apple_matrix = file_matrix(args.tag, version)
     apple_dir, apple_run = authenticate_build("apple", pointers["apple"], args.tag, source, apple_matrix, work)
     apple, apple_evidence = inspect_apple(apple_dir, pointers["apple"], args.tag, source, version, build, tools, helper)
@@ -635,7 +639,7 @@ def build_manifest(args, pointers, stable, helper, work):
         consumedFixtureSha256=tools["app/Tests/VortxNativeLiveABITests.swift"])
     records = sorted(apple, key=lambda pair: pair[1]["name"])
     manifest = {"schemaVersion": 1, "distribution": "hosted-direct-beta", "repository": REPO,
-                "releaseId": positive(args.release_id), "tag": args.tag, "sourceCommit": source,
+                "releaseId": positive(args.release_id), "tag": args.tag, "buildTag": BUILD_TAG, "sourceCommit": source,
                 "version": version, "build": build, "sourceFileSha256": tools,
                 "builds": {"apple": apple_run}, "evidence": {"apple": apple_evidence},
                 "requiredPublication": {"prerelease": True, "make_latest": "false", "platforms": ["apple"], "feedWrites": False},
@@ -746,6 +750,7 @@ def main():
         sums = "".join(f"{item['sha256']}  {item['name']}\n" for _, item in records).encode()
         require(stable_snapshot(args.tag, helper) == stable, "stable Latest/main/feeds/route snapshot changed")
         check_tag(args.tag, args.source_commit)
+        check_tag(BUILD_TAG, args.source_commit)
         current_release = api(f"releases/{args.release_id}")
         release_identity(current_release, args.release_id, args.tag, args.command != "verify-published", args.source_commit)
         if args.command == "prepare":
@@ -776,6 +781,7 @@ def main():
                 require(destination.stat().st_size == size and digest(destination) == expected_sha, "draft bytes differ")
         require(stable_snapshot(args.tag, helper) == stable, "stable routes changed during downloads")
         check_tag(args.tag, args.source_commit)
+        check_tag(BUILD_TAG, args.source_commit)
         final_release = api(f"releases/{args.release_id}")
         release_identity(final_release, args.release_id, args.tag, args.command != "verify-published", args.source_commit)
         require(provenance_binding(final_release["body"]) == expected_provenance, "release provenance binding changed")

@@ -50,7 +50,7 @@ class Beta8AppleHotfixControls(unittest.TestCase):
         self.assertEqual(V.tag_version(V.TAG), "0.5.6")
         self.assertEqual(V.expected_engine(V.TAG), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
         self.assertEqual(V.source_versions(project(), "0.5.6", V.TAG), "281")
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.9", "v0.5.6", V.TAG + " "):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.9", "v0.5.6", V.BUILD_TAG, V.TAG + " "):
             with self.assertRaises(ValueError): V.expected_engine(tag)
         with self.assertRaises(ValueError): V.source_versions(project("280"), "0.5.6", V.TAG)
 
@@ -61,10 +61,13 @@ class Beta8AppleHotfixControls(unittest.TestCase):
             with self.assertRaises(ValueError): V.source_versions(malformed, "0.5.6", V.TAG)
 
     def test_typed_dispatch_binds_original_normal_source_and_tag(self):
-        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + V.TAG,
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + V.BUILD_TAG,
                    "sourceCommit": SOURCE, "workflowCommit": SOURCE, "runId": 11, "attempt": 2,
                    "inputs": dict(V.APPLE_INPUTS)}
         V.validate_dispatch(receipt, POINTER, V.TAG, SOURCE)
+        self.assertNotEqual(V.BUILD_TAG, V.TAG)
+        wrong_release_ref = copy.deepcopy(receipt); wrong_release_ref["ref"] = "refs/tags/" + V.TAG
+        with self.assertRaises(ValueError): V.validate_dispatch(wrong_release_ref, POINTER, V.TAG, SOURCE)
         for field, value in (("native_only", "true"), ("recovery_source_commit", V.BASE_BETA7_SOURCE),
                              ("publish_release", True), ("mpvkit_artifacts_url", "https://override.invalid")):
             wrong = copy.deepcopy(receipt); wrong["inputs"][field] = value
@@ -86,11 +89,11 @@ class Beta8AppleHotfixControls(unittest.TestCase):
 
     def test_original_run_source_and_artifact_cannot_be_replaced(self):
         run = {"id": 11, "run_attempt": 2, "event": "workflow_dispatch", "head_sha": SOURCE,
-               "head_branch": V.TAG, "path": ".github/workflows/release-tvos.yml", "workflow_id": 44,
+               "head_branch": V.BUILD_TAG, "path": ".github/workflows/release-tvos.yml", "workflow_id": 44,
                "status": "completed", "conclusion": "success", "repository": {"full_name": V.REPO, "id": 55},
                "head_repository": {"full_name": V.REPO, "id": 55}}
         workflow = {"id": 44, "path": run["path"]}
-        for key, value in (("head_sha", "a" * 40), ("run_attempt", 1), ("head_branch", "main")):
+        for key, value in (("head_sha", "a" * 40), ("run_attempt", 1), ("head_branch", "main"), ("head_branch", V.TAG)):
             wrong = copy.deepcopy(run); wrong[key] = value
             with mock.patch.object(V, "api", side_effect=[wrong, workflow]), mock.patch.object(V, "api_download") as download:
                 with self.assertRaises(ValueError): V.authenticate_build("apple", POINTER, V.TAG, SOURCE, set(), Path("unused"))

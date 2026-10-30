@@ -31,7 +31,7 @@ picker = between(source, 'struct ProfilePickerView: View {',
                  '/// A bounded public Cinemeta')
 methods = '    private func pick(_ profile: UserProfile) {' + between(picker,
   '    private func pick(_ profile: UserProfile) {', "\n}\n")
-methods += '    private func focusDiagnosticRecovery() {' + between(picker,
+methods += "\n" + '    private func focusDiagnosticRecovery() {' + between(picker,
   '    private func focusDiagnosticRecovery() {', "\n    }\n") + "\n    }\n"
 preparing = '    private var profilesArePreparing: Bool {' + between(picker,
   '    private var profilesArePreparing: Bool {', "\n    }\n") + "\n    }"
