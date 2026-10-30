@@ -164,15 +164,83 @@ def installed_jdk(major, environment, run_dir):
     return {"major": major, "variable": variable, "home": str(home), "version": version[:2048], "files": files}
 
 
+def kotlin_layout_candidate(home):
+    library = home / "lib"
+    launcher = home / "bin/kotlinc"
+    report = {"home": str(home)[:1024], "library": str(library)[:1024], "compilerLauncher": str(launcher)[:1024],
+              "jarCount": 0, "jarCountComplete": True, "jarBytes": 0, "jarBytesComplete": True,
+              "directoryEntries": 0, "requiredPresent": [], "qualifies": False, "reasons": []}
+    jars = []
+    try:
+        if not library.is_dir():
+            report["reasons"].append("library-directory-missing")
+        else:
+            with os.scandir(library) as entries:
+                for entry in entries:
+                    report["directoryEntries"] += 1
+                    if report["directoryEntries"] > 256:
+                        report["reasons"].append("directory-entry-budget")
+                        report["jarCountComplete"] = False
+                        break
+                    if entry.name.endswith(".jar"):
+                        jars.append(Path(entry.path))
+                        if len(jars) > 96:
+                            report["reasons"].append("jar-count-budget")
+                            report["jarCountComplete"] = False
+                            break
+        jars.sort()
+        report["jarCount"] = len(jars)
+        if not 1 <= len(jars) <= 96:
+            report["reasons"].append("jar-count-budget")
+        for path in jars:
+            size = path.stat().st_size
+            report["jarBytes"] += size
+            if not path.is_file() or not 0 < size <= 128 * 1024 * 1024:
+                report["reasons"].append("jar-file-budget-or-type")
+        report["jarBytesComplete"] = report["jarCountComplete"]
+        if report["jarBytes"] > 512 * 1024 * 1024:
+            report["reasons"].append("jar-aggregate-budget")
+        required = {"kotlin-compiler.jar", "kotlin-stdlib.jar", "kotlin-reflect.jar"}
+        report["requiredPresent"] = sorted(required.intersection(path.name for path in jars))
+        if len(report["requiredPresent"]) != len(required):
+            report["reasons"].append("required-jars-missing")
+        if not launcher.is_file() or not 0 < launcher.stat().st_size <= 1024 * 1024:
+            report["reasons"].append("compiler-launcher-missing-or-budget")
+    except OSError as error:
+        report["reasons"].append("filesystem-error")
+        report["filesystemError"] = {"type": type(error).__name__, "errno": error.errno}
+        report["jarCount"] = len(jars)
+        report["jarCountComplete"] = False
+        report["jarBytesComplete"] = False
+    report["reasons"] = sorted(set(report["reasons"]))
+    report["qualifies"] = not report["reasons"]
+    return report, jars
+
+
 def installed_kotlin(environment):
     configured = shutil.which("kotlinc", path=environment.get("PATH"))
-    require(configured, "preinstalled Kotlin compiler unavailable")
-    launcher = Path(configured).resolve(strict=True)
-    require(launcher.name == "kotlinc" and launcher.parent.name == "bin", "unrecognized preinstalled Kotlin layout")
-    home = launcher.parent.parent
-    jars = sorted((home / "lib").glob("*.jar"))
-    require(1 <= len(jars) <= 96 and sum(path.stat().st_size for path in jars) <= 512 * 1024 * 1024, "preinstalled Kotlin library budget")
-    require({"kotlin-compiler.jar", "kotlin-stdlib.jar", "kotlin-reflect.jar"}.issubset({path.name for path in jars}), "preinstalled Kotlin compiler libraries missing")
+    discovery = {"originalLauncher": str(configured)[:1024] if configured else None,
+                 "resolvedLauncher": None, "candidates": []}
+    if not configured:
+        emit("kotlin-layout-discovery", discovery)
+        require(False, "preinstalled Kotlin compiler unavailable")
+    try:
+        launcher = Path(configured).resolve(strict=True)
+    except OSError as error:
+        discovery["launcherError"] = {"type": type(error).__name__, "errno": error.errno}
+        emit("kotlin-layout-discovery", discovery)
+        require(False, "preinstalled Kotlin launcher cannot be resolved")
+    discovery["resolvedLauncher"] = str(launcher)[:1024]
+    if launcher.name != "kotlinc" or launcher.parent.name != "bin":
+        emit("kotlin-layout-discovery", discovery)
+        require(False, "unrecognized preinstalled Kotlin layout")
+    prefix = launcher.parent.parent
+    candidates = [(home, *kotlin_layout_candidate(home)) for home in (prefix, prefix / "libexec")]
+    discovery["candidates"] = [report for _, report, _ in candidates]
+    emit("kotlin-layout-discovery", discovery)
+    valid = [(home, jars) for home, report, jars in candidates if report["qualifies"]]
+    require(len(valid) == 1, "preinstalled Kotlin layout requires exactly one complete bounded candidate")
+    home, jars = valid[0]
     files = {path.name: file_identity(path, 128 * 1024 * 1024) for path in jars}
     entries = [record["resolved"] for record in files.values()]
     require(all(entry and os.pathsep not in entry and not any(c in entry for c in ("\x00", "\n", "\r", "*")) for entry in entries),
@@ -180,7 +248,11 @@ def installed_kotlin(environment):
     require(len({entry.casefold() for entry in entries}) == len(entries), "duplicate resolved Kotlin classpath path")
     identities = [(Path(entry).stat().st_dev, Path(entry).stat().st_ino) for entry in entries]
     require(len(set(identities)) == len(entries), "duplicate physical Kotlin classpath jar")
-    return {"home": str(home), "launcher": file_identity(Path(configured), 1024 * 1024), "libraries": files,
+    original_identity = file_identity(Path(configured), 1024 * 1024)
+    compiler_identity = file_identity(home / "bin/kotlinc", 1024 * 1024)
+    return {"home": str(home), "launcher": original_identity, "compilerLauncher": compiler_identity,
+            "launcherDiffersFromCompilerLauncher": original_identity["resolved"] != compiler_identity["resolved"],
+            "layoutDiscovery": discovery, "libraries": files,
             "classpathEntries": entries, "classpath": os.pathsep.join(entries), "classpathSuffixPolicy": "lowercase .jar only"}
 
 
@@ -298,7 +370,7 @@ def main():
             and (run_dir / "OHJson.kt").read_bytes()[len(android_preamble):] == android_span, "declaration source equivalence failed")
     graph["compilerInputs"] = {name: digest(data) for name, data in generated.items()}
     graph["fixtureSources"] = {name: digest((fixture / name).read_bytes()) for name in
-                               ("SwiftFixture.swift", "KotlinFixture.kt", "run-hosted.py", "source-pins.json", "corpus.tsv")}
+                               ("SwiftFixture.swift", "KotlinFixture.kt", "run-hosted.py", "source-pins.json", "corpus.tsv", "test_toolchain_layout.py")}
     write_json(run_dir / "source-graph.json", graph)
     write_json(run_dir / "corpus-manifest.json", cases)
     emit("source-graph", graph)

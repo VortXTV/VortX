@@ -249,7 +249,7 @@ internal object XperienceCollections {
             out.toByteArray()
         }
         '[' -> OHJson.array((array(raw) ?: reject(Failure.INVALID_JSON)).map(::canonical))
-        '"' -> canonicalQuote(string(raw))
+        '"' -> canonicalQuote(string(raw) ?: reject(Failure.INVALID_JSON))
         't', 'f', 'n' -> trim(raw)
         else -> canonicalNumber(raw)
     }

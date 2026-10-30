@@ -31,6 +31,10 @@ jobs:
           submodules: false
           lfs: false
           clean: false
+      - name: Check bounded installed-tool layouts
+        env:
+          VORTX_HOSTED_LAYOUT_UNIT_TESTS: '1'
+        run: python3 -m unittest discover -s test/xperience-wire-parity -p test_toolchain_layout.py
       - name: Compare genuine document parsers and canonical bytes
         env:
           OMP_NUM_THREADS: '1'
