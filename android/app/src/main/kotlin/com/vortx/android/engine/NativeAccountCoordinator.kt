@@ -8,6 +8,7 @@ import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
 import com.vortx.android.sync.NativePlaylistProfileGateway
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.sync.LocalLibraryMutationAuthority
 import com.vortx.android.sync.VortXSyncDoc
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
@@ -48,6 +49,8 @@ internal class NativeAccountCoordinator(
     private val historyBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
     /** Read-only metadata admission, captured on IO. Never reused for a native mutation. */
     private val captureProfilePresentationAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = captureOwnAccountAdmission,
+    /** For You command identity includes auth/session/operation scope, independent of read stamps. */
+    private val captureForYouAccountAuthority: (SessionOwnerSnapshot.Account) -> LocalLibraryMutationAuthority? = { null },
 ) : NativeAccountGateway, NativePlaylistProfileGateway {
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
     private val mounted = AtomicReference<Mounted?>()
@@ -662,6 +665,28 @@ internal class NativeAccountCoordinator(
     /** Captures only a still-mounted identity; callers perform account authentication outside this lock. */
     internal fun accountFor(session: VortxNativeSession): SessionOwnerSnapshot.Account? = synchronized(lifecycleLock) {
         mounted.get()?.takeIf { it.session === session }?.account
+    }
+    internal class ForYouMutationAdmission(val identity: Any, private val admission: (() -> Boolean) -> Boolean) {
+        fun admit(action: () -> Boolean): Boolean = admission(action)
+    }
+
+    /** Capture under Session. Retain full account generation, exact mount and auth/session/operation scope. */
+    internal fun captureForYouMutationAdmission(session: VortxNativeSession): ForYouMutationAdmission {
+        check(Thread.holdsLock(session)) { "For You capture must hold Session" }
+        val current = checkNotNull(mounted.get()) { "Native account changed" }
+        check(current.session === session && accountCurrent(current.account)) { "Native account changed" }
+        val account = current.account
+        val authenticated = captureForYouAccountAuthority(account)
+        check(authenticated != null || ownCredentials == null) { "For You authentication unavailable" }
+        val identity = listOf(com.vortx.android.foryou.ForYouIdentityRef(current), account,
+            authenticated?.identity ?: com.vortx.android.foryou.ForYouIdentityRef(current))
+        return ForYouMutationAdmission(identity) { action ->
+            val mountedAction = {
+                synchronized(lifecycleLock) { if (mounted.get() === current) action() else false }
+            }
+            if (authenticated != null) authenticated.admit(mountedAction)
+            else accountCurrent(account) && mountedAction() // deterministic fixtures only
+        }
     }
     /**
      * Final reclaim fence. Deliberately contains no auth or session calls: writers enter in the

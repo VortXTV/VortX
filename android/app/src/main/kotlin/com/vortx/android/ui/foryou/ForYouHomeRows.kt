@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.vortx.android.R
-import com.vortx.android.foryou.ForYouInterests
+import com.vortx.android.foryou.ForYouEditSession
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -67,10 +67,10 @@ fun ForYouInvitePhone(onTune: () -> Unit) {
 
 /** Full-screen host for the interests picker. Back is "not now" on the first run, Cancel when editing. */
 @Composable
-fun ForYouPickerDialog(initial: ForYouInterests?, firstRun: Boolean, chip: ForYouChip, edge: Dp, onDismiss: () -> Unit) {
+fun ForYouPickerDialog(opening: ForYouEditSession, firstRun: Boolean, chip: ForYouChip, edge: Dp, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Box(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas).statusBarsPadding()) {
-            ForYouInterestsPicker(initial, firstRun, chip, edge, onDismiss)
+            ForYouInterestsPicker(opening, firstRun, chip, edge, onDismiss)
         }
     }
 }

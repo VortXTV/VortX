@@ -117,8 +117,8 @@ assert.doesNotMatch(publicationTail,/session\.(?:read|owned|withCurrentRead)|cap
 assert.match(publicationTail,/mounted\.get\(\) === current && changes\.value == epoch && session\.updates\.value == version/);
 const forYou=read('foryou/ForYouStore.kt');
 const forYouExtract=fixture('tests-extracted/ForYouReloadBoundary.kt');
-const forYouBody=forYou.slice(forYou.indexOf('class ForYouStore internal constructor('),forYou.indexOf('    suspend fun save(interests:')).replace('class ForYouStore internal constructor(','class ExtractedForYouStore internal constructor(');
-assert(forYouExtract.includes(forYouBody),'Entire actual ForYou reload class body must match');
+const forYouBody=forYou.slice(forYou.indexOf('class ForYouStore internal constructor('),forYou.indexOf('    companion object {\n        internal const val LOCAL_KEY'));
+assert(forYouExtract.includes(forYouBody),'Entire actual ForYou Store through native/local writes must match');
 assert(forYouExtract.includes(forYou.slice(forYou.indexOf('interface ForYouNativeGateway {'),forYou.indexOf('/**\n * The active profile'))),'Actual ForYou Snapshot and State must match');
 assert.match(forYou,/registerProfileSwitch \{ reload\(invalidate = true\) \}/);
 assert.match(forYou,/private suspend fun reload\([\s\S]*withContext\(ioDispatcher\)[\s\S]*reloadMutex\.withLock[\s\S]*currentCoroutineContext\(\)\.ensureActive\(\)/);
@@ -151,3 +151,13 @@ assert.match(read('sync/VortXSyncManager.kt'),/profileStore\.refreshNativeProjec
 assert.match(read('sync/VortXSyncManager.kt'),/val isSignedIn: Boolean get\(\) = session != null/);
 console.log('PASS metadata_only_main_effects_preserve_live_commands_and_background_dependent_capture_contracts');
 console.log('INFO source and scheduling collaborators only; no full Android/JNI/device crash proof');
+
+// The full write path above is actual source; the separate adapter fixture below is actual source too.
+assert.doesNotMatch(forYou, /suspend fun (?:save|delete)\(/, 'Unbound delayed Store write API must not return');
+assert.match(forYou, /fun prepare\(edit: ForYouEditSession/);
+assert.match(forYou, /origin\.epoch == authorityEpoch\.get\(\) && intent\.edit\.isActive\(\)/);
+assert.match(forYou, /native\.write\(checkNotNull\(origin\.owner\)/);
+assert.match(forYou, /localMutex\.withLock[\s\S]*origin\.localAuthority[\s\S]*intent\.observed\.matches/);
+assert.match(forYou, /if \(current\(\)\) reload\(\)/);
+assert.doesNotMatch(method(forYou,'    suspend fun execute('), /signedIn\(\)|activeProfileId\(\)|gateway\?\.write/);
+console.log('PASS actual_store_original_write_intent_and_one_field_local_merge_sources');

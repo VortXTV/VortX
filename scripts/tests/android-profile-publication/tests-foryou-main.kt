@@ -23,13 +23,14 @@ fun runForYouReloadBoundaryCases() = runBlocking {
                 if(captures.incrementAndGet()==1) {
                     entered.countDown();check(release.await(5,TimeUnit.SECONDS))
                 }
-                return Result.success(ForYouNativeGateway.Snapshot(selected,JSONObject(selected)) { action ->
+                return Result.success(ForYouNativeGateway.Snapshot(object:ForYouNativeGateway.Owner { override val profileId=selected; override val scopeIdentity=listOf(selected,version) },
+                    JSONObject().put(ForYouInterests.FIELD,JSONObject().put("value",ForYouInterests(genres=listOf(selected)).toJson()))) { action ->
                     if(selected==owner && version==epoch) { action();true } else false
                 })
             }
-            override suspend fun write(profileId:String,field:String,value:Any)=Result.success(Unit)
+            override suspend fun write(owner:ForYouNativeGateway.Owner,field:String,observed:ForYouObservedField,value:Any,isCurrent:()->Boolean)=Result.success(Unit)
         }
-        val store=ExtractedForYouStore(object:android.content.SharedPreferences {},
+        val store=ForYouStore(object:android.content.SharedPreferences {},
             activeProfileId={check(Thread.currentThread().name=="foryou-ui");active},signedIn={true},
             registerProfileSwitch={listener=it},scope=scope,mainDispatcher=ui,ioDispatcher=io)
         store.installNativeGateway(gateway)
@@ -43,7 +44,7 @@ fun runForYouReloadBoundaryCases() = runBlocking {
         check(captures.get()==1) { "Synchronous switch hook performed a native capture" }
         release.countDown()
         withTimeout(5000) { while(!store.state.value.ready) delay(5) }
-        check(store.state.value.profileId=="B" && store.state.value.interests?.marker=="B")
+        check(store.state.value.profileId=="B" && store.state.value.interests?.genres==listOf("B"))
         check(captures.get()==2) { "Superseded native reloads were not coalesced" }
         store.invalidateNativeAuthority()
         check(!store.state.value.ready && store.state.value.interests==null)

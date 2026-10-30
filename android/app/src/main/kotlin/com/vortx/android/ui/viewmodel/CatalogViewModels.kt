@@ -603,14 +603,8 @@ class HomeViewModel internal constructor(
         val enabled = state.ready && state.profileId?.equals(activeProfileId(), ignoreCase = true) == true &&
             ProfileStore.sharedOrNull()?.active?.isKids != true
         forYouRows?.refresh(state.profileId, state.interests, state.collections, forYouOwned, forYouWatched, enabled)
-        _forYouUi.value = com.vortx.android.foryou.ForYouUi(
-            enabled = enabled,
-            profileId = state.profileId,
-            interests = state.interests,
-            showInvite = enabled && (state.interests?.isEmpty ?: true) &&
-                railPreferences?.state?.value?.hidden?.contains(HomeRail.FOR_YOU) != true,
-            undecided = enabled && state.interests?.decided != true,
-        )
+        _forYouUi.value = com.vortx.android.foryou.forYouOpeningUi(state, enabled,
+            railPreferences?.state?.value?.hidden?.contains(HomeRail.FOR_YOU) == true)
     }
 
     private fun currentContinueWatchingPermit(): ContinueWatchingPermit {

@@ -117,6 +117,12 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
             } }
             gate
+        } }, captureForYouAccountAuthority = { captured -> syncManager?.let { manager ->
+            val authority = manager.captureLocalLibraryMutationAuthority() ?: return@let null
+            if (manager.sessionOwnerSnapshot() != captured) return@let null
+            com.vortx.android.sync.LocalLibraryMutationAuthority(authority.identity) { action -> authority.admit {
+                syncManager === manager && manager.sessionOwnerSnapshot() == captured && authority.admit(action)
+            } }
         } }, onAuthorityChanged = {
             com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
             com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority()

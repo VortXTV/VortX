@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -29,6 +30,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.vortx.android.R
+import com.vortx.android.foryou.ForYouEditSession
+import com.vortx.android.foryou.PreparedForYouWrite
 import com.vortx.android.foryou.ForYouEra
 import com.vortx.android.foryou.ForYouExtra
 import com.vortx.android.foryou.ForYouGenre
@@ -55,21 +58,26 @@ typealias ForYouChip = @Composable (label: String, selected: Boolean, onClick: (
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun ForYouInterestsPicker(initial: ForYouInterests?, firstRun: Boolean, chip: ForYouChip, edge: Dp, onFinish: () -> Unit) {
+fun ForYouInterestsPicker(opening: ForYouEditSession, firstRun: Boolean, chip: ForYouChip, edge: Dp, onFinish: () -> Unit) {
     val context = LocalContext.current
     val text = remember(context) { ForYouText(context) }
     val scope = rememberCoroutineScope()
-    var draft by remember { mutableStateOf(initial ?: ForYouInterests()) }
-    var saving by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
+    DisposableEffect(opening) { onDispose { opening.close() } }
+    var draft by remember(opening) { mutableStateOf(opening.state.interests ?: ForYouInterests()) }
+    var saving by remember(opening) { mutableStateOf(false) }
+    var error by remember(opening) { mutableStateOf<String?>(null) }
     val failed = stringResource(R.string.for_you_save_failed)
     fun save(value: ForYouInterests) {
         if (saving) return
+        val store = ForYouStore.shared(context)
+        val intent = store.prepare(opening, value.copy(decided = true)).getOrElse { error = failed; return }
         saving = true; error = null
         scope.launch {
-            val result = ForYouStore.shared(context).save(value.copy(decided = true))
-            saving = false
-            if (result.isSuccess) onFinish() else error = failed
+            val result = store.execute(intent)
+            if (opening.isActive()) {
+                saving = false
+                if (result.isSuccess) opening.finishIfActive(onFinish) else error = failed
+            }
         }
     }
     Column(
@@ -103,7 +111,7 @@ fun ForYouInterestsPicker(initial: ForYouInterests?, firstRun: Boolean, chip: Fo
         Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
             chip(stringResource(if (firstRun) R.string.for_you_done else R.string.for_you_save), true, { save(draft) }, null)
             chip(stringResource(if (firstRun) R.string.for_you_skip else R.string.for_you_cancel), false,
-                { if (firstRun) save(ForYouInterests()) else onFinish() }, null)
+                { if (firstRun) save(ForYouInterests()) else opening.finishIfActive(onFinish) }, null)
         }
     }
 }
@@ -155,6 +163,7 @@ fun ForYouPeoplePicker(people: List<ForYouPerson>, onChange: (List<ForYouPerson>
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SmartCollectionEditor(
+    opening: ForYouEditSession,
     existing: SmartCollection?,
     watched: Set<String>,
     chip: ForYouChip,
@@ -165,30 +174,33 @@ fun SmartCollectionEditor(
     val context = LocalContext.current
     val text = remember(context) { ForYouText(context) }
     val scope = rememberCoroutineScope()
-    var name by remember { mutableStateOf(existing?.name.orEmpty()) }
-    var rules by remember { mutableStateOf(existing?.rules ?: SmartCollectionRules()) }
-    var home by remember { mutableStateOf(existing?.home ?: true) }
-    var items by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var saving by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var confirmDelete by remember { mutableStateOf(false) }
+    DisposableEffect(opening) { onDispose { opening.close() } }
+    var name by remember(opening) { mutableStateOf(existing?.name.orEmpty()) }
+    var rules by remember(opening) { mutableStateOf(existing?.rules ?: SmartCollectionRules()) }
+    var home by remember(opening) { mutableStateOf(existing?.home ?: true) }
+    var items by remember(opening) { mutableStateOf<List<MetaItem>>(emptyList()) }
+    var loading by remember(opening) { mutableStateOf(true) }
+    var saving by remember(opening) { mutableStateOf(false) }
+    var error by remember(opening) { mutableStateOf<String?>(null) }
+    var deleteIntent by remember(opening) { mutableStateOf<PreparedForYouWrite?>(null) }
     val nameFirst = stringResource(R.string.smart_collections_name_first)
     val yearOrder = stringResource(R.string.smart_collections_year_order)
     val failed = stringResource(R.string.smart_collections_save_failed)
-    LaunchedEffect(rules) {
+    LaunchedEffect(opening, rules) {
         loading = true
         if (items.isNotEmpty()) delay(500) // debounce chip bursts; the first preview runs at once
         items = ForYouRowsModel.titles(rules)
         loading = false
     }
-    fun persist(operation: suspend () -> Result<Unit>) {
+    fun persist(intent: PreparedForYouWrite) {
         if (saving) return
         saving = true; error = null
         scope.launch {
-            val result = operation()
-            saving = false
-            if (result.isSuccess) onFinish() else error = failed
+            val result = ForYouStore.shared(context).execute(intent)
+            if (opening.isActive()) {
+                saving = false
+                if (result.isSuccess) opening.finishIfActive(onFinish) else error = failed
+            }
         }
     }
     val shown = if (rules.hideWatched) items.filterNot { it.id in watched } else items
@@ -270,14 +282,18 @@ fun SmartCollectionEditor(
                     else -> {
                         val collection = existing?.copy(name = trimmed, rules = rules, home = home)
                             ?: SmartCollection.make(trimmed, rules, home)
-                        persist { ForYouStore.shared(context).save(collection) }
+                        ForYouStore.shared(context).prepare(opening, collection).fold(::persist, { error = failed })
                     }
                 }
             }, null)
-            chip(stringResource(R.string.for_you_cancel), false, onFinish, null)
+            chip(stringResource(R.string.for_you_cancel), false, { opening.finishIfActive(onFinish) }, null)
             if (existing != null) {
-                chip(stringResource(if (confirmDelete) R.string.smart_collections_delete_confirm else R.string.smart_collections_delete), confirmDelete, {
-                    if (confirmDelete) persist { ForYouStore.shared(context).delete(existing) } else confirmDelete = true
+                chip(stringResource(if (deleteIntent != null) R.string.smart_collections_delete_confirm else R.string.smart_collections_delete), deleteIntent != null, {
+                    val confirmed = deleteIntent
+                    if (confirmed != null) persist(confirmed) else {
+                        // Freeze the target and register when confirmation opens, before async work.
+                        ForYouStore.shared(context).prepareDelete(opening, existing).fold({ deleteIntent = it }, { error = failed })
+                    }
                 }, null)
             }
         }
