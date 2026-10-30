@@ -32,7 +32,7 @@ require(!commit.isEmpty && !commit.contains("store.capture()") && commit.contain
 require(view.contains("confirmationDialog(\"Replace this saved import?\"") && model.contains("let replacement: XperienceSavedNamespace?"),
         "namespace replacement requires confirmation of staged inputs")
 require(model.contains("namespace.bindings[XperienceAddonBinding.key(for: source)]") &&
-        model.contains("installed: installed, mapping: mapping"), "browsing requires a saved exact installed-instance mapping")
+        model.contains("installed.resolve(source, mapping: mapping)"), "browsing requires a saved exact installed-instance mapping")
 require(view.contains("XperienceCatalogClient.load(source: request.source, candidate: request.candidate") &&
         view.contains("model.accepts(request.generation)"), "guarded catalog results are fenced before publication")
 for forbidden in ["URLSession", "installAddon(", "canonicalTransport", "transportDigest", "safeHost", "AsyncImage", "PosterImageLoader", "seedBackdrop:", "seedLogo:", "autoPlayOnAppear:"] {
@@ -90,8 +90,17 @@ require(view.contains(".accessibilityAddTraits(model.destination == \"append\" ?
         view.contains(".accessibilityAddTraits(row.selection == nil ? .isSelected : [])"),
         "destination and installed-instance choices expose their selected state")
 require(view.contains("Use this installed instance for \\(row.title)") &&
-        model.contains("Installed instance \\(index + 1)"),
+        model.contains("Installed instance \\(installed.displayOrdinal(at: index))"),
         "binding hints identify the safe source label while preserving ordinal instance labels")
+require(model.contains("installed.candidates.enumerated()") &&
+        model.contains("installed.resolve(entry.source, mapping: candidate.mapping)") &&
+        model.contains("installed.mappingMatches(mappings[entry.key], candidate: candidate)") &&
+        model.contains("installed.hasRejectedDescriptor(for: entry.source)"),
+        "every offered installed instance uses rejected-descriptor-aware admission and exact identity selection")
+require(model.contains("Choose a listed valid instance or repair your add-ons.") &&
+        view.contains("loadTask?.cancel(); loadTask = nil") &&
+        view.contains("loadRequestID == requestID"),
+        "unavailable projection has an actionable bounded message and retains original request cancellation fences")
 let routes = view.components(separatedBy: "@ViewBuilder private func destination").last?.components(separatedBy: "private func card").first ?? ""
 require(routes.components(separatedBy: ".macBackAffordance()").count == 5 &&
         view.contains("Return and reload.\")\n                    #if os(macOS)\n                    .macBackAffordance()"),

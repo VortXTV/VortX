@@ -7,7 +7,7 @@ import Foundation
     func captureXperienceExportEdit(_ collection: SmartCollection) throws -> CurationEditSession
     func xperienceExportEditIsCurrent(_ session: CurationEditSession) -> Bool
     func xperienceExportContextIsCurrent(_ session: CurationEditSession) -> Bool
-    func xperienceExportCandidates(_ session: CurationEditSession) throws -> [XperienceAddonBinding.Candidate]
+    func xperienceExportCandidates(_ session: CurationEditSession) throws -> XperienceInstalledCatalogs.Snapshot
     func saveXperienceExport(_ document: CurationDocument, session: CurationEditSession) async throws
     func retireXperienceExportEdit(_ session: CurationEditSession)
 }
@@ -23,7 +23,7 @@ import Foundation
         let ticket: Ticket
         let owner: CredentialScopeRegistry.Capture
         let session: CurationEditSession
-        let installed: [XperienceAddonBinding.Candidate]
+        let installed: XperienceInstalledCatalogs.Snapshot
         let previousCredential: XperienceExportCredentialVault.Record?
         let repair: XperienceExportCredentialVault.RepairTicket?
         let sourceID: String

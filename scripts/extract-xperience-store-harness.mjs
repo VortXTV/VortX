@@ -19,6 +19,8 @@ const persistence = 'app/SourcesShared/XperienceNativePersistence.swift';
 const declarations = 'import Foundation\n' + [
   section('app/SourcesShared/VortxResourceBridge.swift', 'indirect enum VortxJSON:', 'struct VortxResourceRequest:'),
   section('app/SourcesShared/VortxNativeRuntime.swift', 'enum VortxNativeError:', '/// Per-call locking plus one logical reservation'),
+  section('app/SourcesShared/VortxResourceBridge.swift', 'struct VortxResourceAddon: Codable, Sendable {', 'struct VortxResourceGroup: Decodable, Sendable {'),
+  section(persistence, 'enum XperienceInstalledCatalogs {', '/// Keeps secure provider bytes private and in memory.'),
   section(persistence, 'enum XperienceExactEvidence {', '/// Uses exactly the current JSONSerialization document serializer'),
   section(persistence, 'struct XperienceSavedNamespace:', '/// Only installed manifest descriptors become candidates.'),
   section('app/SourcesShared/VortxNativeHostPreferences.swift', 'extension VortxRawHostRegister {',

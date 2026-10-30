@@ -27,7 +27,83 @@ import CryptoKit
                     "catalogId": .string("synthetic/catalog"), "genre": .string("None")])])])])
         ])]))
     }
+    static func installedProjectionIsolation() throws {
+        let urlA = "https://catalog.example.invalid/a/manifest.json?token=one"
+        let urlB = "https://catalog.example.invalid/b/manifest.json?token=two"
+        let badURL = "https://catalog.example.invalid/a bad/manifest.json"
+        let catalog: VortxJSON = .array([.object(["type": .string("movie"), "id": .string("popular")])])
+        func descriptor(_ wire: String, _ id: String?, _ url: String, _ catalogs: VortxJSON? = nil) -> VortxResourceAddon {
+            var manifest: [String: VortxJSON] = ["futureInstalledField": .object(["keep": .integer(17)])]
+            if let id { manifest["id"] = .string(id) }
+            if let catalogs { manifest["catalogs"] = catalogs }
+            return .init(id: wire, transportUrl: url, manifest: .object(manifest))
+        }
+        func source(_ id: String) throws -> XperienceCollections.Source {
+            try XperienceCollections.project(.array([.object(["id": .string("collection"), "title": .string("Synthetic"),
+                "folders": .array([.object(["id": .string("folder"), "title": .string("Folder"),
+                    "sources": .array([.object(["provider": .string("addon"), "addonId": .string(id),
+                        "type": .string("movie"), "catalogId": .string("popular"),
+                        "url": .string("https://untrusted.example.invalid/manifest.json")])])])])])]))
+                .collections[0].folders[0].sources[0]
+        }
+        func resolved(_ snapshot: XperienceInstalledCatalogs.Snapshot, _ id: String,
+                      mapping: XperienceAddonBinding.Mapping? = nil) throws -> XperienceAddonBinding.Candidate {
+            guard case .resolved(let value) = snapshot.resolve(try source(id), mapping: mapping) else {
+                throw Failure.assertion("expected attributable installed source to resolve")
+            }
+            try check(Data(value.manifestID.utf8) == Data(id.utf8), "projection collapsed exact manifest identity")
+            return value
+        }
+        func unresolved(_ resolution: XperienceAddonBinding.Resolution) throws {
+            if case .resolved = resolution { throw Failure.assertion("rejected installed sibling became unique fallback") }
+        }
+        let validA = descriptor("opaque-a", "fixture.a", urlA, catalog)
+        let validB = descriptor("opaque-b", "fixture.b", urlB, catalog)
+        let control = try XperienceInstalledCatalogs.project([validA])
+        _ = try resolved(control, "fixture.a")
+        let raw = [descriptor("opaque-bad", "fixture.a", badURL, catalog), validB]
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let before = try raw.map { try encoder.encode($0) }
+        let isolated = try XperienceInstalledCatalogs.project(raw)
+        let paired = try resolved(isolated, "fixture.b")
+        try check(isolated.displayOrdinal(at: 0) == 2, "filtered picker label lost original installed position")
+        let endpoint = try XperienceAddonBinding.catalogURL(source: source("fixture.b"), candidate: paired)
+        try check(endpoint.absoluteString == "https://catalog.example.invalid/b/catalog/movie/popular.json?token=two",
+            "bad-before-good projection lost original configured request endpoint")
+        try check(before == raw.map { try encoder.encode($0) }, "projection rewrote original installed config")
+        let sameID = try XperienceInstalledCatalogs.project([descriptor("bad-same", "fixture.a", badURL, catalog), validA])
+        try unresolved(sameID.resolve(source("fixture.a")))
+        _ = try resolved(sameID, "fixture.a", mapping: sameID.candidates[0].mapping)
+        try check(sameID.resolve(source("fixture.a"), mapping: .init(manifestID: "fixture.a", transportDigest: String(repeating: "0", count: 64))) == .mappingUnavailable,
+            "stale explicit mapping adopted a surviving sibling")
+        let two = try XperienceInstalledCatalogs.project([validA, descriptor("second-a", "fixture.a", urlB, catalog)])
+        guard case .ambiguous = two.resolve(try source("fixture.a")) else { throw Failure.assertion("valid same-name ambiguity lost") }
+        let duplicate = try XperienceInstalledCatalogs.project([validA, descriptor("duplicate-a", "fixture.a", urlA, catalog)])
+        try check(duplicate.resolve(source("fixture.a"), mapping: duplicate.candidates[0].mapping) == .invalidRegistry,
+            "duplicate valid configured identity was silently de-duplicated")
+        try reject(.invalidRegistry) { _ = try XperienceInstalledCatalogs.project([descriptor("unknown", nil, urlA, catalog), validB]) }
+        try reject(.invalidRegistry) { _ = try XperienceInstalledCatalogs.project([descriptor("blank", " \t", urlA, catalog), validB]) }
+        let nfc = "caf\u{00e9}.addon", nfd = "cafe\u{0301}.addon"
+        try check(nfc == nfd && Data(nfc.utf8) != Data(nfd.utf8), "Unicode negative control is not byte-distinct")
+        let unicode = try XperienceInstalledCatalogs.project([descriptor("unicode-bad", nfc, badURL, catalog), descriptor("unicode-good", nfd, urlB, catalog)])
+        let unicodeCandidate = try resolved(unicode, nfd)
+        try check(!unicode.mappingMatches(.init(manifestID: nfc, transportDigest: unicodeCandidate.transportDigest), candidate: unicodeCandidate),
+            "UI mapping selection collapsed NFC/NFD manifest IDs")
+        try check(unicode.resolve(source(nfd), mapping: .init(manifestID: nfc, transportDigest: unicodeCandidate.transportDigest)) == .mappingUnavailable,
+            "UTF8-distinct mapping gained endpoint authority")
+        let noCatalog = try XperienceInstalledCatalogs.project([descriptor("stream-only", "fixture.a", urlB), validA])
+        _ = try resolved(noCatalog, "fixture.a")
+        let malformed = try XperienceInstalledCatalogs.project([descriptor("catalog-bad", "fixture.a", urlA, .string("malformed")), validB])
+        _ = try resolved(malformed, "fixture.b")
+        // Identity-only empty-catalog admission supplies no endpoint. Its known collision
+        // must veto a mapping that cannot identify the original valid instance uniquely.
+        for alias in [urlA, "HTTPS://CATALOG.EXAMPLE.INVALID/a/manifest.json?token=one"] {
+            let collision = try XperienceInstalledCatalogs.project([descriptor("collision-bad", "fixture.a", alias, .string("malformed")), validA])
+            try unresolved(collision.resolve(source("fixture.a"), mapping: collision.candidates[0].mapping))
+        }
+    }
     static func run() throws {
+        try installedProjectionIsolation()
         // Exact ciphertext length compared against the actual existing sealing implementation.
         for count in [0, 1, 2, 3, 63, 1_500, 65_535] {
             let plaintext = Data(repeating: 0x78, count: count)
@@ -106,7 +182,7 @@ import CryptoKit
             ])]))
         let streamOnly = VortxResourceAddon(id: "streams", transportUrl: "https://streams.addon.example/manifest.json",
             manifest: .object(["id": .string("synthetic.streams"), "resources": .array([.string("stream")])]))
-        let candidates = try XperienceInstalledCatalogs.candidates([installed, streamOnly])
+        let candidates = try XperienceInstalledCatalogs.project([installed, streamOnly]).candidates
         try check(candidates.count == 1 && candidates[0].catalogs.count == 1, "unrelated search-only catalog poisoned registry")
         try check(candidates[0].catalogs[0].requiresGenre && candidates[0].catalogs[0].acceptsGenre,
             "legacy required genre was lost")

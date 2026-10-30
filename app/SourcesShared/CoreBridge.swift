@@ -6511,13 +6511,13 @@ extension CoreBridge {
         return result
     }
     @MainActor func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxRawHostRegister], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
         guard target.lifetime.isActive, nativeWatchlistTargetIsCurrent(target.owner),
               let snapshot = target.owner.facade.capturedHostProfileSnapshot(expected: target.owner.binding, registry: target.registry) else {
             throw XperiencePersistenceFailure.staleContext
         }
         return (snapshot.rawRegisters,
-                try XperienceInstalledCatalogs.candidates(snapshot.registry))
+                try XperienceInstalledCatalogs.project(snapshot.registry))
     }
     @MainActor func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }

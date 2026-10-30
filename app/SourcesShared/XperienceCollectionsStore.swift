@@ -60,14 +60,21 @@ struct XperienceImportLease {
     func capture() throws -> XperienceImportLease {
         if observedLease != nil { invalidate() } // A superseding gesture retires the old worker authority too.
         let lease = XperienceImportLease(target: try core.captureNativeXperienceTarget())
-        observedLease = lease
-        observedRegisters = try core.nativeXperienceSnapshot(target: lease.target).registers
-        return lease
+        do {
+            let registers = try core.nativeXperienceSnapshot(target: lease.target).registers
+            observedLease = lease; observedRegisters = registers
+            return lease
+        } catch {
+            // Failed whole-registry admission cannot leave an undisclosed original gesture
+            // active. Cleanup preserves the original failure, including cancellation.
+            core.retireNativeXperienceTarget(lease.target)
+            throw error
+        }
     }
     func isCurrent(_ lease: XperienceImportLease) -> Bool {
         return observedLease?.identity == lease.identity && core.nativeXperienceTargetIsCurrent(lease.target)
     }
-    func candidates(_ lease: XperienceImportLease) throws -> [XperienceAddonBinding.Candidate] {
+    func candidates(_ lease: XperienceImportLease) throws -> XperienceInstalledCatalogs.Snapshot {
         guard isCurrent(lease) else { throw XperiencePersistenceFailure.staleContext }
         return try core.nativeXperienceSnapshot(target: lease.target).candidates
     }

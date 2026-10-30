@@ -281,12 +281,50 @@ import Foundation
                     "unknown raw metadata change retires the actual Store observation without successor recapture")
     }
 
+    static func isolatedInstalledBindingChoice() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let catalogs: VortxJSON = .array([.object(["type": .string("movie"), "id": .string("popular")])])
+        core.installedProjection = try XperienceInstalledCatalogs.project([
+            .init(id: "bad", transportUrl: "https://catalog.example.invalid/a bad/manifest.json",
+                manifest: .object(["id": .string("fixture.a"), "catalogs": catalogs])),
+            .init(id: "valid", transportUrl: "https://catalog.example.invalid/a/manifest.json?configuration=synthetic",
+                manifest: .object(["id": .string("fixture.a"), "catalogs": catalogs]))
+        ])
+        let admitted = try XperienceCollections.project(.array([.object(["id": .string("collection"),
+            "title": .string("Synthetic"), "futureOpaque": .string("retain"), "folders": .array([
+                .object(["id": .string("folder"), "title": .string("Folder"), "sources": .array([
+                    .object(["provider": .string("addon"), "addonId": .string("fixture.a"),
+                        "type": .string("movie"), "catalogId": .string("popular")])])])])])]))
+        let model = XperienceCollectionsViewModel(store: store)
+        var subscription: AnyCancellable?
+        let text = String(decoding: try XperienceCollections.canonicalData(admitted.raw), as: UTF8.self)
+        await withCheckedContinuation { continuation in
+            subscription = model.$preview.compactMap { $0 }.first().sink { _ in continuation.resume() }
+            model.previewPaste(text)
+        }
+        subscription?.cancel()
+        guard let row = model.bindingRows.first else { throw Failure.assertion("missing isolated installed row") }
+        try require(row.selection == nil && model.unavailableSourceCount == 1,
+                    "actual ViewModel does not auto-map a surviving malformed-same-ID sibling")
+        try require(row.choices.count == 1 && row.choices[0].title == "Installed instance 2",
+                    "actual ViewModel offers only the valid original installed position")
+        try require(row.status.contains("unavailable") && !row.status.contains("https://"),
+                    "unresolved installed state is bounded and actionable without config output")
+        model.chooseInstance(row: row.id, choice: row.choices[0].id)
+        try require(model.bindingRows[0].selection != nil && model.unavailableSourceCount == 0,
+                    "explicit valid original mapping resolves through actual ViewModel wrapper")
+        try require(model.preview?.raw == admitted.raw && core.captures.count == 1 && core.syntheticPublications == 0,
+                    "binding choice preserves raw preview and original capture without a write")
+        model.stop()
+    }
+
     static func run() async throws {
         let selected = CommandLine.arguments.dropFirst().first ?? "all"
         let cases: [(String, () async throws -> Void)] = [
             ("own-ack", ownACK), ("changed-registers", changedRegisters), ("profile-aba", profileABA),
             ("context-retirement", contextRetirement), ("pending-identity", pendingIdentity),
-            ("cancellation", cancellation), ("ui-stop", viewModelStop), ("raw-observation", rawObservation)
+            ("cancellation", cancellation), ("ui-stop", viewModelStop), ("raw-observation", rawObservation), ("installed-isolation", isolatedInstalledBindingChoice)
         ]
         guard selected == "all" || cases.contains(where: { $0.0 == selected }) else { throw Failure.assertion("unknown case") }
         for (name, operation) in cases where selected == "all" || selected == name {

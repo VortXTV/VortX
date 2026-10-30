@@ -152,7 +152,7 @@ inputs=(
  "$run_dir/VortxNativeBootstrapArchive.swift" "$run_dir/AddonURLGuard.swift"
  "$run_dir/AddonPairingProtocol.swift" "$run_dir/VortXEdgeAuth.swift" "$run_dir/CurationCollection.swift"
  "$run_dir/CurationDocument.swift" "$run_dir/CurationEdit.swift"
- "$run_dir/XperienceCollections.swift" "$run_dir/XperienceAddonBinding.swift"
+ "$run_dir/XperienceCollections.swift" "$run_dir/XperienceAddonBinding.swift" "$run_dir/OwnerHistoryExactJSON.swift"
  "$run_dir/XperienceExportEndpoint.swift" "$run_dir/XperienceExportSystemKeychain.swift"
  "$run_dir/XperienceExportHTTP.swift" "$run_dir/XperienceProfileExportAdmission.swift"
  "$run_dir/XperienceCurationExportMapper.swift" "$run_dir/XperienceCurationExportController.swift"

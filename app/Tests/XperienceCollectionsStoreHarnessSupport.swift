@@ -43,6 +43,7 @@ struct XperiencePreparedExport: Sendable {}
     }
     var context = Context()
     var registers: [String: VortxJSON] = [:]
+    var installedProjection = XperienceInstalledCatalogs.Snapshot.empty
     // Synthetic byte fixtures only; genuine encrypted producer/CAS coverage belongs to
     // XperienceNativeCheckpointTests. Never call a DTO encoding original account evidence.
     var rawRegisterFixtures: [String: VortxRawHostRegister] = [:]
@@ -76,14 +77,14 @@ struct XperiencePreparedExport: Sendable {}
         return result
     }
     func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxRawHostRegister], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         let waiter = snapshotWaiter
         snapshotWaiter = nil
         waiter?.resume()
         var bytes = try registers.mapValues { try VortxRawHostRegister.prepared(VortxNativeHostFieldEvidence.canonicalData($0)) }
         bytes.merge(rawRegisterFixtures) { _, fixture in fixture }
-        return (bytes, [])
+        return (bytes, installedProjection)
     }
     func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
         preparationCount += 1

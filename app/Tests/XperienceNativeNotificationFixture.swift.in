@@ -86,14 +86,14 @@ final class CoreBridge {
             && target.facade.capturedHostProfileSnapshot(expected: target.binding, registry: target.registry) != nil
     }
     @MainActor func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxRawHostRegister], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
         guard nativeXperienceTargetIsCurrent(target),
               let snapshot = target.facade.capturedHostProfileSnapshot(expected: target.binding, registry: target.registry) else {
             throw XperiencePersistenceFailure.staleContext
         }
         let waiter = snapshotWaiter; snapshotWaiter = nil; snapshotWaiterID = nil
         waiter?.resume()
-        return (snapshot.rawRegisters, try XperienceInstalledCatalogs.candidates(snapshot.registry))
+        return (snapshot.rawRegisters, try XperienceInstalledCatalogs.project(snapshot.registry))
     }
     @MainActor func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
         // This notification-only collaborator never supplies a fake export/provider witness.

@@ -7,7 +7,7 @@ enum XperienceCurationExportMapper {
     static func map(_ projection: XperienceProfileExportAdmission.Projection,
                     upstreamCollectionID: String, sourceID: String,
                     into current: CurationDocument,
-                    installed: [XperienceAddonBinding.Candidate]) throws -> CurationDocument {
+                    installed: XperienceInstalledCatalogs.Snapshot) throws -> CurationDocument {
         guard let collection = projection.collections.collections.first(where: { $0.id == upstreamCollectionID }) else {
             throw XperienceExportFailure.missingCollection
         }
@@ -29,7 +29,7 @@ enum XperienceCurationExportMapper {
             let sources = try folder.sources.map { source -> VortxJSON in
                 guard source.isAddon, let addon = source.addonID,
                       let type = source.type, let catalogID = source.catalogID,
-                      case .resolved = XperienceAddonBinding.resolve(source, installed: installed) else {
+                      case .resolved = installed.resolve(source) else {
                     // Missing, unsupported, duplicate or ambiguous installed instances reject this refresh.
                     throw XperienceExportFailure.unsupportedSource
                 }

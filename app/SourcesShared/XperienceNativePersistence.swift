@@ -249,42 +249,133 @@ struct XperienceSavedNamespace: Equatable, Sendable, Identifiable {
 
 /// Only installed manifest descriptors become candidates. Collection JSON cannot nominate a host.
 enum XperienceInstalledCatalogs {
-    static func candidates(_ registry: [VortxResourceAddon]) throws -> [XperienceAddonBinding.Candidate] {
+    /// A captured projection, not an endpoint/owner capability. Rejections stay private to
+    /// THIS registry observation; no URL/config/error string is exposed or persisted.
+    struct Snapshot: Sendable {
+        let candidates: [XperienceAddonBinding.Candidate]
+        private let originalOrdinals: [Int]
+        private let rejectedIDs: Set<Data>
+        private let rejectedConfiguredIdentities: [Data: Set<String>]
+        // Typed compatibility for exhaustive, already-admitted candidate inputs (including
+        // existing pure mapper fixtures). Real installed capture always calls project below.
+        init(admittedCandidates: [XperienceAddonBinding.Candidate]) {
+            candidates = admittedCandidates; originalOrdinals = Array(admittedCandidates.indices)
+            rejectedIDs = []; rejectedConfiguredIdentities = [:]
+        }
+        fileprivate init(candidates: [XperienceAddonBinding.Candidate], originalOrdinals: [Int], rejectedIDs: Set<Data>,
+                         rejectedConfiguredIdentities: [Data: Set<String>]) {
+            precondition(candidates.count == originalOrdinals.count)
+            self.candidates = candidates; self.originalOrdinals = originalOrdinals; self.rejectedIDs = rejectedIDs
+            self.rejectedConfiguredIdentities = rejectedConfiguredIdentities
+        }
+        static let empty = Snapshot(admittedCandidates: [])
+        func displayOrdinal(at admittedIndex: Int) -> Int { originalOrdinals[admittedIndex] + 1 }
+        func hasRejectedDescriptor(for source: XperienceCollections.Source) -> Bool {
+            guard source.isAddon, let id = source.addonID else { return false }
+            return rejectedIDs.contains(Data(id.utf8))
+        }
+        func resolve(_ source: XperienceCollections.Source,
+                     mapping: XperienceAddonBinding.Mapping? = nil) -> XperienceAddonBinding.Resolution {
+            let result = XperienceAddonBinding.resolve(source, installed: candidates, mapping: mapping)
+            if mapping == nil, hasRejectedDescriptor(for: source) { return .invalidRegistry }
+            if case .resolved(let candidate) = result,
+               rejectedConfiguredIdentities[Data(candidate.manifestID.utf8)]?.contains(candidate.transportDigest) == true {
+                // A mapping cannot distinguish an invalid configuration with the SAME admitted
+                // identity. Never use it as permission to pick a surviving same-name instance.
+                return .invalidRegistry
+            }
+            return result
+        }
+        func mappingMatches(_ mapping: XperienceAddonBinding.Mapping?, candidate: XperienceAddonBinding.Candidate) -> Bool {
+            guard let mapping else { return false }
+            return Data(mapping.manifestID.utf8) == Data(candidate.manifestID.utf8)
+                && mapping.transportDigest == candidate.transportDigest
+        }
+    }
+    private struct IdentityBudget {
+        // Reuse the existing native/source JSON bound, not a new small manifest-ID quota.
+        // Rejected observations retain at most the identity bytes admitted by this capture.
+        var remaining = OwnerHistoryExactJSON.maximumBytes
+        mutating func admit(_ identity: String) throws {
+            let count = identity.utf8.count
+            guard count < remaining else { throw XperiencePersistenceFailure.invalidRegistry }
+            remaining -= count + 1
+        }
+    }
+    static func project(_ registry: [VortxResourceAddon]) throws -> Snapshot {
         var output: [XperienceAddonBinding.Candidate] = []
-        for addon in registry {
-            guard let manifest = addon.manifest, case .string(let id) = manifest["id"], !id.isEmpty else {
+        var originalOrdinals: [Int] = []
+        var rejectedIDs = Set<Data>(), rejectedConfiguredIdentities: [Data: Set<String>] = [:]
+        var budget = IdentityBudget()
+        for (originalIndex, addon) in registry.enumerated() {
+            try Task.checkCancellation()
+            // An absent/invalid/unbounded identity cannot be attributed and rejects the
+            // whole capture. Swift String equality is NEVER an identity key here.
+            guard let manifest = addon.manifest, case .object = manifest,
+                  case .string(let id) = manifest["id"],
+                  id.unicodeScalars.contains(where: { !CharacterSet.whitespacesAndNewlines.contains($0) }) else {
                 throw XperiencePersistenceFailure.invalidRegistry
             }
-            // Stremio stream/subtitle-only manifests may omit catalogs. They nominate no collection
-            // endpoint. A PRESENT malformed catalogs value is still a registry error.
-            guard let rawCatalogs = manifest["catalogs"] else { continue }
-            guard let catalogs = rawCatalogs.array else { throw XperiencePersistenceFailure.invalidRegistry }
-            let projected = try catalogs.compactMap { catalog -> XperienceAddonBinding.Catalog? in
-                guard case .string(let type) = catalog["type"], case .string(let id) = catalog["id"],
-                      !type.isEmpty, !id.isEmpty else { throw XperiencePersistenceFailure.invalidRegistry }
-                let extras = catalog["extra"]?.array ?? []
-                let supported = Set(extras.compactMap { $0["name"].flatMap { try? $0.decode(String.self) } }
-                    + (catalog["extraSupported"]?.array ?? []).compactMap { try? $0.decode(String.self) })
-                let legacyRequired: [String]
-                if let value = catalog["extraRequired"] {
-                    guard let array = value.array else { throw XperiencePersistenceFailure.invalidRegistry }
-                    legacyRequired = try array.map {
-                        guard case .string(let name) = $0, !name.isEmpty else { throw XperiencePersistenceFailure.invalidRegistry }
-                        return name
-                    }
-                } else { legacyRequired = [] }
-                let required = Set(extras.filter { $0["isRequired"] == .bool(true) }
-                    .compactMap { $0["name"].flatMap { try? $0.decode(String.self) } } + legacyRequired)
-                // Search-only and other unsupported-extra catalogs are not collection endpoints.
-                // Exclude only this endpoint: a referenced source resolves as missing/unavailable,
-                // while its raw JSON stays saved and unrelated usable catalogs remain importable.
-                guard required.subtracting(["genre"]).isEmpty else { return nil }
-                return .init(type: type, id: id, acceptsGenre: supported.contains("genre") || required.contains("genre"),
-                    requiresGenre: required.contains("genre"), supportsSkip: supported.contains("skip"))
+            try budget.admit(id)
+            // A known catalog-omitted manifest advertises no endpoint. Preserve that old
+            // behavior; it must not taint a valid same-ID catalog sibling as malformed.
+            guard manifest["catalogs"] != nil else { continue }
+            var admittedTransport: XperienceAddonBinding.Candidate?
+            do {
+                admittedTransport = try .init(manifestID: id, transport: addon.transportUrl, catalogs: [])
+                let catalogs = try projectedCatalogs(manifest)
+                output.append(try .init(manifestID: id, transport: addon.transportUrl, catalogs: catalogs))
+                originalOrdinals.append(originalIndex)
+            } catch XperiencePersistenceFailure.invalidRegistry {
+                rejectedIDs.insert(Data(id.utf8))
+                if let digest = admittedTransport?.transportDigest {
+                    rejectedConfiguredIdentities[Data(id.utf8), default: []].insert(digest)
+                }
+            } catch XperienceAddonBinding.Failure.invalidRegistry {
+                rejectedIDs.insert(Data(id.utf8))
+                if let digest = admittedTransport?.transportDigest {
+                    rejectedConfiguredIdentities[Data(id.utf8), default: []].insert(digest)
+                }
             }
-            output.append(try .init(manifestID: id, transport: addon.transportUrl, catalogs: projected))
+            // Other failures, including cancellation, are not descriptor faults.
         }
-        return output
+        return .init(candidates: output, originalOrdinals: originalOrdinals, rejectedIDs: rejectedIDs,
+            rejectedConfiguredIdentities: rejectedConfiguredIdentities)
+    }
+    private static func projectedCatalogs(_ manifest: VortxJSON) throws -> [XperienceAddonBinding.Catalog] {
+        guard let catalogs = manifest["catalogs"]?.array else { throw XperiencePersistenceFailure.invalidRegistry }
+        return try catalogs.compactMap { catalog -> XperienceAddonBinding.Catalog? in
+            try Task.checkCancellation()
+            guard case .object = catalog, case .string(let type) = catalog["type"], case .string(let id) = catalog["id"],
+                  !type.isEmpty, !id.isEmpty else { throw XperiencePersistenceFailure.invalidRegistry }
+            let extras: [VortxJSON]
+            if let value = catalog["extra"] {
+                guard let array = value.array else { throw XperiencePersistenceFailure.invalidRegistry }; extras = array
+            } else { extras = [] }
+            var supported = Set<String>(), required = Set<String>()
+            for extra in extras {
+                guard case .object = extra, case .string(let name) = extra["name"], !name.isEmpty else {
+                    throw XperiencePersistenceFailure.invalidRegistry
+                }
+                supported.insert(name)
+                if let value = extra["isRequired"] {
+                    guard case .bool(let needed) = value else { throw XperiencePersistenceFailure.invalidRegistry }
+                    if needed { required.insert(name) }
+                }
+            }
+            for (key, isRequired) in [("extraSupported", false), ("extraRequired", true)] {
+                if let value = catalog[key] {
+                    guard let array = value.array else { throw XperiencePersistenceFailure.invalidRegistry }
+                    for entry in array {
+                        guard case .string(let name) = entry, !name.isEmpty else { throw XperiencePersistenceFailure.invalidRegistry }
+                        if isRequired { required.insert(name) } else { supported.insert(name) }
+                    }
+                }
+            }
+            guard required.subtracting(["genre"]).isEmpty else { return nil }
+            return .init(type: type, id: id, acceptsGenre: supported.contains("genre") || required.contains("genre"),
+                requiresGenre: required.contains("genre"), supportsSkip: supported.contains("skip"))
+        }
     }
 }
 
