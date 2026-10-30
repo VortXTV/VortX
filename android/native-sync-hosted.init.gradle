@@ -14,7 +14,9 @@ allprojects {
         if (task.path == ":app:testPlayDebugUnitTest") {
             def expected = [
                 "com.vortx.android.sync.VortXSyncManagerBackupRevisionTest": 14L,
-                "com.vortx.android.sync.NativeAccountSyncTest": 8L,
+                "com.vortx.android.sync.NativeAccountSyncTest": 19L,
+                "com.vortx.android.integrations.NativeProspectiveProviderTest": 2L,
+                "com.vortx.android.engine.NativeOwnerHistoryJniTest": 5L,
             ]
             def observed = [:].withDefault { 0L }
             def names = [] as Set
@@ -76,10 +78,10 @@ allprojects {
             afterSuite { descriptor, result ->
                 if (descriptor.parent == null) {
                     requireExactLibrary()
-                    if (observed != expected || result.testCount != 22L ||
+                    if (observed != expected || result.testCount != 40L ||
                             result.skippedTestCount != 0L || result.failedTestCount != 0L)
-                        throw new GradleException("Require real native BackupRevision14 plus NativeAccountSync8, zero skips/failures")
-                    logger.lifecycle("Executed native BackupRevision14 and NativeAccountSync8 with unchanged real host JNI")
+                        throw new GradleException("Require exact BackupRevision14, NativeAccountSync19, ProspectiveProvider2 and OwnerHistoryJni5; zero skips/failures")
+                    logger.lifecycle("Executed required 40-test roster with unchanged real host JNI; XML receipt distinguishes the real-JNI subset")
                 }
             }
         }

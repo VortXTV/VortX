@@ -56,11 +56,14 @@ internal class NativeAccountCoordinator(
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession) {
         private var retired = false
         private var authenticatedRead: NativeAccountReadCapture? = null
+        private var sourceNativeProjection: ByteArray? = null
 
-        @Synchronized fun retain(read: NativeAccountReadCapture): Boolean {
+        @Synchronized fun retain(read: NativeAccountReadCapture, projection: ByteArray): Boolean {
             if (retired || read.account != account) return false
             val old = authenticatedRead
             authenticatedRead = read
+            sourceNativeProjection?.fill(0)
+            sourceNativeProjection = projection.copyOf()
             if (old !== read) old?.retire()
             return true
         }
@@ -69,6 +72,7 @@ internal class NativeAccountCoordinator(
             if (expected == null || authenticatedRead === expected) {
                 authenticatedRead?.retire()
                 authenticatedRead = null
+                sourceNativeProjection?.fill(0); sourceNativeProjection = null
             }
         }
 
@@ -76,7 +80,20 @@ internal class NativeAccountCoordinator(
             retired = true
             authenticatedRead?.retire()
             authenticatedRead = null
+            sourceNativeProjection?.fill(0); sourceNativeProjection = null
         }
+        @Synchronized fun readIdentity(): NativeAccountReadCapture? = authenticatedRead.takeUnless { retired }
+        @Synchronized fun sourceProjection(): ByteArray? = sourceNativeProjection?.copyOf().takeUnless { retired }
+        @Synchronized fun <T> withRead(expected: NativeAccountReadCapture, action: (ByteArray, ByteArray) -> T): T {
+            check(!retired && authenticatedRead === expected) { "Authenticated raw observation changed" }
+            val raw = expected.copyRawForApply(account)
+            val projection = checkNotNull(sourceNativeProjection).copyOf()
+            return try { action(raw, projection) } finally { raw.fill(0); projection.fill(0) }
+        }
+    }
+    @Volatile private var playlistAccountProducer: com.vortx.android.sync.NativePlaylistAccountProducer? = null
+    override fun installPlaylistAccountProducer(producer: com.vortx.android.sync.NativePlaylistAccountProducer) {
+        playlistAccountProducer = producer
     }
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
@@ -114,6 +131,8 @@ internal class NativeAccountCoordinator(
         val admission: (() -> Boolean) -> Boolean,
         val lifetime: PlaylistLifetime,
         override val receiptOwner: CapturedReceiptOwner,
+        val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer?,
     ) : NativePlaylistProfileGateway.Target {
         override val accountId get() = account.id
         override val profileId get() = owner.profileID
@@ -447,7 +466,9 @@ internal class NativeAccountCoordinator(
     }
 
     private fun <T> withCapturedPlaylistTarget(target: CapturedPlaylistTarget, action: (VortxNativeRead) -> T): T =
-        target.session.withCompleteAccountExportOwner(target.owner) { read ->
+        target.session.withCompleteAccountExportOwner(target.owner, target.originalRead != null) { read ->
+            check(target.originalRead == null || (target.installation.readIdentity() === target.originalRead &&
+                playlistAccountProducer === target.producer)) { "Original complete-account observation changed" }
             withAdmittedPlaylistTarget(target, read, action)
         }
 
@@ -483,11 +504,13 @@ internal class NativeAccountCoordinator(
         val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) {
             "Native playlist account admission unavailable"
         }
-        installation.session.withCompleteAccountExportRead { read ->
+        val originalRead = installation.readIdentity()
+        val producer = playlistAccountProducer
+        installation.session.withPlaylistReceiptCapture(originalRead != null && producer != null) { read, receiptEpoch ->
             val receiptOwner = CapturedReceiptOwner(installation.account, installation.session, read.owner,
-                installation, admission, installation.session.receiptProfileEpoch(read.owner))
+                installation, admission, receiptEpoch)
             val target = CapturedPlaylistTarget(installation.account, installation.session, read.owner,
-                installation, admission, PlaylistLifetime(), receiptOwner)
+                installation, admission, PlaylistLifetime(), receiptOwner, originalRead, producer)
             withAdmittedPlaylistTarget(target, read) { playlistSnapshot(target, it) }
         }
     }
@@ -613,13 +636,22 @@ internal class NativeAccountCoordinator(
             ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
         val edit = runCatching { UUID.fromString(editId).takeIf { it.toString() == editId } }.getOrNull()
             ?: return Result.failure(IllegalArgumentException("Invalid playlist edit identity"))
+        var accountWrite: com.vortx.android.sync.NativePlaylistAccountWrite? = null
+        var originalCheckpoint: NativeCheckpointRead? = null
         val prepared = playlistResult {
             withCapturedPlaylistTarget(captured) { read ->
-                detachPlaylistEdit(field, expectedRegister, value, playlistFields(read, captured.profileId))
+                val detached = detachPlaylistEdit(field, expectedRegister, value, playlistFields(read, captured.profileId))
+                originalCheckpoint = captured.session.captureGenericPlaylistCheckpoint(captured.owner)
+                if (!captured.session.hasOwnerHistory()) {
+                    accountWrite = checkNotNull(captured.producer?.capture(captured.account)) {
+                        "Complete account write admission unavailable"
+                    }
+                }
+                detached
             }
-        }.getOrElse { return Result.failure(it) }
+        }.getOrElse { accountWrite?.close(); return Result.failure(it) }
         val operationJob = currentCoroutineContext()[Job]
-        return withContext(Dispatchers.IO) {
+        return try { withContext(Dispatchers.IO) {
             playlistResult {
                 operationJob?.ensureActive()
                 withCapturedPlaylistTarget(captured) { read ->
@@ -627,7 +659,21 @@ internal class NativeAccountCoordinator(
                     val liveFields = playlistFields(read, captured.profileId)
                     NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value, liveFields)
                     captured.session.dispatchBudgetedPlaylist(captured.owner,
-                        JSONObject().put(prepared.field, prepared.value), beforeCommit = {
+                        JSONObject().put(prepared.field, prepared.value),
+                        prospectiveGlobalChanges = accountWrite?.pendingGlobalValues(),
+                        genericCheckpoint = originalCheckpoint,
+                        genericAdmission = accountWrite?.let { write -> { native: ByteArray, host: ByteArray, commit: () -> Unit ->
+                            captured.installation.withRead(checkNotNull(captured.originalRead)) { raw, projection ->
+                                write.commitCandidate(raw, projection, native, host) {
+                                    operationJob?.ensureActive()
+                                    check(mounted.get() === captured.installation && accountCurrent(captured.account) &&
+                                        playlistAccountProducer === captured.producer)
+                                    NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value,
+                                        playlistFields(captured.session.read(), captured.profileId))
+                                    commit()
+                                }
+                            }
+                        } }, beforeCommit = {
                             operationJob?.ensureActive()
                             check(mounted.get() === captured.installation && accountCurrent(captured.account)) {
                                 "Native playlist target changed"
@@ -658,7 +704,7 @@ internal class NativeAccountCoordinator(
                     CapturedPlaylistSnapshot(captured, acceptedFields, receipt)
                 }
             }
-        }
+        } } finally { accountWrite?.close() }
     }
 
     suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
@@ -896,7 +942,23 @@ internal class NativeAccountCoordinator(
             it.account == account && !it.session.requiresRecovery() && !it.session.hasOwnerHistory()
         } ?: return false
         val retained = runCatching { captured.retainedCopyFor(account) }.getOrNull() ?: return false
-        if (!current.retain(retained)) { retained.retire(); return false }
+        val raw = captured.copyRawForApply(account)
+        val projection = try {
+            val native = NativeProfileOverlayWitness.parseAccountDocument(raw).getJSONObject("nativeSync")
+            // Same public generic create/bind/merge path used by NativeOwnAccountBaseline.validate.
+            // This is the source-only projection, before any local pending state was merged into it.
+            VortxNativeRuntime.create(bindings, current.session.scope.ownerProfileID, "Owner").use { runtime ->
+                for (action in listOf(JSONObject().put("type", "bind_sync_scope").put("scope", current.session.scope.accountID),
+                    JSONObject().put("type", "merge_native_sync").put("document", native))) {
+                    check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Generic source projection rejected" }
+                }
+                JSONObject(runtime.stateJson()).getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+            }
+        } catch (cancelled: CancellationException) { retained.retire(); throw cancelled }
+        catch (failure: Throwable) { retained.retire(); return false }
+        finally { raw.fill(0) }
+        try { if (!current.retain(retained, projection)) { retained.retire(); return false } }
+        finally { projection.fill(0) }
         if (mounted.get() !== current || !isCurrent() || !accountCurrent(account)) {
             current.clearRead(retained)
             return false
@@ -1381,7 +1443,8 @@ internal class NativeAccountCoordinator(
             val host = read.state.getJSONObject("hostProfilePreferences")
             NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
                 read.state.getBoolean("hostProfileSyncPending"), read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document"),
-                read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount())
+                read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount(),
+                current.sourceProjection())
         }
     }
 

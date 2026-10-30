@@ -74,6 +74,10 @@ import kotlinx.coroutines.flow.collect
 /// class, and the engine re-hydrates its encrypted checkpoint from disk.
 class VortXApplication : Application(), SingletonImageLoader.Factory {
 
+    /** All app-context settings writers share the prospective-account commit fence. */
+    override fun getSharedPreferences(name: String, mode: Int): android.content.SharedPreferences =
+        com.vortx.android.sync.NativeSettingsFence.wrap(name, super.getSharedPreferences(name, mode))
+
     /// Process-owned recovery work. A failed cleanup cannot cancel another startup child, and IO keeps
     /// encrypted preference reads, engine add-on inspection, and Worker revocation off the main thread.
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

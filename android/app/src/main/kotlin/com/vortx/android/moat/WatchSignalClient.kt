@@ -174,7 +174,7 @@ object WatchSignalClient {
      */
     private fun claimMarker(context: Context, marker: String): Boolean {
         synchronized(markerLock) {
-            val prefs = context.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+            val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
             val current = decodeMarkers(prefs.getString(SENT_KEY, null))
             val (claimed, next) = claimMarkerIn(current, marker, SENT_CAP)
             if (!claimed) return false
@@ -188,7 +188,7 @@ object WatchSignalClient {
      * UUID (non-PII); the worker only ever stores its hash. Mirrors Apple `watcherId`.
      */
     private fun watcherId(context: Context): String {
-        val prefs = context.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+        val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
         val existing = prefs.getString(WATCHER_ID_KEY, null)
         if (!existing.isNullOrEmpty()) return existing
         val fresh = UUID.randomUUID().toString()

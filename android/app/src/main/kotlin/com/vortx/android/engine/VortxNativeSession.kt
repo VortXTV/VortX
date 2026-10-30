@@ -137,7 +137,7 @@ internal interface VortxCheckpointStore {
     val supportsCheckpointAuthority: Boolean get() = false
     /** Full atomic replacement, durable flush and authenticated readback before returning. */
     fun commit(scope: VortxAccountScope, snapshot: String)
-    /** Typed routes require an original encrypted-file CAS; old stores cannot pretend support. */
+    /** Complete-account routes require an original encrypted-file CAS; old stores cannot pretend support. */
     fun captureCheckpoint(scope: VortxAccountScope): NativeCheckpointRead =
         error("Authenticated checkpoint compare/replace unavailable")
     fun requireCurrentCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead) {
@@ -269,7 +269,7 @@ internal class VortxEncryptedCheckpointStore(
                                                          snapshot: String): NativeCheckpointRead {
         val current = readSealed(scope)
         check(expected.matches(readIssuer, scope, checkpointGeneration(scope), current)) { "Native checkpoint changed" }
-        // Validation/replay/whole-account budgeting is owned by the same typed Session authority;
+        // Validation/replay/whole-account budgeting is owned by the same Session admission;
         // this storage layer does not turn an interpretation-only JSONObject into its raw source.
         require(snapshot.toByteArray(Charsets.UTF_8).size <= MAX_BYTES - 28)
         retireCheckpointRead(scope)
@@ -432,14 +432,22 @@ internal class VortxNativeSession private constructor(
         signalPlaylistInvalidation()
     }
 
-    @Synchronized internal fun receiptProfileEpoch(owner: VortxNativeOwner): Long {
-        requireCompleteAccountExportRoute()
-        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
-        return playlistReceiptProfileEpoch
+    /** Mint read-only receipt identity in the SAME complete-account capture as its mutation target.
+     * No separate generic flag or raw-GET observation can later upgrade an existing receipt to a
+     * write permit. The coordinator still admits its original account/mount before publishing it. */
+    @Synchronized internal fun <T> withPlaylistReceiptCapture(
+        genericReadAvailable: Boolean = false,
+        action: (VortxNativeRead, Long) -> T,
+    ): T {
+        requireCompleteAccountExportRoute(genericReadAvailable)
+        return action(read(), playlistReceiptProfileEpoch)
     }
 
+    /** A frozen upload may receive a same-profile GET/merge after receipt capture. That retires
+     * mutation revision and raw-read identity, but not this read-only receipt scope. Never consult
+     * the old GET or prospective-write permit here, and never mint a replacement owner. */
     @Synchronized internal fun <T> withPlaylistReceiptEpoch(owner: VortxNativeOwner, epoch: Long, action: () -> T): T {
-        requireCompleteAccountExportRoute()
+        check(!closed && !requiresRecovery() && isAccountCurrent()) { "Playlist receipt session unavailable" }
         check(owner.scope == scope && epoch == playlistReceiptProfileEpoch) { "Playlist receipt owner changed" }
         return action()
     }
@@ -665,9 +673,16 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun rawAccount(): ByteArray? = ownerHistory?.cloudAccount()
     @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !requiresRecovery() && isAccountCurrent() && read().owner == owner
 
-    private fun requireCompleteAccountExportRoute() {
-        check(!closed && !requiresRecovery() && runtime.isTyped && isAccountCurrent()) {
+    private fun requireCompleteAccountExportRoute(genericReadAvailable: Boolean = false) {
+        check(!closed && !requiresRecovery() && isAccountCurrent() &&
+            (runtime.isTyped || (genericReadAvailable && store.supportsCheckpointAuthority && acknowledgedCheckpoint != null))) {
             "Complete account export budget unavailable"
+        }
+    }
+    @Synchronized internal fun captureGenericPlaylistCheckpoint(owner: VortxNativeOwner): NativeCheckpointRead? = owned(owner) {
+        if (runtime.isTyped) null else checkNotNull(acknowledgedCheckpoint).also {
+            check(store.supportsCheckpointAuthority)
+            store.requireCurrentCheckpoint(scope, it)
         }
     }
 
@@ -680,19 +695,21 @@ internal class VortxNativeSession private constructor(
 
     /**
      * Captures one full presentation only after the scalar route/account checks pass. A generic JNI
-     * runtime is rejected without decoding its state. The owner overload additionally rejects a
+     * runtime additionally requires the coordinator's retained raw-read producer and store CAS.
+     * The owner overload additionally rejects a
      * stale Session revision/scope before that one remaining presentation read; it does not claim
      * that current-owner publication is O(1).
      */
-    @Synchronized internal fun <T> withCompleteAccountExportRead(action: (VortxNativeRead) -> T): T {
-        requireCompleteAccountExportRoute()
+    @Synchronized internal fun <T> withCompleteAccountExportRead(genericReadAvailable: Boolean = false, action: (VortxNativeRead) -> T): T {
+        requireCompleteAccountExportRoute(genericReadAvailable)
         return action(read())
     }
     @Synchronized internal fun <T> withCompleteAccountExportOwner(
         owner: VortxNativeOwner,
+        genericReadAvailable: Boolean = false,
         action: (VortxNativeRead) -> T,
     ): T {
-        requireCompleteAccountExportRoute()
+        requireCompleteAccountExportRoute(genericReadAvailable)
         check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
         val read = read()
         check(read.owner == owner) { "Native owner changed" }
@@ -995,6 +1012,9 @@ internal class VortxNativeSession private constructor(
         owner: VortxNativeOwner,
         profileFieldChanges: JSONObject,
         beforeCommit: () -> Unit,
+        prospectiveGlobalChanges: JSONObject? = null,
+        genericAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
+        genericCheckpoint: NativeCheckpointRead? = null,
     ): List<String> {
         check(profileFieldChanges.length() == 1 &&
             profileFieldChanges.keys().asSequence().all { it.startsWith(NativePlaylist.PREFIX) }) {
@@ -1002,7 +1022,8 @@ internal class VortxNativeSession private constructor(
         }
         return dispatchInternal(emptyList(), owner, null, true, null, null, null, null, null, null,
             beforeCommit, profileFieldChanges, emptyMap(), false,
-            requireCompleteAccountExportBudget = true)
+            requireCompleteAccountExportBudget = true, genericAdmission = genericAdmission,
+            genericCheckpoint = genericCheckpoint, prospectiveGlobalChanges = prospectiveGlobalChanges)
     }
 
     private fun dispatchInternal(
@@ -1021,10 +1042,14 @@ internal class VortxNativeSession private constructor(
         legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>>,
         progressOnly: Boolean,
         requireCompleteAccountExportBudget: Boolean,
+        genericAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
+        genericCheckpoint: NativeCheckpointRead? = null,
+        prospectiveGlobalChanges: JSONObject? = null,
     ): List<String> = owned(owner) {
         // This check precedes fork, host Lamport minting and every durable side effect. The later
         // commit flag prevents a future refactor from falling back to the generic local store.
-        check(!requireCompleteAccountExportBudget || runtime.isTyped) {
+        check(!requireCompleteAccountExportBudget || runtime.isTyped ||
+            (genericAdmission != null && store.supportsCheckpointAuthority)) {
             "Complete account export budget unavailable"
         }
         actions.forEach(scope::rejectCredentials)
@@ -1032,6 +1057,11 @@ internal class VortxNativeSession private constructor(
         scope.rejectCredentials(hostArchive)
         val originalRuntime = runtime
         val originalRevision = revision
+        val originalCheckpoint = if (requireCompleteAccountExportBudget && !runtime.isTyped)
+            checkNotNull(genericCheckpoint).also {
+                check(acknowledgedCheckpoint === it) { "Original playlist checkpoint changed" }
+                store.requireCurrentCheckpoint(scope, it)
+            } else null
         val before = originalRuntime.stateJson()
         val candidate = originalRuntime.fork()
         var installed = false
@@ -1079,9 +1109,28 @@ internal class VortxNativeSession private constructor(
             val state = validatePresentation(updated)
             val prior = JSONObject(before)
             val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
-            beforeCommit()
-            commitCheckpoint(updated, candidate, hostArchive, playbackState,
-                requireCompleteAccountExportBudget = requireCompleteAccountExportBudget)
+            val replace = {
+                beforeCommit()
+                check(runtime === originalRuntime && revision == originalRevision &&
+                    (originalCheckpoint == null || acknowledgedCheckpoint === originalCheckpoint)) {
+                    "Original native checkpoint authority changed"
+                }
+                commitCheckpoint(updated, candidate, hostArchive, playbackState,
+                    requireCompleteAccountExportBudget = requireCompleteAccountExportBudget,
+                    genericOriginalCheckpoint = originalCheckpoint)
+            }
+            if (originalCheckpoint != null) {
+                val native = state.getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+                // Include every captured pending global value in the complete cloud candidate,
+                // but persist only the requested playlist field. This budget preview neither
+                // acknowledges dirty stamps nor chooses a new durable global conflict winner.
+                val prospectiveHost = prospectiveGlobalChanges?.let {
+                    NativeHostPreferences.recordGlobals(scope, hostState, it)
+                } ?: hostState
+                val host = prospectiveHost.getJSONObject("document").toString().toByteArray(Charsets.UTF_8)
+                try { checkNotNull(genericAdmission).invoke(native, host, replace) }
+                finally { native.fill(0); host.fill(0) }
+            } else replace()
             check(isAccountCurrent()) { "Native account changed" }
             val rosterChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
             val profileOrRegistryChanged = rosterChanged ||
@@ -1143,9 +1192,10 @@ internal class VortxNativeSession private constructor(
      * In particular, old runtime A must never overwrite a possibly installed binding B. */
     private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null,
                                  playbackState: PlaybackCheckpointState? = null,
-                                 requireCompleteAccountExportBudget: Boolean = false) {
+                                 requireCompleteAccountExportBudget: Boolean = false,
+                                 genericOriginalCheckpoint: NativeCheckpointRead? = null) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
-        check(!requireCompleteAccountExportBudget || candidate.isTyped) {
+        check(!requireCompleteAccountExportBudget || candidate.isTyped || genericOriginalCheckpoint != null) {
             "Complete account export budget unavailable"
         }
         // Resource revisions, ordinary progress/settings, unrelated roster edits and dormant
@@ -1165,13 +1215,20 @@ internal class VortxNativeSession private constructor(
         try {
             val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
             val committedCompleteAccount = candidate.commitTypedCheckpoint(snapshot, archiveChanges)
-            check(!requireCompleteAccountExportBudget || committedCompleteAccount) {
+            check(!requireCompleteAccountExportBudget || committedCompleteAccount || genericOriginalCheckpoint != null) {
                 "Complete account export budget unavailable"
             }
             if (!committedCompleteAccount) {
-                store.commit(scope, snapshot)
-                check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
-                if (store.supportsCheckpointAuthority) {
+                if (genericOriginalCheckpoint != null) {
+                    check(acknowledgedCheckpoint === genericOriginalCheckpoint)
+                    // The exact original encrypted-file capability is consumed by atomic CAS.
+                    acknowledgedCheckpoint = store.compareAndCommitCheckpoint(scope, genericOriginalCheckpoint, snapshot)
+                        .also { check(it.plaintext == snapshot) { "Native checkpoint readback failed" } }
+                } else {
+                    store.commit(scope, snapshot)
+                    check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
+                }
+                if (genericOriginalCheckpoint == null && store.supportsCheckpointAuthority) {
                     acknowledgedCheckpoint = store.captureCheckpoint(scope).also { check(it.plaintext == snapshot) }
                 }
             }

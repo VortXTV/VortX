@@ -118,7 +118,9 @@ internal class NativeProviderCredentials(val scope: String, sealed: String? = nu
         val existing = document.opt("apiKeys")
         require(existing == null || existing === JSONObject.NULL || existing is JSONObject)
         val api = (existing as? JSONObject) ?: JSONObject().also { document.put("apiKeys", it) }
-        fields().keys().forEach { key ->
+        // Account-qualified legacy fallback is part of the prospective encrypted account too.
+        // Mirroring it into legacy apiKeys does not mint a native register or clear pending intent.
+        (fields().keys().asSequence().toSet() + local.getJSONObject("baseline").keys().asSequence().toSet()).forEach { key ->
             val value = value(key)
             if (value == null) api.remove(key) else api.put(key, value)
             if (key in METADATA) {

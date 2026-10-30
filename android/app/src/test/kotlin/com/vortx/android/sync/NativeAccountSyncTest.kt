@@ -32,8 +32,14 @@ class NativeAccountSyncTest {
         manager.installSessionRestoreTestSeam(manager.currentSession())
         manager.installNativeGatewayTestSeam(gateway, providerStore)
     }
-    @org.junit.Before fun mainDispatcher() { Dispatchers.setMain(UnconfinedTestDispatcher()) }
-    @org.junit.After fun resetDispatcher() { com.vortx.android.integrations.NativeProviderAccess.unbindForTest(); Dispatchers.resetMain() }
+    @org.junit.Before fun mainDispatcher() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+    }
+    @org.junit.After fun resetDispatcher() {
+        NativeSettingsFence.queuedNotificationsForTest = null
+        com.vortx.android.integrations.NativeProviderAccess.unbindForTest(); Dispatchers.resetMain()
+    }
     private val key = ByteArray(32) { (it + 1).toByte() }
     private val account = VortXSyncManager.Account("00000000-0000-0000-0000-000000000123", "fixture@example.invalid", "Fixture", false)
     private fun bindings() = object : VortxRuntimeBindings {
@@ -173,6 +179,315 @@ class NativeAccountSyncTest {
             assertEquals(1, requests)
             assertEquals("{\"stremiox.audioLang\":123.25}", context.getSharedPreferences("vortx_sync_dirty", 0).getString(storageKey, null))
         } finally { manager.cancelSyncTestWork() }
+    }
+
+    /** Genuine generic export -> real encrypted GET -> manager capture -> actual coordinator mount.
+     * Never fabricate a native schema carrier or a verified streaming UID. UNRUN proposal.
+     */
+    private inner class GenericPlaylistFixture(val padding: Int = 0) {
+        val context = TestContext()
+        val manager = VortXSyncManager(context)
+        val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "generic-playlist-admission-").toFile()
+        val disk = VortxEncryptedCheckpointStore(directory) { javax.crypto.spec.SecretKeySpec(key, "AES") }
+        var forks = 0
+        var checkpointAttempts = 0
+        private val checkpoints = object : com.vortx.android.engine.VortxCheckpointStore by disk {
+            override fun compareAndCommitCheckpoint(scope: com.vortx.android.engine.VortxAccountScope,
+                expected: com.vortx.android.engine.NativeCheckpointRead, snapshot: String): com.vortx.android.engine.NativeCheckpointRead {
+                checkpointAttempts++
+                return disk.compareAndCommitCheckpoint(scope, expected, snapshot)
+            }
+        }
+        lateinit var principal: SessionOwnerSnapshot.Account
+        lateinit var runtime: NativeAccountCoordinator
+        lateinit var originalRaw: ByteArray
+        var uploaded: ByteArray? = null
+        var uploadedVersion: Long? = null
+        var onFork: (() -> Unit)? = null
+        val field = com.vortx.android.engine.NativePlaylist.field(java.util.UUID.fromString("00000000-0000-0000-0000-000000000101"))
+        fun value() = com.vortx.android.engine.NativePlaylist.encodedValue(com.vortx.android.engine.NativePlaylist.Document(
+            "00000000-0000-0000-0000-000000000101", "Saved", listOf(com.vortx.android.engine.NativePlaylist.Entry(
+                "00000000-0000-0000-0000-000000000201", "tt000101", "movie", "Title"))))
+        suspend fun start() {
+            org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+            System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
+            manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0,
+                transport = { method, _, body, _ ->
+                    if (method == "GET") 200 to JSONObject().put("version", 100).put("document",
+                        VortXCrypto.sealDocument(key, originalRaw, account.id, 100, true))
+                    else {
+                        val sent = requireNotNull(body)
+                        uploadedVersion = sent.getLong("version")
+                        uploaded = VortXCrypto.openDocument(key, sent.getString("document"), account.id, sent.getLong("version"))
+                        200 to JSONObject().put("accepted", true)
+                    }
+                })
+            manager.installSessionRestoreTestSeam(manager.currentSession())
+            principal = manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+            val baseBindings = bindings()
+            val hooked = object : VortxRuntimeBindings by baseBindings {
+                override fun hydrate(snapshot: String): Long = baseBindings.hydrate(snapshot).also {
+                    forks++
+                    val action = onFork; onFork = null; action?.invoke()
+                }
+            }
+            runtime = NativeAccountCoordinator(hooked, checkpoints, { noNetwork() }, { manager.sessionOwnerSnapshot() == it },
+                { it() }, {}, captureOwnAccountAdmission = { captured ->
+                    manager.captureLocalLibraryMutationAdmission()?.let { admission -> { action ->
+                        admission { manager.sessionOwnerSnapshot() == captured && action() }
+                    } }
+                })
+            val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)
+            val legacy = JSONObject().put("vortx", JSONObject().put("roster", org.json.JSONArray().put(owner.encode()))
+                .put("rosterModified", 1).put("library", org.json.JSONArray()).put("addons", org.json.JSONArray()))
+            assertTrue(runtime.applyDocument(principal, legacy) { true })
+            val genuine = requireNotNull(runtime.exportDocument(principal))
+            assertNull(genuine.rawAccount)
+            assertTrue(genuine.nativeSync.getInt("schemaVersion") in 1..5)
+            assertTrue(genuine.nativeSync.has("legacyImport"))
+            val unknown = "{\"number\":1.2300e+2,\"negativeZero\":-0}".toByteArray()
+            val native = com.vortx.android.engine.OHJson.Obj(genuine.nativeSync.toString().toByteArray())
+                .set("futureNative", unknown).encoded()
+            val host = JSONObject(requireNotNull(genuine.hostPreferences).toString())
+            val profiles = host.getJSONObject("profiles")
+            val profile = com.vortx.android.engine.NativeHostPreferences.canonicalProfileID(owner.id)
+            val bucket = profiles.optJSONObject(profile) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(profile, it) }
+            bucket.getJSONObject("fields").put("playlist.v2.future", JSONObject().put("clock", 1)
+                .put("actor", "00000000-0000-0000-0000-000000000222")
+                .put("value", JSONObject().put("schema", 2).put("future", JSONObject().put("opaque", true))))
+            val root = com.vortx.android.engine.OHJson.Obj(legacy.toString().toByteArray())
+                .set("nativeSync", native).set("futureRoot", unknown)
+                .set("nativeHostPreferences", host.toString().toByteArray())
+                .set("apiKeys", "{\"futureKey\":\"preserved\"}".toByteArray())
+            if (padding > 0) root.set("padding", com.vortx.android.engine.OHJson.quote("x".repeat(padding)))
+            originalRaw = root.encoded()
+            installNative(manager, runtime)
+            assertTrue(manager.syncDown(true))
+            val retained = requireNotNull(coordinatorRead(runtime))
+            assertArrayEquals(originalRaw, retained.copyRawForApply(principal))
+            assertNotNull(runtime.exportDocument(principal)?.genericSourceNativeProjection)
+        }
+        suspend fun edit(target: NativePlaylistProfileGateway.Target = runtime.capturePlaylistProfile().getOrThrow().target) =
+            runtime.compareAndSetPlaylistField(target, "00000000-0000-0000-0000-000000000301", field, null, value())
+        suspend fun rejectAt(message: String, checkpointCalls: Int = 0) {
+            // Capture must succeed, and a real fork must be reached. An earlier admission failure
+            // cannot masquerade as provider/host budget, ABA, or encrypted checkpoint-CAS coverage.
+            val target = runtime.capturePlaylistProfile().getOrThrow().target
+            val priorForks = forks
+            val priorAttempts = checkpointAttempts
+            val failure = edit(target).exceptionOrNull()
+            assertNotNull(failure)
+            assertEquals(message, failure!!.message)
+            assertEquals(priorForks + 1, forks)
+            assertEquals(priorAttempts + checkpointCalls, checkpointAttempts)
+        }
+        suspend fun finish() {
+            if (::runtime.isInitialized) runtime.retire()
+            manager.cancelSyncTestWork()
+            if (::originalRaw.isInitialized) originalRaw.fill(0)
+            uploaded?.fill(0)
+            directory.listFiles()?.forEach { it.delete() }; directory.delete()
+        }
+    }
+
+    @Test fun `generic saved edit retains real GET after sync lease expiry and uploads raw siblings`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val retained = requireNotNull(coordinatorRead(fixture.runtime))
+            val staleTarget = fixture.runtime.capturePlaylistProfile().getOrThrow().target
+            fixture.manager.expireSyncOperationTestSeam()
+            assertTrue(fixture.edit(staleTarget).isFailure)
+            // Fresh UI authority is legal; old GET generation remains provenance, not live authority.
+            assertSame(retained, coordinatorRead(fixture.runtime))
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-pending")))
+            val accepted = fixture.edit().getOrThrow()
+            val ticket = requireNotNull(accepted.receipt)
+            val receiptOwner = accepted.target.receiptOwner
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Pending,
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+            assertTrue(accepted.registers.has(fixture.field))
+            assertTrue(accepted.registers.has("playlist.v2.future"))
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == true)
+            val local = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext!!
+            assertFalse(local.contains("fixture-pending"))
+            assertTrue(fixture.manager.syncUp())
+            // nativeSyncUp freezes this edit before its fresh GET replaces retained raw identity.
+            // The original receipt survives that merge; the original mutation target does not.
+            assertNotSame(retained, coordinatorRead(fixture.runtime))
+            assertFalse(fixture.runtime.playlistTargetIsCurrent(accepted.target))
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Saved(requireNotNull(fixture.uploadedVersion)),
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+            val sent = com.vortx.android.engine.OHJson.Obj(requireNotNull(fixture.uploaded))
+            val original = com.vortx.android.engine.OHJson.Obj(fixture.originalRaw)
+            assertArrayEquals(original.raw("futureRoot"), sent.raw("futureRoot"))
+            assertArrayEquals(original.obj("nativeSync").raw("futureNative"), sent.obj("nativeSync").raw("futureNative"))
+            val id = com.vortx.android.engine.NativeHostPreferences.canonicalProfileID(UserProfile.OWNER_ID)
+            assertArrayEquals(original.obj("nativeHostPreferences").obj("profiles").obj(id).obj("fields").raw("playlist.v2.future"),
+                sent.obj("nativeHostPreferences").obj("profiles").obj(id).obj("fields").raw("playlist.v2.future"))
+            assertEquals("preserved", JSONObject(com.vortx.android.engine.OHJson.utf8(sent.raw("apiKeys"))).getString("futureKey"))
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `full pending provider family can reject playlist before any local checkpoint replacement`() = runBlocking {
+        val fixture = GenericPlaylistFixture(2_000_000)
+        try {
+            fixture.start()
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "p".repeat(1_200_000))))
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            val updates = fixture.runtime.session().playlistUpdates.value
+            fixture.rejectAt("Complete account exceeds encrypted budget")
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+            assertEquals(updates, fixture.runtime.session().playlistUpdates.value)
+            assertFalse(fixture.runtime.session().requiresRecovery())
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == true)
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `queued dirty callback cannot hide oversized current host setting from precommit budget`() = runBlocking {
+        val fixture = GenericPlaylistFixture(2_000_000)
+        val notifications = mutableListOf<() -> Unit>()
+        NativeSettingsFence.queuedNotificationsForTest = notifications
+        try {
+            fixture.start()
+            val prefs = fixture.context.getSharedPreferences("vortx_settings", 0)
+            // 2 MB retained root + 3.7 MB prospective host is unambiguously above the encrypted
+            // 7 MiB envelope bound, even before JSON/nonce/tag/prefix overhead.
+            prefs.edit().putString("stremiox.languageOverride", "x".repeat(3_700_000)).apply()
+            assertTrue(notifications.isNotEmpty()) // The real changed value exists while its dirty callback waits.
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            fixture.rejectAt("Complete account exceeds encrypted budget")
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+            assertFalse(fixture.runtime.session().requiresRecovery())
+        } finally { fixture.finish(); NativeSettingsFence.queuedNotificationsForTest = mutableListOf() }
+    }
+
+    @Test fun `host ABA after capture and before fork commit is rejected by writer revision`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            fixture.onFork = {
+                val prefs = fixture.context.getSharedPreferences("vortx_settings", 0)
+                val old = prefs.getString("stremiox.languageOverride", null)
+                prefs.edit().putString("stremiox.languageOverride", "fixture-intermediate").apply()
+                prefs.edit().putString("stremiox.languageOverride", old).apply()
+            }
+            fixture.rejectAt("Pending settings changed")
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+            assertFalse(fixture.runtime.session().requiresRecovery())
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `provider pending acknowledgement invalidates full record even when selected credential event is unchanged`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "fixture-value")))
+            val wire = com.vortx.android.integrations.NativeProviderVault(providerStore).load(fixture.principal).document()
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            fixture.onFork = { assertTrue(com.vortx.android.integrations.NativeProviderAccess.acknowledge(fixture.principal, wire)) }
+            fixture.rejectAt("Pending provider family changed")
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+            assertFalse(fixture.runtime.session().requiresRecovery())
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `original absent register observation cannot overwrite a first committed playlist edit`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val target = fixture.runtime.capturePlaylistProfile().getOrThrow().target
+            fixture.edit(target).getOrThrow()
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            assertEquals("Stale playlist register", fixture.edit(target).exceptionOrNull()?.message)
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `same plaintext checkpoint replacement cannot reuse original encrypted file capability`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val scope = fixture.runtime.session().scope
+            val before = requireNotNull(fixture.disk.captureCheckpoint(scope).plaintext)
+            fixture.onFork = { fixture.disk.commit(scope, before) }
+            fixture.rejectAt("Native checkpoint changed", checkpointCalls = 1)
+            assertEquals(before, fixture.disk.captureCheckpoint(scope).plaintext)
+            assertTrue(fixture.runtime.session().requiresRecovery())
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `second authenticated raw read retires old playlist raw identity before a later edit`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val target = fixture.runtime.capturePlaylistProfile().getOrThrow().target
+            val original = requireNotNull(coordinatorRead(fixture.runtime))
+            assertTrue(fixture.manager.syncDown(true))
+            assertNotSame(original, coordinatorRead(fixture.runtime))
+            val before = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext
+            assertTrue(fixture.edit(target).isFailure)
+            assertEquals(before, fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext)
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `generic frozen receipt survives fresh GET while rejected candidate and retired lifetime cannot ACK`() = runBlocking {
+        val fixture = GenericPlaylistFixture()
+        try {
+            fixture.start()
+            val accepted = fixture.edit().getOrThrow()
+            val ticket = requireNotNull(accepted.receipt)
+            val receiptOwner = accepted.target.receiptOwner
+            val frozen = fixture.runtime.freezePlaylistReceipts(fixture.principal)
+            val original = requireNotNull(coordinatorRead(fixture.runtime))
+            assertTrue(fixture.manager.syncDown(true))
+            assertNotSame(original, coordinatorRead(fixture.runtime))
+            assertFalse(fixture.runtime.playlistTargetIsCurrent(accepted.target))
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Pending,
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+            // Fresh GET has no saved field. It cannot acknowledge this exact frozen register.
+            fixture.runtime.acceptPlaylistReceipts(fixture.principal, frozen, fixture.originalRaw.toString(Charsets.UTF_8), 101)
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Pending,
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+            val host = requireNotNull(fixture.runtime.exportDocument(fixture.principal)?.hostPreferences)
+            fixture.runtime.acceptPlaylistReceipts(fixture.principal, frozen,
+                JSONObject().put("nativeHostPreferences", host).toString(), 102)
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Saved(102),
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+            fixture.runtime.retirePlaylistReceiptOwner(receiptOwner)
+            fixture.runtime.acceptPlaylistReceipts(fixture.principal, frozen,
+                JSONObject().put("nativeHostPreferences", host).toString(), 103)
+            assertEquals(com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Unknown,
+                fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint))
+        } finally { fixture.finish() }
+    }
+
+    @Test fun `settings wrapper detaches sets and keeps clear multi key listener and unregister behavior`() {
+        val prefs = TestContext().getSharedPreferences("vortx_settings", 0)
+        val notifications = mutableListOf<() -> Unit>()
+        NativeSettingsFence.queuedNotificationsForTest = notifications
+        val events = mutableListOf<String?>()
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, name -> events += name }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        val input = mutableSetOf("one", "two")
+        prefs.edit().putStringSet("set", input).putString("other", "value").commit()
+        input.clear()
+        prefs.getStringSet("set", null)!!.clear()
+        (prefs.all.getValue("set") as MutableSet<*>).clear()
+        assertEquals(setOf("one", "two"), prefs.getStringSet("set", null))
+        assertTrue(events.isEmpty())
+        notifications.toList().forEach { it() }; notifications.clear()
+        assertEquals(setOf("set", "other"), events.toSet())
+        events.clear()
+        prefs.edit().clear().putString("afterClear", "kept").commit()
+        notifications.toList().forEach { it() }; notifications.clear()
+        assertTrue(events.contains(null)); assertTrue(events.contains("afterClear"))
+        assertEquals(mapOf("afterClear" to "kept"), prefs.all)
+        prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        events.clear(); prefs.edit().putString("later", "value").apply()
+        notifications.toList().forEach { it() }
+        assertTrue(events.isEmpty())
     }
 
     private fun coordinatorRead(coordinator: NativeAccountCoordinator): NativeAccountReadCapture? {
@@ -557,32 +872,43 @@ class NativeAccountSyncTest {
         private val stores = mutableMapOf<String, SharedPreferences>()
         override fun getApplicationContext(): Context = this
         override fun getPackageName() = "com.vortx.android.native.test"
-        override fun getSharedPreferences(name: String, mode: Int): SharedPreferences = stores.getOrPut(name) { memoryPreferences() }
+        override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
+            NativeSettingsFence.wrap(name, stores.getOrPut(name) { memoryPreferences() })
         override fun deleteSharedPreferences(name: String) = stores.remove(name) != null
     }
     companion object {
         private fun memoryPreferences(): SharedPreferences {
             val values = linkedMapOf<String, Any?>()
+            val listeners = java.util.WeakHashMap<SharedPreferences.OnSharedPreferenceChangeListener, Unit>()
+            lateinit var preference: SharedPreferences
             fun editor(): SharedPreferences.Editor {
                 val edits = linkedMapOf<String, Any?>(); var clear = false
                 return Proxy.newProxyInstance(SharedPreferences.Editor::class.java.classLoader, arrayOf(SharedPreferences.Editor::class.java)) { proxy, method, args ->
                     when (method.name) {
                         "clear" -> { clear = true; proxy }
                         "remove" -> { edits[args!![0] as String] = null; proxy }
-                        "commit", "apply" -> { if (clear) values.clear(); edits.forEach { (k, v) -> if (v == null) values.remove(k) else values[k] = v }; if (method.name == "commit") true else null }
+                        "commit", "apply" -> {
+                            if (clear) values.clear()
+                            edits.forEach { (k, v) -> if (v == null) values.remove(k) else values[k] = v }
+                            val keys = edits.keys.map { it as String? } + if (clear) listOf(null) else emptyList()
+                            listeners.keys.toList().forEach { listener -> keys.forEach { listener.onSharedPreferenceChanged(preference, it) } }
+                            if (method.name == "commit") true else null
+                        }
                         else -> if (method.name.startsWith("put")) { edits[args!![0] as String] = args[1]; proxy } else null
                     }
                 } as SharedPreferences.Editor
             }
-            return Proxy.newProxyInstance(SharedPreferences::class.java.classLoader, arrayOf(SharedPreferences::class.java)) { _, method, args ->
+            preference = Proxy.newProxyInstance(SharedPreferences::class.java.classLoader, arrayOf(SharedPreferences::class.java)) { _, method, args ->
                 when (method.name) {
                     "getAll" -> values.toMap()
                     "contains" -> values.containsKey(args!![0])
                     "edit" -> editor()
-                    "registerOnSharedPreferenceChangeListener", "unregisterOnSharedPreferenceChangeListener" -> null
+                    "registerOnSharedPreferenceChangeListener" -> { listeners[args!![0] as SharedPreferences.OnSharedPreferenceChangeListener] = Unit; null }
+                    "unregisterOnSharedPreferenceChangeListener" -> { listeners.remove(args!![0] as SharedPreferences.OnSharedPreferenceChangeListener); null }
                     else -> if (method.name.startsWith("get")) values[args!![0]] ?: args[1] else null
                 }
             } as SharedPreferences
+            return preference
         }
     }
 }

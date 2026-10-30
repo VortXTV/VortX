@@ -275,6 +275,9 @@ class NativeOwnerHistoryJniTest {
                     listOf(NativePlaylist.Entry("00000000-0000-0000-0000-000000000302",
                         "typed-history", "movie", "Typed saved title"))))
                 val playlistOwner = cold.read().owner
+                val receiptScope = cold.withPlaylistReceiptCapture { read, epoch -> read.owner to epoch }
+                assertEquals(playlistOwner, receiptScope.first)
+                assertTrue(cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { true })
                 val playlistRevision = cold.playlistUpdates.value
                 val beforeRejectedPlaylist = coldStore.captureCheckpoint(scope).plaintext
 
@@ -336,6 +339,18 @@ class NativeOwnerHistoryJniTest {
                 assertArrayEquals(exported.encoded(), persisted.accountBase)
                 assertTrue(runCatching { coldStore.requireCurrentCheckpoint(scope, coldRead) }.isFailure)
 
+                // Reuse the genuine exported typed account, archive and host state. A same-profile
+                // receive retires mutation revision but preserves the original read-only receipt.
+                cold.receiveOwnerHistory(exported, authority, NativeOwnerHistoryJniBindings, remoteHost = playlistCloudHost)
+                assertTrue(cold.hasOwnerHistory())
+                assertFalse(cold.accepts(playlistOwner))
+                assertTrue(cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { true })
+                authority.active = false
+                assertTrue(runCatching {
+                    cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { error("Retired account admitted") }
+                }.exceptionOrNull()?.message == "Playlist receipt session unavailable")
+                authority.active = true
+
                 // An already published playlist snapshot must receive a narrow invalidation when
                 // an unrelated checkpoint loses its original authority. The failed candidate is
                 // not installed, its mutation callback is not acknowledged, and durable bytes are
@@ -343,16 +358,20 @@ class NativeOwnerHistoryJniTest {
                 val publishedRegister = JSONObject(playlistRegister.toString())
                 val beforeFailedCheckpoint = coldStore.captureCheckpoint(scope).plaintext
                 val beforeFailureRevision = cold.playlistUpdates.value
+                val failureOwner = cold.read().owner
                 val failedCheckpoint = runCatching {
                     cold.dispatch(
                         listOf(JSONObject().put("type", "mark_watched").put("metaId", "failed-checkpoint")),
-                        owner = playlistOwner,
+                        owner = failureOwner,
                         beforeCommit = { authority.active = false },
                     )
                 }
                 authority.active = true
                 assertTrue(failedCheckpoint.isFailure)
                 assertTrue(cold.requiresRecovery())
+                assertEquals("Playlist receipt session unavailable", runCatching {
+                    cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { error("Recovering receipt admitted") }
+                }.exceptionOrNull()?.message)
                 assertEquals(beforeFailureRevision + 1, cold.playlistUpdates.value)
                 assertEquals(beforeFailedCheckpoint, coldStore.captureCheckpoint(scope).plaintext)
                 assertEquals(2, notifications)

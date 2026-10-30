@@ -10,7 +10,9 @@ internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: 
     val rawRoster: JSONArray = JSONArray(roster.map { it.encode() }), val hostProfileSyncPending: Boolean = false,
     val hostPreferences: JSONObject? = null, val hostSettingsBaseline: Any? = null,
     /** Complete raw account from the accepted typed checkpoint, never a reconstructed DTO. */
-    val rawAccount: ByteArray? = null)
+    val rawAccount: ByteArray? = null,
+    /** Actual source-only JNI projection paired with the retained authenticated generic GET. */
+    val genericSourceNativeProjection: ByteArray? = null)
 
 /** Opaque current mount and mutation generation; contains no account document or credentials. */
 internal data class NativeAccountMountToken(val installation: Any, val revision: Long)
@@ -80,6 +82,8 @@ internal class NativeAccountReadCapture private constructor(
  */
 internal interface NativeAccountGateway {
     fun retire()
+    /** Bound by the account manager; credentials remain inside its composer, outside Session/JNI. */
+    fun installPlaylistAccountProducer(producer: NativePlaylistAccountProducer) {}
     /** Cheap certification only. Missing/recovering mounts must take the full checkpoint path. */
     fun currentMountToken(account: SessionOwnerSnapshot.Account): NativeAccountMountToken? = null
     /** Requires a captured, durably authenticated account lease; never infers a global owner. */
@@ -120,6 +124,19 @@ internal interface NativeAccountGateway {
     fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any? = null
     fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?,
         acceptedCandidate: String, version: Long) {}
+}
+
+/** One edit's immutable full-family observations; raw GET operation metadata is not its authority. */
+internal fun interface NativePlaylistAccountProducer {
+    fun capture(account: SessionOwnerSnapshot.Account): NativePlaylistAccountWrite?
+}
+internal interface NativePlaylistAccountWrite : AutoCloseable {
+    /** Detached values only. No caller can mutate the captured family witness. */
+    fun pendingGlobalValues(): JSONObject
+    /** Must hold original account/provider/settings witnesses through [commit], without suspension. */
+    fun commitCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
+        candidateNative: ByteArray, candidateHost: ByteArray, commit: () -> Unit)
+    override fun close()
 }
 
 /**

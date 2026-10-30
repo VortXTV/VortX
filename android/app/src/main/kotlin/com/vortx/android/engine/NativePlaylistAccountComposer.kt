@@ -1,0 +1,73 @@
+package com.vortx.android.engine
+
+import org.json.JSONObject
+
+/** App-only whole cloud account composition. Never pass its output to JNI or host archives. */
+internal object NativePlaylistAccountComposer {
+    /** The before projection is the exact JNI normalization of the authenticated source, not the
+     * post-merge mount (which can already contain pending native mutations). */
+    fun compose(raw: ByteArray, originalNativeProjection: ByteArray, native: ByteArray,
+        host: ByteArray, providers: JSONObject): ByteArray {
+        val base = NativeOwnerHistoryAccount(raw)
+        val originalNative = requireNotNull(base.raw("nativeSync"))
+        val schema = OHJson.integer(OHJson.Obj(originalNative).raw("schemaVersion"))
+        require(schema in 1L..5L && base.raw(NativeOwnerHistoryAccount.ARCHIVE) == null)
+        val patchedNative = patch(originalNative, originalNativeProjection, native)
+        val nativeWire = if (OHJson.equal(originalNativeProjection, native)) patchedNative else
+            OHJson.Obj(patchedNative).set("schemaVersion", OHJson.Obj(native).raw("schemaVersion")).encoded()
+        val replacements = linkedMapOf(
+            "nativeSync" to nativeWire,
+            "nativeHostPreferences" to preserveRegisters(base.raw("nativeHostPreferences"), host),
+        )
+        // Provider mirror is prepared inside its full-record vault fence, without commit/ack.
+        // Preserve untouched apiKeys siblings (and their raw numeric/string spelling).
+        for (key in listOf("nativeProviderCredentials", "apiKeys")) {
+            providers.optJSONObject(key)?.let { next ->
+                val old = base.raw(key)
+                val encoded = next.toString().toByteArray(Charsets.UTF_8)
+                replacements[key] = if (old == null) encoded else patch(old,
+                    JSONObject(OHJson.utf8(old)).toString().toByteArray(Charsets.UTF_8), encoded)
+            }
+        }
+        return base.replacingOwned(replacements).validateBudget(writeV2 = true)
+    }
+
+    /** Apply changes between genuine source projection and prospective projection to raw slices.
+     * Unobserved raw keys are never inferred deletes. Ambiguous changed opaque arrays fail closed.
+     */
+    private fun patch(raw: ByteArray, before: ByteArray, after: ByteArray): ByteArray {
+        if (OHJson.equal(before, after)) return raw.copyOf()
+        val previous = JSONObject("{\"v\":" + OHJson.utf8(before) + "}").get("v")
+        val next = JSONObject("{\"v\":" + OHJson.utf8(after) + "}").get("v")
+        if (previous is JSONObject && next is JSONObject) {
+            val result = OHJson.Obj(raw); val a = OHJson.Obj(before); val b = OHJson.Obj(after)
+            for (key in a.keys + b.keys) {
+                val old = a[key]; val value = b[key]
+                if (value == null) result.remove(key)
+                else if (old == null) {
+                    val unobserved = result[key]
+                    require(unobserved == null || OHJson.equal(unobserved, value)) { "Unobserved raw sibling collision" }
+                    result.set(key, value)
+                } else result.set(key, patch(result[key] ?: old, old, value))
+            }
+            return result.encoded()
+        }
+        // Replacing an array/scalar is safe only when the original projection lost no raw material.
+        // Unchanged opaque arrays above retain every byte. No row identity is guessed here.
+        require(OHJson.equal(raw, before)) { "Opaque native value requires lossless mutation support" }
+        return after.copyOf()
+    }
+    private fun preserveRegisters(raw: ByteArray?, host: ByteArray): ByteArray {
+        if (raw == null) return host.copyOf()
+        val source = OHJson.Obj(raw)
+        val next = OHJson.Obj(host)
+        val originalProfiles = source.obj("profiles")
+        val nextProfiles = next.obj("profiles")
+        val originalNames = originalProfiles.keys.associateBy(NativeHostPreferences::canonicalProfileID)
+        val renamed = OHJson.Obj()
+        nextProfiles.keys.forEach { key -> renamed.set(originalNames[NativeHostPreferences.canonicalProfileID(key)] ?: key,
+            nextProfiles.raw(key)) }
+        next.set("profiles", renamed.encoded())
+        return patch(raw, JSONObject(OHJson.utf8(raw)).toString().toByteArray(Charsets.UTF_8), next.encoded())
+    }
+}

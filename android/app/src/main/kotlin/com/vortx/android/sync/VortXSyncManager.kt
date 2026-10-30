@@ -915,7 +915,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * only in the encrypted session/credential stores, never in this file.
      */
     private val settingsPrefs: SharedPreferences =
-        appContext.getSharedPreferences(SETTINGS_PREFS_FILE, Context.MODE_PRIVATE)
+        NativeSettingsFence.wrap(SETTINGS_PREFS_FILE, appContext.getSharedPreferences(SETTINGS_PREFS_FILE, Context.MODE_PRIVATE))
 
     // ---- LOCAL-WINS settings bookkeeping (audit 09 S-04, the Android port of Apple SettingsDirtyKeys) ----
 
@@ -927,7 +927,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * never carries another account's dirty set. Stored as a JSON object string in its own tiny prefs file.
      */
     private val dirtyPrefs: SharedPreferences =
-        appContext.getSharedPreferences("vortx_sync_dirty", Context.MODE_PRIVATE)
+        NativeSettingsFence.wrap("vortx_sync_dirty", appContext.getSharedPreferences("vortx_sync_dirty", Context.MODE_PRIVATE))
 
     /** Strong ref: Android holds preference listeners WEAKLY, so an inline lambda would be collected. */
     private val settingsChangeListener =
@@ -969,7 +969,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     /** Re-baseline the differ shadow to the live domain (after a remote apply / suppressed window). */
-    private fun refreshSettingsShadow() { settingsShadow = currentSyncableDomain() }
+    private fun refreshSettingsShadow() { NativeSettingsFence.mutateBookkeeping { settingsShadow = currentSyncableDomain() } }
 
     /**
      * A preferences write landed. Under [applyingRemote] it is a remote/housekeeping write: re-baseline only.
@@ -977,21 +977,22 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * durable), and re-baseline. No-op marking while signed out (nothing to protect).
      */
     private fun noteLocalSettingsChange() {
-        // A callback must keep its original account across the domain read/diff as well as the write.
         val lease = captureSyncLease()
-        val current = currentSyncableDomain()
-        val signedIn = lease != null
-        val changed = if (!applyingRemote && signedIn) {
-            SettingsDirtyKeys.changedSyncableKeys(settingsShadow, current) { SettingsBackup.isSyncable(it) }
-        } else {
-            emptySet()
-        }
-        settingsShadow = current
-        if (changed.isEmpty() || lease == null) return
+        if (lease == null) { refreshSettingsShadow(); return }
+        var changed = emptySet<String>()
         if (!publishIfSyncLeaseCurrent(lease) {
-            val dirty = readDirtySettings()
-            SettingsDirtyKeys.mark(changed, at = System.currentTimeMillis() / 1000.0, into = dirty)
-            writeDirtySettings(dirty)
+            NativeSettingsFence.mutateBookkeeping {
+                val current = currentSyncableDomain()
+                changed = if (!applyingRemote) SettingsDirtyKeys.changedSyncableKeys(settingsShadow, current) {
+                    SettingsBackup.isSyncable(it)
+                } else emptySet()
+                settingsShadow = current
+                if (changed.isNotEmpty()) {
+                    val dirty = readDirtySettings()
+                    SettingsDirtyKeys.mark(changed, at = System.currentTimeMillis() / 1000.0, into = dirty)
+                    writeDirtySettings(dirty)
+                }
+            }
         }) return
         // Native receives can remain bodyless indefinitely. Exportable global edits must own
         // their own durable retry instead of waiting for an unrelated library/profile mutation.
@@ -1020,7 +1021,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     init {
-        settingsShadow = currentSyncableDomain()
+        NativeSettingsFence.mutateBookkeeping { settingsShadow = currentSyncableDomain() }
         settingsPrefs.registerOnSharedPreferenceChangeListener(settingsChangeListener)
     }
 
@@ -1187,6 +1188,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     internal fun attachNativeGateway(gateway: NativeAccountGateway) {
         nativeGateway = gateway
         bindNativeProviders()
+        gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
         scope.launch { syncDown(force = true) }
         scope.launch { sessionUiState.collect { state ->
             com.vortx.android.integrations.NativeProviderAccess.accountChanged()
@@ -1197,6 +1199,59 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         nativeGateway = gateway
         if (credentials != null) { nativeProviderStore = credentials; nativeProviderTestStore = true }
         bindNativeProviders()
+        gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
+    }
+
+    /** Capture once before the edit suspends. GET operation generation is intentionally absent:
+     * this edit owns a new current authenticated admission, plus the coordinator's original raw GET.
+     */
+    private fun capturePlaylistAccountWrite(account: SessionOwnerSnapshot.Account): NativePlaylistAccountWrite? {
+        if (sessionOwnerSnapshot() != account) return null
+        val lease = captureSyncLease()?.takeIf { it.accountId == account.id && it.ownerEpoch == account.generation } ?: return null
+        var result: NativePlaylistAccountWrite? = null
+        if (!publishIfSyncLeaseCurrent(lease) {
+            val providers = checkNotNull(com.vortx.android.integrations.NativeProviderAccess.captureProspective(account))
+            try {
+                val (hostWitness, capturedGlobals) = NativeSettingsFence.capture {
+                    val rawDirty = dirtyPrefs.getString(dirtySettingsStorageKey(account.id), null)
+                    val dirty = rawDirty?.let(::JSONObject) ?: JSONObject()
+                    dirty.keys().forEach { key -> require(dirty.getDouble(key).let { it.isFinite() && it >= 0 }) }
+                    val values = currentSyncableDomain()
+                    // Writer notification is deliberately asynchronous. Its not-yet-stamped edits
+                    // are included from the same fenced domain/shadow observation, never omitted.
+                    val unstamped = SettingsDirtyKeys.changedSyncableKeys(settingsShadow, values) {
+                        SettingsBackup.isSyncable(it)
+                    }
+                    val fields = dirty.keys().asSequence().toSet() + unstamped
+                    val exportable = fields.filter { it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS }
+                    require(exportable.all { !settingsPrefs.contains(it) || values.containsKey(it) }) {
+                        "Pending global setting cannot be exported"
+                    }
+                    JSONObject().also { changes -> exportable.forEach { field ->
+                        changes.put(field, values[field]?.let(JSONObject::wrap) ?: JSONObject.NULL)
+                    } }.toString()
+                }
+                result = object : NativePlaylistAccountWrite {
+                    private var active = true
+                    override fun pendingGlobalValues(): JSONObject { check(active); return JSONObject(capturedGlobals) }
+                    override fun commitCandidate(raw: ByteArray, originalNativeProjection: ByteArray,
+                        candidateNative: ByteArray, candidateHost: ByteArray, commit: () -> Unit) {
+                        check(active)
+                        check(publishIfSyncLeaseCurrent(lease) {
+                            providers.withCurrent(com.vortx.android.engine.NativeProfileOverlayWitness.parseAccountDocument(raw)) { full ->
+                                NativeSettingsFence.withCurrent(hostWitness) {
+                                    val prospective = com.vortx.android.engine.NativePlaylistAccountComposer.compose(
+                                        raw, originalNativeProjection, candidateNative, candidateHost, full)
+                                    try { commit() } finally { prospective.fill(0) }
+                                }
+                            }
+                        }) { "Original playlist account admission changed" }
+                    }
+                    override fun close() { active = false; providers.close() }
+                }
+            } catch (failure: Throwable) { providers.close(); throw failure }
+        }) return null
+        return result
     }
 
     /**
@@ -1809,6 +1864,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     /** Narrow regression seam for final native-dispatch admission; production replacements use the same coordinator. */
     internal fun captureSyncLeaseAdmissionTestSeam(): ((() -> Boolean) -> Boolean)? =
         captureSyncLease()?.let(::syncLeaseAdmission)
+    /** Exercise an expired transient sync operation without changing the authenticated account. */
+    internal fun expireSyncOperationTestSeam() { operations.invalidate {} }
 
     /** Capture invocation ownership even while signed out; a queued action cannot adopt a later session. */
     internal fun captureLocalLibraryMutationAdmission(): ((() -> Boolean) -> Boolean)? =
@@ -2412,7 +2469,21 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 replacements.remove("nativeSync")
                 replacements.remove("nativeHostPreferences")
             }
-            val rawCandidate = exactBase.replacingOwned(replacements).validateBudget(writeV2 = true)
+            val rawCandidate = if (exported.rawAccount != null || exported.genericSourceNativeProjection == null) {
+                // Preserve legacy bootstrap, but never downgrade a real generic native source
+                // whose original lossless projection could not be retained.
+                check(exported.rawAccount != null || (document.optJSONObject("nativeSync")?.optInt("schemaVersion") ?: 0) !in 1..5) {
+                    "Original generic native source projection unavailable"
+                }
+                exactBase.replacingOwned(replacements).validateBudget(writeV2 = true)
+            }
+            else {
+                val sourceProjection = exported.genericSourceNativeProjection ?: return null
+                try { com.vortx.android.engine.NativePlaylistAccountComposer.compose(originalRaw, sourceProjection,
+                    exported.nativeSync.toString().toByteArray(Charsets.UTF_8),
+                    checkNotNull(exported.hostPreferences).toString().toByteArray(Charsets.UTF_8), withProviders)
+                } finally { sourceProjection.fill(0) }
+            }
             return deriveBackup(lease, withProviders, pulled, gateway, exportMount, rawCandidate)
         }
         val first = derived() ?: return false
