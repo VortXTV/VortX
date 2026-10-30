@@ -1064,6 +1064,9 @@ final class CoreBridge: ObservableObject {
             return retirement
         }
         nativePlaybackReadLifetime.completeRetirement(installSubtitleRetirement)
+        // Dedicated owner-boundary signal. Playlist stores refresh their captured target or retire it;
+        // delivery must not retarget an old request to whichever profile is current later.
+        nativePlaylistChangeRevision &+= 1
         NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
             session.revoke(); throw VortxNativeError.invalidSnapshot
@@ -1129,6 +1132,7 @@ final class CoreBridge: ObservableObject {
         loadBoard()
         guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
         loadLibrary()
+        nativePlaylistChangeRevision &+= 1
     }
     @MainActor
     func closeNativeSession() async {
@@ -1155,6 +1159,8 @@ final class CoreBridge: ObservableObject {
             return (old, retirement)
         }
         nativePlaybackReadLifetime.completeRetirement(retiredBridge.1)
+        // Invalidate views holding the retired account/profile target before any async cleanup.
+        nativePlaylistChangeRevision &+= 1
         let old = retiredBridge.0
         nativeAccountEditRequests.removeAll(); nativePublishedCredentialSlot = nil
         let cancelEpoch = detachPublicationEpochStorage()
@@ -1332,6 +1338,8 @@ final class CoreBridge: ObservableObject {
     /// Bumped on every `RuntimeEvent::NewState`; SwiftUI observes this to refresh. `changedFields`
     /// holds the field names that changed since the last bump (e.g. ["board", "ctx"]).
     @MainActor @Published private(set) var revision = 0
+    /// Change-driven pulse for profile playlist carriers only; never a player/frame revision.
+    @MainActor @Published private(set) var nativePlaylistChangeRevision: UInt64 = 0
     @MainActor private(set) var changedFields: Set<String> = []
 
     /// Decoded screen state, refreshed on the main queue as the engine emits field changes.
@@ -7091,6 +7099,8 @@ extension CoreBridge {
                 VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential)
             case .progressAccepted:
                 VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential, progressOnly: true)
+            case .hostCarrierChanged(let receipt):
+                core.receiveNativePlaylistHostChange(receipt, producer: event.producer, origin: origin)
             case .changed:
                 guard core.nativeCallbackOriginIsCurrent(origin) else { return }
                 core.receiveOwnedMetadata(event, origin: origin)
@@ -7115,6 +7125,14 @@ extension CoreBridge {
     }
     @MainActor private func nativeCallbackOriginIsCurrent(_ origin: NativeCallbackOrigin) -> Bool {
         nativeCallbackSourceIsCurrent(origin) && publicationStillCurrent(origin.publication)
+    }
+
+    @MainActor private func receiveNativePlaylistHostChange(
+        _ receipt: VortxNativeCoreFacade.HostChangeReceipt,
+        producer: VortxNativeCoreFacade, origin: NativeCallbackOrigin) {
+        guard producer === origin.producer, nativeCallbackOriginIsCurrent(origin),
+              receipt.sourceID == producer.sourceID, producer.acceptsHostChange(receipt) else { return }
+        nativePlaylistChangeRevision &+= 1
     }
 
     @MainActor private func makeNativeSourceCallback(installation: UUID,
@@ -8116,6 +8134,41 @@ extension CoreBridge {
         let accepted = try await target.owner.facade.setCapturedPlaylistField(edit, expected: target.owner.binding,
             sourceAuthority: target.authority, checkpointValidator: validator)
         guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
-        return accepted // Local durable register only; not cloud-acceptance evidence.
+        guard let receiptOwner = nativePlaylistReceiptOwner(target.owner) else { throw VortxNativeError.superseded }
+        let originalCapture = target.owner.owner.credential
+        // This publishes only pending intent after local CAS. It does not label a cloud save.
+        _ = VortXSyncManager.shared.registerNativePlaylistMutation(credentialCapture: originalCapture,
+            owner: receiptOwner, field: edit.field, register: accepted)
+        return accepted // Local durable register only; cloud proof requires an exact accepted export.
+    }
+}
+
+
+extension CoreBridge {
+
+    @MainActor func captureNativePlaylistReceiptOwner() -> NativePlaylistReceiptOwner? {
+        guard let target = captureNativeWatchlistTarget() else { return nil }
+        return nativePlaylistReceiptOwner(target)
+    }
+    @MainActor private func nativePlaylistReceiptOwner(_ target: NativeWatchlistTarget) -> NativePlaylistReceiptOwner? {
+        guard case .account = target.owner.credential.scope, let accountGeneration = target.owner.accountGeneration else { return nil }
+        return .init(credentialNamespace: target.owner.credential.namespace,
+            credentialGeneration: target.owner.credential.generation, accountGeneration: accountGeneration,
+            profileID: target.owner.profileID, profileKey: target.binding.profileID,
+            profileGeneration: target.binding.profileGeneration,
+            sessionGeneration: target.owner.sessionGeneration)
+    }
+
+    /// Receipt check ignores the short-lived save-operation latch but requires the original account,
+    /// session, profile, account generation and profile generation to remain selected and installed.
+    @MainActor func nativePlaylistReceiptOwnerIsCurrent(_ owner: NativePlaylistReceiptOwner) -> Bool {
+        guard let current = captureNativeWatchlistTarget() else { return false }
+        return current.owner.credential.namespace == owner.credentialNamespace
+            && current.owner.credential.generation == owner.credentialGeneration
+            && current.owner.sessionGeneration == owner.sessionGeneration
+            && current.owner.accountGeneration == owner.accountGeneration && current.owner.profileID == owner.profileID
+            && current.binding.profileID == owner.profileKey
+            && current.binding.profileGeneration == owner.profileGeneration
+            && nativeWatchlistTargetIsCurrent(current)
     }
 }

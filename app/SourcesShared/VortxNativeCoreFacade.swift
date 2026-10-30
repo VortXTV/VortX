@@ -121,11 +121,27 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             self.resources = resources; self.resourceValues = resourceValues
         }
     }
+    /// Data-free receipt for one actually changed, acknowledged native host-preference carrier.
+    /// It deliberately carries no field values or serialized profile/account content.
+    struct HostChangeReceipt: Equatable, Sendable {
+        let sourceID: UUID
+        let sequence: UInt64
+        let accountGeneration: UUID
+        let profileGeneration: UUID
+        let registryGeneration: UUID
+        let profileID: String
+        fileprivate init(_ change: ChangeReceipt) {
+            sourceID = change.sourceID; sequence = change.sequence
+            accountGeneration = change.accountGeneration; profileGeneration = change.profileGeneration
+            registryGeneration = change.registryGeneration; profileID = change.profileID
+        }
+    }
     /// Original callback origin, captured before delivery or any executor hop.
     /// The source reference is historical identity, not fresh admission authority.
     struct SourceEvent: Sendable {
         enum Kind: Sendable {
             case changed(legacyFields: [String], receipt: ChangeReceipt?)
+            case hostCarrierChanged(HostChangeReceipt)
             case mutationAccepted
             case progressAccepted
         }
@@ -183,6 +199,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     // Installed only by private init, before exposure. Builders are pure local value capture;
     // the returned delivery, never the client callback, is invoked after the outermost F.
     private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?
+    private var sourceHostChangeDelivery: (@Sendable (HostChangeReceipt) -> (@Sendable () -> Void)?)?
     private var sourceAcceptedDelivery: (@Sendable (Bool) -> (@Sendable () -> Void)?)?
     private let ownedChange: (@Sendable (ChangeReceipt) -> Void)?
     private let changed: @Sendable ([String]) -> Void
@@ -403,6 +420,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 let event = SourceEvent(producer: self, kind: .changed(legacyFields: fields, receipt: receipt))
                 return { sourceEvent(event) }
             }
+            sourceHostChangeDelivery = { [weak self] receipt in
+                guard let self else { return nil }
+                let event = SourceEvent(producer: self, kind: .hostCarrierChanged(receipt))
+                return { sourceEvent(event) }
+            }
             sourceAcceptedDelivery = { [weak self] progressOnly in
                 guard let self else { return nil }
                 let event = SourceEvent(producer: self, kind: progressOnly ? .progressAccepted : .mutationAccepted)
@@ -430,8 +452,14 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         lock.withLock {
             let legacy = changed, owned = ownedChange
             let source = sourceChangedDelivery?(legacyFields, receipt)
+            let hostReceipt = receipt.flatMap { change in
+                legacyFields.contains("native_host_preferences") && change.fields.contains("native_host_preferences")
+                    ? HostChangeReceipt(change) : nil
+            }
+            let hostSource = hostReceipt.flatMap { sourceHostChangeDelivery?($0) }
             lock.afterOutermostUnlock {
                 source?()
+                hostSource?()
                 if let receipt { owned?(receipt) }
                 if !legacyFields.isEmpty { legacy(legacyFields) }
             }
@@ -455,6 +483,18 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// Recheck immediately before the owning sink commits. Original Bridge installation,
     /// credential and Session authority remain separate; no Session lease is acquired under F.
+    func acceptsHostChange(_ receipt: HostChangeReceipt) -> Bool {
+        lock.withLock {
+            guard !closed, receipt.sourceID == sourceID, receipt.sequence > 0,
+                  receipt.sequence <= changeSequence,
+                  (latestChangeSequence["native_host_preferences"] ?? 0) <= receipt.sequence,
+                  receipt.accountGeneration == accountEpoch,
+                  receipt.profileGeneration == watchlistProfileGeneration,
+                  receipt.registryGeneration == registryGeneration,
+                  values["native_state"]?["activeProfileId"] == .string(receipt.profileID) else { return false }
+            return true
+        }
+    }
     func acceptsChange(_ receipt: ChangeReceipt, field: String? = nil, settlingResource: Bool = false) -> Bool {
         lock.withLock {
             guard !closed, receipt.sourceID == sourceID, receipt.sequence > 0,

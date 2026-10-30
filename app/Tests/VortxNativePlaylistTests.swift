@@ -10,7 +10,7 @@ struct VortxNativePlaylistTests {
         do { try body() } catch { print("PASS \(label)"); return }
         preconditionFailure(label)
     }
-    static func main() throws {
+    static func main() async throws {
         let playlistID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
         let entryID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
         let candidate = PlaybackTitleQueuePolicy.Candidate(contentID: "tt123", type: "movie", title: "Example")!
@@ -68,6 +68,92 @@ struct VortxNativePlaylistTests {
               "false-heavy actual encoded body exceeds value ceiling")
         rejects("false-heavy envelope denied before serialization") {
             try VortxNativePlaylist.validateEnvelope(name: "playlist.v2.false-heavy", value: falseHeavy, global: false)
+        }
+
+        // Actual volatile receipt ledger policy: exact register, local edit generation, owner scope and caps.
+        let actorID = UUID().uuidString.lowercased()
+        let register: VortxJSON = .object(["clock": .unsigned(7), "actor": .string(actorID), "value": value])
+        let canonicalRegister = VortxNativePlaylist.canonicalReceiptRegister(register)!
+        let receiptOwner = NativePlaylistReceiptOwner(credentialNamespace: "account.fixture",
+            credentialGeneration: 4, accountGeneration: UUID(), profileID: UUID(uuidString: "A0000000-ABCD-EF01-AAAA-BBBBBBBBBBBB")!,
+            profileKey: "A0000000-ABCD-EF01-AAAA-BBBBBBBBBBBB", profileGeneration: UUID(), sessionGeneration: UUID())
+        let key = VortxNativePlaylist.field(playlistID)
+        var ledger = NativePlaylistCloudReceiptLedger()
+        let first = ledger.register(owner: receiptOwner, field: key, canonicalRegister: canonicalRegister)!
+        let firstFingerprint = NativePlaylistRegisterFingerprint(canonicalRegister: canonicalRegister)
+        check(ledger.state(owner: receiptOwner, field: key, current: firstFingerprint) == .pending,
+              "cloud receipt starts pending for exact register")
+        let wrongRegister = VortxNativePlaylist.canonicalReceiptRegister(.object([
+            "clock": .unsigned(8), "actor": .string(actorID), "value": value
+        ]))!
+        check(canonicalRegister != wrongRegister, "whole-register identity includes clock and actor")
+        check(!ledger.acknowledge(first.key, edit: first.edit, exactAcceptedRegister: wrongRegister, version: 9),
+              "candidate with different register cannot acknowledge pending edit")
+        let newer = ledger.register(owner: receiptOwner, field: key, canonicalRegister: wrongRegister)!
+        check(!ledger.acknowledge(newer.key, edit: first.edit, exactAcceptedRegister: canonicalRegister, version: 9),
+              "older edit generation cannot acknowledge newer local register")
+        let newFingerprint = NativePlaylistRegisterFingerprint(canonicalRegister: wrongRegister)
+        check(ledger.state(owner: receiptOwner, field: key, current: firstFingerprint) == .unknown
+              && ledger.state(owner: receiptOwner, field: key, current: newFingerprint) == .pending,
+              "superseded register is unknown while latest register stays pending")
+        check(ledger.acknowledge(newer.key, edit: newer.edit, exactAcceptedRegister: wrongRegister, version: 10)
+              && ledger.state(owner: receiptOwner, field: key, current: newFingerprint) == .saved(version: 10),
+              "exact current candidate yields versioned volatile receipt")
+        let replacementOwner = NativePlaylistReceiptOwner(credentialNamespace: receiptOwner.credentialNamespace,
+            credentialGeneration: receiptOwner.credentialGeneration, accountGeneration: receiptOwner.accountGeneration,
+            profileID: UUID(), profileKey: UUID().uuidString, profileGeneration: UUID(),
+            sessionGeneration: receiptOwner.sessionGeneration)
+        check(ledger.state(owner: replacementOwner, field: key, current: newFingerprint) == .unknown,
+              "receipt cannot transfer to another profile generation")
+        check(!ledger.invalidate(owner: replacementOwner) && ledger.state(owner: receiptOwner, field: key, current: newFingerprint) == .saved(version: 10),
+              "repeated invalidation of an unrelated owner is idempotent and preserves the current receipt")
+        var bounded = NativePlaylistCloudReceiptLedger()
+        var firstKey: String?
+        var last: (NativePlaylistReceiptKey, UUID)?
+        for index in 0...NativePlaylistCloudReceiptLedger.maximumEntries {
+            let id = UUID()
+            let field = VortxNativePlaylist.field(id)
+            let registered = bounded.register(owner: receiptOwner, field: field, canonicalRegister: canonicalRegister)!
+            if index == 0 { firstKey = field }
+            last = (registered.key, registered.edit)
+        }
+        let firstWasEvicted = bounded.state(owner: receiptOwner, field: firstKey!, current: firstFingerprint) == .unknown
+        let newestIsPending = bounded.state(owner: receiptOwner, field: last!.0.field, current: firstFingerprint) == .pending
+        check(firstWasEvicted && newestIsPending && bounded.pending.count == NativePlaylistCloudReceiptLedger.maximumEntries,
+              "bounded ledger evicts only in-memory proof metadata")
+        check(bounded.register(owner: receiptOwner, field: VortxNativePlaylist.field(UUID()),
+              canonicalRegister: Data(repeating: 0x61, count: NativePlaylistCloudReceiptLedger.maximumRegisterBytes + 1)) == nil,
+              "oversized receipt rejected before retention")
+        var byteBounded = NativePlaylistCloudReceiptLedger()
+        var oldestField: String?
+        for index in 0..<9 {
+            let field = VortxNativePlaylist.field(UUID())
+            _ = byteBounded.register(owner: receiptOwner, field: field,
+                canonicalRegister: Data(repeating: UInt8(index), count: 500 * 1024))!
+            if index == 0 { oldestField = field }
+        }
+        check(byteBounded.state(owner: receiptOwner, field: oldestField!, current: firstFingerprint) == .unknown
+              && byteBounded.pending.count < 9,
+              "aggregate byte cap evicts only oldest volatile receipt metadata")
+
+        let frozenPlaintext = try JSONEncoder().encode(VortxJSON.object(["nativeHostPreferences": .object([
+            "profiles": .object([receiptOwner.profileKey: .object(["fields": .object([key: register])])])
+        ])]))
+        let candidateProjection = try await NativePlaylistCloudReceiptProjectionWorker.shared.candidateProjection(
+            plaintext: frozenPlaintext, owner: receiptOwner, fields: [key], edits: [key: first.edit])
+        check(candidateProjection.registers[key] == canonicalRegister && candidateProjection.edits[key] == first.edit,
+              "background projection matches exact captured register and frozen edit generation")
+        check(try await NativePlaylistCloudReceiptProjectionWorker.shared.fingerprint(register) == firstFingerprint,
+              "background query fingerprint avoids main-actor register serialization")
+        let wrongProfileCase = try JSONEncoder().encode(VortxJSON.object(["nativeHostPreferences": .object([
+            "profiles": .object([receiptOwner.profileKey.lowercased(): .object(["fields": .object([key: register])])])
+        ])]))
+        do {
+            _ = try await NativePlaylistCloudReceiptProjectionWorker.shared.candidateProjection(
+                plaintext: wrongProfileCase, owner: receiptOwner, fields: [key], edits: [key: first.edit])
+            preconditionFailure("carrier with a noncanonical profile key must not match the captured key")
+        } catch NativePlaylistCloudReceiptProjectionWorker.Failure.invalidProjection {
+            print("PASS profile key lookup uses captured spelling")
         }
         for boolean in [true, false] {
             // Compact {"v":<bool>,"p":""} is 17 bytes for true, 18 for false.

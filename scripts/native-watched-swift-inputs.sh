@@ -13,6 +13,8 @@ native_watched_swift_inputs=(
   app/SourcesShared/VortxNativeHostFieldMutation.swift
   app/SourcesShared/PlaybackTitleQueuePolicy.swift
   app/SourcesShared/VortxNativePlaylist.swift
+  app/SourcesShared/NativePlaylistCloudReceiptLedger.swift
+  app/SourcesShared/NativePlaylistCloudReceiptProjectionWorker.swift
   app/SourcesShared/VortxNativeFIFOAdmission.swift
   app/SourcesShared/OwnerHistoryExactJSON.swift
   app/SourcesShared/VortxNativeWebsiteAddonEdits.swift

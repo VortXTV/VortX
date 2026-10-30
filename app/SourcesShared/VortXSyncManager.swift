@@ -128,6 +128,9 @@ final class VortXSyncManager: ObservableObject {
     /// from this device (or signed out).
     @Published private(set) var lastSyncAt: Date?
     @Published private(set) var backupUploadFailure: SyncBackupUploadFailure?
+    /// Playlist cloud receipts are volatile exact-register evidence, separate from account-wide sync status.
+    @Published private(set) var nativePlaylistCloudReceiptRevision: UInt64 = 0
+    private var nativePlaylistReceiptLedger = NativePlaylistCloudReceiptLedger()
 
     /// Transport success does not mean every locally retained preference has converged.
     var pendingSettingsMessage: String? {
@@ -3493,6 +3496,8 @@ final class VortXSyncManager: ObservableObject {
         // Interpretation-only preference fields sliced from THAT plaintext, before the PUT.
         // Retried DerivedSyncDocs retain their own projection; never substitute current state.
         var nativePreferenceAckData: Data? = nil
+        var nativePlaylistAckData: NativePlaylistCandidateProjection? = nil
+        var nativePlaylistAcceptedVersion: Int? = nil
         // Captured with the host edits actually submitted to the native merge. In
         // particular, later repair of an omitted key cannot acknowledge its old stamp.
         var nativeDirtySettings: [String: Double] = [:]
@@ -3511,7 +3516,9 @@ final class VortXSyncManager: ObservableObject {
         for attempt in 0..<maxRetries {
             guard isCurrent(capture), doc.credentialCapture == capture, doc.sourceIsCurrent(),
                   !hasPendingAccountDocApply(for: capture),
-                  let version = SyncDocumentRevisionPolicy.next(after: doc.baseRevision) else { return false }
+                  let version = SyncDocumentRevisionPolicy.next(after: doc.baseRevision),
+                  let frozen = await freezePlaylistAckCandidate(doc, version: version), isCurrent(capture), frozen.sourceIsCurrent() else { return false }
+            doc = frozen
             switch await pushSyncDocAt(doc.document, version: version, baseRevision: doc.baseRevision,
                                       credentialCapture: capture, plaintextData: doc.plaintextData,
                                       sourceIsCurrent: doc.sourceIsCurrent) {
@@ -4000,14 +4007,17 @@ final class VortXSyncManager: ObservableObject {
         if nativePreparedSeedCapture == capture {
             // Deployed worker: version zero INSERT succeeds only while no row exists. Never
             // escalate a rejected/unknown first insert to an epoch version over a peer's seed.
-            guard initial.baseRevision == nil, initial.credentialCapture == capture else { return false }
-            switch await pushSyncDocAt(initial.document, version: 0, baseRevision: initial.baseRevision,
-                                      credentialCapture: capture, plaintextData: initial.plaintextData,
-                                      sourceIsCurrent: initial.sourceIsCurrent) {
+            guard initial.baseRevision == nil, initial.credentialCapture == capture,
+                  let frozen = await freezePlaylistAckCandidate(initial, version: 0), isCurrent(capture) else { return false }
+            switch await pushSyncDocAt(frozen.document, version: 0, baseRevision: frozen.baseRevision,
+                                      credentialCapture: capture, plaintextData: frozen.plaintextData,
+                                      sourceIsCurrent: frozen.sourceIsCurrent) {
             case .accepted:
                 guard isCurrent(capture) else { return false }
-                acknowledgeNativePreferenceCloud(initial.document, receipts: preferenceReceipts, capture: capture,
-                    sentPreferenceAckData: initial.nativePreferenceAckData)
+                acknowledgeNativePlaylistCloudReceipts(frozen, capture: capture)
+                guard isCurrent(capture), frozen.sourceIsCurrent(), !hasPendingAccountDocApply(for: capture) else { return false }
+                acknowledgeNativePreferenceCloud(frozen.document, receipts: preferenceReceipts, capture: capture,
+                    sentPreferenceAckData: frozen.nativePreferenceAckData)
                 clearPushedDirtySettings(initial.nativeDirtySettings); return true
             case .upgradeRequired: return false
             case .rejected, .error:
@@ -4018,6 +4028,8 @@ final class VortXSyncManager: ObservableObject {
         }
         let pushed = await pushDerivedDoc(initial, credentialCapture: capture, onAccepted: { [weak self] sent in
             guard let self, self.isCurrent(capture), let id = self.account?.id else { return }
+            self.acknowledgeNativePlaylistCloudReceipts(sent, capture: capture)
+            guard self.isCurrent(capture), sent.sourceIsCurrent(), !self.hasPendingAccountDocApply(for: capture) else { return }
             let sentDoc = sent.document
             self.acknowledgeNativePreferenceCloud(sentDoc, receipts: preferenceReceipts, capture: capture,
                 sentPreferenceAckData: sent.nativePreferenceAckData)
@@ -6685,4 +6697,97 @@ extension VortXSyncManager {
             return nil
         }
     }
+}
+
+
+extension VortXSyncManager {
+    /// Called only after CoreBridge's captured local CAS/checkpoint returns its durable raw register.
+    func registerNativePlaylistMutation(credentialCapture capture: CredentialScopeRegistry.Capture,
+                                        owner: NativePlaylistReceiptOwner, field: String,
+                                        register: VortxJSON) -> Bool {
+        guard isCurrent(capture), capture == credentialAuthority.capture(), owner.credentialNamespace == capture.namespace,
+              owner.credentialGeneration == UInt64(capture.generation),
+              CoreBridge.shared.nativePlaylistReceiptOwnerIsCurrent(owner),
+              let bytes = VortxNativePlaylist.canonicalReceiptRegister(register),
+              nativePlaylistReceiptLedger.register(owner: owner, field: field, canonicalRegister: bytes) != nil else { return false }
+        nativePlaylistCloudReceiptRevision &+= 1
+        // Facade mutation acceptance may have raced an older upload and its ACK cleanup.
+        // Re-arm the existing push queue for this exact original credential generation.
+        nativeMutationDidCommit(credentialCapture: capture)
+        return true
+    }
+
+    func nativePlaylistCloudReceipt(owner: NativePlaylistReceiptOwner, field: String,
+                                               fingerprint: NativePlaylistRegisterFingerprint) -> NativePlaylistCloudReceiptState {
+        let capture = credentialAuthority.capture()
+        guard isCurrent(capture), owner.credentialNamespace == capture.namespace,
+              owner.credentialGeneration == UInt64(capture.generation),
+              CoreBridge.shared.nativePlaylistReceiptOwnerIsCurrent(owner) else {
+            invalidateNativePlaylistCloudReceipts(owner: owner)
+            return .unknown
+        }
+        return nativePlaylistReceiptLedger.state(owner: owner, field: field, current: fingerprint)
+    }
+
+    func invalidateNativePlaylistCloudReceipts(owner: NativePlaylistReceiptOwner? = nil) {
+        if nativePlaylistReceiptLedger.invalidate(owner: owner) {
+            nativePlaylistCloudReceiptRevision &+= 1
+        }
+    }
+
+    private func freezePlaylistAckCandidate(_ input: DerivedSyncDoc, version: Int) async -> DerivedSyncDoc? {
+        guard input.credentialCapture == credentialAuthority.capture(), input.sourceIsCurrent(),
+              !hasPendingAccountDocApply(for: input.credentialCapture) else { return nil }
+        let pending = nativePlaylistReceiptLedger.pending(credentialNamespace: input.credentialCapture.namespace,
+            generation: UInt64(input.credentialCapture.generation))
+        guard let owner = pending.first?.0.owner,
+              CoreBridge.shared.nativePlaylistReceiptOwnerIsCurrent(owner) else {
+            return DerivedSyncDoc(document: input.document, baseRevision: input.baseRevision,
+                credentialCapture: input.credentialCapture, sourceIsCurrent: input.sourceIsCurrent,
+                plaintextData: input.plaintextData, nativePreferenceAckData: input.nativePreferenceAckData,
+                nativeDirtySettings: input.nativeDirtySettings)
+        }
+        guard let plaintext = input.plaintextData ?? (try? JSONSerialization.data(withJSONObject: input.document)),
+              plaintext.count <= OwnerHistoryExactJSON.maximumBytes else { return nil }
+        var projection: NativePlaylistCandidateProjection?
+        let selected = pending.filter { $0.0.owner == owner }
+        let fields = selected.map { $0.0.field }
+        let edits = Dictionary(uniqueKeysWithValues: selected.map { ($0.0.field, $0.1.edit) })
+        projection = try? await NativePlaylistCloudReceiptProjectionWorker.shared.candidateProjection(
+            plaintext: plaintext, owner: owner, fields: fields, edits: edits)
+        guard input.sourceIsCurrent(), isCurrent(input.credentialCapture),
+              !hasPendingAccountDocApply(for: input.credentialCapture) else { return nil }
+        return DerivedSyncDoc(document: input.document, baseRevision: input.baseRevision,
+            credentialCapture: input.credentialCapture, sourceIsCurrent: input.sourceIsCurrent,
+            plaintextData: plaintext, nativePreferenceAckData: input.nativePreferenceAckData,
+            nativePlaylistAckData: projection, nativePlaylistAcceptedVersion: version,
+            nativeDirtySettings: input.nativeDirtySettings)
+    }
+
+    private func acknowledgeNativePlaylistCloudReceipts(_ candidate: DerivedSyncDoc,
+                                                         capture: CredentialScopeRegistry.Capture) {
+        guard isCurrent(capture), candidate.credentialCapture == capture, candidate.sourceIsCurrent(),
+              !hasPendingAccountDocApply(for: capture), let projection = candidate.nativePlaylistAckData,
+              let version = candidate.nativePlaylistAcceptedVersion,
+              isCurrentOwner(projection.owner) else { return }
+        for (field, edit) in projection.edits {
+            let key = NativePlaylistReceiptKey(owner: projection.owner, field: field)
+            guard let intent = nativePlaylistReceiptLedger.pending(key, edit: edit),
+                  projection.registers[field] == intent.register,
+                  isCurrent(capture), candidate.sourceIsCurrent(),
+                  !hasPendingAccountDocApply(for: capture), isCurrentOwner(key.owner),
+                  nativePlaylistReceiptLedger.isPending(key, edit: edit) else { continue }
+            guard nativePlaylistReceiptLedger.acknowledge(key, edit: edit,
+                exactAcceptedRegister: intent.register, version: version) else { continue }
+            nativePlaylistCloudReceiptRevision &+= 1
+        }
+    }
+
+    private func isCurrentOwner(_ owner: NativePlaylistReceiptOwner) -> Bool {
+        let capture = credentialAuthority.capture()
+        return isCurrent(capture) && owner.credentialNamespace == capture.namespace
+            && owner.credentialGeneration == UInt64(capture.generation)
+            && CoreBridge.shared.nativePlaylistReceiptOwnerIsCurrent(owner)
+    }
+
 }

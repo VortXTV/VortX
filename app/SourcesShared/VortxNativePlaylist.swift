@@ -9,7 +9,7 @@ enum VortxNativePlaylist {
     static let maximumJSONDepth = 64
     static let maximumJSONNodes = 65_536
     static let maximumValueBytes = 512 * 1024
-    private static let maximumRegisterBytes = maximumValueBytes + 1024
+    static let maximumRegisterBytes = maximumValueBytes + 1024
     static let maximumLivePlaylists = 32
 
     struct Document: Equatable, Sendable {
@@ -163,6 +163,15 @@ enum VortxNativePlaylist {
         ])
         guard boundedJSONCost(value) != nil else { throw Failure.oversized }
         return value
+    }
+
+    /// Bounded exact register encoding for receipt identity. Call only after validating the carrier
+    /// register envelope; never serialize an unbounded caller-supplied VortxJSON first.
+    static func canonicalReceiptRegister(_ raw: VortxJSON) -> Data? {
+        guard boundedRegisterValue(raw) != nil,
+              let bytes = try? VortxNativeHostFieldEvidence.canonicalData(raw),
+              bytes.count <= maximumRegisterBytes else { return nil }
+        return bytes
     }
 
     /// Validate the complete observed register before the raw CAS serializer/equality helper runs.
