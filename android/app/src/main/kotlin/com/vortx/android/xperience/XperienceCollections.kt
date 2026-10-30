@@ -310,7 +310,10 @@ internal object XperienceCollections {
     private fun portableSwiftNumber(text: String): String {
         val before = normalizedNumber(text)
         val encoded = swiftFixedWidthInteger(before) ?: run {
-            val number = text.toDoubleOrNull()?.takeIf(Double::isFinite) ?: reject(Failure.UNPRESERVABLE_NUMBER)
+            // Apple StrictParser maps a failed/non-finite SDK Double decode to INVALID_JSON.
+            // Raw exponent bounds above still fail first as UNPRESERVABLE_NUMBER.
+            val number = text.toDoubleOrNull() ?: reject(Failure.INVALID_JSON)
+            if (!number.isFinite()) reject(Failure.INVALID_JSON)
             swiftShortestDouble(number)
         }
         if (before != normalizedNumber(encoded)) reject(Failure.UNPRESERVABLE_NUMBER)

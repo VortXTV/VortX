@@ -7,6 +7,17 @@ import java.nio.file.StandardOpenOption
 
 fun main(args: Array<String>) {
     require(args.size == 2)
+    for (token in listOf("00", "01", "-01", "1.", "1.e1", "+1", ".1", "1e", "1e+", "1e--2")) {
+        val input = """[{"id":"numeric-grammar","title":"Numeric grammar","folders":[],"extension":$token}]""".toByteArray(Charsets.UTF_8)
+        try {
+            XperienceCollections.parse(input)
+            throw AssertionError("Malformed numeric token was admitted: $token")
+        } catch (failure: XperienceCollections.Rejected) {
+            check(failure.reason == XperienceCollections.Failure.INVALID_JSON) {
+                "Malformed numeric token had the wrong failure: $token ${failure.reason}"
+            }
+        }
+    }
     val corpus = Files.readAllBytes(Path.of(args[0]))
     require(corpus.size <= 128 * 1024)
     val lines = OHJson.utf8(corpus).split('\n').filter { it.isNotEmpty() && !it.startsWith('#') }

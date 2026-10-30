@@ -2,7 +2,10 @@ import Foundation
 
 @main
 struct SwiftFixture {
-    enum FixtureFailure: Error { case invalidArguments, invalidCorpus, unexpectedFailure }
+    enum FixtureFailure: Error {
+        case invalidArguments, invalidCorpus, unexpectedFailure
+        case malformedNumberAdmitted(String), malformedNumberWrongFailure(String)
+    }
 
     static func category(_ failure: XperienceCollections.Failure) -> String {
         switch failure {
@@ -23,6 +26,15 @@ struct SwiftFixture {
 
     static func main() throws {
         guard CommandLine.arguments.count == 3 else { throw FixtureFailure.invalidArguments }
+        for token in ["00", "01", "-01", "1.", "1.e1", "+1", ".1", "1e", "1e+", "1e--2"] {
+            let input = Data("[{\"id\":\"numeric-grammar\",\"title\":\"Numeric grammar\",\"folders\":[],\"extension\":\(token)}]".utf8)
+            do {
+                _ = try XperienceCollections.parse(input)
+                throw FixtureFailure.malformedNumberAdmitted(token)
+            } catch let failure as XperienceCollections.Failure {
+                guard failure == .invalidJSON else { throw FixtureFailure.malformedNumberWrongFailure(token) }
+            }
+        }
         let corpusURL = URL(fileURLWithPath: CommandLine.arguments[1])
         let output = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
         let corpus = try Data(contentsOf: corpusURL)
