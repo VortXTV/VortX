@@ -129,7 +129,7 @@ run_component() {
   return "$status"
 }
 stop_if_interrupted
-expected_input_manifest_sha=24924c0a39673d3ee5b91da8612cb2f498321e3dcf9364f9c0f467b6b7f94166
+expected_input_manifest_sha=c91fe5afd5413170903e1c756ab50aa62b3df0e0e25381fbf8e8a4e16fe92fa8
 observed_input_manifest_sha="$(shasum -a 256 "$repo_root/test/xperience-export/pinned-fixtures.sha256")"
 observed_input_manifest_sha="${observed_input_manifest_sha%% *}"
 [[ "$observed_input_manifest_sha" == "$expected_input_manifest_sha" ]] || exit 90

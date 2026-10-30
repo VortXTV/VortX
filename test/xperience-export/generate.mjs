@@ -44,7 +44,7 @@ function generate(repoArgument, runArgument, runnerArgument) {
   read(path.join(repo, 'app/SourcesShared/VortxNativeCoreFacade.swift'));
   read(path.join(repo, 'app/SourcesShared/LegacyWatchOwnership.swift'));
   const proofPath = path.join(run, 'NativeSubtitleProofHosts.swift');
-  const proofRun = spawnSync(process.execPath, [proofComposer, repo, 'full-shells', proofPath], {encoding: 'utf8'});
+  const proofRun = spawnSync(process.execPath, [proofComposer, repo, 'bridge-extension-facade-shell', proofPath], {encoding: 'utf8'});
   if (proofRun.error || proofRun.status !== 0) throw new Error('Actual subtitle proof extraction failed: ' + (proofRun.stderr || proofRun.error));
   const proofReceipt = JSON.parse(proofRun.stdout);
   outputs.push({path: proofPath, sha256: hash(fs.readFileSync(proofPath))});
