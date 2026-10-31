@@ -2167,7 +2167,9 @@ struct PlayerScreen: View {
     // Playback-info overlay rows, refreshed while the Info panel is open.
     @State private var infoRows: [(String, String)] = []
 
-    var body: some View {
+    // The body is split into three chained views because Xcode 26 cannot type-check the whole modifier
+    // chain in reasonable time (Xcode 27 can). Order and behaviour are unchanged.
+    private var playerSceneBase: some View {
         Group {
             // ONE full-chrome player for every stream on every platform (Gap 1). Adaptive-HLS (.m3u8) on iOS
             // used to mount the bare `HLSPlayerView` (no track selection / episode nav / skip pill / trickplay /
@@ -2187,6 +2189,10 @@ struct PlayerScreen: View {
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
         .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(playbackGateToken); LoopbackPlaybackAssertion.begin(for: url) }
+    }
+
+    private var playerSceneWithWatchPartyOwnership: some View {
+        playerSceneBase
         .onValueChange(of: curMeta?.videoId) { _ in invalidateWatchPartyOwner() }
         .onValueChange(of: playbackSessionID) { _ in invalidateWatchPartyOwner() }
         .onValueChange(of: coordinator.player?.activeLoadToken) { _ in invalidateWatchPartyOwner() }
@@ -2200,6 +2206,10 @@ struct PlayerScreen: View {
         .onReceive(ProfileStore.shared.$activeID) { _ in invalidateWatchPartyOwner() }
         .onReceive(watchPartyAuthOwner.$account) { _ in invalidateWatchPartyOwner() }
         .onReceive(watchPartyAuthOwner.$isSignedIn) { _ in invalidateWatchPartyOwner() }
+    }
+
+    var body: some View {
+        playerSceneWithWatchPartyOwnership
         // Panels and the failure screen list sources, so they follow every engine change.
         .onValueChange(of: panel != nil || loadFailed) { listsSources in engineChanges.followAll(listsSources) }
         // A first frame, remote resume or dismissed dialog re-arms a visible bar. The original
