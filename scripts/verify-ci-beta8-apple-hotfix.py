@@ -30,14 +30,12 @@ REPO = "VortXTV/VortX"
 MARKER = "<!-- vortx-distribution: hosted-direct-beta -->"
 PROVENANCE = "VortX-Hosted-Direct-Beta-Provenance.json"
 SUMS = "SHA256SUMS.txt"
-# The v0.5.6-beta.8 tag points at a source whose Android did not compile; it is never published.
-# The same Apple hotfix scope ships as beta 9.
-TAG = "v0.5.6-beta.9"
-# The immutable candidate is built first; the public release tag is created only after acceptance.
-# candidate.1 failed the live ABI gate (harness file list); candidates 2 and 3 failed the CI compiler's
-# concurrency and type-check limits (Xcode 26); candidate.4 predates AetherEngine; candidate.5 timed out
-# its simulator launch build. candidate.6 is the accepted build source.
-BUILD_TAG = "v0.5.6-beta.9-candidate.6"
+# The v0.5.6-beta.8 tag points at a source whose Android did not compile, and v0.5.6-beta.9 at a source
+# this contract rejected (six Apple version pairs once VortXAetherKit joined); neither is published.
+# The same Apple scope, with AetherEngine, ships as beta 10.
+TAG = "v0.5.6-beta.10"
+# Beta 10 candidate.1 is the accepted build source (the Beta 9 candidates are superseded).
+BUILD_TAG = "v0.5.6-beta.10-candidate.1"
 VERSION = "0.5.6"
 BUILD = "281"
 ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
@@ -220,7 +218,7 @@ def public_download(tag, name, destination, size, expected_sha):
 
 
 def tag_version(tag):
-    require(tag == TAG, "only the exact reviewed Beta 9 Apple release is eligible")
+    require(tag == TAG, "only the exact reviewed Beta 10 Apple release is eligible")
     return VERSION
 
 
@@ -282,7 +280,8 @@ def source_versions(project, version, tag):
     require(tag_version(tag) == version, "source version differs from the exact beta tag")
     versions = re.findall(r'^\s*MARKETING_VERSION:\s*"?([0-9.]+)"?\s*$', project, re.M)
     builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
-    expected_pairs = 5
+    # The five app targets plus the VortXAetherKit framework embedded in both Apple TV apps.
+    expected_pairs = 6
     require(len(versions) == len(builds) == expected_pairs and set(versions) == {version} and len(set(builds)) == 1,
             "Apple target version/build pairs must agree with the exact beta contract")
     if tag == TAG:

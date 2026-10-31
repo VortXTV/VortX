@@ -9,9 +9,9 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 - **Imported Stremio titles in Library ([#267](https://github.com/VortXTV/VortX/issues/267)).** Apple apps now display the native engine’s combined Library view, including imported saved titles and eligible watched history. Continue Watching, detail membership, filters and search use the same accepted snapshot. Removed titles stay removed, and movies and series with the same ID keep their own resume state. A connected account also has an explicit **Refresh Stremio import** action, including after relaunch.
 - **Less work blocking Android sign-in ([#277](https://github.com/VortXTV/VortX/issues/277)).** Initial profile reads and recovery run in the background; the screen applies only a result that still belongs to the current account and profile. Dependent For You reloads are asynchronous, stale retries are bounded, and failed recovery retains pending saved changes. The reported customer crash still needs confirmation on the affected device.
 
-## 0.5.6 beta 9 - Accounts that always open, Cast and saved playlists
+## 0.5.6 beta 10 - Accounts that always open, Cast, saved playlists and AetherEngine
 
-Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 beta 7 packages while its account-sync changes finish testing. This beta brings the Apple apps everything since beta 7 (the beta 8 number was not published): accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists and Library genre filters, a new AetherEngine player to try on Apple TV, plus the fixes below.
+Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 beta 7 packages while its account-sync changes finish testing. This beta brings the Apple apps everything since beta 7 (the beta 8 and beta 9 numbers were not published): accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists and Library genre filters, a new AetherEngine player to try on Apple TV, plus the fixes below.
 
 ### Fixed
 

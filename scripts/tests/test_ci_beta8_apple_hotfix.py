@@ -23,7 +23,7 @@ BASE = datetime(2026, 10, 30, tzinfo=timezone.utc)
 def project(build="281"):
     return "name: Controlled\ntargets:\n" + "".join(
         f"  {name}:\n    settings:\n      MARKETING_VERSION: 0.5.6\n      CURRENT_PROJECT_VERSION: {build}\n"
-        for name in ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")) + "schemes:\n"
+        for name in ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXAetherKit", "VortXTVLite")) + "schemes:\n"
 
 
 def steps():
@@ -50,7 +50,7 @@ class Beta8AppleHotfixControls(unittest.TestCase):
         self.assertEqual(V.tag_version(V.TAG), "0.5.6")
         self.assertEqual(V.expected_engine(V.TAG), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
         self.assertEqual(V.source_versions(project(), "0.5.6", V.TAG), "281")
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.8", "v0.5.6-beta.10", "v0.5.6", V.BUILD_TAG, V.TAG + " "):
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.11", "v0.5.6", V.BUILD_TAG, V.TAG + " "):
             with self.assertRaises(ValueError): V.expected_engine(tag)
         with self.assertRaises(ValueError): V.source_versions(project("280"), "0.5.6", V.TAG)
 
