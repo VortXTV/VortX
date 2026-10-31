@@ -28,6 +28,9 @@ final class AetherEngineController: NSObject, PlayerEngine {
     private var isSeeking = false
     /// One-shot: the next load mounts paused (the surface was asked to start paused).
     var holdsNextLoadPaused = false
+    /// The local copy of the selected add-on subtitle, and the request allowed to replace it.
+    private var sidecarFile: URL?
+    private var sidecarRevision = 0
     var contentIsDolbyVision = false
     var isFullPlayerPresentation = false
     private(set) var videoSizeMode = "fit"
@@ -146,6 +149,8 @@ final class AetherEngineController: NSObject, PlayerEngine {
         player.stop()
         activeLoadToken = nil
         hasFirstFrame = false
+        sidecarRevision &+= 1
+        replaceSidecarFile(with: nil)
         subtitleOverlay.setText(nil)
     }
 
@@ -182,11 +187,50 @@ final class AetherEngineController: NSObject, PlayerEngine {
     func setSubtitleTrack(_ id: Int) {
         if id < 0 { player.clearSubtitle() } else { player.selectSubtitleTrack(id: id) }
     }
+    /// Add-on subtitles download through the shared pinned transport, like the other lanes: HTTPS only, the
+    /// connected address vetted, no redirects, size-capped. The engine opens only the local copy, never the
+    /// add-on's URL, so its own fetcher never reaches an address the policy refused.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
-        guard let subtitleURL = URL(string: url) else { completion?(false); return }
-        player.selectSidecarSubtitle(url: subtitleURL, headers: nil)
-        completion?(true)
+        sidecarRevision &+= 1
+        let revision = sidecarRevision
+        guard let remote = URL(string: url), let token = activeLoadToken else { completion?(false); return }
+        let finish: @MainActor @Sendable (Bool) -> Void = { ok in completion?(ok) }
+        SubtitleFileFetcher.fetch(remote, timeout: timeout) { [weak self] data in
+            let file = data.flatMap { Self.writeSidecar($0, remote: remote) }
+            Task { @MainActor in
+                guard let self, let file, self.activeLoadToken == token, self.sidecarRevision == revision else {
+                    if let file { try? FileManager.default.removeItem(at: file) }
+                    finish(false)
+                    return
+                }
+                self.replaceSidecarFile(with: file)
+                self.player.selectSidecarSubtitle(url: file, headers: nil)
+                finish(true)
+            }
+        }
+    }
+
+    private func replaceSidecarFile(with file: URL?) {
+        if let sidecarFile, sidecarFile != file { try? FileManager.default.removeItem(at: sidecarFile) }
+        sidecarFile = file
+    }
+
+    /// The fetched bytes as a temporary file the engine can open, keeping the add-on's extension when it
+    /// names a subtitle format (the engine also probes the content).
+    nonisolated private static func writeSidecar(_ data: Data, remote: URL) -> URL? {
+        let known: Set<String> = ["srt", "ass", "ssa", "vtt", "sub", "sup"]
+        let pathExtension = remote.pathExtension.lowercased()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aether-subtitles", isDirectory: true)
+        let file = directory.appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(known.contains(pathExtension) ? pathExtension : "srt")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: file, options: .atomic)
+            return file
+        } catch {
+            return nil
+        }
     }
     func setSubDelay(_ seconds: Double) {
         subtitleDelay = seconds
