@@ -4253,6 +4253,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             kind: .explicitKeepCurrent,
             permitsUse: source.permitsUse)
         automaticSubtitleRequest = request
+        // The task and its main-actor callbacks capture this witness, never the non-Sendable AVFoundation
+        // objects themselves: Xcode 26's region checker rejects those inside the task.
+        let selection = NativeSubtitleSelectionWitness(item: originalItem, group: group, option: selectedOption)
         automaticSubtitleTask = Task { @MainActor [weak self] in
             guard let self else {
                 completion(.superseded)
@@ -4268,17 +4271,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 timings = try await reference.read { [weak self] in
                     guard let self else { return false }
                     return self.ownsAutomaticSubtitle(request) && !Task.isCancelled
-                        && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                        && selection.isUnchanged
                 }
             } catch {
                 let current = self.ownsAutomaticSubtitle(request) && !Task.isCancelled
-                    && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                    && selection.isUnchanged
                 self.finishExplicitSubtitlePreparation(request)
                 completion(current ? .unavailable : .superseded)
                 return
             }
             guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
-                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption else {
+                  selection.isUnchanged else {
                 self.finishExplicitSubtitlePreparation(request)
                 completion(.superseded)
                 return
@@ -4294,7 +4297,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 return (prepared, SubtitleCueRenderer.parse(data: source.data))
             }.value
             guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
-                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption else {
+                  selection.isUnchanged else {
                 self.finishExplicitSubtitlePreparation(request)
                 completion(.superseded)
                 return
@@ -4308,18 +4311,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 try await reference.validateAfterPreparation { [weak self] in
                     guard let self else { return false }
                     return self.ownsAutomaticSubtitle(request) && !Task.isCancelled
-                        && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                        && selection.isUnchanged
                 }
             } catch {
                 let current = self.ownsAutomaticSubtitle(request) && !Task.isCancelled
-                    && originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption
+                    && selection.isUnchanged
                 self.finishExplicitSubtitlePreparation(request)
                 completion(current ? .unavailable : .superseded)
                 return
             }
             guard self.ownsAutomaticSubtitle(request), !Task.isCancelled,
                   source.permitsUse(), self.player.currentItem === originalItem,
-                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == selectedOption,
+                  selection.isUnchanged,
                   !self.externalSubActive else {
                 self.finishExplicitSubtitlePreparation(request)
                 completion(.superseded)
@@ -4361,7 +4364,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             let settled = await self.awaitExplicitNativeSubtitleSettlement(request)
             guard settled, self.ownsAutomaticSubtitle(request), !Task.isCancelled,
                   request.rawSettled, self.externalSubActive,
-                  originalItem.currentMediaSelection.selectedMediaOption(in: group) == nil else {
+                  selection.isCleared else {
                 self.failExplicitSubtitleAfterNativeChange(request, completion: completion)
                 return
             }
@@ -6672,4 +6675,25 @@ extension AVPlayerEngineController {
         publishPictureInPictureState()
     }
 }
+
+/// The native subtitle selection an explicit alignment request started from. Main-actor isolated, so it is
+/// Sendable: the request's task and callbacks capture it instead of the AVFoundation objects it holds.
+@MainActor
+private final class NativeSubtitleSelectionWitness {
+    private let item: AVPlayerItem
+    private let group: AVMediaSelectionGroup
+    private let option: AVMediaSelectionOption
+
+    init(item: AVPlayerItem, group: AVMediaSelectionGroup, option: AVMediaSelectionOption) {
+        self.item = item
+        self.group = group
+        self.option = option
+    }
+
+    /// The item still shows the subtitle option the request started from.
+    var isUnchanged: Bool { item.currentMediaSelection.selectedMediaOption(in: group) == option }
+    /// The item's native subtitle is off.
+    var isCleared: Bool { item.currentMediaSelection.selectedMediaOption(in: group) == nil }
+}
+
 #endif
