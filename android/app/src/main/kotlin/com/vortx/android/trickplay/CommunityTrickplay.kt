@@ -178,6 +178,9 @@ object CommunityTrickplay {
     private const val TILE_W = 320
     private const val TILE_H = 180
     private const val MAX_BYTES = 3 * 1024 * 1024
+    // Metadata carries only the fixed sheet descriptor; a 600-cue index stays well below 256 KiB.
+    private const val MAX_METADATA_BYTES = 64 * 1024
+    private const val MAX_VTT_BYTES = 256 * 1024
 
     /** floor(duration/10)*10, matching the Worker's durationBucket. */
     fun durationBucket(duration: Double): Int {
@@ -276,7 +279,23 @@ object CommunityTrickplay {
                 cols = cols,
                 tileW = tileW,
                 tileH = tileH,
-            ) ?: return null
+            )
+            return cropCue(cue)
+        }
+
+        /** Approximate resident-sheet fallback. The cue retains its actual capture interval. */
+        fun nearestCrop(time: Double): Bitmap? = cropCue(TrickplayTimeline.nearestCue(
+            time = time,
+            parsedCues = cues,
+            frameCount = frameCount,
+            legacyInterval = intervalS,
+            cols = cols,
+            tileW = tileW,
+            tileH = tileH,
+        ))
+
+        private fun cropCue(cue: TrickplayTimelineCue?): Bitmap? {
+            cue ?: return null
             if (cue.x < 0 || cue.y < 0 || cue.x + cue.width > bitmap.width ||
                 cue.y + cue.height > bitmap.height
             ) {
@@ -314,7 +333,10 @@ object CommunityTrickplay {
             if (!requestControl.isActive()) return@withContext null
             VortXEdgeAuth.sign(metaConn)
             if (metaConn.responseCode != 200) return@withContext null
-            val text = metaConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val metadataLength = metaConn.contentLengthLong
+            val text = metaConn.inputStream.use {
+                TrickplayDownloadInput.read(it, MAX_METADATA_BYTES, metadataLength, requestControl::isActive)
+            }?.toString(Charsets.UTF_8) ?: return@withContext null
             if (!requestControl.isActive()) return@withContext null
             val meta = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
 
@@ -347,8 +369,11 @@ object CommunityTrickplay {
                         }
                         vttConn?.let(requestControl::register)
                         if (!requestControl.isActive()) return@runCatching null
-                        if (vttConn?.responseCode == 200) {
-                            vttConn?.inputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        val connection = vttConn
+                        if (connection != null && connection.responseCode == 200) {
+                            connection.inputStream.use {
+                                TrickplayDownloadInput.read(it, MAX_VTT_BYTES, connection.contentLengthLong, requestControl::isActive)
+                            }?.toString(Charsets.UTF_8)
                         } else {
                             null
                         }
@@ -375,9 +400,31 @@ object CommunityTrickplay {
             requestControl.register(spriteConn)
             if (!requestControl.isActive()) return@withContext null
             if (spriteConn.responseCode != 200) return@withContext null
-            val bytes = spriteConn.inputStream.use { it.readBytes() }
+            val spriteLength = spriteConn.contentLengthLong
+            val bytes = spriteConn.inputStream.use {
+                TrickplayDownloadInput.read(it, MAX_BYTES, spriteLength, requestControl::isActive)
+            } ?: return@withContext null
             if (!requestControl.isActive()) return@withContext null
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withContext null
+            // Compressed bytes alone do not bound allocation. Probe dimensions without pixels, then
+            // require room for the declared grid and the shared producers' finite sheet budget.
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            try {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            } catch (_: OutOfMemoryError) {
+                return@withContext null
+            }
+            if (!TrickplaySpriteGeometry.permits(bounds.outWidth, bounds.outHeight, frameCount, cols, tileW, tileH) ||
+                !requestControl.isActive()
+            ) return@withContext null
+            val bitmap = try {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } catch (_: OutOfMemoryError) {
+                null
+            } ?: return@withContext null
+            if (!requestControl.isActive()) {
+                bitmap.recycle()
+                return@withContext null
+            }
 
             Sheet(
                 bitmap = bitmap,

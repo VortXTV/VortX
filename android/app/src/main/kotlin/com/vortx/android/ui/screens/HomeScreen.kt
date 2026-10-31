@@ -90,6 +90,7 @@ fun HomeScreen(
     onBrowseCatalog: ((Catalog) -> Unit)? = null,
     onCatalogItem: ((MetaItem) -> Unit)? = null,
     onQuickView: ((MetaItem) -> Unit)? = null,
+    onImportedCollections: (() -> Unit)? = null,
 ) {
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -137,6 +138,7 @@ fun HomeScreen(
                     onBrowseCatalog,
                     onCatalogItem,
                     onQuickView,
+                    onImportedCollections,
                     lastStreamStore,
                     viewModel,
                     modifier,
@@ -157,6 +159,7 @@ private fun HomeContent(
     onBrowseCatalog: ((Catalog) -> Unit)?,
     onCatalogItem: ((MetaItem) -> Unit)?,
     onQuickView: ((MetaItem) -> Unit)?,
+    onImportedCollections: (() -> Unit)?,
     lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
     modifier: Modifier,
@@ -176,9 +179,14 @@ private fun HomeContent(
     } == true
     val hubShown = collections.isVisible && !hubHidden
     val forYouUi by viewModel.forYouUi.collectAsStateWithLifecycle()
-    // null: no picker; true: the once-per-profile first-run offer; false: Tune (edit).
-    var interestsPicker by remember { mutableStateOf<Boolean?>(null) }
-    LaunchedEffect(forYouUi) { if (interestsPicker == null && viewModel.claimFirstRunOffer()) interestsPicker = true }
+    // Capture the rendered load at opening; recomposition must not replace its authority.
+    var interestsPicker by remember { mutableStateOf<Pair<com.vortx.android.foryou.ForYouEditSession, Boolean>?>(null) }
+    fun openInterests(firstRun: Boolean) {
+        val original = forYouUi.openingState ?: return
+        interestsPicker?.first?.close()
+        interestsPicker = com.vortx.android.foryou.ForYouEditSession(original) to firstRun
+    }
+    LaunchedEffect(forYouUi) { if (interestsPicker == null && viewModel.claimFirstRunOffer()) openInterests(true) }
     val forYouContext = androidx.compose.ui.platform.LocalContext.current
     val forYouText = remember(forYouContext) { com.vortx.android.foryou.ForYouText(forYouContext) }
     val rows = remember(visibleCatalogs, hubShown, hubOrder, forYouUi.showInvite) {
@@ -187,9 +195,9 @@ private fun HomeContent(
             hubOrder, forYouUi.showInvite,
         )
     }
-    interestsPicker?.let { firstRun ->
-        com.vortx.android.ui.foryou.ForYouPickerDialog(forYouUi.interests, firstRun, com.vortx.android.ui.foryou.phoneForYouChip,
-            VortXTheme.spacing.edge) { interestsPicker = null }
+    interestsPicker?.let { open ->
+        com.vortx.android.ui.foryou.ForYouPickerDialog(open.first, open.second, com.vortx.android.ui.foryou.phoneForYouChip,
+            VortXTheme.spacing.edge) { open.first.close(); if (interestsPicker === open) interestsPicker = null }
     }
     val lastCatalogId = visibleCatalogs.lastOrNull()?.id
     // The featured hero is the first item of the first rail (Continue Watching, else the leading add-on
@@ -240,9 +248,10 @@ private fun HomeContent(
         itemsIndexed(rows, key = { _, row -> homeRowKey(row) }) { _, row ->
             when (row) {
                 HomeRowItem.HubRow ->
-                    CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub)
-                HomeRowItem.ForYouHeader -> com.vortx.android.ui.foryou.ForYouHeaderPhone { interestsPicker = false }
-                HomeRowItem.ForYouInvite -> com.vortx.android.ui.foryou.ForYouInvitePhone { interestsPicker = false }
+                    CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub,
+                        onImportedCollections = onImportedCollections)
+                HomeRowItem.ForYouHeader -> com.vortx.android.ui.foryou.ForYouHeaderPhone { openInterests(false) }
+                HomeRowItem.ForYouInvite -> com.vortx.android.ui.foryou.ForYouInvitePhone { openInterests(false) }
                 is HomeRowItem.CatalogRow -> {
                     val catalog = row.catalog
                     if (catalog.id == lastCatalogId) {

@@ -28,9 +28,10 @@ data class SourceContributorSettlement(
 )
 
 /// Owns a detail screen's source-list ASSEMBLY pipeline off the render path: raw engine stream groups ->
-/// merge (TorBox search + Singularity + media-server groups) -> disabled-add-on subtraction -> direct-links
+/// merge (TorBox search + media-server groups) -> disabled-add-on subtraction -> direct-links
 /// filter -> [StreamRanking], all coalesced and run OFF the caller's thread, publishing ONE immutable ranked
 /// [SourceListState] per real change. The Kotlin port of Apple `app/SourcesShared/SourceListModel.swift`.
+/// Authorized pool groups arrive inside the repository's raw publication; the legacy source is settlement-only.
 ///
 /// WHY (from Apple): the detail bodies used to re-assemble the whole list on EVERY engine bump (a `revision`
 /// storm 6-7x/sec while sources load), saturating the main thread on a 1200+ stream title. This model inverts
@@ -54,7 +55,7 @@ data class SourceContributorSettlement(
 ///
 /// One instance per detail screen. The source-list UI consumes ONLY [state].
 class SourceListModel(
-    /// The scope the coalescer + off-thread assembly + the fire-and-forget HOARD run on. Owned by the caller
+    /// The scope the coalescer and off-thread assembly run on. Owned by the caller
     /// (e.g. a ViewModel's scope); [close] stops the coalescer.
     private val scope: CoroutineScope,
     private val coalesceMs: Long = COALESCE_MS,
@@ -79,7 +80,7 @@ class SourceListModel(
 
     /// The view-owned ranking inputs the assembly needs, the Kotlin analogue of Apple's `Context` struct.
     /// [prefs] is the FROZEN [SourcePrefsSnapshot] the off-thread rank reads (never a live store); [contentId]
-    /// owns target-scoped TorBox rows and seeds the fire-and-forget HOARD (null = neither lane).
+    /// owns target-scoped TorBox rows. Repository source contexts own pool reads and contributions.
     data class Context(
         val metaId: String = "",
         val streamId: String? = null, // null = all loaded groups (movie); set = one episode's groups
@@ -92,7 +93,7 @@ class SourceListModel(
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
-        val contentId: String? = null, // canonical auxiliary target id + Singularity HOARD seed
+        val contentId: String? = null, // canonical auxiliary target id
     )
 
     // ---- Binding + input setters ----
@@ -217,7 +218,9 @@ class SourceListModel(
         if (signature == publishedSignature) return // published output already correct: skip the assembly
         publishedSignature = signature
 
-        val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, jsSnapshot.streams, media, ctx).copy(
+        // The repository has already attached any authorized pool rows to raw. A second frontend snapshot
+        // carries no repository binding authority and must never be merged into the live list.
+        val assembled = assemble(raw, torboxSnapshot.streams, emptyList(), jsSnapshot.streams, media, ctx).copy(
             torboxEpoch = torboxSnapshot.epoch,
             singularityEpoch = singularitySnapshot.epoch,
             communityJsEpoch = jsSnapshot.epoch,
@@ -225,24 +228,6 @@ class SourceListModel(
             mediaServerGroupsHash = media.hashCode(),
         )
         _state.value = assembled
-
-        // HOARD (fire-and-forget): capture only raw add-on + TorBox torrent infohashes, before the display's
-        // direct-links-only filter. Singularity output and media-server groups are intentionally outside this
-        // boundary, so pooled witnesses cannot feed themselves and private media-server URLs cannot cross it.
-        // Dedup is per (content id, infohash), allowing torrents that arrive in later engine waves to upload.
-        val cid = ctx.contentId
-        if (cid != null && SourceIndexClient.isEnabled) {
-            val candidates = contributionDescriptors(raw, torboxSnapshot.streams, ctx.disabledAddons)
-            // The process ledger is intentionally marked before the fail-soft POST starts. This at-most-once
-            // tradeoff prevents rebuild storms from retrying a failing endpoint; a dropped POST becomes
-            // eligible again on the next app launch. The pool is opportunistic and never gates playback.
-            val fresh = hoardLedger.takeNew(cid, candidates, SourceIndexClient.MAX_DESCRIPTORS_PER_TITLE)
-            if (fresh.isNotEmpty()) {
-                scope.launch(Dispatchers.IO) {
-                    SourceIndexClient.contribute(cid, fresh)
-                }
-            }
-        }
     }
 
     /// A stable hash of exactly the ranking inputs that move the assembly, mirroring Apple's `Hasher.combine`
@@ -281,8 +266,6 @@ class SourceListModel(
     )
 
     companion object {
-        private val hoardLedger = SourceHoardLedger()
-
         /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in. Mirrors
         /// Apple's `coalesceMs`.
         const val COALESCE_MS = 250L
@@ -317,9 +300,9 @@ class SourceListModel(
             mediaServerGroups: List<StreamGroup>,
             ctx: Context,
         ): SourceListState {
-            // Raw add-on + TorBox inputs form both the initial display assembly and the only contribution
-            // boundary. Singularity and media-server lanes are merged only after capture eligibility is fixed.
-            var assembled = contributionGroups(raw, torboxStreams, ctx.disabledAddons)
+            // Repository-authorized pool groups already travel in raw and remain visible. Contribution
+            // eligibility is a separate boundary below, so displaying raw cannot recapture pooled rows.
+            var assembled = TorBoxSearchSource.merge(torboxStreams, enabledRawGroups(raw, ctx.disabledAddons))
 
             // Merge order preserved from Apple's displayGroups: Singularity after raw + TorBox, then the
             // media-server direct-play groups. Final rank order is decided by StreamRanking, not merge order.
@@ -391,21 +374,23 @@ class SourceListModel(
         }
 
         /// The only groups eligible for contribution: enabled raw add-on results plus TorBox search results.
-        /// This is deliberately evaluated before any direct-links-only display filter and has no parameters for
-        /// Singularity or media-server lanes, making recursive pooled witnesses and private server URLs
-        /// structurally ineligible.
+        /// This is evaluated before any direct-links-only display filter. Repository pool groups are excluded
+        /// by their stable base, preserving configured add-on identity even when its label is "Singularity".
+        /// The media-server lane has no input here, so private server URLs are structurally ineligible.
         fun contributionGroups(
             raw: List<StreamGroup>,
             torboxStreams: List<StreamSource>,
             disabledAddons: Set<String>,
         ): List<StreamGroup> {
-            val enabledRaw = if (disabledAddons.isEmpty()) {
-                raw
-            } else {
-                val disabled = disabledAddons.map { it.trim().lowercase() }.toSet()
-                raw.filter { it.addon.trim().lowercase() !in disabled }
-            }
+            val enabledRaw = enabledRawGroups(raw, disabledAddons)
+                .filterNot { it.base == SourceIndexClient.GROUP_ID }
             return TorBoxSearchSource.merge(torboxStreams, enabledRaw)
+        }
+
+        private fun enabledRawGroups(raw: List<StreamGroup>, disabledAddons: Set<String>): List<StreamGroup> {
+            if (disabledAddons.isEmpty()) return raw
+            val disabled = disabledAddons.map { it.trim().lowercase() }.toSet()
+            return raw.filter { it.addon.trim().lowercase() !in disabled }
         }
 
         /// Extract canonical torrent descriptors from the contribution-only group boundary.
@@ -439,8 +424,8 @@ class SourceListModel(
 /// Process-lifetime contribution dedup keyed by content id plus canonical torrent identity. It marks only the
 /// descriptors actually returned to the caller, so a per-run limit cannot strand an unsubmitted tail forever.
 /// Capacity is fail-closed: once [maxEntries] is reached, new unique claims stop and existing process-lifetime
-/// claims are never evicted. The client is compile-time dormant; its re-enable lane must relocate this state
-/// beside the process-wide pacer and replace claim-before-launch with atomic pending reservations.
+/// claims are never evicted. Retained only for pure compatibility fixtures; live repository capture and
+/// process-wide client reservations do not use this legacy ledger.
 internal class SourceHoardLedger(private val maxEntries: Int = 40_000) {
     private val seen = LinkedHashSet<String>()
 

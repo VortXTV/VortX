@@ -40,6 +40,9 @@ void init_methods_cache(JNIEnv *env) {
         java_Boolean = find_and_ref("java/lang/Boolean");
         java_Boolean_init = env->GetMethodID(java_Boolean, "<init>", "(Z)V");
 
+        seam_MpvReferenceNode = find_and_ref("com/vortx/android/player/mpv/seam/MpvReferenceNode");
+        seam_MpvReferenceNode_init = env->GetMethodID(seam_MpvReferenceNode, "<init>",
+            "([Ljava/lang/String;[I[J[D[J)V");
         seam_MpvSeam = find_and_ref("com/vortx/android/player/mpv/seam/MpvSeam");
         seam_MpvSeam_eventProperty_S  = env->GetMethodID(seam_MpvSeam, "eventProperty", "(Ljava/lang/String;)V"); // eventProperty(String)
         seam_MpvSeam_eventProperty_Sb = env->GetMethodID(seam_MpvSeam, "eventProperty", "(Ljava/lang/String;Z)V"); // eventProperty(String, boolean)
@@ -51,6 +54,9 @@ void init_methods_cache(JNIEnv *env) {
         // else 0 (client.h documents .error as present only for the ERROR reason).
         seam_MpvSeam_eventEndFile_II = env->GetMethodID(seam_MpvSeam, "eventEndFile", "(II)V"); // eventEndFile(int, int)
         seam_MpvSeam_eventStartFile_J = env->GetMethodID(seam_MpvSeam, "eventStartFile", "(J)V");
+        seam_MpvSeam_eventReferenceReply_JIN = env->GetMethodID(seam_MpvSeam, "eventReferenceReply",
+            "(JILcom/vortx/android/player/mpv/seam/MpvReferenceNode;)V");
+        seam_MpvSeam_eventReferenceFailure_J = env->GetMethodID(seam_MpvSeam, "eventReferenceFailure", "(J)V");
         seam_MpvSeam_event = env->GetMethodID(seam_MpvSeam, "event", "(I)V"); // event(int)
         seam_MpvSeam_logMessage_SiS = env->GetMethodID(seam_MpvSeam, "logMessage", "(Ljava/lang/String;ILjava/lang/String;)V"); // logMessage(String, int, String)
     });

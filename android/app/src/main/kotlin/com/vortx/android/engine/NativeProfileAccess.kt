@@ -7,6 +7,7 @@ import org.json.JSONObject
 
 internal class NativeProfileAccess(
     private val publicationAdmission: ((VortxNativeSession, () -> Boolean) -> Boolean)? = null,
+    private val capturePreparedPublication: ((VortxNativeSession) -> NativeProfileGateway.PreparedProjection)? = null,
     private val session: () -> VortxNativeSession,
 ) : NativeProfileGateway {
     internal class EditTarget internal constructor(internal val runtime: VortxNativeSession, internal val owner: VortxNativeOwner,
@@ -31,6 +32,25 @@ internal class NativeProfileAccess(
         }
     }
     override fun read(): NativeProfileGateway.Projection = projection(session().read())
+    override fun prepareProjection(mountIdentity: Any, prepare: (NativeProfileGateway.Projection) -> Unit): NativeProfileGateway.PreparedProjection {
+        val runtime = mountIdentity as? VortxNativeSession ?: error("Invalid native profile mount")
+        check(session() === runtime) { "Native profile account changed" }
+        // This entire synchronous transaction runs on IO. No ProfileStore fields or Main callback
+        // occur here, and none of these monitors survive the return to the suspend caller.
+        return runtime.withCurrentRead { read ->
+            val admit = checkNotNull(publicationAdmission) { "Native profile publication admission unavailable" }
+            var result: NativeProfileGateway.PreparedProjection? = null
+            check(admit(runtime) {
+                check(session() === runtime) { "Native profile account changed" }
+                prepare(projection(read))
+                // A qualified legacy write may have advanced the update stamp. Capture its acknowledged
+                // successor, not the pre-migration projection or an independently sampled stamp.
+                result = checkNotNull(capturePreparedPublication) { "Native profile metadata admission unavailable" }(runtime)
+                true
+            }) { "Native profile account changed" }
+            checkNotNull(result)
+        }
+    }
     override fun <T> withProjection(expected: NativeProfileGateway.Projection, action: () -> T): T =
         withCurrentProjection { current ->
             check(current == expected) { "Native profile projection changed" }

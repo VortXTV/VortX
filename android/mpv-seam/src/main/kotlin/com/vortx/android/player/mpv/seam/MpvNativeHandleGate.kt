@@ -18,6 +18,7 @@ internal class MpvNativeHandleGate(initialHandle: Long) {
     private var inFlightCalls = 0
     private var originalOwnerLiveness: java.util.concurrent.atomic.AtomicBoolean? = null
     private var destroyAfterLastCall: ((Long) -> Unit)? = null
+    private val asyncLeases = mutableSetOf<AsyncLease>()
 
     init {
         require(initialHandle != 0L) { "native handle must be non-zero" }
@@ -40,19 +41,67 @@ internal class MpvNativeHandleGate(initialHandle: Long) {
         return try {
             call(leasedHandle)
         } finally {
-            val deferredDestroy = synchronized(lock) {
-                inFlightCalls -= 1
-                if (inFlightCalls != 0) {
-                    null
-                } else {
-                    destroyAfterLastCall?.let { destroyHandle ->
-                        destroyAfterLastCall = null
-                        DestroyWork(handle.also { handle = 0L }, destroyHandle)
-                    }
-                }
-            }
-            deferredDestroy?.run()
+            releaseCall()
         }
+    }
+
+    /**
+     * Pins this original handle for an effect, including its real asynchronous terminal replies and
+     * exact grant cleanup. Closing ordinary admission must not strand an already admitted effect.
+     * Only the reference transport receives this token; it must not expose an arbitrary cleanup call.
+     */
+    fun acquireAsyncLease(onDestroy: () -> Unit): AsyncLease? = synchronized(lock) {
+        if (phase != Phase.ACTIVE || originalOwnerLiveness?.get() != true) return@synchronized null
+        AsyncLease(onDestroy).also {
+            inFlightCalls += 1
+            asyncLeases.add(it)
+        }
+    }
+
+    internal inner class AsyncLease internal constructor(internal val onDestroy: () -> Unit) {
+        private var closed = false // under the enclosing gate lock
+
+        val isOwnerCurrent: Boolean get() = synchronized(lock) {
+            !closed && this in asyncLeases && phase == Phase.ACTIVE && originalOwnerLiveness?.get() == true
+        }
+
+        fun <T> submit(defaultValue: T, call: (Long) -> T): T = use(defaultValue, false, call)
+
+        /** Exact abort/revoke only. This does not reopen ordinary handle admission. */
+        fun <T> cleanup(defaultValue: T, call: (Long) -> T): T = use(defaultValue, true, call)
+
+        private fun <T> use(defaultValue: T, cleanup: Boolean, call: (Long) -> T): T {
+            val leasedHandle = synchronized(lock) {
+                if (closed || this !in asyncLeases || handle == 0L || phase == Phase.DESTROYED ||
+                    (!cleanup && (phase != Phase.ACTIVE || originalOwnerLiveness?.get() != true))) {
+                    return defaultValue
+                }
+                inFlightCalls += 1 // protects a reply-before-enqueue-return or cleanup/close race
+                handle
+            }
+            return try { call(leasedHandle) } finally { releaseCall() }
+        }
+
+        fun close() {
+            synchronized(lock) {
+                if (closed) return
+                closed = true
+                check(asyncLeases.remove(this))
+            }
+            releaseCall()
+        }
+    }
+
+    private fun releaseCall() {
+        val deferredDestroy = synchronized(lock) {
+            check(inFlightCalls > 0)
+            inFlightCalls -= 1
+            if (inFlightCalls != 0) null else destroyAfterLastCall?.let { destroyHandle ->
+                destroyAfterLastCall = null
+                DestroyWork(handle.also { handle = 0L }, destroyHandle)
+            }
+        }
+        deferredDestroy?.run()
     }
 
     /**
@@ -61,17 +110,20 @@ internal class MpvNativeHandleGate(initialHandle: Long) {
      * returned and its last releaser executes finalization.
      */
     fun requestDestroy(destroyHandle: (Long) -> Unit): (() -> Unit)? {
-        val immediateDestroy = synchronized(lock) {
+        val work = synchronized(lock) {
             if (phase != Phase.ACTIVE) return null
             phase = Phase.DESTROYING
-            if (inFlightCalls == 0) {
+            val immediate = if (inFlightCalls == 0) {
                 DestroyWork(handle.also { handle = 0L }, destroyHandle)
             } else {
                 destroyAfterLastCall = destroyHandle
                 null
             }
+            asyncLeases.map { it.onDestroy } to immediate
         }
-        return immediateDestroy?.let { work -> { work.run() } }
+        // Cancellation may synchronously reenter or complete an effect. No gate monitor crosses it.
+        for (cancel in work.first) runCatching(cancel)
+        return work.second?.let { destroy -> { destroy.run() } }
     }
 
     private inner class DestroyWork(

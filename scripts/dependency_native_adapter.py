@@ -54,6 +54,13 @@ _DOVI_SCOPE = {
 _SAFE_MAPPING_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+&(),:/-]{0,159}$")
 _MAPPING_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
+def _archive_adapter():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dependency_archive_adapter", Path(__file__).with_name("dependency_archive_adapter.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 # These are the only parent-registry identities this adapter is allowed to
 # borrow from the generic monitor.  The keys are the exact public endpoints in
 # the reviewed native manifest; the values are the exact generic compare
@@ -594,6 +601,17 @@ def augment_inventory(inventory: Mapping[str, Any], manifest: Mapping[str, Any],
                 entry["native_lanes"] = sorted(set(entry.get("native_lanes", [])) | set(identity["lanes"]))
                 if "underlying_library" in identity:
                     entry["native_underlying_library"] = deepcopy(identity["underlying_library"])
+    archive = _archive_adapter()
+    for group, pages in archive.SOURCES.items():
+        spec = manifest["upstreams"].get(group, {})
+        if spec.get("mode") != "official-archive/feed" or spec.get("endpoints") != [pages[0]]:
+            continue
+        if ("native-archive", group) not in by_key:
+            entries.append({"ecosystem": "native-archive", "name": group,
+                            "current": "native-pin-unverified", "repository": "native-monitor/" + group,
+                            "source": pages[0], "kind": "native-archive-upstream",
+                            "native_upstream_groups": [group],
+                            "native_lanes": [item["lane"] for item in _lane_index(manifest)[group]]})
     coverage = build_native_coverage(manifest, prior_native=prior_native)
     result = dict(inventory)
     result["entries"] = entries
@@ -866,7 +884,7 @@ def _retain_previous_cursor(record: dict[str, Any], previous: Mapping[str, Any])
     record["retained_previous_state"] = True
     record["previous_status"] = previous.get("status")
     cursor = previous.get("last_success")
-    if isinstance(cursor, Mapping):
+    if isinstance(cursor, Mapping) and "last_success" not in record:
         record["last_success"] = deepcopy(dict(cursor))
     refs = _bounded_journal_refs(previous)
     if refs:
@@ -971,6 +989,26 @@ def build_native_coverage(manifest: Mapping[str, Any], prior_native: Mapping[str
             else:
                 record["status"] = "pending-observation"
                 record["reason"] = "existing-github-observer-not-run"
+        elif mode == "official-archive/feed" and group in {"ffmpeg", "gmp", "nettle", "freetype"}:
+            archive = _archive_adapter()
+            key = "native-archive:" + group
+            metadata = releases.get(key) if isinstance(releases, Mapping) else None
+            evidence = successful_observations.get(key) if isinstance(successful_observations, Mapping) else None
+            record.update({"observation_key": key, "observation_source": "official-archive-index-observer"})
+            valid = (spec.get("endpoints") == [archive.SOURCES[group][0]] and compare_collections_valid
+                     and key not in error_keys and key not in incomplete_keys
+                     and archive.valid_metadata(group, metadata)
+                     and _parent_success_evidence_reason(evidence, metadata) is None)
+            if valid:
+                record["status"] = "observed"
+                record["last_success"] = {"component": key, "source": metadata["source"],
+                                          "observed_at": metadata["observed_at"],
+                                          "versions": deepcopy(metadata["versions"]),
+                                          "archive_urls": deepcopy(metadata["archive_urls"])}
+            else:
+                record["status"] = "unverified"
+                record["reason"] = "official-archive-observation-unverified"
+                gaps.append({"source": "native/" + group, "reason": record["reason"]})
         elif mode == "parent-registry":
             parent = _parent_registry_observation(
                 group, spec, releases, error_keys, incomplete_keys, observation_checked_at,

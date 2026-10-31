@@ -1,0 +1,130 @@
+// Small collaborators for the actual Session/Facade -> actual CoreBridge callback BODY
+// -> actual Store notification regression. The extractor inserts the complete literal
+// production callback/lifetime/origin/mailbox declarations at the markers below.
+// No fixture method posts NotificationCenter hints, mints SourceEvents, edits the facade
+// cache, replaces a Session, or recaptures a successor after a worker/notification hop.
+import Combine
+import Foundation
+import os
+
+/*__ACTUAL_NATIVE_CALLBACK_LIFETIME__*/
+
+@MainActor final class ProfileStore {
+    static let shared = ProfileStore()
+    @Published var activeID: UUID? = nil
+}
+@MainActor final class VortXSyncManager {
+    static let shared = VortXSyncManager()
+    @Published var isSignedIn = true
+}
+enum LibraryAutoAdd {
+    static let watchlistChangedNote = Notification.Name("synthetic.unused.raw-notification.watchlist")
+}
+
+/// The Store's context collaborator. Credential/FIFO/write authority are not invented
+/// here: the regression sends the real mutations through the original actual facade.
+/// Full application installation/account and downstream metadata/ACK UI proof remain
+/// separate. The callback intake/lifetime/mailbox and synchronous note body are literal.
+final class CoreBridge {
+    @MainActor static let shared = CoreBridge()
+    /*__ACTUAL_CONTEXT_NOTIFICATION_NAME__*/
+    /*__ACTUAL_PUBLICATION_TOKEN__*/
+    /*__ACTUAL_NATIVE_CALLBACK_ORIGIN_AND_MAILBOX__*/
+
+    private let nativeCallbackLifetime = NativeCallbackLifetime()
+    private let publicationEpochState = OSAllocatedUnfairLock(initialState: UInt64(0))
+    private let playerActiveSnapshotState = OSAllocatedUnfairLock(initialState: false)
+    @MainActor private lazy var nativeCallbackReceiver = NativeCallbackReceiver()
+    @MainActor private let installation = UUID()
+    @MainActor private let credential = CredentialScopeRegistry.shared.capture()
+    @MainActor private var originalFacade: VortxNativeCoreFacade?
+    @MainActor private(set) var captureCount = 0
+    @MainActor private var snapshotWaiter: CheckedContinuation<Void, Error>?
+    @MainActor private var snapshotWaiterID: UUID?
+    @MainActor init() {}
+
+    /// Downstream actor delivery is a collaborator only. It neither posts the synchronous
+    /// Xperience note nor makes write/current-owner decisions for the actual facade.
+    @MainActor private final class NativeCallbackReceiver {
+        func receive(_ event: VortxNativeCoreFacade.SourceEvent, origin: NativeCallbackOrigin) {
+            _ = event; _ = origin
+        }
+    }
+
+    /*__ACTUAL_MAKE_NATIVE_SOURCE_CALLBACK__*/
+
+    @MainActor func makeNotificationSourceCallbackForFixture()
+        -> @Sendable (VortxNativeCoreFacade.SourceEvent) -> Void {
+        nativeCallbackLifetime.prepare(installation)
+        return makeNativeSourceCallback(installation: installation, credential: credential)
+    }
+    @MainActor func installOriginalForFixture(_ facade: VortxNativeCoreFacade) throws {
+        guard originalFacade == nil, let binding = facade.watchlistBinding else { throw VortxNativeError.invalidSnapshot }
+        originalFacade = facade
+        nativeCallbackLifetime.bind(installation, credential: credential, sourceID: facade.sourceID)
+        ProfileStore.shared.activeID = UUID(uuidString: binding.profileID)
+    }
+    struct NativeXperienceTarget {
+        let facade: VortxNativeCoreFacade
+        let binding: VortxNativeCoreFacade.WatchlistBinding
+        let registry: VortxNativeCoreFacade.RegistryBinding
+        let lifetime: XperienceImportLifetime
+    }
+    @MainActor func captureNativeXperienceTarget() throws -> NativeXperienceTarget {
+        guard let facade = originalFacade, let binding = facade.watchlistBinding,
+              let registry = facade.registryBinding,
+              facade.capturedHostProfileSnapshot(expected: binding, registry: registry) != nil else {
+            throw XperiencePersistenceFailure.unavailable
+        }
+        captureCount += 1
+        return .init(facade: facade, binding: binding, registry: registry, lifetime: .init())
+    }
+    @MainActor func retireNativeXperienceTarget(_ target: NativeXperienceTarget) { target.lifetime.revoke() }
+    @MainActor func nativeXperienceTargetIsCurrent(_ target: NativeXperienceTarget) -> Bool {
+        target.lifetime.isActive && originalFacade === target.facade
+            && target.facade.watchlistBinding == target.binding && target.facade.registryBinding == target.registry
+            && target.facade.capturedHostProfileSnapshot(expected: target.binding, registry: target.registry) != nil
+    }
+    @MainActor func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
+        guard nativeXperienceTargetIsCurrent(target),
+              let snapshot = target.facade.capturedHostProfileSnapshot(expected: target.binding, registry: target.registry) else {
+            throw XperiencePersistenceFailure.staleContext
+        }
+        let waiter = snapshotWaiter; snapshotWaiter = nil; snapshotWaiterID = nil
+        waiter?.resume()
+        return (snapshot.rawRegisters, try XperienceInstalledCatalogs.project(snapshot.registry))
+    }
+    @MainActor func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
+        // This notification-only collaborator never supplies a fake export/provider witness.
+        throw XperiencePersistenceFailure.unavailable
+    }
+    @MainActor func saveNativeXperienceImport(_ edit: XperienceImportNamespace.RawEdit,
+        target: NativeXperienceTarget, validator: XperiencePreparedExport) async throws -> VortxRawHostRegister {
+        throw XperiencePersistenceFailure.unavailable
+    }
+    @MainActor func observeRealMutationForFixture(
+        _ mutation: @escaping @MainActor () async throws -> Void) async throws {
+        guard snapshotWaiter == nil else { throw VortxNativeError.invalidSnapshot }
+        let id = UUID()
+        try await withCheckedThrowingContinuation { continuation in
+            snapshotWaiter = continuation; snapshotWaiterID = id
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard snapshotWaiterID == id else { return }
+                let waiter = snapshotWaiter; snapshotWaiter = nil; snapshotWaiterID = nil
+                waiter?.resume(throwing: VortxNativeError.invalidSnapshot)
+            }
+            Task { @MainActor in
+                do { try await mutation() }
+                catch {
+                    guard snapshotWaiterID == id else { return }
+                    let waiter = snapshotWaiter; snapshotWaiter = nil; snapshotWaiterID = nil
+                    waiter?.resume(throwing: error)
+                }
+            }
+        }
+        // The wait is resumed only when the REAL Store subscriber calls its snapshot
+        // boundary. That synchronous subscriber finishes before MainActor resumes us.
+    }
+}

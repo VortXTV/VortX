@@ -40,7 +40,7 @@ jobs:
       - name: Verify reviewed recipes
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 32cc85106366e2fb11d29c35aef8a57baa5bc6d8290d92384bd4069b16e18f4a scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
+          printf '%s  %s\n' 6defe6abf8d198caab4036c79dc185efbaf94c61282c1108ceb6510bc27d24f8 scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
           shasum -a 256 -c scripts/native-media-hosted/inputs.sha256
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -52,6 +52,15 @@ jobs:
         run: |
           set -euo pipefail
           brew install meson ninja cmake pkg-config nasm wget jq autoconf automake libtool sdl2
+      - name: Verify the native helper Python interpreter
+        run: |
+          set -euo pipefail
+          # Match BaseBuild.defaultPath: native callbacks resolve this same python3.
+          native_path='/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+          native_python="$(PATH="$native_path" /usr/bin/which python3)"
+          test -n "$native_python"
+          mkdir -p _build/native-media/apple
+          env -u HOME -u PYTHONHOME -u PYTHONPATH PATH="$native_path" "$native_python" -I -B -c 'import hashlib,json,os,pathlib,sys,sysconfig,tomllib; exe=pathlib.Path(sys.executable).resolve(strict=True); origin=pathlib.Path(tomllib.__spec__.origin).resolve(strict=True); stdlib=pathlib.Path(sysconfig.get_path("stdlib")).resolve(strict=True); assert sys.version_info >= (3,11) and sys.flags.isolated == sys.flags.dont_write_bytecode == sys.flags.no_user_site == sys.flags.ignore_environment == 1 and "HOME" not in os.environ and origin.is_relative_to(stdlib) and tomllib.loads("ok=true") == {"ok":True}; print(json.dumps({"schema":"vortx-apple-native-python-capability-v1","executable":str(exe),"executableSHA256":hashlib.sha256(exe.read_bytes()).hexdigest(),"version":list(sys.version_info[:3]),"tomllibOrigin":str(origin),"tomllibSHA256":hashlib.sha256(origin.read_bytes()).hexdigest(),"isolated":True,"minimumVersion":[3,11],"targetHelpersImported":False},sort_keys=True))' > _build/native-media/apple/apple-python-capability.json
       - name: Build unpromoted Apple candidate
         run: |
           set -euo pipefail
@@ -64,6 +73,7 @@ jobs:
           name: native-media-apple-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             _build/native-media/apple/*.tar*
+            _build/native-media/apple/*.zip
             _build/native-media/apple/*.json
             _build/native-media/apple/*.txt
             _build/native-media/apple/*.log
@@ -85,7 +95,7 @@ jobs:
       - name: Verify reviewed recipes
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 32cc85106366e2fb11d29c35aef8a57baa5bc6d8290d92384bd4069b16e18f4a scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
+          printf '%s  %s\n' 6defe6abf8d198caab4036c79dc185efbaf94c61282c1108ceb6510bc27d24f8 scripts/native-media-hosted/inputs.sha256 | shasum -a 256 -c -
           shasum -a 256 -c scripts/native-media-hosted/inputs.sha256
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

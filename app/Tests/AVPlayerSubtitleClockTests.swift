@@ -1,5 +1,44 @@
-// The runner compiles the actual engine activation/sync/update methods and actual cue renderer. No AV objects.
+// The runner compiles the actual engine activation/sync/update/retirement methods and cue renderer.
+// This fixture exercises manual/raw subtitle timing. It cannot mint an automatic request or publication.
 import Foundation
+
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+enum AVSubtitleRequestRetirementCause: Equatable {
+    case successor, ownerRevoked, uncertainNativeCommit, cancelledNativeCommit, engineTeardown
+}
+// Nil-only tripwires satisfy the current method dependencies without substituting a successful
+// AVKit request, credential owner, publication receipt or corrected-overlay renderer. Private
+// trapping initializers prevent this fixture from manufacturing either capability.
+@MainActor final class SubtitleClockUnexpectedAutomaticRequest {
+    enum Kind { case automaticSelection, explicitKeepCurrent }
+    private init() { preconditionFailure("Automatic request is outside the manual clock fixture") }
+    var kind: Kind { preconditionFailure("Automatic request access is outside the manual clock fixture") }
+    var publication: SubtitleClockUnexpectedPublication? {
+        get { preconditionFailure("Publication access is outside the manual clock fixture") }
+        set { preconditionFailure("Publication mutation is outside the manual clock fixture") }
+    }
+    var rawSettled: Bool {
+        get { preconditionFailure("Automatic request access is outside the manual clock fixture") }
+        set { preconditionFailure("Automatic request mutation is outside the manual clock fixture") }
+    }
+    var nativeCommitStarted: Bool {
+        get { preconditionFailure("Native subtitle commit is outside the manual clock fixture") }
+        set { preconditionFailure("Native subtitle commit is outside the manual clock fixture") }
+    }
+    var retirementCause: AVSubtitleRequestRetirementCause? {
+        get { preconditionFailure("Request retirement is outside the manual clock fixture") }
+        set { preconditionFailure("Request retirement is outside the manual clock fixture") }
+    }
+}
+@MainActor final class SubtitleClockUnexpectedPublication {
+    private init() { preconditionFailure("Publication is outside the manual clock fixture") }
+    var isRevoked: Bool { preconditionFailure("Publication access is outside the manual clock fixture") }
+    func claimOwnerRevocationForDefaultRetirement() -> Bool {
+        preconditionFailure("Owner revocation is outside the manual clock fixture")
+    }
+    func close() { preconditionFailure("Publication cleanup is outside the manual clock fixture") }
+}
+#endif
 
 @MainActor final class SubtitleClockFixturePlayer {
     struct Time { let seconds: Double }
@@ -13,6 +52,11 @@ import Foundation
     var updates = 0
     func setText(_ value: String?) { text = value; updates += 1 }
     func applyStyle() { styleApplications += 1 }
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+    func setPreparedPresentation(_ value: SubtitleReferencePresentation.Presentation?) {
+        preconditionFailure("Corrected-overlay publication is outside the manual clock fixture")
+    }
+#endif
 }
 @MainActor final class SubtitleClockFixtureEngine {
     let player = SubtitleClockFixturePlayer()
@@ -22,6 +66,20 @@ import Foundation
     var externalSubActive = false
 #if VORTX_CURRENT_ALIGNMENT
     var subtitleAlignmentGeneration: UInt64 = 0
+#endif
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+    var automaticSubtitleRequest: SubtitleClockUnexpectedAutomaticRequest?
+    var automaticSubtitleTask: Task<Void, Never>?
+    var alignedSubtitlePublication: SubtitleClockUnexpectedPublication?
+    var alignedSubtitlePresentation: SubtitleReferencePresentation.Prepared?
+    var alignedSubtitleClock = SubtitleReferencePresentation.Clock()
+    var alignedSubtitleSelection: Never?
+    var externalSubtitleSettlement = AVPlayerRecoverySettlementPolicy.ExternalSubtitleSettlement()
+    var externalSubtitleRequestRevision: UInt64 = 41
+    var subtitleSelectionRevision: UInt64 = 73
+    func automaticSubtitleRequestIsCurrent(_ generation: UInt64) -> Bool {
+        preconditionFailure("Automatic admission is outside the manual clock fixture")
+    }
 #endif
     var nativeOverlayInvalidations = 0
     func invalidateNativeSubtitleOverlay() { nativeOverlayInvalidations += 1 }
@@ -57,7 +115,39 @@ import Foundation
         check("activation leaves actual paused player clock unchanged", engine.player.paused && engine.player.seconds == 10)
 
         // No periodic tick occurs between these calls: each production method must refresh the right cue itself.
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+        // This is pure presentation data, never a publication or an owner grant. Retirement must
+        // discard it and reset the real Clock before the ordinary raw-file overlay refreshes.
+        let retimed = SubtitleReferenceNativeQuery.RetimedFile(
+            originalJob: UUID(), srt: Data("1\n00:16:49,000 --> 00:16:51,000\npure prepared cue\n\n".utf8),
+            cues: [.init(startMs: 1009_000, endMs: 1011_000, text: "pure prepared cue")],
+            offsetMs: 0, driftPpm: 0, confidence: 1000)
+        let prepared: SubtitleReferencePresentation.Prepared
+        do { prepared = try SubtitleReferencePresentation.prepare(retimed) }
+        catch { preconditionFailure("Genuine pure presentation preparation failed: \(error)") }
+        engine.alignedSubtitlePresentation = prepared
+        check("actual pure clock first sample changes", engine.alignedSubtitleClock.sample(
+            prepared, mediaSeconds: 1010, manualDelaySeconds: 0).changed)
+        check("actual pure clock repeated sample is stable", !engine.alignedSubtitleClock.sample(
+            prepared, mediaSeconds: 1010, manualDelaySeconds: 0).changed)
+        engine.externalSubtitleSettlement.request(generation: 7, mountIdentity: 8, revision: 73)
+        let settlementBeforeTiming = engine.externalSubtitleSettlement
+        let task = Task<Void, Never> {}
+        engine.automaticSubtitleTask = task
+#endif
         engine.setSubDelay(3)
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+        check("manual timing cancels and releases the original worker task",
+              task.isCancelled && engine.automaticSubtitleTask == nil)
+        check("manual timing drops prepared state without manufacturing a request or publication",
+              engine.alignedSubtitlePresentation == nil && engine.automaticSubtitleRequest == nil
+                && engine.alignedSubtitlePublication == nil && engine.alignedSubtitleSelection == nil)
+        check("manual retirement resets the actual pure clock", engine.alignedSubtitleClock.sample(
+            prepared, mediaSeconds: 1010, manualDelaySeconds: 0).changed)
+        check("manual timing preserves pending native settlement and file/selection intent revisions",
+              engine.externalSubtitleSettlement == settlementBeforeTiming
+                && engine.externalSubtitleRequestRevision == 41 && engine.subtitleSelectionRevision == 73)
+#endif
 #if VORTX_CURRENT_ALIGNMENT
         check("positive timing edit retires alignment", engine.subtitleAlignmentRevision != beforeSync)
         let afterPositiveSync = engine.subtitleAlignmentRevision
@@ -118,6 +208,10 @@ import Foundation
         engine.player.seconds = -1
         engine.setSubDelay(0)
         check("negative player clock cannot rewind before achieved origin", engine.subtitleOverlay?.text == "origin cue")
+#if VORTX_AVKIT_ALIGNMENT_REQUEST
+        check("manual-only fixture never acquired automatic request or publication authority",
+              engine.automaticSubtitleRequest == nil && engine.alignedSubtitlePublication == nil)
+#endif
         print(failures == 0 ? "ALL PASS" : "\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)
     }

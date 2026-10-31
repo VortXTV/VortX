@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.WindowInsets
@@ -86,17 +85,10 @@ fun CinemaQuickViewScreen(
                 } else {
                     AsyncImage(
                         model = artwork,
-                        contentDescription = item.name,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-                item.poster?.takeIf { it.isNotBlank() }?.let { poster ->
-                    AsyncImage(
-                        model = poster,
+                        // The adjacent title supplies the label; the backdrop is decorative.
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.width(112.dp).height(168.dp).clip(VortXShapes.card),
+                        modifier = Modifier.fillMaxSize(),
                     )
                 }
             }

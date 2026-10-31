@@ -1,0 +1,237 @@
+diff --git a/stream/reference_source.h b/stream/reference_source.h
+--- a/stream/reference_source.h
++++ b/stream/reference_source.h
+@@ -117,3 +117,29 @@
+     struct stream_reference_observation_values *values);
+ void stream_reference_observation_release(
+     struct stream_reference_observation **observation);
++
++// Owned evidence of the actual sent GET corresponding to an observation token.
++// This does not upgrade INITIAL_REQUEST_ONLY into a replay/reader capability.
++// The request includes credentials; keep native-only, never log or persist it.
++struct stream_reference_sent_request;
++struct stream_reference_sent_request_values {
++    struct stream_reference_observation_values response;
++    char *request;
++    uint32_t request_bytes;
++};
++bool stream_reference_source_observe_sent_request(
++    struct stream *s, int64_t deadline_ns,
++    struct stream_reference_sent_request **out);
++// Original owner only, under the same live stream/AVIO exclusion as observation.
++bool stream_reference_source_revalidate_sent_request(
++    struct stream *s, const struct stream_reference_sent_request *request);
++// Retained owned data only; no live stream/AVIO/option/cancel pointer borrowing.
++bool stream_reference_sent_request_cancelled(
++    const struct stream_reference_sent_request *request);
++bool stream_reference_sent_request_copy_values(
++    const struct stream_reference_sent_request *request,
++    struct stream_reference_sent_request_values *out);
++void stream_reference_sent_request_values_clear(
++    struct stream_reference_sent_request_values *values);
++void stream_reference_sent_request_release(
++    struct stream_reference_sent_request **request);
+diff --git a/stream/stream_lavf.c b/stream/stream_lavf.c
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -30,6 +30,7 @@
+ #include "osdep/timer.h"
+ #include "stream.h"
+ #include "network.h"
++#include "vortx_http_request.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+ 
+@@ -494,6 +495,125 @@
+     return true;
+ }
+ 
++// This owns actual sent bytes, not initial options relabelled as a current
++// request. Its observation retains the original source/cancel/epoch lifetime.
++// It remains evidence only: no open/replay/redirect/reader permission is granted.
++struct stream_reference_sent_request {
++    struct stream_reference_observation *observation;
++    struct avpriv_vortx_http_sent_request sent;
++};
++
++bool stream_reference_sent_request_cancelled(
++    const struct stream_reference_sent_request *request)
++{
++    return !request || stream_reference_observation_cancelled(request->observation);
++}
++
++void stream_reference_sent_request_release(
++    struct stream_reference_sent_request **handle)
++{
++    if (!handle)
++        return;
++    struct stream_reference_sent_request *request = *handle;
++    *handle = NULL;
++    if (request) {
++        avpriv_vortx_http_sent_request_clear(&request->sent);
++        stream_reference_observation_release(&request->observation);
++        av_free(request);
++    }
++}
++
++static bool reference_sent_request_valid(
++    const struct avpriv_vortx_http_sent_request *sent,
++    const struct stream_reference_observation *observation)
++{
++    return sent->version == VORTX_HTTP_SENT_REQUEST_VERSION &&
++        sent->request && sent->location && sent->request_bytes > 0 &&
++        sent->request_bytes <= VORTX_HTTP_SENT_REQUEST_MAX_BYTES &&
++        strnlen(sent->request, sent->request_bytes + 1) == sent->request_bytes &&
++        sent->response_generation == observation->values.response_generation &&
++        !strcmp(sent->location, observation->values.location);
++}
++
++bool stream_reference_source_observe_sent_request(
++    stream_t *s, int64_t deadline_ns, struct stream_reference_sent_request **out)
++{
++    if (!out || *out)
++        return false;
++    struct stream_reference_observation *observation = NULL;
++    if (!stream_reference_source_observe_response(s, deadline_ns, &observation))
++        return false;
++    struct stream_reference_sent_request *request = av_mallocz(sizeof(*request));
++    if (!request) {
++        stream_reference_observation_release(&observation);
++        return false;
++    }
++    request->observation = observation;
++    struct lavf_priv *p = s->priv;
++    if (!reference_observation_matches_source(s, observation) || !p || !p->avio ||
++        avpriv_vortx_http_copy_sent_request(p->avio,
++            observation->values.response_generation, &request->sent) < 0 ||
++        !reference_sent_request_valid(&request->sent, observation) ||
++        !stream_reference_source_revalidate_observation(s, observation)) {
++        stream_reference_sent_request_release(&request);
++        return false;
++    }
++    *out = request;
++    return true;
++}
++
++bool stream_reference_source_revalidate_sent_request(
++    stream_t *s, const struct stream_reference_sent_request *request)
++{
++    struct avpriv_vortx_http_sent_request current = {0};
++    bool valid = false;
++    if (!request || !stream_reference_source_revalidate_observation(
++                        s, request->observation))
++        return false;
++    struct lavf_priv *p = s->priv;
++    if (p && p->avio && avpriv_vortx_http_copy_sent_request(p->avio,
++            request->sent.response_generation, &current) == 0) {
++        valid = reference_sent_request_valid(&current, request->observation) &&
++            current.request_bytes == request->sent.request_bytes &&
++            !memcmp(current.request, request->sent.request, current.request_bytes) &&
++            stream_reference_source_revalidate_observation(s, request->observation);
++    }
++    avpriv_vortx_http_sent_request_clear(&current);
++    return valid;
++}
++
++void stream_reference_sent_request_values_clear(
++    struct stream_reference_sent_request_values *values)
++{
++    if (!values)
++        return;
++    stream_reference_observation_values_clear(&values->response);
++    av_free(values->request);
++    *values = (struct stream_reference_sent_request_values){0};
++}
++
++bool stream_reference_sent_request_copy_values(
++    const struct stream_reference_sent_request *request,
++    struct stream_reference_sent_request_values *out)
++{
++    if (!out || out->request || out->request_bytes || out->response.etag ||
++        out->response.location || out->response.response_generation ||
++        out->response.source_generation || out->response.source_epoch ||
++        stream_reference_sent_request_cancelled(request))
++        return false;
++    struct stream_reference_sent_request_values copy = {0};
++    copy.request = av_strndup(request->sent.request, request->sent.request_bytes);
++    if (!copy.request || !stream_reference_observation_copy_values(
++                            request->observation, &copy.response) ||
++        stream_reference_sent_request_cancelled(request)) {
++        stream_reference_sent_request_values_clear(&copy);
++        return false;
++    }
++    copy.request_bytes = (uint32_t)request->sent.request_bytes;
++    *out = copy;
++    return true;
++}
++
+ static int interrupt_cb(void *ctx);
+ 
+ static bool reopen_at(stream_t *s, int64_t offset)
+diff --git a/stream/vortx_http_request.h b/stream/vortx_http_request.h
+new file mode 100644
+--- /dev/null
++++ b/stream/vortx_http_request.h
+@@ -0,0 +1,33 @@
++/* VortX-private native bridge. Not a public FFmpeg, libmpv or Swift API.
++ * The identical contract is carried inside both matched source packages.
++ * Only the genuine AVIO owner may call copy while AVIO/HTTP remain alive and
++ * no I/O, seek, close, replacement or other owner operation can intervene.
++ * This observes sent GET bytes. It is NOT permission to open/replay a request,
++ * follow a redirect, choose a destination, or infer complete resource identity.
++ */
++#ifndef VORTX_PRIVATE_HTTP_SENT_REQUEST_H
++#define VORTX_PRIVATE_HTTP_SENT_REQUEST_H
++#include <stddef.h>
++#include <stdint.h>
++struct AVIOContext;
++#define VORTX_HTTP_SENT_REQUEST_VERSION 1u
++#define VORTX_HTTP_SENT_REQUEST_MAX_BYTES (32u * 1024u)
++struct avpriv_vortx_http_sent_request {
++    char *location;
++    char *request; /* exact successfully written request headers, including GET line */
++    size_t request_bytes; /* excludes the owned terminating NUL */
++    int64_t response_generation;
++    unsigned version;
++};
++/* out must be zero/cleared; failure leaves it unchanged. Returns 0 only for an
++ * owned snapshot of the expected current completed response. A nonzero result
++ * is optional unavailability and must not change playback. Credentials remain
++ * native memory only: never log, persist or expose these strings as AVOptions.
++ * New matched FFmpeg/MPV components and symbol/header parity are mandatory.
++ */
++int avpriv_vortx_http_copy_sent_request(
++    struct AVIOContext *owner, int64_t expected_generation,
++    struct avpriv_vortx_http_sent_request *out);
++void avpriv_vortx_http_sent_request_clear(
++    struct avpriv_vortx_http_sent_request *value);
++#endif
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1833,9 +1833,24 @@
+ minor = client_h_define.split('|')[1].strip('() ')
+ client_api_version = major + '.' + minor + '.0'
+ 
++# Keep the six native-only evidence functions in Android's shared component.
++# They remain hidden; this is not public API or a reader/caller activation.
++vortx_sent_request_link_roots = []
++if host_machine.system() == 'android'
++    vortx_sent_request_link_roots = [
++        '-Wl,--undefined=stream_reference_source_observe_sent_request',
++        '-Wl,--undefined=stream_reference_source_revalidate_sent_request',
++        '-Wl,--undefined=stream_reference_sent_request_cancelled',
++        '-Wl,--undefined=stream_reference_sent_request_release',
++        '-Wl,--undefined=stream_reference_sent_request_values_clear',
++        '-Wl,--undefined=stream_reference_sent_request_copy_values',
++    ]
++endif
++
+ libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
+                  include_directories: incdir_public,
+-                 link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
++                 link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']) +
++                            vortx_sent_request_link_roots,
+                  version: client_api_version, install: get_option('libmpv'),
+                  build_by_default: get_option('libmpv'))
+ 

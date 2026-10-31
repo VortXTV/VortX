@@ -5,6 +5,9 @@ package com.vortx.android.engine
 import com.vortx.android.profile.ContinueWatchingOwnerGate
 import com.vortx.android.profile.ExtractedProfileStore
 import com.vortx.android.profile.NativeProfileGateway
+import com.vortx.android.profile.PlaylistScopeEvidence
+import com.vortx.android.profile.PlaylistScopeTransition
+import com.vortx.android.profile.playlistScopeTransition
 import com.vortx.android.profile.UserProfile
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -236,6 +239,25 @@ private fun migrationMutationStillRequiresFreshSaveReadbackAndNestedPublication(
     println("PASS migration_save_readback_and_nested_fresh_publication_remain_live_reads")
 }
 
+
+private fun playlistScopeTransitionClassifierUsesOnlyAdmittedScopeEvidence() {
+    fun witness(accountID: String? = "acct", generation: Long? = 7L, epoch: Long? = null,
+        selectedID: String? = "MAIN", profileID: String? = "MAIN", slot: String = "primary", engine: Boolean = true) =
+        PlaylistScopeEvidence(selectedID, profileID, slot, engine, accountID, generation, epoch)
+    check(playlistScopeTransition(witness(), witness()) == PlaylistScopeTransition.PROJECTION_REFRESH)
+    check(playlistScopeTransition(witness(), witness(selectedID = "CHILD", profileID = "CHILD", slot = "primary.CHILD", engine = false)) ==
+        PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    check(playlistScopeTransition(witness(), witness(generation = 8L)) == PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    check(playlistScopeTransition(witness(), witness(epoch = 1L)) == PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    check(playlistScopeTransition(witness(accountID = null, generation = null), witness(accountID = null, generation = null)) ==
+        PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    check(playlistScopeTransition(witness(selectedID = null, profileID = null), witness(selectedID = null, profileID = null)) ==
+        PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    check(playlistScopeTransition(witness(accountID = "", generation = 7L), witness(accountID = "", generation = 7L)) ==
+        PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+    println("PASS admitted_playlist_scope_classifier_preserves_same_scope_and_hard_cuts_real_boundaries")
+}
+
 fun main() {
     successRetainsAllPublicationFencesAndGenericIdentity()
     concurrentWorkerSessionThenAuthCompletesWithoutInversion()
@@ -248,5 +270,8 @@ fun main() {
     closedRecoveryAndAccountFailuresRejectBeforePublication()
     nullableResultAndFreshProjectionArePreserved()
     migrationMutationStillRequiresFreshSaveReadbackAndNestedPublication()
-    println("PASS projection_boundary_packet_complete cases=15")
+    playlistScopeTransitionClassifierUsesOnlyAdmittedScopeEvidence()
+    runBootstrapBoundaryCases()
+    runForYouReloadBoundaryCases()
+    println("PASS projection_boundary_packet_complete prior_cases=15 bootstrap_schedules=6 foryou_schedule=1")
 }

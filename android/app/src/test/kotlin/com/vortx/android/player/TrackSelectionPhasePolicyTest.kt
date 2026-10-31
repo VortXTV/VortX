@@ -75,4 +75,63 @@ class TrackSelectionPhasePolicyTest {
         assertEquals(DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION, afterAddon.subtitle)
         assertFalse(afterAddon.automaticDefaults(true, true).selectSubtitle)
     }
+
+    @Test
+    fun `pool waits for settled addon lookup and respects existing track admission`() {
+        val initial = TrackSelectionPhases()
+        val afterAudio = initial.apply(AutomaticTrackDefaults(selectAudio = true, selectSubtitle = false))
+        assertFalse(initial.mayAttemptPool(false, addonLookupSettled = true, hasPreferredAddon = false))
+        assertFalse(afterAudio.mayAttemptPool(false, addonLookupSettled = false, hasPreferredAddon = false))
+        assertFalse(afterAudio.mayAttemptPool(false, addonLookupSettled = true, hasPreferredAddon = true))
+        assertFalse(afterAudio.mayAttemptPool(true, addonLookupSettled = true, hasPreferredAddon = false))
+        assertFalse(afterAudio.recordAddonAttempt().mayAttemptPool(false, true, false))
+        assertFalse(afterAudio.holdSubtitle().mayAttemptPool(false, true, false))
+        assertTrue(afterAudio.mayAttemptPool(false, addonLookupSettled = true, hasPreferredAddon = false))
+        val embeddedDefault = afterAudio.apply(AutomaticTrackDefaults(selectAudio = false, selectSubtitle = true))
+        assertTrue(embeddedDefault.mayAttemptPool(true, addonLookupSettled = true, hasPreferredAddon = false))
+    }
+
+    @Test
+    fun `pool reservation is once per load and does not change the subtitle effect phase`() {
+        val eligible = TrackSelectionPhases().apply(
+            AutomaticTrackDefaults(selectAudio = true, selectSubtitle = false),
+        )
+        val reserved = eligible.recordPoolSelection()
+        assertTrue(reserved.poolAttempted)
+        assertFalse(reserved.addonAttempted)
+        assertEquals(eligible.subtitle, reserved.subtitle)
+        assertEquals(eligible.audio, reserved.audio)
+        assertFalse(reserved.automaticDefaults(true, true).selectSubtitle)
+        assertFalse(reserved.mayAttemptAddon(hasSelectableSubtitle = false))
+        assertFalse(reserved.mayAttemptAddon(hasSelectableSubtitle = true))
+        assertFalse(reserved.mayAttemptPool(false, true, false))
+        assertEquals(reserved, reserved.recordPoolSelection())
+    }
+
+    @Test
+    fun `reserved pool does not block independent audio defaults`() {
+        val reserved = TrackSelectionPhases().recordPoolSelection()
+        val defaults = reserved.automaticDefaults(hasSelectableAudio = true, hasSelectableSubtitle = true)
+        assertEquals(AutomaticTrackDefaults(selectAudio = true, selectSubtitle = false), defaults)
+        val applied = reserved.apply(defaults)
+        assertEquals(DefaultTrackPhase.DEFAULT_APPLIED, applied.audio)
+        assertEquals(DefaultTrackPhase.WAITING_FOR_INVENTORY, applied.subtitle)
+        assertTrue(applied.poolAttempted)
+    }
+
+    @Test
+    fun `explicit holds still deny pool and a fresh loaded engine resets its reservation`() {
+        val old = TrackSelectionPhases()
+            .apply(AutomaticTrackDefaults(selectAudio = true, selectSubtitle = false))
+            .recordPoolSelection()
+            .holdSubtitle()
+        assertEquals(DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION, old.subtitle)
+        assertFalse(old.automaticDefaults(true, true).selectSubtitle)
+        assertFalse(old.mayAttemptPool(false, true, false))
+        val fresh = TrackSelectionPhases()
+        assertFalse(fresh.poolAttempted)
+        assertFalse(fresh.addonAttempted)
+        assertEquals(DefaultTrackPhase.WAITING_FOR_INVENTORY, fresh.subtitle)
+        assertTrue(fresh.apply(AutomaticTrackDefaults(true, false)).mayAttemptPool(false, true, false))
+    }
 }

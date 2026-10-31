@@ -25,7 +25,7 @@ serde_json = "1"
 
 # The VortX streaming server from the private engine, pinned to the same reviewed revision the apps
 # build against, and run in process (src/server.rs). CI fetches it with the engine token.
-vortx-streaming-server = { git = "https://github.com/VortXTV/vortx-core", rev = "0c30f4782aee544a2b7e33169ad60d03630d4097" }
+vortx-streaming-server = { git = "https://github.com/VortXTV/vortx-core", rev = "7b79b45d62dd06716661ff196a845e76330a140f" }
 once_cell = "1"
 http = "1"
 tempfile = "3"

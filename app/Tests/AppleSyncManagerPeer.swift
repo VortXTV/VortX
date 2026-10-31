@@ -67,6 +67,12 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     static let shared = CoreBridge()
     var session: VortxNativeSession?
     var generation = 1
+    // RECEIPT FIXTURE GRAPH START
+    var currentPlaylistReceiptOwner: NativePlaylistReceiptOwner?
+    func nativePlaylistReceiptOwnerIsCurrent(_ owner: NativePlaylistReceiptOwner) -> Bool {
+        session != nil && currentPlaylistReceiptOwner == owner
+    }
+    // RECEIPT FIXTURE GRAPH END
     private var snapshots: [String: Data] = [:]
     struct RegistryBinding { let scope: VortxAccountScope }
     var nativeRegistryBinding: RegistryBinding? {
@@ -132,6 +138,9 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
         var preferenceCommand: String?; var preferenceValue: String?
         var projectionStamp: Double?; var projectionValue: String?
         var globalScenario: String?; var globalDuringPUT: String?
+        // RECEIPT FIXTURE GRAPH START
+        var playlistReceiptCase: String?
+        // RECEIPT FIXTURE GRAPH END
     }
     struct Edit: Decodable { let profileID: String?; let fields: [String: VortxJSON] }
     struct Account { let id: String }
@@ -157,12 +166,22 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     var isApplyingRemote = false
     var nativePushQueue = NativeForegroundSyncPolicy.PushQueue()
     var nativeDurablePushPending = false
+    var pendingNativeMutationPush: CredentialScopeRegistry.Capture?
     var pendingSync: Task<Void, Never>?
     var pendingSyncCapture: CredentialScopeRegistry.Capture?
     var pendingSyncID: UUID?
     var pendingSyncAwaitsProgressWindow = false
     var realtimeActive = false
     var nativePreferenceIntentStatus = "idle"
+    // RECEIPT FIXTURE GRAPH START
+    var playlistReceiptFixtureOwner: NativePlaylistReceiptOwner?
+    var playlistReceiptFixtureField: String?
+    var playlistReceiptFixtureCapture: CredentialScopeRegistry.Capture?
+    var playlistReceiptFixtureNewValue: VortxJSON?
+    var playlistReceiptFixtureNewRegister: VortxJSON?
+    var playlistReceiptQueueGenerationBefore: UInt64?
+    var playlistReceiptRearmObserved = false
+    // RECEIPT FIXTURE GRAPH END
     var nativePreferenceLocalAdmissions: [UUID: [NativePreferenceIntentStore.Group: NativePreferenceLocalAdmission]] = [:]
     let nativePreferenceAdmissionGate = NativePreferenceIntentStore.AdmissionGate()
     var hasPendingPush: Bool { nativePushQueue.hasPendingPush || nativeDurablePushPending }
@@ -350,6 +369,18 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
             req.httpBody = try body.map { try JSONSerialization.data(withJSONObject: $0) }
             if method == "PUT" {
                 putVersions.append(body?["version"] as? Int ?? -1)
+                // RECEIPT FIXTURE GRAPH START
+                if putVersions.count == 1, command.playlistReceiptCase == "edit-during-put",
+                   let owner = playlistReceiptFixtureOwner, let capture = playlistReceiptFixtureCapture,
+                   let field = playlistReceiptFixtureField, let value = playlistReceiptFixtureNewValue,
+                   let session = CoreBridge.shared.session {
+                    try await edit([], edits: [.init(profileID: AppleSyncManagerPeer.owner, fields: [field: value])])
+                    try await refreshSnapshots()
+                    let register = try await playlistRegister(session: session, field: field)
+                    playlistReceiptFixtureNewRegister = register
+                    _ = registerNativePlaylistMutation(credentialCapture: capture, owner: owner, field: field, register: register)
+                }
+                // RECEIPT FIXTURE GRAPH END
                 if putVersions.count == 1, let change = command.globalDuringPUT {
                     if change == "repair-omitted" {
                         UserDefaults.standard.set(true, forKey: "stremiox.autoSkip")
@@ -369,12 +400,120 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
             if method == "PUT", command.keyABA == true {
                 dataKey = Data(repeating: 3, count: 32); retire(); dataKey = AppleSyncManagerPeer.key; retire()
             }
+            // RECEIPT FIXTURE GRAPH START
+            if method == "PUT", putVersions.count == 1, command.playlistReceiptCase == "owner-during-put" {
+                CoreBridge.shared.currentPlaylistReceiptOwner = nil
+            }
+            if method == "PUT", putVersions.count == 1, command.playlistReceiptCase == "registration-after-accept",
+               let owner = playlistReceiptFixtureOwner, let capture = playlistReceiptFixtureCapture,
+               let field = playlistReceiptFixtureField, let value = playlistReceiptFixtureNewValue,
+               let session = CoreBridge.shared.session {
+                // The server has accepted the older frozen candidate. Commit/register the
+                // newer local generation before that older acceptance returns to syncUp.
+                try await edit([], edits: [.init(profileID: AppleSyncManagerPeer.owner, fields: [field: value])])
+                try await refreshSnapshots()
+                let register = try await playlistRegister(session: session, field: field)
+                playlistReceiptFixtureNewRegister = register
+                _ = registerNativePlaylistMutation(credentialCapture: capture, owner: owner, field: field, register: register)
+                playlistReceiptRearmObserved = nativePushQueue.generation > (playlistReceiptQueueGenerationBefore ?? 0)
+                    && nativePushQueue.hasPendingPush
+            }
+            // RECEIPT FIXTURE GRAPH END
             // The canonical absent response is bodyless 404. Preserve that HTTP status;
             // failing JSON decode must not turn a real authenticated absence into transport 0.
             return ((response as? HTTPURLResponse)?.statusCode ?? 0,
                     data.isEmpty ? nil : (try? JSONSerialization.jsonObject(with: data)) as? [String: Any])
         } catch { return (0, nil) }
     }
+    // RECEIPT FIXTURE GRAPH START
+    private func playlistRegister(session: VortxNativeSession, field: String) async throws -> VortxJSON {
+        let host = try await session.hostPreferencesDocument()
+        guard let register = host["profiles"]?[AppleSyncManagerPeer.owner]?["fields"]?[field],
+              VortxNativePlaylist.canonicalReceiptRegister(register) != nil else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        return register
+    }
+
+    func runPlaylistReceiptCase(_ scenario: String) async throws -> [String: VortxJSON] {
+        guard let session = CoreBridge.shared.session else { throw VortxNativeError.unavailable }
+        let playlistID = UUID(uuidString: "A0000000-ABCD-EF01-AAAA-BBBBBBBBBBBB")!
+        let entryID = UUID(uuidString: "A0000000-ABCD-EF01-AAAA-BBBBBBBBBBBC")!
+        let candidate = PlaybackTitleQueuePolicy.Candidate(contentID: "tt-receipt-fixture", type: "movie", title: "Receipt fixture")!
+        let document = VortxNativePlaylist.Document(id: playlistID, name: "Receipt fixture", entries: [
+            .init(id: entryID, candidate: candidate)
+        ])
+        let value = try VortxNativePlaylist.encodedValue(document)
+        let field = VortxNativePlaylist.field(playlistID)
+        try await session.dispatch([], now: 100, hostEdits: [.init(profileID: AppleSyncManagerPeer.owner, fields: [field: value])])
+        let original = try await playlistRegister(session: session, field: field)
+        try await publishProfiles(); try await refreshSnapshots()
+        let capture = credentialAuthority.capture()
+        let owner = NativePlaylistReceiptOwner(credentialNamespace: capture.namespace,
+            credentialGeneration: UInt64(capture.generation), accountGeneration: UUID(uuidString: "B0000000-ABCD-EF01-AAAA-BBBBBBBBBBBC")!,
+            profileID: UUID(uuidString: AppleSyncManagerPeer.owner)!, profileKey: AppleSyncManagerPeer.owner,
+            profileGeneration: UUID(uuidString: "B0000000-ABCD-EF01-AAAA-BBBBBBBBBBBB")!,
+            sessionGeneration: UUID(uuidString: "B0000000-ABCD-EF01-AAAA-BBBBBBBBBBBD")!)
+        CoreBridge.shared.currentPlaylistReceiptOwner = owner
+        playlistReceiptFixtureCapture = capture
+        guard registerNativePlaylistMutation(credentialCapture: capture, owner: owner, field: field, register: original) else {
+            throw VortxNativeError.superseded
+        }
+        playlistReceiptFixtureOwner = owner; playlistReceiptFixtureField = field
+        let changedValue = try VortxNativePlaylist.encodedValue(.init(id: playlistID, name: "Newer local receipt", entries: [
+            .init(id: entryID, candidate: candidate)
+        ]))
+        playlistReceiptFixtureNewValue = changedValue
+        playlistReceiptQueueGenerationBefore = nativePushQueue.generation
+        if scenario == "registration-after-accept" {
+            // Isolate the generation created by the post-accept registration. Keep the
+            // existing queue debt and run its worker in foreground retry mode.
+            pendingSync?.cancel(); pendingSync = nil; pendingSyncID = nil
+            realtimeActive = true
+        }
+        let initialFingerprint = try await NativePlaylistCloudReceiptProjectionWorker.shared.fingerprint(original)!
+        let uploadAccepted = await syncUp()
+        let afterFirst = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: initialFingerprint)
+        var result: [String: VortxJSON] = [
+            "receiptUploadAccepted": .bool(uploadAccepted),
+            "receiptFirstPending": .bool(afterFirst == .pending),
+            "receiptFirstSaved": .bool({ if case .saved = afterFirst { return true }; return false }())
+        ]
+        if scenario == "lost-retry" {
+            let beforeRetry = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: initialFingerprint)
+            let retryAccepted = await syncUp()
+            let afterRetry = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: initialFingerprint)
+            result["receiptLostReplyStayedPending"] = .bool(beforeRetry == .pending)
+            result["receiptRetryAccepted"] = .bool(retryAccepted)
+            if case .saved(let version) = afterRetry { result["receiptRetryVersion"] = .integer(Int64(version)) }
+        } else if scenario == "edit-during-put" {
+            guard let newer = playlistReceiptFixtureNewRegister else { throw VortxNativeError.invalidSnapshot }
+            let newFingerprint = try await NativePlaylistCloudReceiptProjectionWorker.shared.fingerprint(newer)!
+            let newState = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: newFingerprint)
+            let newerIsPendingOrSaved: Bool
+            switch newState {
+            case .pending, .saved: newerIsPendingOrSaved = true
+            case .unknown: newerIsPendingOrSaved = false
+            }
+            result["receiptNewEditRemainsPendingOrSaved"] = .bool(newerIsPendingOrSaved)
+            result["receiptOldEditNotSaved"] = .bool(afterFirst != .saved(version: 1) && afterFirst != .saved(version: 0))
+        } else if scenario == "owner-during-put" {
+            result["receiptRetiredOwnerNotSaved"] = .bool(!({ if case .saved = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: initialFingerprint) { return true }; return false }()))
+        } else if scenario == "registration-after-accept" {
+            guard let newer = playlistReceiptFixtureNewRegister else { throw VortxNativeError.invalidSnapshot }
+            let newerFingerprint = try await NativePlaylistCloudReceiptProjectionWorker.shared.fingerprint(newer)!
+            await pendingSync?.value
+            let currentAfterDrain = nativePlaylistCloudReceipt(owner: owner, field: field, fingerprint: newerFingerprint)
+            let savedReceiptVersion: Int
+            if case .saved(let version) = currentAfterDrain { savedReceiptVersion = version }
+            else { savedReceiptVersion = -1 }
+            result["receiptPostAcceptRegistrationArmedNewGeneration"] = .bool(playlistReceiptRearmObserved)
+            result["receiptPostAcceptNewGenerationUploaded"] = .bool({ if case .saved = currentAfterDrain { return true }; return false }())
+            result["receiptPostAcceptNewGenerationVersion"] = .integer(Int64(savedReceiptVersion))
+        }
+        return result
+    }
+    // RECEIPT FIXTURE GRAPH END
     func run() async throws -> [String: VortxJSON] {
         if let scenario = command.globalScenario {
             try UserDefaults.standard.open(command.directory)
@@ -753,6 +892,10 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
             }
         }
         switch command.mode {
+        // RECEIPT FIXTURE GRAPH START
+        case "playlist-receipt":
+            for (key, value) in try await runPlaylistReceiptCase(command.playlistReceiptCase ?? "accepted") { result[key] = value }
+        // RECEIPT FIXTURE GRAPH END
         case "edit": try await edit(command.actions ?? [], edits: command.edits ?? [])
         case "push": result["accepted"] = .bool(await syncUp())
         case "auto":

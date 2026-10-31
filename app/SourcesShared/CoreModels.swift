@@ -39,8 +39,10 @@ struct CoreCWItem: Decodable, Identifiable, Sendable {
     var temp: Bool? = nil
     /// A native Library row for a title watched or started but never saved: listed, not saved membership.
     var previouslyWatched: Bool? = nil
+    /// Optional accepted catalog facts; absence means unknown, including older saved rows.
+    var genres: [String]? = nil
 
-    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp, previouslyWatched }
+    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp, previouslyWatched, genres }
 
     /// 0…1 watch progress (timeOffset/duration; both in ms).
     var progress: Double {

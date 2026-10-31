@@ -1,7 +1,10 @@
 package com.vortx.android.engine
 
 import com.vortx.android.foryou.ForYouNativeGateway
+import com.vortx.android.foryou.ForYouObservedField
 import com.vortx.android.foryou.ForYouSync
+import com.vortx.android.foryou.ForYouIdentityRef
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -11,12 +14,21 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-/**
- * The active native profile's `forYou.` host fields (interests and smart collections). Writes go through
- * the same Session -> authenticated account -> mounted lifecycle fence as [NativeWatchlistAccess], so an
- * edit lands only on the profile and account it was made for, and syncs like the watchlist.
- */
-internal class NativeForYouAccess(private val accounts: NativeAccountCoordinator) : ForYouNativeGateway {
+/** Original command capture uses Session -> authenticated account -> exact mounted installation.
+ * Store publication monitors never enter native calls. Generic Session.dispatch remains unchanged. */
+internal class NativeForYouAccess(
+    private val accounts: NativeAccountCoordinator,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ForYouNativeGateway {
+    private class Captured(
+        val session: VortxNativeSession,
+        val native: VortxNativeOwner,
+        val admission: NativeAccountCoordinator.ForYouMutationAdmission,
+    ) : ForYouNativeGateway.Owner {
+        override val profileId get() = native.profileID
+        override val scopeIdentity = listOf(ForYouIdentityRef(session), native, admission.identity)
+    }
+
     override val changes: Flow<Unit> = channelFlow {
         accounts.changes.collectLatest {
             send(Unit)
@@ -24,31 +36,53 @@ internal class NativeForYouAccess(private val accounts: NativeAccountCoordinator
         }
     }
 
-    override fun read(): Result<Pair<String, JSONObject>> = runCatching {
-        val read = accounts.session().read()
+    private fun fields(read: VortxNativeRead): JSONObject {
         val all = read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document")
             .getJSONObject("profiles").optJSONObject(read.owner.profileID)?.getJSONObject("fields") ?: JSONObject()
-        read.owner.profileID to JSONObject().also { fields ->
-            all.keys().asSequence().filter { it.startsWith(ForYouSync.PREFIX) }.forEach { fields.put(it, all.getJSONObject(it)) }
+        return JSONObject().also { result ->
+            all.keys().asSequence().filter { it.startsWith(ForYouSync.PREFIX) }.forEach { result.put(it, all.getJSONObject(it)) }
         }
     }
 
-    override suspend fun write(profileId: String, field: String, value: Any): Result<Unit> {
-        val operation = currentCoroutineContext()
-        return withContext(Dispatchers.IO) { runCatching {
+    override fun capture(): Result<ForYouNativeGateway.Snapshot> = runCatching {
+        val session = accounts.session()
+        session.withCurrentRead { read ->
+            val admission = accounts.captureForYouMutationAdmission(session)
+            val publication = accounts.captureProfilePresentation(session)
+            var result: ForYouNativeGateway.Snapshot? = null
+            check(admission.admit {
+                result = ForYouNativeGateway.Snapshot(Captured(session, read.owner, admission), fields(read), publication::publishIfCurrent)
+                true
+            }) { "For You account changed" }
+            checkNotNull(result)
+        }
+    }
+
+    override suspend fun write(owner: ForYouNativeGateway.Owner, field: String, observed: ForYouObservedField,
+                               value: Any, isCurrent: () -> Boolean): Result<Unit> {
+        val captured = owner as? Captured ?: return Result.failure(IllegalArgumentException("Invalid For You authority"))
+        val detached = runCatching {
             ForYouSync.validate(field, value)
-            val session = accounts.session()
-            val read = session.read()
-            check(read.owner.profileID.equals(profileId, ignoreCase = true)) { "Profile changed before this edit committed" }
-            session.owned(read.owner) {
-                val account = checkNotNull(accounts.accountFor(session))
-                check(accounts.withProfileMutation(session, account) {
+            if (value === JSONObject.NULL) JSONObject.NULL else JSONObject((value as JSONObject).toString())
+        }.getOrElse { return Result.failure(it) }
+        val operation = currentCoroutineContext()
+        return withContext(ioDispatcher) { try {
+            operation.ensureActive()
+            captured.session.owned(captured.native) {
+                check(captured.admission.admit {
                     operation.ensureActive()
-                    session.dispatch(emptyList(), read.owner, profileFieldChanges = JSONObject().put(field, value),
-                        beforeCommit = { operation.ensureActive() })
+                    check(isCurrent()) { "For You opening changed" }
+                    check(observed.matches(fields(captured.session.read()), field)) { "For You field changed; draft preserved" }
+                    captured.session.dispatch(emptyList(), captured.native,
+                        profileFieldChanges = JSONObject().put(field, detached),
+                        beforeCommit = { operation.ensureActive(); check(isCurrent()) { "For You opening changed" } })
                     true
-                }) { "For You account changed" }
+                }) { "For You account or mount changed" }
             }
+            Result.success(Unit)
+        } catch (failure: Throwable) {
+            if (failure is kotlinx.coroutines.CancellationException) throw failure
+            Result.failure(failure)
         } }
     }
 }

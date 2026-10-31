@@ -66,6 +66,14 @@ object RemoteConfig {
     /** The current snapshot (baked until [bootstrap] loads a cached / fetched config). Read lock-free. */
     fun current(): Snapshot = snapshot
 
+    /** Unrelated config fields never retire an authenticated Source Index context. */
+    private fun installSnapshot(next: Snapshot) {
+        val changed = snapshot.isFeatureOn("sourceIndex", true) != next.isFeatureOn("sourceIndex", true)
+        snapshot = next
+        // Fence after the visible fact: an authorization issued during the write cannot miss closure.
+        if (changed) com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
+    }
+
     /** Convenience: tri-state [Snapshot.isFeatureOn] against the current snapshot. */
     fun isFeatureOn(key: String, default: Boolean): Boolean = snapshot.isFeatureOn(key, default)
 
@@ -78,7 +86,7 @@ object RemoteConfig {
      */
     fun bootstrap(context: Context, scope: CoroutineScope) {
         val appContext = context.applicationContext
-        loadCachedSnapshot(appContext)?.let { snapshot = it }
+        loadCachedSnapshot(appContext)?.let(::installSnapshot)
         scope.launch { runCatching { refresh(appContext) } }
     }
 
@@ -111,10 +119,10 @@ object RemoteConfig {
             // master.remoteConfigEnabled == false is the whole-system kill switch: discard to baked and do NOT
             // persist, so deleting the field restores the last-good behavior on the next fetch.
             if (masterDisabled(root)) {
-                snapshot = Snapshot.baked()
+                installSnapshot(Snapshot.baked())
                 return@withContext
             }
-            snapshot = validate(root)
+            installSnapshot(validate(root))
             persist(context, rawJson = text, etag = connection.getHeaderField("ETag"))
         } catch (_: Exception) {
             // Timeout / offline / decode failure: keep last-good. Never throw.

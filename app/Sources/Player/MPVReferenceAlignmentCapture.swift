@@ -72,6 +72,8 @@ struct MPVReferenceAlignmentCapture: Sendable, Equatable {
     let streamIndex: Int
     let timestampOrigin: Double
 
+    /// The matched native snapshot supplies the hidden embedded REFERENCE identity separately
+    /// from the visible primary (which may be Off or the exact ordinary external subtitle just mounted).
     /// MPV's builtin MKV ff-index is only an approximation. Positively require
     /// lavf and its actual AVStream.index; no language/title, picker ordinal,
     /// src-id or unknown-property fallback is an original stream mapping.
@@ -87,7 +89,11 @@ struct MPVReferenceAlignmentCapture: Sendable, Equatable {
               let origin = double("demuxer-start-time", handle), abs(origin) <= 86_400,
               double("sub-delay", handle) == 0, double("sub-speed", handle) == 1,
               double("sub-fps", handle) == 0,
-              let primary = integer("sid", handle), primary > 0,
+              let snapshot = MPVOwnedSubtitleTransport.snapshot(handle),
+              snapshot.entry == expectedEntryID, snapshot.source == source.generation,
+              snapshot.origin == origin,
+              let referenceID = Int(exactly: snapshot.sid),
+              let referenceIndex = Int(exactly: snapshot.referenceCommandIndex),
               let count = integer("track-list/count", handle), (1...128).contains(count) else { return nil }
         var selected: (Int, Int)?
         for row in 0..<count {
@@ -95,16 +101,15 @@ struct MPVReferenceAlignmentCapture: Sendable, Equatable {
             guard let type = string(prefix + "type", handle) else { return nil }
             guard type == "sub" else { continue } // MPV IDs are per type, not globally unique.
             guard let id = integer(prefix + "id", handle) else { return nil }
-            guard id == primary else { continue }
+            guard id == referenceID else { continue }
             guard selected == nil,
                   flag(prefix + "external", handle) == false,
-                  flag(prefix + "selected", handle) == true,
-                  integer(prefix + "main-selection", handle) == 0,
-                  let index = integer(prefix + "ff-index", handle), (0..<128).contains(index) else { return nil }
+                  let index = integer(prefix + "ff-index", handle), (0..<128).contains(index),
+                  index == referenceIndex else { return nil }
             // Codec admissibility is checked against this exact AVStream by the extractor.
             selected = (id, index)
         }
-        guard let selected, integer("sid", handle) == primary,
+        guard let selected, MPVOwnedSubtitleTransport.snapshot(handle) == snapshot,
               LocalFile.read(handle) == source else { return nil }
         return .init(localFile: source, input: input, trackID: selected.0,
                      streamIndex: selected.1, timestampOrigin: origin)
@@ -136,43 +141,82 @@ struct MPVReferenceAlignmentCapture: Sendable, Equatable {
 /// Strict versioned node transport for the owned native subtitle renderer. Missing properties on an
 /// older SDK mean unavailable. Native node pointers never escape a synchronous borrow.
 enum MPVOwnedSubtitleTransport {
+    /// v2 local state mirrors the remote capability's ten typed identity fields,
+    /// adding source-generation and active-ticket. The command argument uses
+    /// one packed primaryFlags integer because native commands cap at 11 args:
+    /// bit 0 = external primary, bit 1 = visible primary.
     struct Snapshot: Sendable, Equatable {
         let intent: Int64
         let entry: Int64
         let source: Int64
         let sid: Int64
+        let referenceCommandIndex: Int64
         let stream: Int64
         let origin: Double
-        let visible: Bool
+        let primarySID: Int64
+        let primaryExternal: Bool
+        let primaryVisible: Bool
         let activeTicket: Int64
 
+        var referenceSID: Int64 { sid }
+        var referenceStreamIndex: Int64 { stream }
+        var visible: Bool { primaryVisible }
+
         var arguments: [Argument] {
-            [.integer(intent), .integer(entry), .integer(source), .integer(sid),
-             .integer(stream), .number(origin)]
+            [.integer(intent), .integer(entry), .integer(source),
+             .integer(sid), .integer(referenceCommandIndex), .integer(stream),
+             .integer(primarySID),
+             .integer(MPVOwnedSubtitleTransport.packedPrimaryFlags(external: primaryExternal, visible: primaryVisible)),
+             .number(origin)]
         }
     }
+
     enum Argument: Sendable { case integer(Int64), number(Double), string(String) }
     private enum Value { case integer(Int64), number(Double), flag(Bool) }
 
+    private static let snapshotKeys: Set<String> = [
+        "version", "intent-generation", "entry-id", "source-generation",
+        "reference-sid", "reference-command-index", "reference-stream-index",
+        "demux-origin", "primary-sid", "primary-external", "primary-visible",
+        "active-ticket"
+    ]
+
     static func snapshot(_ handle: OpaquePointer) -> Snapshot? {
         var node = mpv_node()
-        guard mpv_get_property(handle, "vortx-owned-subtitle-state", MPV_FORMAT_NODE, &node) >= 0 else { return nil }
+        guard mpv_get_property(handle, "vortx-owned-subtitle-state", MPV_FORMAT_NODE, &node) >= 0 else {
+            return nil
+        }
         defer { mpv_free_node_contents(&node) }
         return decodeSnapshot(node)
     }
 
     static func decodeSnapshot(_ node: mpv_node) -> Snapshot? {
-        guard let fields = fields(node, count: 9), integer(fields["version"]) == 1,
+        guard let fields = exactFields(node, names: snapshotKeys),
+              integer(fields["version"]) == 2,
               let intent = integer(fields["intent-generation"]), intent > 0,
               let entry = integer(fields["entry-id"]), entry > 0,
               let source = integer(fields["source-generation"]), source > 0,
-              let sid = integer(fields["sid"]), sid > 0,
-              let stream = integer(fields["ff-index"]), (0..<128).contains(stream),
-              case .some(.number(let origin)) = fields["origin"], origin.isFinite, abs(origin) <= 86_400,
-              case .some(.flag(let visible)) = fields["primary-visible"], visible,
-              let active = integer(fields["active-ticket"]), active >= 0 else { return nil }
-        return .init(intent: intent, entry: entry, source: source, sid: sid, stream: stream,
-                     origin: origin, visible: visible, activeTicket: active)
+              let sid = integer(fields["reference-sid"]),
+              (1...Int64(Int32.max)).contains(sid),
+              let referenceCommandIndex = integer(fields["reference-command-index"]),
+              (0..<128).contains(referenceCommandIndex),
+              let stream = integer(fields["reference-stream-index"]),
+              (0..<1024).contains(stream),
+              let primarySID = integer(fields["primary-sid"]),
+              (0...Int64(Int32.max)).contains(primarySID),
+              case .some(.flag(let primaryExternal)) = fields["primary-external"],
+              case .some(.flag(let primaryVisible)) = fields["primary-visible"],
+              primarySID != 0 || !primaryExternal,
+              case .some(.number(let origin)) = fields["demux-origin"],
+              origin.isFinite, abs(origin) <= 86_400,
+              let active = integer(fields["active-ticket"]), active >= 0 else {
+            return nil
+        }
+        return .init(intent: intent, entry: entry, source: source, sid: sid,
+                     referenceCommandIndex: referenceCommandIndex, stream: stream,
+                     origin: origin, primarySID: primarySID,
+                     primaryExternal: primaryExternal, primaryVisible: primaryVisible,
+                     activeTicket: active)
     }
 
     static func externalSRT(_ file: URL) -> Data? {
@@ -223,18 +267,30 @@ enum MPVOwnedSubtitleTransport {
     }
 
     static func decodePreparationReply(_ node: mpv_node) -> PreparationResult {
-        guard let result = fields(node, count: 2), integer(result["version"]) == 1,
-              let ticket = integer(result["ticket"]), ticket > 0 else { return .unconfirmed }
+        guard let result = exactFields(node, names: ["version", "ticket"]),
+              integer(result["version"]) == 2,
+              let ticket = integer(result["ticket"]), ticket > 0 else {
+            return .unconfirmed
+        }
         return .ready(ticket)
     }
+
     static func commit(_ handle: OpaquePointer, ticket: Int64, snapshot: Snapshot) -> Bool {
         var result = mpv_node()
         defer { mpv_free_node_contents(&result) }
-        guard command(handle, "vortx-subtitle-owned-commit", [.integer(ticket)] + snapshot.arguments, &result) >= 0 else { return false }
-        guard let result = fields(result, count: 3), integer(result["version"]) == 1,
-              integer(result["ticket"]) == ticket, case .some(.flag(true)) = result["committed"] else { return false }
+        guard command(handle, "vortx-subtitle-owned-commit",
+                      [.integer(ticket)] + snapshot.arguments, &result) >= 0 else {
+            return false
+        }
+        guard let result = exactFields(result, names: ["version", "ticket", "committed"]),
+              integer(result["version"]) == 2,
+              integer(result["ticket"]) == ticket,
+              case .some(.flag(true)) = result["committed"] else {
+            return false
+        }
         return true
     }
+
     static func revoke(_ handle: OpaquePointer, ticket: Int64) -> Bool {
         guard ticket > 0 else { return false }
         var result = mpv_node()
@@ -256,16 +312,26 @@ enum MPVOwnedSubtitleTransport {
                 }
             }
         }
-        guard status >= 0, let result = fields(result, count: 2), integer(result["version"]) == 1,
-              case .some(.flag(_)) = result["released"] else { return false }
+        guard status >= 0,
+              let result = exactFields(result, names: ["version", "released"]),
+              integer(result["version"]) == 2,
+              case .some(.flag(_)) = result["released"] else {
+            return false
+        }
         // Both true (exact slot removed) and false (exact ticket already absent) certify that
         // future native borrows cannot acquire this ticket. Neither proves physical display.
         return true
     }
 
-    private static func integer(_ value: Value?) -> Int64? {
-        guard case .some(.integer(let value)) = value else { return nil }; return value
+    fileprivate static func packedPrimaryFlags(external: Bool, visible: Bool) -> Int64 {
+        (external ? 1 : 0) | (visible ? 2 : 0)
     }
+
+    private static func integer(_ value: Value?) -> Int64? {
+        guard case .some(.integer(let value)) = value else { return nil }
+        return value
+    }
+
     private static func fields(_ node: mpv_node, count: Int) -> [String: Value]? {
         guard node.format == MPV_FORMAT_NODE_MAP, let list = node.u.list,
               Int(list.pointee.num) == count, let keys = list.pointee.keys,
@@ -276,16 +342,26 @@ enum MPVOwnedSubtitleTransport {
             let keyText = String(cString: key)
             guard result[keyText] == nil else { return nil }
             switch values[index].format {
-            case MPV_FORMAT_INT64: result[keyText] = .integer(values[index].u.int64)
-            case MPV_FORMAT_DOUBLE: result[keyText] = .number(values[index].u.double_)
+            case MPV_FORMAT_INT64:
+                result[keyText] = .integer(values[index].u.int64)
+            case MPV_FORMAT_DOUBLE:
+                result[keyText] = .number(values[index].u.double_)
             case MPV_FORMAT_FLAG:
                 guard values[index].u.flag == 0 || values[index].u.flag == 1 else { return nil }
                 result[keyText] = .flag(values[index].u.flag == 1)
-            default: return nil
+            default:
+                return nil
             }
         }
         return result
     }
+
+    private static func exactFields(_ node: mpv_node, names: Set<String>) -> [String: Value]? {
+        guard let fields = fields(node, count: names.count),
+              Set(fields.keys) == names else { return nil }
+        return fields
+    }
+
     private static func command(_ handle: OpaquePointer, _ name: String,
                                 _ arguments: [Argument], _ result: inout mpv_node) -> Int32 {
         withCommand(name, arguments) { mpv_command_node(handle, $0, &result) }
@@ -303,11 +379,14 @@ enum MPVOwnedSubtitleTransport {
         }
         for (index, value) in arguments.enumerated() {
             switch value {
-            case .integer(let value): nodes[index].format = MPV_FORMAT_INT64; nodes[index].u.int64 = value
-            case .number(let value): nodes[index].format = MPV_FORMAT_DOUBLE; nodes[index].u.double_ = value
+            case .integer(let value):
+                nodes[index].format = MPV_FORMAT_INT64; nodes[index].u.int64 = value
+            case .number(let value):
+                nodes[index].format = MPV_FORMAT_DOUBLE; nodes[index].u.double_ = value
             case .string(let value):
                 guard !value.contains("\0"), let string = strdup(value) else { return -1 }
-                strings.append(string); nodes[index].format = MPV_FORMAT_STRING; nodes[index].u.string = string
+                strings.append(string)
+                nodes[index].format = MPV_FORMAT_STRING; nodes[index].u.string = string
             }
         }
         var list = mpv_node_list(num: Int32(arguments.count), values: nodes, keys: nil)

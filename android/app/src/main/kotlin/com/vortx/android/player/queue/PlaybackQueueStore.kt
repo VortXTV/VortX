@@ -89,10 +89,43 @@ internal class PlaybackQueueStore internal constructor(
 
     fun add(owner: ContinueWatchingOwner, item: MetaItem, playNext: Boolean = false): Boolean =
         mutate(owner) { PlaybackQueueModel.add(it, owner, item, playNext) }
+    /** True means one immutable local persistence intent was admitted; it is not a cloud-sync receipt. */
+    fun appendCandidates(owner: ContinueWatchingOwner, items: List<MetaItem>): Boolean =
+        mutate(owner) { PlaybackQueueModel.appendCandidates(it, owner, items) }
+
+    /**
+     * If existing owner/readiness/backpressure admission reaches the batch transform, the lock-free
+     * predicate is invoked once under the queue monitor. It must only read an atomic consumer stamp:
+     * no locks, owner lookup, Session call, or further callback. A cut completed before this predicate
+     * rejects; an overlapping call may linearize here before that cut. Existing capacity, persistence
+     * and backpressure behavior stays unchanged.
+     */
+    fun appendCandidatesIfCurrent(
+        owner: ContinueWatchingOwner,
+        items: List<MetaItem>,
+        lockFreeAdmission: () -> Boolean,
+    ): Boolean = mutate(owner) { state ->
+        if (lockFreeAdmission()) PlaybackQueueModel.appendCandidates(state, owner, items) else null
+    }
+
     fun move(owner: ContinueWatchingOwner, id: String, delta: Int): Boolean =
         mutate(owner) { PlaybackQueueModel.move(it, owner, id, delta) }
     fun remove(owner: ContinueWatchingOwner, id: String): Boolean =
         mutate(owner) { PlaybackQueueModel.remove(it, owner, id) }
+
+    /** Snapshot only the exact current owner before/after the monitor read; never substitute a successor. */
+    fun playlistSnapshot(owner: ContinueWatchingOwner): PlaybackQueuePlaylistSnapshot? {
+        if (ownerNow() != owner) return null
+        val snapshot = synchronized(monitor) {
+            _state.value.takeIf { it.ready && it.owner == owner }?.let {
+                PlaybackQueuePlaylistSnapshot(
+                    items = it.entries.map { entry -> entry.item },
+                    remainingCapacity = (PlaybackQueueModel.MAX_ENTRIES - it.entries.size).coerceAtLeast(0),
+                )
+            }
+        }
+        return snapshot?.takeIf { ownerNow() == owner }
+    }
 
     fun capture(owner: ContinueWatchingOwner, id: String): PlaybackQueueToken? {
         if (ownerNow() != owner) return null

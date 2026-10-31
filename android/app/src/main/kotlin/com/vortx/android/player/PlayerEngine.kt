@@ -108,8 +108,25 @@ interface PlayerEngine {
     fun beginSubtitleSelection(): PlayerSubtitleSelection? = null
     fun captureSubtitleSelection(): PlayerSubtitleSelection? = null
     fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean = false
+    /** Background preparation witness only; final commands still require the concrete engine gate. */
+    fun isSubtitlePreparationCurrent(request: PlayerSubtitleSelection): Boolean = false
     fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean = false
     fun addExternalSubtitle(url: String, request: PlayerSubtitleSelection): Boolean = false
+
+    /** Mount the requested file first; unsupported/unmatched alignment keeps that ordinary selection. */
+    suspend fun selectExternalSubtitleAutomatically(
+        url: String,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult = if (addExternalSubtitle(url, request))
+        PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT else PlayerExternalSubtitleSelectionResult.FAILED
+    /** Already-fetched installed add-on bytes. Unsupported engines must never refetch the identity URL. */
+    suspend fun selectAddonSubtitle(
+        source: PlayerAddonSubtitleSource,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult = PlayerExternalSubtitleSelectionResult.FAILED
+
     fun setSubtitleDelay(seconds: Double, request: PlayerSubtitleSelection): Boolean = false
 
     /// Mount and select the exact additional external subtitle file. Re-selecting a mounted file
@@ -288,6 +305,7 @@ data class PlayerState(
 enum class EngineFallbackReason {
     SURFACE_ATTACH_FAILED,
     AUDIO_OUTPUT_FAILED,
+    SUBTITLE_RETIREMENT_UNCONFIRMED,
 }
 
 internal fun PlayerState.requestEngineFallback(reason: EngineFallbackReason): PlayerState =
@@ -385,3 +403,9 @@ internal fun freshPlayerStateForLoad(): PlayerState = PlayerState(isBuffering = 
 ///
 /// It intentionally does NOT live here: a `src/main` copy plus a flavor copy is a duplicate-class build
 /// error (the flavor source set is additive to main, not an override of a same-named declaration).
+
+/** A result describes this exact selection, never a claim about another source/engine or device. */
+enum class PlayerExternalSubtitleSelectionResult {
+    ALIGNED, SELECTED_WITHOUT_ALIGNMENT, SUPERSEDED, NEEDS_STOP, FAILED;
+    val selected: Boolean get() = this == ALIGNED || this == SELECTED_WITHOUT_ALIGNMENT
+}

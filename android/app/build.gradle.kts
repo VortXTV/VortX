@@ -381,8 +381,8 @@ dependencies {
     // Compose route chooser uses. Both are plain Google/AndroidX libraries with NO GPL native code (unlike
     // libmpv, which is fullImplementation-only), so they are LICENSING-BOUNDARY-SAFE plain `implementation`
     // dependencies compiled into BOTH the `full` and `play` flavors: the Play build stays GPL-clean and gains
-    // casting without any libmpv. Torrents are gated out of casting as loopback URLs (CastEligibility), so a
-    // remote receiver is only ever handed a stream it can actually reach.
+    // casting without any libmpv. CastEligibility accepts receiver-reachable streams, including torrents
+    // exposed by the user's selected LAN server, and rejects device-loopback-only URLs.
     implementation(libs.play.services.cast.framework)
     implementation(libs.androidx.mediarouter)
 

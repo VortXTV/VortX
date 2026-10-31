@@ -1,0 +1,273 @@
+--- a/stream/reference_source.h
++++ b/stream/reference_source.h
+@@ -143,3 +143,19 @@
+     struct stream_reference_sent_request_values *values);
+ void stream_reference_sent_request_release(
+     struct stream_reference_sent_request **request);
++
++// One prerequisite for a future finite duplicate reader, NOT an open/replay
++// capability. The original owner alone may derive bounded-prefix HTTP options
++// from the exact retained sent GET while s/AVIO are alive and excluded from I/O.
++// This preserves sent Cookie/static Authorization, not learned cookies or the
++// initial request's stale headers. Outputs own native secrets; never log them,
++// persist them or pass them through Swift. Both outputs must initially be NULL.
++// On failure they are unchanged. Free successful outputs with av_free and
++// av_dict_free. Keep request alive through every future use/cancel check and
++// revalidate it again on its original owner before accepting any result.
++// Destination/proxy/TLS-route, duplicate-response/entity, track and complete
++// prefix admission remain REQUIRED; this function performs no network I/O.
++#define STREAM_REFERENCE_PREFIX_MAX_BYTES (128u * 1024u * 1024u)
++bool stream_reference_source_prepare_prefix_request(
++    struct stream *s, const struct stream_reference_sent_request *request,
++    uint32_t max_bytes, char **url, struct AVDictionary **options);
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -16,9 +16,11 @@
+  */
+ 
+ #include <limits.h>
++#include <stdio.h>
+ 
+ #include <libavformat/avformat.h>
+ #include <libavformat/avio.h>
++#include <libavutil/bprint.h>
+ #include <libavutil/mem.h>
+ #include <libavutil/opt.h>
+ 
+@@ -611,7 +613,225 @@
+     }
+     copy.request_bytes = (uint32_t)request->sent.request_bytes;
+     *out = copy;
++    return true;
++}
++
++static bool reference_prefix_field(const char *line, size_t length,
++                                   const char *name)
++{
++    return strlen(name) == length && !av_strncasecmp(line, name, length);
++}
++
++// A deliberately small policy grammar. Unsupported wildcard/exclusion syntax
++// disables only this optional preparation instead of relaxing the old policy.
++static bool reference_prefix_protocols(const char *list, const char *needed,
++                                       bool whitelist)
++{
++    if (!list)
++        return true;
++    bool found = false;
++    const char *p = list;
++    if (!*p)
++        return !whitelist;
++    while (*p) {
++        const char *end = strchr(p, ',');
++        if (!end)
++            end = p + strlen(p);
++        size_t length = end - p;
++        if (!length || length > 32)
++            return false;
++        for (const char *c = p; c < end; c++) {
++            if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') ||
++                  *c == '_' || *c == '-' || *c == '+'))
++                return false;
++        }
++        if (strlen(needed) == length && !memcmp(p, needed, length))
++            found = true;
++        if (!*end)
++            break;
++        p = end + 1;
++        if (!*p)
++            return false;
++    }
++    return whitelist ? found : !found;
++}
++
++static bool reference_prefix_range(const char *value, size_t length)
++{
++    if (length < 8 || memcmp(value, "bytes=", 6))
++        return false;
++    const char *p = value + 6, *end = value + length;
++    uint64_t ignored = 0;
++    if (p == end || *p < '0' || *p > '9')
++        return false;
++    while (p < end && *p >= '0' && *p <= '9') {
++        if (ignored > (INT64_MAX - (*p - '0')) / 10u)
++            return false;
++        ignored = ignored * 10u + (*p++ - '0');
++    }
++    if (p == end || *p++ != '-')
++        return false;
++    ignored = 0;
++    while (p < end && *p >= '0' && *p <= '9') {
++        if (ignored > (INT64_MAX - (*p - '0')) / 10u)
++            return false;
++        ignored = ignored * 10u + (*p++ - '0');
++    }
++    return p == end;
++}
++
++static char *reference_prefix_headers(
++    const struct stream_reference_sent_request *request, uint32_t max_bytes)
++{
++    static const char *const rejected[] = {
++        "Content-Length", "Transfer-Encoding", "Expect", "Upgrade", "Trailer",
++        "TE", "Proxy-Authorization", "Proxy-Connection", "If-Match",
++        "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range",
++        NULL,
++    };
++    const char *wire = request->sent.request;
++    size_t bytes = request->sent.request_bytes;
++    const char *end = wire + bytes;
++    const char *line = strstr(wire, "\r\n");
++    if (!line || bytes < 18 || memcmp(wire, "GET /", 5) ||
++        memcmp(end - 4, "\r\n\r\n", 4))
++        return NULL;
++    const char *etag = request->observation->values.etag;
++    size_t etag_bytes = strlen(etag);
++    if (etag_bytes < 2 || etag_bytes > REFERENCE_RESPONSE_ETAG_LIMIT ||
++        etag[0] != '"' || etag[etag_bytes - 1] != '"')
++        return NULL;
++    for (size_t n = 1; n + 1 < etag_bytes; n++) {
++        unsigned char c = etag[n];
++        if (c < 0x21 || c == '"' || c == 0x7f)
++            return NULL;
++    }
++    AVBPrint headers;
++    av_bprint_init(&headers, 0, VORTX_HTTP_SENT_REQUEST_MAX_BYTES);
++    unsigned host = 0, agent = 0, accept = 0;
++    line += 2;
++    while (line < end - 2) {
++        const char *next = strstr(line, "\r\n");
++        const char *colon = next ? memchr(line, ':', next - line) : NULL;
++        if (!next || next >= end - 2 || !colon || colon == line)
++            goto fail;
++        size_t name_bytes = colon - line;
++        const char *value = colon + 1, *value_end = next;
++        while (value < value_end && (*value == ' ' || *value == '\t'))
++            value++;
++        while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t'))
++            value_end--;
++        size_t value_bytes = value_end - value;
++        for (int n = 0; rejected[n]; n++) {
++            if (reference_prefix_field(line, name_bytes, rejected[n]))
++                goto fail;
++        }
++        if (reference_prefix_field(line, name_bytes, "Range")) {
++            if (!reference_prefix_range(value, value_bytes))
++                goto fail;
++        } else if (reference_prefix_field(line, name_bytes, "Connection")) {
++            if (!((value_bytes == 5 && !av_strncasecmp(value, "close", 5)) ||
++                  (value_bytes == 10 && !av_strncasecmp(value, "keep-alive", 10))))
++                goto fail;
++        } else if (reference_prefix_field(line, name_bytes, "Accept-Encoding")) {
++            if (value_bytes != 8 || av_strncasecmp(value, "identity", 8))
++                goto fail;
++        } else if (reference_prefix_field(line, name_bytes, "Icy-MetaData")) {
++            // Normal mpv asks for ICY metadata. Keeping that custom field would
++            // defeat icy=0, so explicitly decline it in this candidate prefix.
++            if (value_bytes != 1 || (value[0] != '0' && value[0] != '1'))
++                goto fail;
++        } else {
++            host += reference_prefix_field(line, name_bytes, "Host");
++            agent += reference_prefix_field(line, name_bytes, "User-Agent");
++            accept += reference_prefix_field(line, name_bytes, "Accept");
++            av_bprint_append_data(&headers, line, next - line + 2);
++        }
++        line = next + 2;
++    }
++    if (line != end - 2 || host != 1 || agent != 1 || accept != 1)
++        goto fail;
++    // The old Range is intentionally replaced. This material requests a finite
++    // prefix under the original strong validator, not an equivalent response.
++    av_bprintf(&headers, "Range: bytes=0-%u\r\nIf-Match: %s\r\n"
++               "Connection: close\r\nAccept-Encoding: identity\r\n"
++               "Icy-MetaData: 0\r\n",
++               (unsigned)(max_bytes - 1), etag);
++    if (!av_bprint_is_complete(&headers))
++        goto fail;
++    char *out = NULL;
++    if (av_bprint_finalize(&headers, &out) < 0)
++        return NULL;
++    return out;
++fail:
++    av_bprint_finalize(&headers, NULL);
++    return NULL;
++}
++
++bool stream_reference_source_prepare_prefix_request(
++    stream_t *s, const struct stream_reference_sent_request *request,
++    uint32_t max_bytes, char **url, AVDictionary **options)
++{
++    if (!url || !options || *url || *options || !max_bytes ||
++        max_bytes > STREAM_REFERENCE_PREFIX_MAX_BYTES ||
++        !stream_reference_source_revalidate_sent_request(s, request))
++        return false;
++    // Only immutable retained source policy is consulted. Never copy its stale
++    // initial Cookie/headers, learned live options or a current global setting.
++    const AVDictionary *original = request->observation->initial.source->options;
++    AVDictionaryEntry *white = av_dict_get(original, "protocol_whitelist", NULL, AV_DICT_MATCH_CASE);
++    AVDictionaryEntry *black = av_dict_get(original, "protocol_blacklist", NULL, AV_DICT_MATCH_CASE);
++    AVDictionaryEntry *proxy = av_dict_get(original, "http_proxy", NULL, AV_DICT_MATCH_CASE);
++    bool https = !strncmp(request->sent.location, "https://", 8);
++    if ((!https && strncmp(request->sent.location, "http://", 7)) ||
++        (proxy && proxy->value[0]))
++        return false;
++    const char *needed[] = {https ? "https" : "http", "tcp", https ? "tls" : NULL, NULL};
++    for (int n = 0; needed[n]; n++) {
++        if (!reference_prefix_protocols(white ? white->value : NULL, needed[n], true) ||
++            !reference_prefix_protocols(black ? black->value : NULL, needed[n], false))
++            return false;
++    }
++    char *copy_url = av_strdup(request->sent.location);
++    char *headers = reference_prefix_headers(request, max_bytes);
++    AVDictionary *copy_options = NULL;
++    int64_t remaining_us = (request->observation->deadline_ns - mp_time_ns()) / 1000;
++    if (!copy_url || !headers || remaining_us <= 0)
++        goto fail;
++    char end_offset[16], timeout[24];
++    snprintf(end_offset, sizeof(end_offset), "%u", (unsigned)max_bytes);
++    snprintf(timeout, sizeof(timeout), "%lld", (long long)remaining_us);
++    if (av_dict_set(&copy_options, "headers", headers, 0) < 0 ||
++        av_dict_set(&copy_options, "method", "GET", 0) < 0 ||
++        av_dict_set(&copy_options, "tls_verify", "1", 0) < 0 ||
++        av_dict_set(&copy_options, "http_proxy", "", 0) < 0 ||
++        av_dict_set(&copy_options, "cookies", "", 0) < 0 ||
++        av_dict_set(&copy_options, "icy", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "seekable", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "offset", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "end_offset", end_offset, 0) < 0 ||
++        av_dict_set(&copy_options, "multiple_requests", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "reconnect", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "reconnect_at_eof", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "reconnect_on_network_error", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "reconnect_on_http_error", "", 0) < 0 ||
++        av_dict_set(&copy_options, "reconnect_streamed", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "max_redirects", "0", 0) < 0 ||
++        av_dict_set(&copy_options, "timeout", timeout, 0) < 0 ||
++        av_dict_set(&copy_options, "rw_timeout", timeout, 0) < 0 ||
++        av_dict_set(&copy_options, "protocol_whitelist", https ? "https,tcp,tls" : "http,tcp", 0) < 0 ||
++        (black && av_dict_set(&copy_options, "protocol_blacklist", black->value, 0) < 0) ||
++        !stream_reference_source_revalidate_sent_request(s, request))
++        goto fail;
++    av_free(headers);
++    *url = copy_url;
++    *options = copy_options;
+     return true;
++fail:
++    av_free(copy_url);
++    av_free(headers);
++    av_dict_free(&copy_options);
++    return false;
+ }
+ 
+ static int interrupt_cb(void *ctx);
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1843,6 +1843,7 @@
+         '-Wl,--undefined=stream_reference_sent_request_cancelled',
+         '-Wl,--undefined=stream_reference_sent_request_release',
+         '-Wl,--undefined=stream_reference_sent_request_values_clear',
+         '-Wl,--undefined=stream_reference_sent_request_copy_values',
++        '-Wl,--undefined=stream_reference_source_prepare_prefix_request',
+     ]
+ endif

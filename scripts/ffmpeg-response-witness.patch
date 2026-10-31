@@ -1,0 +1,343 @@
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -61,6 +61,7 @@
+ #define HTTP_SINGLE   1
+ #define HTTP_MUTLI    2
+ #define MAX_DATE_LEN  19
++#define RESPONSE_ETAG_LIMIT 1024
+ #define WHITESPACES " \n\t\r"
+ typedef enum {
+     LOWER_PROTO,
+@@ -87,6 +88,12 @@
+     char *headers;
+     char *mime_type;
+     char *http_version;
++    /* Optional response metadata only. Never changes HTTP playback admission. */
++    char *response_etag;
++    char *response_location; // same completed response, never the mutable routing option
++    char response_etag_pending[RESPONSE_ETAG_LIMIT + 1];
++    int response_etag_seen;
++    int response_etag_invalid;
+     char *user_agent;
+     char *referer;
+     char *content_type;
+@@ -179,6 +186,8 @@
+     { "post_data", "set custom HTTP post data", OFFSET(post_data), AV_OPT_TYPE_BINARY, .flags = D | E },
+     { "mime_type", "export the MIME type", OFFSET(mime_type), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { "http_version", "export the http response version", OFFSET(http_version), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "response_etag", "export a bounded strong ETag from a complete GET response", OFFSET(response_etag), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "response_location", "export the complete resource location paired with response_etag", OFFSET(response_location), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { "cookies", "set cookies to be sent in applicable future requests, use newline delimited Set-Cookie HTTP field value syntax", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+     { "icy", "request ICY metadata", OFFSET(icy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+     { "icy_metadata_headers", "return ICY metadata headers", OFFSET(icy_metadata_headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+@@ -209,6 +218,130 @@
+     { NULL }
+ };
+ 
++/* These helpers expose metadata, not a generic resource-identity guarantee.
++ * NULL means unavailable, including malformed, weak, duplicate or oversized
++ * validators. Allocation failure disables only this optional observation. */
++static void http_response_etag_reset(HTTPContext *s)
++{
++    av_freep(&s->response_etag);
++    av_freep(&s->response_location);
++    s->response_etag_pending[0] = 0;
++    s->response_etag_seen = 0;
++    s->response_etag_invalid = 0;
++}
++
++static int http_response_status_valid(const char *line)
++{
++    if (strnlen(line, 13) < 13 ||
++        (strncmp(line, "HTTP/1.0 ", 9) && strncmp(line, "HTTP/1.1 ", 9)))
++        return 0;
++    for (int n = 9; n < 12; n++) {
++        if (line[n] < '0' || line[n] > '9')
++            return 0;
++    }
++    return line[12] == ' ';
++}
++
++static void http_response_etag_header(HTTPContext *s, const char *value)
++{
++    const unsigned char *start = (const unsigned char *)value;
++    const unsigned char *end;
++    size_t length = strnlen(value, MAX_URL_SIZE);
++    if (s->response_etag_seen || length == MAX_URL_SIZE) {
++        s->response_etag_invalid = 1;
++        return;
++    }
++    s->response_etag_seen = 1;
++    end = start + length;
++    while (start < end && (*start == ' ' || *start == '\t'))
++        start++;
++    while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
++        end--;
++    length = end - start;
++    if (length < 2 || length > RESPONSE_ETAG_LIMIT ||
++        start[0] != '"' || end[-1] != '"') {
++        s->response_etag_invalid = 1;
++        return;
++    }
++    /* RFC9110 etagc: %x21 / %x23-7E / obs-text. W/ and comma lists
++     * cannot enter this path; even identical repeated fields are ambiguous. */
++    for (const unsigned char *c = start + 1; c < end - 1; c++) {
++        if (*c < 0x21 || *c == '"' || *c == 0x7f) {
++            s->response_etag_invalid = 1;
++            return;
++        }
++    }
++    memcpy(s->response_etag_pending, start, length);
++    s->response_etag_pending[length] = 0;
++}
++
++/* A completed response snapshot must not certify a truncated routing prefix.
++ * Whole-URL/path fit the actual MAX_URL_SIZE buffers; the conservative host
++ * bound leaves space in the actual 1024-byte host/transport join buffers.
++ * Reject userinfo/fragments/ambiguous ports instead of silently dropping them.
++ * This is bounded routing metadata, not TLS or resource equivalence authority.
++ */
++static int http_response_location_valid(const char *location)
++{
++    URLComponents parts;
++    size_t length;
++    if (!location || !(length = strnlen(location, MAX_URL_SIZE)) ||
++        length == MAX_URL_SIZE ||
++        (strncmp(location, "http://", 7) && strncmp(location, "https://", 8)))
++        return 0;
++    for (const unsigned char *p = (const unsigned char *)location; *p; p++) {
++        if (*p <= 0x20 || *p >= 0x7f)
++            return 0;
++    }
++    if (ff_url_decompose(&parts, location, location + length) < 0 ||
++        !URL_COMPONENT_HAVE(parts, authority) ||
++        !URL_COMPONENT_HAVE(parts, host) ||
++        URL_COMPONENT_HAVE(parts, userinfo) ||
++        URL_COMPONENT_HAVE(parts, fragment) ||
++        parts.port - parts.host > 900 ||
++        (parts.host[0] == '[' && parts.port - parts.host <= 2))
++        return 0;
++    if (URL_COMPONENT_HAVE(parts, port)) {
++        unsigned port = 0;
++        if (parts.path - parts.port < 2 || parts.path - parts.port > 6)
++            return 0;
++        for (const char *p = parts.port + 1; p < parts.path; p++) {
++            if (*p < '0' || *p > '9')
++                return 0;
++            port = port * 10 + (*p - '0');
++        }
++        if (!port || port > 65535)
++            return 0;
++    }
++    return 1;
++}
++
++static void http_response_etag_publish(URLContext *h)
++{
++    HTTPContext *s = h->priv_data;
++    if (!s->response_etag_invalid && s->response_etag_seen &&
++        s->response_etag_pending[0] && s->end_header &&
++        (s->http_code == 200 || s->http_code == 206) &&
++        !s->is_connected_server && h->prot &&
++        (!strcmp(h->prot->name, "http") || !strcmp(h->prot->name, "https")) &&
++        (h->flags & AVIO_FLAG_READ) && !(h->flags & AVIO_FLAG_WRITE) &&
++        !s->post_data && (!s->method || !strcmp(s->method, "GET")) &&
++        http_response_location_valid(s->location)) {
++        char *etag = av_strdup(s->response_etag_pending);
++        char *location = av_strdup(s->location);
++        if (etag && location) {
++            // Read consecutive getters only on the actual HTTP I/O owner, with
++            // no intervening I/O. No partial pair is published on allocation failure.
++            s->response_etag = etag;
++            s->response_location = location;
++        } else {
++            av_free(etag);
++            av_free(location);
++        }
++    }
++    s->response_etag_pending[0] = 0;
++}
++
+ static int http_connect(URLContext *h, const char *path, const char *local_path,
+                         const char *hoststr, const char *auth,
+                         const char *proxyauth);
+@@ -412,6 +545,7 @@
+ 
+ redo:
+ 
++    http_response_etag_reset(s);
+     cached = redirect_cache_get(s);
+     if (cached) {
+         if (redirects++ >= s->max_redirects)
+@@ -532,6 +666,7 @@
+     char hostname1[1024], hostname2[1024], proto1[10], proto2[10];
+     int port1, port2;
+ 
++    http_response_etag_reset(s);
+     if (!h->prot ||
+         !(!strcmp(h->prot->name, "http") ||
+           !strcmp(h->prot->name, "https")))
+@@ -862,9 +997,9 @@
+     return *s->buf_ptr++;
+ }
+ 
+-static int http_get_line(HTTPContext *s, char *line, int line_size)
+-{
+-    int ch;
++static int http_get_line(HTTPContext *s, char *line, int line_size, int *invalid)
++{
++    int ch, previous_cr = 0;
+     char *q;
+ 
+     q = line;
+@@ -872,6 +1007,10 @@
+         ch = http_getc(s);
+         if (ch < 0)
+             return ch;
++        if (invalid && ((previous_cr && ch != '\n') || ch == 0x7f ||
++                        (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t')))
++            *invalid = 1;
++        previous_cr = ch == '\r';
+         if (ch == '\n') {
+             /* process line */
+             if (q > line && q[-1] == '\r')
+@@ -882,6 +1021,8 @@
+         } else {
+             if ((q - line) < line_size - 1)
+                 *q++ = ch;
++            else if (invalid)
++                *invalid = 1;
+         }
+     }
+ }
+@@ -1177,6 +1318,7 @@
+     HTTPContext *s = h->priv_data;
+     const char *auto_method =  h->flags & AVIO_FLAG_READ ? "POST" : "GET";
+     char *tag, *p, *end, *method, *resource, *version;
++    const char *field_value;
+     int ret;
+ 
+     /* end of header */
+@@ -1187,6 +1329,8 @@
+ 
+     p = line;
+     if (line_count == 0) {
++        if (s->is_connected_server || !http_response_status_valid(line))
++            s->response_etag_invalid = 1;
+         if (s->is_connected_server) {
+             // HTTP method
+             method = p;
+@@ -1264,15 +1408,28 @@
+     } else {
+         while (*p != '\0' && *p != ':')
+             p++;
+-        if (*p != ':')
++        if (*p != ':') {
++            s->response_etag_invalid = 1;
+             return 1;
++        }
+ 
+         *p  = '\0';
+         tag = line;
+-        p++;
++        /* Reject ambiguous field syntax for optional identity metadata only;
++         * retain the existing HTTP parser and playback result unchanged. */
++        for (const unsigned char *c = (const unsigned char *)tag; *c; c++) {
++            if (!((*c >= '0' && *c <= '9') || (*c >= 'A' && *c <= 'Z') ||
++                  (*c >= 'a' && *c <= 'z') || strchr("!#$%&'*+-.^_`|~", *c)))
++                s->response_etag_invalid = 1;
++        }
++        if (!*tag)
++            s->response_etag_invalid = 1;
++        field_value = ++p;
+         while (av_isspace(*p))
+             p++;
+-        if (!av_strcasecmp(tag, "Location")) {
++        if (!av_strcasecmp(tag, "ETag")) {
++            http_response_etag_header(s, field_value);
++        } else if (!av_strcasecmp(tag, "Location")) {
+             if ((ret = parse_location(s, p)) < 0)
+                 return ret;
+         } else if (!av_strcasecmp(tag, "Content-Length") &&
+@@ -1444,20 +1601,23 @@
+     char line[MAX_URL_SIZE];
+     int err = 0, http_err = 0;
+ 
++    http_response_etag_reset(s);
+     av_freep(&s->new_location);
+     s->expires = 0;
+     s->chunksize = UINT64_MAX;
+     s->filesize_from_content_range = UINT64_MAX;
+ 
+     for (;;) {
+-        int parsed_http_code = 0;
+-
+-        if ((err = http_get_line(s, line, sizeof(line))) < 0) {
++        int parsed_http_code = 0, invalid_line = 0;
++
++        if ((err = http_get_line(s, line, sizeof(line), &invalid_line)) < 0) {
+             av_log(h, AV_LOG_ERROR, "Error reading HTTP response: %s\n",
+                    av_err2str(err));
+             return err;
+         }
+ 
++        if (invalid_line)
++            s->response_etag_invalid = 1;
+         av_log(h, AV_LOG_TRACE, "header='%s'\n", line);
+ 
+         err = process_line(h, line, s->line_count, &parsed_http_code);
+@@ -1493,6 +1653,7 @@
+     cookie_string(s->cookie_dict, &s->cookies);
+     av_dict_free(&s->cookie_dict);
+ 
++    http_response_etag_publish(h);
+     return err;
+ }
+ 
+@@ -1709,6 +1870,8 @@
+ 
+     err = 0;
+ done:
++    if (err < 0)
++        http_response_etag_reset(s);
+     av_freep(&authstr);
+     av_freep(&proxyauthstr);
+     return err;
+@@ -1731,7 +1894,7 @@
+             int err;
+ 
+             do {
+-                if ((err = http_get_line(s, line, sizeof(line))) < 0)
++                if ((err = http_get_line(s, line, sizeof(line), NULL)) < 0)
+                     return err;
+             } while (!*line);    /* skip CR LF from last chunk */
+ 
+@@ -1742,7 +1905,7 @@
+                     s->chunksize);
+ 
+             if (!s->chunksize && s->multiple_requests) {
+-                http_get_line(s, line, sizeof(line)); // read empty chunk
++                http_get_line(s, line, sizeof(line), NULL); // read empty chunk
+                 s->chunkend = 1;
+                 return 0;
+             }
+@@ -1993,13 +2156,18 @@
+ 
+     if (s->icy_metaint > 0) {
+         size = store_icy(h, size);
+-        if (size < 0)
++        if (size < 0) {
++            if (size != AVERROR_EOF)
++                http_response_etag_reset(s);
+             return size;
++        }
+     }
+ 
+     size = http_read_stream(h, buf, size);
+     if (size > 0)
+         s->icy_data_read += size;
++    else if (size < 0 && size != AVERROR_EOF)
++        http_response_etag_reset(s);
+     return size;
+ }
+ 

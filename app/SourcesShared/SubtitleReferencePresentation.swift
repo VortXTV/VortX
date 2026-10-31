@@ -192,7 +192,7 @@ enum SubtitleReferencePresentation {
         var previousStart: UInt64?
         for (index, source) in file.cues.enumerated() {
             guard source.startMs < source.endMs, source.endMs <= 91_000_000,
-                  previousStart.map({ source.startMs > $0 }) ?? true,
+                  previousStart.map({ source.startMs >= $0 }) ?? true,
                   !source.text.isEmpty, source.text.utf8.count <= 16_384,
                   !source.text.contains("\0") else { throw Failure.invalidCue(index: index) }
             guard let runs = parseRuns(source.text) else { throw Failure.unsupportedMarkup(index: index) }

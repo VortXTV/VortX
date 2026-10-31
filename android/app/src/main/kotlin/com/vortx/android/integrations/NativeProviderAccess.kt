@@ -18,6 +18,31 @@ internal class NativeProviderVault(private val secure: CredentialStoreAccess, pr
     private var observedOwner: SessionOwnerSnapshot.Account? = null
     private var observedEvents: JSONObject? = null
     private var revision = 0L
+    private var writeGeneration = 0L
+
+    /** Full sensitive record observation, not the selected-provider event revision. No toString. */
+    class Observation internal constructor(internal val owner: SessionOwnerSnapshot.Account,
+        internal val generation: Long, internal val sealed: String?, internal val legacy: String?)
+
+    fun observe(owner: SessionOwnerSnapshot.Account): Observation {
+        val snapshot = secure.confirmedSnapshot(key(owner))
+        check(snapshot.availability == PersistentCredentialAvailability.AVAILABLE) { "Provider secure storage unavailable" }
+        val sealed = snapshot.values[key(owner)]
+        // Unlike load, observing an absent vault must never initialize/commit it.
+        val legacy = if (sealed == null) qualifiedLegacy?.invoke(owner)?.toString() else null
+        return Observation(owner, writeGeneration, sealed, legacy)
+    }
+    fun requireCurrent(observation: Observation) {
+        val current = observe(observation.owner)
+        check(current.generation == observation.generation && current.sealed == observation.sealed &&
+            current.legacy == observation.legacy) { "Pending provider family changed" }
+    }
+    fun prospective(observation: Observation, document: JSONObject): JSONObject {
+        val candidate = NativeProviderCredentials(scope(observation.owner), observation.sealed)
+        observation.legacy?.let { candidate.merge(JSONObject(it)) }
+        candidate.merge(document)
+        return candidate.mirror(document)
+    }
 
     fun load(owner: SessionOwnerSnapshot.Account): NativeProviderCredentials {
         val snapshot = secure.confirmedSnapshot(key(owner))
@@ -33,6 +58,8 @@ internal class NativeProviderVault(private val secure: CredentialStoreAccess, pr
     fun commit(owner: SessionOwnerSnapshot.Account, candidate: NativeProviderCredentials) {
         require(candidate.scope == scope(owner))
         val encoded = candidate.encoded()
+        check(writeGeneration < Long.MAX_VALUE) { "Provider revision exhausted" }
+        writeGeneration += 1 // Includes same-byte writes and uncertain writes; rejects full-record ABA.
         check(secure.set(key(owner), encoded)) { "Provider secure commit unavailable" }
         val readback = secure.confirmedSnapshot(key(owner))
         check(readback.availability == PersistentCredentialAvailability.AVAILABLE && readback.values[key(owner)] == encoded) {
@@ -72,6 +99,32 @@ internal object NativeProviderAccess {
 
     data class Guard internal constructor(val owner: SessionOwnerSnapshot.Account, val keys: Set<String>, val events: JSONObject, internal val bindingIdentity: Any)
     data class Read(val values: Map<String, String?>, val revision: Long, val owner: SessionOwnerSnapshot.Account)
+
+    /** Opaque app-sensitive lifetime. It exports no credential-bearing fields or generated toString. */
+    class Prospective internal constructor(private val selected: Any,
+        private var observation: NativeProviderVault.Observation?) : AutoCloseable {
+        fun <T> withCurrent(document: JSONObject, action: (JSONObject) -> T): T {
+            val original = checkNotNull(observation) { "Provider observation retired" }
+            val binding = selected as Binding
+            return checkNotNull(binding.admission.withCurrent(original.owner) {
+                synchronized(storeLock) {
+                    check(NativeProviderAccess.binding === binding) { "Provider binding changed" }
+                    binding.vault.requireCurrent(original)
+                    action(binding.vault.prospective(original, document))
+                }
+            }) { "Provider account changed" }
+        }
+        override fun close() { observation = null }
+    }
+    fun captureProspective(owner: SessionOwnerSnapshot.Account): Prospective? {
+        val selected = binding ?: return null
+        return selected.admission.withCurrent(owner) {
+            synchronized(storeLock) {
+                check(binding === selected) { "Provider binding changed" }
+                Prospective(selected, selected.vault.observe(owner))
+            }
+        }
+    }
 
     private fun <T> access(expected: SessionOwnerSnapshot.Account? = null, action: (Binding, SessionOwnerSnapshot.Account, NativeProviderCredentials) -> T): T? {
         val selected = binding ?: return null

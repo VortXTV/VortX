@@ -1,0 +1,440 @@
+diff --git a/libavformat/http.c b/libavformat/http.c
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -42,6 +42,8 @@
+ #include "libavutil/parseutils.h"
+ 
+ #include "avformat.h"
++#include "avio_internal.h"
++#include "vortx_http_request.h"
+ #include "http.h"
+ #include "httpauth.h"
+ #include "internal.h"
+@@ -93,6 +95,13 @@
+     char *response_etag;
+     char *response_location; // same completed response, never the mutable routing option
+     int64_t response_generation; // completed header observation, never body/request authority
++    char *sent_request_pending;
++    char *sent_location_pending;
++    size_t sent_request_pending_bytes;
++    char *sent_request;
++    char *sent_location;
++    size_t sent_request_bytes;
++    int64_t sent_request_generation;
+     char response_etag_pending[RESPONSE_ETAG_LIMIT + 1];
+     int response_etag_seen;
+     int response_etag_invalid;
+@@ -250,11 +259,30 @@
+ /* These helpers expose metadata, not a generic resource-identity guarantee.
+  * NULL means unavailable, including malformed, weak, duplicate or oversized
+  * validators. Allocation failure disables only this optional observation. */
++/* Sent bytes are optional private evidence. Pending bytes survive an interim
++ * header only; current bytes are bound to exactly one completed response token.
++ * These helpers never change request/response admission or network behavior. */
++static void http_sent_request_pending_clear(HTTPContext *s)
++{
++    av_freep(&s->sent_request_pending);
++    av_freep(&s->sent_location_pending);
++    s->sent_request_pending_bytes = 0;
++}
++
++static void http_sent_request_current_clear(HTTPContext *s)
++{
++    av_freep(&s->sent_request);
++    av_freep(&s->sent_location);
++    s->sent_request_bytes = 0;
++    s->sent_request_generation = 0;
++}
++
+ static void http_response_etag_reset(HTTPContext *s)
+ {
+     av_freep(&s->response_etag);
+     av_freep(&s->response_location);
+     s->response_generation = 0;
++    http_sent_request_current_clear(s);
+     s->response_etag_pending[0] = 0;
+     s->response_etag_seen = 0;
+     s->response_etag_invalid = 0;
+@@ -270,6 +298,18 @@
+             return 0;
+     }
+     return line[12] == ' ';
++}
++
++static void http_response_etag_reset_request(HTTPContext *s)
++{
++    http_response_etag_reset(s);
++    http_sent_request_pending_clear(s);
++}
++
++static int http_sent_request_header_error(HTTPContext *s, int error)
++{
++    http_response_etag_reset_request(s);
++    return error;
+ }
+ 
+ static void http_response_etag_header(HTTPContext *s, const char *value)
+@@ -344,6 +384,119 @@
+             return 0;
+     }
+     return 1;
++}
++
++static inline int has_header(const char *str, const char *header);
++
++/* Validate the actual serialized bytes, not user-supplied option spellings.
++ * Refuse ambiguous header shapes for this optional snapshot only. */
++static int http_sent_request_wire_valid(const char *wire, size_t bytes)
++{
++    const char *names[64];
++    size_t lengths[64];
++    unsigned fields = 0, hosts = 0;
++    if (!wire || bytes < 18 || bytes > VORTX_HTTP_SENT_REQUEST_MAX_BYTES ||
++        strnlen(wire, bytes + 1) != bytes || memcmp(wire, "GET /", 5) ||
++        memcmp(wire + bytes - 4, "\r\n\r\n", 4))
++        return 0;
++    const char *end = wire + bytes;
++    const char *line = strstr(wire, "\r\n");
++    if (!line || line - wire < 14 || memcmp(line - 9, " HTTP/1.1", 9))
++        return 0;
++    for (const unsigned char *c = (const unsigned char *)wire + 4;
++         c < (const unsigned char *)line - 9; c++) {
++        if (*c <= 0x20 || *c >= 0x7f)
++            return 0;
++    }
++    line += 2;
++    while (line < end - 2) {
++        const char *next = strstr(line, "\r\n");
++        const char *colon = next ? memchr(line, ':', next - line) : NULL;
++        if (!next || next >= end - 2 || !colon || colon == line || fields == 64)
++            return 0;
++        for (const unsigned char *c = (const unsigned char *)line;
++             c < (const unsigned char *)colon; c++) {
++            if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
++                  (*c >= '0' && *c <= '9')) && !strchr("!#$%&'*+-.^_`|~", *c))
++                return 0;
++        }
++        for (const unsigned char *c = (const unsigned char *)colon + 1;
++             c < (const unsigned char *)next; c++) {
++            if ((*c < 0x20 && *c != '\t') || *c == 0x7f)
++                return 0;
++        }
++        size_t length = colon - line;
++        for (unsigned n = 0; n < fields; n++) {
++            if (lengths[n] == length && !av_strncasecmp(names[n], line, length))
++                return 0;
++        }
++        if (length == 19 && !av_strncasecmp(line, "Proxy-Authorization", length))
++            return 0;
++        if (length == 4 && !av_strncasecmp(line, "Host", length))
++            hosts++;
++        names[fields] = line;
++        lengths[fields++] = length;
++        line = next + 2;
++    }
++    return line == end - 2 && hosts == 1;
++}
++
++static void http_sent_request_capture(URLContext *h, const char *wire, size_t bytes,
++                                      const char *path, const char *local_path,
++                                      const char *method, const char *auth,
++                                      const char *proxyauth, const char *authstr,
++                                      const char *proxyauthstr)
++{
++    HTTPContext *s = h->priv_data;
++    char *copy = NULL, *location = NULL;
++    int64_t tls_verify = 0;
++    if ((h->flags & AVIO_FLAG_WRITE) || !(h->flags & AVIO_FLAG_READ) ||
++        s->post_data || s->listen || s->is_connected_server || strcmp(method, "GET") ||
++        !path || path != local_path || path[0] != '/' ||
++        (auth && *auth) || (proxyauth && *proxyauth) || authstr || proxyauthstr ||
++        s->auth_state.auth_type != HTTP_AUTH_NONE ||
++        s->proxy_auth_state.auth_type != HTTP_AUTH_NONE ||
++        (s->http_proxy && *s->http_proxy) ||
++        has_header(s->headers, "\r\nHost: ") ||
++        !http_response_location_valid(s->location) ||
++        !http_sent_request_wire_valid(wire, bytes))
++        return;
++    if (!strncmp(s->location, "https://", 8)) {
++        const AVOption *verify = av_opt_find(s->hd, "tls_verify", NULL, 0,
++                                            AV_OPT_SEARCH_CHILDREN);
++        if (!verify || verify->type != AV_OPT_TYPE_BOOL ||
++            av_opt_get_int(s->hd, "tls_verify", AV_OPT_SEARCH_CHILDREN, &tls_verify) < 0 ||
++            tls_verify != 1)
++            return;
++    }
++    copy = av_strndup(wire, bytes);
++    location = av_strdup(s->location);
++    if (!copy || !location) {
++        av_free(copy);
++        av_free(location);
++        return;
++    }
++    s->sent_request_pending = copy;
++    s->sent_location_pending = location;
++    s->sent_request_pending_bytes = bytes;
++}
++
++static void http_sent_request_complete(HTTPContext *s)
++{
++    if (s->http_code >= 100 && s->http_code < 200)
++        return;
++    if (s->response_generation > 0 && s->sent_request_pending &&
++        s->sent_location_pending && s->response_location &&
++        !strcmp(s->sent_location_pending, s->response_location)) {
++        // The token is minted for the response read AFTER these actual bytes.
++        // Equal URL/ETag does not manufacture this causal request association.
++        s->sent_request = s->sent_request_pending;
++        s->sent_location = s->sent_location_pending;
++        s->sent_request_bytes = s->sent_request_pending_bytes;
++        s->sent_request_generation = s->response_generation;
++        s->sent_request_pending = s->sent_location_pending = NULL;
++    }
++    http_sent_request_pending_clear(s);
+ }
+ 
+ static void http_response_etag_publish(URLContext *h)
+@@ -373,6 +526,7 @@
+         }
+     }
+     s->response_etag_pending[0] = 0;
++    http_sent_request_complete(s);
+ }
+ 
+ static int http_connect(URLContext *h, const char *path, const char *local_path,
+@@ -578,7 +732,7 @@
+ 
+ redo:
+ 
+-    http_response_etag_reset(s);
++    http_response_etag_reset_request(s);
+     cached = redirect_cache_get(s);
+     if (cached) {
+         if (redirects++ >= s->max_redirects)
+@@ -699,7 +853,7 @@
+     char hostname1[1024], hostname2[1024], proto1[10], proto2[10];
+     int port1, port2;
+ 
+-    http_response_etag_reset(s);
++    http_response_etag_reset_request(s);
+     if (!h->prot ||
+         !(!strcmp(h->prot->name, "http") ||
+           !strcmp(h->prot->name, "https")))
+@@ -1634,6 +1788,7 @@
+     char line[MAX_URL_SIZE];
+     int err = 0, http_err = 0;
+ 
++    // A valid interim response may be followed by final headers for this GET.
+     http_response_etag_reset(s);
+     av_freep(&s->new_location);
+     s->expires = 0;
+@@ -1646,23 +1801,24 @@
+         if ((err = http_get_line(s, line, sizeof(line), &invalid_line)) < 0) {
+             av_log(h, AV_LOG_ERROR, "Error reading HTTP response: %s\n",
+                    av_err2str(err));
+-            return err;
++            return http_sent_request_header_error(s, err);
+         }
+ 
+         if (invalid_line)
+             s->response_etag_invalid = 1;
+-        av_log(h, AV_LOG_TRACE, "header='%s'\n", line);
+-
++        size_t header_bytes = strlen(line);
+         err = process_line(h, line, s->line_count, &parsed_http_code);
++        av_log(h, AV_LOG_TRACE, "HTTP response header: status=%d line=%d bytes=%zu\n",
++               s->http_code, s->line_count, header_bytes);
+         if (err < 0) {
+             if (parsed_http_code) {
+                 http_err = err;
+             } else {
+                 /* Prefer to return HTTP code error if we've already seen one. */
+                 if (http_err)
+-                    return http_err;
++                    return http_sent_request_header_error(s, http_err);
+                 else
+-                    return err;
++                    return http_sent_request_header_error(s, err);
+             }
+         }
+         if (err == 0)
+@@ -1670,7 +1826,7 @@
+         s->line_count++;
+     }
+     if (http_err)
+-        return http_err;
++        return http_sent_request_header_error(s, http_err);
+ 
+     // filesize from Content-Range can always be used, even if using chunked Transfer-Encoding
+     if (s->filesize_from_content_range != UINT64_MAX)
+@@ -1734,6 +1890,7 @@
+     int send_expect_100 = 0;
+     int keep_alive = 1;
+ 
++    http_response_etag_reset_request(s);
+     av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
+ 
+     /* send http header */
+@@ -1841,7 +1998,9 @@
+         av_bprintf(&request, "Proxy-%s", proxyauthstr);
+     av_bprintf(&request, "\r\n");
+ 
+-    av_log(h, AV_LOG_DEBUG, "request: %s\n", request.str);
++    av_log(h, AV_LOG_DEBUG, "HTTP request: method=%s bytes=%u\n",
++           !strcmp(method, "GET") ? "GET" :
++           !strcmp(method, "POST") ? "POST" : "other", request.len);
+ 
+     if (!av_bprint_is_complete(&request)) {
+         av_log(h, AV_LOG_ERROR, "overlong headers\n");
+@@ -1851,6 +2010,9 @@
+ 
+     if ((err = ffurl_write(s->hd, request.str, request.len)) < 0)
+         goto done;
++    if ((size_t)err == request.len)
++        http_sent_request_capture(h, request.str, request.len, path, local_path,
++                                  method, auth, proxyauth, authstr, proxyauthstr);
+ 
+     if (s->post_data)
+         if ((err = ffurl_write(s->hd, s->post_data, s->post_datalen)) < 0)
+@@ -1904,7 +2066,7 @@
+     err = 0;
+ done:
+     if (err < 0)
+-        http_response_etag_reset(s);
++        http_response_etag_reset_request(s);
+     av_freep(&authstr);
+     av_freep(&proxyauthstr);
+     return err;
+@@ -2191,7 +2353,7 @@
+         size = store_icy(h, size);
+         if (size < 0) {
+             if (size != AVERROR_EOF)
+-                http_response_etag_reset(s);
++                http_response_etag_reset_request(s);
+             return size;
+         }
+     }
+@@ -2200,7 +2362,7 @@
+     if (size > 0)
+         s->icy_data_read += size;
+     else if (size < 0 && size != AVERROR_EOF)
+-        http_response_etag_reset(s);
++        http_response_etag_reset_request(s);
+     return size;
+ }
+ 
+@@ -2264,6 +2426,8 @@
+ {
+     int ret = 0;
+     HTTPContext *s = h->priv_data;
++
++    http_response_etag_reset_request(s);
+ 
+ #if CONFIG_ZLIB
+     inflateEnd(&s->inflate_stream);
+@@ -2472,6 +2636,67 @@
+ };
+ #endif /* CONFIG_HTTPS_PROTOCOL */
+ 
++void avpriv_vortx_http_sent_request_clear(
++    struct avpriv_vortx_http_sent_request *value)
++{
++    if (!value)
++        return;
++    av_free(value->location);
++    av_free(value->request);
++    *value = (struct avpriv_vortx_http_sent_request){0};
++}
++
++int avpriv_vortx_http_copy_sent_request(
++    AVIOContext *owner, int64_t expected_generation,
++    struct avpriv_vortx_http_sent_request *out)
++{
++    URLContext *h;
++    HTTPContext *s;
++    int recognized = 0;
++    struct avpriv_vortx_http_sent_request copy = {0};
++    if (!out || out->location || out->request || out->request_bytes ||
++        out->response_generation || out->version || expected_generation <= 0 ||
++        !owner || owner->av_class != &ff_avio_class ||
++        !(h = ffio_geturlcontext(owner)) || !h->priv_data)
++        return AVERROR(EINVAL);
++#if CONFIG_HTTP_PROTOCOL
++    recognized |= h->prot == &ff_http_protocol &&
++                  h->prot->priv_data_class == &http_context_class &&
++                  h->prot->priv_data_size == sizeof(HTTPContext);
++#endif
++#if CONFIG_HTTPS_PROTOCOL
++    recognized |= h->prot == &ff_https_protocol &&
++                  h->prot->priv_data_class == &https_context_class &&
++                  h->prot->priv_data_size == sizeof(HTTPContext);
++#endif
++    if (!recognized)
++        return AVERROR(ENOSYS);
++    s = h->priv_data; // private typed access only after exact protocol/class/size
++    if (s->class != h->prot->priv_data_class ||
++        s->response_generation != expected_generation ||
++        s->sent_request_generation != expected_generation ||
++        !s->sent_request || !s->sent_location || !s->response_location ||
++        strcmp(s->sent_location, s->response_location) ||
++        !http_sent_request_wire_valid(s->sent_request, s->sent_request_bytes))
++        return AVERROR(EAGAIN);
++    copy.location = av_strdup(s->sent_location);
++    copy.request = av_strndup(s->sent_request, s->sent_request_bytes);
++    if (!copy.location || !copy.request) {
++        avpriv_vortx_http_sent_request_clear(&copy);
++        return AVERROR(ENOMEM);
++    }
++    copy.request_bytes = s->sent_request_bytes;
++    copy.response_generation = expected_generation;
++    copy.version = VORTX_HTTP_SENT_REQUEST_VERSION;
++    if (s->response_generation != expected_generation ||
++        s->sent_request_generation != expected_generation) {
++        avpriv_vortx_http_sent_request_clear(&copy);
++        return AVERROR(EAGAIN);
++    }
++    *out = copy;
++    return 0;
++}
++
+ #if CONFIG_HTTPPROXY_PROTOCOL
+ static int http_proxy_close(URLContext *h)
+ {
+diff --git a/libavformat/vortx_http_request.h b/libavformat/vortx_http_request.h
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_http_request.h
+@@ -0,0 +1,33 @@
++/* VortX-private native bridge. Not a public FFmpeg, libmpv or Swift API.
++ * The identical contract is carried inside both matched source packages.
++ * Only the genuine AVIO owner may call copy while AVIO/HTTP remain alive and
++ * no I/O, seek, close, replacement or other owner operation can intervene.
++ * This observes sent GET bytes. It is NOT permission to open/replay a request,
++ * follow a redirect, choose a destination, or infer complete resource identity.
++ */
++#ifndef VORTX_PRIVATE_HTTP_SENT_REQUEST_H
++#define VORTX_PRIVATE_HTTP_SENT_REQUEST_H
++#include <stddef.h>
++#include <stdint.h>
++struct AVIOContext;
++#define VORTX_HTTP_SENT_REQUEST_VERSION 1u
++#define VORTX_HTTP_SENT_REQUEST_MAX_BYTES (32u * 1024u)
++struct avpriv_vortx_http_sent_request {
++    char *location;
++    char *request; /* exact successfully written request headers, including GET line */
++    size_t request_bytes; /* excludes the owned terminating NUL */
++    int64_t response_generation;
++    unsigned version;
++};
++/* out must be zero/cleared; failure leaves it unchanged. Returns 0 only for an
++ * owned snapshot of the expected current completed response. A nonzero result
++ * is optional unavailability and must not change playback. Credentials remain
++ * native memory only: never log, persist or expose these strings as AVOptions.
++ * New matched FFmpeg/MPV components and symbol/header parity are mandatory.
++ */
++int avpriv_vortx_http_copy_sent_request(
++    struct AVIOContext *owner, int64_t expected_generation,
++    struct avpriv_vortx_http_sent_request *out);
++void avpriv_vortx_http_sent_request_clear(
++    struct avpriv_vortx_http_sent_request *value);
++#endif

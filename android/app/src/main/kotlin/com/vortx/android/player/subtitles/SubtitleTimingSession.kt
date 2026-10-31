@@ -5,8 +5,37 @@ package com.vortx.android.player.subtitles
  * source/profile/account admission and live engine support. This policy has no Android classes or IO.
  */
 internal class SubtitleTimingSession(savedManualSeconds: Double?) {
-    private var seeded = SubtitleAutoResync.resolve(savedManualSeconds, null, false).seeded
+    private val initial = SubtitleAutoResync.resolve(savedManualSeconds, null, false)
+    private var seeded = initial.seeded
+    private var offsetSource = initial.source
     private var retired = false
+    private var alignment: Any? = null
+
+    /** A pending cue correction fences late community-only writes, including a same-value write. */
+    @Synchronized fun beginAlignment(): Any? {
+        if (retired) return null
+        return Any().also { alignment = it }
+    }
+
+    /** Reset ONLY an applied community offset, before capturing the native reference capability. */
+    fun prepareAlignment(attempt: Any, admit: ((() -> Boolean) -> Boolean), applyZero: () -> Boolean): Boolean = admit {
+        synchronized(this) {
+            if (retired || alignment !== attempt) return@synchronized false
+            if (offsetSource != SubtitleAutoResync.OffsetSource.COMMUNITY) return@synchronized true
+            if (!applyZero()) return@synchronized false
+            offsetSource = SubtitleAutoResync.OffsetSource.NONE
+            seeded = false
+            true
+        }
+    }
+
+    /** A stale completion cannot release a newer pending choice or seed its timing state. */
+    @Synchronized fun finishAlignment(attempt: Any, aligned: Boolean): Boolean {
+        if (retired || alignment !== attempt) return false
+        alignment = null
+        if (aligned) seeded = true
+        return true
+    }
 
     @Synchronized fun retire() { retired = true }
 
@@ -31,11 +60,12 @@ internal class SubtitleTimingSession(savedManualSeconds: Double?) {
         if (!delaySupported) return false // Media3 has no supported live subtitle-delay operation.
         return admit {
             synchronized(this) {
-                if (retired || seeded) return@synchronized false
+                if (retired || seeded || alignment != null) return@synchronized false
                 val resolved = SubtitleAutoResync.resolve(null, poolOffsetMs, alreadySeeded = false)
                 if (resolved.source != SubtitleAutoResync.OffsetSource.COMMUNITY) return@synchronized false
                 if (!apply(resolved.seconds)) return@synchronized false
                 seeded = true
+                offsetSource = resolved.source
                 true
             }
         }
@@ -65,7 +95,9 @@ internal class SubtitleTimingSession(savedManualSeconds: Double?) {
                 if (retired) return@synchronized false
                 val resolved = SubtitleAutoResync.resolve(seconds, null, alreadySeeded = false)
                 if (!apply(resolved.seconds)) return@synchronized false
+                alignment = null
                 seeded = true
+                offsetSource = resolved.source
                 true
             }
         }

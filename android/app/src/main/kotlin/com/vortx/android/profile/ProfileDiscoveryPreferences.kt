@@ -50,9 +50,12 @@ internal fun <T> sameContinueWatchingMigrationAuthority(previousAccount: T?, cur
 /** A failed checkpoint retains only this exact qualified capture; it cannot adopt another owner on retry. */
 internal class ContinueWatchingMigrationCheckpoint<T> {
     data class Witness<T>(val profileID: String, val account: T, val traktEpoch: Long)
+    data class State<T>(val witness: Witness<T>?, val pendingDiscovery: ProfileDiscoveryPreferences?)
     var witness: Witness<T>? = null
         private set
     private var pendingDiscovery: ProfileDiscoveryPreferences? = null
+    fun snapshot(): State<T> = State(witness, pendingDiscovery)
+    fun restore(state: State<T>) { witness = state.witness; pendingDiscovery = state.pendingDiscovery }
     fun capture(profileID: String, account: T, epoch: Long) { pendingDiscovery = null; witness = Witness(profileID, account, epoch) }
     fun retire() { witness = null; pendingDiscovery = null }
     /** Retained only with this witness, so a later fresh projection cannot erase a failed local edit. */
@@ -71,7 +74,11 @@ internal class ContinueWatchingMigrationCheckpoint<T> {
         val discovery = pendingDiscovery ?: incoming.discovery ?: ProfileDiscoveryPreferences()
         val edited = incoming.copy(discovery = discovery.copy(
             continueWatchingSource = "trakt", continueWatchingWindow = discovery.continueWatchingWindow ?: "20"))
-        val saved = runCatching { if (authorityIsCurrent()) save(edited) else null }.getOrNull()
+        val saved = try { if (authorityIsCurrent()) save(edited) else null }
+        catch (failure: Exception) {
+            if (failure is kotlinx.coroutines.CancellationException) throw failure
+            null // A failed durable checkpoint retains the exact witness and pending discovery.
+        }
         if (!authorityIsCurrent()) { retire(); return null }
         if (saved?.activeID != captured.profileID || saved.profiles.firstOrNull { it.id == captured.profileID }?.discovery != edited.discovery || !readbackIsCurrent(saved)) return null
         if (!authorityIsCurrent()) { retire(); return null }

@@ -181,6 +181,132 @@ class NativeOwnerHistoryCompatibilityTest {
         assertTrue(fixture.native.order.isEmpty()); assertTrue(candidate.close()); assertTrue(fixture.owner.close())
     }
 
+    @Test fun keyedCapabilityArmsBeforeMutationAndKeepsOriginalDurableOrder() {
+        val fixture = Fixture(formats = b("[\"keyed_rows/1\"]"), acceptsDispatch = true)
+        val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        assertEquals(listOf("keyed_rows/1"), fixture.native.requests.filter { it.first == "checkpoint_delta" }.map { it.second })
+        candidate.dispatch(b("{\"type\":\"get_state\"}"), 1)
+        assertEquals("checkpoint_delta", fixture.native.requests.last().first)
+        assertTrue(fixture.native.requests.indexOfFirst { it.first == "checkpoint_delta" } <
+            fixture.native.requests.indexOfFirst { it.first == "dispatch" })
+        assertTrue(fixture.native.requests.filter { it.first == "checkpoint_delta" }.all { it.second == "keyed_rows/1" })
+        fixture.owner.commit(candidate, b("{}"))
+        assertEquals(listOf("persist", "accept"), fixture.native.order)
+        assertFalse(fixture.owner.requiresAuthenticatedReopen); assertTrue(fixture.owner.close())
+    }
+    @Test fun olderRuntimeGetsNoFormatAndNegotiatedRuntimeMayFallBackToCoarse() {
+        for (formats in listOf(null, b("[\"future/2\"]"), b("[\"keyed_rows/1\"]"))) {
+            val fixture = Fixture(formats = formats, acceptsDispatch = true)
+            val capture = fixture.owner.capture(target, fixture.authority)
+            val candidate = fixture.owner.candidate(capture, fixture.transaction)
+            fixture.native.forceCoarse = true
+            candidate.dispatch(b("{\"type\":\"get_state\"}"), 1)
+            val requested = fixture.native.requests.filter { it.first == "checkpoint_delta" }
+            if (formats == null || OHJson.utf8(formats).contains("future")) assertTrue(requested.all { it.second == null })
+            else assertTrue(requested.all { it.second == "keyed_rows/1" })
+            fixture.owner.commit(candidate, b("{}")); assertEquals(listOf("persist", "accept"), fixture.native.order)
+            assertTrue(fixture.owner.close())
+        }
+    }
+    @Test fun malformedRuntimeCapabilitiesAreRejectedAndFailedPersistCannotAcceptKeyed() {
+        for (formats in listOf(b("null"), b("[1]"), b("[\"keyed_rows/1\",\"keyed_rows/1\"]"),
+            OHJson.array(List(17) { OHJson.quote("format-$it") }))) {
+            fails { Fixture(formats = formats) }
+        }
+        val fixture = Fixture(formats = b("[\"keyed_rows/1\"]"), acceptsDispatch = true)
+        val capture = fixture.owner.capture(target, fixture.authority); val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        candidate.dispatch(b("{\"type\":\"get_state\"}"), 1); fixture.failPersist = true
+        fails { fixture.owner.commit(candidate, b("{}")) }
+        assertEquals(listOf("persist"), fixture.native.order); assertTrue(fixture.owner.requiresAuthenticatedReopen)
+        candidate.close(); fixture.owner.close()
+    }
+
+    @Test fun preparedAccountAdmissionSeesActualCandidateAndCannotRewriteItsOwnedBytes() {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var observed: ByteArray? = null
+        val accepted = fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { raw, persist ->
+            assertTrue(fixture.native.order.isEmpty())
+            val account = NativeOwnerHistoryAccount(raw)
+            assertArrayEquals(b("-0.0"), account.raw("future"))
+            assertArrayEquals(b("{}"), account.raw("nativeHostPreferences"))
+            observed = raw
+            raw.fill(0) // The callback sees a copy, not the actual candidate's account/checkpoint.
+            persist()
+        })
+        assertTrue(observed!!.all { it == 0.toByte() })
+        assertArrayEquals(b("-0.0"), NativeOwnerHistoryAccount(accepted.accountBase).raw("future"))
+        assertEquals(listOf("persist", "accept"), fixture.native.order)
+        assertTrue(fixture.owner.close())
+    }
+    @Test fun preparedAccountRejectionAndLateCallbackNeverPersistOrAccept() {
+        for (throwDuringAdmission in listOf(false, true)) {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var late: (() -> Unit)? = null
+        fails { fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+            late = persist
+            if (throwDuringAdmission) error("Synthetic precommit budget refusal")
+        }) }
+        fails { late!!() }
+        assertTrue(fixture.native.order.isEmpty())
+        assertFalse(fixture.owner.requiresAuthenticatedReopen)
+        assertTrue(candidate.close()); assertTrue(fixture.owner.close())
+        }
+    }
+    @Test fun preparedAccountCallbackCannotMoveToAnotherThreadOrReusePersistence() {
+        val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+        val candidate = fixture.owner.candidate(capture, fixture.transaction)
+        var crossThread: Throwable? = null
+        var worker: Thread? = null
+        try {
+            fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+                val thread = Thread { try { persist() } catch (error: Throwable) { crossThread = error } }
+                thread.isDaemon = true; worker = thread
+                thread.start(); thread.join(2_000)
+                assertFalse("Synthetic cross-thread refusal did not finish within two seconds", thread.isAlive)
+                assertNotNull(crossThread)
+                assertTrue(fixture.native.order.isEmpty())
+                persist()
+                fails { persist() }
+            })
+            assertEquals(listOf("persist", "accept"), fixture.native.order)
+        } finally {
+            worker?.takeIf { it.isAlive }?.let { thread -> thread.interrupt(); thread.join(1_000) }
+            val candidateClosed = runCatching { candidate.accepted || candidate.close() }
+            val ownerClosed = runCatching { fixture.owner.close() }
+            assertTrue("Synthetic candidate cleanup failed", candidateClosed.getOrDefault(false))
+            assertTrue("Synthetic owner cleanup failed", ownerClosed.getOrDefault(false))
+            assertFalse("Synthetic callback worker survived bounded cleanup", worker?.isAlive == true)
+        }
+    }
+    @Test fun preparedAccountRetainsOriginalFileAndAuthorityThroughAdmission() {
+        for (failure in listOf("authority", "file", "budget")) for (swallow in listOf(false, true)) {
+            val fixture = Fixture(); val capture = fixture.owner.capture(target, fixture.authority)
+            var budgetCurrent = true
+            val transaction = NativeOwnerHistoryCoordinator.Transaction(fixture.account, fixture.authority) {
+                check(budgetCurrent) { "Synthetic changed precommit budget witness" }
+                NativeOwnerHistoryAccount(it).validateBudget(true)
+            }
+            val candidate = fixture.owner.candidate(capture, transaction)
+            fails { fixture.owner.commitPrepared(candidate, b("{}"), NativePreparedAccountAdmission { _, persist ->
+                when (failure) {
+                    "file" -> fixture.read = NativeCheckpointRead(fixture.read.plaintext, fixture.issuer, scope, 0, byteArrayOf(2))
+                    "authority" -> fixture.authority.active = false
+                    "budget" -> budgetCurrent = false
+                }
+                // Swallowing a failed callback must never make the coordinator return a false
+                // accepted checkpoint merely because the callback was invoked.
+                if (swallow) try { persist() } catch (_: Exception) { } else persist()
+            }) }
+            assertTrue(fixture.native.order.isEmpty())
+            assertFalse(fixture.owner.requiresAuthenticatedReopen)
+            fixture.authority.active = true
+            candidate.close(); fixture.owner.close()
+        }
+    }
+
     private fun snapshot() = OHJson.Obj().set("roster", OHJson.Obj().set("profiles", OHJson.Obj().set(scope.ownerProfileID,
         b("{\"id\":\"${scope.ownerProfileID}\",\"owner\":true,\"deleted\":false,\"account\":{\"kind\":\"shared\"}}")).encoded()).encoded())
         .set("libraries", b("{}")).set("activeProfileId", OHJson.quote(scope.ownerProfileID))
@@ -196,12 +322,12 @@ class NativeOwnerHistoryCompatibilityTest {
     private fun archive(source: ByteArray) = OHJson.Obj().set("schemaVersion", b("1")).set("kind", OHJson.quote("vortx.owner-history.archive/1"))
         .set("sourceDocumentBase64", OHJson.quote(OHJson.b64(source))).set("metadataEvidenceBase64", b("[]")).encoded()
 
-    private inner class Fixture(unknownNative: ByteArray? = null) {
+    private inner class Fixture(unknownNative: ByteArray? = null, formats: ByteArray? = null, acceptsDispatch: Boolean = false) {
         private val initial = snapshot().also { root -> unknownNative?.let { raw ->
             val native = root.obj("nativeSync"); val unknown = OHJson.Obj(raw)
             unknown.keys.forEach { native.setFrom(unknown, it) }; root.set("nativeSync", native.encoded())
         } }
-        val authority = Authority(); val issuer = Any(); val native = ProtocolFixture(); var failPersist = false
+        val authority = Authority(); val issuer = Any(); val native = ProtocolFixture(formats, acceptsDispatch); var failPersist = false
         var read = NativeCheckpointRead(OHJson.utf8(initial.encoded()), issuer, scope, 0, byteArrayOf(0))
         val account = NativeOwnerHistoryAccount(OHJson.Obj().set("nativeSync", initial.raw("nativeSync")).set("future", b("-0.0")).encoded())
         val transaction = NativeOwnerHistoryCoordinator.Transaction(account, authority) { NativeOwnerHistoryAccount(it).validateBudget(true) }
@@ -213,23 +339,29 @@ class NativeOwnerHistoryCompatibilityTest {
             }, { NativeOwnerHistoryCoordinator.HostProjection(b("{}"), b("{}")) })
     }
     /** Scripted protocol receipts only; no copied kernel reducer or archive interpretation. */
-    private inner class ProtocolFixture : NativeOwnerHistoryBindings {
+    private inner class ProtocolFixture(private val formats: ByteArray? = null, private val acceptsDispatch: Boolean = false) : NativeOwnerHistoryBindings {
+        val requests = mutableListOf<Pair<String, String?>>()
+        private val generations = mutableMapOf<Long, Long>()
+        private val journals = mutableMapOf<Long, MutableList<ByteArray>>()
+        var forceCoarse = false
         var next = 1L; var failCloseHandle = -1L; val parents = mutableMapOf<Long, ByteArray?>(); val order = mutableListOf<String>()
         override fun canonicalize(evidence: ByteArray): ByteArray? = error("Unexpected canonicalizer in source-free fixture")
         override fun open(snapshot: ByteArray, verifier: NativeOwnerHistoryVerifier): Long {
             for (purpose in listOf("session_open_input", "session_open_normalized")) check(verifier.verify(OHJson.Obj().set("kind", OHJson.quote("full"))
                 .set("check", OHJson.Obj().set("contract", OHJson.quote("vortx.owner-history-complete-archive/1")).set("purpose", OHJson.quote(purpose)).set("candidateState", snapshot).encoded()).encoded()))
-            val handle = next++; parents[handle] = null; return handle
+            val handle = next++; parents[handle] = null; generations[handle] = 0; return handle
         }
         private fun lease(handle: Long, f: ByteArray, purpose: String) = OHJson.Obj().set("kind", OHJson.quote("lease"))
             .set("check", OHJson.Obj().set("contract", OHJson.quote("vortx.owner-history-session-lease/1")).set("purpose", OHJson.quote(purpose))
                 .set("fence", f).set("preparedAgainst", parents[handle] ?: b("null")).encoded()).encoded()
         override fun fork(handle: Long, fence: ByteArray, verifier: NativeOwnerHistoryVerifier): Long {
             check(verifier.verify(lease(handle, fence, "fork")))
-            val child = next++; parents[child] = fence.copyOf(); return child
+            val child = next++; parents[child] = fence.copyOf(); generations[child] = OHJson.Obj(fence).text("mutationGeneration").toLong(); return child
         }
         override fun request(handle: Long, json: ByteArray, now: Long, verifier: NativeOwnerHistoryVerifier): ByteArray {
-            val r = OHJson.Obj(json); val f = fence(handle.toString()); val kind = r.text("kind")
+            val r = OHJson.Obj(json); val kind = r.text("kind")
+            val f = OHJson.Obj(fence(handle.toString())).set("mutationGeneration", OHJson.quote(generations.getValue(handle).toString())).encoded()
+            requests += kind to r["format"]?.let(OHJson::text)
             check(verifier.verify(lease(handle, f, if (kind == "accept") "checkpoint_accepted" else kind)))
             return when (kind) {
                 "merge" -> {
@@ -246,13 +378,33 @@ class NativeOwnerHistoryCompatibilityTest {
                 "checkpoint" -> OHJson.Obj().set("kind", OHJson.quote("checkpoint")).set("fence", f)
                     .set("state", snapshot().encoded()).set("durableAck", b("false"))
                     .set("requiresCompleteArchiveEnvelope", b("true")).encoded()
-                "capture" -> OHJson.Obj().set("kind", OHJson.quote("capture")).set("fence", f).set("advertise", b("false")).encoded()
-                "checkpoint_delta" -> OHJson.Obj().set("kind", OHJson.quote(kind)).set("fence", f).set("preparedAgainst", requireNotNull(parents[handle]))
-                    .set("reuseExactOwnerHistoryFromWitness", OHJson.quote("witness")).set("delta", b("{}"))
-                    .set("durableAck", b("false")).set("requiresCompleteArchiveEnvelope", b("true")).encoded()
+                "capture" -> OHJson.Obj().set("kind", OHJson.quote("capture")).set("fence", f).set("advertise", b("false")).also { reply ->
+                    formats?.let { reply.set("checkpointDeltaFormats", it) }
+                }.encoded()
+                "checkpoint_delta" -> {
+                    val reply = OHJson.Obj().set("kind", OHJson.quote(kind)).set("fence", f).set("preparedAgainst", requireNotNull(parents[handle]))
+                        .set("reuseExactOwnerHistoryFromWitness", OHJson.quote("witness"))
+                        .set("durableAck", b("false")).set("requiresCompleteArchiveEnvelope", b("true"))
+                    if (r["format"] != null && !forceCoarse) {
+                        require(r.text("format") == "keyed_rows/1")
+                        reply.set("deltaEncoding", OHJson.quote("keyed_rows/1"))
+                            .set("keyedStateSteps", OHJson.array(journals.getOrPut(handle) { mutableListOf() }))
+                    } else reply.set("delta", b("{}"))
+                    reply.encoded()
+                }
                 "accept" -> { order += "accept"; parents[handle] = null; OHJson.Obj().set("kind", OHJson.quote("accepted")).set("fence", f).set("durableAck", b("false")).encoded() }
-                "dispatch" -> OHJson.Obj().set("kind", OHJson.quote("action_rejected")).set("fence", f).set("preparedAgainst", requireNotNull(parents[handle]))
+                "dispatch" -> if (!acceptsDispatch) OHJson.Obj().set("kind", OHJson.quote("action_rejected")).set("fence", f).set("preparedAgainst", requireNotNull(parents[handle]))
                     .set("reason", OHJson.quote("native_action_rejected")).set("durableAck", b("false")).set("advertise", b("false")).encoded()
+                else {
+                    val previous = generations.getValue(handle); generations[handle] = previous + 1
+                    journals[handle]?.add(OHJson.Obj().set("baseGeneration", OHJson.quote(previous.toString()))
+                        .set("revision", OHJson.quote((previous + 1).toString())).set("edits", b("{\"libraries\":{},\"nativeWatches\":{},\"slotWatches\":{}}")).encoded())
+                    OHJson.Obj().set("kind", OHJson.quote("dispatched")).set("instanceId", OHJson.quote(handle.toString()))
+                        .set("mutationGeneration", OHJson.quote((previous + 1).toString())).set("sourceSetWitnessId", OHJson.quote("witness"))
+                        .set("events", b("[]")).set("durableAck", b("false"))
+                        .set("activeTarget", OHJson.Obj().set("profileId", OHJson.quote(scope.ownerProfileID))
+                            .set("binding", OHJson.Obj(f).raw("binding")).encoded()).encoded()
+                }
                 "resolve_candidate" -> OHJson.Obj().set("kind", OHJson.quote("resolved_candidate")).set("fence", f)
                     .set("result", r.raw("request")).set("durableAck", b("false")).set("advertise", b("false")).encoded()
                 else -> error("Unexpected scripted request")

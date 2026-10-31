@@ -63,7 +63,7 @@ internal class NativeOwnerHistorySessionAdapter private constructor(
         }
     }
 
-    private inner class View(private var staged: NativeOwnerHistoryCoordinator.Candidate?) : VortxRuntimeDelegate {
+    private inner class View(private var staged: NativeOwnerHistoryCoordinator.Candidate?) : VortxPreparedAccountDelegate {
         private var closed = false
         private fun usable() { check(!closed && !requiresRecovery()) { "Owner history Session unavailable" } }
         override fun fork(): VortxRuntimeDelegate {
@@ -96,6 +96,10 @@ internal class NativeOwnerHistorySessionAdapter private constructor(
             return OHJson.utf8(staged?.stateForPresentation() ?: coordinator.validatePresentation(capture()))
         }
         override fun commitCheckpoint(snapshot: String, archiveChanges: Map<String, ByteArray>) {
+            commitPreparedCheckpoint(snapshot, archiveChanges, NativePreparedAccountAdmission { _, persist -> persist() })
+        }
+        override fun commitPreparedCheckpoint(snapshot: String, archiveChanges: Map<String, ByteArray>,
+                                               admission: NativePreparedAccountAdmission) {
             usable()
             val candidate = staged ?: coordinator.candidate(capture(), transaction())
             var installed = false
@@ -107,7 +111,7 @@ internal class NativeOwnerHistorySessionAdapter private constructor(
                 candidate.replaceLocalState(raw.encoded())
                 if (archiveChanges.isNotEmpty()) candidate.replaceHostArchive(archiveChanges)
                 val host = raw.raw("nativeHostPreferenceState")
-                accepted = coordinator.commit(candidate, host)
+                accepted = coordinator.commitPrepared(candidate, host, admission)
                 acceptSelection(candidate.fence)
                 staged = null; installed = true
             } finally {

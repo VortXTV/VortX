@@ -7,12 +7,22 @@ private let AV_CODEC_ID_MOV_TEXT: AVCodecID = 0x4D4F5654
 private let policyOtherCodec: AVCodecID = 0x4D4F5655
 
 private enum SubtitleEmbeddedExtractor {
-    enum TimingWindowFailure: Error {
-        case invalidTextPayload
-    }
+// @source:TimingWindowFailure
+// @source:TimingWindow
+// @source:TimingCue
+// @source:appendTimingCue
 
 // @source:timingPacketHasOutput
 // @source:timingPacketIsMovTextClear
+}
+
+private enum SubtitleReferenceNativeQuery {
+// @source:referenceQueryWindows
+// @source:referenceQueryTiming
+}
+
+private enum SubtitleReferencePreparation {
+// @source:referenceTimings
 }
 
 private enum SubtitleTimingPolicyTestFailure: Error {
@@ -164,10 +174,75 @@ private enum SubtitleTimingPolicyTests {
         try requireMovText(packetSize: 2, bytes: nil, expected: false, "nil data")
         try requireMovText(packetSize: 5, bytes: [0, 0, 0, 0, 0], expected: false,
                            "larger zero-prefix guard")
+        // Actual production append helper preserves all decoder-order occurrences, not a
+        // decoder substitute. Native packet/decode behavior remains a separate integration gate.
+        typealias Cue = SubtitleEmbeddedExtractor.TimingCue
+        var corpus: [Cue] = []
+        let longCue = Cue(startSeconds: 1, endSeconds: 191)
+        try SubtitleEmbeddedExtractor.appendTimingCue(longCue, to: &corpus)
+        try SubtitleEmbeddedExtractor.appendTimingCue(.init(startSeconds: 1, endSeconds: 3), to: &corpus)
+        try SubtitleEmbeddedExtractor.appendTimingCue(.init(startSeconds: 1, endSeconds: 3), to: &corpus)
+        try require(corpus == [longCue, .init(startSeconds: 1, endSeconds: 3), .init(startSeconds: 1, endSeconds: 3)],
+                    "whole long/equal-start/exact-timing occurrences were changed")
+        do {
+            try SubtitleEmbeddedExtractor.appendTimingCue(.init(startSeconds: 0.9999, endSeconds: 2), to: &corpus)
+            throw SubtitleTimingPolicyTestFailure.failed("backward cue accepted")
+        } catch SubtitleEmbeddedExtractor.TimingWindowFailure.invalidCueTiming {}
+        try require(corpus.count == 3, "refused backward append mutated evidence")
+        for invalid in [Cue(startSeconds: .nan, endSeconds: 2), Cue(startSeconds: 1, endSeconds: .infinity),
+                        Cue(startSeconds: -1, endSeconds: 1), Cue(startSeconds: 2, endSeconds: 2),
+                        Cue(startSeconds: 1, endSeconds: 86_401)] {
+            do {
+                try SubtitleEmbeddedExtractor.appendTimingCue(invalid, to: &corpus)
+                throw SubtitleTimingPolicyTestFailure.failed("invalid cue accepted")
+            } catch SubtitleEmbeddedExtractor.TimingWindowFailure.invalidCueTiming {}
+        }
+        corpus = []
+        for _ in 0..<1_024 { try SubtitleEmbeddedExtractor.appendTimingCue(longCue, to: &corpus) }
+        do {
+            try SubtitleEmbeddedExtractor.appendTimingCue(longCue, to: &corpus)
+            throw SubtitleTimingPolicyTestFailure.failed("1025th occurrence accepted")
+        } catch SubtitleEmbeddedExtractor.TimingWindowFailure.budget(let budget) {
+            try require(budget == "cues", "wrong overflow budget")
+        }
+        try require(corpus.count == 1_024, "overflow truncated or deduplicated complete prefix")
+
+        let window = try SubtitleEmbeddedExtractor.TimingWindow(startSeconds: 0, endSeconds: 1_080,
+                                                                 purpose: .reference)
+        let precise: [Cue] = [
+            .init(startSeconds: 1.0001, endSeconds: 200), .init(startSeconds: 1.0002, endSeconds: 3),
+            .init(startSeconds: 1.0002, endSeconds: 3), .init(startSeconds: 20, endSeconds: 21),
+            .init(startSeconds: 40, endSeconds: 41), .init(startSeconds: 60, endSeconds: 61),
+            .init(startSeconds: 80, endSeconds: 81), .init(startSeconds: 100, endSeconds: 1_080)
+        ]
+        guard let projected = SubtitleReferencePreparation.referenceTimings(from: precise, window: window) else {
+            throw SubtitleTimingPolicyTestFailure.failed("whole/tied projection rejected")
+        }
+        try require(projected.count == precise.count && projected.prefix(3).map(\.startMs) == [1_000, 1_000, 1_000]
+                    && projected[0].endMs == 200_000 && projected.last?.endMs == 1_080_000,
+                    "projection lost rounding ties, true duration, order or window endpoint")
+        var backward = precise
+        backward.swapAt(0, 1) // Same represented millisecond, but truly backward in seconds.
+        try require(SubtitleReferencePreparation.referenceTimings(from: backward, window: window) == nil,
+                    "backward sub-millisecond order was hidden by rounding")
+        var crossing = precise
+        crossing[7] = Cue(startSeconds: 100, endSeconds: 1_080.0001)
+        try require(SubtitleReferencePreparation.referenceTimings(from: crossing, window: window) == nil,
+                    "window-crossing cue was clipped or accepted")
+        var vanished = precise
+        vanished[0] = Cue(startSeconds: 1.0001, endSeconds: 1.0002)
+        try require(SubtitleReferencePreparation.referenceTimings(from: vanished, window: window) == nil,
+                    "zero-width millisecond projection was accepted")
+        try require(SubtitleReferencePreparation.referenceTimings(from: Array(precise.prefix(7)), window: window) == nil,
+                    "short projection accepted")
+        let wrongWindow = try SubtitleEmbeddedExtractor.TimingWindow(startSeconds: 0, endSeconds: 1_080,
+                                                                      purpose: .subject)
+        try require(SubtitleReferencePreparation.referenceTimings(from: precise, window: wrongWindow) == nil,
+                    "subject window accepted as reference")
     }
 
     static func main() throws {
         try run()
-        print("PASS subtitle timing helpers: full-consumption and MOV_TEXT clear policy")
+        print("PASS subtitle timing helpers: full-consumption, MOV_TEXT clear, complete cue corpus and lossless reference projection")
     }
 }

@@ -51,6 +51,7 @@ internal fun CollectionsHub(
     onOpen: (CollectionsHubTarget) -> Unit,
     onRetryProviders: () -> Unit,
     modifier: Modifier = Modifier,
+    onImportedCollections: (() -> Unit)? = null,
 ) {
     if (!snapshot.isVisible) return
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg)) {
@@ -71,6 +72,11 @@ internal fun CollectionsHub(
         }
         HubTileRow(stringResource(R.string.collections_group_genres), snapshot.genres, onOpen)
         HubTileRow(stringResource(R.string.collections_group_decades), snapshot.decades, onOpen)
+        onImportedCollections?.let { open ->
+            Button(onClick = open, modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
+                Text(stringResource(R.string.xperience_title))
+            }
+        }
     }
 }
 

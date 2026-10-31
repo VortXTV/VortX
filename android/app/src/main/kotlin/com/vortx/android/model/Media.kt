@@ -640,7 +640,7 @@ data class Playable(
     val viaStreamingServer: Boolean = false,
     /// Resume position in milliseconds from per-profile watch history, or 0 to start from the top.
     val startPositionMs: Long = 0L,
-    /// True when [url] is a loopback URL served by the in-process streaming server (a resolved torrent).
+    /// True for a raw torrent served by the on-device or explicitly chosen streaming server.
     /// The [PlayerEngineRouter] keeps torrents on libmpv (ExoPlayer cannot replay the torrent warm-up),
     /// and the mpv engine sizes its read-ahead down for a local stream, mirroring the Apple engine.
     val isTorrent: Boolean = false,
@@ -670,6 +670,8 @@ data class Playable(
     /// meta id + chosen episode); [com.vortx.android.integrations.ScrobbleService] consumes it on the
     /// play/pause/stop transitions. Mirrors the Apple `ExternalMediaRef`.
     val mediaRef: MediaRef? = null,
+    /** Exact selected catalog video ID for encrypted party matching; never sent to the relay in clear. */
+    val watchPartyVideoId: String? = null,
     /// A SECOND, audio-only URL to merge with [url] at load, non-null ONLY for a client-resolved YouTube
     /// trailer whose modern InnerTube answer is ADAPTIVE (a video-only leg + a separate audio leg, the
     /// norm at every height on the app clients). The mpv engine mounts it via `audio-add`; the ExoPlayer
@@ -732,6 +734,8 @@ data class Playable(
     val playbackLease: AutoCloseable? = null,
     /** Subtitle lookup must use this file's hints even after a source or player switch. */
     val subtitleMetadata: SubtitleRequestMetadata = SubtitleRequestMetadata(),
+    /** Exact device-selected torrent route, carried by its resolver only; never restored from an add-on URL. */
+    val streamingServerRoute: com.vortx.android.engine.StreamingServerRoute? = null,
 ) {
     override fun toString(): String =
         "Playable(url=${redactedTransportUrl(url)}, title=$title, viaStreamingServer=$viaStreamingServer, " +

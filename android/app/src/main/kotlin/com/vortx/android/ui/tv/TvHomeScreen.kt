@@ -89,6 +89,8 @@ fun TvHomeScreen(
     // Bumped by the shell when the Home tab is re-selected on the rail, so the rail list scrolls back to the
     // top -- the 10-foot analogue of Apple's `scrollToTopOnBump`.
     reselectSignal: Int = 0,
+    onImportedCollections: (() -> Unit)? = null,
+    importedReturnSignal: Int = 0,
 ) {
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -99,11 +101,16 @@ fun TvHomeScreen(
     val hubOrder by viewModel.collectionsHubOrder.collectAsStateWithLifecycle()
     val hubHidden by viewModel.collectionsHubHidden.collectAsStateWithLifecycle()
     val forYouUi by viewModel.forYouUi.collectAsStateWithLifecycle()
-    // null: no picker; true: the once-per-profile first-run offer; false: Tune (edit).
-    var interestsPicker by remember { mutableStateOf<Boolean?>(null) }
-    LaunchedEffect(forYouUi) { if (interestsPicker == null && viewModel.claimFirstRunOffer()) interestsPicker = true }
-    interestsPicker?.let { firstRun ->
-        com.vortx.android.ui.foryou.ForYouPickerDialog(forYouUi.interests, firstRun, tvForYouChip, TvDimens.edge) { interestsPicker = null }
+    // Capture the rendered load at opening; recomposition must not replace its authority.
+    var interestsPicker by remember { mutableStateOf<Pair<com.vortx.android.foryou.ForYouEditSession, Boolean>?>(null) }
+    fun openInterests(firstRun: Boolean) {
+        val original = forYouUi.openingState ?: return
+        interestsPicker?.first?.close()
+        interestsPicker = com.vortx.android.foryou.ForYouEditSession(original) to firstRun
+    }
+    LaunchedEffect(forYouUi) { if (interestsPicker == null && viewModel.claimFirstRunOffer()) openInterests(true) }
+    interestsPicker?.let { open ->
+        com.vortx.android.ui.foryou.ForYouPickerDialog(open.first, open.second, tvForYouChip, TvDimens.edge) { open.first.close(); if (interestsPicker === open) interestsPicker = null }
     }
     if (collectionBrowse.target != null) {
         TvCollectionsBrowseScreen(
@@ -137,6 +144,8 @@ fun TvHomeScreen(
                     collectionsHubHidden = hubHidden,
                     onCollection = viewModel::openCollection,
                     onRetryCollections = viewModel::retryCollectionsHub,
+                    onImportedCollections = onImportedCollections,
+                    importedReturnSignal = importedReturnSignal,
                     onItem = { item ->
                         if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
                     },
@@ -147,7 +156,7 @@ fun TvHomeScreen(
                     reselectSignal = reselectSignal,
                     modifier = modifier,
                     forYouShowInvite = forYouUi.showInvite,
-                    onTuneForYou = { interestsPicker = false },
+                    onTuneForYou = { openInterests(false) },
                     onSurprise = { viewModel.pickHomeSurprise()?.let { onItem(it); true } ?: false },
                 )
             }
@@ -164,6 +173,8 @@ private fun TvHomeContent(
     collectionsHubHidden: Boolean,
     onCollection: (CollectionsHubTarget) -> Unit,
     onRetryCollections: () -> Unit,
+    onImportedCollections: (() -> Unit)?,
+    importedReturnSignal: Int,
     onItem: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
@@ -303,6 +314,8 @@ private fun TvHomeContent(
                             onCollection,
                             onRetryCollections,
                             if (index == 0) firstCardFocus else null,
+                            onImportedCollections,
+                            importedReturnSignal,
                         )
                         HomeRowItem.ForYouHeader -> TvForYouHeader(onTuneForYou, if (index == 0) firstCardFocus else null)
                         HomeRowItem.ForYouInvite -> TvForYouInvite(onTuneForYou, if (index == 0) firstCardFocus else null)

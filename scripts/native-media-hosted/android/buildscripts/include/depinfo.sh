@@ -15,8 +15,8 @@ v_libunibreak=8_0
 v_libunibreak_sha256=9c4fad6e517338a098373acc9f35579ae2c325e6446666fb9ac2666ba15ceba4
 v_libass=0.17.5
 v_libass_sha=4a05d8127f525943ebf45fdc6497c9e665947f0d
-v_harfbuzz=14.6.0
-v_harfbuzz_sha=c7a7457b7385f33178e8cf87615ca077a810bbe7
+v_harfbuzz=15.0.0
+v_harfbuzz_sha=35f656a1a2bab548ea7f54a6dd3fba2b09680d14
 v_fribidi=1.0.17
 v_fribidi_sha=b93119f5fdc7ea47672cc304c1455ffa6dfe7536
 v_freetype=2-14-3
@@ -26,8 +26,9 @@ v_fontconfig=2.18.3
 v_fontconfig_sha=0f236723a3c26bd9745e32ba2b3ee21e5f809295
 v_mbedtls=3.6.7
 v_mbedtls_sha=068ff080b369adfac81509f9b57b2afabaf82dc5
-# Preserve the selected 5774f40f producer's Apple-aligned custom native base.
-v_libplacebo_sha=4c426e466814536def653cb23f1d1c287ea7a7f5
+# Stable libplacebo v7.387.0 retains the prior custom FEL base (141 ahead, 0 behind).
+# Android has no LittleCMS dependency; do not invent an LCMS runtime upgrade here.
+v_libplacebo_sha=275f7dea27924cdd34ab2e6c20e448b6bc4fab65
 v_dav1d=1.5.4
 v_dav1d_sha=54706fc6bc0cdecab7e9593974a4039cc038fca7
 v_ffmpeg=9.0.2

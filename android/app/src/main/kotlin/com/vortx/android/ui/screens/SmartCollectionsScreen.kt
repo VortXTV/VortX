@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.vortx.android.R
 import com.vortx.android.foryou.ForYouText
+import com.vortx.android.foryou.ForYouEditSession
 import com.vortx.android.foryou.SmartCollection
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
@@ -40,7 +41,7 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 
 /** Which collection the builder is open on: [collection] null is a new one. */
-private data class Editing(val collection: SmartCollection?)
+private data class Editing(val collection: SmartCollection?, val opening: ForYouEditSession)
 
 /**
  * Library > Smart collections on phone and tablet (Apple `iOSSmartCollectionsView`): every collection as a
@@ -53,10 +54,10 @@ fun SmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> Unit, modif
     val state = rememberSmartCollectionsState()
     var editing by remember { mutableStateOf<Editing?>(null) }
     editing?.let { open ->
-        BackHandler { editing = null }
+        BackHandler { open.opening.close(); if (editing === open) editing = null }
         SmartCollectionEditor(
-            existing = open.collection, watched = state.watched, chip = phoneForYouChip, edge = VortXTheme.spacing.edge,
-            onFinish = { editing = null },
+            opening = open.opening, existing = open.collection, watched = state.watched, chip = phoneForYouChip, edge = VortXTheme.spacing.edge,
+            onFinish = { if (editing === open) editing = null },
         ) { items, _ ->
             if (items.isNotEmpty()) PosterRail(catalog = Catalog("smartCollection.preview", "", items), onItem = {})
         }
@@ -74,7 +75,7 @@ fun SmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> Unit, modif
             item {
                 Column(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge), verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                     Text(stringResource(R.string.smart_collections_intro), style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary))
-                    Chip(label = stringResource(R.string.smart_collections_new), selected = false, onClick = { editing = Editing(null) },
+                    Chip(label = stringResource(R.string.smart_collections_new), selected = false, onClick = { if (state.store.ready) editing = Editing(null, ForYouEditSession(state.store)) },
                         leadingIcon = Icons.Filled.Add)
                     when {
                         !state.store.ready -> Note(stringResource(R.string.smart_collections_not_ready))
@@ -88,7 +89,7 @@ fun SmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> Unit, modif
                     Row(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge), verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                         Chip(label = stringResource(R.string.smart_collections_edit), selected = false,
-                            onClick = { editing = Editing(collection) }, leadingIcon = Icons.Filled.Tune)
+                            onClick = { editing = Editing(collection, ForYouEditSession(state.store)) }, leadingIcon = Icons.Filled.Tune)
                         if (collection.home) Text(stringResource(R.string.smart_collections_on_home).uppercase(),
                             style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.accentBright))
                     }

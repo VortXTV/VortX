@@ -24,6 +24,7 @@
 #include "globals.h"
 #include "jni_utils.h"
 #include "log.h"
+#include "subtitle_reference.h"
 
 // A Java observer must not poison mpv's long-lived native event thread. JNI leaves a thrown Java
 // exception pending after CallVoidMethod; every later JNI call is then invalid until it is cleared.
@@ -161,6 +162,12 @@ void *event_thread(void *arg) {
             continue;
 
         switch (mp_event->event_id) {
+        case MPV_EVENT_COMMAND_REPLY:
+            // Deep-copy typed bounded reply data before the next wait invalidates this event.
+            // Internal request completion survives ordinary observer removal during destroy.
+            send_reference_reply(env, instance, mp_event);
+            sendEventToJava(env, instance, mp_event->event_id); // preserve original generic FIFO event
+            break;
         case MPV_EVENT_LOG_MESSAGE:
             msg = (mpv_event_log_message*)mp_event->data;
             if (msg && msg->prefix && msg->level && msg->text) {

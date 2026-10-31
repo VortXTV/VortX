@@ -9,16 +9,21 @@ import com.vortx.android.net.VortXEdgeAuth
 import com.vortx.android.sources.CanonicalContentIdentity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +33,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 private val CANONICAL_INFOHASH = Regex("""^[0-9a-f]{40}$""")
 private val CANONICAL_CONTENT_ID = Regex("""^(tt[0-9]{6,10}|tmdb:[0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$""")
@@ -52,16 +59,11 @@ private val CANONICAL_CONTENT_ID = Regex("""^(tt[0-9]{6,10}|tmdb:[0-9]{1,10})(:[
 /// GATING (VortX-only): `sources.vortx.tv` is a [VortXEdgeAuth] gated host, so BOTH the POST and the GET are
 /// HMAC-signed. Signing is a safe no-op without a provisioned secret (the worker's observe mode allows it).
 ///
-/// ANDROID AVAILABILITY: this client is deliberately dormant because Android has no canonical give-to-get
-/// consent, SourceIndex fleet switch, VortX-account identity, X-VX-Moat token, or bounded streamed transport
-/// surface. Re-enable also requires pinning the exact baked origin and refusing every redirect. Consent, fleet,
-/// account, and moat must be live lifecycle gates whose closure cancels in-flight SERVE, clears published
-/// sources, and prevents late publication. [isEnabled] remains false until a separate lane wires and verifies
-/// all six surfaces and receives independent security sign-off. Before that
-/// re-enable, the process ledger must also move from SourceListModel beside this client's pacer, claim each
-/// <=16 chunk after pacing immediately before POST without eviction, and gain cancellation/overlap tests.
-/// Extraction and
-/// reconstruction stay compiled and tested, but neither HOARD nor SERVE can touch the network while disabled.
+/// ANDROID AVAILABILITY: legacy Boolean entry points remain dormant behind [isEnabled] = false. The internal
+/// authorized entry points require an App-issued [SourceIndexAuthorization] joining the original native,
+/// account, vault and live gate facts. They require a nonempty current moat token for every GET/POST, pin the
+/// baked origin, refuse redirects and disconnect blocking requests when that captured capability retires.
+/// The process-wide upload ledger lives beside the pacer and reserves only the next paced <=16-row attempt.
 object SourceIndexClient {
 
     private const val TAG = "sing"
@@ -265,6 +267,251 @@ object SourceIndexClient {
     internal fun uploadBatches(descriptors: List<Descriptor>): List<List<Descriptor>> =
         uploadableDescriptors(descriptors).take(MAX_DESCRIPTORS_PER_TITLE).chunked(BATCH_SIZE)
 
+    /** The App-owned capability is the only enabled path. Legacy Boolean entry points stay dormant. */
+    internal suspend fun hoardAuthorized(
+        contentId: String,
+        descriptors: List<Descriptor>,
+        authorization: SourceIndexAuthorization,
+    ) {
+        if (canonicalContentId(contentId) != contentId || !authorization.isCurrent()) return
+        withAuthorizedWork(authorization) {
+            hoardAuthorizedBody(contentId, descriptors, authorization, uploadPacer, uploadLedger, ::postAuthorizedBatch)
+        }
+    }
+
+    internal suspend fun hoardAuthorizedUsing(
+        contentId: String,
+        descriptors: List<Descriptor>,
+        authorization: SourceIndexAuthorization,
+        pacer: SourceUploadPacer,
+        ledger: SourceIndexUploadLedger,
+        post: suspend (String, List<Descriptor>, String, SourceIndexAuthorization) -> Unit,
+    ) {
+        if (canonicalContentId(contentId) != contentId || !authorization.isCurrent()) return
+        withAuthorizedWork(authorization) {
+            hoardAuthorizedBody(contentId, descriptors, authorization, pacer, ledger) { id, batch, moat, lease, beginAttempt ->
+                if (beginAttempt()) post(id, batch, moat, lease)
+            }
+        }
+    }
+
+    private suspend fun hoardAuthorizedBody(
+        contentId: String,
+        descriptors: List<Descriptor>,
+        authorization: SourceIndexAuthorization,
+        pacer: SourceUploadPacer,
+        ledger: SourceIndexUploadLedger,
+        post: suspend (String, List<Descriptor>, String, SourceIndexAuthorization, () -> Boolean) -> Unit,
+    ) {
+        val batches = uploadBatches(descriptors)
+        for (batch in batches) {
+            currentCoroutineContext().ensureActive()
+            if (!authorization.isCurrent()) return
+            pacer.pace {
+                currentCoroutineContext().ensureActive()
+                if (!authorization.isCurrent()) return@pace
+                val moat = try { authorization.moatToken() } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) { null } ?: return@pace
+                currentCoroutineContext().ensureActive()
+                if (!authorization.isCurrent()) return@pace
+                // Reserve only this paced chunk. Pending reservations consume capacity and suppress overlap,
+                // but cancellation before the actual attempt releases them for a later eligible caller.
+                val reservation = ledger.reserve(contentId, batch) ?: return@pace
+                try {
+                    currentCoroutineContext().ensureActive()
+                    if (!authorization.isCurrent()) return@pace
+                    if (contributionBody(contentId, reservation.descriptors) == null) return@pace
+                    // The production transport claims at its first blocking I/O, after dispatcher admission.
+                    post(contentId, reservation.descriptors, moat, authorization, reservation::beginAttempt)
+                } finally {
+                    reservation.close()
+                }
+            }
+        }
+    }
+
+    private suspend fun postAuthorizedBatch(
+        contentId: String, chunk: List<Descriptor>, moat: String, authorization: SourceIndexAuthorization,
+        beginAttempt: () -> Boolean,
+    ) {
+        val body = contributionBody(contentId, chunk)?.toByteArray(Charsets.UTF_8) ?: return
+        try {
+            authorizedConnection("$BASE_URL/sources/contribute", authorization, moat) { conn, requireCurrent ->
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setFixedLengthStreamingMode(body.size)
+                conn.setRequestProperty("content-type", "application/json")
+                VortXEdgeAuth.sign(conn)
+                requireCurrent()
+                // Once bytes may leave, ambiguous failures remain claimed for the process lifetime.
+                if (!beginAttempt()) return@authorizedConnection
+                conn.outputStream.use { output -> requireCurrent(); output.write(body) }
+                requireCurrent()
+                if (conn.responseCode !in 200..299) throw IOException("source HTTP error")
+                requireCurrent()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // A failed or ambiguous attempt remains claimed; no credential or configured URL is logged.
+        }
+    }
+
+    internal suspend fun fetchPooledAuthorized(
+        contentId: String, authorization: SourceIndexAuthorization,
+    ): List<PooledSource> = fetchPooledAuthorizedUsing(contentId, authorization, page = ::fetchAuthorizedPage)
+
+    /** Same assembler as the production path; tests replace only the bounded HTTP page operation. */
+    internal suspend fun fetchPooledAuthorizedUsing(
+        contentId: String,
+        authorization: SourceIndexAuthorization,
+        nowNanos: () -> Long = System::nanoTime,
+        page: suspend (String, String, SourceIndexAuthorization, Long) -> ByteArray,
+    ): List<PooledSource> {
+        if (canonicalContentId(contentId) != contentId || !authorization.isCurrent()) return emptyList()
+        return withAuthorizedWork(authorization) {
+            fetchPooledAuthorizedBody(contentId, authorization, nowNanos, page)
+        }
+    }
+
+    private suspend fun fetchPooledAuthorizedBody(
+        contentId: String,
+        authorization: SourceIndexAuthorization,
+        nowNanos: () -> Long,
+        page: suspend (String, String, SourceIndexAuthorization, Long) -> ByteArray,
+    ): List<PooledSource> {
+        var url = serveUrl(contentId) ?: return emptyList()
+        if (!authorization.isCurrent()) return emptyList()
+        val collected = ArrayList<PooledSource>()
+        val identities = HashSet<String>()
+        val cursors = HashSet<String>()
+        var totalBytes = 0
+        val started = nowNanos()
+        var versioned = false
+        try {
+            do {
+                currentCoroutineContext().ensureActive()
+                if (!authorization.isCurrent() || nowNanos() - started >= TRAVERSAL_TIMEOUT_NANOS) return emptyList()
+                val moat = authorization.moatToken() ?: return emptyList()
+                if (!authorization.isCurrent() || nowNanos() - started >= TRAVERSAL_TIMEOUT_NANOS) return emptyList()
+                val bytes = page(url, moat, authorization, started)
+                currentCoroutineContext().ensureActive()
+                if (!authorization.isCurrent() || nowNanos() - started >= TRAVERSAL_TIMEOUT_NANOS) return emptyList()
+                if (bytes.size > MAX_PAGE_BYTES || bytes.size > MAX_ASSEMBLED_BYTES - totalBytes) return emptyList()
+                totalBytes += bytes.size
+                val body = bytes.toString(Charsets.UTF_8)
+                val root = JSONObject(body)
+                val cursor: String?
+                if (root.has("paginationVersion")) {
+                    if (root.opt("paginationVersion") != 1 || root.opt("sources") !is JSONArray ||
+                        root.getJSONArray("sources").length() > MAX_SERVE_RESULTS || root.opt("hasMore") !is Boolean) return emptyList()
+                    cursor = when (val next = root.opt("nextCursor")) {
+                        null, JSONObject.NULL -> null
+                        is String -> next
+                        else -> return emptyList()
+                    }
+                    if (root.getBoolean("hasMore") != (cursor != null)) return emptyList()
+                    versioned = true
+                } else {
+                    if (versioned || root.has("nextCursor") || root.has("hasMore")) return emptyList()
+                    cursor = null
+                }
+                for (source in parsePooled(body)) {
+                    val key = source.kind?.let { kind -> source.id?.let { id -> "$kind\n$id" } }
+                    if (key == null || identities.add(key)) collected += source
+                }
+                if (cursor == null) break
+                if (!validServeCursor(cursor) || !cursors.add(cursor)) return emptyList()
+                url = serveUrl(contentId, cursor) ?: return emptyList()
+            } while (true)
+            return collected.takeIf { authorization.isCurrent() && nowNanos() - started < TRAVERSAL_TIMEOUT_NANOS }.orEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return emptyList()
+        }
+    }
+
+    /** Revoke suspended mint waits, pacer waiters and blocking transport as one operation-owned child job. */
+    private suspend fun <T> withAuthorizedWork(authorization: SourceIndexAuthorization, work: suspend () -> T): T = coroutineScope {
+        val job = currentCoroutineContext()[Job]
+        val registration = authorization.onRevoked { job?.cancel(CancellationException("Source authorization retired")) }
+        try {
+            currentCoroutineContext().ensureActive()
+            work()
+        } finally {
+            registration.close()
+        }
+    }
+
+    private suspend fun fetchAuthorizedPage(
+        url: String, moat: String, authorization: SourceIndexAuthorization, started: Long,
+    ): ByteArray = authorizedConnection(url, authorization, moat) { conn, requireCurrent ->
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("accept", "application/json")
+        VortXEdgeAuth.sign(conn)
+        requireCurrent()
+        if (conn.responseCode !in 200..299) throw IOException("source HTTP error")
+        if (conn.contentLengthLong > MAX_PAGE_BYTES) throw IOException("source page exceeds budget")
+        conn.inputStream.use { input ->
+            val result = ByteArrayOutputStream()
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                requireCurrent()
+                if (System.nanoTime() - started >= TRAVERSAL_TIMEOUT_NANOS) throw IOException("source traversal timed out")
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > MAX_PAGE_BYTES - result.size()) throw IOException("source page exceeds budget")
+                result.write(buffer, 0, count)
+            }
+            requireCurrent()
+            result.toByteArray()
+        }
+    }
+
+    /** The cancellation handler is installed before any blocking I/O, including connection establishment. */
+    internal suspend fun <T> authorizedConnection(
+        url: String, authorization: SourceIndexAuthorization, moat: String,
+        openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
+        operation: (HttpURLConnection, () -> Unit) -> T,
+    ): T = withContext(Dispatchers.IO) {
+        suspendCancellableCoroutine { continuation ->
+            val parsed = URL(url)
+            if (!url.startsWith("$BASE_URL/") || parsed.protocol != "https" || parsed.host != "sources.vortx.tv" ||
+                parsed.port != -1 || parsed.userInfo != null || parsed.ref != null || moat.isBlank()) {
+                continuation.resumeWithException(IOException("invalid source origin"))
+                return@suspendCancellableCoroutine
+            }
+            val conn = openConnection(parsed)
+            val registration = authorization.onRevoked {
+                continuation.cancel()
+            }
+            continuation.invokeOnCancellation {
+                SourceIndexLifecycle.dispatchTeardown { conn.disconnect() }
+            }
+            try {
+                conn.connectTimeout = HTTP_TIMEOUT_MS
+                conn.readTimeout = HTTP_TIMEOUT_MS
+                conn.useCaches = false
+                conn.instanceFollowRedirects = false
+                conn.setRequestProperty(MOAT_HEADER, moat)
+                val requireCurrent: () -> Unit = {
+                    if (!continuation.isActive || !authorization.isCurrent()) throw CancellationException("Source authorization retired")
+                }
+                requireCurrent()
+                val value = operation(conn, requireCurrent)
+                requireCurrent()
+                if (continuation.isActive) continuation.resume(value)
+            } catch (failure: Throwable) {
+                if (continuation.isActive) continuation.resumeWithException(failure)
+            } finally {
+                registration.close()
+                conn.disconnect()
+            }
+        }
+    }
+
     // MARK: - SERVE: GET /sources?content_id=… (signed, opt-in + login-gated)
 
     /// Read the corroborated pooled sources for [contentId]. Returns `[]` unless the Singularity SERVE toggle
@@ -428,7 +675,6 @@ object SourceIndexClient {
                 null
             }
         }
-        Log.d(TAG, "streams reconstruct pooled=${pooled.size} -> playable=${built.size} (torrent-only)")
         return built
     }
 
@@ -444,19 +690,21 @@ object SourceIndexClient {
 
     // MARK: - Feature gates
 
-    /// Hard availability gate. Re-enable only after a separate lane wires and verifies six surfaces: consent,
-    /// the SourceIndex fleet switch, VortX-account identity, X-VX-Moat token minting, exact baked-origin
-    /// enforcement with every redirect refused, and bounded streamed GET/POST transport. Consent, fleet,
-    /// account, and moat closure must cancel in-flight SERVE, clear current published sources, and prevent late
-    /// publication before independent security sign-off. That lane must also relocate the
-    /// non-evicting process ledger beside [uploadPacer], claim each paced <=16 batch immediately before POST,
-    /// and verify cancellation plus overlapping callers.
+    /// Legacy availability remains closed. The App-owned capability APIs above provide the separate path;
+    /// a stale Boolean caller cannot opt itself into authenticated pool work.
     const val isEnabled: Boolean = false
 
     /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default ON (give-to-get; still sign-in
     /// gated in [fetchPooled]). A settings surface can flip this when one lands. Mirrors Apple `serveEnabled`.
     @Volatile
     var serveEnabled: Boolean = true
+        set(value) {
+            if (field == value) return
+            SourceIndexLifecycle.invalidateDeferred()
+            field = value
+            // A lease may be issued in the pre-write gap using the old gate fact. Retire that epoch too.
+            SourceIndexLifecycle.invalidateDeferred()
+        }
 
     /// Reserved hook for the future signed-off identity lane. It is never invoked while [isEnabled] is false.
     @Volatile
@@ -481,6 +729,7 @@ object SourceIndexClient {
     internal const val MAX_SERVE_RESULTS = 100 // per page; never a total-result cap
     private const val MAX_PAGE_BYTES = 64 * 1024
     private const val MAX_ASSEMBLED_BYTES = 8 * 1024 * 1024
+    private const val TRAVERSAL_TIMEOUT_NANOS = 30_000_000_000L
     private const val MIN_CORROBORATION = 1 // torrent worker floor; do not re-tighten it on the client
     internal fun validServeCursor(raw: String): Boolean =
         raw.isNotEmpty() && raw.length <= 512 && raw.all { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }
@@ -530,6 +779,7 @@ object SourceIndexClient {
 
     /// One process-wide pacer, not one delay loop per title. This is the actual per-IP rate-control boundary.
     private val uploadPacer = SourceUploadPacer(INTER_BATCH_DELAY_MS)
+    private val uploadLedger = SourceIndexUploadLedger()
 
     private fun JSONObject.optStringOrNull(key: String): String? {
         if (!has(key) || isNull(key)) return null
@@ -537,6 +787,43 @@ object SourceIndexClient {
     }
 
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+}
+
+/** Non-evicting process ledger. Pending and attempted entries share one hard capacity. */
+internal class SourceIndexUploadLedger(private val maxEntries: Int = 40_000) {
+    private val lock = Any()
+    private val entries = mutableMapOf<String, Long?>()
+    private var nextID = 0L
+
+    internal fun reserve(contentId: String, descriptors: List<SourceIndexClient.Descriptor>): Reservation? = synchronized(lock) {
+        if (SourceIndexClient.canonicalContentId(contentId) != contentId) return@synchronized null
+        val accepted = SourceIndexClient.uploadableDescriptors(descriptors).take(SourceIndexClient.BATCH_SIZE).filter {
+            !entries.containsKey(key(contentId, it))
+        }.take((maxEntries - entries.size).coerceAtLeast(0))
+        if (accepted.isEmpty()) return@synchronized null
+        val id = ++nextID
+        val keys = accepted.map { key(contentId, it) }
+        keys.forEach { entries[it] = id }
+        Reservation(id, accepted, keys)
+    }
+
+    internal inner class Reservation internal constructor(
+        private val id: Long, val descriptors: List<SourceIndexClient.Descriptor>, private val keys: List<String>,
+    ) : AutoCloseable {
+        private var pending = true
+        fun beginAttempt(): Boolean = synchronized(lock) {
+            if (!pending || keys.any { entries[it] != id }) return@synchronized false
+            keys.forEach { entries[it] = null }
+            pending = false
+            true
+        }
+        override fun close() = synchronized(lock) {
+            if (pending) keys.forEach { if (entries[it] == id) entries.remove(it) }
+            pending = false
+        }
+    }
+
+    private fun key(contentId: String, descriptor: SourceIndexClient.Descriptor) = "$contentId|${descriptor.kind}|${descriptor.id}"
 }
 
 /// Serializes outbound actions and leaves [intervalMs] after the previous action completes. Clock and sleeper

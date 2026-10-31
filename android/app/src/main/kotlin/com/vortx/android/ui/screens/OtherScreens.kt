@@ -90,6 +90,7 @@ import com.vortx.android.ui.components.PosterRail
 import com.vortx.android.ui.components.LoadingRail
 import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.library.LibraryGenrePolicy
 import com.vortx.android.ui.library.LibrarySegment
 import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.search.RecentSearchesRow
@@ -299,15 +300,18 @@ fun LibraryScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
     val randomPick by viewModel.randomPickState.collectAsStateWithLifecycle()
+    val genreScope by viewModel.genreScope.collectAsStateWithLifecycle()
+    var genreChoice by remember(viewModel, genreScope) { mutableStateOf(LibraryGenrePolicy.Choice.All) }
     val result = (state as? UiState.Success<LibraryResult>)?.data
     val filters = result?.filters
     val allItems = result?.items.orEmpty()
     val segments = remember(allItems) { LibrarySegment.availableSegments(allItems) }
-    var selectedSegment by remember { mutableStateOf(LibrarySegment.ALL) }
-    val activeSegment = if (selectedSegment in segments || segments.isEmpty()) selectedSegment else LibrarySegment.ALL
+    var selectedSegment by remember(viewModel, genreScope) { mutableStateOf(LibrarySegment.ALL) }
+    val activeSegment = selectedSegment.effective(allItems)
     val segmentedItems = remember(allItems, activeSegment) { activeSegment.filter(allItems) }
+    val genreChoices = remember(segmentedItems, genreChoice) { LibraryGenrePolicy.choices(segmentedItems, genreChoice) }
     val applicableFilters = remember(segmentedItems) { LibrarySmartFilter.applicable(segmentedItems) }
-    var selectedFilters by remember { mutableStateOf(emptySet<LibrarySmartFilter>()) }
+    var selectedFilters by remember(viewModel, genreScope) { mutableStateOf(emptySet<LibrarySmartFilter>()) }
     val activeFilters = selectedFilters intersect applicableFilters.toSet()
 
     DisposableEffect(viewModel) {
@@ -333,6 +337,7 @@ fun LibraryScreen(
             }
             LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
             LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
+            LibraryGenreChips(genreChoices, genreChoice) { genreChoice = it }
             LibrarySmartFilterChips(
                 available = applicableFilters,
                 active = activeFilters,
@@ -358,10 +363,10 @@ fun LibraryScreen(
                 ErrorState(s.message, onRetry = viewModel::retry)
             }
             is UiState.Success -> PosterGrid(
-                items = LibrarySmartFilter.apply(segmentedItems, activeFilters),
+                items = LibraryGenrePolicy.refine(segmentedItems, genreChoice, activeFilters),
                 onItem = onItem,
-                emptyHint = if (activeFilters.isEmpty()) "Titles you save appear here."
-                            else "Nothing matches these filters.",
+                emptyHint = if (activeFilters.isEmpty() && genreChoice == LibraryGenrePolicy.Choice.All) "Titles you save appear here."
+                            else stringResource(R.string.library_no_matches),
                 onRemove = viewModel::remove,
                 header = libraryHeader,
             )
@@ -438,6 +443,26 @@ private fun LibrarySegmentChips(
                 selected = segment == active,
                 onClick = { onSelect(segment) },
             )
+        }
+    }
+}
+
+@Composable
+private fun LibraryGenreChips(
+    choices: List<LibraryGenrePolicy.Choice>,
+    selected: LibraryGenrePolicy.Choice,
+    onSelect: (LibraryGenrePolicy.Choice) -> Unit,
+) {
+    ChipScrollRow {
+        choices.forEach { choice ->
+            val label = when (choice) {
+                LibraryGenrePolicy.Choice.All -> stringResource(R.string.library_genre_all)
+                LibraryGenrePolicy.Choice.Unknown -> stringResource(R.string.library_genre_unknown)
+                else -> choice.name
+            }
+            androidx.compose.runtime.key(choice.id) {
+                Chip(label = label, selected = choice == selected, onClick = { onSelect(choice) })
+            }
         }
     }
 }
@@ -654,6 +679,7 @@ fun SettingsScreen(
     onOpenGallery: (() -> Unit)? = null,
     onUsenetServersClick: (() -> Unit)? = null,
     onNzbIndexersClick: (() -> Unit)? = null,
+    onImportedCollectionsClick: (() -> Unit)? = null,
 ) {
     val accountValue = when (authState) {
         is AuthState.SignedIn -> authState.email ?: "Signed in"
@@ -769,6 +795,10 @@ fun SettingsScreen(
         // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as
         // the Add-ons and Media servers rows.
         SettingRow(VortXIcons.library, "Library", "Export, import", onClick = onLibraryClick)
+        onImportedCollectionsClick?.let {
+            SettingRow(VortXIcons.library, stringResource(R.string.xperience_title),
+                stringResource(R.string.xperience_settings_detail), onClick = it)
+        }
         // Backup: a device-wide settings backup to a file (profiles included), distinct from the Library
         // export above (which carries saved titles only). Neither routes through account sync.
         SettingRow(VortXIcons.download, "Backup", "Settings to a file", onClick = onBackupClick)

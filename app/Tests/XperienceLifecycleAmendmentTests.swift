@@ -166,7 +166,7 @@ import Foundation
         }
 
         func xperienceExportCandidates(_ session: CurationEditSession)
-            throws -> [XperienceAddonBinding.Candidate] { installed }
+            throws -> XperienceInstalledCatalogs.Snapshot { .init(admittedCandidates: installed) }
 
         func saveXperienceExport(_ document: CurationDocument,
                                  session: CurationEditSession) async throws {

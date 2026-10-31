@@ -11,10 +11,12 @@ test "$(shasum -a 256 "$headers/vortx_ffi.h" | awk '{print $1}')" = "${VORTX_SYN
 mkdir -p app/build
 fixture_dir=$(mktemp -d "$PWD/app/build/apple-sync-manager.XXXXXX")
 source_file=app/SourcesShared/VortXSyncManager.swift
+manager_baseline=0
 if [[ ${1:-} == --baseline-ref ]]; then
     test $# -eq 2
     git show "$2:app/SourcesShared/VortXSyncManager.swift" > "$fixture_dir/baseline.swift"
     source_file="$fixture_dir/baseline.swift"
+    manager_baseline=1
 fi
 node test/apple-sync-manager.mjs --extract "$source_file" "$fixture_dir/Combined.swift"
 sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$fixture_dir/UserProfile.swift"
@@ -36,7 +38,11 @@ nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -swift-ve
 if [[ ${VORTX_SYNC_DIRTY_GLOBALS_ONLY:-0} == 1 ]]; then
     node test/apple-sync-dirty-globals.mjs "$fixture_dir/manager-peer" "$fixture_dir"
 else
-    node test/apple-sync-manager.mjs "$fixture_dir/manager-peer" "$fixture_dir"
+    if [[ $manager_baseline == 1 ]]; then
+        VORTX_SYNC_TEST_BASELINE=1 node test/apple-sync-manager.mjs "$fixture_dir/manager-peer" "$fixture_dir"
+    else
+        node test/apple-sync-manager.mjs "$fixture_dir/manager-peer" "$fixture_dir"
+    fi
     node test/apple-sync-dirty-globals.mjs "$fixture_dir/manager-peer" "$fixture_dir"
 fi
 test "$(shasum -a 256 "$library" | awk '{print $1}')" = "$VORTX_SYNC_TEST_LIBRARY_SHA256"

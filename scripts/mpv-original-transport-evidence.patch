@@ -1,0 +1,146 @@
+--- a/stream/reference_source.h
++++ b/stream/reference_source.h
+@@ -3,6 +3,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include "vortx_http_request.h"
+ 
+ struct stream;
+ struct AVDictionary;
+@@ -139,6 +140,13 @@
+ bool stream_reference_sent_request_copy_values(
+     const struct stream_reference_sent_request *request,
+     struct stream_reference_sent_request_values *out);
++// NEW private scalar output, keeping the existing values structure/API size
++// unchanged. Requires zero output; unavailable facts/cancellation leave it
++// unchanged. No live context is read. These facts prove neither a peer
++// destination nor DNS/trust-store reproduction or reader permission.
++bool stream_reference_sent_request_copy_transport(
++    const struct stream_reference_sent_request *request,
++    struct avpriv_vortx_http_transport *out);
+ void stream_reference_sent_request_values_clear(
+     struct stream_reference_sent_request_values *values);
+ void stream_reference_sent_request_release(
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -519,7 +519,7 @@
+     struct stream_reference_sent_request *request = *handle;
+     *handle = NULL;
+     if (request) {
+-        avpriv_vortx_http_sent_request_clear(&request->sent);
++        avpriv_vortx_http_sent_request_clear_v2(&request->sent);
+         stream_reference_observation_release(&request->observation);
+         av_free(request);
+     }
+@@ -553,7 +553,7 @@
+     request->observation = observation;
+     struct lavf_priv *p = s->priv;
+     if (!reference_observation_matches_source(s, observation) || !p || !p->avio ||
+-        avpriv_vortx_http_copy_sent_request(p->avio,
++        avpriv_vortx_http_copy_sent_request_v2(p->avio,
+             observation->values.response_generation, &request->sent) < 0 ||
+         !reference_sent_request_valid(&request->sent, observation) ||
+         !stream_reference_source_revalidate_observation(s, observation)) {
+@@ -573,14 +573,16 @@
+                         s, request->observation))
+         return false;
+     struct lavf_priv *p = s->priv;
+-    if (p && p->avio && avpriv_vortx_http_copy_sent_request(p->avio,
++    if (p && p->avio && avpriv_vortx_http_copy_sent_request_v2(p->avio,
+             request->sent.response_generation, &current) == 0) {
+         valid = reference_sent_request_valid(&current, request->observation) &&
+             current.request_bytes == request->sent.request_bytes &&
+             !memcmp(current.request, request->sent.request, current.request_bytes) &&
++            avpriv_vortx_http_transport_equal(&current.transport,
++                                              &request->sent.transport) &&
+             stream_reference_source_revalidate_observation(s, request->observation);
+     }
+-    avpriv_vortx_http_sent_request_clear(&current);
++    avpriv_vortx_http_sent_request_clear_v2(&current);
+     return valid;
+ }
+ 
+@@ -616,6 +618,21 @@
+     return true;
+ }
+ 
++bool stream_reference_sent_request_copy_transport(
++    const struct stream_reference_sent_request *request,
++    struct avpriv_vortx_http_transport *out)
++{
++    if (!out || out->version || out->route || out->tls_backend || out->tls_policy ||
++        stream_reference_sent_request_cancelled(request) ||
++        request->sent.transport.version != VORTX_HTTP_TRANSPORT_VERSION)
++        return false;
++    struct avpriv_vortx_http_transport copy = request->sent.transport;
++    if (stream_reference_sent_request_cancelled(request))
++        return false;
++    *out = copy;
++    return true;
++}
++
+ static bool reference_prefix_field(const char *line, size_t length,
+                                    const char *name)
+ {
+--- a/stream/vortx_http_request.h
++++ b/stream/vortx_http_request.h
+@@ -10,14 +10,43 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ struct AVIOContext;
+-#define VORTX_HTTP_SENT_REQUEST_VERSION 1u
++#define VORTX_HTTP_SENT_REQUEST_VERSION 2u
+ #define VORTX_HTTP_SENT_REQUEST_MAX_BYTES (32u * 1024u)
++/* Private observation, not permission to replay. No address, hostname, CA
++ * pathname, certificate or proxy credentials cross this scalar contract.
++ * Direct TCP does NOT prove a DNS result, peer IP or destination admission. */
++#define VORTX_HTTP_TRANSPORT_VERSION 1u
++#define VORTX_HTTP_ROUTE_DIRECT_TCP 1u
++#define VORTX_HTTP_ROUTE_HTTP_PROXY 2u
++#define VORTX_HTTP_ROUTE_HTTP_CONNECT 3u
++#define VORTX_HTTP_TLS_SECURETRANSPORT 1u
++#define VORTX_HTTP_TLS_MBEDTLS 2u
++#define VORTX_HTTP_TLS_VERIFIED 1u
++#define VORTX_HTTP_TLS_CUSTOM_CA 2u
++#define VORTX_HTTP_TLS_CLIENT_IDENTITY 4u
++#define VORTX_HTTP_TLS_HOST_OVERRIDE 8u
++#define VORTX_HTTP_TLS_NUMERIC_HOST 16u
++#define VORTX_HTTP_TLS_POLICY_MASK 31u
++struct avpriv_vortx_http_transport {
++    unsigned version; /* zero means unavailable, never an inferred default */
++    unsigned route;
++    unsigned tls_backend;
++    unsigned tls_policy; /* captured only after successful backend open */
++};
++static inline int avpriv_vortx_http_transport_equal(
++    const struct avpriv_vortx_http_transport *a,
++    const struct avpriv_vortx_http_transport *b)
++{
++    return a->version == b->version && a->route == b->route &&
++           a->tls_backend == b->tls_backend && a->tls_policy == b->tls_policy;
++}
+ struct avpriv_vortx_http_sent_request {
+     char *location;
+     char *request; /* exact successfully written request headers, including GET line */
+     size_t request_bytes; /* excludes the owned terminating NUL */
+     int64_t response_generation;
+     unsigned version;
++    struct avpriv_vortx_http_transport transport;
+ };
+ /* out must be zero/cleared; failure leaves it unchanged. Returns 0 only for an
+  * owned snapshot of the expected current completed response. A nonzero result
+@@ -25,9 +54,11 @@
+  * native memory only: never log, persist or expose these strings as AVOptions.
+  * New matched FFmpeg/MPV components and symbol/header parity are mandatory.
+  */
+-int avpriv_vortx_http_copy_sent_request(
++/* New symbols are mandatory for this larger v2 output. Keeping the old symbol
++ * and checking version after writing would corrupt an old caller's stack. */
++int avpriv_vortx_http_copy_sent_request_v2(
+     struct AVIOContext *owner, int64_t expected_generation,
+     struct avpriv_vortx_http_sent_request *out);
+-void avpriv_vortx_http_sent_request_clear(
++void avpriv_vortx_http_sent_request_clear_v2(
+     struct avpriv_vortx_http_sent_request *value);
+ #endif

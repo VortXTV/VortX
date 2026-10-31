@@ -1,262 +1,309 @@
 package com.vortx.android.moat
 
 import android.content.Context
-import com.vortx.android.config.RemoteConfig
+import com.vortx.android.singularity.SourceIndexLifecycle
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
-/**
- * Short-lived MOAT token issuer + cache for the VortX community SERVE side. The Kotlin port of Apple
- * `app/SourcesShared/MoatToken.swift`.
- *
- * The gated community pools (`sources.vortx.tv` Singularity, and the other pooled reads) do NOT merely
- * edge-sign reads; their READ path additionally requires a per-account MOAT token (`X-VX-Moat`): no token
- * means an empty list, a HARD login gate. CONTRIBUTE stays open, only SERVE is moat-gated. The token is minted
- * by the issuer at `api.vortx.tv`, is short-lived, and must be refreshed before it expires. This is the client
- * that mints, caches (with expiry), refreshes, and stamps it onto outgoing gated reads.
- *
- * DORMANCY: this is groundwork, kept DORMANT exactly like Apple ships it gated. On Android the sole SERVE
- * consumer, [com.vortx.android.singularity.SourceIndexClient], stays behind its own compile-time
- * `isEnabled = false` gate pending a separately security-signed-off lane, and its `moatTokenProvider` (which
- * this client is wired to) is never invoked while that gate is closed. So this mints nothing at runtime today;
- * it exists so the token flows the same way Apple wires MoatToken into SourceIndexClient once SERVE re-enables.
- *
- * FAIL-SOFT CONTRACT (every method): an unwired client, no session, a mint error, offline, a signed-out
- * account, or withdrawn consent all collapse to "no token" -> the caller stamps nothing -> the gated read
- * returns empty. Nothing throws to a caller and nothing ever blocks or crashes. A missing token is a normal,
- * expected state (the whole app works signed out), so it is never surfaced as an error.
- *
- * IDENTITY: the mint is authenticated with the VortX account session bearer (the `api.vortx.tv` session token
- * VortXSyncManager persists), NOT the Stremio authKey (which goes solely to api.strem.io per the account
- * invariant). The bearer is supplied through [sessionProvider], injected once at app start from the already-
- * built session manager, so this client never reaches into another type's private storage.
- *
- * GATING: minting is gated on [MoatConsent.contributeAndConsume] (give-to-get: no consent -> no moat token ->
- * no SERVE) AND on the caller-supplied signed-in flag. A signed-out or opted-out device never mints.
- *
- * CONCURRENCY: a [Mutex] guards the cache + in-flight mint so a burst of gated reads shares ONE mint instead
- * of stampeding the issuer, and the network mint itself runs OUTSIDE the lock (the lock is never held across a
- * suspending request).
- */
+/** Short-lived account-authenticated MOAT tokens. Secrets are never logged or persisted by this client.
+ * Legacy SourceIndex entry points remain compile-time dormant; the App-owned authorized path supplies
+ * its captured account scope and live give-to-get gates before requesting this token. */
 object MoatToken {
-
-    /** The gated-read header, byte-for-byte Apple's `MoatToken.header`. */
     const val HEADER = "X-VX-Moat"
-
-    /** The query-param fallback for element loads that cannot carry a header, byte-for-byte Apple's `queryParam`. */
     const val QUERY_PARAM = "vmoat"
 
-    /** The VortX account session credential the mint authenticates with (bearer + account id for the scope digest). */
-    data class SessionCredential(val bearer: String, val accountId: String)
-
-    /** The issuer's mint response, decoded from `{ token, expiresIn?|expiresAt? }`. */
-    data class Minted(val token: String, val expiresAtMs: Long)
-
-    /**
-     * Injected once at app start (see VortXApplication). Reads the CURRENT VortX session live on each call so a
-     * later sign-in / sign-out is reflected without re-wiring. null (unwired) keeps the client dormant.
-     */
-    @Volatile
-    var sessionProvider: (() -> SessionCredential?)? = null
-
-    /**
-     * Injected once at app start. Needed to consult [MoatConsent] from the context-free SERVE call sites. null
-     * (unwired) keeps the client dormant.
-     */
-    @Volatile
-    var appContext: Context? = null
-
-    /** Test seam for the issuer round trip. null uses the real [mint]. */
-    @Volatile
-    var mintProvider: (suspend (String) -> Minted?)? = null
-
-    /**
-     * Refresh the token this far BEFORE its stated expiry, so a read never rides an about-to-die token across
-     * the worker's clock skew. Matches Apple's 60 s.
-     */
-    private const val REFRESH_SKEW_MS = 60_000L
-
-    /** Default token lifetime when the issuer states neither an absolute expiry nor a TTL. Matches Apple's 15 min. */
-    private const val DEFAULT_TTL_MS = 15 * 60 * 1000L
-
-    private const val MINT_TIMEOUT_MS = 8_000
-
-    private data class Scope(val credentialDigest: String)
-
-    private data class Cached(val scope: Scope, val token: String, val expiresAtMs: Long)
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mutex = Mutex()
-    private var cached: Cached? = null
-    private var inFlight: Deferred<String?>? = null
-    private var inFlightScope: Scope? = null
-
-    // MARK: - Public API
-
-    /**
-     * The current valid moat token, minting or refreshing as needed. Returns null (never throws) when the
-     * device cannot or should not hold one: unwired, opted out of the pool, signed out, offline, or the mint
-     * failed. Mirrors Apple `current(isSignedIn:)`.
-     *
-     * [isSignedIn] is the caller's account signed-in flag (the SERVE gate is login-only). Passed in rather than
-     * read here so this stays free of a UI dependency and testable.
-     */
-    suspend fun current(isSignedIn: Boolean): String? {
-        val context = appContext ?: return null
-        if (!isSignedIn) return null
-        if (!MoatConsent.contributeAndConsume(context)) return null
-        val credential = sessionProvider?.invoke()?.takeIf { it.bearer.isNotEmpty() } ?: return null
-        val tokenScope = Scope(credentialDigest = digest(credential))
-
-        val flight = mutex.withLock {
-            val fresh = cached
-            if (fresh != null && fresh.scope == tokenScope && fresh.expiresAtMs - nowMs() > REFRESH_SKEW_MS) {
-                return fresh.token
-            }
-            if (fresh != null && fresh.scope != tokenScope) cached = null
-            val existing = inFlight
-            if (existing != null && inFlightScope == tokenScope) {
-                existing
-            } else {
-                val bearer = credential.bearer
-                val started = scope.async(start = CoroutineStart.LAZY) { mintAndStore(bearer, tokenScope) }
-                inFlight = started
-                inFlightScope = tokenScope
-                started
-            }
-        }
-        flight.start()
-        return runCatching { flight.await() }.getOrNull()
+    data class SessionCredential(val bearer: String, val accountId: String) {
+        override fun toString(): String = "SessionCredential(<redacted>)"
+    }
+    data class Minted(val token: String, val expiresAtMs: Long) {
+        override fun toString(): String = "Minted(<redacted>)"
     }
 
-    /**
-     * Proactively warm the token (e.g. right after login) so the first gated read does not pay the mint latency.
-     * Fire-and-forget; result ignored. No-op when unwired / opted out / signed out. Mirrors Apple `prewarm`.
-     */
-    suspend fun prewarm(isSignedIn: Boolean) {
-        current(isSignedIn)
-    }
+    /** Reads the CURRENT VortX account bearer, never a streaming-provider credential. */
+    @Volatile var sessionProvider: (() -> SessionCredential?)? = null
+    @Volatile var appContext: Context? = null
+    /** Existing issuer test seam. Production always uses the fixed-origin bounded transport. */
+    @Volatile var mintProvider: (suspend (String) -> Minted?)? = null
 
-    /**
-     * Stamp the moat token onto a gated READ [connection] as `X-VX-Moat`. No-op when there is no token (the
-     * worker then returns an empty list, the correct fail-soft SERVE result). Call AFTER the edge signature so
-     * both ride together. Mirrors Apple `stamp`.
-     */
+    private val cache = MoatSourceEpochCache(
+        credentialProvider = { sessionProvider?.invoke() },
+        permitted = { appContext?.let(MoatConsent::contributeAndConsume) == true },
+        mint = { bearer, cancellation ->
+            val injected = mintProvider
+            if (injected != null) injected(bearer) else mint(bearer, cancellation)
+        },
+    )
+
+    suspend fun current(isSignedIn: Boolean): String? = if (isSignedIn) cache.current() else null
+    suspend fun prewarm(isSignedIn: Boolean) { current(isSignedIn) }
     suspend fun stamp(connection: HttpURLConnection, isSignedIn: Boolean) {
-        val token = current(isSignedIn) ?: return
-        connection.setRequestProperty(HEADER, token)
+        current(isSignedIn)?.let { connection.setRequestProperty(HEADER, it) }
     }
-
-    /**
-     * The moat token as a query-param value for element loads that cannot carry a custom header. Returns null
-     * when there is no token. Mirrors Apple `queryValue`. Callers MUST NOT log the built URL and SHOULD load it
-     * on an ephemeral request so the short-lived token is not written to a persistent cache.
-     */
     suspend fun queryValue(isSignedIn: Boolean): String? = current(isSignedIn)
 
-    /** Unconditional teardown for sign-out / consent-off / shutdown. Mirrors Apple `clear()`. */
-    suspend fun clear() {
-        mutex.withLock {
-            cached = null
-            inFlight?.cancel()
-            inFlight = null
-            inFlightScope = null
+    /** Explicit test/shutdown teardown. Authorization mutations use the scoped overload or lifecycle callback. */
+    suspend fun clear() { cache.clear() }
+    internal fun clear(retiredSourceEpoch: Long) { cache.clearThrough(retiredSourceEpoch) }
+
+    private const val MINT_TIMEOUT_MS = 8_000
+    private const val MAX_MINT_BYTES = 64 * 1024
+    private const val DEFAULT_TTL_MS = 15 * 60 * 1000L
+    private const val ISSUER_URL = "https://api.vortx.tv/v1/moat/token"
+
+    /** No RemoteConfig override or redirect may receive the account bearer. */
+    private suspend fun mint(bearer: String, cancellation: MoatMintCancellation): Minted? {
+        if (bearer.isBlank()) return null
+        return try {
+            withContext(Dispatchers.IO) {
+                suspendCancellableCoroutine { continuation ->
+                    val started = System.nanoTime()
+                    val conn = URL(ISSUER_URL).openConnection() as HttpURLConnection
+                    val registration = cancellation.onTransportCancelled(
+                        cancelContinuation = { continuation.cancel() },
+                        disconnect = { conn.disconnect() },
+                    )
+                    continuation.invokeOnCancellation { cancellation.cancel() }
+                    try {
+                        fun requireCurrent() {
+                            if (!continuation.isActive || cancellation.isCancelled()) throw CancellationException("Moat authorization retired")
+                            if (System.nanoTime() - started >= MINT_TIMEOUT_MS * 1_000_000L) throw IOException("Moat mint timed out")
+                        }
+                        conn.requestMethod = "POST"
+                        conn.connectTimeout = MINT_TIMEOUT_MS
+                        conn.readTimeout = MINT_TIMEOUT_MS
+                        conn.useCaches = false
+                        conn.instanceFollowRedirects = false
+                        conn.setRequestProperty("accept", "application/json")
+                        conn.setRequestProperty("authorization", "Bearer $bearer")
+                        requireCurrent()
+                        if (conn.responseCode !in 200..299) throw IOException("Moat HTTP error")
+                        if (conn.contentLengthLong > MAX_MINT_BYTES) throw IOException("Moat response exceeds budget")
+                        val bytes = conn.inputStream.use { input ->
+                            val result = ByteArrayOutputStream()
+                            val chunk = ByteArray(8 * 1024)
+                            while (true) {
+                                requireCurrent()
+                                val count = input.read(chunk)
+                                if (count < 0) break
+                                if (count > MAX_MINT_BYTES - result.size()) throw IOException("Moat response exceeds budget")
+                                result.write(chunk, 0, count)
+                            }
+                            requireCurrent()
+                            result.toByteArray()
+                        }
+                        val json = JSONObject(bytes.toString(Charsets.UTF_8))
+                        val token = (json.opt("token") as? String)?.takeIf {
+                            it.isNotBlank() && it.length <= 16 * 1024 && it.none(Char::isISOControl)
+                        } ?: throw IOException("Invalid Moat token")
+                        val now = System.currentTimeMillis()
+                        fun positiveInteger(key: String): Long {
+                            val raw = json.opt(key) as? Number ?: throw IOException("Invalid Moat expiry")
+                            return BigDecimal(raw.toString()).longValueExact().takeIf { it > 0 }
+                                ?: throw IOException("Invalid Moat expiry")
+                        }
+                        val expiry = when {
+                            json.has("expiresAt") && !json.isNull("expiresAt") -> Math.multiplyExact(positiveInteger("expiresAt"), 1000L)
+                            json.has("expiresIn") && !json.isNull("expiresIn") -> Math.addExact(now, Math.multiplyExact(positiveInteger("expiresIn"), 1000L))
+                            else -> Math.addExact(now, DEFAULT_TTL_MS)
+                        }
+                        if (expiry <= now) throw IOException("Expired Moat token")
+                        requireCurrent()
+                        if (continuation.isActive) continuation.resume(Minted(token, expiry))
+                    } catch (failure: Throwable) {
+                        if (continuation.isActive) continuation.resumeWithException(failure)
+                    } finally {
+                        registration.close()
+                        runCatching { conn.disconnect() }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            null
         }
     }
+}
 
-    // MARK: - Mint (issuer round trip)
+/** A connection cancellation latch. Registration and callbacks never run under the token-state lock. */
+internal class MoatMintCancellation {
+    private val lock = Any()
+    private var cancelled = false
+    private var nextID = 0L
+    private val callbacks = mutableMapOf<Long, () -> Unit>()
+    fun isCancelled(): Boolean = synchronized(lock) { cancelled }
+    fun onCancelled(callback: () -> Unit): AutoCloseable {
+        val id = synchronized(lock) {
+            if (cancelled) null else (++nextID).also { callbacks[it] = callback }
+        }
+        if (id == null) runCatching(callback)
+        return AutoCloseable { if (id != null) synchronized(lock) { callbacks.remove(id) } }
+    }
+    /** Cancellation state is immediate; a caller holding UI/native locks never performs blocking teardown. */
+    fun onTransportCancelled(cancelContinuation: () -> Unit, disconnect: () -> Unit): AutoCloseable = onCancelled {
+        cancelContinuation()
+        SourceIndexLifecycle.dispatchTeardown(disconnect)
+    }
+    fun cancel() {
+        val retired = synchronized(lock) {
+            if (cancelled) return
+            cancelled = true
+            callbacks.values.toList().also { callbacks.clear() }
+        }
+        retired.forEach { runCatching { it() } }
+    }
+}
 
-    private suspend fun mintAndStore(bearer: String, tokenScope: Scope): String? {
-        val minted = (mintProvider ?: { b -> mint(b) }).invoke(bearer)
-        return mutex.withLock {
-            if (inFlightScope == tokenScope) {
-                inFlight = null
-                inFlightScope = null
-            }
-            // Re-validate every live authorization fact before storing: a sign-out / consent-off / account swap
-            // that happened while the mint was in flight must not surface a now-stale token.
-            val context = appContext
-            val credential = sessionProvider?.invoke()
-            val stillCurrent = context != null &&
-                MoatConsent.contributeAndConsume(context) &&
-                credential != null && credential.bearer.isNotEmpty() &&
-                digest(credential) == tokenScope.credentialDigest
-            if (!stillCurrent || minted == null) {
+/** The actual production cache, also usable by source fixtures without constructing an Android Context. */
+internal class MoatSourceEpochCache(
+    private val credentialProvider: () -> MoatToken.SessionCredential?,
+    private val permitted: () -> Boolean,
+    private val mint: suspend (String, MoatMintCancellation) -> MoatToken.Minted?,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val nowMs: () -> Long = System::currentTimeMillis,
+    private val epoch: () -> Long = SourceIndexLifecycle::currentEpoch,
+    private val observeEpoch: (Long, () -> Unit) -> AutoCloseable = SourceIndexLifecycle::onEpochInvalidated,
+) {
+    private data class TokenScope(val epoch: Long, val credentialDigest: String)
+    private data class Cached(val scope: TokenScope, val tag: Long, val value: MoatToken.Minted, val registration: AutoCloseable?)
+    private class Flight(val scope: TokenScope, val tag: Long, val task: Deferred<String?>,
+                         val cancellation: MoatMintCancellation, var registration: AutoCloseable? = null) {
+        // A concurrent waiter must not start this LAZY task before its epoch observer is attached.
+        val ready = CompletableDeferred<Unit>()
+    }
+    private val lock = Any()
+    private var nextTag = 0L
+    private var cached: Cached? = null
+    private var inFlight: Flight? = null
+
+    private fun capture(): Pair<TokenScope, MoatToken.SessionCredential>? {
+        val originalEpoch = epoch()
+        if (!runCatching(permitted).getOrDefault(false)) return null
+        val credential = runCatching(credentialProvider).getOrNull()?.takeIf {
+            it.bearer.isNotBlank() && it.accountId.isNotBlank()
+        } ?: return null
+        if (epoch() != originalEpoch) return null
+        val input = (credential.accountId + "\u0000" + credential.bearer).toByteArray(Charsets.UTF_8)
+        val digest = MessageDigest.getInstance("SHA-256").digest(input).joinToString("") { "%02x".format(it) }
+        return TokenScope(originalEpoch, digest) to credential
+    }
+
+    suspend fun current(): String? {
+        val (original, credential) = capture() ?: return null
+        var retiredFlight: Flight? = null
+        var retiredRegistration: AutoCloseable? = null
+        var fresh: Cached? = null
+        var created = false
+        val flight = synchronized(lock) {
+            val previous = cached
+            if (previous != null && previous.scope == original && previous.value.expiresAtMs - nowMs() > REFRESH_SKEW_MS) {
+                fresh = previous
                 null
             } else {
-                cached = Cached(tokenScope, minted.token, minted.expiresAtMs)
-                minted.token
+                cached = null
+                retiredRegistration = previous?.registration
+                val previousFlight = inFlight
+                if (previousFlight != null && previousFlight.scope == original) previousFlight
+                else {
+                    retiredFlight = previousFlight
+                    val tag = ++nextTag
+                    val cancellation = MoatMintCancellation()
+                    val task = scope.async(start = CoroutineStart.LAZY) { mintAndStore(original, tag, credential.bearer, cancellation) }
+                    Flight(original, tag, task, cancellation).also { inFlight = it; created = true }
+                }
             }
         }
-    }
-
-    /**
-     * One mint round trip to the issuer. Fail-soft to null on any error / non-2xx / decode miss / empty bearer.
-     * POSTs to `<issuer>/v1/moat/token` with the VortX account session bearer; the worker returns
-     * `{ token, expiresIn?|expiresAt? }`. Mirrors Apple `mint`.
-     */
-    private fun mint(bearer: String): Minted? {
-        if (bearer.isEmpty()) return null
-        var conn: HttpURLConnection? = null
-        try {
-            conn = (URL(issuerBase() + "/v1/moat/token").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = MINT_TIMEOUT_MS
-                readTimeout = MINT_TIMEOUT_MS
-                useCaches = false
-                instanceFollowRedirects = false
-                setRequestProperty("accept", "application/json")
-                setRequestProperty("authorization", "Bearer $bearer")
-            }
-            val code = conn.responseCode
-            if (code !in 200..299) return null
-            val text = conn.inputStream.bufferedReader().use { it.readText() }
-            val json = runCatching { JSONObject(text) }.getOrNull() ?: return null
-            val token = json.optString("token").takeIf { it.isNotBlank() } ?: return null
-            val expiresAtMs = when {
-                json.has("expiresAt") && !json.isNull("expiresAt") -> json.optLong("expiresAt") * 1000L
-                json.has("expiresIn") && !json.isNull("expiresIn") -> nowMs() + json.optLong("expiresIn") * 1000L
-                else -> nowMs() + DEFAULT_TTL_MS
-            }
-            return Minted(token, expiresAtMs)
-        } catch (_: Throwable) {
-            return null
-        } finally {
-            conn?.disconnect()
+        retiredRegistration?.close()
+        retire(retiredFlight)
+        val selectedCache = fresh
+        if (selectedCache != null) {
+            if (!currentCoroutineContext().isActive || capture()?.first != original) return null
+            return selectedCache.value.token.takeIf { synchronized(lock) { cached === selectedCache } }
         }
+        flight ?: return null
+        if (created) {
+            val registration = observeEpoch(original.epoch) { clearThrough(original.epoch) }
+            val retained = synchronized(lock) {
+                if (inFlight === flight) { flight.registration = registration; true } else false
+            }
+            if (!retained) registration.close()
+            flight.ready.complete(Unit)
+        }
+        try { flight.ready.await() } catch (_: Exception) { return null }
+        flight.task.start()
+        val token = try { flight.task.await() } catch (_: Exception) { null }
+        if (token == null || !currentCoroutineContext().isActive || capture()?.first != original) return null
+        return token.takeIf { synchronized(lock) { cached?.let { it.tag == flight.tag && it.scope == original } == true } }
     }
 
-    /**
-     * The issuer base, baked to api.vortx.tv. The `endpoint("moat")` lookup is a forward hook: RemoteConfig has
-     * no `moat` endpoint wired today (it returns null for it), so this always resolves to the baked default
-     * until a `moat` key is decoded there. Repoint by wiring that key, not by editing here. Mirrors Apple
-     * `issuerBase`.
-     */
-    private fun issuerBase(): String =
-        RemoteConfig.current().endpoint("moat") ?: "https://api.vortx.tv"
-
-    // MARK: - Helpers
-
-    /**
-     * A private digest binding the cache to the exact account session credential. A token minted for account A
-     * is never served to account B: the digest changes with either the account id or the bearer. Never logged,
-     * persisted, or returned. Mirrors Apple's `identityDigest`.
-     */
-    private fun digest(credential: SessionCredential): String {
-        val input = (credential.accountId + " " + credential.bearer).toByteArray(Charsets.UTF_8)
-        return MessageDigest.getInstance("SHA-256").digest(input)
-            .joinToString("") { "%02x".format(it) }
+    private suspend fun mintAndStore(original: TokenScope, tag: Long, bearer: String,
+                                     cancellation: MoatMintCancellation): String? {
+        val minted = try { mint(bearer, cancellation) } catch (_: Exception) { null }
+        // Provider/native predicates run outside token state. The owner tag and epoch are checked again at acceptance.
+        val live = currentCoroutineContext().isActive && !cancellation.isCancelled() && capture()?.first == original
+        var registration: AutoCloseable? = null
+        val accepted = synchronized(lock) {
+            val owner = inFlight
+            if (owner == null || owner.tag != tag || owner.scope != original) null
+            else {
+                inFlight = null
+                if (live && epoch() == original.epoch && minted != null && minted.token.isNotBlank() && minted.expiresAtMs > nowMs()) {
+                    cached = Cached(original, tag, minted, owner.registration)
+                    minted.token
+                } else { registration = owner.registration; null }
+            }
+        }
+        registration?.close()
+        return accepted
     }
 
-    private fun nowMs(): Long = System.currentTimeMillis()
+    /** A delayed callback may retire A without touching a token or mint created in reopened epoch B. */
+    fun clearThrough(retiredEpoch: Long) {
+        val retired = synchronized(lock) {
+            val oldCache = cached?.takeIf { it.scope.epoch <= retiredEpoch }
+            if (oldCache != null) cached = null
+            val oldFlight = inFlight?.takeIf { it.scope.epoch <= retiredEpoch }
+            if (oldFlight != null) inFlight = null
+            oldCache?.registration to oldFlight
+        }
+        retired.first?.close()
+        retire(retired.second)
+    }
+
+    fun clear() {
+        val retired = synchronized(lock) {
+            val value = cached?.registration to inFlight
+            cached = null
+            inFlight = null
+            value
+        }
+        retired.first?.close()
+        retire(retired.second)
+    }
+
+    private fun retire(flight: Flight?) {
+        if (flight == null) return
+        flight.registration?.close()
+        flight.cancellation.cancel()
+        flight.task.cancel()
+    }
+
+    companion object { private const val REFRESH_SKEW_MS = 60_000L }
 }

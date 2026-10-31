@@ -20,6 +20,8 @@ void init_methods_cache(JNIEnv *env);
 UTIL_EXTERN jclass java_Integer, java_Double, java_Boolean;
 UTIL_EXTERN jmethodID java_Integer_init, java_Double_init, java_Boolean_init;
 
+UTIL_EXTERN jclass seam_MpvReferenceNode;
+UTIL_EXTERN jmethodID seam_MpvReferenceNode_init;
 UTIL_EXTERN jclass seam_MpvSeam;
 UTIL_EXTERN jmethodID seam_MpvSeam_eventProperty_S,
         seam_MpvSeam_eventProperty_Sb,
@@ -28,5 +30,7 @@ UTIL_EXTERN jmethodID seam_MpvSeam_eventProperty_S,
         seam_MpvSeam_eventProperty_SS,
         seam_MpvSeam_eventEndFile_II,
         seam_MpvSeam_eventStartFile_J,
+        seam_MpvSeam_eventReferenceReply_JIN,
+        seam_MpvSeam_eventReferenceFailure_J,
         seam_MpvSeam_event,
         seam_MpvSeam_logMessage_SiS;

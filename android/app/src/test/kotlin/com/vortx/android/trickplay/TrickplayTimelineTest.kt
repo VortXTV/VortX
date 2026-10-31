@@ -161,6 +161,55 @@ class TrickplayTimelineTest {
     }
 
     @Test
+    fun `approximate fallback uses actual VTT neighbors without changing coverage`() {
+        val vtt = "WEBVTT\n\n00:10.000 --> 00:20.000\nsprite#xywh=0,0,320,180\n\n" +
+            "00:40.000 --> 00:50.000\nsprite#xywh=320,0,320,180\n"
+        val cues = requireNotNull(TrickplayTimeline.parseVtt(vtt, 2, 2, 320, 180))
+        fun nearest(time: Double) = TrickplayTimeline.nearestCue(time, cues, 2, 10.0, 2, 320, 180)
+        assertEquals(0, nearest(0.0)?.tileIndex)
+        assertEquals(0, nearest(20.0)?.tileIndex)
+        assertEquals(0, nearest(30.0)?.tileIndex) // Equal distance chooses the earlier real tile.
+        assertEquals(1, nearest(30.001)?.tileIndex)
+        assertEquals(1, nearest(45.0)?.tileIndex)
+        assertEquals(1, nearest(500.0)?.tileIndex)
+        assertEquals(40.0, nearest(30.001)?.start ?: -1.0, 0.0)
+        assertEquals(50.0, nearest(30.001)?.end ?: -1.0, 0.0)
+        assertNull(TrickplayTimeline.cue(30.001, cues, 2, 10.0, 2, 320, 180))
+        assertNull(nearest(Double.NaN))
+        assertNull(nearest(Double.POSITIVE_INFINITY))
+        assertNull(nearest(-1.0))
+    }
+
+    @Test
+    fun `approximate fallback never invents coverage for invalid advertised VTT`() {
+        val invalid = TrickplayTimeline.fetchedCues(true, "not-vtt", 3, 2, 320, 180)
+        assertEquals(emptyList<TrickplayTimelineCue>(), invalid)
+        assertNull(TrickplayTimeline.nearestCue(5.0, invalid, 3, 10.0, 2, 320, 180))
+        assertNull(TrickplayTimeline.nearestCue(50.0, emptyList(), 3, 10.0, 2, 320, 180))
+        val last = TrickplayTimeline.nearestCue(Double.MAX_VALUE, null, 3, 10.0, 2, 320, 180)
+        assertEquals(2, last?.tileIndex)
+        assertEquals(20.0, last?.start ?: -1.0, 0.0)
+        assertEquals(30.0, last?.end ?: -1.0, 0.0)
+        assertEquals(0, last?.x)
+        assertEquals(180, last?.y)
+        assertNull(TrickplayTimeline.nearestCue(50.0, null, 0, 10.0, 2, 320, 180))
+        assertNull(TrickplayTimeline.nearestCue(50.0, null, 3, Double.NaN, 2, 320, 180))
+        assertNull(TrickplayTimeline.nearestCue(50.0, null, 3, Double.MAX_VALUE, 2, 320, 180))
+    }
+
+    @Test
+    fun `nearest cue reads logarithmic neighbors rather than copying or scanning a sheet`() {
+        val values = List(4_096) { index -> cue(index * 20.0, index * 20.0 + 10.0, index) }
+        var reads = 0
+        val indexed = object : AbstractList<TrickplayTimelineCue>() {
+            override val size: Int get() = values.size
+            override fun get(index: Int): TrickplayTimelineCue { reads += 1; return values[index] }
+        }
+        assertEquals(2_005, TrickplayTimeline.nearestCue(40_115.0, indexed, 4_096, 10.0, 2, 320, 180)?.tileIndex)
+        assertTrue("two bounded binary searches plus adjacent entries", reads <= 30)
+    }
+
+    @Test
     fun `generated vtt uses actual times and preserves explicit gap fence`() {
         val times = listOf(0.0, 10.0, 100.0, 110.0)
         val fences = TrickplayTimeline.selectedCueEndFences(

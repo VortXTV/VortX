@@ -2,6 +2,9 @@ package com.vortx.android.ui.tv
 
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,6 +34,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.library.LibraryGenrePolicy
 import com.vortx.android.ui.library.LibrarySegment
 import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.UiState
@@ -75,6 +79,10 @@ fun TvLibraryScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val landingState by landingViewModel.state.collectAsStateWithLifecycle()
     val randomPick by viewModel.randomPickState.collectAsStateWithLifecycle()
+    val genreScope by viewModel.genreScope.collectAsStateWithLifecycle()
+    var genreChoice by remember(viewModel, genreScope) { mutableStateOf(LibraryGenrePolicy.Choice.All) }
+    var segment by remember(viewModel, genreScope) { mutableStateOf(LibrarySegment.ALL) }
+    var smartSelected by remember(viewModel, genreScope) { mutableStateOf(emptySet<LibrarySmartFilter>()) }
     val pickerIsActive by rememberUpdatedState(pickerActive)
     DisposableEffect(viewModel, pickerActive) {
         if (!pickerActive) viewModel.clearRandomPick()
@@ -105,6 +113,13 @@ fun TvLibraryScreen(
             is UiState.Error -> TvError(s.message, onRetry = viewModel::retry)
             is UiState.Success -> TvLibraryContent(
                 result = s.data,
+                genreChoice = genreChoice,
+                onSelectGenre = { genreChoice = it },
+                filterScope = genreScope,
+                segment = segment,
+                onSelectSegment = { segment = it },
+                smartSelected = smartSelected,
+                onToggleSmart = { smartSelected = LibrarySmartFilter.toggle(smartSelected, it) },
                 onItem = onItem,
                 onSelectSort = viewModel::load,
                 onRemove = viewModel::remove,
@@ -127,6 +142,13 @@ fun TvLibraryScreen(
 @Composable
 private fun TvLibraryContent(
     result: LibraryResult,
+    genreChoice: LibraryGenrePolicy.Choice,
+    onSelectGenre: (LibraryGenrePolicy.Choice) -> Unit,
+    filterScope: Pair<String?, com.vortx.android.data.ContinueWatchingOwner?>,
+    segment: LibrarySegment,
+    onSelectSegment: (LibrarySegment) -> Unit,
+    smartSelected: Set<LibrarySmartFilter>,
+    onToggleSmart: (LibrarySmartFilter) -> Unit,
     onItem: (MetaItem) -> Unit,
     onSelectSort: (String) -> Unit,
     onRemove: (String) -> Unit,
@@ -147,19 +169,19 @@ private fun TvLibraryContent(
     // Client-side type segmentation (adds the Anime bucket the engine cannot express) + smart filters, both
     // pure refinements over the loaded set -- see TvLibrarySmartFilters.kt.
     val segments = remember(allItems) { LibrarySegment.availableSegments(allItems) }
-    var segment by remember(allItems) { mutableStateOf(LibrarySegment.ALL) }
-    val activeSegment = if (segment in segments || segments.isEmpty()) segment else LibrarySegment.ALL
+    val activeSegment = segment.effective(allItems)
     val afterSegment = remember(allItems, activeSegment) { activeSegment.filter(allItems) }
 
+    val genreChoices = remember(afterSegment, genreChoice) { LibraryGenrePolicy.choices(afterSegment, genreChoice) }
     val applicableFilters = remember(afterSegment) { LibrarySmartFilter.applicable(afterSegment) }
-    var smartSelected by remember(allItems) { mutableStateOf(emptySet<LibrarySmartFilter>()) }
     // Only keep selected filters that still partition the current set, so a filter left over from another
     // segment can never blank the grid.
     val activeFilters = smartSelected intersect applicableFilters.toSet()
-    val shown = remember(afterSegment, activeFilters) { LibrarySmartFilter.apply(afterSegment, activeFilters) }
+    val shown = remember(afterSegment, genreChoice, activeFilters) { LibraryGenrePolicy.refine(afterSegment, genreChoice, activeFilters) }
 
-    var focusedItem by remember(allItems) { mutableStateOf<MetaItem?>(null) }
-    val heroItem = focusedItem ?: shown.firstOrNull() ?: allItems.firstOrNull()
+    var focusedItem by remember(filterScope) { mutableStateOf<MetaItem?>(null) }
+    val heroItem = focusedItem?.let { focused -> shown.firstOrNull { it.id == focused.id && it.type == focused.type } }
+        ?: shown.firstOrNull()
     val enriched = rememberEnrichedHeroItem(heroItem)
     val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.44f).dp.coerceIn(240.dp, 400.dp)
 
@@ -192,10 +214,13 @@ private fun TvLibraryContent(
                     filters = result.filters,
                     segments = segments,
                     activeSegment = activeSegment,
-                    onSelectSegment = { segment = it },
+                    onSelectSegment = onSelectSegment,
+                    genreChoices = genreChoices,
+                    genreChoice = genreChoice,
+                    onSelectGenre = onSelectGenre,
                     applicableFilters = applicableFilters,
                     selectedFilters = activeFilters,
-                    onToggleFilter = { smartSelected = LibrarySmartFilter.toggle(smartSelected, it) },
+                    onToggleFilter = onToggleSmart,
                     onSelectSort = onSelectSort,
                 )
             }
@@ -285,6 +310,9 @@ private fun TvLibraryControls(
     segments: List<LibrarySegment>,
     activeSegment: LibrarySegment,
     onSelectSegment: (LibrarySegment) -> Unit,
+    genreChoices: List<LibraryGenrePolicy.Choice>,
+    genreChoice: LibraryGenrePolicy.Choice,
+    onSelectGenre: (LibraryGenrePolicy.Choice) -> Unit,
     applicableFilters: List<LibrarySmartFilter>,
     selectedFilters: Set<LibrarySmartFilter>,
     onToggleFilter: (LibrarySmartFilter) -> Unit,
@@ -309,6 +337,19 @@ private fun TvLibraryControls(
                     segments.firstOrNull { it.name == chip.value }?.let(onSelectSegment)
                 },
             )
+        }
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = TvDimens.edge),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        ) {
+            items(genreChoices, key = { it.id }) { choice ->
+                val label = when (choice) {
+                    LibraryGenrePolicy.Choice.All -> stringResource(com.vortx.android.R.string.library_genre_all)
+                    LibraryGenrePolicy.Choice.Unknown -> stringResource(com.vortx.android.R.string.library_genre_unknown)
+                    else -> choice.name
+                }
+                TvFilterChip(label, choice == genreChoice, onClick = { onSelectGenre(choice) })
+            }
         }
         if (applicableFilters.isNotEmpty()) {
             TvChipRow(

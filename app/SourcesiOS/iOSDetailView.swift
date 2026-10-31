@@ -844,9 +844,9 @@ struct iOSDetailView: View {
         #endif
     }
 
-    // Opaque view boundaries keep the scene, lifecycle and presentation chains independently
-    // type-checkable without changing their modifier order or view identity.
-    private var detailScene: some View {
+    // #279: opaque helpers still expose their nested generic metadata at runtime. Erase selected
+    // stable section roots to bound that expansion; state and lifecycle stay owned by this detail.
+    private var detailScene: AnyView {
         // A GeometryReader gives us the EXACT viewport width to HARD-cap the content column with
         // `.frame(width:)`. `maxWidth: .infinity` only sets an upper bound; it does not stop a child
         // whose intrinsic width exceeds the screen (the hero's single-line metaRow / action button row on
@@ -854,7 +854,7 @@ struct iOSDetailView: View {
         // negative leading origin and clipped every hero element off the left edge. A concrete width can't
         // be exceeded, so the column (and hero) stay pinned to the screen. macOS was wide enough to never
         // overflow, which is why this only bit iOS.
-        GeometryReader { geo in
+        AnyView(GeometryReader { geo in
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                 // Terminal metadata failure short-circuits the whole page (both scroll models): there is no
@@ -1028,6 +1028,7 @@ struct iOSDetailView: View {
                 .macBackAffordance()
         }
         #endif
+        )
     }
 
     private var detailLifecycle: some View {
@@ -1482,7 +1483,7 @@ struct iOSDetailView: View {
 
     /// Hero: full-bleed backdrop + scrim + title / meta / action row / synopsis. `scrollToSources`
     /// is wired into the movie action row's "Sources" button (the tvOS 3-action twin).
-    private func hero(width: CGFloat, height: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
+    private func hero(width: CGFloat, height: CGFloat, scrollToSources: @escaping () -> Void) -> AnyView {
         // Two stacked blocks, NOT one bottom-aligned ZStack over the backdrop. The backdrop is a
         // fixed-height banner with the title + meta + a clamped synopsis overlaid at its bottom; the action
         // buttons and the (long) full synopsis flow BELOW it on the canvas. Putting the whole column inside
@@ -1495,12 +1496,12 @@ struct iOSDetailView: View {
         // pin the banner while the below-content + episode/source list scroll independently beneath it. On
         // iOS/iPadOS the two are composed back into the exact single scrolling column as before.
         let overlap = SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: height)
-        return VStack(alignment: .leading, spacing: overlap > 0 ? 0 : Theme.Space.md) {
+        return AnyView(VStack(alignment: .leading, spacing: overlap > 0 ? 0 : Theme.Space.md) {
             heroBanner(width: width, height: height)
             heroBelow(width: width, scrollToSources: scrollToSources)
                 .padding(.top, -overlap)
         }
-        .frame(width: width, alignment: .leading)
+        .frame(width: width, alignment: .leading))
     }
 
     #if os(macOS)
@@ -1535,10 +1536,10 @@ struct iOSDetailView: View {
 
     /// A confined media card containing artwork, ambient trailer, title/facts and back/overflow chrome.
     /// Actions and longer copy remain outside it, in the page's existing scrolling column.
-    private func heroBanner(width: CGFloat, height: CGFloat) -> some View {
+    private func heroBanner(width: CGFloat, height: CGFloat) -> AnyView {
         let band = heroBandHeight(width: width, viewport: height)
         let cardWidth = CinemaHeroCardGeometry.innerWidth(viewport: width)
-        return ZStack(alignment: .bottomLeading) {
+        return AnyView(ZStack(alignment: .bottomLeading) {
             backdrop(height: band)
                 // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
                 // shows. Mounted ONLY for VOD with a resolved YouTube id and when motion is allowed; the
@@ -1570,7 +1571,7 @@ struct iOSDetailView: View {
         .frame(width: cardWidth, alignment: .leading)
         .cinemaHeroCard()
         .padding(.horizontal, CinemaHeroCardGeometry.inset)
-        .padding(.top, Theme.Space.xs)
+        .padding(.top, Theme.Space.xs))
     }
 
     private func heroActionOverlap(width: CGFloat, viewport: CGFloat) -> CGFloat {
@@ -1584,8 +1585,8 @@ struct iOSDetailView: View {
     /// The scrollable remainder of the hero: the action row (Watch Now / series actions), the full
     /// synopsis, cast/crew, and language chips. On macOS this scrolls (with the episode/source list) under
     /// the pinned banner; on iOS it is the lower half of the single hero column.
-    private func heroBelow(width: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+    private func heroBelow(width: CGFloat, scrollToSources: @escaping () -> Void) -> AnyView {
+        AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Branch on the SAME authoritative signal the body uses (episodeList vs sourceSection), not the
             // raw hub-guess `type`: a hub tile the hub mis-typed as "movie" that resolves to a series/
             // collection meta would otherwise show movie Play actions contradicting an episodic body (#102).
@@ -1625,7 +1626,7 @@ struct iOSDetailView: View {
         // second `.sheet(item:)` on the SAME view shadows it (see the `presentation` note). heroBelow is the
         // shared host for both the movie (`watchNow`) and series (`seriesHeroActions`) Download chips on iOS
         // AND macOS, so one attachment here covers both entry points on both platforms.
-        .downloadQualityPicker($downloadPicker)
+        .downloadQualityPicker($downloadPicker))
     }
 
     /// The synopsis to render: the engine meta's description, else TMDB's overview (a hub-seeded tt id
@@ -2346,7 +2347,7 @@ struct iOSDetailView: View {
     /// resume episode is partially watched), then the trailer + library chips, the touch/Mac twin
     /// of the tvOS series hero. Tapping it pushes that episode's source list (the same screen an
     /// episode-row tap opens), so the user still picks the source.
-    @ViewBuilder private var seriesHeroActions: some View {
+    private var seriesHeroActions: AnyView {
         let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
         let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
         let primaryResumeSeconds: Double? = primary.flatMap {
@@ -2355,7 +2356,7 @@ struct iOSDetailView: View {
             }
             return $0.isResume ? primaryEpisodeResumeSeconds($0.video) : nil
         }
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+        return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Full-width primary episode CTA on its own line (matches the movie Play button), with the
             // resume stripe just beneath it.
             if let m = meta, let primary {
@@ -2411,7 +2412,7 @@ struct iOSDetailView: View {
                 shareChip
             }
         }
-        .padding(.top, Theme.Space.xs)
+        .padding(.top, Theme.Space.xs))
     }
 
     /// Resume position (the saved episode, if not yet watched) vs the first unwatched episode,
@@ -2720,12 +2721,12 @@ struct iOSDetailView: View {
     /// button (best ranked source), **Quality** and session **Audio** pickers, a one-launch **Player**
     /// picker, a **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
-    @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
+    private func watchNow(scrollToSources: @escaping () -> Void) -> AnyView {
         let groups = rankedMovie().groups
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+        return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // The primary CTA is a big, high-contrast rounded Play button on its own line, the
             // cinematic-media-app hero action, no longer one small chip lost in a wrapping row.
             // Width-capped per platform (heroCtaMaxWidth) so it doesn't span the whole Mac window (#6).
@@ -2826,7 +2827,7 @@ struct iOSDetailView: View {
                     .foregroundStyle(Theme.Palette.textTertiary)
             }
         }
-        .padding(.top, Theme.Space.xs)
+        .padding(.top, Theme.Space.xs))
     }
 
     /// Two-level Quality picker for the hero action row: resolution tier (4K / 1080p / 720p / Others),
@@ -8218,7 +8219,8 @@ struct iOSSourceList: View {
             url: url,
             isTorrent: stream.isTorrent,
             isUsenet: stream.isUsenet,
-            requestHeaders: stream.requestHeaders
+            requestHeaders: stream.requestHeaders,
+            selectedServerURL: StremioServer.isCustom ? URL(string: StremioServer.base) : nil
         ), ExternalPlayer.canRouteExternally(url, isTorrent: stream.isTorrent) {
             ForEach(externalPlayerTargets) { target in
                 Button("Play in \(target.name)") {

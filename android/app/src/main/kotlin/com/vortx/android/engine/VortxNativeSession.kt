@@ -137,7 +137,7 @@ internal interface VortxCheckpointStore {
     val supportsCheckpointAuthority: Boolean get() = false
     /** Full atomic replacement, durable flush and authenticated readback before returning. */
     fun commit(scope: VortxAccountScope, snapshot: String)
-    /** Typed routes require an original encrypted-file CAS; old stores cannot pretend support. */
+    /** Complete-account routes require an original encrypted-file CAS; old stores cannot pretend support. */
     fun captureCheckpoint(scope: VortxAccountScope): NativeCheckpointRead =
         error("Authenticated checkpoint compare/replace unavailable")
     fun requireCurrentCheckpoint(scope: VortxAccountScope, expected: NativeCheckpointRead) {
@@ -269,7 +269,7 @@ internal class VortxEncryptedCheckpointStore(
                                                          snapshot: String): NativeCheckpointRead {
         val current = readSealed(scope)
         check(expected.matches(readIssuer, scope, checkpointGeneration(scope), current)) { "Native checkpoint changed" }
-        // Validation/replay/whole-account budgeting is owned by the same typed Session authority;
+        // Validation/replay/whole-account budgeting is owned by the same Session admission;
         // this storage layer does not turn an interpretation-only JSONObject into its raw source.
         require(snapshot.toByteArray(Charsets.UTF_8).size <= MAX_BYTES - 28)
         retireCheckpointRead(scope)
@@ -400,7 +400,64 @@ internal class VortxNativeSession private constructor(
     private val onProgressMutation: () -> Unit = onMutation,
     private var ownerHistory: NativeOwnerHistorySessionAdapter? = null,
     private val ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
+    initialRawHostState: ByteArray,
 ) : AutoCloseable {
+    /** Captured before decode from the authenticated local checkpoint, or freshly minted when
+     * there was no local host state. This is persistence material, not a new write capability. */
+    private var rawNativeHostPreferenceState = NativeRawHostPreferences.captureLocal(scope, initialRawHostState)
+    /** Cheap read-only observation validity, never account/native/load authority or cached health. */
+    internal class XperienceObservation private constructor() : AutoCloseable {
+        private val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        fun isCurrent(): Boolean = live.get()
+        override fun close() { live.set(false) }
+        companion object { internal fun issued() = XperienceObservation() }
+    }
+    private class XperienceObservedProfile(val fields: Map<String, ByteArray>) {
+        val tokens = ArrayList<java.lang.ref.WeakReference<XperienceObservation>>()
+        fun prune() { tokens.removeAll { it.get()?.isCurrent() != true } }
+        fun close() { tokens.forEach { it.get()?.close() }; fields.values.forEach { it.fill(0) }; tokens.clear() }
+    }
+    private val xperienceObservations = linkedMapOf<String, XperienceObservedProfile>()
+    @Synchronized internal fun captureXperienceObservation(owner: VortxNativeOwner): XperienceObservation = owned(owner) {
+        check(!requiresRecovery())
+        pruneXperienceObservations()
+        val profile = NativeHostPreferences.canonicalProfileID(owner.profileID)
+        val observed = xperienceObservations.getOrPut(profile) {
+            XperienceObservedProfile(NativeXperienceWrite.fields(rawNativeHostPreferenceState, profile))
+        }
+        XperienceObservation.issued().also { observed.tokens += java.lang.ref.WeakReference(it) }
+    }
+    private fun pruneXperienceObservations() {
+        val iterator = xperienceObservations.iterator()
+        while (iterator.hasNext()) {
+            val (_, group) = iterator.next(); group.prune()
+            if (group.tokens.isEmpty()) { group.close(); iterator.remove() }
+        }
+    }
+    private fun retireXperienceObservations() {
+        xperienceObservations.values.forEach { it.close() }; xperienceObservations.clear()
+    }
+    /** Both typed receive and ordinary checkpoint installation use this exact raw path.
+     * One retained raw family per actively observed profile; weak tokens never retain callers.
+     * Compare only active profiles and preserve tokens on byte-equal family/progress updates. */
+    private fun replaceRawHostPreferenceState(next: ByteArray) {
+        pruneXperienceObservations()
+        if (!rawNativeHostPreferenceState.contentEquals(next)) {
+            val iterator = xperienceObservations.iterator()
+            while (iterator.hasNext()) {
+                val (profile, group) = iterator.next()
+                val fields = NativeXperienceWrite.fields(next, profile)
+                try {
+                    if (group.fields.keys != fields.keys || group.fields.any { (key, raw) -> !raw.contentEquals(fields[key]) }) {
+                        group.close(); iterator.remove() // Revoke before replacing raw state; ABA cannot resurrect.
+                    }
+                } finally { fields.values.forEach { it.fill(0) } }
+            }
+        }
+        rawNativeHostPreferenceState.fill(0); rawNativeHostPreferenceState = next
+    }
+    private var rawHostMergeActive = false
+    private var rawHostMerge: ByteArray? = null
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner,
                             val bridges: MutableList<VortxResourceBridge> = mutableListOf(),
                             var completed: List<Pair<String, Long>>? = null) {
@@ -418,6 +475,40 @@ internal class VortxNativeSession private constructor(
     private var acknowledgedCheckpoint: NativeCheckpointRead? = null
     private val changes = MutableStateFlow(0L)
     val updates: StateFlow<Long> get() = changes
+    private val playlistRevisions = MutableStateFlow(0L)
+    // Read-only receipt identity: profile changes, including an ABA, advance this epoch.
+    // Same-profile peer merges may invalidate mutation/resource revisions without replacing it.
+    private var playlistReceiptProfileEpoch = 0L
+    /** Narrow invalidation for exact-target admission/revision loss and playlist projection changes. */
+    internal val playlistUpdates: StateFlow<Long> get() = playlistRevisions
+    /** Emit only after the changed projection or unavailable admission is already observable. */
+    private fun signalPlaylistInvalidation() { playlistRevisions.value += 1 }
+    private fun enterCheckpointUncertainty() {
+        if (checkpointUncertain) return
+        checkpointUncertain = true
+        retireXperienceObservations()
+        signalPlaylistInvalidation()
+    }
+
+    /** Mint read-only receipt identity in the SAME complete-account capture as its mutation target.
+     * No separate generic flag or raw-GET observation can later upgrade an existing receipt to a
+     * write permit. The coordinator still admits its original account/mount before publishing it. */
+    @Synchronized internal fun <T> withPlaylistReceiptCapture(
+        genericReadAvailable: Boolean = false,
+        action: (VortxNativeRead, Long) -> T,
+    ): T {
+        requireCompleteAccountExportRoute(genericReadAvailable)
+        return action(read(), playlistReceiptProfileEpoch)
+    }
+
+    /** A frozen upload may receive a same-profile GET/merge after receipt capture. That retires
+     * mutation revision and raw-read identity, but not this read-only receipt scope. Never consult
+     * the old GET or prospective-write permit here, and never mint a replacement owner. */
+    @Synchronized internal fun <T> withPlaylistReceiptEpoch(owner: VortxNativeOwner, epoch: Long, action: () -> T): T {
+        check(!closed && !requiresRecovery() && isAccountCurrent()) { "Playlist receipt session unavailable" }
+        check(owner.scope == scope && epoch == playlistReceiptProfileEpoch) { "Playlist receipt owner changed" }
+        return action()
+    }
 
     private fun validatePresentation(snapshot: String): JSONObject = if (runtime.isTyped)
         scope.validateOwnerHistoryPresentation(snapshot) else scope.validateSnapshot(snapshot)
@@ -435,12 +526,18 @@ internal class VortxNativeSession private constructor(
                  onProgressMutation: () -> Unit = onMutation,
                  ownerHistoryBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
                  ownerHistoryAuthority: NativeOwnerHistoryAuthority? = null,
+                 initialRawHostPreferences: ByteArray? = null,
                  isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
             scope.rejectCredentials(initialHostProfiles)
             scope.rejectCredentials(initialHostArchive)
             bootstrapActions.forEach(scope::rejectCredentials)
             val stored = store.readRetained(scope)
+            // Capture the encrypted plaintext slice BEFORE JSONObject/hydration normalization.
+            val storedRawHost = stored?.takeUnless(NativeOwnerHistorySessionAdapter::isEnvelope)?.let {
+                OHJson.Obj(it.toByteArray(Charsets.UTF_8))["nativeHostPreferenceState"]
+            }
+            NativeRawHostPreferences.requireIncomingObservation(scope, initialHostPreferences, initialRawHostPreferences)
             if (stored != null && NativeOwnerHistorySessionAdapter.isEnvelope(stored)) {
                 require(bootstrapActions.isEmpty()) { "Typed peer changes require the raw account route" }
                 val original = store.captureCheckpoint(scope)
@@ -503,6 +600,8 @@ internal class VortxNativeSession private constructor(
                 hostState = NativeHostPreferences.seedWatchlists(scope, hostState, initialLegacyWatchlists.filterKeys {
                     liveRoster.optJSONObject(it)?.optBoolean("deleted") == false
                 })
+                val rawHostState = NativeRawHostPreferences.reconcile(scope, storedRawHost, hostState,
+                    initialHostPreferences, initialRawHostPreferences)
                 hostProfiles = NativeHostPreferences.projectProfiles(hostState, hostProfiles,
                     JSONObject(runtime.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(hostProfiles)
@@ -527,12 +626,13 @@ internal class VortxNativeSession private constructor(
                 NativeWebsiteProfileEdits.validateRetained(scope, pendingWebsiteEdits, websiteCertificates)
                 val pendingAddonEdits = old?.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending()
                 NativeWebsiteAddonEdits.validatePending(scope, pendingAddonEdits)
-                val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
+                val snapshotProjection = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
                     .put("nativeHostPreferenceState", hostState)
                     .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
                     .put("legacyWebsiteBootstrap", legacyBootstrap)
                     .put("websiteProfileEditPending", pendingWebsiteEdits).put("websiteProfileEditCertificates", websiteCertificates)
                     .put("websiteAddonEditPending", pendingAddonEdits).toString()
+                val snapshot = NativeRawHostPreferences.snapshot(snapshotProjection, rawHostState)
                 scope.validateSnapshot(snapshot)
                 verifyCandidate?.invoke(runtime)
                 store.commit(scope, snapshot)
@@ -542,7 +642,8 @@ internal class VortxNativeSession private constructor(
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) },
                     legacyBootstrap?.let { JSONObject(it.toString()) },
                     JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), NativeWebsiteAddonEdits.detached(pendingAddonEdits), onMutation, beforeOwnerChange,
-                    onProgressMutation = onProgressMutation, ownerHistoryAuthority = ownerHistoryAuthority)
+                    onProgressMutation = onProgressMutation, ownerHistoryAuthority = ownerHistoryAuthority,
+                    initialRawHostState = rawHostState)
                     .also {
                         it.heldLegacyReconciliation = heldBootstrapReason
                         if (store.supportsCheckpointAuthority) {
@@ -583,7 +684,8 @@ internal class VortxNativeSession private constructor(
                     state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
                     state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
                     state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
-                    onMutation, beforeOwnerChange, onProgressMutation, adapter, authority)
+                    onMutation, beforeOwnerChange, onProgressMutation, adapter, authority,
+                    initialRawHostState = checkpoint.hostPreferences)
                 session.read() // Real typed-source validation preceded this presentation admission.
                 return session
             } catch (failure: Throwable) { adapter.close(); throw failure }
@@ -605,17 +707,22 @@ internal class VortxNativeSession private constructor(
             val runtime = VortxNativeRuntime.hydrate(bindings, core.toString())
             try {
                 store.requireCurrentCheckpoint(scope, original)
+                val host = NativeHostPreferences.local(scope, state.optJSONObject("nativeHostPreferenceState"))
+                // Absence mints a new local actor; a present original slice is always retained.
+                val rawHost = OHJson.Obj(raw.toByteArray(Charsets.UTF_8))["nativeHostPreferenceState"]
+                    ?: host.toString().toByteArray(Charsets.UTF_8)
                 val archive = state.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", state.getJSONArray("excludedCredentialPaths"))
                 }
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent,
                     state.optJSONObject("hostProfilePreferences") ?: JSONObject(), state.optBoolean("hostProfileSyncPending"),
-                    NativeHostPreferences.local(scope, state.optJSONObject("nativeHostPreferenceState")), state.optJSONObject("legacyImportMaterial"),
+                    host, state.optJSONObject("legacyImportMaterial"),
                     archive, state.optJSONObject("legacyWebsiteBootstrap"),
                     state.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray()),
                     state.optJSONObject("websiteProfileEditCertificates") ?: JSONObject(),
                     state.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(),
-                    onMutation, beforeOwnerChange, onProgressMutation, ownerHistoryAuthority = authority)
+                    onMutation, beforeOwnerChange, onProgressMutation, ownerHistoryAuthority = authority,
+                    initialRawHostState = rawHost)
                     .also { it.acknowledgedCheckpoint = original }
             } catch (failure: Throwable) { runtime.close(); throw failure }
         }
@@ -638,7 +745,269 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun requiresRecovery(): Boolean = checkpointUncertain || ownerHistory?.requiresRecovery() == true
     @Synchronized fun hasOwnerHistory(): Boolean = ownerHistory != null
     @Synchronized fun rawAccount(): ByteArray? = ownerHistory?.cloudAccount()
+    /** Detached readonly raw observation. Never accepts an owner or grants mutation authority. */
+    @Synchronized internal fun rawHostPreferences(): ByteArray {
+        check(!closed && !requiresRecovery() && isAccountCurrent())
+        return NativeRawHostPreferences.document(rawNativeHostPreferenceState)
+    }
+
+    /** The coordinator provides the authenticated source slice under its EXISTING account,
+     * Session and mount admission. This synchronous scope carries provenance only; dispatch still
+     * performs all original authority/fork/checkpoint checks. No source is recaptured on resume. */
+    @Synchronized internal fun <T> withRawHostMerge(raw: ByteArray?, action: () -> T): T {
+        check(!rawHostMergeActive) { "Nested raw host observation" }
+        rawHostMergeActive = true; rawHostMerge = raw?.copyOf()
+        return try { action() } finally {
+            rawHostMerge?.fill(0); rawHostMerge = null; rawHostMergeActive = false
+        }
+    }
     @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !requiresRecovery() && isAccountCurrent() && read().owner == owner
+
+    private fun requireCompleteAccountExportRoute(genericReadAvailable: Boolean = false) {
+        check(!closed && !requiresRecovery() && isAccountCurrent() &&
+            (runtime.isTyped || (genericReadAvailable && store.supportsCheckpointAuthority && acknowledgedCheckpoint != null))) {
+            "Complete account export budget unavailable"
+        }
+    }
+    @Synchronized internal fun captureGenericPlaylistCheckpoint(owner: VortxNativeOwner): NativeCheckpointRead? = owned(owner) {
+        if (runtime.isTyped) null else checkNotNull(acknowledgedCheckpoint).also {
+            check(store.supportsCheckpointAuthority)
+            store.requireCurrentCheckpoint(scope, it)
+        }
+    }
+
+    /** Logical projection only, never raw persistence provenance or a catalog/fetch permit. Capture
+     * the original profile/registry/binding and inherited addon preferences before suspension. */
+    internal fun xperienceContext(read: VortxNativeRead): String {
+        val host = read.state.getJSONObject("hostProfilePreferences")
+        val preferences = JSONObject()
+        setOf(read.owner.profileID, scope.ownerProfileID).forEach { id ->
+            preferences.put(id, host.optJSONObject(id)?.optJSONObject("addonPreferences") ?: JSONObject.NULL)
+        }
+        return JSONObject().put("roster", read.state.getJSONObject("roster"))
+            .put("addons", read.state.getJSONObject("nativeSync").getJSONObject("addons"))
+            .put("bindings", bindingSelections(read.state)).put("preferences", preferences).toString()
+    }
+    @Synchronized internal fun xperienceFields(owner: VortxNativeOwner): Map<String, ByteArray> = owned(owner) {
+        NativeXperienceWrite.fields(rawNativeHostPreferenceState, owner.profileID)
+    }
+
+    /** Retains actual original runtime/checkpoint identity, not a decoded account surrogate. */
+    internal class XperienceOperation private constructor(
+        internal val session: VortxNativeSession,
+        internal val owner: VortxNativeOwner,
+        internal val runtime: VortxNativeRuntime,
+        internal val checkpoint: NativeCheckpointRead?,
+        internal val typedCheckpoint: NativeOwnerHistoryCoordinator.Checkpoint?,
+        internal val context: String,
+        internal val change: NativeXperienceWrite.Change,
+        raw: ByteArray,
+    ) : AutoCloseable {
+        private var raw: ByteArray? = raw.copyOf()
+        internal fun matches(value: ByteArray) = raw?.contentEquals(value) == true
+        override fun close() { raw?.fill(0); raw = null }
+        companion object {
+            internal fun capture(session: VortxNativeSession, owner: VortxNativeOwner, runtime: VortxNativeRuntime,
+                checkpoint: NativeCheckpointRead?, typed: NativeOwnerHistoryCoordinator.Checkpoint?,
+                context: String, change: NativeXperienceWrite.Change, raw: ByteArray) =
+                XperienceOperation(session, owner, runtime, checkpoint, typed, context, change, raw)
+        }
+    }
+    @Synchronized internal fun captureXperienceOperation(owner: VortxNativeOwner, context: String,
+        change: NativeXperienceWrite.Change, genericReadAvailable: Boolean): XperienceOperation =
+        withCompleteAccountExportOwner(owner, genericReadAvailable) { read ->
+            check(xperienceContext(read) == context) { "Original Xperience context changed" }
+            NativeXperienceWrite.requireClocks(rawNativeHostPreferenceState)
+            change.admit(NativeXperienceWrite.register(rawNativeHostPreferenceState, owner.profileID, change.field))
+            val checkpoint = captureGenericPlaylistCheckpoint(owner)
+            val typed = ownerHistory?.checkpoint()
+            check((typed != null) == runtime.isTyped) { "Original typed checkpoint unavailable" }
+            XperienceOperation.capture(this, owner, runtime, checkpoint, typed, context, change, rawNativeHostPreferenceState)
+        }
+    private fun requireXperienceOperation(operation: XperienceOperation) {
+        check(operation.session === this && operation.runtime === runtime && accepts(operation.owner) &&
+            operation.matches(rawNativeHostPreferenceState) &&
+            xperienceContext(read()) == operation.context) { "Original Xperience operation changed" }
+        if (operation.typedCheckpoint != null) check(ownerHistory?.checkpoint() === operation.typedCheckpoint) {
+            "Original typed Xperience checkpoint changed"
+        } else {
+            check(operation.checkpoint != null && acknowledgedCheckpoint === operation.checkpoint)
+            store.requireCurrentCheckpoint(scope, operation.checkpoint)
+        }
+        operation.change.admit(NativeXperienceWrite.register(rawNativeHostPreferenceState,
+            operation.owner.profileID, operation.change.field))
+    }
+    /** An actual coordinator checkpoint read rechecks original authority and encrypted-file
+     * identity. A pre-persistence typed preview refusal may keep the unchanged parent usable;
+     * accepted/started uncertainty, a changed file or revoked authority cannot pass this proof. */
+    private fun typedCheckpointStillCurrent(expected: NativeOwnerHistoryCoordinator.Checkpoint?): Boolean =
+        expected != null && ownerHistory?.requiresRecovery() == false &&
+            runCatching { ownerHistory?.checkpoint() === expected }.getOrDefault(false)
+
+    private val xperiencePreviewIssuer = Any()
+    /** Opaque full-host provenance, NOT account authority. A caller-created instance lacks the
+     * Session's private issuer. The genuine instance expires with its synchronous preview scope. */
+    internal class XperienceHostPreview internal constructor(
+        private val issuer: Any,
+        internal val operation: XperienceOperation,
+        host: ByteArray,
+    ) : AutoCloseable {
+        private val thread = Thread.currentThread()
+        private var host: ByteArray? = host.copyOf()
+        internal fun issuedBy(value: Any) = issuer === value
+        internal fun <T> copyFor(action: (ByteArray) -> T): T {
+            check(Thread.currentThread() === thread) { "Xperience preview crossed threads" }
+            val copy = checkNotNull(host) { "Xperience preview expired" }.copyOf()
+            return try { action(copy) } finally { copy.fill(0) }
+        }
+        fun <T> withRawHost(scope: VortxAccountScope, action: (ByteArray) -> T): T =
+            operation.session.withXperiencePreview(this, scope, action)
+        override fun close() { host?.fill(0); host = null }
+    }
+    @Synchronized private fun <T> withXperiencePreview(preview: XperienceHostPreview,
+        expectedScope: VortxAccountScope, action: (ByteArray) -> T): T {
+        check(preview.issuedBy(xperiencePreviewIssuer) && expectedScope == scope) { "Unattested Xperience host preview" }
+        requireXperienceOperation(preview.operation)
+        return preview.copyFor { host ->
+            NativeHostPreferences.validate(scope, JSONObject(OHJson.utf8(host)))
+            NativeXperienceWrite.maximumClock(host)
+            val local = OHJson.Obj().set("document", host).encoded()
+            preview.operation.change.requireReplacement(checkNotNull(NativeXperienceWrite.register(local,
+                preview.operation.owner.profileID, preview.operation.change.field)))
+            action(host)
+        }
+    }
+
+    @Synchronized internal fun dispatchXperience(
+        operation: XperienceOperation,
+        prospectiveGlobalChanges: JSONObject,
+        genericAdmission: (ByteArray, XperienceHostPreview, () -> Unit) -> Unit,
+        typedAdmission: (ByteArray, ByteArray, () -> Unit) -> Unit,
+        beforeCommit: () -> Unit,
+    ): ByteArray {
+        requireXperienceOperation(operation)
+        val replacement = NativeXperienceWrite.replace(scope, operation.owner.profileID,
+            rawNativeHostPreferenceState, operation.change)
+        dispatchInternal(emptyList(), operation.owner, null, true, null, null, null, null, null, null,
+            beforeCommit, null, emptyMap(), false, true, null, operation.checkpoint,
+            prospectiveGlobalChanges, operation, replacement, typedAdmission, genericAdmission)
+        val accepted = NativeXperienceWrite.register(rawNativeHostPreferenceState, operation.owner.profileID,
+            operation.change.field)
+        if (accepted == null || !accepted.contentEquals(replacement.register())) {
+            enterCheckpointUncertainty()
+            error("Xperience raw register readback failed")
+        }
+        return accepted
+    }
+
+    private val rawHostExportIssuer = Any()
+    /** Fresh post-GET checkpoint provenance. It is unrelated to any old in-memory edit object.
+     * The coordinator supplies the retained authenticated source under its original admission;
+     * arbitrary raw host data cannot construct the Session's private issuer. */
+    internal class RawHostExport internal constructor(
+        private val issuer: Any,
+        internal val session: VortxNativeSession,
+        internal val owner: VortxNativeOwner,
+        internal val runtime: VortxNativeRuntime,
+        internal val checkpoint: NativeCheckpointRead,
+        internal val context: String,
+        internal val sourceCurrent: () -> Boolean,
+        local: ByteArray, source: ByteArray, projection: ByteArray, native: ByteArray,
+    ) : AutoCloseable {
+        private val thread = Thread.currentThread()
+        private var active = true; private var consumed = false
+        private val local = local.copyOf(); private val source = source.copyOf()
+        private val projection = projection.copyOf(); private val native = native.copyOf()
+        internal fun issuedBy(value: Any) = issuer === value
+        internal fun matchesLocal(value: ByteArray) = local.contentEquals(value)
+        fun composeHost(scope: VortxAccountScope, source: ByteArray, projection: ByteArray,
+            action: (ByteArray, ByteArray) -> ByteArray): ByteArray = session.withRawHostExportCurrent(this, scope) {
+            check(active && !consumed && Thread.currentThread() === thread) { "Raw host export expired, repeated or changed thread" }
+            check(this.source.contentEquals(source) && this.projection.contentEquals(projection)) { "Original raw host export source changed" }
+            consumed = true
+            val host = NativeRawHostPreferences.document(local); val native = native.copyOf()
+            try {
+                val result = action(native, host)
+                try { session.requireRawHostExport(this); result }
+                catch (failure: Throwable) { result.fill(0); throw failure }
+            } finally { host.fill(0); native.fill(0) }
+        }
+        internal fun requireActive() { check(active && Thread.currentThread() === thread) { "Raw host export expired or changed thread" } }
+        override fun close() { active = false; local.fill(0); source.fill(0); projection.fill(0); native.fill(0) }
+    }
+    @Synchronized internal fun <T> withRawHostExport(owner: VortxNativeOwner, source: ByteArray,
+        projection: ByteArray, sourceCurrent: () -> Boolean, action: (RawHostExport) -> T): T =
+        withCompleteAccountExportOwner(owner, true) { read ->
+            check(!runtime.isTyped && sourceCurrent()) { "Generic raw host export unavailable" }
+            NativeXperienceWrite.requireClocks(rawNativeHostPreferenceState)
+            val checkpoint = checkNotNull(captureGenericPlaylistCheckpoint(owner))
+            val native = read.state.getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+            val snapshot = RawHostExport(rawHostExportIssuer, this, owner, runtime, checkpoint,
+                xperienceContext(read), sourceCurrent, rawNativeHostPreferenceState, source, projection, native)
+            native.fill(0)
+            try { action(snapshot) } finally { snapshot.close() }
+        }
+    private fun requireRawHostExport(snapshot: RawHostExport) {
+        snapshot.requireActive()
+        check(snapshot.issuedBy(rawHostExportIssuer) && snapshot.session === this && snapshot.runtime === runtime &&
+            accepts(snapshot.owner) && snapshot.matchesLocal(rawNativeHostPreferenceState) &&
+            acknowledgedCheckpoint === snapshot.checkpoint && xperienceContext(read()) == snapshot.context &&
+            snapshot.sourceCurrent()) { "Original raw host export changed" }
+        store.requireCurrentCheckpoint(scope, snapshot.checkpoint)
+    }
+    @Synchronized private fun <T> withRawHostExportCurrent(snapshot: RawHostExport,
+        expectedScope: VortxAccountScope, action: () -> T): T {
+        check(scope == expectedScope) { "Raw host export scope changed" }
+        requireRawHostExport(snapshot)
+        return action()
+    }
+
+    /** The PUT candidate may outlive a newer local checkpoint. Only its exact sent raw carrier
+     * can clear pending; newer events remain pending. This acknowledgement uses today's original
+     * file CAS while the caller holds the ORIGINAL upload account/mount/accepted receipt fence. */
+    @Synchronized internal fun acknowledgeRawHostDocument(sent: ByteArray, isCurrent: () -> Boolean): Boolean {
+        check(isCurrent() && !requiresRecovery()) { "Raw host acknowledgement retired" }
+        val current = NativeRawHostPreferences.document(rawNativeHostPreferenceState)
+        val matches = try { OHJson.equal(current, sent) } finally { current.fill(0) }
+        if (!matches) return true
+        val owner = read().owner
+        val checkpoint = try { checkNotNull(captureGenericPlaylistCheckpoint(owner)) }
+        catch (failure: Throwable) { enterCheckpointUncertainty(); throw failure }
+        dispatchInternal(emptyList(), owner, null, false, null, null, null, JSONObject(OHJson.utf8(sent)),
+            null, null, { check(isCurrent()) { "Raw host acknowledgement retired" } }, null, emptyMap(), false, false,
+            checkpointCASOnly = checkpoint)
+        return isCurrent()
+    }
+
+    /** Scalar-only exact captured-owner gate. Revision is advanced for profile/route invalidation. */
+    @Synchronized internal fun <T> withCompleteAccountExportOwnerScalar(owner: VortxNativeOwner, action: () -> T): T {
+        requireCompleteAccountExportRoute()
+        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
+        return action()
+    }
+
+    /**
+     * Captures one full presentation only after the scalar route/account checks pass. A generic JNI
+     * runtime additionally requires the coordinator's retained raw-read producer and store CAS.
+     * The owner overload additionally rejects a
+     * stale Session revision/scope before that one remaining presentation read; it does not claim
+     * that current-owner publication is O(1).
+     */
+    @Synchronized internal fun <T> withCompleteAccountExportRead(genericReadAvailable: Boolean = false, action: (VortxNativeRead) -> T): T {
+        requireCompleteAccountExportRoute(genericReadAvailable)
+        return action(read())
+    }
+    @Synchronized internal fun <T> withCompleteAccountExportOwner(
+        owner: VortxNativeOwner,
+        genericReadAvailable: Boolean = false,
+        action: (VortxNativeRead) -> T,
+    ): T {
+        requireCompleteAccountExportRoute(genericReadAvailable)
+        check(owner.scope == scope && owner.revision == revision) { "Native owner changed" }
+        val read = read()
+        check(read.owner == owner) { "Native owner changed" }
+        return action(read)
+    }
 
     /** One current owner/state capture, kept under Session through the caller's admission.
      * Unlike read followed by owned, no monitor-release window needs a second full snapshot. */
@@ -655,6 +1024,7 @@ internal class VortxNativeSession private constructor(
         val oldRuntime = runtime
         val originalPlaybackState = originalPlaybackRead.state
         var changesPlaybackOwner = false
+        var changesReceiptProfile = false
         var next = ownerHistory
         var newOwner = false
         if (next == null) {
@@ -671,13 +1041,13 @@ internal class VortxNativeSession private constructor(
             val carrier = requireNotNull(account.raw(NativeOwnerHistoryAccount.ARCHIVE))
             val ownerUID = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
             val checkpoint = NativeOwnerHistoryCoordinator.Checkpoint(scope, retained.toByteArray(Charsets.UTF_8),
-                nativeHostPreferenceState.toString().toByteArray(Charsets.UTF_8), NativeOwnerHistorySources.empty(scope).local(),
+                rawNativeHostPreferenceState, NativeOwnerHistorySources.empty(scope).local(),
                 account.encoded(), ownerUID)
             next = try { NativeOwnerHistorySessionAdapter.open(scope, checkpoint, original, historyBindings, store,
                 requireNotNull(ownerHistoryAuthority) { "Original mounted account authority unavailable" }, authority) }
             catch (failure: NativeOwnerHistoryCoordinator.Uncertain) {
                 com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-                checkpointUncertain = true; unconfirmedHistoryRetirement = true
+                enterCheckpointUncertainty(); unconfirmedHistoryRetirement = true
                 slots.values.forEach { it.close() }; slots.clear()
                 throw failure
             }
@@ -686,18 +1056,22 @@ internal class VortxNativeSession private constructor(
         val adapter = requireNotNull(next)
         try {
             val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope, nativeHostPreferenceState), remoteHost)
+            val rawHost = NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, host,
+                remoteHost, account.raw("nativeHostPreferences"))
             var projected: JSONObject? = null
-            adapter.receive(account, authority, host.toString().toByteArray(Charsets.UTF_8), local = { bytes ->
+            adapter.receive(account, authority, rawHost, local = { bytes ->
                 val state = JSONObject(OHJson.utf8(bytes))
+                changesReceiptProfile = state.getString("activeProfileId") != originalPlaybackState.getString("activeProfileId")
                 val profiles = NativeHostPreferences.projectProfiles(host, hostProfilePreferences,
                     state.getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(profiles)
                 changesPlaybackOwner = nativePlaybackOwnerChanged(originalPlaybackState, state)
                 projected = profiles
-                state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
+                val projection = state.put("hostProfilePreferences", profiles).put("hostProfileSyncPending", hostProfileSyncPending)
                     .put("nativeHostPreferenceState", host)
                     .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
-                    .put("websiteAddonEditPending", websiteAddonEditPending).toString().toByteArray(Charsets.UTF_8)
+                    .put("websiteAddonEditPending", websiteAddonEditPending).toString()
+                NativeRawHostPreferences.snapshot(projection, rawHost).toByteArray(Charsets.UTF_8)
             }, beforePersist = {
                 // This Session monitor excludes new authenticated owner captures until receive
                 // and its visible projection complete. Revoke BEFORE native/checkpoint acceptance.
@@ -705,18 +1079,23 @@ internal class VortxNativeSession private constructor(
                 // The generic engine is retired before typed persistence/native acceptance. No
                 // second live writer can later overwrite the transferred checkpoint.
                 if (newOwner) {
+                    retireXperienceObservations()
                     try { oldRuntime.close() }
-                    catch (failure: Throwable) { checkpointUncertain = true; throw failure }
+                    catch (failure: Throwable) { enterCheckpointUncertainty(); throw failure }
                 }
             })
             if (newOwner) { runtime = adapter.view(); ownerHistory = adapter }
+            if (changesReceiptProfile) { playlistReceiptProfileEpoch += 1; retireXperienceObservations() }
             hostProfilePreferences = requireNotNull(projected)
             nativeHostPreferenceState = host
+            replaceRawHostPreferenceState(rawHost.copyOf())
             invalidate(); changes.value += 1
         } catch (failure: Throwable) {
-            if (newOwner || adapter.requiresRecovery()) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+            if (newOwner || adapter.requiresRecovery()) {
+                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                enterCheckpointUncertainty()
+            }
             if (newOwner) {
-                checkpointUncertain = true
                 // Retain the reservation even if native retirement is uncertain.
                 ownerHistory = adapter
                 runCatching { adapter.close() }
@@ -800,12 +1179,21 @@ internal class VortxNativeSession private constructor(
             commitCheckpoint(updated, candidate, playbackState = playbackState)
             check(isAccountCurrent()) { "Native account changed" }
             val profileChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
+            val playlistProfileChanged = profileChanged ||
+                preferences.toString() != hostProfilePreferences.toString() ||
+                state.getString("activeProfileId") != owner.profileID
+            if (state.getString("activeProfileId") != owner.profileID) {
+                playlistReceiptProfileEpoch += 1; retireXperienceObservations()
+            }
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             nativeHostPreferenceState = applied.host
             websiteProfileEditPending = pending
             websiteProfileEditCertificates = applied.certificates
-            if (profileChanged || state.getString("activeProfileId") != owner.profileID) invalidate()
+            if (playlistProfileChanged) {
+                if (profileChanged || state.getString("activeProfileId") != owner.profileID) invalidate()
+                else signalPlaylistInvalidation()
+            }
             changes.value += 1
             true
         } finally { if (!installed) candidate.close() }
@@ -911,15 +1299,83 @@ internal class VortxNativeSession private constructor(
                               verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
                               beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
                               legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
-                              progressOnly: Boolean = false): List<String> = owned(owner) {
+                              progressOnly: Boolean = false): List<String> = dispatchInternal(
+        actions, owner, hostProfiles, notifyMutation, hostArchive, remoteHostPreferences, globalChanges,
+        acknowledgeHostPreferences, baselineHostProfiles, verifyCandidate, beforeCommit,
+        profileFieldChanges, legacyWatchlists, progressOnly, requireCompleteAccountExportBudget = false)
+
+    /**
+     * Dedicated playlist route. Its JVM/API surface cannot opt out of the complete-account gate,
+     * while the longstanding [dispatch] signature and generated default-call ABI remain unchanged.
+     */
+    @Synchronized internal fun dispatchBudgetedPlaylist(
+        owner: VortxNativeOwner,
+        profileFieldChanges: JSONObject,
+        beforeCommit: () -> Unit,
+        prospectiveGlobalChanges: JSONObject? = null,
+        genericAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
+        genericCheckpoint: NativeCheckpointRead? = null,
+    ): List<String> {
+        check(profileFieldChanges.length() == 1 &&
+            profileFieldChanges.keys().asSequence().all { it.startsWith(NativePlaylist.PREFIX) }) {
+            "Budgeted playlist dispatch accepts one playlist profile field"
+        }
+        return dispatchInternal(emptyList(), owner, null, true, null, null, null, null, null, null,
+            beforeCommit, profileFieldChanges, emptyMap(), false,
+            requireCompleteAccountExportBudget = true, genericAdmission = genericAdmission,
+            genericCheckpoint = genericCheckpoint, prospectiveGlobalChanges = prospectiveGlobalChanges)
+    }
+
+    private fun dispatchInternal(
+        actions: List<JSONObject>,
+        owner: VortxNativeOwner,
+        hostProfiles: JSONObject?,
+        notifyMutation: Boolean,
+        hostArchive: JSONObject?,
+        remoteHostPreferences: JSONObject?,
+        globalChanges: JSONObject?,
+        acknowledgeHostPreferences: JSONObject?,
+        baselineHostProfiles: JSONObject?,
+        verifyCandidate: ((VortxNativeRuntime) -> Unit)?,
+        beforeCommit: () -> Unit,
+        profileFieldChanges: JSONObject?,
+        legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>>,
+        progressOnly: Boolean,
+        requireCompleteAccountExportBudget: Boolean,
+        genericAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
+        genericCheckpoint: NativeCheckpointRead? = null,
+        prospectiveGlobalChanges: JSONObject? = null,
+        xperienceOperation: XperienceOperation? = null,
+        xperienceReplacement: NativeXperienceWrite.Replacement? = null,
+        typedAdmission: ((ByteArray, ByteArray, () -> Unit) -> Unit)? = null,
+        xperienceAdmission: ((ByteArray, XperienceHostPreview, () -> Unit) -> Unit)? = null,
+        checkpointCASOnly: NativeCheckpointRead? = null,
+    ): List<String> = owned(owner) {
+        // This check precedes fork, host Lamport minting and every durable side effect. The later
+        // commit flag prevents a future refactor from falling back to the generic local store.
+        check(!requireCompleteAccountExportBudget || runtime.isTyped ||
+            ((genericAdmission != null || xperienceAdmission != null) && store.supportsCheckpointAuthority)) {
+            "Complete account export budget unavailable"
+        }
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
         val originalRuntime = runtime
         val originalRevision = revision
+        val originalCheckpoint = if (!runtime.isTyped && (requireCompleteAccountExportBudget || checkpointCASOnly != null))
+            checkNotNull(genericCheckpoint ?: checkpointCASOnly).also {
+                check(acknowledgedCheckpoint === it) { "Original playlist checkpoint changed" }
+                store.requireCurrentCheckpoint(scope, it)
+            } else null
         val before = originalRuntime.stateJson()
+        if (xperienceOperation != null) {
+            requireXperienceOperation(xperienceOperation)
+            check(requireCompleteAccountExportBudget && xperienceReplacement != null && typedAdmission != null &&
+                xperienceAdmission != null && profileFieldChanges == null && actions.isEmpty())
+        }
         val candidate = originalRuntime.fork()
         var installed = false
+        var xperienceCheckpointStarted = false
         try {
             var heldAction: JSONObject? = null
             var heldReason: String? = null
@@ -950,27 +1406,77 @@ internal class VortxNativeSession private constructor(
             if (globalChanges != null) hostState = NativeHostPreferences.recordGlobals(scope, hostState, globalChanges)
             if (acknowledgeHostPreferences != null && NativeHostPreferences.equal(hostState.getJSONObject("document"), acknowledgeHostPreferences))
                 hostState.put("pending", false)
-            preferences = NativeHostPreferences.projectProfiles(hostState, preferences,
+            val rawHostState = if (xperienceReplacement != null) xperienceReplacement.local().also {
+                hostState = NativeHostPreferences.local(scope, JSONObject(OHJson.utf8(it)))
+            } else NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, hostState,
+                remoteHostPreferences, if (remoteHostPreferences != null) rawHostMerge else null)
+            if (xperienceOperation == null) preferences = NativeHostPreferences.projectProfiles(hostState, preferences,
                 JSONObject(candidate.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
             NativeHostPreferences.validateProjectedProfiles(preferences)
             val retained = legacyImportMaterial ?: actions.firstOrNull { it !== heldAction && it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
             val archive = hostArchive ?: hostDocumentArchive
-            val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
+            val updatedProjection = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("nativeHostPreferenceState", hostState)
                 .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
                 .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates)
                 .put("websiteAddonEditPending", websiteAddonEditPending).toString()
+            val updated = NativeRawHostPreferences.snapshot(updatedProjection, rawHostState)
             val state = validatePresentation(updated)
             val prior = JSONObject(before)
             val playbackState = PlaybackCheckpointState(originalRuntime, originalRevision, candidate, updated, prior, state)
-            beforeCommit()
-            commitCheckpoint(updated, candidate, hostArchive, playbackState)
+            val needsPreview = (originalCheckpoint != null && requireCompleteAccountExportBudget) || xperienceOperation != null
+            val prospectiveRawHost = if (needsPreview) NativeRawHostPreferences.reconcile(scope, rawHostState,
+                prospectiveGlobalChanges?.let { NativeHostPreferences.recordGlobals(scope, hostState, it) } ?: hostState) else null
+            val prospectiveHost = prospectiveRawHost?.let(NativeRawHostPreferences::document)
+            val xperiencePreview = if (xperienceOperation != null)
+                XperienceHostPreview(xperiencePreviewIssuer, xperienceOperation, checkNotNull(prospectiveHost)) else null
+            val replace = {
+                beforeCommit()
+                xperienceOperation?.let(::requireXperienceOperation)
+                check(runtime === originalRuntime && revision == originalRevision &&
+                    (originalCheckpoint == null || acknowledgedCheckpoint === originalCheckpoint)) {
+                    "Original native checkpoint authority changed"
+                }
+                if (xperienceOperation != null && !candidate.isTyped) xperienceCheckpointStarted = true
+                commitCheckpoint(updated, candidate, hostArchive, playbackState,
+                    requireCompleteAccountExportBudget = requireCompleteAccountExportBudget,
+                    genericOriginalCheckpoint = originalCheckpoint,
+                    preparedOriginalCheckpoint = xperienceOperation?.typedCheckpoint,
+                    preparedAccountAdmission = if (xperienceOperation != null && candidate.isTyped)
+                        NativePreparedAccountAdmission { account, persist ->
+                            NativeXperienceWrite.admitOnce({ once ->
+                                checkNotNull(typedAdmission).invoke(account, checkNotNull(prospectiveHost), once)
+                            }) {
+                                beforeCommit()
+                                requireXperienceOperation(xperienceOperation)
+                                persist()
+                            }
+                        } else null)
+            }
+            try { if (originalCheckpoint != null && requireCompleteAccountExportBudget) {
+                val native = state.getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+                // Include every captured pending global value in the complete cloud candidate,
+                // but persist only the requested playlist field. This budget preview neither
+                // acknowledges dirty stamps nor chooses a new durable global conflict winner.
+                try {
+                    if (xperienceOperation != null) NativeXperienceWrite.admitOnce({ once ->
+                        checkNotNull(xperienceAdmission).invoke(native, checkNotNull(xperiencePreview), once)
+                    }, replace)
+                    else checkNotNull(genericAdmission).invoke(native, checkNotNull(prospectiveHost), replace)
+                } finally { native.fill(0) }
+            } else replace() } finally { xperiencePreview?.close(); prospectiveHost?.fill(0); prospectiveRawHost?.fill(0) }
             check(isAccountCurrent()) { "Native account changed" }
-            val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
+            val rosterChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
+            val profileOrRegistryChanged = rosterChanged ||
                 prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString() ||
                 !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
+            val activeProfileChanged = state.getString("activeProfileId") != owner.profileID
+            if (activeProfileChanged) { playlistReceiptProfileEpoch += 1; retireXperienceObservations() }
+            val playlistProfileChanged = rosterChanged || hostChanged || activeProfileChanged
+            val playlistFieldChanged = profileFieldChanges?.keys()?.asSequence()
+                ?.any { it.startsWith(NativePlaylist.PREFIX) } == true
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
             hostProfileSyncPending = pendingPreferences
@@ -979,12 +1485,26 @@ internal class VortxNativeSession private constructor(
             if (actions.any(NativeLegacyReconciliationPolicy::holdable)) heldLegacyReconciliation = heldReason
             hostDocumentArchive = archive?.let { JSONObject(it.toString()) }
             // Any profile/registry mutation invalidates in-flight resources. Progress does not.
-            if (hostChanged || profileOrRegistryChanged || state.getString("activeProfileId") != owner.profileID || actions.any {
+            val ownerInvalidated = hostChanged || profileOrRegistryChanged || activeProfileChanged || actions.any {
                     it.getString("type") in setOf("patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
-                }) invalidate()
+                }
+            if (ownerInvalidated) invalidate()
+            // Full host merges are infrequent account-sync boundaries. Signal them without a
+            // per-frame/per-resource full-family comparison; local playlist writes and profile
+            // ownership changes signal only after the checkpoint and in-memory swap succeeded.
+            if (!ownerInvalidated && (remoteHostPreferences != null || playlistFieldChanged || playlistProfileChanged))
+                signalPlaylistInvalidation()
             changes.value += 1
             if (notifyMutation) { if (progressOnly) onProgressMutation() else onMutation() }
             results
+        } catch (failure: Throwable) {
+            // A producer failure after a durable callback cannot leave an old view writable.
+            // Typed outcome comes from the actual coordinator/file/authority, never callback
+            // invocation. Generic started writes retain their existing uncertainty semantics.
+            if (xperienceOperation != null && !installed &&
+                (if (xperienceOperation.typedCheckpoint != null) !typedCheckpointStillCurrent(xperienceOperation.typedCheckpoint)
+                 else xperienceCheckpointStarted)) enterCheckpointUncertainty()
+            throw failure
         } finally { if (!installed) candidate.close() }
     }
     /** Same-UID relinks still change credential authority. Dormant slot merges do not revoke
@@ -998,6 +1518,7 @@ internal class VortxNativeSession private constructor(
         beforeOwnerChange()
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.close() }; slots.clear()
+        signalPlaylistInvalidation()
     }
     /** Only this Session creates it from its actual original runtime and validated candidate.
      * JSON values are caller-owned locals, never exposed to callbacks or stored as a fresh owner oracle. */
@@ -1013,8 +1534,15 @@ internal class VortxNativeSession private constructor(
      * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
      * In particular, old runtime A must never overwrite a possibly installed binding B. */
     private fun commitCheckpoint(snapshot: String, candidate: VortxNativeRuntime = runtime, hostArchive: JSONObject? = null,
-                                 playbackState: PlaybackCheckpointState? = null) {
+                                 playbackState: PlaybackCheckpointState? = null,
+                                 requireCompleteAccountExportBudget: Boolean = false,
+                                 genericOriginalCheckpoint: NativeCheckpointRead? = null,
+                                 preparedAccountAdmission: NativePreparedAccountAdmission? = null,
+                                 preparedOriginalCheckpoint: NativeOwnerHistoryCoordinator.Checkpoint? = null) {
         check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
+        check(!requireCompleteAccountExportBudget || candidate.isTyped || genericOriginalCheckpoint != null) {
+            "Complete account export budget unavailable"
+        }
         // Resource revisions, ordinary progress/settings, unrelated roster edits and dormant
         // slots are not playback ownership. The active exact binding transaction is.
         val changesPlaybackOwner = if (playbackState == null) {
@@ -1031,38 +1559,61 @@ internal class VortxNativeSession private constructor(
         }
         try {
             val archiveChanges = if (hostArchive != null) ownerHistory?.hostArchiveChanges(hostArchive).orEmpty() else emptyMap()
-            if (!candidate.commitTypedCheckpoint(snapshot, archiveChanges)) {
-                store.commit(scope, snapshot)
-                check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
-                if (store.supportsCheckpointAuthority) {
+            val committedCompleteAccount = if (preparedAccountAdmission == null)
+                candidate.commitTypedCheckpoint(snapshot, archiveChanges)
+            else candidate.commitTypedPreparedCheckpoint(snapshot, archiveChanges, preparedAccountAdmission)
+            check(preparedAccountAdmission == null || committedCompleteAccount) {
+                "Prepared-account admission requires the original typed candidate"
+            }
+            check(!requireCompleteAccountExportBudget || committedCompleteAccount || genericOriginalCheckpoint != null) {
+                "Complete account export budget unavailable"
+            }
+            if (!committedCompleteAccount) {
+                if (genericOriginalCheckpoint != null) {
+                    check(acknowledgedCheckpoint === genericOriginalCheckpoint)
+                    // The exact original encrypted-file capability is consumed by atomic CAS.
+                    acknowledgedCheckpoint = store.compareAndCommitCheckpoint(scope, genericOriginalCheckpoint, snapshot)
+                        .also { check(it.plaintext == snapshot) { "Native checkpoint readback failed" } }
+                } else {
+                    store.commit(scope, snapshot)
+                    check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
+                }
+                if (genericOriginalCheckpoint == null && store.supportsCheckpointAuthority) {
                     acknowledgedCheckpoint = store.captureCheckpoint(scope).also { check(it.plaintext == snapshot) }
                 }
             }
+            val acceptedRawHost = OHJson.Obj(snapshot.toByteArray(Charsets.UTF_8)).raw("nativeHostPreferenceState")
+            replaceRawHostPreferenceState(acceptedRawHost)
         } catch (error: Throwable) {
+            if (preparedAccountAdmission != null && typedCheckpointStillCurrent(preparedOriginalCheckpoint)) throw error
             com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-            checkpointUncertain = true
+            enterCheckpointUncertainty()
             slots.values.forEach { it.close() }; slots.clear()
             changes.value += 1
             throw error
         }
     }
     private fun checkpoint(core: String, profiles: JSONObject, pendingProfiles: Boolean, host: JSONObject, material: JSONObject?, archive: JSONObject?, bootstrap: JSONObject?, websitePending: JSONObject, certificates: JSONObject,
-                           addonPending: JSONObject = websiteAddonEditPending): String =
-        JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)
+                           addonPending: JSONObject = websiteAddonEditPending): String {
+        val rawHost = NativeRawHostPreferences.reconcile(scope, rawNativeHostPreferenceState, host)
+        val projection = JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)
             .put("nativeHostPreferenceState", host).put("legacyImportMaterial", material)
             .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
             .put("legacyWebsiteBootstrap", bootstrap)
             .put("websiteProfileEditPending", websitePending).put("websiteProfileEditCertificates", certificates)
             .put("websiteAddonEditPending", addonPending).toString()
+        return NativeRawHostPreferences.snapshot(projection, rawHost)
+    }
     @Synchronized override fun close() {
         if (retirementComplete) return
-        if (!closed) { closed = true; invalidate() }
+        if (!closed) { closed = true; retireXperienceObservations(); invalidate() }
         check(!unconfirmedHistoryRetirement) { "Owner history retirement unconfirmed; writer remains reserved" }
         // Failed retirement keeps the exact owner reachable and all admission quarantined.
         // A second close retries it; it must not silently release the account's writer slot.
         runtime.close()
         ownerHistory?.close()
         (transport as? AutoCloseable)?.close()
+        rawNativeHostPreferenceState.fill(0)
         retirementComplete = true
         changes.value += 1
     }

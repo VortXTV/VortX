@@ -1,6 +1,7 @@
 import Foundation
 
-/// An in-memory queue of content identities. Resolved URLs, headers and leases never enter this model.
+/// A bounded queue of catalog identities. Resolved URLs, headers and leases never enter this model or its
+/// durable snapshot. A cold restore always returns every entry to pending state; no ticket is reusable.
 struct PlaybackTitleQueuePolicy {
     static let capacity = 100
 
@@ -54,6 +55,22 @@ struct PlaybackTitleQueuePolicy {
     private(set) var active: Active?
     private(set) var revision = UUID()
     var count: Int { upcoming.count + (active == nil ? 0 : 1) }
+    var durableEntries: [Entry] {
+        active.map { [$0.entry] + upcoming } ?? upcoming
+    }
+
+    /// Install a fully validated cold snapshot only into pristine state. A previously active entry is encoded
+    /// at the head by durableEntries, but is intentionally pending after relaunch so the ordinary detail/source
+    /// path must mint fresh route authority and observe a real first frame again.
+    @discardableResult
+    mutating func restorePending(_ entries: [Entry]) -> Bool {
+        guard active == nil, upcoming.isEmpty,
+              entries.count <= Self.capacity,
+              Set(entries.map(\.id)).count == entries.count else { return false }
+        upcoming = entries
+        revision = UUID()
+        return true
+    }
 
     @discardableResult
     mutating func enqueue(_ candidate: Candidate, placement: Placement, id: UUID = UUID()) -> Bool {
@@ -64,6 +81,28 @@ struct PlaybackTitleQueuePolicy {
         case .next: upcoming.insert(entry, at: 0)
         case .last: upcoming.append(entry)
         }
+        revision = UUID()
+        return true
+    }
+
+    /// Atomically append one already-validated catalog batch. IDs are minted locally so a cloud playlist's
+    /// durable item identity can never become queue route/ticket authority. Every candidate and fresh ID is
+    /// staged before live order or revision changes; capacity or identity failure therefore changes nothing.
+    @discardableResult
+    mutating func appendCandidates(
+        _ candidates: [Candidate],
+        makeID: () -> UUID = { UUID() }
+    ) -> Bool {
+        guard !candidates.isEmpty, candidates.count <= Self.capacity - count else { return false }
+        var knownIDs = Set(durableEntries.map(\.id))
+        var appended: [Entry] = []
+        appended.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            let id = makeID()
+            guard knownIDs.insert(id).inserted else { return false }
+            appended.append(.init(id: id, candidate: candidate))
+        }
+        upcoming.append(contentsOf: appended)
         revision = UUID()
         return true
     }

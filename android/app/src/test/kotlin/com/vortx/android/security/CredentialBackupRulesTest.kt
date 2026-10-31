@@ -69,6 +69,8 @@ class CredentialBackupRulesTest {
             "vortx_mediaserver_tokens_plain.xml",
             "vortx_iptv_creds.xml",
             "vortx_iptv_creds_plain.xml",
+            // A restored LAN-server choice would silently enroll network/Cast authority on another device.
+            "vortx_streaming_server_device.xml",
         )
     }
 }

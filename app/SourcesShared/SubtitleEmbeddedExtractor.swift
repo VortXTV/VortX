@@ -110,6 +110,191 @@ enum SubtitleEmbeddedExtractor {
             .map { $0.value.finish(preferVTT: preferVTT) }
     }
 
+    /// Optional donation only: complete EOF or nothing. Never used by ordinary display/alignment.
+    /// The original permission and cancellation are checked before opening the owned descriptor,
+    /// in custom IO/interrupt callbacks, between packets and before any output escapes.
+    static func extractContributionText(input: String, maximumTextBytes: Int,
+        cancellation: TimingWindowCancellation,
+        permitsUse: @escaping @Sendable () -> Bool) -> [ExtractedTrack] {
+        guard !Thread.isMainThread, !cancellation.isCancelled, permitsUse(),
+              (1...1_048_576).contains(maximumTextBytes), isLocalFileInput(input) else { return [] }
+        let deadline = DispatchTime.now().uptimeNanoseconds + 8_000_000_000
+        do {
+            let source = try LocalTimingSource.open(input: input)
+            // A full scan of a large movie is optional work we decline, not a partial subtitle.
+            guard source.identity.byteCount > 0, source.identity.byteCount <= (64 << 20) else { return [] }
+            let reader = try LocalTimingReader(source: source, cancellation: cancellation,
+                permitsUse: permitsUse, deadline: deadline, requireFullReads: true)
+            defer { withExtendedLifetime(reader) {} }
+            let tracks = try readContributionText(reader: reader, maximumTextBytes: maximumTextBytes)
+            try reader.checkStop()
+            try source.validateUnchanged()
+            try reader.checkStop()
+            return tracks
+        } catch { return [] }
+    }
+
+    private static func readContributionText(reader: LocalTimingReader, maximumTextBytes: Int) throws -> [ExtractedTrack] {
+        try reader.checkStop()
+        guard let context = avformat_alloc_context() else { throw TimingWindowFailure.allocation }
+        var format: UnsafeMutablePointer<AVFormatContext>? = context
+        var customIO: UnsafeMutablePointer<AVIOContext>?
+        var didOpen = false
+        defer {
+            if didOpen { avformat_close_input(&format) }
+            else if let format { format.pointee.pb = nil; avformat_free_context(format) }
+            if let customIO {
+                let backing = customIO.pointee.buffer
+                var ownedIO: UnsafeMutablePointer<AVIOContext>? = customIO
+                avio_context_free(&ownedIO)
+                if let backing { av_free(backing) }
+            }
+        }
+        let opaque = Unmanaged.passUnretained(reader).toOpaque()
+        context.pointee.interrupt_callback.callback = { opaque in
+            guard let opaque else { return 1 }
+            return Unmanaged<LocalTimingReader>.fromOpaque(opaque).takeUnretainedValue().shouldInterrupt ? 1 : 0
+        }
+        context.pointee.interrupt_callback.opaque = opaque
+        context.pointee.io_open = { _, _, _, _, _ in -1 }
+        context.pointee.max_streams = 128
+        context.pointee.max_probe_packets = 32
+        context.pointee.probesize = 1 << 20
+        context.pointee.max_analyze_duration = 100_000
+        let scratchSize = 32 << 10
+        guard let scratch = av_malloc(scratchSize)?.assumingMemoryBound(to: UInt8.self) else {
+            throw TimingWindowFailure.allocation
+        }
+        guard let io = avio_alloc_context(scratch, Int32(scratchSize), 0, opaque,
+            { opaque, bytes, count in
+                guard let opaque, let bytes, count > 0 else { return -1 }
+                return Unmanaged<LocalTimingReader>.fromOpaque(opaque).takeUnretainedValue().read(bytes, count: count)
+            }, nil,
+            { opaque, offset, whence in
+                guard let opaque else { return -1 }
+                return Unmanaged<LocalTimingReader>.fromOpaque(opaque).takeUnretainedValue().seek(offset: offset, whence: whence)
+            }) else { av_free(scratch); throw TimingWindowFailure.allocation }
+        customIO = io
+        io.pointee.seekable = 1
+        context.pointee.pb = io
+        context.pointee.flags |= 0x0080
+        var options: OpaquePointer?
+        defer { av_dict_free(&options) }
+        for (key, value) in [("format_whitelist", "matroska,webm,mov"), ("protocol_whitelist", "file"),
+                             ("enable_drefs", "0"), ("use_absolute_path", "0")] {
+            let code = av_dict_set(&options, key, value, 0)
+            guard code >= 0 else { throw TimingWindowFailure.libav(stage: "options", code: code) }
+        }
+        let openCode = avformat_open_input(&format, nil, nil, &options)
+        didOpen = openCode == 0
+        try reader.checkStop()
+        guard openCode == 0, let input = format else { throw TimingWindowFailure.libav(stage: "open", code: openCode) }
+        let infoCode = avformat_find_stream_info(input, nil)
+        try reader.checkStop()
+        guard infoCode >= 0 else { throw TimingWindowFailure.libav(stage: "streams", code: infoCode) }
+        let count = Int(input.pointee.nb_streams)
+        guard count > 0, count <= 128, let streams = input.pointee.streams else { throw TimingWindowFailure.budget("streams") }
+        var builders: [Int: CueBuilder] = [:]
+        var decoders: [Int: UnsafeMutablePointer<AVCodecContext>] = [:]
+        defer { for (_, context) in decoders { var value: UnsafeMutablePointer<AVCodecContext>? = context; avcodec_free_context(&value) } }
+        for index in 0..<count {
+            try reader.checkStop()
+            guard let stream = streams[index], let parameters = stream.pointee.codecpar,
+                  parameters.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
+                  isTextSubtitle(parameters.pointee.codec_id) else { continue }
+            guard stream.pointee.index == Int32(index), builders.count < 4, parameters.pointee.extradata_size >= 0,
+                  parameters.pointee.extradata_size <= 65_536,
+                  let codec = avcodec_find_decoder(parameters.pointee.codec_id),
+                  (codec.pointee.capabilities & (1 << 5)) == 0, // AV_CODEC_CAP_DELAY, same imported bit as timing extraction.
+                  let decoder = avcodec_alloc_context3(codec) else { throw TimingWindowFailure.budget("decoders") }
+            var opened = false
+            defer { if !opened { var value: UnsafeMutablePointer<AVCodecContext>? = decoder; avcodec_free_context(&value) } }
+            guard avcodec_parameters_to_context(decoder, parameters) >= 0,
+                  avcodec_open2(decoder, codec, nil) >= 0,
+                  decoder.pointee.subtitle_header_size >= 0,
+                  decoder.pointee.subtitle_header_size <= 65_536 else { throw TimingWindowFailure.invalidTextPayload }
+            opened = true
+            decoders[index] = decoder
+            let timeBase = av_q2d(stream.pointee.time_base)
+            guard timeBase.isFinite, timeBase > 0 else { throw TimingWindowFailure.invalidStreamTiming }
+            let language: String
+            if let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0), let value = entry.pointee.value {
+                language = String(try boundedTimingText(value).prefix(32)).lowercased()
+            } else { language = "und" }
+            builders[index] = CueBuilder(lang: language,
+                timeBaseSeconds: timeBase, assPreTextCommas: assPreTextCommas(ctx: decoder),
+                maximumTextBytes: maximumTextBytes)
+        }
+        guard !builders.isEmpty else { return [] }
+        guard let packet = av_packet_alloc() else { throw TimingWindowFailure.allocation }
+        defer { var value: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&value) }
+        var packets = 0
+        while true {
+            try reader.checkStop()
+            let code = av_read_frame(input, packet)
+            try reader.checkStop()
+            if code == -541_478_725 { break } // AVERROR_EOF, never treat another read failure as completion.
+            guard code >= 0 else { throw TimingWindowFailure.libav(stage: "read", code: code) }
+            packets += 1
+            guard packets <= 100_000, packet.pointee.size >= 0, packet.pointee.size <= 262_144 else {
+                av_packet_unref(packet); throw TimingWindowFailure.budget("packets")
+            }
+            let index = Int(packet.pointee.stream_index)
+            guard index >= 0, index < count else {
+                av_packet_unref(packet); throw TimingWindowFailure.invalidRequest
+            }
+            if let decoder = decoders[index], let builder = builders[index] {
+                do { try decodeContributionPacket(packet, context: decoder, builder: builder) }
+                catch { av_packet_unref(packet); throw error }
+            }
+            av_packet_unref(packet)
+        }
+        try reader.checkStop()
+        var output: [ExtractedTrack] = []
+        for index in builders.keys.sorted() {
+            try reader.checkStop()
+            guard let builder = builders[index], !builder.exceededBudget else { throw TimingWindowFailure.budget("text") }
+            let track = builder.finish(preferVTT: false)
+            guard track.srt.utf8.count <= maximumTextBytes else { throw TimingWindowFailure.budget("text") }
+            output.append(track)
+        }
+        try reader.checkStop()
+        return output
+    }
+
+    private static func decodeContributionPacket(_ packet: UnsafeMutablePointer<AVPacket>,
+        context: UnsafeMutablePointer<AVCodecContext>, builder: CueBuilder) throws {
+        var subtitle = AVSubtitle()
+        var got: Int32 = 0
+        let code = avcodec_decode_subtitle2(context, &subtitle, &got, packet)
+        defer { avsubtitle_free(&subtitle) }
+        guard code >= 0, code == packet.pointee.size else { throw TimingWindowFailure.libav(stage: "decode", code: code) }
+        guard got != 0 else { return }
+        guard subtitle.num_rects <= 64 else { throw TimingWindowFailure.budget("rects") }
+        guard subtitle.num_rects > 0, let rects = subtitle.rects else { return }
+        var lines: [String] = []
+        for index in 0..<Int(subtitle.num_rects) {
+            guard let rect = rects[index] else { throw TimingWindowFailure.invalidTextPayload }
+            if let raw = rect.pointee.text { lines.append(try boundedTimingText(raw)) }
+            else if let raw = rect.pointee.ass {
+                lines.append(plainTextFromASS(try boundedTimingText(raw), preTextCommas: builder.assPreTextCommas))
+            } else { throw TimingWindowFailure.invalidTextPayload }
+        }
+        let text = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard packet.pointee.pts != Int64.min else { throw TimingWindowFailure.invalidCueTiming }
+        let pts = Double(packet.pointee.pts) * builder.timeBaseSeconds
+        let start = pts + Double(subtitle.start_display_time) / 1000
+        let endMilliseconds = subtitle.end_display_time > subtitle.start_display_time
+            ? Double(subtitle.end_display_time) : Double(subtitle.start_display_time) + 3000
+        let end = pts + endMilliseconds / 1000
+        guard start.isFinite, end.isFinite, start >= 0, end >= start, end <= 86_400 else {
+            throw TimingWindowFailure.invalidCueTiming
+        }
+        builder.add(startSeconds: start, endSeconds: end, text: text)
+        guard !builder.exceededBudget else { throw TimingWindowFailure.budget("text") }
+    }
+
     /// Absolute positions on the original media timeline, before any playback remux.
     struct TimingWindow: Sendable, Equatable {
         enum Purpose: Sendable, Equatable {
@@ -573,18 +758,24 @@ enum SubtitleEmbeddedExtractor {
                 assCommas: assCommas, window: window) {
                 // Check BEFORE append. Overflow is a failed extraction, never an
                 // apparently complete prefix that the matcher might trust.
-                if cues.last != cue {
-                    guard cues.count < 1_024 else { throw TimingWindowFailure.budget("cues") }
-                    cues.append(cue)
-                }
+                try appendTimingCue(cue, to: &cues)
             }
         }
         try reader.checkStop()
-        let ordered = cues.sorted {
-            $0.startSeconds == $1.startSeconds
-                ? $0.endSeconds < $1.endSeconds : $0.startSeconds < $1.startSeconds
+        return (cues, packets)
+    }
+
+    /// Keep the complete decoder-order evidence corpus. Equal starts and identical intervals
+    /// may be separate dialogue; they remain separate entries in the confidence denominator.
+    static func appendTimingCue(_ cue: TimingCue, to cues: inout [TimingCue]) throws {
+        guard cue.startSeconds.isFinite, cue.endSeconds.isFinite,
+              cue.startSeconds >= 0, cue.endSeconds <= 86_400,
+              cue.startSeconds < cue.endSeconds else { throw TimingWindowFailure.invalidCueTiming }
+        if let previous = cues.last, cue.startSeconds < previous.startSeconds {
+            throw TimingWindowFailure.invalidCueTiming
         }
-        return (ordered, packets)
+        guard cues.count < 1_024 else { throw TimingWindowFailure.budget("cues") }
+        cues.append(cue)
     }
 
     /// The decoder's bytes-consumed receipt is independent of whether it emits
@@ -689,6 +880,8 @@ enum SubtitleEmbeddedExtractor {
         private let fileSize: Int64
         private let deadline: UInt64
         private let cancellation: TimingWindowCancellation
+        private let permitsUse: @Sendable () -> Bool
+        private let requireFullReads: Bool
         private var offset: Int64 = 0
         private var reads = 0
         private var seeks = 0
@@ -696,10 +889,14 @@ enum SubtitleEmbeddedExtractor {
         private(set) var bytesRead: Int64 = 0
         private var stop: TimingWindowFailure?
 
-        init(source: LocalTimingSource, cancellation: TimingWindowCancellation) throws {
+        init(source: LocalTimingSource, cancellation: TimingWindowCancellation,
+             permitsUse: @escaping @Sendable () -> Bool = { true }, deadline: UInt64? = nil,
+             requireFullReads: Bool = false) throws {
             self.source = source
             self.cancellation = cancellation
-            deadline = DispatchTime.now().uptimeNanoseconds + 8_000_000_000
+            self.permitsUse = permitsUse
+            self.requireFullReads = requireFullReads
+            self.deadline = deadline ?? (DispatchTime.now().uptimeNanoseconds + 8_000_000_000)
             fileSize = source.identity.byteCount
             guard !cancellation.isCancelled else { throw TimingWindowFailure.cancelled }
             try source.validateUnchanged()
@@ -707,7 +904,7 @@ enum SubtitleEmbeddedExtractor {
 
         var shouldInterrupt: Bool {
             if stop != nil { return true }
-            if cancellation.isCancelled { stop = .cancelled; return true }
+            if cancellation.isCancelled || !permitsUse() { stop = .cancelled; return true }
             if DispatchTime.now().uptimeNanoseconds >= deadline { stop = .deadline; return true }
             return false
         }
@@ -734,6 +931,7 @@ enum SubtitleEmbeddedExtractor {
             reads += 1
             let result = pread(source.descriptor, buffer, Int(allowed), off_t(offset))
             guard result >= 0 else { stop = .localIO(errno); return Self.exitCode }
+            if requireFullReads, result != Int(allowed) { stop = .localIO(EIO); return Self.exitCode }
             guard result > 0 else { return Self.eofCode }
             offset += Int64(result)
             bytesRead += Int64(result)
@@ -916,14 +1114,25 @@ enum SubtitleEmbeddedExtractor {
         /// stream's OWN `[Events]` Format line (standard layout = 8). See `assPreTextCommas(ctx:)`.
         let assPreTextCommas: Int
         private var cues: [(start: Double, end: Double, text: String)] = []
+        private let maximumTextBytes: Int?
+        private var estimatedBytes = 8
+        private(set) var exceededBudget = false
 
-        init(lang: String, timeBaseSeconds: Double, assPreTextCommas: Int) {
+        init(lang: String, timeBaseSeconds: Double, assPreTextCommas: Int, maximumTextBytes: Int? = nil) {
             self.lang = lang
             self.timeBaseSeconds = timeBaseSeconds
             self.assPreTextCommas = assPreTextCommas
+            self.maximumTextBytes = maximumTextBytes
         }
 
         func add(startSeconds: Double, endSeconds: Double, text: String) {
+            if let maximumTextBytes {
+                let additional = text.utf8.count + 96
+                guard !exceededBudget, cues.count < 10_000, additional <= maximumTextBytes - estimatedBytes else {
+                    exceededBudget = true; return
+                }
+                estimatedBytes += additional
+            }
             cues.append((startSeconds, endSeconds, text))
         }
 

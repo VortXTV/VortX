@@ -11,7 +11,7 @@ extension ForYouStore: XperienceCurationExportStore {
         guard let target = session.target else { return false }
         return CoreBridge.shared.nativeXperienceContextIsCurrent(target)
     }
-    func xperienceExportCandidates(_ session: CurationEditSession) throws -> [XperienceAddonBinding.Candidate] {
+    func xperienceExportCandidates(_ session: CurationEditSession) throws -> XperienceInstalledCatalogs.Snapshot {
         guard isCurrentRichEdit(session) else { throw XperienceExportFailure.staleContext }
         guard let target = session.target else { throw XperienceExportFailure.unavailable }
         return try CoreBridge.shared.nativeXperienceSnapshot(target: target).candidates

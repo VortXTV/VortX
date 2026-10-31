@@ -121,6 +121,9 @@ options:
     - zh-Hant
     - zu
 packages:
+  GoogleCast:
+    url: https://github.com/googlecast/google-cast-ios-sdk
+    exactVersion: "4.8.6"
   # MPVKit, built BY US from pinned upstream refs, for Dolby Vision Profile 7 enhancement-layer
   # (FEL) support. Was: url https://github.com/mpvkit/MPVKit, exactVersion "0.41.0-n8.1.2".
   #
@@ -240,6 +243,8 @@ targets:
       - path: ../CHANGELOG.md
         buildPhase: resources
     dependencies:
+      - package: GoogleCast
+        product: GoogleCastDynamic
       - package: MPVKit
         product: MPVKit-GPL
       # The VortX engine ABI (vortx-ffi staticlib xcframework, built by scripts/build-ffi-xcframework.sh;

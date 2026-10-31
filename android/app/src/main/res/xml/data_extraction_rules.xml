@@ -33,6 +33,8 @@
         <exclude domain="sharedpref" path="vortx_iptv_creds.xml" />
         <exclude domain="sharedpref" path="vortx_iptv_creds_plain.xml" />
         <exclude domain="sharedpref" path="community_js_providers.xml" />
+        <!-- A LAN server is an explicit choice on this device, not transferable network authority. -->
+        <exclude domain="sharedpref" path="vortx_streaming_server_device.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="Downloads" />
@@ -56,5 +58,7 @@
         <exclude domain="sharedpref" path="vortx_iptv_creds.xml" />
         <exclude domain="sharedpref" path="vortx_iptv_creds_plain.xml" />
         <exclude domain="sharedpref" path="community_js_providers.xml" />
+        <!-- A LAN server is an explicit choice on this device, not transferable network authority. -->
+        <exclude domain="sharedpref" path="vortx_streaming_server_device.xml" />
     </device-transfer>
 </data-extraction-rules>

@@ -9,8 +9,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /// One external subtitle offered by a subtitles add-on (e.g. an OpenSubtitles add-on). Mirrors Apple
 /// `AddonSubtitle` (SubtitleAddons.swift:4).
@@ -20,6 +19,10 @@ data class AddonSubtitle(
     val lang: String,
     val addonName: String,
     val releaseName: String? = null,
+    /** Exact installed manifest transport URL; only this origin may authorize private DNS. */
+    val originalInstalledBase: String? = null,
+    /** Actual final subtitle-index URL; resolution base only, never private-address authority. */
+    val actualFinalIndexUri: String? = null,
 ) {
     val displayTitle: String get() = releaseName?.takeIf { it.isNotBlank() }
         ?.let { "$addonName · $it" } ?: addonName
@@ -30,6 +33,8 @@ data class AddonSubtitle(
 data class SubtitleAddonSource(
     val baseUrl: String,
     val name: String,
+    /** Keep the exact installed transport URL distinct from the derived resource base. */
+    val originalInstalledBase: String = baseUrl,
 )
 
 /// Fetches external subtitles from every installed add-on that declares the `subtitles` resource,
@@ -49,14 +54,15 @@ object SubtitleAddonService {
         return addons
             .filter { it.providesSubtitles && !it.isDisabled }
             .mapNotNull { addon ->
-                val trimmed = addon.transportUrl.trim().trimEnd('/')
+                val original = addon.transportUrl.trim()
+                val trimmed = original.trimEnd('/')
                 val base = if (trimmed.endsWith(MANIFEST_LEAF, ignoreCase = true)) {
                     trimmed.dropLast(MANIFEST_LEAF.length)
                 } else {
                     trimmed
                 }.trimEnd('/')
                 if (base.isBlank() || !seen.add(base.lowercase())) return@mapNotNull null
-                SubtitleAddonSource(baseUrl = base, name = addon.name)
+                SubtitleAddonSource(baseUrl = base, name = addon.name, originalInstalledBase = original)
             }
     }
 
@@ -64,10 +70,7 @@ object SubtitleAddonService {
     private const val MANIFEST_LEAF = "/manifest.json"
 
     /// The `(type, videoId)` pair the subtitles resource is queried with, from the playable's
-    /// [MediaRef]: a movie queries its imdb id, a series episode queries `imdb:season:episode`
-    /// (the same engine video-id shape Apple hands to `SubtitleAddonService.fetch`). Null when the
-    /// ref carries no imdb identity (a pasted magnet, a tmdb-only catalog) -- the fetch is simply
-    /// skipped, fail-soft.
+    /// [MediaRef]: a movie queries its imdb id, a series episode queries `imdb:season:episode`.
     fun queryFor(ref: MediaRef): Pair<String, String>? {
         val imdb = ref.imdb?.takeIf { it.isNotBlank() } ?: return null
         return if (ref.isSeries) {
@@ -80,9 +83,7 @@ object SubtitleAddonService {
     }
 
     /// All subtitles for `type/videoId` across the given subtitle add-ons, in source order,
-    /// deduplicated by URL (Apple `fetch`, SubtitleAddons.swift:54: same route
-    /// `{base}/subtitles/{type}/{videoId}.json`, same 15s per-source timeout, same fail-soft
-    /// empty-on-error per add-on, same source-order concat + URL dedupe).
+    /// deduplicated by resolved canonical URL.
     suspend fun fetch(sources: List<SubtitleAddonSource>, type: String, videoId: String,
                       metadata: SubtitleRequestMetadata = SubtitleRequestMetadata()): List<AddonSubtitle> {
         if (sources.isEmpty()) return emptyList()
@@ -98,67 +99,77 @@ object SubtitleAddonService {
         return collected.flatten().filter { seen.add(it.url) }
     }
 
-    /// One add-on's `subtitles` response, or empty on ANY failure (bad URL, network error, non-2xx,
-    /// malformed JSON) -- a flaky subtitle add-on must never break the player's track list.
     private suspend fun fetchOne(source: SubtitleAddonSource, paths: List<String>): List<AddonSubtitle> =
         withContext(Dispatchers.IO) {
-            runCatching {
+            try {
+                val deadline = AddonSubtitleIndexTransport.deadlineAfterTimeout()
                 for ((attempt, path) in paths.withIndex()) {
-                    val connection = URL("${source.baseUrl.trimEnd('/')}/$path").openConnection() as HttpURLConnection
-                    try {
-                        connection.requestMethod = "GET"
-                        connection.connectTimeout = FETCH_TIMEOUT_MS
-                        connection.readTimeout = FETCH_TIMEOUT_MS
-                        connection.instanceFollowRedirects = true
-                        val status = connection.responseCode
-                        if (attempt == 0 && paths.size > 1 && status in listOf(404, 405)) continue
-                        if (status !in 200..299) return@runCatching emptyList()
-                        // Listings are tiny: enforce the cap even when Content-Length is absent or false.
-                        if (connection.contentLengthLong > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
-                        val bytes = connection.inputStream.use { input ->
-                            val out = java.io.ByteArrayOutputStream()
-                            val buffer = ByteArray(16 * 1024)
-                            var total = 0
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read < 0) break
-                                total += read
-                                if (total > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
-                                out.write(buffer, 0, read)
-                            }
-                            out.toByteArray()
-                        }
-                        return@runCatching parseSubtitles(bytes.toString(Charsets.UTF_8), source.name)
-                    } finally {
-                        connection.disconnect()
-                    }
+                    val endpoint = "${source.baseUrl.trimEnd('/')}/$path"
+                    val response = AddonSubtitleIndexTransport.get(endpoint, source.originalInstalledBase, deadline)
+                        ?: return@withContext emptyList()
+                    if (attempt == 0 && paths.size > 1 && response.status in listOf(404, 405)) continue
+                    if (response.status !in 200..299) return@withContext emptyList()
+                    val body = response.body ?: return@withContext emptyList()
+                    return@withContext parseSubtitles(
+                        body.toString(Charsets.UTF_8), source.name, source.originalInstalledBase, response.finalIndexUri,
+                    )
                 }
                 emptyList()
-            }.getOrDefault(emptyList())
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
-    /// Decode `{ "subtitles": [{ id?, url, lang? }] }` (the Stremio subtitles-resource shape) into
-    /// [AddonSubtitle]s; entries with no `url` are dropped, `lang` defaults to "und" exactly as the
-    /// Apple decoder does.
-    private fun parseSubtitles(body: String, addonName: String): List<AddonSubtitle> {
+    /// Decode Stremio subtitle rows, resolving references against the actual final index URL.
+    /// Each canonical URL and the aggregate UTF-8 URL text are bounded to prevent oversized rows or
+    /// relative-prefix amplification; when the aggregate budget is exhausted, stop in source order.
+    private fun parseSubtitles(
+        body: String,
+        addonName: String,
+        originalInstalledBase: String,
+        actualFinalIndexUri: String,
+    ): List<AddonSubtitle> {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         val array = root.optJSONArray("subtitles") ?: return emptyList()
+        val index = actualFinalIndexUri.toHttpUrlOrNull() ?: return emptyList()
         val out = mutableListOf<AddonSubtitle>()
+        val seen = mutableSetOf<String>()
+        var retainedUrlBytes = 0
         for (i in 0 until array.length()) {
             val sub = array.optJSONObject(i) ?: continue
-            val url = (sub.opt("url") as? String)?.takeIf { it.isNotBlank() } ?: continue
+            val rawUrl = (sub.opt("url") as? String)?.takeIf { it.isNotBlank() } ?: continue
+            if (rawUrl.toByteArray(Charsets.UTF_8).size > MAX_URL_TEXT_BYTES) continue
+            val canonicalUrl = resolveAddonSubtitleUrl(index, rawUrl) ?: continue
+            if (!seen.add(canonicalUrl)) continue
+            val bytes = canonicalUrl.toByteArray(Charsets.UTF_8).size
+            if (bytes > MAX_URL_TEXT_BYTES || retainedUrlBytes + bytes > MAX_RETAINED_URL_BYTES) break
+            retainedUrlBytes += bytes
             out += AddonSubtitle(
-                id = (sub.opt("id") as? String)?.takeIf { it.isNotBlank() } ?: url,
-                url = url,
+                id = (sub.opt("id") as? String)?.takeIf { it.isNotBlank() } ?: canonicalUrl,
+                url = canonicalUrl,
                 lang = (sub.opt("lang") as? String)?.takeIf { it.isNotBlank() } ?: "und",
                 addonName = addonName,
                 releaseName = (sub.opt("subtitleFileName") as? String)?.takeIf { it.isNotBlank() },
+                originalInstalledBase = originalInstalledBase,
+                actualFinalIndexUri = actualFinalIndexUri,
             )
         }
         return out
     }
 
-    /// Per-source fetch timeout, matching Apple's `req.timeoutInterval = 15`.
-    private const val FETCH_TIMEOUT_MS = 15_000
-    private const val LISTING_RESPONSE_MAX_BYTES = 1024 * 1024
 }
+
+/** Resolve one bounded resource reference against the actual index URI without broadening the origin policy. */
+internal fun resolveAddonSubtitleUrl(indexUri: okhttp3.HttpUrl, raw: String): String? {
+    if (raw.toByteArray(Charsets.UTF_8).size > MAX_URL_TEXT_BYTES || raw.any { it.code < 0x20 || it.code == 0x7f }) return null
+    val resolved = indexUri.resolve(raw) ?: return null
+    if (resolved.scheme != "http" && resolved.scheme != "https") return null
+    if (resolved.username.isNotEmpty() || resolved.password.isNotEmpty()) return null
+    val canonical = resolved.newBuilder().fragment(null).build().toString()
+    return canonical.takeIf { it.toByteArray(Charsets.UTF_8).size <= MAX_URL_TEXT_BYTES }
+}
+
+private const val MAX_URL_TEXT_BYTES = 128 * 1024
+private const val MAX_RETAINED_URL_BYTES = 1024 * 1024

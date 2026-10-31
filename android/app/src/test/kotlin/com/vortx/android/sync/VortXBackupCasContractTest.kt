@@ -28,7 +28,41 @@ class VortXBackupCasContractTest {
         var document = JSONObject()
         var hostPreferences = JSONObject().put("globals", JSONObject().put("fields", JSONObject()))
         var beforePrepare: (() -> Unit)? = null
+        val pendingReceiptIds = mutableListOf("old")
+        val receiptResults = mutableListOf<Triple<List<String>, String, Long>>()
+        override fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any = pendingReceiptIds.toList()
+        override fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?, acceptedCandidate: String, version: Long) {
+            @Suppress("UNCHECKED_CAST")
+            receiptResults += Triple(frozen as List<String>, acceptedCandidate, version)
+        }
         override fun retire() { installation = Any() }
+        // Explicit synthetic gateway currency: no Session exists in this contract fixture.
+        private inner class Currency(val expected: Any?, val origin: NativeAccountUploadCurrency.Origin) : NativeAccountUploadCurrency {
+            override fun isCurrent() = origin.isCurrent() && installation === expected
+            override fun <T> withCurrentSession(action: () -> T): T? = if (isCurrent()) action() else null
+        }
+        override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
+            object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
+        override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+            originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+            action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+            val currency = Currency(installation, original)
+            val exported = exportDocument(account)
+            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, currentMountToken(account), null, null, currency) }
+        }
+        override suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin,
+            isCurrent: () -> Boolean): Pair<JSONObject, NativeAccountUploadCurrency>? {
+            val currency = Currency(installation, original)
+            val seed = prepareEmptyAccount(account) { isCurrent() && currency.isCurrent() } ?: return null
+            return (seed to currency).takeIf { isCurrent() && currency.isCurrent() }
+        }
+        override suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
+            original: NativeAccountUploadCurrency, isCurrent: () -> Boolean): NativeAccountUploadCurrency? {
+            val captured = original as? Currency ?: return null
+            if (!captured.isCurrent() || !isCurrent()) return null
+            if (!applyDocument(account, document) { original.isCurrent() && isCurrent() }) return null
+            return Currency(installation, captured.origin).takeIf { isCurrent() && captured.origin.isCurrent() }
+        }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) = installation?.let { NativeAccountMountToken(it, 0) }
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) = isCurrent()
         override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject? {
@@ -145,12 +179,40 @@ class VortXBackupCasContractTest {
         try {
             fixture.loseAcceptedResponse = true
             assertFalse(fixture.manager.syncUp()); assertEquals(0, fixture.gateway.acknowledgments)
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
             assertEquals(0L, fixture.manager.lastAppliedVersion())
             fixture.cloud.put("afterLostResponse", "keep"); fixture.revision = 42
             assertTrue(fixture.manager.syncUp())
             assertEquals(listOf(40L, 42L), fixture.bases); assertEquals(listOf(41L, 43L), fixture.versions)
             assertEquals("keep", fixture.cloud.getString("afterLostResponse"))
             assertEquals(1, fixture.gateway.acknowledgments)
+        } finally { fixture.close(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `receipt uses frozen identities and final accepted retry candidate`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val fixture = Fixture()
+        try {
+            fixture.beforePut = { if (it == 1) {
+                fixture.gateway.pendingReceiptIds += "late"
+                fixture.cloud.put("retryMarker", "winner")
+                fixture.revision = 41
+            } }
+            assertTrue(fixture.manager.syncUp())
+            val receipt = fixture.gateway.receiptResults.single()
+            assertEquals(listOf("old"), receipt.first)
+            assertEquals(42L, receipt.third)
+            assertEquals("winner", JSONObject(receipt.second).getString("retryMarker"))
+        } finally { fixture.close(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `malformed accepted response cannot issue receipt`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val fixture = Fixture()
+        try {
+            fixture.failPut = 200 to JSONObject().put("accepted", "true")
+            assertFalse(fixture.manager.syncUp())
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
         } finally { fixture.close(); Dispatchers.resetMain() }
     }
 
@@ -162,6 +224,7 @@ class VortXBackupCasContractTest {
             fixture.manager.requestSyncSoon()
             fixture.dispatcher.scheduler.advanceTimeBy(2_501); fixture.dispatcher.scheduler.runCurrent()
             assertEquals(1, fixture.puts); assertEquals(0, fixture.gateway.acknowledgments)
+            assertTrue(fixture.gateway.receiptResults.isEmpty())
             assertEquals(0L, fixture.manager.lastAppliedVersion())
             assertEquals("Update VortX to keep syncing. Your changes are still on this device.", fixture.manager.syncProblem.value)
             assertTrue(fixture.context.getSharedPreferences("vortx_sync_state", android.content.Context.MODE_PRIVATE)
@@ -180,6 +243,7 @@ class VortXBackupCasContractTest {
                 fixture.beforePut = { if (reauthenticate) fixture.manager.replaceSyncSessionTestSeam(
                     VortXSyncManager.Session("replacement-token", fixture.account, fixture.key)) else fixture.gateway.retire() }
                 assertFalse(fixture.manager.syncUp()); assertEquals(0, fixture.gateway.acknowledgments)
+                assertTrue(fixture.gateway.receiptResults.isEmpty())
                 assertEquals(0L, fixture.manager.lastAppliedVersion())
             } finally { fixture.close() }
         }

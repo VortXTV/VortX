@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CryptoKit
 
 /// Exercises actual native Session+Facade, the supplied ABI and encrypted checkpoint store.
@@ -54,6 +55,19 @@ private final class XperienceTestGateAuthority: VortxMutationAuthority, @uncheck
 private struct XperienceTestOwnerAuthority: VortxMutationAuthority {
     func withActive(_ operation: () throws -> Void) throws { try operation() }
 }
+private final class XperienceSourceNotificationTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hostChanges = 0
+    private var notes = 0
+    var hostChangeCount: Int { lock.withLock { hostChanges } }
+    var noteCount: Int { lock.withLock { notes } }
+    func event(_ event: VortxNativeCoreFacade.SourceEvent) {
+        if case .changed(let fields, _) = event.kind, fields.contains("native_host_preferences") {
+            lock.withLock { hostChanges += 1 }
+        }
+    }
+    func note() { lock.withLock { notes += 1 } }
+}
 @main @MainActor enum XperienceNativeCheckpointTests {
     enum Failure: Error { case assertion(String) }
     static func check(_ value: Bool, _ message: String) throws { if !value { throw Failure.assertion(message) } }
@@ -67,8 +81,283 @@ private struct XperienceTestOwnerAuthority: VortxMutationAuthority {
             "future": .string(String(repeating: "x", count: padding)),
             "folders": .array([.object(["id": .string("folder"), "title": .string("Folder"), "sources": .array([])])])])]))
     }
+    /// New assertions use the REAL raw producer, encrypted store, facade and Session bodies.
+    /// No register serializer/comparator miniature is substituted. Inputs remain a few KiB.
+    static func rawRetention(_ directory: URL) async throws {
+        let owner = "10000000-0000-0000-0000-000000000091"
+        let actor = "30000000-0000-0000-0000-000000000091"
+        let scope = VortxAccountScope(account: "synthetic.xperience-raw-retention", ownerProfileID: owner)
+        let backing = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
+        let store = XperienceCountingCheckpointStore(backing)
+        let initial = try VortxNativeSession(scope: scope, ownerName: "Synthetic", abi: VortxCABI(),
+            store: store, transport: VortxCResourceTransport(), allowNewAccount: true, hostActor: actor)
+        let snapshot = try await initial.stateJSON()
+        let initialHost = try await initial.hostPreferencesPublication().rawDocument
+        await initial.close()
+        let edit = try XperienceImportNamespace.appendRaw(document: document(), label: "Original", bindings: [:])
+        let exact = Data("340282366920938463463374607431768211455".utf8)
+        var envelope = try OwnerHistoryExactJSON.Object(edit.raw.value)
+        envelope.set("futureExact", exact)
+        envelope.set("futureDecimal", Data("9007199254740993.0".utf8))
+        var register = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        register.set("clock", Data("7".utf8)); register.set("actor", try OwnerHistoryExactJSON.string(actor))
+        register.set("value", try envelope.encoded()); register.set("futureRegister", exact)
+        let originalRegister = try register.encoded()
+        let futureField = "xperience.import.10000000-0000-0000-0000-000000000092"
+        let deletedField = "xperience.import.10000000-0000-0000-0000-000000000093"
+        let future = Data((#"{"clock":8,"actor":""# + actor + #"","value":{"schemaVersion":2,"future":340282366920938463463374607431768211455},"extension":9007199254740993.0}"#).utf8)
+        let tombstone = Data((#"{"clock":9,"actor":""# + actor + #"","value":null,"future":18446744073709551616}"#).utf8)
+        var fields = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        fields.set(edit.field, originalRegister); fields.set(futureField, future); fields.set(deletedField, tombstone)
+        var wrapper = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        wrapper.set("fields", try fields.encoded()); wrapper.set("futureWrapper", exact)
+        var profiles = try OwnerHistoryExactJSON.Object(Data("{}".utf8)); profiles.set(owner, try wrapper.encoded())
+        var carrier = try OwnerHistoryExactJSON.Object(initialHost)
+        carrier.set("profiles", try profiles.encoded()); carrier.set("futureDocument", exact)
+        var sealed = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        sealed.set("actor", try OwnerHistoryExactJSON.string(actor)); sealed.set("counter", Data("9".utf8))
+        sealed.set("document", try carrier.encoded()); sealed.set("futureLocal", exact)
+        // This is an explicit SYNTHETIC original encrypted fixture, before reopening the
+        // actual producer. No live account/source/SDK bytes are invented from a DTO.
+        try backing.commit(snapshot, scope: scope, hostPreferences: sealed.encoded())
+        let session = try VortxNativeSession(scope: scope, ownerName: "Synthetic", abi: VortxCABI(),
+            store: store, transport: VortxCResourceTransport(), hostActor: actor)
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: session.resourceRegistry(), changed: { _ in })
+        guard let binding = facade.watchlistBinding, let registry = facade.registryBinding,
+              let observed = facade.capturedHostProfileSnapshot(expected: binding, registry: registry),
+              let original = observed.rawRegisters[edit.field] else { throw Failure.assertion("raw original unavailable") }
+        try check(original.bytes == originalRegister, "original register was reconstructed after DTO decoding")
+        let whitespace = try VortxRawHostRegister.prepared(Data(" \n".utf8) + original.bytes + Data(" \n".utf8))
+        try check(VortxRawHostRegister.same(original, whitespace), "raw observation treated whitespace as successor content")
+        var precision = try OwnerHistoryExactJSON.Object(original.bytes)
+        precision.set("futureRegister", Data("340282366920938463463374607431768211454".utf8))
+        try check(!VortxRawHostRegister.same(original, try VortxRawHostRegister.prepared(precision.encoded())),
+            "raw CAS rounded exact integers in unknown metadata")
+        do {
+            _ = try VortxRawHostRegister.prepared(Data(#"{"clock":1,"clock":2,"value":null}"#.utf8))
+            throw Failure.assertion("duplicate register key accepted")
+        } catch OwnerHistoryExactJSON.Failure.malformed {}
+        var deep = Data("0".utf8)
+        for _ in 0..<129 { deep = Data("[".utf8) + deep + Data("]".utf8) }
+        do {
+            var tooDeep = try OwnerHistoryExactJSON.Object(Data("{}".utf8)); tooDeep.set("value", deep)
+            _ = try VortxRawHostRegister.prepared(tooDeep.encoded())
+            throw Failure.assertion("raw register bypassed depth bound")
+        } catch OwnerHistoryExactJSON.Failure.excessive {}
+        try check(!VortxRawHostRegister.same(nil, observed.rawRegisters[deletedField]), "raw absence and tombstone were conflated")
+        do {
+            _ = try XperienceSavedNamespace.read(field: futureField, register: observed.rawRegisters[futureField]!)
+            throw Failure.assertion("future format was rewritten as a supported namespace")
+        } catch XperiencePersistenceFailure.unsupportedSavedFormat {}
+        let saved = try XperienceSavedNamespace.read(field: edit.field, register: original)
+        let replacement = try saved.rawReplacement(document: document(), label: "Renamed", bindings: [:])
+        let replacementValue = try OwnerHistoryExactJSON.Object(replacement.raw.value)
+        try check(replacementValue["futureExact"] == exact && replacementValue["futureDecimal"] == Data("9007199254740993.0".utf8),
+            "raw replacement changed an unknown exact value")
+        let budget = try XperienceExportBudget(completeAccountPlaintext: Data(#"{"nativeSync":{},"legacy":{"exact":340282366920938463463374607431768211455}}"#.utf8),
+            maximumSealedBytes: XperienceExportBudget.officialMaximumSealedBytes, writeV2: true)
+        let accepted = try await facade.setCapturedRawHostProfileField(replacement.nativeEdit, expected: binding, registry: registry,
+            sourceAuthority: XperienceTestOwnerAuthority(), checkpointValidator: budget)
+        let acceptedObject = try OwnerHistoryExactJSON.Object(accepted.bytes)
+        try check(acceptedObject["futureRegister"] == exact, "complete register metadata was erased")
+        guard let durable = try store.readHostPreferences(scope: scope) else { throw Failure.assertion("raw checkpoint absent") }
+        let local = try OwnerHistoryExactJSON.Object(durable)
+        let durableDocument = try OwnerHistoryExactJSON.Object(local.required("document"))
+        let durableProfiles = try OwnerHistoryExactJSON.Object(durableDocument.required("profiles"))
+        let durableWrapper = try OwnerHistoryExactJSON.Object(durableProfiles.required(owner))
+        let durableFields = try OwnerHistoryExactJSON.Object(durableWrapper.required("fields"))
+        try check(local["futureLocal"] == exact && durableDocument["futureDocument"] == exact && durableWrapper["futureWrapper"] == exact,
+            "producer-to-checkpoint path erased unknown siblings")
+        try check(durableFields[futureField] == future && durableFields[deletedField] == tombstone,
+            "unknown format or tombstone was pruned by replacement")
+        let durableValue = try OwnerHistoryExactJSON.Object(OwnerHistoryExactJSON.Object(durableFields.required(edit.field)).required("value"))
+        try check(durableValue["futureExact"] == exact && durableValue["futureDecimal"] == Data("9007199254740993.0".utf8),
+            "raw future integer/decimal changed in encrypted checkpoint")
+        let count = store.count
+        do {
+            _ = try await facade.setCapturedRawHostProfileField(replacement.nativeEdit, expected: binding, registry: registry,
+                sourceAuthority: XperienceTestOwnerAuthority(), checkpointValidator: budget)
+            throw Failure.assertion("raw stale original CAS accepted")
+        } catch VortxNativeHostFieldMutationError.staleRegister {}
+        try check(store.count == count && store.readHostPreferences(scope: scope) == durable, "raw CAS rejection changed durable bytes")
+        // Equal clock+actor/value with changed unknown register metadata is still a
+        // different full observation, and actual merge must reject its contradiction.
+        var contradictory = try OwnerHistoryExactJSON.Object(accepted.bytes)
+        contradictory.set("futureRegister", Data("340282366920938463463374607431768211454".utf8))
+        var remoteFields = try OwnerHistoryExactJSON.Object(Data("{}".utf8)); remoteFields.set(edit.field, try contradictory.encoded())
+        var remoteWrapper = try OwnerHistoryExactJSON.Object(Data("{}".utf8)); remoteWrapper.set("fields", try remoteFields.encoded())
+        var remoteProfiles = try OwnerHistoryExactJSON.Object(Data("{}".utf8)); remoteProfiles.set(owner, try remoteWrapper.encoded())
+        var remote = try OwnerHistoryExactJSON.Object(durableDocument.encoded()); remote.set("profiles", try remoteProfiles.encoded())
+        do {
+            _ = try await session.dispatch([], now: 1001, hostRemoteRaw: remote.encoded())
+            throw Failure.assertion("same-clock/actor raw contradiction merged")
+        } catch VortxNativeError.invalidSnapshot {}
+        try check(store.count == count && store.readHostPreferences(scope: scope) == durable, "contradictory merge wrote")
+        do {
+            _ = try await session.dispatch([], now: 1001,
+                hostEdits: [.init(profileID: owner, fields: [edit.field: replacement.value], rawFields: [edit.field: replacement.raw.value])],
+                hostFieldCAS: .init(profileID: owner, field: edit.field, register: replacement.expectedRegister, raw: replacement.raw),
+                checkpointValidator: budget)
+            throw Failure.assertion("actual Session before-edit raw CAS accepted the old observation")
+        } catch VortxNativeHostFieldMutationError.staleRegister {}
+        try check(store.count == count && store.readHostPreferences(scope: scope) == durable, "raw Session stale CAS wrote")
+        let cancel = try XperienceImportNamespace.appendRaw(document: Self.document(), label: "Raw cancellation", bindings: [:])
+        let gate = XperienceTestGateAuthority()
+        let cancelled = Task {
+            try await facade.setCapturedRawHostProfileField(cancel.nativeEdit, expected: binding, registry: registry,
+                sourceAuthority: gate, checkpointValidator: budget)
+        }
+        let entered = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: gate.entered.wait(timeout: .now() + 5) == .success) }
+        }
+        try check(entered, "raw final authority not reached")
+        cancelled.cancel(); gate.release.signal()
+        do { _ = try await cancelled.value; throw Failure.assertion("raw cancellation reached durability") }
+        catch VortxNativeHostFieldMutationError.cancelled {}
+        try check(store.count == count && store.readHostPreferences(scope: scope) == durable, "raw cancelled checkpoint changed bytes")
+        // Existing typed unrelated edits must materialize against the retained raw baseline.
+        _ = try await session.dispatch([], now: 1002, hostEdits: [.init(profileID: owner, fields: ["avatar": .string("synthetic")])])
+        let unrelated = try OwnerHistoryExactJSON.Object(store.readHostPreferences(scope: scope)!)
+        let unrelatedDocument = try OwnerHistoryExactJSON.Object(unrelated.required("document"))
+        let unrelatedProfiles = try OwnerHistoryExactJSON.Object(unrelatedDocument.required("profiles"))
+        let unrelatedFields = try OwnerHistoryExactJSON.Object(OwnerHistoryExactJSON.Object(unrelatedProfiles.required(owner)).required("fields"))
+        try check(unrelatedFields[edit.field] == accepted.bytes && unrelatedFields[futureField] == future && unrelatedFields[deletedField] == tombstone,
+            "unrelated typed edit rewrote raw registers")
+        // The generic exporter uses the exact production projection, retaining complete
+        // unknown account/native siblings without sending provider/account data to host.
+        let account = try OwnerHistoryAccountExport(completeAccountPlaintext:
+            Data(#"{"legacy":{"exact":340282366920938463463374607431768211455},"nativeSync":{"futureNative":9007199254740993.0},"providerSibling":{"keep":18446744073709551616}}"#.utf8))
+        let exported = try account.projectingGenericHost(native: .object(["schemaVersion": .integer(1)]),
+            host: unrelatedDocument.encoded(), profileEditResults: .object([:]))
+        try check(exported.raw("legacy") == account.raw("legacy") && exported.raw("providerSibling") == account.raw("providerSibling") &&
+            exported.raw("nativeHostPreferences") == unrelatedDocument.encoded(), "generic exporter lost original raw siblings/host")
+        let exportedNative = try OwnerHistoryExactJSON.Object(exported.raw("nativeSync")!)
+        try check(exportedNative["futureNative"] == Data("9007199254740993.0".utf8), "generic native sibling changed")
+        let tiny = try XperienceExportBudget(completeAccountPlaintext: exported.encoded(), maximumSealedBytes: 32, writeV2: true)
+        do {
+            try tiny.validateRawHost(native: .object(["schemaVersion": .integer(1)]), host: unrelatedDocument.encoded(), profileEditResults: .object([:]))
+            throw Failure.assertion("exact raw export budget ignored retained siblings")
+        } catch XperiencePersistenceFailure.exportTooLarge {}
+        await facade.shutdown()
+    }
+    /// Real encrypted Session -> actual Facade -> complete literal production CoreBridge
+    /// callback/lifetime/mailbox -> actual Store subscription. Fixture context and downstream
+    /// metadata receiver are collaborators only; no manually posted notification is used.
+    static func rawPublicationNotifications(_ directory: URL) async throws {
+        let owner = "10000000-0000-0000-0000-000000000094"
+        let actor = "30000000-0000-0000-0000-000000000094"
+        let scope = VortxAccountScope(account: "synthetic.xperience-raw-notifications", ownerProfileID: owner)
+        let backing = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
+        let counted = XperienceCountingCheckpointStore(backing)
+        let initial = try VortxNativeSession(scope: scope, ownerName: "Synthetic", abi: VortxCABI(),
+            store: counted, transport: VortxCResourceTransport(), allowNewAccount: true, hostActor: actor)
+        let snapshot = try await initial.stateJSON()
+        await initial.close()
+        let first = try XperienceImportNamespace.appendRaw(document: document(), label: "First", bindings: [:])
+        var otherCollections = try document().raw.array!
+        var otherCollection = try otherCollections[0].decode([String: VortxJSON].self)
+        otherCollection["id"] = .string("other-notification-collection"); otherCollections[0] = .object(otherCollection)
+        let second = try XperienceImportNamespace.appendRaw(document: XperienceCollections.project(.array(otherCollections)),
+            label: "Other register", bindings: [:])
+        var source = try VortxNativeHostPreferences(scope: scope, actor: actor)
+        try source.editRaw(profileID: owner, field: first.field, value: first.raw.value, scope: scope)
+        try source.editRaw(profileID: owner, field: second.field, value: second.raw.value, scope: scope)
+        var local = try OwnerHistoryExactJSON.Object(source.encoded())
+        var host = try OwnerHistoryExactJSON.Object(local.required("document"))
+        var profiles = try OwnerHistoryExactJSON.Object(host.required("profiles"))
+        var profile = try OwnerHistoryExactJSON.Object(profiles.required(owner))
+        var fields = try OwnerHistoryExactJSON.Object(profile.required("fields"))
+        var other = try OwnerHistoryExactJSON.Object(fields.required(second.field))
+        other.set("futureRegister", Data("340282366920938463463374607431768211455".utf8))
+        fields.set(second.field, try other.encoded()); profile.set("fields", try fields.encoded())
+        profiles.set(owner, try profile.encoded()); host.set("profiles", try profiles.encoded())
+        local.set("document", try host.encoded())
+        try backing.commit(snapshot, scope: scope, hostPreferences: local.encoded())
+        let session = try VortxNativeSession(scope: scope, ownerName: "Synthetic", abi: VortxCABI(),
+            store: counted, transport: VortxCResourceTransport(), hostActor: actor)
+        let core = CoreBridge(), trace = XperienceSourceNotificationTrace()
+        let callback = core.makeNotificationSourceCallbackForFixture()
+        let note = NotificationCenter.default.addObserver(forName: CoreBridge.xperienceContextChangedNote,
+            object: nil, queue: nil) { _ in trace.note() }
+        defer { NotificationCenter.default.removeObserver(note) }
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: session.resourceRegistry(),
+            sourceEvent: { event in trace.event(event); callback(event) }, changed: { _ in })
+        try core.installOriginalForFixture(facade)
+        let store = XperienceCollectionsStore(core: core)
+        let lease = try store.capture()
+        guard let binding = facade.watchlistBinding, let registry = facade.registryBinding,
+              let original = facade.capturedHostProfileSnapshot(expected: binding, registry: registry) else {
+            throw Failure.assertion("notification original source unavailable")
+        }
+        let typed = try await session.hostPreferencesDocument()
+        let previousValues: [String: VortxJSON] = ["native_host_preferences": typed]
+        let originalRaw = [owner: original.rawRegisters]
+        // Complete register metadata at equal clock+actor is rejected by mergeRaw. Do not
+        // waive that rule to manufacture a supposedly accepted runtime event. Instead test
+        // the EXACT production changed-field decision with typed-equal acknowledged evidence.
+        var metadataOnly = try OwnerHistoryExactJSON.Object(original.rawRegisters[second.field]!.bytes)
+        metadataOnly.set("futureRegister", Data("340282366920938463463374607431768211454".utf8))
+        var metadataRaw = original.rawRegisters
+        metadataRaw[second.field] = try VortxRawHostRegister.prepared(metadataOnly.encoded())
+        let actualDecision = VortxNativeCoreFacade.acknowledgedChangedFields(previous: previousValues,
+            acknowledged: previousValues, previousRaw: originalRaw, acknowledgedRaw: [owner: metadataRaw])
+        try check(actualDecision == ["native_host_preferences"], "actual publication decision hid typed-equal other-register metadata")
+        let a = original.rawRegisters[second.field]!, b = metadataRaw[second.field]!
+        let opaqueA = VortxRawHostRegister(bytes: a.bytes, canonical: nil, value: a.value, canonicalValue: nil, metadata: nil)
+        let opaqueB = VortxRawHostRegister(bytes: b.bytes, canonical: nil, value: b.value, canonicalValue: nil, metadata: nil)
+        var noCacheA = original.rawRegisters, noCacheB = original.rawRegisters
+        noCacheA[second.field] = opaqueA; noCacheB[second.field] = opaqueB
+        try check(VortxNativeCoreFacade.acknowledgedChangedFields(previous: previousValues, acknowledged: previousValues,
+            previousRaw: [owner: noCacheA], acknowledgedRaw: [owner: noCacheB]) == ["native_host_preferences"],
+            "two absent canonical caches hid different raw observations")
+        var whitespaceRaw = original.rawRegisters
+        whitespaceRaw[second.field] = try VortxRawHostRegister.prepared(Data(" \n".utf8) + a.bytes + Data(" \n".utf8))
+        try check(VortxNativeCoreFacade.acknowledgedChangedFields(previous: previousValues, acknowledged: previousValues,
+            previousRaw: originalRaw, acknowledgedRaw: [owner: whitespaceRaw]).isEmpty,
+            "successful semantic raw caches lost intended whitespace conflation")
+        // Real Session accepted no-content merge: source canonical equality keeps the
+        // original full register. Neither facade nor actual callback should fabricate a hint.
+        var whitespaceFields = fields; whitespaceFields.set(second.field, whitespaceRaw[second.field]!.bytes)
+        var whitespaceProfile = profile; whitespaceProfile.set("fields", try whitespaceFields.encoded())
+        var whitespaceProfiles = profiles; whitespaceProfiles.set(owner, try whitespaceProfile.encoded())
+        var whitespaceHost = host; whitespaceHost.set("profiles", try whitespaceProfiles.encoded())
+        _ = try await facade.mergeAccountDocumentReceipt(nil, hostRemote: nil, legacyMaterial: nil,
+            hostRemoteRaw: whitespaceHost.encoded())
+        await facade.settled()
+        try check(trace.hostChangeCount == 0 && trace.noteCount == 0 && store.isCurrent(lease) && core.captureCount == 1,
+            "real unchanged raw merge emitted a context hint or recaptured ownership")
+        // Accepted LWW update changes the OTHER register's unknown metadata and advances
+        // its real clock. The real pipeline must deliver a note to the original Store.
+        // This integration case is separate from the typed-equal source decision above.
+        metadataOnly.set("clock", Data("3".utf8))
+        var nextFields = fields; nextFields.set(second.field, try metadataOnly.encoded())
+        var nextProfile = profile; nextProfile.set("fields", try nextFields.encoded())
+        var nextProfiles = profiles; nextProfiles.set(owner, try nextProfile.encoded())
+        var nextHost = host; nextHost.set("profiles", try nextProfiles.encoded())
+        let nextHostBytes = try nextHost.encoded()
+        try await core.observeRealMutationForFixture {
+            _ = try await facade.mergeAccountDocumentReceipt(nil, hostRemote: nil, legacyMaterial: nil,
+                hostRemoteRaw: nextHostBytes)
+        }
+        await facade.settled()
+        try check(trace.hostChangeCount == 1 && trace.noteCount == 1,
+            "actual Session/Facade/CoreBridge callback did not deliver the real host hint")
+        try check(!store.isCurrent(lease) && core.captureCount == 1 && facade.watchlistBinding == binding,
+            "other-register metadata notification failed to retire the original view or recaptured a successor")
+        guard let acknowledged = facade.capturedHostProfileSnapshot(expected: binding, registry: registry) else {
+            throw Failure.assertion("original notification source retired unexpectedly")
+        }
+        try check(VortxRawHostRegister.same(acknowledged.rawRegisters[first.field], original.rawRegisters[first.field]),
+            "other-register notification changed the originally rendered field")
+        let rawOther = try OwnerHistoryExactJSON.Object(acknowledged.rawRegisters[second.field]!.bytes)
+        try check(rawOther["futureRegister"] == Data("340282366920938463463374607431768211454".utf8),
+            "real notification path changed or lost unknown raw register metadata")
+        await facade.shutdown()
+    }
     static func run() async throws {
         guard CommandLine.arguments.count == 2 else { throw Failure.assertion("disposable directory required") }
+        try await rawRetention(URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("raw-register-retention"))
+        try await rawPublicationNotifications(URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("raw-notification"))
         let owner = "10000000-0000-0000-0000-000000000071"
         let scope = VortxAccountScope(account: "synthetic.xperience-checkpoint", ownerProfileID: owner)
         let backing = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[1]),
@@ -348,7 +637,13 @@ private struct XperienceTestOwnerAuthority: VortxMutationAuthority {
         await reopenedFacade.shutdown()
         print("PASS actual native CAS/budget/ABA/registry/unknown-carrier/cancellation/lifetime/preflight/postwrite-reopen")
     }
-    static func main() async {
-        do { try await run() } catch { print("FAIL Xperience native checkpoint components"); exit(1) }
+    static func main() {
+        // The actual Store uses receive(on: RunLoop.main); keep that Foundation delivery
+        // boundary live while the existing real native checkpoint cases await their work.
+        Task { @MainActor in
+            do { try await run(); exit(0) }
+            catch { print("FAIL Xperience native checkpoint components"); exit(1) }
+        }
+        CFRunLoopRun()
     }
 }

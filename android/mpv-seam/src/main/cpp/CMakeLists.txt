@@ -35,7 +35,7 @@ set_target_properties(avcodec PROPERTIES IMPORTED_LOCATION "${AVCODEC_IMPORTED_L
 add_library(
     vortx_mpv_seam
     SHARED
-    main.cpp render.cpp log.cpp jni_utils.cpp property.cpp event.cpp audio_preset.cpp
+    main.cpp render.cpp log.cpp jni_utils.cpp property.cpp event.cpp audio_preset.cpp subtitle_reference.cpp
 )
 
 target_link_libraries(vortx_mpv_seam mpv avcodec log)

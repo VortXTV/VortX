@@ -422,7 +422,7 @@ import Foundation
         let current = try legacyDocument()
         let linked = try XperienceCurationExportMapper.map(
             projection, upstreamCollectionID: collectionID, sourceID: sourceID,
-            into: current, installed: [try candidate()])
+            into: current, installed: .init(admittedCandidates: [try candidate()]))
         try require(linked.raw["overrides"]?["removedFolderIDs"]?.array?.contains(.string("rules")) == true,
                     "mapper preserves legacy local folder tombstones")
         try require(linked.raw["base"]?["folders"]?.array?.contains(where: {
@@ -432,25 +432,45 @@ import Foundation
         try requireFailure(XperienceExportFailure.unsupportedSource, {
             _ = try XperienceCurationExportMapper.map(try mappedProjection(sourceProvider: "foreign"),
                                                        upstreamCollectionID: collectionID, sourceID: sourceID,
-                                                       into: current, installed: [try candidate()])
+                                                       into: current, installed: .init(admittedCandidates: [try candidate()]))
         }, "unsupported provider is not coerced into an addon source")
         try requireFailure(XperienceExportFailure.unsupportedSource, {
             _ = try XperienceCurationExportMapper.map(projection,
                                                        upstreamCollectionID: collectionID, sourceID: sourceID,
-                                                       into: current, installed: [])
+                                                       into: current, installed: .empty)
         }, "missing installed addon binding rejects the complete selection")
         try requireFailure(XperienceExportFailure.unsupportedSource, {
             let second = try candidate(transport: "https://other.example/manifest.json")
             _ = try XperienceCurationExportMapper.map(projection,
                                                        upstreamCollectionID: collectionID, sourceID: sourceID,
-                                                       into: current, installed: [try candidate(), second])
+                                                       into: current, installed: .init(admittedCandidates: [try candidate(), second]))
         }, "ambiguous installed addon binding rejects instead of choosing first")
+
+        let installedCatalog: VortxJSON = .array([.object(["type": .string("movie"), "id": .string("catalog")])])
+        let originalValid = VortxResourceAddon(id: "synthetic-valid", transportUrl: "https://addon.example/manifest.json",
+            manifest: .object(["id": .string("addon.example"), "catalogs": installedCatalog]))
+        func rejected(_ id: String) -> VortxResourceAddon {
+            .init(id: "synthetic-rejected", transportUrl: "https://other.example/invalid path/manifest.json",
+                manifest: .object(["id": .string(id), "catalogs": installedCatalog, "futureOpaque": .string("retain")]))
+        }
+        let isolated = try XperienceInstalledCatalogs.project([rejected("unrelated.example"), originalValid])
+        let isolatedMapped = try XperienceCurationExportMapper.map(projection,
+            upstreamCollectionID: collectionID, sourceID: sourceID, into: current, installed: isolated)
+        let isolatedBytes = try XperienceCollections.canonicalData(isolatedMapped.raw)
+        let linkedBytes = try XperienceCollections.canonicalData(linked.raw)
+        try require(isolatedBytes == linkedBytes,
+                    "actual curation mapper retains a valid unrelated installed source after attributable rejection")
+        let rejectedSameID = try XperienceInstalledCatalogs.project([rejected("addon.example"), originalValid])
+        try requireFailure(XperienceExportFailure.unsupportedSource, {
+            _ = try XperienceCurationExportMapper.map(projection,
+                upstreamCollectionID: collectionID, sourceID: sourceID, into: current, installed: rejectedSameID)
+        }, "actual curation mapper cannot bypass rejected same-ID awareness through a filtered array")
 
         let unknown = try unknownRichDocument()
         let refreshed = try XperienceCurationExportMapper.map(projection,
                                                                upstreamCollectionID: collectionID,
                                                                sourceID: sourceID, into: unknown,
-                                                               installed: [try candidate()])
+                                                               installed: .init(admittedCandidates: [try candidate()]))
         try require(refreshed.raw["base"]?["futureBaseLeaf"] == .string("keep") &&
                     refreshed.raw["base"]?["presentation"]?["futurePresentationLeaf"] == .string("keep") &&
                     refreshed.raw["base"]?["artwork"]?["futureBaseArtworkLeaf"] == .string("keep") &&
@@ -468,7 +488,7 @@ import Foundation
         try requireFailure(XperienceExportFailure.missingCollection, {
             _ = try XperienceCurationExportMapper.map(missing,
                                                        upstreamCollectionID: collectionID, sourceID: sourceID,
-                                                       into: current, installed: [try candidate()])
+                                                       into: current, installed: .init(admittedCandidates: [try candidate()]))
         }, "selected upstream collection ID must exist in the admitted profile")
     }
 
@@ -558,15 +578,15 @@ import Foundation
         var retirements = 0
         var invalidateContextAfterSave = false
         var afterSave: (() -> Void)?
-        let installed: [XperienceAddonBinding.Candidate]
+        let installed: XperienceInstalledCatalogs.Snapshot
 
-        init(session: CurationEditSession, installed: [XperienceAddonBinding.Candidate] = []) {
+        init(session: CurationEditSession, installed: XperienceInstalledCatalogs.Snapshot = .empty) {
             self.session = session; self.installed = installed
         }
         func captureXperienceExportEdit(_ collection: SmartCollection) throws -> CurationEditSession { session }
         func xperienceExportEditIsCurrent(_ session: CurationEditSession) -> Bool { current }
         func xperienceExportContextIsCurrent(_ session: CurationEditSession) -> Bool { contextCurrent }
-        func xperienceExportCandidates(_ session: CurationEditSession) throws -> [XperienceAddonBinding.Candidate] {
+        func xperienceExportCandidates(_ session: CurationEditSession) throws -> XperienceInstalledCatalogs.Snapshot {
             installed
         }
         func saveXperienceExport(_ document: CurationDocument, session: CurationEditSession) async throws {
@@ -743,7 +763,7 @@ import Foundation
 
     static func controllerCASAndSyncDistinction() async throws {
         let (collection, session) = try sessionFixture()
-        let fixture = ExportStoreFixture(session: session, installed: [try candidate()])
+        let fixture = ExportStoreFixture(session: session, installed: .init(admittedCandidates: [try candidate()]))
         fixture.saveError = CurationFailure.staleRevision
         let mappedPayload = try data(envelope(.array([mappedCollectionValue()])))
         let backend = CredentialBackend()
@@ -771,7 +791,7 @@ import Foundation
                     "failed native CAS leaves the prior private URL credential unchanged")
 
         let (postACKCollection, postACKSession) = try sessionFixture()
-        let postACKFixture = ExportStoreFixture(session: postACKSession, installed: [try candidate()])
+        let postACKFixture = ExportStoreFixture(session: postACKSession, installed: .init(admittedCandidates: [try candidate()]))
         postACKFixture.invalidateContextAfterSave = true // same owner, changed install/registry witness.
         let postACKBackend = CredentialBackend()
         let postACKAuthority = CredentialScopeRegistry(initialScope: .signedOutDevice)
@@ -795,7 +815,7 @@ import Foundation
 
         let (credentialFailureCollection, credentialFailureSession) = try sessionFixture()
         let credentialFailureFixture = ExportStoreFixture(session: credentialFailureSession,
-                                                           installed: [try candidate()])
+                                                           installed: .init(admittedCandidates: [try candidate()]))
         let credentialFailureBackend = CredentialBackend()
         credentialFailureFixture.afterSave = { credentialFailureBackend.failReads = true }
         let credentialFailureAuthority = CredentialScopeRegistry(initialScope: .signedOutDevice)
@@ -824,7 +844,7 @@ import Foundation
                     "reconnect-needed UI message does not claim account sync or a complete link")
 
         let (finalReadCollection, finalReadSession) = try sessionFixture()
-        let finalReadFixture = ExportStoreFixture(session: finalReadSession, installed: [try candidate()])
+        let finalReadFixture = ExportStoreFixture(session: finalReadSession, installed: .init(admittedCandidates: [try candidate()]))
         let finalReadBackend = CredentialBackend()
         finalReadFixture.afterSave = { finalReadBackend.failFinalReadAfterWriteCertification() }
         let finalReadAuthority = CredentialScopeRegistry(initialScope: .signedOutDevice)
@@ -852,7 +872,7 @@ import Foundation
 
     static func successfulLinkAndExplicitRefresh() async throws {
         let (collection, baselineSession) = try sessionFixture()
-        let linkFixture = ExportStoreFixture(session: baselineSession, installed: [try candidate()])
+        let linkFixture = ExportStoreFixture(session: baselineSession, installed: .init(admittedCandidates: [try candidate()]))
         let backend = CredentialBackend()
         let authority = CredentialScopeRegistry(initialScope: .signedOutDevice)
         let vault = XperienceExportCredentialVault(store: backend.store(), authority: authority)
@@ -875,7 +895,7 @@ import Foundation
         // A new gesture/session reads the saved common document, but the same owner-scoped vault
         // carries the private URL. Refresh is an explicit user action, never an implicit poll.
         let refreshSession = sessionFrom(baselineSession, document: saved)
-        let refreshFixture = ExportStoreFixture(session: refreshSession, installed: [try candidate()])
+        let refreshFixture = ExportStoreFixture(session: refreshSession, installed: .init(admittedCandidates: [try candidate()]))
         let refreshProbe = TransportProbe(payload: payload)
         let refreshController = XperienceCurationExportController(
             store: refreshFixture, vault: vault, authority: authority,

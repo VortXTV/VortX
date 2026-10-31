@@ -469,6 +469,7 @@ struct TVPlayerView: View {
     @State private var addedSubURLs: Set<String> = []
     @State private var subtitleLoadingURL: String?     // an add-on subtitle is downloading (shows Loading… in its row)
     @State private var subtitleAlignmentPresentation: SubtitleAlignmentPresentationRequest?
+    @State private var addonSubtitlePreparationTask: Task<Void, Never>?
     @State private var subtitlePresentationEpoch = UUID()
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
     // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
@@ -490,6 +491,8 @@ struct TVPlayerView: View {
     @State private var addedPooledIDs: Set<Int> = []
     @State private var pooledSeededOffset = false
     @State private var embeddedUploadDone = false
+    @State private var embeddedContributionTask: Task<Void, Never>?
+    @State private var embeddedContributionLoad: SubtitlePoolClient.ContributionLoad?
     @State private var langContributeDone = false      // the container language-index contribute ran once this session
     @State private var offsetCaptureTask: Task<Void, Never>?
     /// Debounced persist of the manual subtitle offset (W2-B FIX 2). One write per nudge burst instead of one
@@ -1030,6 +1033,17 @@ struct TVPlayerView: View {
     @State private var showStats = false                // live playback info overlay
     @State private var statsRows: [(String, String)] = []
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
+    @State private var showWatchParty = false
+    @State private var watchPartyModel: WatchPartyPanelModel?
+    @StateObject private var watchPartyOwner = TVWatchPartyPlaybackOwner()
+    @State private var watchPartyAuthWitness: VortXWatchPartyAuthSnapshot?
+    @State private var watchPartyTargetWitness: PlaybackMutationTarget?
+    @State private var watchPartyLoadWitness: PlayerLoadToken?
+    @State private var watchPartySourceWitness: Int?
+    @State private var watchPartyEpisodeWitness: Int?
+    @State private var watchPartyRouteWitness: Bool?
+    @State private var watchPartySessionWitness: String?
+    @State private var watchPartyVideoWitness: String?
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
     @State private var localTrickplayCaptureBreaker = TrickplayLocalCaptureBreaker()
     @State private var lastLocalTrickplayCapture = -1000.0
@@ -1141,9 +1155,12 @@ struct TVPlayerView: View {
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
+            // The room panel uses real SwiftUI focus. Removing the catcher retires its held-remote
+            // repeats and callbacks instead of leaving its exclusive UIKit focus lock above the panel.
+            if !showWatchParty {
             RemoteCatcher(
                 onPress: { handlePress($0) },
-                onSwipe: { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } },
+                onSwipe: { if !showWatchParty { noteInteraction(); if !stillWatching && !showStreamQR { showControls() } } },
                 accessibilityItems: remoteAccessibilityItems,
                 accessibilityFocusedID: remoteAccessibilityFocusedID,
                 accessibilityAnnouncement: remoteAccessibilityAnnouncement,
@@ -1152,6 +1169,7 @@ struct TVPlayerView: View {
                 onAccessibilityAdjust: remoteAccessibilityAdjust,
                 onAccessibilityEscape: { handlePress(.menu) }
             )
+            }
 
             if buffering && !loadFailed {
                 VStack(spacing: Theme.Space.md) {
@@ -1206,6 +1224,9 @@ struct TVPlayerView: View {
                     .allowsHitTesting(false)
             }
             if stillWatching { stillWatchingOverlay }
+            if showWatchParty, let model = watchPartyModel {
+                TVWatchPartyRoomPresentation(model: model, onClose: closeWatchPartyPanel)
+            }
         }
         // Every control in the player carries the chosen accent, however it was presented.
         .tint(Theme.Palette.accent)
@@ -1360,8 +1381,31 @@ struct TVPlayerView: View {
         // Quality buttons must appear when they do. `streamsEpoch` bumps ONLY when the engine's ready-stream
         // set actually changed, so this is the exact, cheap edge the cached counts need: no per-body-pass walk,
         // and no waiting for the viewer to open a panel before the buttons show up.
+        .onReceive(WatchPartyPendingInvite.shared.$invite) { invite in
+            // The strict shared holder validates the full fragment URL. Opening the panel never joins.
+            if invite != nil, !showWatchParty { openWatchPartyPanel() }
+        }
+        .onReceive(ProfileStore.shared.$activeID.dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onReceive(VortXSyncManager.shared.$isSignedIn.dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onReceive(VortXSyncManager.shared.$account.map { $0?.id }.removeDuplicates().dropFirst()) { _ in
+            invalidateWatchParty()
+        }
+        .onChange(of: coordinator.player?.activeLoadToken) { invalidateWatchParty() }
+        .onChange(of: playbackMutationTarget) { invalidateWatchParty() }
+        .onChange(of: hasStartedPlaying) { _, ready in
+            if ready, WatchPartyPendingInvite.shared.invite != nil, !showWatchParty { openWatchPartyPanel() }
+        }
+        .onChange(of: playbackSessionID) { invalidateWatchParty() }
+        .onChange(of: curMeta?.videoId) { invalidateWatchParty() }
+        .onChange(of: episodeSwitchGeneration) { invalidateWatchParty() }
+        .onChange(of: isAVPlayerActive) { invalidateWatchParty() }
+        .onChange(of: reconnecting) { _, active in if active { invalidateWatchParty() } }
         .onChange(of: playbackDeadlineClock.isPaused) { refreshPlaybackIdleTimer() }
-        .onChange(of: loadFailed) { refreshPlaybackIdleTimer() }
+        .onChange(of: loadFailed) { if loadFailed { invalidateWatchParty() }; refreshPlaybackIdleTimer() }
         .onChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
@@ -1385,6 +1429,7 @@ struct TVPlayerView: View {
             consumePendingManualEpisodeNavigationIfReady()
         }
         .onChange(of: sourceSwitchGeneration) {
+            invalidateWatchParty()
             fetchSkipTimestamps()
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
@@ -1392,6 +1437,9 @@ struct TVPlayerView: View {
             hydrateDirectResumeSeriesInventory()
         }
         .onDisappear {
+            invalidateWatchParty()
+            embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
+            embeddedContributionTask?.cancel(); embeddedContributionTask = nil
             invalidateSubtitleAlignmentPresentation()
             TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
             cancelEmptySourceRecovery()
@@ -2001,6 +2049,9 @@ struct TVPlayerView: View {
             )
             if name == MPVProperty.duration, let seconds = data as? Double {
                 completionEvidence.recordDuration(seconds, owner: loadToken)
+                if let source = TrickplayCaptureSource(player: coordinator.player, loadToken: loadToken) {
+                    scrubThumbnails.observeNativeCaptureDuration(seconds, source: source)
+                }
             } else if name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
                       event.loadToken == loadToken {
                 completionEvidence.recordPosition(event.seconds, owner: loadToken)
@@ -2270,21 +2321,11 @@ struct TVPlayerView: View {
                     // state then ride the ordinary tick / pause handlers below. Seeks go through the engine
                     // RELATIVE/ABSOLUTE calls so they always act on the LIVE position, never a captured one.
                     NowPlayingCenter.wireCommands(
-                        play: { viewerPlay() },
-                        pause: { viewerPause() },
+                        play: { viewerPlay(shareWithParty: true) },
+                        pause: { viewerPause(shareWithParty: true) },
                         togglePause: { viewerToggle() },
-                        seekBy: { delta in
-                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-                            if handleDeferredResumeUserSeek(.relative(delta)) { return }
-                            cancelPendingLibmpvResumeForUserSeek()
-                            coordinator.player?.seek(by: delta)
-                        },
-                        seekTo: { position in
-                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-                            if handleDeferredResumeUserSeek(.absolute(position)) { return }
-                            cancelPendingLibmpvResumeForUserSeek()
-                            coordinator.player?.seek(to: position)
-                        },
+                        seekBy: { delta in seek(delta) },
+                        seekTo: { position in issueSeek(to: position, reason: "system-seek") },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
                     refreshNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
@@ -2728,6 +2769,7 @@ struct TVPlayerView: View {
     // MARK: - Remote handling (all input arrives here from the UIKit catcher)
 
     private func handlePress(_ type: UIPress.PressType) {
+        guard !showWatchParty else { return } // reject a queued catcher callback before dismantle
         noteInteraction()   // any remote press is presence: re-arm the "Still watching?" idle guard
         if stillWatching {
             switch type {
@@ -2888,14 +2930,15 @@ struct TVPlayerView: View {
         // settings cluster (gear, aspect, speed, sources, quality), then the centre transport, then
         // the right track cluster (audio, subs, episodes, chapters). Keeping this in step with the
         // visual order is what makes d-pad focus land where the eye expects.
+        let episodeControls = episodeControlAvailability
         var c: [Control] = [.settings, .aspect, .playback]
         if hasAlternateSources { c.append(.sources) }
         if hasQualityOptions { c.append(.quality) }
         c.append(.restart)
         c.append(.back)
-        if showsPreviousEpisodeControl { c.append(.prev) }
+        if episodeControls.previous { c.append(.prev) }
         c.append(.play)
-        if showsNextEpisodeControl { c.append(.next) }
+        if episodeControls.next { c.append(.next) }
         c.append(.fwd)
         if !audioTracks.isEmpty { c.append(.audio) }
         c.append(.subs)
@@ -3119,7 +3162,8 @@ struct TVPlayerView: View {
     }
 
     private var controlBar: some View {
-        VStack(spacing: 0) {
+        let episodeControls = episodeControlAvailability
+        return VStack(spacing: 0) {
             HStack(alignment: .top, spacing: Theme.Space.lg) {
                 ctrlButton(.close, "chevron.left")
                 Spacer(minLength: Theme.Space.lg)
@@ -3152,9 +3196,9 @@ struct TVPlayerView: View {
                     HStack(spacing: Theme.Space.md) {
                         ctrlButton(.restart, "arrow.counterclockwise")
                         ctrlButton(.back, "gobackward.\(seekStep)")
-                        if showsPreviousEpisodeControl { ctrlButton(.prev, "backward.end.fill") }
+                        if episodeControls.previous { ctrlButton(.prev, "backward.end.fill") }
                         ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true)
-                        if showsNextEpisodeControl { ctrlButton(.next, "forward.end.fill") }
+                        if episodeControls.next { ctrlButton(.next, "forward.end.fill") }
                         ctrlButton(.fwd, "goforward.\(seekStep)")
                     }
                     // Left cluster: the gear plus the "how it plays" controls (aspect, speed, source and
@@ -3503,42 +3547,9 @@ struct TVPlayerView: View {
                     let loading = subtitleLoadingURL == sub.url
                     rows.append(OptionRow(label: sub.displayTitle,
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
-                        // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
-                        // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
-                        // until the track arrives (then it moves into the embedded list above).
-                        // Bind the engine BEFORE latching subtitleLoadingURL: `coordinator.player` is a weak
-                        // reference that is nil in the engine demote/switch render gap (see
-                        // demoteAVPlayerToMPV's deferral note), and an optional-chained call there would
-                        // swallow the completion, stranding the latch so EVERY later subtitle pick is
-                        // silently dead for the session (the "stuck on Loading…" report).
-                        invalidateSubtitleAlignmentPresentation()
-                        guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
-                        userPickedSubtitle = true
-                        suppressRapidBufferingRecovery(reason: "user external subtitle")
-                        subtitleLoadingURL = sub.url
-                        refreshTracksSoon()
-                        let subtitlePresentationID = subtitlePresentationEpoch
-                        let subtitleLoadToken = player.activeLoadToken
-                        let subtitleVideoID = curMeta?.videoId
-                        player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
-                            guard permitsSubtitlePublication(
-                                loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID
-                            ) else { return }
-                            subtitleLoadingURL = nil
-                            // Record the add ONLY when it landed on the still-live engine: a demote/switch
-                            // mid-download applies the sub to the dead engine, and recording it would drop
-                            // the row from the list with nothing rendering (dead until panel re-open).
-                            if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
-                            else if !ok { showEngineNote(String(localized: "Subtitle failed to load")) }   // honest failure (iOS shows an alert; tvOS showed nothing)
-                            if ok, player === coordinator.player {
-                                applyCurrentSubtitleDelayIfReady(force: false)
-                            }
-                            refreshTracksSoon()
-                            VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on ok=\(ok))")
-                        }
+                        selectAddonSubtitle(sub)
                     })
-                    if URL(string: sub.url)?.pathExtension.lowercased() == "srt",
-                       alignmentAvailable {
+                    if alignmentAvailable {
                         rows.append(OptionRow(label: String(localized: "Auto-align") + " · " + sub.displayTitle,
                             detail: String(localized: "Match timing to embedded subtitles"),
                             isSelected: aligned?.url == sub.url) {
@@ -4071,6 +4082,10 @@ struct TVPlayerView: View {
         var rows: [OptionRow] = []
         if !isTrailer {
             rows.append(OptionRow(label: "Playback queue", detail: "\(PlaybackTitleQueue.shared.count)  ›") { openPanel(.queue) })
+            // Ships dark: the account service's party routes are not live yet. RemoteConfig turns it on.
+            if RemoteConfig.snapshot.isFeatureOn("watchParty", default: false) {
+                rows.append(OptionRow(label: "Watch Party", detail: "›") { openWatchPartyPanel() })
+            }
         }
         // Handoff only when the URL is self-contained. A header-gated stream needs specific request
         // headers (it is either playing through our embedded /proxy/ on a loopback URL, or as a
@@ -4504,6 +4519,7 @@ struct TVPlayerView: View {
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         invalidateSubtitlePresentationForReplacement()
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         addedPooledIDs = []; embeddedUploadDone = false
         langContributeDone = false
     }
@@ -5296,8 +5312,9 @@ struct TVPlayerView: View {
     }
 
     private func refreshTracks() {
-        audioTracks = coordinator.player?.tracks(ofType: "audio") ?? []
-        subtitleTracks = coordinator.player?.tracks(ofType: "sub") ?? []
+        let tracks = coordinator.player?.audioAndSubtitleTracks()
+        audioTracks = tracks?.audio ?? []
+        subtitleTracks = tracks?.subtitles ?? []
     }
     private func refreshTracksSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
@@ -6489,7 +6506,7 @@ struct TVPlayerView: View {
             preventIdle: !leftPlayback && !loadFailed && !playbackDeadlineClock.isPaused)
     }
 
-    private func viewerPause() {
+    private func viewerPause(shareWithParty: Bool = false) {
         watchedDwell.reset()
         // Teardown can temporarily leave no controller; the replacement still owes this input.
         localNNTPStallRecovery.suspend()
@@ -6498,14 +6515,16 @@ struct TVPlayerView: View {
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(true)
         coordinator.player?.pause()
+        if shareWithParty { shareWatchPartyControl("pause", at: currentTime) }
     }
 
-    private func viewerPlay() {
+    private func viewerPlay(shareWithParty: Bool = false) {
         recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(false)
         coordinator.player?.play()
+        if shareWithParty { shareWatchPartyControl("play", at: currentTime) }
     }
 
     private func updateIncomingPauseIntent(_ paused: Bool) {
@@ -6538,7 +6557,8 @@ struct TVPlayerView: View {
     }
 
     private func viewerToggle() {
-        if playbackDeadlineClock.isPaused { viewerPlay() } else { viewerPause() }
+        if playbackDeadlineClock.isPaused { viewerPlay(shareWithParty: true) }
+        else { viewerPause(shareWithParty: true) }
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -8278,27 +8298,7 @@ struct TVPlayerView: View {
         // language match the embedded selector uses, so "tur"/"tr-TR" still hit a "tr" preference).
         let pick = TrackSelector.preferredSubtitle(in: addonSubs, languages: prefs.subtitleLanguages, language: \.lang)
         if let sub = pick {
-            // Bind the engine BEFORE latching anything: in the engine demote/switch render gap
-            // `coordinator.player` is nil, and an optional-chained call would swallow the completion,
-            // stranding `subtitleLoadingURL` (every later pick then silently no-ops). Returning WITHOUT
-            // latching `autoAddonSubTried` lets the next list/track completion retry on the live engine.
-            guard let player = coordinator.player else { return }
-            autoAddonSubTried = true
-            subtitleLoadingURL = sub.url
-            let subtitlePresentationID = subtitlePresentationEpoch
-            let subtitleLoadToken = player.activeLoadToken
-            let subtitleVideoID = curMeta?.videoId
-            player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
-                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID, presentationID: subtitlePresentationID) else { return }
-                subtitleLoadingURL = nil
-                // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
-                if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
-                if ok, player === coordinator.player {
-                    applyCurrentSubtitleDelayIfReady(force: false)
-                }
-                refreshTracksSoon()
-                VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok))")
-            }
+            selectAddonSubtitle(sub, automatic: true)
             return
         }
         // Tier 2 - community-pooled subtitles, when no add-on had the chain language. Same tolerant match.
@@ -8306,7 +8306,7 @@ struct TVPlayerView: View {
         if let sub = pooledPick {
             autoAddonSubTried = true
             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community auto)")
-            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated download -> addExternalSubtitle -> addedPooledIDs
+            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated bytes -> owned automatic selection -> addedPooledIDs
             return
         }
         // No chain match. Latch only once BOTH async lists have arrived (each completion re-calls this), so a
@@ -8400,6 +8400,7 @@ struct TVPlayerView: View {
               player.subtitleDelayAvailable,
               let loadToken = player.activeLoadToken else { return }
         if !force {
+            guard subtitleAlignmentPresentation?.selectsRequestedFile != true else { return }
             guard subDelay != 0 else { return }
             if subtitleDelayAppliedLoadToken == loadToken { return }
         }
@@ -8407,29 +8408,212 @@ struct TVPlayerView: View {
         subtitleDelayAppliedLoadToken = loadToken
     }
 
-    /// Retire only the pending alignment's UI and original engine. Ordinary downloads keep
-    /// their existing latch when no alignment owns it; same-URL successor work is never cleared.
+    /// Clear only the request whose presentation UUID still owns the shared loading row.
+    private func clearAddonSubtitlePreparation(presentationID: UUID, url: String) -> Bool {
+        guard subtitleAlignmentPresentation?.id == presentationID else { return false }
+        // Do not cancel the source permit after a successful mount; the engine owns its revision lifetime.
+        addonSubtitlePreparationTask = nil
+        subtitleAlignmentPresentation = nil
+        if subtitleLoadingURL == url { subtitleLoadingURL = nil }
+        return true
+    }
+
+    private func refreshAddonSubtitleRows() {
+        if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
+    }
+
+    private func startAddonSubtitlePreparation(
+        _ subtitle: AddonSubtitle,
+        presentation: SubtitleAlignmentPresentationRequest,
+        player: any PlayerEngine,
+        load: PlayerLoadToken,
+        loadLifetime: SubtitlePoolClient.ContributionLoad,
+        revision: UInt64,
+        target: PlaybackMutationTarget,
+        owner: PlayerSubtitleAlignmentOwner?,
+        videoID: String?,
+        credential: CredentialScopeRegistry.Capture,
+        applicationEpoch: UUID,
+        failure: (@MainActor () -> Void)?,
+        onPrepared: @escaping @MainActor (PlayerLocalSubtitleSource,
+            SubtitleEmbeddedExtractor.TimingWindowCancellation) -> Void
+    ) {
+        let cancellation = presentation.preparationCancellation
+        let permit = AddonSubtitleFileClient.FreshnessPermit(for: subtitle) {
+            !cancellation.isCancelled && loadLifetime.isCurrent
+                && CredentialScopeRegistry.shared.isCurrent(credential)
+                && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+        }
+        let task = Task { @MainActor in
+            do {
+                let file = try await AddonSubtitleFileClient.fetch(subtitle, permit: permit)
+                let current = !cancellation.isCancelled
+                    && subtitleAlignmentPresentation?.id == presentation.id
+                    && subtitlePresentationEpoch == presentation.id
+                    && subtitleLoadingURL == subtitle.url
+                    && player === coordinator.player
+                    && player.activeLoadToken == load
+                    && loadLifetime.isCurrent
+                    && player.subtitleAlignmentRevision == revision
+                    && target.stillOwnsCurrentContext(core: core)
+                    && curMeta?.videoId == videoID
+                    && CredentialScopeRegistry.shared.isCurrent(credential)
+                    && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                    && (owner.map { $0.applicationEpoch == applicationEpoch && $0.account == credential } ?? true)
+                guard current else {
+                    presentation.preparationCancellation.cancel()
+                    if clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) {
+                        refreshAddonSubtitleRows()
+                    }
+                    return
+                }
+                guard let source = PlayerLocalSubtitleSource.installedAddon(file) else {
+                    presentation.preparationCancellation.cancel()
+                    guard clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) else { return }
+                    failure?()
+                    refreshAddonSubtitleRows()
+                    return
+                }
+                addonSubtitlePreparationTask = nil
+                onPrepared(source, cancellation)
+            } catch {
+                guard subtitleAlignmentPresentation?.id == presentation.id else { return }
+                let current = !cancellation.isCancelled
+                    && subtitlePresentationEpoch == presentation.id
+                    && subtitleLoadingURL == subtitle.url
+                    && player === coordinator.player
+                    && player.activeLoadToken == load
+                    && loadLifetime.isCurrent
+                    && player.subtitleAlignmentRevision == revision
+                    && target.stillOwnsCurrentContext(core: core)
+                    && curMeta?.videoId == videoID
+                    && CredentialScopeRegistry.shared.isCurrent(credential)
+                    && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                    && (owner.map { $0.applicationEpoch == applicationEpoch && $0.account == credential } ?? true)
+                if !current { presentation.preparationCancellation.cancel() }
+                guard clearAddonSubtitlePreparation(presentationID: presentation.id, url: subtitle.url) else { return }
+                if current { failure?() }
+                refreshAddonSubtitleRows()
+            }
+        }
+        addonSubtitlePreparationTask = task
+    }
+
+    /// Retire only the pending presentation and original engine request. Same-URL successor work is never cleared.
     private func invalidateSubtitleAlignmentPresentation() {
+        addonSubtitlePreparationTask?.cancel()
+        addonSubtitlePreparationTask = nil
         guard let original = subtitleAlignmentPresentation else { return }
+        original.preparationCancellation.cancel()
         subtitleAlignmentPresentation = nil
         subtitlePresentationEpoch = UUID()
         if subtitleLoadingURL == original.url { subtitleLoadingURL = nil }
         if let request = original.requestGeneration {
-            (original.player as? MPVMetalViewController)?.cancelAutomaticSubtitleAlignment(ifRequestGeneration: request)
+            original.player?.cancelAutomaticSubtitleAlignment(ifRequestGeneration: request)
         }
     }
 
     private func invalidateSubtitlePresentationForReplacement() {
+        embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         invalidateSubtitleAlignmentPresentation()
         subtitlePresentationEpoch = UUID()
         subtitlePoolRequests.invalidate()
         subtitleLoadingURL = nil
     }
 
-    /// A subtitle request may finish after an episode load or same-episode reload replaced the player item.
-    /// Require both its opaque load token and its content identity before publishing completion state.
-    /// Keep ordinary subtitle selection separate from this explicit automatic timing request.
-    /// Its mounted owner is captured before the first asynchronous operation, never on completion.
+    /// Normal manual and preferred-language picks share the same original selection transaction.
+    /// Capture owner/load/presentation before alignment or ordinary mounting can change the primary.
+    private func selectAddonSubtitle(_ sub: AddonSubtitle, automatic: Bool = false) {
+        if automatic {
+            guard !autoAddonSubTried, !userPickedSubtitle, subtitleLoadingURL == nil else { return }
+        } else {
+            invalidateSubtitleAlignmentPresentation()
+        }
+        guard subtitleLoadingURL == nil, let player = coordinator.player,
+              let load = player.activeLoadToken else { return }
+        restoreSubtitleTimingOffsetIfReady()
+        applyCurrentSubtitleDelayIfReady(force: false)
+        let target = playbackMutationTarget
+        guard target.stillOwnsCurrentContext(core: core) else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+            return
+        }
+        guard let loadLifetime = player.captureSubtitleContributionLoad(for: load),
+              let revision = player.subtitleAlignmentRevision,
+              let applicationEpoch = LegacyWatchOwnership.captureApplicationEpoch() else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+            return
+        }
+        let credential = CredentialScopeRegistry.shared.capture()
+        let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: target)
+        guard !(player is MPVMetalViewController) || owner != nil,
+              owner.map({ $0.applicationEpoch == applicationEpoch && $0.account == credential }) ?? true else {
+            if !automatic {
+                showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+            return
+        }
+        if automatic { autoAddonSubTried = true } else { userPickedSubtitle = true }
+        let video = curMeta?.videoId
+        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: sub.url,
+            selectsRequestedFile: true)
+        subtitlePresentationEpoch = presentation.id
+        subtitleAlignmentPresentation = presentation
+        subtitlePoolRequests.invalidate()
+        if !automatic { suppressRapidBufferingRecovery(reason: "user external subtitle") }
+        subtitleLoadingURL = sub.url
+        refreshAddonSubtitleRows()
+        startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
+            loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
+            videoID: video, credential: credential, applicationEpoch: applicationEpoch,
+            failure: automatic ? nil : {
+                self.showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }) { source, cancellation in
+                let request = player.selectLocalExternalSubtitleAutomatically(source,
+                    title: sub.displayTitle, lang: sub.lang, owner: owner,
+                    expectedLoad: load, expectedRevision: revision) { result in
+                    guard self.subtitleAlignmentPresentation?.id == presentation.id else { return }
+                    let mayPublish = !cancellation.isCancelled
+                        && player === self.coordinator.player
+                        && self.permitsSubtitlePublication(loadToken: load, videoID: video,
+                            presentationID: presentation.id)
+                        && loadLifetime.isCurrent
+                        && target.stillOwnsCurrentContext(core: self.core)
+                        && CredentialScopeRegistry.shared.isCurrent(credential)
+                        && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                        && (owner.map { LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) && $0.account == credential } ?? true)
+                    guard self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url) else { return }
+                    guard mayPublish else { self.refreshAddonSubtitleRows(); return }
+                    if result.succeeded {
+                        if case .selectedWithoutAlignment = result {
+                            self.addedSubURLs.insert(sub.url)
+                            self.applyCurrentSubtitleDelayIfReady(force: false)
+                            self.subtitlePoolRequests.invalidate()
+                            self.fetchPooledSubtitles()
+                        } else if self.subDelay == 0 {
+                            self.pooledSeededOffset = true
+                            self.subDelay = 0
+                            self.subtitleDelayAppliedLoadToken = load
+                        } else {
+                            self.applyCurrentSubtitleDelayIfReady(force: false)
+                        }
+                        // Successful UI completion does not revoke the source permit held by the engine.
+                    }
+                    if !automatic, let message = result.failureMessage { self.showEngineNote(message) }
+                    self.refreshAddonSubtitleRows()
+                }
+                if self.subtitleAlignmentPresentation?.id == presentation.id {
+                    self.subtitleAlignmentPresentation?.requestGeneration = request
+                    self.addonSubtitlePreparationTask = nil
+                }
+            }
+    }
+
     private func alignAddonSubtitle(_ sub: AddonSubtitle) {
         invalidateSubtitleAlignmentPresentation()
         guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
@@ -8437,7 +8621,20 @@ struct TVPlayerView: View {
             showEngineNote(PlayerSubtitleAlignmentResult.unavailable.failureMessage ?? "")
             return
         }
-        guard let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget) else {
+        let target = playbackMutationTarget
+        guard target.stillOwnsCurrentContext(core: core) else {
+            showEngineNote(PlayerSubtitleAlignmentResult.superseded.failureMessage ?? "")
+            return
+        }
+        guard let loadLifetime = player.captureSubtitleContributionLoad(for: load),
+              let revision = player.subtitleAlignmentRevision,
+              let applicationEpoch = LegacyWatchOwnership.captureApplicationEpoch() else {
+            showEngineNote(PlayerSubtitleAlignmentResult.unavailable.failureMessage ?? "")
+            return
+        }
+        let credential = CredentialScopeRegistry.shared.capture()
+        guard let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: target),
+              owner.applicationEpoch == applicationEpoch, owner.account == credential else {
             showEngineNote(PlayerSubtitleAlignmentResult.superseded.failureMessage ?? "")
             return
         }
@@ -8448,32 +8645,42 @@ struct TVPlayerView: View {
         subtitleAlignmentPresentation = presentation
         subtitlePoolRequests.invalidate()
         subtitleLoadingURL = sub.url
-        refreshTracksSoon()
-        let requestGeneration = player.alignExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang, owner: owner) { result in
-            guard subtitleAlignmentPresentation?.id == presentation.id,
-                  player === coordinator.player,
-                  permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
-                  subtitleLoadingURL == sub.url else { return }
-            subtitleAlignmentPresentation = nil
-            subtitleLoadingURL = nil
-            guard playbackMutationTarget.stillOwnsCurrentContext(core: core),
-                  LegacyWatchOwnership.applicationEpochIsCurrent(owner.applicationEpoch) else { return }
-            if let message = result.failureMessage {
-                showEngineNote(message)
+        refreshAddonSubtitleRows()
+        startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
+            loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
+            videoID: video, credential: credential, applicationEpoch: applicationEpoch,
+            failure: {
+                self.showEngineNote(PlayerSubtitleAlignmentResult.failed.failureMessage ?? "")
+            }) { source, cancellation in
+                let request = player.alignLocalExternalSubtitle(source,
+                    title: sub.displayTitle, lang: sub.lang, owner: owner,
+                    expectedLoad: load, expectedRevision: revision) { result in
+                    guard self.subtitleAlignmentPresentation?.id == presentation.id else { return }
+                    let mayPublish = !cancellation.isCancelled
+                        && player === self.coordinator.player
+                        && self.permitsSubtitlePublication(loadToken: load, videoID: video,
+                            presentationID: presentation.id)
+                        && loadLifetime.isCurrent
+                        && target.stillOwnsCurrentContext(core: self.core)
+                        && CredentialScopeRegistry.shared.isCurrent(credential)
+                        && LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+                        && owner.applicationEpoch == applicationEpoch
+                        && owner.account == credential
+                    guard self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url) else { return }
+                    guard mayPublish else { self.refreshAddonSubtitleRows(); return }
+                    if let message = result.failureMessage { self.showEngineNote(message) }
+                    self.refreshAddonSubtitleRows()
+                }
+                if self.subtitleAlignmentPresentation?.id == presentation.id {
+                    if let request {
+                        self.subtitleAlignmentPresentation?.requestGeneration = request
+                        self.addonSubtitlePreparationTask = nil
+                    } else {
+                        _ = self.clearAddonSubtitlePreparation(presentationID: presentation.id, url: sub.url)
+                        self.refreshAddonSubtitleRows()
+                    }
+                }
             }
-            refreshTracksSoon()
-        }
-        // The callee returns its original request, never a later sampled generation.
-        // A synchronous rejection may already have completed and cleared this presentation.
-        if subtitleAlignmentPresentation?.id == presentation.id {
-            if let requestGeneration {
-                subtitleAlignmentPresentation?.requestGeneration = requestGeneration
-            } else {
-                subtitleAlignmentPresentation = nil
-                if subtitleLoadingURL == sub.url { subtitleLoadingURL = nil }
-                refreshTracksSoon()
-            }
-        }
     }
 
     private func permitsSubtitlePublication(loadToken: PlayerLoadToken?, videoID: String?,
@@ -8556,6 +8763,7 @@ struct TVPlayerView: View {
                    releaseFingerprint: subFingerprint
                ),
                timingGenerationMatches,
+               subtitleAlignmentPresentation == nil,
                subDelay == 0,
                let offsetMs = result.offsetMs,
                offsetMs != 0 {
@@ -8572,7 +8780,8 @@ struct TVPlayerView: View {
     /// P2: load a pooled subtitle into the player, reusing the exact external-subtitle path (download to a
     /// local file, then mpv `sub-add`). Shows the shared Loading… row state. Fail-soft.
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
-        if !auto { invalidateSubtitleAlignmentPresentation() }
+        if auto { selectAutomaticPooledSubtitle(sub); return }
+        invalidateSubtitleAlignmentPresentation()
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume,
               VortXSyncManager.shared.isSignedIn else { return }
@@ -8655,6 +8864,92 @@ struct TVPlayerView: View {
         }
     }
 
+    /// Preferred-language pool selection preserves the exact pre-download decision. The pool
+    /// supplies immutable authorized bytes; the engine captures its real reference before raw mounting.
+    private func selectAutomaticPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+        guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
+              MoatConsent.contributeAndConsume, VortXSyncManager.shared.isSignedIn,
+              let player = coordinator.player, let load = player.activeLoadToken else { return }
+        restoreSubtitleTimingOffsetIfReady()
+        applyCurrentSubtitleDelayIfReady(force: false)
+        guard let revision = player.subtitleAlignmentRevision else { return }
+        let owner = PlayerSubtitleAlignmentOwner.capture(core: core, target: playbackMutationTarget)
+        guard !(player is MPVMetalViewController) || owner != nil else { return }
+        let marker = sub.url.absoluteString
+        let video = curMeta?.videoId
+        let presentation = SubtitleAlignmentPresentationRequest(player: player, url: marker,
+            selectsRequestedFile: true)
+        let admission = PooledSubtitleSelectionPolicy.Admission(engine: ObjectIdentifier(player), load: load,
+            revision: revision, presentation: presentation.id)
+        let fence = SubtitlePoolClient.PublicationFence(contentKey: sub.contentKey)
+        subtitlePresentationEpoch = presentation.id
+        subtitleAlignmentPresentation = presentation
+        subtitlePoolRequests.invalidate()
+        let download = subtitlePoolRequests.beginDownload()
+        subtitleLoadingURL = marker
+        if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
+        Task { @MainActor in
+            let data = await SubtitlePoolClient.downloadData(sub,
+                isSignedIn: VortXSyncManager.shared.isSignedIn)
+            guard subtitleAlignmentPresentation?.id == presentation.id,
+                  subtitlePoolRequests.ownsDownload(download) else {
+                _ = subtitlePoolRequests.finishDownload(download)
+                return
+            }
+            let current = admission.permits(engine: ObjectIdentifier(coordinator.player ?? player),
+                load: coordinator.player?.activeLoadToken, revision: player.subtitleAlignmentRevision,
+                presentation: subtitlePresentationEpoch)
+                && player === coordinator.player
+                && curMeta?.videoId == video
+                && playbackMutationTarget.stillOwnsCurrentContext(core: core)
+                && (owner.map { LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) } ?? true)
+                && fence.permits(currentContentKey: communityContentKey,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn)
+            guard current, let data,
+                  let source = PlayerLocalSubtitleSource(data: data, format: sub.format,
+                    identityURL: sub.url, permitsUse: {
+                        // Load/content and native owner are checked separately by the engine. This
+                        // thread-safe fence preserves the original session/consent generations there.
+                        fence.permits(currentContentKey: sub.contentKey, isSignedIn: true)
+                    }) else {
+                if subtitlePoolRequests.finishDownload(download) {
+                    subtitleAlignmentPresentation = nil
+                    subtitleLoadingURL = nil
+                    if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
+                }
+                return // Automatic failure stays silent and never retries as an ordinary mount.
+            }
+            guard let external = subtitlePoolRequests.beginExternal(after: download) else { return }
+            let request = player.selectLocalExternalSubtitleAutomatically(source,
+                title: pooledLabel(sub), lang: sub.lang, owner: owner,
+                expectedLoad: load, expectedRevision: revision) { result in
+                guard subtitleAlignmentPresentation?.id == presentation.id,
+                      subtitlePoolRequests.finishExternal(external) else { return }
+                subtitleAlignmentPresentation = nil
+                subtitleLoadingURL = nil
+                guard player === coordinator.player,
+                      permitsSubtitlePublication(loadToken: load, videoID: video, presentationID: presentation.id),
+                      playbackMutationTarget.stillOwnsCurrentContext(core: core),
+                      owner.map({ LegacyWatchOwnership.applicationEpochIsCurrent($0.applicationEpoch) }) ?? true,
+                      fence.permits(currentContentKey: communityContentKey,
+                        isSignedIn: VortXSyncManager.shared.isSignedIn) else { if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }; return }
+                if result.succeeded {
+                    addedPooledIDs.insert(sub.id)
+                    if case .aligned = result, subDelay == 0 {
+                        pooledSeededOffset = true
+                        subtitleDelayAppliedLoadToken = load
+                    } else {
+                        applyCurrentSubtitleDelayIfReady(force: false)
+                    }
+                }
+                if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
+            }
+            if subtitleAlignmentPresentation?.id == presentation.id {
+                subtitleAlignmentPresentation?.requestGeneration = request
+            }
+        }
+    }
+
     /// The label for a pooled subtitle row: the language name. NO add-on wording (framing rule) - pooled subs
     /// are just "subtitles" with a subtle community provenance shown in the row detail.
     private func pooledLabel(_ sub: SubtitlePoolClient.PooledSubtitle) -> String { langName(sub.lang) }
@@ -8690,42 +8985,41 @@ struct TVPlayerView: View {
 
     /// P4: extract the file's own embedded TEXT subtitle tracks off-main and upload each to the pool so users
     /// on a different rip benefit. Best-effort, once per session, never blocks playback; ignores failures.
+    /// Donation has separate 64 MiB file / 128 MiB cumulative read / 8-second cooperative budgets.
+    /// It contributes only after complete EOF; larger or interrupted work is silently omitted.
     /// LOCAL FILES (finished downloads) ONLY: extraction demuxes the whole container, so on a streamed play it
     /// re-downloaded the entire file next to the player - the Apple TV "remux builds up frame drops and
     /// distorted audio" regression, stacking a further never-cancelled full-file read on every restart and
     /// episode switch. The extractor hard-refuses remote inputs too; checking here skips spawning the task.
     private func uploadEmbeddedSubtitlesIfNeeded() {
-        guard !embeddedUploadDone, let contentKey = communityContentKey else { return }
-        embeddedUploadDone = true
+        guard !embeddedUploadDone, playbackMutationTarget.stillOwnsCurrentContext(core: core),
+              let player = coordinator.player, let token = player.activeLoadToken,
+              let originalLoad = player.captureSubtitleContributionLoad(for: token),
+              let contentKey = communityContentKey,
+              let permit = SubtitlePoolClient.contributionPermit(contentKey: contentKey,
+                load: originalLoad) else { return }
         let inputStr = (curURL ?? url).absoluteString
         guard SubtitleEmbeddedExtractor.isLocalFileInput(inputStr) else { return }
+        embeddedUploadDone = true
         refreshSubFingerprint()
         let fp = subFingerprint
-        Task.detached(priority: .utility) {
-            let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
-            for track in tracks where track.cueCount > 0 {
-                await SubtitlePoolClient.upload(contentKey: contentKey, lang: track.lang, fingerprint: fp,
-                                                origin: "embedded", format: track.format, text: track.srt)
+        let cancellation = SubtitleEmbeddedExtractor.TimingWindowCancellation()
+        embeddedContributionTask?.cancel()
+        embeddedContributionLoad = originalLoad
+        embeddedContributionTask = Task.detached(priority: .utility) {
+            await withTaskCancellationHandler {
+                guard !Task.isCancelled, permit.isCurrent else { return }
+                let tracks = SubtitleEmbeddedExtractor.extractContributionText(input: inputStr,
+                    maximumTextBytes: permit.maximumTextBytes, cancellation: cancellation,
+                    permitsUse: { permit.isCurrent })
+                for track in tracks where track.cueCount > 0 {
+                    guard !Task.isCancelled, permit.isCurrent else { return }
+                    await SubtitlePoolClient.upload(contentKey: contentKey, lang: track.lang, fingerprint: fp,
+                        origin: "embedded", format: track.format, text: track.srt, permit: permit)
+                }
+            } onCancel: {
+                cancellation.cancel()
             }
-        }
-    }
-
-    /// Hoard a successfully-loaded ADD-ON subtitle into the community pool (origin "addon") so the next user
-    /// gets it without hitting the add-on. Best-effort, off-main, gated + size-capped + fail-soft inside
-    /// `SubtitlePoolClient.upload`; never blocks playback. The sub text is downloaded once from the add-on URL.
-    private func hoardAddonSubtitle(_ sub: AddonSubtitle) {
-        guard let contentKey = communityContentKey, let subURL = URL(string: sub.url) else { return }
-        refreshSubFingerprint()
-        let fp = subFingerprint
-        let lang = sub.lang
-        let ext = subURL.pathExtension.lowercased()
-        let format = ["srt", "vtt", "ass"].contains(ext) ? ext : "srt"
-        Task.detached(priority: .utility) {
-            guard let data = try? await URLSession.shared.data(from: subURL).0,
-                  let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-                  !text.isEmpty else { return }
-            await SubtitlePoolClient.upload(contentKey: contentKey, lang: lang, fingerprint: fp,
-                                            origin: "addon", format: format, text: text)
         }
     }
 
@@ -9497,12 +9791,20 @@ struct TVPlayerView: View {
         }
     }
 
-    private var showsPreviousEpisodeControl: Bool {
-        isEpisodePlaybackContext && (directResumeInventoryRefreshPending || hasPrevEpisode)
-    }
-
-    private var showsNextEpisodeControl: Bool {
-        isEpisodePlaybackContext && (directResumeInventoryRefreshPending || hasNextEpisode)
+    /// One ephemeral projection per control-row construction. Both directions use the same
+    /// ordered inventory and index; no cache can outlive a profile/source/episode change.
+    private var episodeControlAvailability: (previous: Bool, next: Bool) {
+        guard isEpisodePlaybackContext else { return (false, false) }
+        if directResumeInventoryRefreshPending { return (true, true) }
+        guard let m = curMeta else { return (false, false) }
+        let inventory = manualEpisodeNavigationInventory
+        guard let index = AppleManualEpisodeNavigationPolicy.currentIndex(
+            currentID: m.videoId,
+            currentSeason: m.season,
+            currentEpisode: m.episode,
+            inventory: inventory
+        ) else { return (false, false) }
+        return (index > 0, index + 1 < inventory.count)
     }
 
     private var episodeIndex: Int? {
@@ -9515,7 +9817,6 @@ struct TVPlayerView: View {
         )
     }
     private var hasNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodes.count } ?? false }
-    private var hasPrevEpisode: Bool { (episodeIndex ?? 0) > 0 }
 
     /// The `CoreVideo` for the episode currently playing, resolved from the loaded episode list.
     /// Matches on the engine video id first (canonical), falling back to season+episode for direct
@@ -9937,6 +10238,7 @@ struct TVPlayerView: View {
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         invalidateSubtitlePresentationForReplacement()
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
         addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
         markedWatched = false
         autoAddedThisPlayback = false
@@ -11222,6 +11524,7 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        invalidateWatchParty()
         invalidateSubtitlePresentationForReplacement()
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
         curDebridRef?.nativeUsenetLease?.close()
@@ -11496,7 +11799,11 @@ struct TVPlayerView: View {
         // Retire any countdown accumulated against the old playhead before issuing a user or automatic seek;
         // cancellation/completion memory remains keyed to this media identity in the policy state.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-        if handleDeferredResumeUserSeek(.absolute(target)) { return }
+        let sharesUserSeek = ["restart", "scrub", "skip", "chapter", "system-seek"].contains(reason)
+        if handleDeferredResumeUserSeek(.absolute(target)) {
+            if sharesUserSeek { shareWatchPartyControl("seek", at: target) }
+            return
+        }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user seek")
         DiagnosticsLog.log(
@@ -11504,11 +11811,16 @@ struct TVPlayerView: View {
             String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)
         )
         coordinator.player?.seek(to: target)
+        if sharesUserSeek { shareWatchPartyControl("seek", at: target) }
     }
 
     private func seek(_ delta: Double) {
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
-        if handleDeferredResumeUserSeek(.relative(delta)) { flashControls(); return }
+        let partyTarget = currentTime.isFinite && delta.isFinite ? max(0, currentTime + delta) : Double.nan
+        if handleDeferredResumeUserSeek(.relative(delta)) {
+            shareWatchPartyControl("seek", at: partyTarget)
+            flashControls(); return
+        }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user relative seek")
         DiagnosticsLog.log(
@@ -11516,6 +11828,7 @@ struct TVPlayerView: View {
             String(format: "seek reason=relative from=%.3f to=%.3f duration=%.3f", currentTime, currentTime + delta, duration)
         )
         coordinator.player?.seek(by: delta)
+        shareWatchPartyControl("seek", at: partyTarget)
         flashControls()
     }
 
@@ -11604,6 +11917,136 @@ struct TVPlayerView: View {
     private func commitScrubIfNeeded() { if scrubbing { commitScrub() } }
     /// Discard the in-progress scrub preview and keep playing where we are (Menu while scrubbing).
     private func cancelScrub() { scrubCommit?.cancel(); scrubbing = false; scrubThumbnails.clear(); flashControls() }
+
+    // MARK: - Watch Party caller ownership
+
+    private func currentWatchPartyAuth() -> VortXWatchPartyAuthSnapshot? {
+        guard let witness = watchPartyAuthWitness,
+              let current = VortXSyncManager.shared.captureWatchPartyAuth(), current == witness,
+              VortXSyncManager.shared.isCurrentWatchPartyAuth(current) else { return nil }
+        return current
+    }
+
+    private func currentWatchPartyContext() -> WatchPartyClientSession.ApplyContext? {
+        // These are live State/controller reads, including between admit and apply. The source/route
+        // witnesses also close the interval before SwiftUI delivers the corresponding onChange.
+        guard !leftPlayback, !loadFailed, !reconnecting, !switchingEpisode, !stillWatching, pendingAdvance == nil,
+              hasStartedPlaying, !isTrailer, !isCurrentLiveStream,
+              playbackMutationTarget.stillOwnsCurrentContext(core: core),
+              watchPartyTargetWitness == playbackMutationTarget,
+              watchPartySourceWitness == sourceSwitchGeneration,
+              watchPartyEpisodeWitness == episodeSwitchGeneration,
+              watchPartyRouteWitness == isAVPlayerActive,
+              watchPartySessionWitness == playbackSessionID,
+              let metadata = curMeta, watchPartyVideoWitness == metadata.videoId,
+              let load = coordinator.player?.activeLoadToken, load == watchPartyLoadWitness,
+              callbackBelongsToCommittedMedia(load), assetSanityAttempt.isAccepted(owner: load),
+              let auth = currentWatchPartyAuth(), auth.profileID == ProfileStore.shared.activeID,
+              let titleToken = WatchPartyClientSession.canonicalTitleToken(forPlaybackVideoID: metadata.videoId) else { return nil }
+        return .init(target: playbackMutationTarget, auth: auth, titleToken: titleToken,
+                     playbackSessionID: playbackSessionID, loadToken: load,
+                     localOwnerGeneration: watchPartyOwner.generation)
+    }
+
+    private func openWatchPartyPanel() {
+        noteInteraction()
+        if watchPartyModel == nil {
+            watchPartyAuthWitness = VortXSyncManager.shared.captureWatchPartyAuth()
+            watchPartyTargetWitness = playbackMutationTarget
+            watchPartyLoadWitness = coordinator.player?.activeLoadToken
+            watchPartySourceWitness = sourceSwitchGeneration
+            watchPartyEpisodeWitness = episodeSwitchGeneration
+            watchPartyRouteWitness = isAVPlayerActive
+            watchPartySessionWitness = playbackSessionID
+            watchPartyVideoWitness = curMeta?.videoId
+            watchPartyOwner.rotate()
+            guard currentWatchPartyContext() != nil else {
+                invalidateWatchParty()
+                showEngineNote("Sign in and start a title before opening Watch Party.")
+                return
+            }
+            let owner = watchPartyOwner
+            watchPartyModel = WatchPartyPanelModel(
+                performControl: { applyWatchPartyControl($0) },
+                currentAuth: { currentWatchPartyAuth() },
+                currentContext: { currentWatchPartyContext() },
+                currentPlaybackSnapshot: { currentWatchPartyPlaybackSnapshot() },
+                ownerGeneration: { owner.generation },
+                ownerWillReconnect: { owner.rotate() }
+            )
+        }
+        cancelScrub()
+        hideTask?.cancel()
+        withAnimation { showOptions = false; showInfo = false; showStreamQR = false; showWatchParty = true }
+    }
+
+    private func closeWatchPartyPanel() {
+        showWatchParty = false
+        // Keep membership while the viewer watches. Re-mounting the catcher restores its root focus.
+        showControls()
+    }
+
+    private func invalidateWatchParty() {
+        // Revoke the local capability before shared transport teardown or any network suspension.
+        watchPartyOwner.rotate()
+        watchPartyModel?.cancelAndDisconnect()
+        watchPartyModel = nil
+        watchPartyAuthWitness = nil
+        watchPartyTargetWitness = nil
+        watchPartyLoadWitness = nil
+        watchPartySourceWitness = nil
+        watchPartyEpisodeWitness = nil
+        watchPartyRouteWitness = nil
+        watchPartySessionWitness = nil
+        watchPartyVideoWitness = nil
+        showWatchParty = false
+    }
+
+    private func currentWatchPartyPlaybackSnapshot() -> WatchPartyWire.Control? {
+        guard let context = currentWatchPartyContext(), currentTime.isFinite,
+              currentTime >= 0, currentTime <= 86_400 else { return nil }
+        return .init(action: playbackDeadlineClock.isPaused ? "pause" : "play",
+                     mediaId: context.titleToken, positionMs: Int64((currentTime * 1_000).rounded()))
+    }
+
+    private func shareWatchPartyControl(_ action: String, at position: Double) {
+        guard !watchPartyOwner.applyingRemote, currentWatchPartyContext() != nil,
+              position.isFinite, position >= 0, position <= 86_400 else { return }
+        watchPartyModel?.send(action, positionMs: Int64((position * 1_000).rounded()))
+    }
+
+    /// Called only by the shared one-use admit/apply boundary. No Task or await may enter this
+    /// function: the fresh owner check and the explicit existing player choke points are atomic.
+    private func applyWatchPartyControl(_ control: WatchPartyWire.Control) -> Bool {
+        guard let current = currentWatchPartyContext(), current.titleToken == control.mediaId,
+              duration.isFinite, duration > 0, control.positionMs >= 0,
+              control.positionMs <= 86_400_000, ["play", "pause", "seek"].contains(control.action) else { return false }
+        let requested = Double(control.positionMs) / 1_000
+        // Preserve the existing scrub EOF margin; a peer cannot mark an unfinished title watched.
+        let ceiling = duration > 30 ? duration - 5 : duration
+        guard requested < duration else { return false }
+        let target = min(requested, ceiling)
+        watchPartyOwner.applyingRemote = true
+        defer { watchPartyOwner.applyingRemote = false }
+        if control.action == "seek" || abs(currentTime - target) >= 1.5 {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            watchedDwell.reset()
+            issueSeek(to: target, reason: "watch-party")
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            currentTime = target
+            inFlightSeekTarget = target
+            inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+        }
+        if control.action == "pause" {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            viewerPause()
+        }
+        if control.action == "play" {
+            guard currentWatchPartyContext()?.localOwnerGeneration == current.localOwnerGeneration else { return false }
+            viewerPlay()
+        }
+        return true
+    }
 
     // MARK: - Local trickplay
 
@@ -11697,6 +12140,7 @@ struct TVPlayerView: View {
         guard !buffering, !isPaused else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s (tvOS)"); return }
+        guard let captureSource = TrickplayCaptureSource(player: player, loadToken: player.activeLoadToken) else { return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureGeneration &+= 1
         let captureGeneration = localTrickplayCaptureGeneration
@@ -11728,6 +12172,10 @@ struct TVPlayerView: View {
                     watchdog.cancel()
                     guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    guard let currentSource = TrickplayCaptureSource(
+                        player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
+                    ), currentSource == captureSource,
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
                     self.trickplayCaptureCompletionsSinceReceipt &+= 1
                     self.trickplayCaptureNilSinceReceipt &+= 1
                     if self.localTrickplayCaptureBreaker.recordCapture(hadData: false) {
@@ -11744,10 +12192,15 @@ struct TVPlayerView: View {
                     watchdog.cancel()
                     guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    guard let currentSource = TrickplayCaptureSource(
+                        player: self.coordinator.player, loadToken: self.coordinator.player?.activeLoadToken
+                    ), currentSource == captureSource,
+                       self.assetSanityAttempt.isAccepted(owner: captureSource.loadToken) else { return }
                     self.trickplayCaptureCompletionsSinceReceipt &+= 1
                     _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
                     guard let decoded else { return }   // decode failed / near-black: already logged off-actor
-                    self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
+                    self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time,
+                                                            captureSource: captureSource)
                 }
             }
         }
@@ -11910,7 +12363,7 @@ struct TVPlayerView: View {
     private func maybePromptStillWatching() {
         guard stillWatchingPromptEnabled else { return }   // disabled: never interrupt an idle session
         guard hasStartedPlaying, !stillWatching else { return }
-        guard !isPaused, !showOptions, !buffering, !loadFailed else { return }
+        guard !isPaused, !showOptions, !showWatchParty, !buffering, !loadFailed else { return }
         guard Date() >= idleDeadline else { return }
         presentStillWatching()
     }
@@ -11945,7 +12398,7 @@ struct TVPlayerView: View {
         if advance {
             playNext()
         } else {
-            viewerPlay()
+            viewerPlay(shareWithParty: true)
             showControls()
         }
     }
@@ -12029,6 +12482,7 @@ struct TVPlayerView: View {
     /// Control need individual semantic targets. These virtual rows mirror the same `selected` / `optionRow`
     /// state and call the same activation functions as the Siri Remote, so accessibility never forks behavior.
     private var remoteAccessibilityItems: [RemoteCatcher.AccessibilityItem] {
+        guard !showWatchParty else { return [] }
         if stillWatching {
             return [
                 .init(id: "still-watching.continue", label: "Continue watching", hint: "Resumes playback",
@@ -12192,6 +12646,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityFocus(_ identity: String) {
+        guard !showWatchParty else { return }
         // Delayed accessibility callbacks cannot regain controls hidden by a newer overlay.
         guard remoteAccessibilityItems.contains(where: { $0.id == identity && $0.isEnabled }) else { return }
         if showStreamQR && !stillWatching { return } // The sole QR target is already highlighted.
@@ -12224,6 +12679,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityActivate(_ identity: String) {
+        guard !showWatchParty else { return }
         guard remoteAccessibilityItems.contains(where: { $0.id == identity && $0.isEnabled }) else { return }
         noteInteraction()
         if showStreamQR && !stillWatching {
@@ -12268,6 +12724,7 @@ struct TVPlayerView: View {
     }
 
     private func remoteAccessibilityAdjust(_ identity: String, _ direction: Int) {
+        guard !showWatchParty else { return }
         guard remoteAccessibilityItems.contains(where: {
             $0.id == identity && $0.isEnabled && $0.isAdjustable
         }) else { return }
@@ -12280,6 +12737,61 @@ struct TVPlayerView: View {
         guard t.isFinite, t >= 0 else { return "0:00" }
         let s = Int(t), h = s / 3600, m = (s % 3600) / 60, sec = s % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    }
+}
+
+// MARK: - Native-focus Watch Party presentation
+
+@MainActor
+private final class TVWatchPartyPlaybackOwner: ObservableObject {
+    private(set) var generation = UUID()
+    var applyingRemote = false
+    func rotate() { generation = UUID() }
+}
+
+/// This stays in the player's ZStack. Presenting a full-screen cover would trigger the player's
+/// existing disappear cleanup; removing only RemoteCatcher lets SwiftUI own focus without that.
+private struct TVWatchPartyRoomPresentation: View {
+    @ObservedObject var model: WatchPartyPanelModel
+    let onClose: () -> Void
+    @State private var showInviteQR = false
+
+    var body: some View {
+        ZStack {
+            Theme.Palette.canvas.opacity(0.94).ignoresSafeArea()
+            if showInviteQR, let invite = model.inviteURL {
+                StreamLinkQRView(title: "Watch Party invite", link: invite.absoluteString,
+                    onClose: { showInviteQR = false }, closeHighlighted: false,
+                    instruction: "Scan with your phone to open this private room invite · Press Back to return",
+                    exposesNativeClose: true, handlesExitCommand: false)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        HStack {
+                            Spacer()
+                            Button("Back to player", action: onClose)
+                                .buttonStyle(ChipButtonStyle())
+                        }
+                        WatchPartyRoomPanel(model: model)
+                            .frame(maxWidth: .infinity)
+                        if model.inviteURL != nil {
+                            Button { showInviteQR = true } label: {
+                                Label("Show invite QR", systemImage: "qrcode")
+                            }
+                            .buttonStyle(ChipButtonStyle())
+                        }
+                    }
+                    .frame(maxWidth: 900)
+                    .padding(Theme.Space.screenEdge)
+                    .frame(maxWidth: .infinity)
+                }
+                .focusSection()
+            }
+        }
+        .onChange(of: model.inviteURL) { _, invite in if invite == nil { showInviteQR = false } }
+        .onExitCommand {
+            if showInviteQR { showInviteQR = false } else { onClose() }
+        }
     }
 }
 

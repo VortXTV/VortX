@@ -1,0 +1,47 @@
+name: Xperience wire parity
+
+on:
+  push:
+    branches: [beta-xperience-wire-parity-20261030]
+    paths:
+      - .github/workflows/xperience-wire-parity.yml
+      - test/xperience-wire-parity/**
+      - app/SourcesShared/XperienceCollections.swift
+      - app/SourcesShared/XperienceAddonBinding.swift
+      - app/SourcesShared/XperienceCatalogClient.swift
+      - app/SourcesShared/VortxResourceBridge.swift
+      - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt
+      - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceAddonBinding.kt
+      - android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt
+      - android/app/src/main/kotlin/com/vortx/android/engine/NativeOwnerHistoryAccount.kt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xperience-wire-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  document-wire-parity:
+    if: github.event_name == 'push' && github.repository == 'VortXTV/VortX' && github.ref == 'refs/heads/beta-xperience-wire-parity-20261030' && toJSON(github.event.repository.private) == 'false'
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Read the exact pushed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: false
+      - name: Check bounded installed-tool layouts
+        env:
+          VORTX_HOSTED_LAYOUT_UNIT_TESTS: '1'
+        run: python3 -m unittest discover -s test/xperience-wire-parity -p test_toolchain_layout.py
+      - name: Compare genuine document parsers and canonical bytes
+        env:
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          VECLIB_MAXIMUM_THREADS: '1'
+        run: python3 test/xperience-wire-parity/run-hosted.py

@@ -13,8 +13,9 @@ source_inputs=(
   app/SourcesShared/VortxNativeHostFieldMutation.swift app/SourcesShared/XperienceExportObservation.swift
   app/SourcesShared/XperienceCollections.swift app/SourcesShared/XperienceAddonBinding.swift
   app/SourcesShared/XperienceFileChooserAdmission.swift app/SourcesShared/XperienceImportPrivacy.swift
-  app/SourcesShared/VortxNativeBootstrapArchive.swift
+  app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/OwnerHistoryExactJSON.swift
   app/Tests/XperienceCollectionsStoreHarnessSupport.swift app/Tests/XperienceCollectionsStoreLifecycleTests.swift
+  app/SourcesShared/VortxNativeHostPreferences.swift
   scripts/extract-xperience-store-harness.mjs scripts/test-xperience-store-lifecycle.sh
 )
 shasum -a 256 "${source_inputs[@]}" > "$lifecycle_dir/input-sha256.txt"
@@ -28,7 +29,7 @@ inputs=(
   app/SourcesShared/VortxNativeHostFieldMutation.swift app/SourcesShared/XperienceExportObservation.swift
   app/SourcesShared/XperienceCollections.swift app/SourcesShared/XperienceAddonBinding.swift
   app/SourcesShared/XperienceFileChooserAdmission.swift app/SourcesShared/XperienceImportPrivacy.swift
-  app/SourcesShared/VortxNativeBootstrapArchive.swift
+  app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/OwnerHistoryExactJSON.swift
   app/Tests/XperienceCollectionsStoreHarnessSupport.swift
   "$lifecycle_dir/XperienceCollectionsStore.swift" "$lifecycle_dir/XperienceCollectionsViewModel.swift"
   app/Tests/XperienceCollectionsStoreLifecycleTests.swift

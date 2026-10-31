@@ -48,6 +48,7 @@ import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
+import com.vortx.android.moat.MoatConsent
 import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
@@ -128,6 +129,7 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var stillWatchingPrompt by remember { mutableStateOf(StillWatchingSettings.promptEnabled(appContext)) }
     var stillWatchingAfter by remember { mutableStateOf(StillWatchingSettings.afterEpisodes(appContext)) }
     var communityScrub by remember { mutableStateOf(CommunityTrickplay.isEnabled(appContext)) }
+    var communityPool by remember { mutableStateOf(MoatConsent.contributeAndConsume(appContext)) }
 
     var skipProvider by remember {
         // SkipConfig.init MUST run before the first read/write here. SkipConfig holds its SharedPreferences
@@ -170,6 +172,8 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
+            StreamingServerSettingsSection()
+
             SettingsSection(
                 title = "Audio output",
                 footer = "Applies to the built-in libmpv player. On the ExoPlayer path Android negotiates " +
@@ -264,8 +268,17 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
             SettingsSection(
                 title = "Community",
-                footer = "Share anonymized scrub previews so titles get instant thumbnails for everyone.",
+                footer = MoatConsent.DISCLOSURE + " Turning community improvements off stops sharing and receiving community data.",
             ) {
+                ToggleRow(
+                    label = "Community improvements",
+                    detail = "Share and receive community improvements.",
+                    checked = communityPool,
+                    onCheckedChange = {
+                        MoatConsent.setContribute(appContext, it)
+                        communityPool = MoatConsent.contributeAndConsume(appContext)
+                    },
+                )
                 ToggleRow(
                     label = "Community scrub previews",
                     detail = null,

@@ -227,8 +227,13 @@ internal class OHState private constructor(private val root: OHJson.Obj, private
         result.setValidated("nativeSync", nextNative.encoded())
         return OHState(result, nextNative, nextFence)
     }
-    fun delta(bytes: ByteArray, parent: ByteArray): OHState {
+    fun delta(bytes: ByteArray, parent: ByteArray, allowKeyed: Boolean = false, expectedFence: ByteArray? = null): OHState {
         val r = OHJson.Obj(bytes)
+        expectedFence?.let { require(OHJson.equal(r.raw("fence"), it)) }
+        if (r["deltaEncoding"] != null) {
+            require(allowKeyed) { "Unnegotiated owner-history checkpoint format" }
+            return keyedDelta(r, parent)
+        }
         require(r.text("kind") == "checkpoint_delta" && r.text("reuseExactOwnerHistoryFromWitness") == witness &&
             OHJson.equal(r.raw("preparedAgainst"), parent) && OHJson.utf8(r.raw("durableAck")) == "false" &&
             OHJson.utf8(r.raw("requiresCompleteArchiveEnvelope")) == "true")
@@ -246,6 +251,119 @@ internal class OHState private constructor(private val root: OHJson.Obj, private
             nextNative = mergedNative(changed, native["ownerHistory"]); next.setValidated("nativeSync", nextNative.encoded()) }
         val f = r.raw("fence"); require(OHJson.Obj(f).text("sourceSetWitnessId") == witness)
         return OHState(next, nextNative, f)
+    }
+    /** The public keyed_rows/1 wire contract; only admitted mutable rows are interpreted.
+     * Source/unknown raw slices stay in their original complete-envelope owner. */
+    private fun keyedDelta(reply: OHJson.Obj, parent: ByteArray): OHState {
+        require(reply.keys == setOf("kind", "fence", "preparedAgainst", "deltaEncoding", "keyedStateSteps",
+            "reuseExactOwnerHistoryFromWitness", "requiresCompleteArchiveEnvelope", "durableAck"))
+        require(reply.text("kind") == "checkpoint_delta" && reply.text("deltaEncoding") == KEYED_FORMAT &&
+            reply.text("reuseExactOwnerHistoryFromWitness") == witness &&
+            OHJson.utf8(reply.raw("durableAck")) == "false" &&
+            OHJson.utf8(reply.raw("requiresCompleteArchiveEnvelope")) == "true" &&
+            OHJson.equal(reply.raw("preparedAgainst"), parent) && OHJson.equal(parent, fence))
+        val nextFence = reply.raw("fence"); val before = OHJson.Obj(fence); val after = OHJson.Obj(nextFence)
+        var revision = generation(before); val finalRevision = generation(after)
+        require(after.text("instanceId").isNotEmpty() && after.text("sourceSetWitnessId") == witness)
+        for (key in listOf("instanceId", "mutationGeneration")) { before.remove(key); after.remove(key) }
+        require(OHJson.equal(before.encoded(), after.encoded())) { "Keyed checkpoint changed original authority" }
+        val steps = OHJson.array(reply.raw("keyedStateSteps")); require(steps.size <= 512)
+        val libraries = root.obj("libraries"); val nextNative = native.copy()
+        for (raw in steps) {
+            val step = OHJson.Obj(raw)
+            require(step.keys == setOf("baseGeneration", "revision", "edits") &&
+                unsigned(step.text("baseGeneration")) == revision && revision != ULong.MAX_VALUE &&
+                unsigned(step.text("revision")) == revision + 1uL)
+            val edits = step.obj("edits")
+            require(edits.keys == setOf("libraries", "nativeWatches", "slotWatches"))
+            val changedLibraries = edits.obj("libraries")
+            changedLibraries.keys.forEach { id -> libraries.set(id, libraryEdit(changedLibraries.raw(id), libraries.raw(id))) }
+            val watches = edits.obj("nativeWatches")
+            if (watches.keys.isNotEmpty()) {
+                val values = nextNative.obj("watches")
+                watches.keys.forEach { id -> values.set(id, watchEdit(watches.raw(id), values.raw(id))) }
+                nextNative.setValidated("watches", values.encoded())
+            }
+            val profiles = edits.obj("slotWatches")
+            if (profiles.keys.isNotEmpty()) {
+                val states = nextNative.obj("accountSlots")
+                for (id in profiles.keys) {
+                    val state = states.obj(id); val slots = state.obj("slots"); val changedSlots = profiles.obj(id)
+                    for (key in changedSlots.keys) {
+                        val slot = slots.obj(key)
+                        slot.set("watch", watchEdit(changedSlots.raw(key), slot.raw("watch")))
+                        slots.setValidated(key, slot.encoded())
+                    }
+                    state.setValidated("slots", slots.encoded()); states.setValidated(id, state.encoded())
+                }
+                nextNative.setValidated("accountSlots", states.encoded())
+            }
+            revision += 1uL
+        }
+        require(revision == finalRevision) { "Incomplete keyed checkpoint journal" }
+        // Encoding still produces a complete checkpoint; no incremental encryption/durable ACK.
+        val next = root.copy().setValidated("libraries", libraries.encoded()).setValidated("nativeSync", nextNative.encoded())
+        return OHState(next, nextNative, nextFence)
+    }
+    private fun generation(value: OHJson.Obj) = unsigned(value.text("mutationGeneration"))
+    private fun unsigned(text: String): ULong = requireNotNull(text.toULongOrNull()).also { require(it.toString() == text) }
+    private fun mapEdit(raw: ByteArray, prior: ByteArray): OHJson.Obj {
+        val edits = OHJson.Obj(raw); val result = OHJson.Obj(prior)
+        val identities = result.keys.associateBy { Normalizer.normalize(it, Normalizer.Form.NFC) }.toMutableMap()
+        for (key in edits.keys) {
+            val identity = Normalizer.normalize(key, Normalizer.Form.NFC)
+            require(identities[identity]?.let { it == key } != false) { "Ambiguous keyed row identity" }
+            val edit = edits.obj(key)
+            when (edit.text("op")) {
+                "put" -> { require(edit.keys == setOf("op", "value")); result.set(key, edit.raw("value")); identities[identity] = key }
+                "remove" -> { require(edit.keys == setOf("op") && result[key] != null); result.remove(key); identities.remove(identity) }
+                else -> error("Unknown keyed row operation")
+            }
+        }
+        return result
+    }
+    private fun spanEdit(raw: ByteArray, prior: ByteArray): List<ByteArray> {
+        val edit = OHJson.Obj(raw); require(edit.keys == setOf("at", "remove", "insert"))
+        val values = OHJson.array(prior).toMutableList()
+        val at = OHJson.integer(edit.raw("at")); val count = OHJson.integer(edit.raw("remove"))
+        require(at <= values.size.toLong() && count <= values.size.toLong() - at)
+        val start = at.toInt(); values.subList(start, start + count.toInt()).clear()
+        values.addAll(start, OHJson.array(edit.raw("insert"))); return values
+    }
+    private fun libraryEdit(raw: ByteArray, prior: ByteArray): ByteArray {
+        val edits = OHJson.Obj(raw); val library = OHJson.Obj(prior)
+        val maps = setOf("resume", "watched", "watchLog", "watchContexts")
+        val spans = setOf("items", "history", "continueWatching", "searchHistory", "cwBoard")
+        require(edits.keys.all { it in maps || it in spans || it in setOf("aliases", "entries") })
+        for (key in maps) edits[key]?.let { edit ->
+            val value = mapEdit(edit, library[key] ?: OHJson.literal("{}"))
+            if (key in setOf("watchLog", "watchContexts") && value.keys.isEmpty()) library.remove(key)
+            else library.setValidated(key, value.encoded())
+        }
+        for (key in spans) edits[key]?.let { edit ->
+            val values = spanEdit(edit, library[key] ?: OHJson.literal("[]"))
+            if (key == "cwBoard" && values.isEmpty()) library.remove(key)
+            else library.setValidated(key, OHJson.array(values))
+        }
+        if (edits["aliases"] != null || edits["entries"] != null) {
+            val vault = OHJson.Obj(library["resumeVault"] ?: OHJson.literal("{}"))
+            for (key in listOf("aliases", "entries")) edits[key]?.let { edit ->
+                val value = mapEdit(edit, vault[key] ?: OHJson.literal("{}"))
+                if (value.keys.isEmpty()) vault.remove(key) else vault.setValidated(key, value.encoded())
+            }
+            if (vault.keys.isEmpty()) library.remove("resumeVault") else library.setValidated("resumeVault", vault.encoded())
+        }
+        return library.encoded()
+    }
+    private fun watchEdit(raw: ByteArray, prior: ByteArray): ByteArray {
+        val edits = OHJson.Obj(raw); val watch = OHJson.Obj(prior)
+        require(edits.keys.all { it in setOf("log", "contexts", "identityLinks") })
+        for (key in listOf("log", "contexts")) edits[key]?.let { watch.setValidated(key, mapEdit(it, watch.raw(key)).encoded()) }
+        edits["identityLinks"]?.let { edit ->
+            val values = spanEdit(edit, watch["identityLinks"] ?: OHJson.literal("[]"))
+            if (values.isEmpty()) watch.remove("identityLinks") else watch.setValidated("identityLinks", OHJson.array(values))
+        }
+        return watch.encoded()
     }
     /** Host reducers cannot edit source/native state through disposable presentation JSON. */
     fun localState(raw: ByteArray): OHState {
@@ -272,6 +390,7 @@ internal class OHState private constructor(private val root: OHJson.Obj, private
         return OHState(result, native, fence)
     }
     companion object {
+        const val KEYED_FORMAT = "keyed_rows/1"
         val ROOT = setOf("roster", "libraries", "accountLibraryArchives", "projectedAccountSlots", "nativeSync", "activeProfileId")
         val NATIVE = setOf("websiteAddonReceipts", "accountSlots", "legacyProfileEditReceipts", "legacyImport", "schemaVersion", "scope", "ownerProfileId", "profiles", "addons", "libraries", "watches")
         private val HOST = setOf("hostProfilePreferences", "hostProfileSyncPending", "nativeHostPreferenceState", "websiteProfileEditPending", "websiteProfileEditCertificates", "websiteAddonEditPending")

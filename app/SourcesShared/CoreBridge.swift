@@ -273,11 +273,16 @@ final class CoreBridge: ObservableObject {
     func nativePlaybackTargetIsCurrent(_ target: PlaybackMutationTarget) -> Bool { nativePlaybackBinding(target) != nil }
     /// Manual UI gestures acknowledge persistence, not merely admission to the native FIFO.
     @MainActor
-    func setNativeLibraryMembership(id: String, type: String, name: String, poster: String?, present: Bool,
+    func setNativeLibraryMembership(id: String, type: String, name: String, poster: String?, genres: [String]? = nil, present: Bool,
                                     target: PlaybackMutationTarget) async throws {
         guard let (facade, profile) = nativePlaybackBinding(target),
               case .native(let binding?) = target, let epoch = binding.accountGeneration else { throw VortxNativeError.superseded }
-        try await facade.setLibraryMembership(id: id, type: type, name: name, poster: poster, present: present,
+        let detail = (metaDetails?.meta).flatMap { $0.id == id && $0.type == type ? $0 : nil }
+        let preview = boardRows.flatMap(\.items).first { $0.id == id && $0.type == type }
+        let facts = LibraryGenreFacts.normalized(genres)
+            ?? LibraryGenreFacts.normalized(detail?.genres)
+            ?? LibraryGenreFacts.normalized(preview?.genres)
+        try await facade.setLibraryMembership(id: id, type: type, name: name, poster: poster, genres: facts, present: present,
                                               profileID: profile.uuidString, expectedAccountGeneration: epoch)
         guard nativePlaybackBinding(target)?.0 === facade else { throw VortxNativeError.superseded }
         // Mirror both directions only after the native checkpoint acknowledged persistence,
@@ -472,12 +477,22 @@ final class CoreBridge: ObservableObject {
                                     legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
                                     legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
+        try await mergeNativeAccountDocumentReceipt(remote, hostRemote: hostRemote, capture: capture,
+            legacyMaterial: legacyMaterial, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents,
+            legacyWatchlists: legacyWatchlists, sourceAuthority: sourceAuthority,
+            authenticatedSourceArchive: authenticatedSourceArchive).presentation
+    }
+    @MainActor
+    func mergeNativeAccountDocumentReceipt(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
+                                    legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
+                                    legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
+                                    sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil, hostRemoteRaw: Data? = nil) async throws -> VortxNativeCoreFacade.HostAccountReceipt {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
         let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
-        let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
+        let document = try await facade.mergeAccountDocumentReceipt(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
             hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
-            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
+            sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive, hostRemoteRaw: hostRemoteRaw)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()
@@ -1059,6 +1074,9 @@ final class CoreBridge: ObservableObject {
             return retirement
         }
         nativePlaybackReadLifetime.completeRetirement(installSubtitleRetirement)
+        // Dedicated owner-boundary signal. Playlist stores refresh their captured target or retire it;
+        // delivery must not retarget an old request to whichever profile is current later.
+        nativePlaylistChangeRevision &+= 1
         NotificationCenter.default.post(name: Self.xperienceContextChangedNote, object: nil)
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
             session.revoke(); throw VortxNativeError.invalidSnapshot
@@ -1124,6 +1142,7 @@ final class CoreBridge: ObservableObject {
         loadBoard()
         guard nativeCallbackOriginIsCurrent(installOrigin) else { throw VortxNativeError.superseded }
         loadLibrary()
+        nativePlaylistChangeRevision &+= 1
     }
     @MainActor
     func closeNativeSession() async {
@@ -1150,6 +1169,8 @@ final class CoreBridge: ObservableObject {
             return (old, retirement)
         }
         nativePlaybackReadLifetime.completeRetirement(retiredBridge.1)
+        // Invalidate views holding the retired account/profile target before any async cleanup.
+        nativePlaylistChangeRevision &+= 1
         let old = retiredBridge.0
         nativeAccountEditRequests.removeAll(); nativePublishedCredentialSlot = nil
         let cancelEpoch = detachPublicationEpochStorage()
@@ -1327,6 +1348,8 @@ final class CoreBridge: ObservableObject {
     /// Bumped on every `RuntimeEvent::NewState`; SwiftUI observes this to refresh. `changedFields`
     /// holds the field names that changed since the last bump (e.g. ["board", "ctx"]).
     @MainActor @Published private(set) var revision = 0
+    /// Change-driven pulse for profile playlist carriers only; never a player/frame revision.
+    @MainActor @Published private(set) var nativePlaylistChangeRevision: UInt64 = 0
     @MainActor private(set) var changedFields: Set<String> = []
 
     /// Decoded screen state, refreshed on the main queue as the engine emits field changes.
@@ -4262,15 +4285,16 @@ final class CoreBridge: ObservableObject {
                 guard let id = meta["id"] as? String,
                       let type = meta["type"] as? String,
                       let name = meta["name"] as? String else { continue }
-                ready.append(.init(id: id, type: type, name: name, poster: meta["poster"] as? String))
+                ready.append(.init(id: id, type: type, name: name, poster: meta["poster"] as? String,
+                                   genres: LibraryGenreFacts.acceptedMetadata(data: try? JSONSerialization.data(withJSONObject: meta), id: id, type: type)))
             }
         }
         let catalog = selectedID.flatMap(rawMetaPreview(forId:)).flatMap(Self.mutationPreview)
         let decoded = metaDetails?.meta.map {
-            LibraryWatchedMutationPolicy.MetaPreview(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
+            LibraryWatchedMutationPolicy.MetaPreview(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, genres: LibraryGenreFacts.normalized($0.genres))
         }
         return LibraryWatchedMutationPolicy.detailPreview(
-            targetID: selectedID, ready: ready, catalog: catalog, decoded: decoded
+            targetID: selectedID, targetType: metaDetails?.meta?.type, ready: ready, catalog: catalog, decoded: decoded
         )?.dictionary
     }
 
@@ -4278,7 +4302,8 @@ final class CoreBridge: ObservableObject {
         guard let id = raw["id"] as? String,
               let type = raw["type"] as? String,
               let name = raw["name"] as? String else { return nil }
-        return .init(id: id, type: type, name: name, poster: raw["poster"] as? String)
+        return .init(id: id, type: type, name: name, poster: raw["poster"] as? String,
+                     genres: LibraryGenreFacts.acceptedMetadata(data: try? JSONSerialization.data(withJSONObject: raw), id: id, type: type))
     }
 
     /// Remove the open detail-page title from the library, mirroring the removal to each connected external
@@ -4344,7 +4369,7 @@ final class CoreBridge: ObservableObject {
             Task { @MainActor in
                 do {
                     try await self.setNativeLibraryMembership(id: resident.id, type: resident.type, name: resident.name,
-                                                              poster: resident.poster, present: true, target: target)
+                                                              poster: resident.poster, genres: resident.genres, present: true, target: target)
                 } catch {
                     DiagnosticsLog.log("library", "action=add_saved surface=menu result=failed")
                 }
@@ -6486,26 +6511,26 @@ extension CoreBridge {
         return result
     }
     @MainActor func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxJSON], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
         guard target.lifetime.isActive, nativeWatchlistTargetIsCurrent(target.owner),
               let snapshot = target.owner.facade.capturedHostProfileSnapshot(expected: target.owner.binding, registry: target.registry) else {
             throw XperiencePersistenceFailure.staleContext
         }
-        return (snapshot.registers.filter { $0.key.hasPrefix("xperience.import.") },
-                try XperienceInstalledCatalogs.candidates(snapshot.registry))
+        return (snapshot.rawRegisters,
+                try XperienceInstalledCatalogs.project(snapshot.registry))
     }
     @MainActor func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         return try await VortXSyncManager.shared.prepareXperienceExportBudget(capture: target.owner.owner.credential,
             sourceIsCurrent: { [weak self] in self?.nativeXperienceTargetIsCurrent(target) == true })
     }
-    @MainActor func saveNativeXperienceImport(_ edit: XperienceImportNamespace.Edit, target: NativeXperienceTarget,
-                                            validator: XperiencePreparedExport) async throws -> VortxJSON {
+    @MainActor func saveNativeXperienceImport(_ edit: XperienceImportNamespace.RawEdit, target: NativeXperienceTarget,
+                                            validator: XperiencePreparedExport) async throws -> VortxRawHostRegister {
         try Task.checkCancellation()
         guard edit.field == XperienceImportNamespace.field(edit.namespace),
               nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         try XperienceImportPrivacy.validate(edit)
-        let result = try await target.owner.facade.setCapturedHostProfileField(edit.nativeEdit,
+        let result = try await target.owner.facade.setCapturedRawHostProfileField(edit.nativeEdit,
             expected: target.owner.binding, registry: target.registry,
             sourceAuthority: target.authority, checkpointValidator: validator,
             admission: { fields in try XperienceNativeHostFieldAdmission.validate(edit, fields: fields) })
@@ -7084,6 +7109,8 @@ extension CoreBridge {
                 VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential)
             case .progressAccepted:
                 VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: origin.credential, progressOnly: true)
+            case .hostCarrierChanged(let receipt):
+                core.receiveNativePlaylistHostChange(receipt, producer: event.producer, origin: origin)
             case .changed:
                 guard core.nativeCallbackOriginIsCurrent(origin) else { return }
                 core.receiveOwnedMetadata(event, origin: origin)
@@ -7108,6 +7135,14 @@ extension CoreBridge {
     }
     @MainActor private func nativeCallbackOriginIsCurrent(_ origin: NativeCallbackOrigin) -> Bool {
         nativeCallbackSourceIsCurrent(origin) && publicationStillCurrent(origin.publication)
+    }
+
+    @MainActor private func receiveNativePlaylistHostChange(
+        _ receipt: VortxNativeCoreFacade.HostChangeReceipt,
+        producer: VortxNativeCoreFacade, origin: NativeCallbackOrigin) {
+        guard producer === origin.producer, nativeCallbackOriginIsCurrent(origin),
+              receipt.sourceID == producer.sourceID, producer.acceptsHostChange(receipt) else { return }
+        nativePlaylistChangeRevision &+= 1
     }
 
     @MainActor private func makeNativeSourceCallback(installation: UUID,
@@ -8055,5 +8090,95 @@ extension CoreBridge {
         appleCWMetaRefreshRequest = nil; appleCWMetaRefreshReceipt = nil; appleCWMetaRefreshDetails = nil
         refindRequest = nil; refindGeneration &+= 1
         return entry
+    }
+}
+
+
+// MARK: - Captured encrypted-profile playlists
+extension CoreBridge {
+    struct NativePlaylistTarget {
+        let profileID: UUID
+        fileprivate let owner: NativeWatchlistTarget
+        // These existing lock-only helpers are profile/credential gesture authority, despite
+        // their historical import name; neither carries an add-on registry or import payload.
+        fileprivate let authority: NativeXperienceCommitAuthority
+        fileprivate let lifetime: XperienceImportLifetime
+    }
+    @MainActor func captureNativePlaylistTarget() throws -> NativePlaylistTarget {
+        guard let owner = captureNativeWatchlistTarget(), case .account = owner.owner.credential.scope,
+              let profileID = UUID(uuidString: owner.binding.profileID),
+              owner.facade.capturedPlaylistRegisters(expected: owner.binding) != nil else {
+            throw VortxNativeError.closed
+        }
+        let lifetime = XperienceImportLifetime()
+        return .init(profileID: profileID, owner: owner,
+            authority: .init(core: self, target: owner, lifetime: lifetime), lifetime: lifetime)
+    }
+    @MainActor func retireNativePlaylistTarget(_ target: NativePlaylistTarget) { target.lifetime.revoke() }
+    @MainActor func nativePlaylistContextIsCurrent(_ target: NativePlaylistTarget) -> Bool {
+        nativeWatchlistTargetIsCurrent(target.owner)
+            && target.owner.facade.capturedPlaylistBindingIsCurrent(expected: target.owner.binding)
+    }
+    @MainActor func nativePlaylistTargetIsCurrent(_ target: NativePlaylistTarget) -> Bool {
+        target.lifetime.isActive && nativePlaylistContextIsCurrent(target)
+    }
+    @MainActor func nativePlaylistRegisters(target: NativePlaylistTarget) throws -> [String: VortxJSON] {
+        guard nativePlaylistTargetIsCurrent(target),
+              let fields = target.owner.facade.capturedPlaylistRegisters(expected: target.owner.binding) else {
+            throw VortxNativeError.superseded
+        }
+        return fields
+    }
+    @MainActor func prepareNativePlaylistExportBudget(target: NativePlaylistTarget) async throws -> XperiencePreparedExport {
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        // Reuse the actual complete-account sizing witness and provider/peer reconciliation.
+        // The historical helper name does not make this a new transport or import operation.
+        return try await VortXSyncManager.shared.prepareXperienceExportBudget(capture: target.owner.owner.credential,
+            sourceIsCurrent: { [weak self] in self?.nativePlaylistTargetIsCurrent(target) == true })
+    }
+    @MainActor func saveNativePlaylist(_ edit: VortxNativeHostFieldEdit, target: NativePlaylistTarget,
+                                     validator: XperiencePreparedExport) async throws -> VortxJSON {
+        try Task.checkCancellation()
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        try VortxNativePlaylist.validateMutation(edit, fields: nativePlaylistRegisters(target: target))
+        let accepted = try await target.owner.facade.setCapturedPlaylistField(edit, expected: target.owner.binding,
+            sourceAuthority: target.authority, checkpointValidator: validator)
+        guard nativePlaylistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        guard let receiptOwner = nativePlaylistReceiptOwner(target.owner) else { throw VortxNativeError.superseded }
+        let originalCapture = target.owner.owner.credential
+        // This publishes only pending intent after local CAS. It does not label a cloud save.
+        _ = VortXSyncManager.shared.registerNativePlaylistMutation(credentialCapture: originalCapture,
+            owner: receiptOwner, field: edit.field, register: accepted)
+        return accepted // Local durable register only; cloud proof requires an exact accepted export.
+    }
+}
+
+
+extension CoreBridge {
+
+    @MainActor func captureNativePlaylistReceiptOwner() -> NativePlaylistReceiptOwner? {
+        guard let target = captureNativeWatchlistTarget() else { return nil }
+        return nativePlaylistReceiptOwner(target)
+    }
+    @MainActor private func nativePlaylistReceiptOwner(_ target: NativeWatchlistTarget) -> NativePlaylistReceiptOwner? {
+        guard case .account = target.owner.credential.scope, let accountGeneration = target.owner.accountGeneration else { return nil }
+        return .init(credentialNamespace: target.owner.credential.namespace,
+            credentialGeneration: target.owner.credential.generation, accountGeneration: accountGeneration,
+            profileID: target.owner.profileID, profileKey: target.binding.profileID,
+            profileGeneration: target.binding.profileGeneration,
+            sessionGeneration: target.owner.sessionGeneration)
+    }
+
+    /// Receipt check ignores the short-lived save-operation latch but requires the original account,
+    /// session, profile, account generation and profile generation to remain selected and installed.
+    @MainActor func nativePlaylistReceiptOwnerIsCurrent(_ owner: NativePlaylistReceiptOwner) -> Bool {
+        guard let current = captureNativeWatchlistTarget() else { return false }
+        return current.owner.credential.namespace == owner.credentialNamespace
+            && current.owner.credential.generation == owner.credentialGeneration
+            && current.owner.sessionGeneration == owner.sessionGeneration
+            && current.owner.accountGeneration == owner.accountGeneration && current.owner.profileID == owner.profileID
+            && current.binding.profileID == owner.profileKey
+            && current.binding.profileGeneration == owner.profileGeneration
+            && nativeWatchlistTargetIsCurrent(current)
     }
 }

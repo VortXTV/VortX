@@ -11,7 +11,7 @@ class SubtitleExactSelectionWiringTest {
         assertFalse(screen.contains("mountedAddonSubs"))
         assertFalse(screen.contains("pendingSubSelectAbove"))
         assertFalse(screen.contains("tracks.lastOrNull()?.let { engine.selectSubtitleTrack(it.id) }"))
-        assertTrue(screen.contains("engine.addExternalSubtitle(sub.url, original)"))
+        assertTrue(screen.contains("engine.selectExternalSubtitleAutomatically(sub.url, sub.lang, original)"))
         val mpv = source("full", "mpv/MpvPlayer.kt")
         assertTrue(mpv.contains("mpv.command(arrayOf(\"sub-add\", local.absolutePath, \"select\"))"))
         assertFalse(mpv.contains("subtitleCommandExecutor"))

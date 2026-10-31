@@ -27,13 +27,14 @@ import androidx.compose.ui.res.stringResource
 import androidx.tv.material3.Text
 import com.vortx.android.R
 import com.vortx.android.foryou.ForYouText
+import com.vortx.android.foryou.ForYouEditSession
 import com.vortx.android.foryou.SmartCollection
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.foryou.SmartCollectionEditor
 import com.vortx.android.ui.foryou.rememberSmartCollectionsState
 import com.vortx.android.ui.theme.VortXTheme
 
-private data class TvEditing(val collection: SmartCollection?)
+private data class TvEditing(val collection: SmartCollection?, val opening: ForYouEditSession)
 
 /**
  * Library > Smart collections on TV (Apple `TVSmartCollectionsView`): every collection as a row of the
@@ -45,11 +46,11 @@ internal fun TvSmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> 
     val state = rememberSmartCollectionsState()
     var editing by remember { mutableStateOf<TvEditing?>(null) }
     editing?.let { open ->
-        BackHandler { editing = null }
+        BackHandler { open.opening.close(); if (editing === open) editing = null }
         Box(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
             SmartCollectionEditor(
-                existing = open.collection, watched = state.watched, chip = tvForYouChip, edge = TvDimens.edge,
-                onFinish = { editing = null },
+                opening = open.opening, existing = open.collection, watched = state.watched, chip = tvForYouChip, edge = TvDimens.edge,
+                onFinish = { if (editing === open) editing = null },
             ) { items, _ -> if (items.isNotEmpty()) TvCardRow(items, onItem = {}) }
         }
         return
@@ -64,7 +65,7 @@ internal fun TvSmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> 
                 Column(modifier = Modifier.padding(horizontal = TvDimens.edge), verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                     Text(stringResource(R.string.smart_collections_intro), style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary))
                     TvFilterChip(label = stringResource(R.string.smart_collections_new), selected = false,
-                        onClick = { editing = TvEditing(null) }, leadingIcon = Icons.Filled.Add)
+                        onClick = { if (state.store.ready) editing = TvEditing(null, ForYouEditSession(state.store)) }, leadingIcon = Icons.Filled.Add)
                     when {
                         !state.store.ready -> TvNote(stringResource(R.string.smart_collections_not_ready))
                         state.store.collections.isEmpty() -> TvNote(stringResource(R.string.smart_collections_empty))
@@ -83,7 +84,7 @@ internal fun TvSmartCollectionsScreen(onBack: () -> Unit, onItem: (MetaItem) -> 
                         if (collection.home) Text(stringResource(R.string.smart_collections_on_home).uppercase(),
                             style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.accentBright))
                         TvFilterChip(label = stringResource(R.string.smart_collections_edit), selected = false,
-                            onClick = { editing = TvEditing(collection) }, leadingIcon = Icons.Filled.Tune)
+                            onClick = { editing = TvEditing(collection, ForYouEditSession(state.store)) }, leadingIcon = Icons.Filled.Tune)
                     }
                     if (items.isEmpty()) {
                         Box(modifier = Modifier.padding(horizontal = TvDimens.edge)) {

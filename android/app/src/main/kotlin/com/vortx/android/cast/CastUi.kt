@@ -51,6 +51,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
 import com.google.android.gms.cast.CastMediaControlIntent
+import com.google.android.gms.cast.CastDevice
 import com.vortx.android.R
 
 // Player chrome is always presented over video on a dark ground, so the cast surfaces paint their own dark
@@ -83,7 +84,7 @@ fun CastButton(state: CastPlaybackState, emberAccent: Color, onClick: () -> Unit
 /// it fits this AppCompat-free, Compose-only app (the SDK's View-based `MediaRouteChooserDialog` needs an
 /// AppCompat/MediaRouter theme this app deliberately does not carry).
 @Composable
-fun CastRouteChooserSheet(onDismiss: () -> Unit) {
+fun CastRouteChooserSheet(onDismiss: () -> Unit, onRouteSelected: (String, Boolean) -> Unit = { _, _ -> }) {
     val context = LocalContext.current
     val router = remember(context) { runCatching { MediaRouter.getInstance(context) }.getOrNull() }
     val selector = remember {
@@ -134,6 +135,8 @@ fun CastRouteChooserSheet(onDismiss: () -> Unit) {
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable {
+                                    val deviceId = CastDevice.getFromBundle(route.extras)?.deviceId ?: return@clickable
+                                    onRouteSelected(deviceId, route.isSelected)
                                     router?.selectRoute(route)
                                     onDismiss()
                                 }

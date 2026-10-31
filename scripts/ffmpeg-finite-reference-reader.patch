@@ -1,0 +1,2724 @@
+diff --git a/libavformat/http.c b/libavformat/http.c
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <stdbool.h>
++#include <stdatomic.h>
+ 
+ #include "config.h"
+ #include "config_components.h"
+@@ -44,10 +45,13 @@
+ #include "avformat.h"
+ #include "avio_internal.h"
+ #include "vortx_http_request.h"
++#include "vortx_reference_reader_stream.h"
++#include "vortx_reference_sparse.h"
+ #include "http.h"
+ #include "httpauth.h"
+ #include "internal.h"
+ #include "network.h"
++#include "vortx_reference_pin.h"
+ #include "os_support.h"
+ #include "url.h"
+ #include "version.h"
+@@ -72,6 +76,17 @@
+     WRITE_REPLY_HEADERS,
+     FINISH
+ }HandshakeState;
++
++/* Source-private observation of the ORIGINAL completed response. This never
++ * changes generic HTTP parsing/admission or grows the public v2 snapshot. */
++typedef struct HTTPReferenceTotal {
++    uint64_t length, start, end, total, value;
++    unsigned header_bytes;
++    int status, invalid, length_seen, range_seen, transfer_seen, encoding_seen;
++    int known;
++    int64_t generation;
++} HTTPReferenceTotal;
++struct HTTPReferenceLifetime;
+ 
+ typedef struct HTTPContext {
+     const AVClass *class;
+@@ -178,7 +193,27 @@
+     int64_t sum_latency; /* divide by nb_requests */
+     int64_t max_latency;
+     int max_redirects;
++    /* Strict receipt for the private, pinned, single prefix reader only. */
++    uint64_t reference_body_bytes;
++    uint64_t reference_total_bytes;
++    int reference_admitted;
++    int reference_complete_entity;
++    HTTPReferenceTotal reference_original_total;
++    int reference_header_crlf;
++    struct HTTPReferenceLifetime *reference_lifetime;
+ } HTTPContext;
++
++static void http_reference_total_reset(HTTPContext *s);
++static void http_reference_total_header(HTTPContext *s, const char *line,
++                                        int line_count, int invalid, int crlf);
++static void http_reference_total_publish(HTTPContext *s);
++static void http_reference_lifetime_retire(HTTPContext *s);
++static void http_reference_lifetime_complete(HTTPContext *s);
++static int http_reference_transport_close(HTTPContext *s)
++{
++    http_reference_lifetime_retire(s);
++    return ffurl_closep(&s->hd);
++}
+ 
+ #define OFFSET(x) offsetof(HTTPContext, x)
+ #define D AV_OPT_FLAG_DECODING_PARAM
+@@ -283,6 +318,9 @@
+ 
+ static void http_response_etag_reset(HTTPContext *s)
+ {
++    /* Retire before any original response strings/generation can mutate. */
++    http_reference_lifetime_retire(s);
++    http_reference_total_reset(s);
+     av_freep(&s->response_etag);
+     av_freep(&s->response_location);
+     s->response_generation = 0;
+@@ -564,12 +602,19 @@
+     }
+     s->response_etag_pending[0] = 0;
+     http_sent_request_complete(s);
++    http_reference_total_publish(s);
++    http_reference_lifetime_complete(s);
+ }
+ 
+ static int http_connect(URLContext *h, const char *path, const char *local_path,
+                         const char *hoststr, const char *auth,
+                         const char *proxyauth);
+ static int http_read_header(URLContext *h);
++static int http_reference_read_header(URLContext *h);
++static int http_reference_transport_matches(URLContext *h);
++static int http_sparse_read_header(URLContext *h);
++static int http_sparse_before_request(URLContext *h, const char *wire, size_t bytes);
++static int http_sparse_after_request(URLContext *h);
+ static int http_shutdown(URLContext *h, int flags);
+ 
+ void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
+@@ -642,6 +687,11 @@
+ 
+     if (port < 0)
+         port = 80;
++
++    if (h->vortx_reference_pin && use_proxy) {
++        err = AVERROR(EINVAL);
++        goto end;
++    }
+ 
+     hashmark = strchr(path1, '#');
+     if (hashmark)
+@@ -794,7 +844,9 @@
+         goto redo;
+     }
+ 
+-    av_dict_copy(options, s->chained_options, 0);
++    ret = av_dict_copy(options, s->chained_options, 0);
++    if (h->vortx_reference_pin && ret < 0)
++        return ret;
+ 
+     cur_auth_type       = s->auth_state.auth_type;
+     cur_proxy_auth_type = s->auth_state.auth_type;
+@@ -829,7 +881,7 @@
+         /* restore the offset (http_connect resets it) */
+         s->off = off;
+ 
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+         goto redo;
+     }
+ 
+@@ -837,7 +889,7 @@
+     if (s->http_code == 401) {
+         if ((cur_auth_type == HTTP_AUTH_NONE || s->auth_state.stale) &&
+             s->auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 4) {
+-            ffurl_closep(&s->hd);
++            http_reference_transport_close(s);
+             goto redo;
+         } else
+             goto fail;
+@@ -845,7 +897,7 @@
+     if (s->http_code == 407) {
+         if ((cur_proxy_auth_type == HTTP_AUTH_NONE || s->proxy_auth_state.stale) &&
+             s->proxy_auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 4) {
+-            ffurl_closep(&s->hd);
++            http_reference_transport_close(s);
+             goto redo;
+         } else
+             goto fail;
+@@ -854,7 +906,7 @@
+          s->http_code == 303 || s->http_code == 307 || s->http_code == 308) &&
+         s->new_location) {
+         /* url moved, get next */
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+         if (redirects++ >= s->max_redirects)
+             return AVERROR(EIO);
+ 
+@@ -882,7 +934,7 @@
+ fail:
+     s->off = off;
+     if (s->hd)
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+     if (ret < 0)
+         return ret;
+     return ff_http_averror(s->http_code, AVERROR(EIO));
+@@ -1158,8 +1210,11 @@
+     if (!s->uri)
+         return AVERROR(ENOMEM);
+ 
+-    if (options)
+-        av_dict_copy(&s->chained_options, *options, 0);
++    if (options) {
++        ret = av_dict_copy(&s->chained_options, *options, 0);
++        if (h->vortx_reference_pin && ret < 0)
++            goto bail_out;
++    }
+ 
+     if (s->headers) {
+         int len = strlen(s->headers);
+@@ -1181,6 +1236,7 @@
+     ret = http_open_cnx(h, options);
+ bail_out:
+     if (ret < 0) {
++        http_reference_lifetime_retire(s);
+         av_dict_free(&s->chained_options);
+         av_dict_free(&s->cookie_dict);
+         av_dict_free(&s->redirect_cache);
+@@ -1237,6 +1293,8 @@
+     char *q;
+ 
+     q = line;
++    if (invalid)
++        s->reference_header_crlf = 0;
+     for (;;) {
+         ch = http_getc(s);
+         if (ch < 0)
+@@ -1244,8 +1302,9 @@
+         if (invalid && ((previous_cr && ch != '\n') || ch == 0x7f ||
+                         (ch < 0x20 && ch != '\r' && ch != '\n' && ch != '\t')))
+             *invalid = 1;
+-        previous_cr = ch == '\r';
+         if (ch == '\n') {
++            if (invalid)
++                s->reference_header_crlf = previous_cr;
+             /* process line */
+             if (q > line && q[-1] == '\r')
+                 q--;
+@@ -1258,6 +1317,7 @@
+             else if (invalid)
+                 *invalid = 1;
+         }
++        previous_cr = ch == '\r';
+     }
+ }
+ 
+@@ -1835,6 +1895,11 @@
+     char line[MAX_URL_SIZE];
+     int err = 0, http_err = 0;
+ 
++    if (h->vortx_reference_pin && h->vortx_reference_pin->sparse)
++        return http_sparse_read_header(h);
++    if (h->vortx_reference_pin)
++        return http_reference_read_header(h);
++
+     // A valid interim response may be followed by final headers for this GET.
+     http_response_etag_reset(s);
+     av_freep(&s->new_location);
+@@ -1854,6 +1919,8 @@
+         if (invalid_line)
+             s->response_etag_invalid = 1;
+         size_t header_bytes = strlen(line);
++        http_reference_total_header(s, line, s->line_count, invalid_line,
++                                    s->reference_header_crlf);
+         err = process_line(h, line, s->line_count, &parsed_http_code);
+         av_log(h, AV_LOG_TRACE, "HTTP response header: status=%d line=%d bytes=%zu\n",
+                s->http_code, s->line_count, header_bytes);
+@@ -1936,9 +2003,18 @@
+     const char *method;
+     int send_expect_100 = 0;
+     int keep_alive = 1;
++    int sparse_request = h->vortx_reference_pin && h->vortx_reference_pin->sparse;
++
++    /* A changed backend/policy cannot send credentials before rejection. The
++     * nested TCP open has already checked its actual pinned kernel peer. */
++    if (h->vortx_reference_pin && !http_reference_transport_matches(h))
++        return AVERROR(EINVAL);
+ 
+     http_response_etag_reset_request(s);
+-    av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
++    if (sparse_request)
++        av_bprint_init(&request, 0, VORTX_HTTP_SENT_REQUEST_MAX_BYTES + 1);
++    else
++        av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
+ 
+     /* send http header */
+     post = h->flags & AVIO_FLAG_WRITE;
+@@ -2055,8 +2131,23 @@
+         goto done;
+     }
+ 
++    if (h->vortx_reference_pin && h->vortx_reference_pin->sparse &&
++        (err = http_sparse_before_request(h, request.str, request.len)) < 0)
++        goto done;
+     if ((err = ffurl_write(s->hd, request.str, request.len)) < 0)
+         goto done;
++    if (h->vortx_reference_pin && h->vortx_reference_pin->sparse &&
++        (size_t)err != request.len) {
++        err = AVERROR(EIO);
++        goto done;
++    }
++    if (h->vortx_reference_pin && h->vortx_reference_pin->sparse) {
++        int postcheck = http_sparse_after_request(h);
++        if (postcheck < 0) {
++            err = postcheck;
++            goto done;
++        }
++    }
+     if ((size_t)err == request.len)
+         http_sent_request_capture(h, request.str, request.len, path, local_path,
+                                   method, auth, proxyauth, authstr, proxyauthstr);
+@@ -2114,6 +2205,8 @@
+ done:
+     if (err < 0)
+         http_response_etag_reset_request(s);
++    if (sparse_request)
++        av_bprint_finalize(&request, NULL);
+     av_freep(&authstr);
+     av_freep(&proxyauthstr);
+     return err;
+@@ -2153,7 +2246,7 @@
+             }
+             else if (!s->chunksize) {
+                 av_log(h, AV_LOG_DEBUG, "Last chunk received, closing conn\n");
+-                ffurl_closep(&s->hd);
++                http_reference_transport_close(s);
+                 return 0;
+             }
+             else if (s->chunksize == UINT64_MAX) {
+@@ -2269,7 +2362,7 @@
+             /* send new request for more data on existing connection */
+             AVDictionary *options = NULL;
+             if (s->willclose)
+-                ffurl_closep(&s->hd);
++                http_reference_transport_close(s);
+             s->initial_requests = 0; /* continue streaming uninterrupted from now on */
+             read_ret = http_open_cnx(h, &options);
+             av_dict_free(&options);
+@@ -2301,7 +2394,7 @@
+         conn_attempts++;
+         seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
+         if (seek_ret >= 0 && seek_ret != target) {
+-            ffurl_closep(&s->hd);
++            http_reference_transport_close(s);
+             av_log(h, AV_LOG_ERROR, "Failed to reconnect at %"PRIu64".\n", target);
+             return read_ret;
+         }
+@@ -2486,7 +2579,7 @@
+         ret = http_shutdown(h, h->flags);
+ 
+     if (s->hd)
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+     av_dict_free(&s->chained_options);
+     av_dict_free(&s->cookie_dict);
+     av_dict_free(&s->redirect_cache);
+@@ -2533,6 +2626,7 @@
+         return AVERROR(EINVAL);
+     if (!force_reconnect && off == s->off)
+         return s->off;
++    http_reference_lifetime_retire(s);
+     s->off = off;
+ 
+     if (s->off && h->is_streamed)
+@@ -2541,8 +2635,13 @@
+     /* do not try to make a new connection if seeking past the end of the file */
+     if (s->end_off || s->filesize != UINT64_MAX) {
+         uint64_t end_pos = s->end_off ? s->end_off : s->filesize;
+-        if (s->off >= end_pos)
++        if (s->off >= end_pos) {
++            /* The cursor changed, so older recipes stay retired. This branch
++             * keeps the same live HTTP response/transport without new headers;
++             * give later captures a fresh lifetime, never revive the old one. */
++            http_reference_lifetime_complete(s);
+             return s->off;
++        }
+     }
+ 
+     /* if the location changed (redirect), revert to the original uri */
+@@ -2575,7 +2674,7 @@
+             ret = ffurl_read(s->hd, discard, FFMIN(remaining, sizeof(discard)));
+             if (ret < 0 || ret == AVERROR_EOF || (ret == 0 && remaining)) {
+                 /* connection broken or stuck, need to reopen */
+-                ffurl_closep(&s->hd);
++                http_reference_transport_close(s);
+                 break;
+             }
+             remaining -= ret;
+@@ -2586,7 +2685,7 @@
+             goto done;
+         } else {
+             /* fall back to normal reconnection */
+-            ffurl_closep(&s->hd);
++            http_reference_transport_close(s);
+             old_hd = NULL;
+         }
+     } else {
+@@ -2751,12 +2850,17 @@
+     return 0;
+ }
+ 
++/* SOURCE PROPOSAL: this private implementation is part of the same http.o,
++ * and deliberately accesses only this exact matched HTTPContext layout. */
++#include "vortx_reference_reader.inc"
++#include "vortx_reference_sparse.inc"
++
+ #if CONFIG_HTTPPROXY_PROTOCOL
+ static int http_proxy_close(URLContext *h)
+ {
+     HTTPContext *s = h->priv_data;
+     if (s->hd)
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+     return 0;
+ }
+ 
+@@ -2830,7 +2934,7 @@
+     if (s->http_code == 407 &&
+         (cur_auth_type == HTTP_AUTH_NONE || s->proxy_auth_state.stale) &&
+         s->proxy_auth_state.auth_type != HTTP_AUTH_NONE && auth_attempts < 2) {
+-        ffurl_closep(&s->hd);
++        http_reference_transport_close(s);
+         goto redo;
+     }
+ 
+diff --git a/libavformat/url.h b/libavformat/url.h
+--- a/libavformat/url.h
++++ b/libavformat/url.h
+@@ -33,6 +33,8 @@
+ #define URL_PROTOCOL_FLAG_NESTED_SCHEME 1 /*< The protocol name can be the first part of a nested protocol scheme */
+ #define URL_PROTOCOL_FLAG_NETWORK       2 /*< The protocol uses network */
+ 
++struct FFVortXReferencePin;
++
+ typedef struct URLContext {
+     const AVClass *av_class;    /**< information for av_log(). Set by url_open(). */
+     const struct URLProtocol *prot;
+@@ -51,6 +53,11 @@
+      * libavformat rebuild required: never mix old URLContext allocations.
+      * No AVOption/public getter, live handle or replay authority. */
+     struct avpriv_vortx_http_transport vortx_transport;
++    /* Private optional finite-reader pin. Borrowed only from the immutable
++     * recipe held through synchronous open/read/close; never an AVOption or
++     * an original playback context. Every libavformat component must use this
++     * same internal layout. Ordinary playback leaves this NULL. */
++    const struct FFVortXReferencePin *vortx_reference_pin;
+ } URLContext;
+ 
+ typedef struct URLProtocol {
+diff --git a/libavformat/avio.c b/libavformat/avio.c
+--- a/libavformat/avio.c
++++ b/libavformat/avio.c
+@@ -240,6 +240,19 @@
+         return err;
+     if ((err = av_dict_set(options, "protocol_blacklist", uc->protocol_blacklist, 0)) < 0)
+         goto fail;
++
++    if (uc->vortx_reference_pin && !strcmp(uc->prot->name, "tls")) {
++        int64_t external_sock = 0;
++        /* MBEDTLS otherwise skips ff_tls_open_underlying for this option,
++         * bypassing its private pre-connect policy check. Pinned readers
++         * never accept a caller-provided socket or its borrowed lifetime. */
++        if (!uc->priv_data ||
++            av_opt_get_int(uc->priv_data, "external_sock", 0, &external_sock) < 0 ||
++            external_sock) {
++            err = AVERROR(EINVAL);
++            goto fail;
++        }
++    }
+ 
+     err =
+         uc->prot->url_open2 ? uc->prot->url_open2(uc,
+@@ -375,6 +388,11 @@
+     int ret = ffurl_alloc(puc, filename, flags, int_cb);
+     if (ret < 0)
+         return ret;
++    /* This private pointer is deliberately outside AVOptions. Propagate it
++     * before any nested protocol can connect; recipe lifetime encloses every
++     * context opened by this synchronous finite read. */
++    if (parent)
++        (*puc)->vortx_reference_pin = parent->vortx_reference_pin;
+     if (parent) {
+         ret = av_opt_copy(*puc, parent);
+         if (ret < 0)
+diff --git a/libavformat/tcp.c b/libavformat/tcp.c
+--- a/libavformat/tcp.c
++++ b/libavformat/tcp.c
+@@ -29,6 +29,7 @@
+ #include "network.h"
+ #include "os_support.h"
+ #include "url.h"
++#include "vortx_reference_pin.h"
+ #if HAVE_POLL_H
+ #include <poll.h>
+ #endif
+@@ -145,6 +146,166 @@
+     return 0;
+ }
+ 
++/* The ordinary connection helper logs its URL on failure. This private
++ * optional path returns errors without logging any hostname or URL. The
++ * caller owns and closes fd on every failure. */
++static int tcp_connect_vortx_reference(URLContext *h, int fd,
++                                       const struct sockaddr *peer,
++                                       socklen_t peer_len, int64_t timeout_us)
++{
++    int ret, socket_error;
++    int64_t now = av_gettime_relative(), deadline;
++    socklen_t error_len;
++
++    if (timeout_us <= 0 || now > INT64_MAX - timeout_us)
++        return AVERROR(EINVAL);
++    deadline = now + timeout_us;
++    if (ff_socket_nonblock(fd, 1) < 0)
++        return ff_neterrno();
++    for (;;) {
++        if (ff_check_interrupt(&h->interrupt_callback))
++            return AVERROR_EXIT;
++        if (av_gettime_relative() >= deadline)
++            return AVERROR(ETIMEDOUT);
++        if (!connect(fd, peer, peer_len))
++            return 0;
++        ret = ff_neterrno();
++        if (ret == AVERROR(EISCONN))
++            return 0; /* an interrupted connect may have completed */
++        if (ret == AVERROR(EINTR))
++            continue;
++        if (ret != AVERROR(EINPROGRESS) && ret != AVERROR(EAGAIN) &&
++            ret != AVERROR(EALREADY))
++            return ret;
++        break;
++    }
++    for (;;) {
++        if (ff_check_interrupt(&h->interrupt_callback))
++            return AVERROR_EXIT;
++        now = av_gettime_relative();
++        if (now >= deadline)
++            return AVERROR(ETIMEDOUT);
++        ret = ff_network_wait_fd_timeout(fd, 1, deadline - now,
++                                         &h->interrupt_callback);
++        if (ret == AVERROR(EINTR))
++            continue;
++        if (ret < 0)
++            return ret;
++        do {
++            if (ff_check_interrupt(&h->interrupt_callback))
++                return AVERROR_EXIT;
++            if (av_gettime_relative() >= deadline)
++                return AVERROR(ETIMEDOUT);
++            socket_error = 0;
++            error_len = sizeof(socket_error);
++            ret = getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_len);
++        } while (ret && ff_neterrno() == AVERROR(EINTR));
++        if (ret)
++            return ff_neterrno();
++        if (error_len != sizeof(socket_error))
++            return AVERROR(EIO);
++        return socket_error ? AVERROR(socket_error) : 0;
++    }
++}
++
++/* Optional finite reader only. Preserve the hostname URL for HTTP Host and TLS
++ * SNI, while connecting exactly one recipe-owned numeric sockaddr. No DNS,
++ * fallback address, proxy, caller-chosen local bind, listener or original FD
++ * is used. Bind the captured kernel local IP with a new ephemeral port; this
++ * does not establish physical interface or routing affinity. */
++static int tcp_open_vortx_reference(URLContext *h, TCPContext *s,
++                                    const char *hostname, int port, int flags)
++{
++    const struct FFVortXReferencePin *pin = h->vortx_reference_pin;
++    struct sockaddr_storage actual = {0};
++    struct sockaddr_storage actual_local = {0}, local;
++    socklen_t actual_len = sizeof(actual);
++    socklen_t actual_local_len = sizeof(actual_local);
++    int fd = -1, ret, timeout_ms;
++    unsigned peer_port;
++
++    if (!pin || !memchr(pin->hostname, 0, sizeof(pin->hostname)) ||
++        !pin->hostname[0] || strcmp(hostname, pin->hostname) ||
++        port != pin->port || port <= 0 || port >= 65536 ||
++        flags != AVIO_FLAG_READ_WRITE || s->listen ||
++        s->local_addr || s->local_port ||
++        !ff_vortx_reference_peer_valid(&pin->peer, pin->peer_len) ||
++        !ff_vortx_reference_peer_valid(&pin->local, pin->local_len) ||
++        pin->peer.ss_family != pin->local.ss_family ||
++        pin->transport.version != VORTX_HTTP_TRANSPORT_VERSION ||
++        pin->transport.route != VORTX_HTTP_ROUTE_DIRECT_TCP)
++        return AVERROR(EINVAL);
++    if (pin->peer.ss_family == AF_INET)
++        peer_port = ntohs(((const struct sockaddr_in *)&pin->peer)->sin_port);
++#if HAVE_STRUCT_SOCKADDR_IN6
++    else if (pin->peer.ss_family == AF_INET6)
++        peer_port = ntohs(((const struct sockaddr_in6 *)&pin->peer)->sin6_port);
++#endif
++    else
++        return AVERROR(EINVAL);
++    if (peer_port != port)
++        return AVERROR(EINVAL);
++    local = pin->local;
++    if (local.ss_family == AF_INET)
++        ((struct sockaddr_in *)&local)->sin_port = 0;
++#if HAVE_STRUCT_SOCKADDR_IN6
++    else
++        ((struct sockaddr_in6 *)&local)->sin6_port = 0;
++#endif
++
++    /* The shared owned interrupt also enforces the common absolute deadline.
++     * Keep this protocol's own wait bounded even if an option was omitted. */
++    if (s->open_timeout <= 0)
++        return AVERROR(EINVAL);
++    timeout_ms = s->open_timeout / 1000;
++    if (timeout_ms <= 0)
++        timeout_ms = 1;
++    if (timeout_ms > 30000)
++        timeout_ms = 30000;
++    if (h->rw_timeout <= 0 || h->rw_timeout > 30000000)
++        h->rw_timeout = 30000000;
++    if (ff_check_interrupt(&h->interrupt_callback))
++        return AVERROR_EXIT;
++
++    fd = ff_socket(pin->peer.ss_family, SOCK_STREAM, IPPROTO_TCP, h);
++    if (fd < 0)
++        return ff_neterrno();
++    ret = customize_fd(s, fd, pin->peer.ss_family);
++    if (ret < 0)
++        goto fail;
++    if (bind(fd, (const struct sockaddr *)&local, pin->local_len)) {
++        ret = ff_neterrno();
++        goto fail;
++    }
++    ret = tcp_connect_vortx_reference(h, fd,
++                    (const struct sockaddr *)&pin->peer, pin->peer_len,
++                    (int64_t)timeout_ms * 1000);
++    if (ret < 0)
++        goto fail;
++    if (ff_check_interrupt(&h->interrupt_callback)) {
++        ret = AVERROR_EXIT;
++        goto fail;
++    }
++    if (getpeername(fd, (struct sockaddr *)&actual, &actual_len) ||
++        getsockname(fd, (struct sockaddr *)&actual_local, &actual_local_len)) {
++        ret = ff_neterrno();
++        goto fail;
++    }
++    if (!ff_vortx_reference_peer_equal(&pin->peer, pin->peer_len,
++                                       &actual, actual_len) ||
++        !ff_vortx_reference_local_equal(&pin->local, pin->local_len,
++                                        &actual_local, actual_local_len)) {
++        ret = AVERROR(EIO);
++        goto fail;
++    }
++    h->is_streamed = 1;
++    s->fd = fd;
++    return 0;
++fail:
++    closesocket(fd);
++    return ret;
++}
++
+ /* return non zero if error */
+ static int tcp_open(URLContext *h, const char *uri, int flags)
+ {
+@@ -175,6 +336,8 @@
+         s->open_timeout =
+         h->rw_timeout   = s->rw_timeout;
+     }
++    if (h->vortx_reference_pin)
++        return tcp_open_vortx_reference(h, s, hostname, port, flags);
+     hints.ai_family = AF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+     snprintf(portstr, sizeof(portstr), "%d", port);
+diff --git a/libavformat/tls.c b/libavformat/tls.c
+--- a/libavformat/tls.c
++++ b/libavformat/tls.c
+@@ -26,6 +26,7 @@
+ #include "os_support.h"
+ #include "url.h"
+ #include "tls.h"
++#include "vortx_reference_pin.h"
+ #include "libavutil/avstring.h"
+ #include "libavutil/getenv_utf8.h"
+ #include "libavutil/intreadwrite.h"
+@@ -94,6 +95,33 @@
+                 proxy_path && av_strstart(proxy_path, "http://", NULL);
+     freeenv_utf8(env_no_proxy);
+ 
++    if (parent->vortx_reference_pin) {
++        const struct FFVortXReferencePin *pin = parent->vortx_reference_pin;
++        /* Optional pinned readers support only the default verified TLS
++         * policy. Reject before any nested connection or handshake can run.
++         * The successful backend observation is checked again by HTTP before
++         * credentials are constructed or request headers are written. */
++        if (!memchr(pin->hostname, 0, sizeof(pin->hostname)) ||
++            strcmp(pin->hostname, c->underlying_host) || port != pin->port ||
++            c->verify != 1 || c->ca_file || c->cert_file || c->key_file ||
++            c->cert_buf || c->key_buf || !c->host ||
++            strcmp(c->host, c->underlying_host) || c->numerichost ||
++            c->external_sock || c->listen || c->is_dtls || c->use_srtp ||
++            (c->http_proxy && c->http_proxy[0]) ||
++            use_proxy ||
++            pin->transport.version != VORTX_HTTP_TRANSPORT_VERSION ||
++            pin->transport.route != VORTX_HTTP_ROUTE_DIRECT_TCP ||
++            (pin->transport.tls_backend != VORTX_HTTP_TLS_SECURETRANSPORT &&
++             pin->transport.tls_backend != VORTX_HTTP_TLS_MBEDTLS) ||
++            pin->transport.tls_policy != VORTX_HTTP_TLS_VERIFIED ||
++            !ff_vortx_reference_peer_valid(&pin->peer, pin->peer_len) ||
++            !ff_vortx_reference_peer_valid(&pin->local, pin->local_len) ||
++            pin->peer.ss_family != pin->local.ss_family) {
++            freeenv_utf8(env_http_proxy);
++            return AVERROR(EINVAL);
++        }
++    }
++
+     if (!c->is_dtls && use_proxy) {
+         char proxy_host[200], proxy_auth[200], dest[200];
+         int proxy_port;
+diff --git a/libavformat/vortx_reference_reader.inc b/libavformat/vortx_reference_reader.inc
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_reference_reader.inc
+@@ -0,0 +1,889 @@
++/* SOURCE-ONLY PROPOSAL, UNCOMPILED/UNRUN. Included by matched http.c only.
++ * One original owner captures/revalidates; one utility worker owns each open.
++ * No borrowed playback object, descriptor, cancel state or mutable options. */
++#define VORTX_REFERENCE_HEADER_MAX (32u * 1024u)
++#if ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_BOOL_LOCK_FREE == 2
++#define VORTX_REFERENCE_LIFETIME_ATOMICS 1
++struct HTTPReferenceLifetime {
++    atomic_uint references;
++    atomic_bool retired;
++};
++#else
++#define VORTX_REFERENCE_LIFETIME_ATOMICS 0
++struct HTTPReferenceLifetime { unsigned unavailable; };
++#endif
++#define VORTX_REFERENCE_LIFETIME_MAX_REFS (1u << 20)
++
++struct avpriv_vortx_reference_recipe {
++    struct avpriv_vortx_http_sent_request sent;
++    struct FFVortXReferencePin pin;
++    char *etag;
++    char *url;
++    AVDictionary *options;
++    int64_t deadline_us;
++    struct HTTPReferenceLifetime *lifetime;
++};
++struct avpriv_vortx_reference_reader {
++    const struct avpriv_vortx_reference_recipe *recipe;
++    AVIOInterruptCB owned_interrupt;
++    URLContext *h;
++    uint64_t body_bytes;
++    uint64_t declared_body_bytes;
++    int complete_entity;
++    int reached_entity_eof;
++    int terminal_error;
++};
++
++static void http_reference_lifetime_drop(struct HTTPReferenceLifetime *value)
++{
++#if VORTX_REFERENCE_LIFETIME_ATOMICS
++    if (value && atomic_fetch_sub_explicit(&value->references, 1,
++                                           memory_order_acq_rel) == 1)
++        av_free(value);
++#else
++    (void)value;
++#endif
++}
++
++/* Caller already owns a ref or is the excluded original HTTP owner. */
++static struct HTTPReferenceLifetime *http_reference_lifetime_retain(
++    struct HTTPReferenceLifetime *value)
++{
++#if VORTX_REFERENCE_LIFETIME_ATOMICS
++    unsigned old;
++    if (!value || atomic_load_explicit(&value->retired, memory_order_acquire))
++        return NULL;
++    old = atomic_load_explicit(&value->references, memory_order_relaxed);
++    do {
++        if (!old || old >= VORTX_REFERENCE_LIFETIME_MAX_REFS)
++            return NULL;
++    } while (!atomic_compare_exchange_weak_explicit(&value->references, &old,
++                 old + 1, memory_order_acquire, memory_order_relaxed));
++    if (atomic_load_explicit(&value->retired, memory_order_acquire)) {
++        http_reference_lifetime_drop(value);
++        return NULL;
++    }
++    return value;
++#else
++    (void)value;
++    return NULL;
++#endif
++}
++
++static void http_reference_lifetime_retire(HTTPContext *s)
++{
++    struct HTTPReferenceLifetime *value = s->reference_lifetime;
++#if VORTX_REFERENCE_LIFETIME_ATOMICS
++    if (value)
++        atomic_store_explicit(&value->retired, true, memory_order_release);
++#endif
++    s->reference_lifetime = NULL;
++    http_reference_lifetime_drop(value);
++}
++
++static void http_reference_lifetime_complete(HTTPContext *s)
++{
++    http_reference_lifetime_retire(s);
++#if VORTX_REFERENCE_LIFETIME_ATOMICS
++    if (s->response_generation > 0 && s->response_etag && s->response_location &&
++        s->sent_request && s->sent_location &&
++        s->sent_request_generation == s->response_generation &&
++        !strcmp(s->sent_location, s->response_location)) {
++        struct HTTPReferenceLifetime *value = av_mallocz(sizeof(*value));
++        if (value) {
++            atomic_init(&value->references, 1);
++            atomic_init(&value->retired, false);
++            s->reference_lifetime = value;
++        }
++    }
++#endif
++}
++
++int avpriv_vortx_reference_recipe_current(
++    const struct avpriv_vortx_reference_recipe *recipe)
++{
++#if VORTX_REFERENCE_LIFETIME_ATOMICS
++    return recipe && recipe->lifetime &&
++        !atomic_load_explicit(&recipe->lifetime->retired, memory_order_acquire);
++#else
++    (void)recipe;
++    return 0;
++#endif
++}
++
++static int http_reference_strong_etag(const char *etag)
++{
++    size_t n;
++    if (!etag || (n = strnlen(etag, RESPONSE_ETAG_LIMIT + 1)) < 2 ||
++        n > RESPONSE_ETAG_LIMIT || etag[0] != '"' || etag[n - 1] != '"')
++        return 0;
++    for (size_t i = 1; i + 1 < n; i++) {
++        unsigned char c = etag[i];
++        if (c < 0x21 || c == '"' || c == 0x7f)
++            return 0;
++    }
++    return 1;
++}
++
++static int http_reference_sent_equal(
++    const struct avpriv_vortx_http_sent_request *a,
++    const struct avpriv_vortx_http_sent_request *b)
++{
++    return a && b && a->version == VORTX_HTTP_SENT_REQUEST_VERSION &&
++        b->version == VORTX_HTTP_SENT_REQUEST_VERSION &&
++        a->response_generation > 0 &&
++        a->response_generation == b->response_generation &&
++        a->request_bytes == b->request_bytes &&
++        a->request_bytes <= VORTX_HTTP_SENT_REQUEST_MAX_BYTES &&
++        a->location && b->location && a->request && b->request &&
++        strnlen(a->location, MAX_URL_SIZE) < MAX_URL_SIZE &&
++        strnlen(b->location, MAX_URL_SIZE) < MAX_URL_SIZE &&
++        !strcmp(a->location, b->location) &&
++        strnlen(a->request, a->request_bytes + 1) == a->request_bytes &&
++        strnlen(b->request, b->request_bytes + 1) == b->request_bytes &&
++        !memcmp(a->request, b->request, a->request_bytes) &&
++        avpriv_vortx_http_transport_equal(&a->transport, &b->transport);
++}
++
++static int http_reference_transport_eligible(
++    const struct avpriv_vortx_http_sent_request *sent)
++{
++    const struct avpriv_vortx_http_transport *t = &sent->transport;
++    if (t->version != VORTX_HTTP_TRANSPORT_VERSION ||
++        t->route != VORTX_HTTP_ROUTE_DIRECT_TCP)
++        return 0;
++    if (!strncmp(sent->location, "http://", 7))
++        return !t->tls_backend && !t->tls_policy;
++    return !strncmp(sent->location, "https://", 8) &&
++        (t->tls_backend == VORTX_HTTP_TLS_SECURETRANSPORT ||
++         t->tls_backend == VORTX_HTTP_TLS_MBEDTLS) &&
++        t->tls_policy == VORTX_HTTP_TLS_VERIFIED;
++}
++
++static int http_reference_transport_matches(URLContext *h)
++{
++    HTTPContext *s = h->priv_data;
++    return h->vortx_reference_pin && s->hd && s->hd->is_connected && s->hd->prot &&
++        avpriv_vortx_http_transport_equal(&h->vortx_reference_pin->transport,
++                                          &s->hd->vortx_transport) &&
++        ((!h->vortx_reference_pin->transport.tls_backend &&
++          !strcmp(s->hd->prot->name, "tcp")) ||
++         (h->vortx_reference_pin->transport.tls_backend &&
++          !strcmp(s->hd->prot->name, "tls")));
++}
++
++/* Kernel observation only: never retain this FD or its URLContext. */
++static int http_reference_owner_peer(HTTPContext *s,
++                                    struct sockaddr_storage *peer,
++                                    socklen_t *peer_len,
++                                    struct sockaddr_storage *local,
++                                    socklen_t *local_len)
++{
++    int fd, type = 0;
++    socklen_t type_len = sizeof(type);
++    if (!s->hd || !s->hd->is_connected ||
++        (fd = ffurl_get_file_handle(s->hd)) < 0)
++        return AVERROR(EAGAIN);
++    *peer = (struct sockaddr_storage){0};
++    *peer_len = sizeof(*peer);
++    *local = (struct sockaddr_storage){0};
++    *local_len = sizeof(*local);
++    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_len) ||
++        type_len != sizeof(type) || type != SOCK_STREAM ||
++        getpeername(fd, (struct sockaddr *)peer, peer_len) ||
++        getsockname(fd, (struct sockaddr *)local, local_len) ||
++        !ff_vortx_reference_peer_valid(peer, *peer_len) ||
++        !ff_vortx_reference_peer_valid(local, *local_len) ||
++        peer->ss_family != local->ss_family)
++        return AVERROR(EAGAIN);
++    return 0;
++}
++
++static int http_reference_field(const char *name, size_t bytes, const char *text)
++{
++    return strlen(text) == bytes && !av_strncasecmp(name, text, bytes);
++}
++
++static int http_reference_decimal(const char **cursor, const char *end,
++                                  uint64_t *value)
++{
++    const char *p = *cursor;
++    uint64_t v = 0;
++    if (p == end || *p < '0' || *p > '9')
++        return 0;
++    while (p < end && *p >= '0' && *p <= '9') {
++        unsigned digit = *p++ - '0';
++        if (v > (INT64_MAX - digit) / 10u)
++            return 0;
++        v = v * 10u + digit;
++    }
++    *cursor = p;
++    *value = v;
++    return 1;
++}
++
++static int http_reference_number(const char *text, uint64_t *value)
++{
++    const char *p = text, *end = text + strlen(text);
++    return http_reference_decimal(&p, end, value) && p == end;
++}
++
++static void http_reference_total_reset(HTTPContext *s)
++{
++    s->reference_original_total = (HTTPReferenceTotal){0};
++    s->reference_header_crlf = 0;
++}
++
++/* Observe ORIGINAL raw header lines before the generic parser mutates them.
++ * This optional knowledge is deliberately stricter than generic filesize:
++ * duplicates, signs, overflow, unknown/chunked framing and syntax ambiguity
++ * remain unavailable. Ordinary playback keeps its exact existing behavior. */
++static void http_reference_total_header(HTTPContext *s, const char *line,
++                                        int line_count, int invalid, int crlf)
++{
++    HTTPReferenceTotal *t = &s->reference_original_total;
++    const char *colon, *value, *end, *p;
++    size_t bytes = strlen(line), name_bytes;
++    if (invalid || !crlf || bytes + 2 > VORTX_REFERENCE_HEADER_MAX ||
++        t->header_bytes > VORTX_REFERENCE_HEADER_MAX - (bytes + 2)) {
++        t->invalid = 1;
++        return;
++    }
++    t->header_bytes += bytes + 2;
++    if (!line_count) {
++        if (!http_response_status_valid(line)) {
++            t->invalid = 1;
++            return;
++        }
++        t->status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + line[11] - '0';
++        return;
++    }
++    if (!bytes)
++        return;
++    colon = strchr(line, ':');
++    if (!colon || colon == line) {
++        t->invalid = 1;
++        return;
++    }
++    name_bytes = colon - line;
++    for (const unsigned char *c = (const unsigned char *)line;
++         c < (const unsigned char *)colon; c++) {
++        if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
++              (*c >= '0' && *c <= '9') || strchr("!#$%&'*+-.^_`|~", *c))) {
++            t->invalid = 1;
++            return;
++        }
++    }
++    value = colon + 1;
++    end = line + bytes;
++    while (value < end && (*value == ' ' || *value == '\t'))
++        value++;
++    while (end > value && (end[-1] == ' ' || end[-1] == '\t'))
++        end--;
++    p = value;
++    if (http_reference_field(line, name_bytes, "Content-Length")) {
++        if (t->length_seen++ || !http_reference_decimal(&p, end, &t->length) || p != end)
++            t->invalid = 1;
++    } else if (http_reference_field(line, name_bytes, "Content-Range")) {
++        if (t->range_seen++ || end - value < 6 || memcmp(value, "bytes ", 6)) {
++            t->invalid = 1;
++            return;
++        }
++        p += 6;
++        if (!http_reference_decimal(&p, end, &t->start) ||
++            p == end || *p++ != '-' ||
++            !http_reference_decimal(&p, end, &t->end) ||
++            p == end || *p++ != '/' ||
++            !http_reference_decimal(&p, end, &t->total) || p != end ||
++            t->end < t->start || !t->total || t->end >= t->total)
++            t->invalid = 1;
++    } else if (http_reference_field(line, name_bytes, "Transfer-Encoding")) {
++        t->transfer_seen = 1;
++    } else if (http_reference_field(line, name_bytes, "Content-Encoding")) {
++        if (t->encoding_seen++ || end - value != 8 ||
++            av_strncasecmp(value, "identity", 8))
++            t->invalid = 1;
++    } else if (http_reference_field(line, name_bytes, "Icy-MetaInt") ||
++               http_reference_field(line, name_bytes, "Trailer") ||
++               (http_reference_field(line, name_bytes, "Content-Type") &&
++                end - value >= 10 && !av_strncasecmp(value, "multipart/", 10))) {
++        t->invalid = 1;
++    }
++}
++
++static void http_reference_total_publish(HTTPContext *s)
++{
++    HTTPReferenceTotal *t = &s->reference_original_total;
++    t->generation = s->response_generation;
++    t->known = 0;
++    t->value = 0;
++    if (t->generation <= 0 || t->invalid || t->transfer_seen ||
++        t->status != s->http_code || t->length_seen != 1)
++        return;
++    if (t->status == 200 && !t->range_seen) {
++        t->known = 1;
++        t->value = t->length;
++    } else if (t->status == 206 && t->range_seen == 1 &&
++               t->length == t->end - t->start + 1) {
++        t->known = 1;
++        t->value = t->total;
++    }
++}
++
++static int http_reference_blacklist(const char *list, int https)
++{
++    const char *p = list;
++    if (strnlen(list, 4096) == 4096)
++        return 0;
++    while (*p) {
++        const char *end = strchr(p, ',');
++        size_t n;
++        if (!end)
++            end = p + strlen(p);
++        n = end - p;
++        if (!n || n > 32 || (n == 3 && !memcmp(p, "tcp", n)) ||
++            (https && n == 3 && !memcmp(p, "tls", n)) ||
++            (n == (https ? 5 : 4) && !memcmp(p, https ? "https" : "http", n)))
++            return 0;
++        for (const char *c = p; c < end; c++) {
++            if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') ||
++                  *c == '_' || *c == '-' || *c == '+'))
++                return 0;
++        }
++        if (!*end)
++            break;
++        if (!*(p = end + 1))
++            return 0;
++    }
++    return 1;
++}
++
++/* Reconstruct the existing MPV prefix producer's transformation from actual
++ * retained wire bytes. Replacement inputs alone never confer replay power. */
++static char *http_reference_prepared_headers(
++    const struct avpriv_vortx_http_sent_request *sent,
++    const char *etag, uint32_t max_bytes)
++{
++    static const char *const rejected[] = {
++        "Content-Length", "Transfer-Encoding", "Expect", "Upgrade", "Trailer",
++        "TE", "Proxy-Authorization", "Proxy-Connection", "If-Match",
++        "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range",
++        NULL,
++    };
++    AVBPrint headers;
++    const char *end = sent->request + sent->request_bytes;
++    const char *line = strstr(sent->request, "\r\n");
++    unsigned host = 0, agent = 0, accept = 0;
++    char *out = NULL;
++    if (!http_sent_request_wire_valid(sent->request, sent->request_bytes) || !line)
++        return NULL;
++    av_bprint_init(&headers, 0, VORTX_HTTP_SENT_REQUEST_MAX_BYTES);
++    line += 2;
++    while (line < end - 2) {
++        const char *next = strstr(line, "\r\n");
++        const char *colon = next ? memchr(line, ':', next - line) : NULL;
++        size_t n;
++        if (!next || next >= end - 2 || !colon || colon == line)
++            goto fail;
++        n = colon - line;
++        for (int i = 0; rejected[i]; i++) {
++            if (http_reference_field(line, n, rejected[i]))
++                goto fail;
++        }
++        if (!http_reference_field(line, n, "Range") &&
++            !http_reference_field(line, n, "Connection") &&
++            !http_reference_field(line, n, "Accept-Encoding") &&
++            !http_reference_field(line, n, "Icy-MetaData")) {
++            host += http_reference_field(line, n, "Host");
++            agent += http_reference_field(line, n, "User-Agent");
++            accept += http_reference_field(line, n, "Accept");
++            av_bprint_append_data(&headers, line, next - line + 2);
++        }
++        line = next + 2;
++    }
++    if (line != end - 2 || host != 1 || agent != 1 || accept != 1)
++        goto fail;
++    av_bprintf(&headers, "Range: bytes=0-%u\r\nIf-Match: %s\r\n"
++               "Connection: close\r\nAccept-Encoding: identity\r\n"
++               "Icy-MetaData: 0\r\n", (unsigned)(max_bytes - 1), etag);
++    if (!av_bprint_is_complete(&headers))
++        goto fail;
++    if (av_bprint_finalize(&headers, &out) < 0) {
++        av_free(out);
++        return NULL;
++    }
++    return out;
++fail:
++    av_bprint_finalize(&headers, NULL);
++    return NULL;
++}
++
++static int http_reference_prepared_options(
++    const AVDictionary *options, const char *headers, uint32_t max_bytes,
++    int64_t remaining_us, int https)
++{
++    static const struct { const char *key, *value; } fixed[] = {
++        {"method", "GET"}, {"tls_verify", "1"}, {"http_proxy", ""},
++        {"cookies", ""}, {"icy", "0"}, {"seekable", "0"}, {"offset", "0"},
++        {"multiple_requests", "0"}, {"reconnect", "0"},
++        {"reconnect_at_eof", "0"}, {"reconnect_on_network_error", "0"},
++        {"reconnect_on_http_error", ""}, {"reconnect_streamed", "0"},
++        {"max_redirects", "0"},
++    };
++    const AVDictionaryEntry *entry = NULL;
++    unsigned dynamic = 0;
++    uint64_t timeout = 0, rw_timeout = 0;
++    while ((entry = av_dict_iterate(options, entry))) {
++        unsigned i;
++        for (i = 0; i < FF_ARRAY_ELEMS(fixed); i++) {
++            if (!strcmp(entry->key, fixed[i].key)) {
++                if (strcmp(entry->value, fixed[i].value))
++                    return 0;
++                break;
++            }
++        }
++        if (i < FF_ARRAY_ELEMS(fixed))
++            continue;
++        if (!strcmp(entry->key, "headers")) {
++            if (strnlen(entry->value, VORTX_HTTP_SENT_REQUEST_MAX_BYTES + 1) >
++                VORTX_HTTP_SENT_REQUEST_MAX_BYTES || strcmp(entry->value, headers))
++                return 0;
++            dynamic |= 1;
++        } else if (!strcmp(entry->key, "end_offset")) {
++            uint64_t value;
++            if (!http_reference_number(entry->value, &value) || value != max_bytes)
++                return 0;
++            dynamic |= 2;
++        } else if (!strcmp(entry->key, "timeout")) {
++            if (!http_reference_number(entry->value, &timeout))
++                return 0;
++            dynamic |= 4;
++        } else if (!strcmp(entry->key, "rw_timeout")) {
++            if (!http_reference_number(entry->value, &rw_timeout))
++                return 0;
++            dynamic |= 8;
++        } else if (!strcmp(entry->key, "protocol_whitelist")) {
++            if (strcmp(entry->value, https ? "https,tcp,tls" : "http,tcp"))
++                return 0;
++            dynamic |= 16;
++        } else if (!strcmp(entry->key, "protocol_blacklist")) {
++            if (!http_reference_blacklist(entry->value, https))
++                return 0;
++        } else {
++            return 0;
++        }
++    }
++    for (unsigned i = 0; i < FF_ARRAY_ELEMS(fixed); i++) {
++        if (!av_dict_get(options, fixed[i].key, NULL, AV_DICT_MATCH_CASE))
++            return 0;
++    }
++    return dynamic == 31 && timeout == rw_timeout &&
++        timeout >= remaining_us && timeout <= VORTX_REFERENCE_READER_MAX_US;
++}
++
++void avpriv_vortx_reference_recipe_release_v1(
++    struct avpriv_vortx_reference_recipe **value)
++{
++    struct avpriv_vortx_reference_recipe *recipe;
++    if (!value || !(recipe = *value))
++        return;
++    *value = NULL;
++    avpriv_vortx_http_sent_request_clear_v2(&recipe->sent);
++    av_free(recipe->etag);
++    av_free(recipe->url);
++    av_dict_free(&recipe->options);
++    http_reference_lifetime_drop(recipe->lifetime);
++    av_free(recipe);
++}
++
++int avpriv_vortx_reference_revalidate_v1(
++    AVIOContext *owner, const struct avpriv_vortx_http_sent_request *expected,
++    size_t expected_size, const struct avpriv_vortx_reference_recipe *recipe)
++{
++    struct avpriv_vortx_http_sent_request current = {0};
++    struct sockaddr_storage peer, local;
++    socklen_t peer_len, local_len;
++    URLContext *h;
++    HTTPContext *s;
++    int ret;
++    if (expected_size != sizeof(*expected))
++        return AVERROR(EINVAL);
++    if (!expected || !recipe || !http_reference_sent_equal(expected, &recipe->sent))
++        return AVERROR(EINVAL);
++    ret = avpriv_vortx_http_copy_sent_request_v2(owner,
++                                               expected->response_generation,
++                                               &current);
++    if (ret < 0)
++        return ret;
++    ret = AVERROR(EAGAIN);
++    h = ffio_geturlcontext(owner); /* exact protocol/class/size checked above */
++    s = h->priv_data;
++    if (!h->vortx_reference_pin &&
++        recipe->lifetime == s->reference_lifetime &&
++        avpriv_vortx_reference_recipe_current(recipe) &&
++        http_reference_sent_equal(&current, &recipe->sent) &&
++        s->reference_original_total.generation == current.response_generation &&
++        s->reference_original_total.known == recipe->pin.entity_total_known &&
++        (!recipe->pin.entity_total_known ||
++         s->reference_original_total.value == recipe->pin.entity_total) &&
++        s->response_etag && !strcmp(s->response_etag, recipe->etag) &&
++        s->response_location && !strcmp(s->response_location, recipe->url) &&
++        http_reference_owner_peer(s, &peer, &peer_len, &local, &local_len) >= 0 &&
++        ff_vortx_reference_peer_equal(&recipe->pin.peer, recipe->pin.peer_len,
++                                      &peer, peer_len) &&
++        ff_vortx_reference_peer_equal(&recipe->pin.local, recipe->pin.local_len,
++                                      &local, local_len))
++        ret = 0;
++    avpriv_vortx_http_sent_request_clear_v2(&current);
++    return ret;
++}
++
++int avpriv_vortx_reference_capture_v1(
++    AVIOContext *owner, const struct avpriv_vortx_http_sent_request *expected,
++    size_t expected_size, const char *expected_etag, const char *prepared_url,
++    const AVDictionary *prepared_options, uint32_t max_bytes,
++    int64_t remaining_us, struct avpriv_vortx_reference_recipe **out)
++{
++    struct avpriv_vortx_reference_recipe *recipe = NULL;
++    struct avpriv_vortx_http_sent_request current = {0};
++    char *headers = NULL;
++    URLContext *h;
++    HTTPContext *s;
++    char proto[10], path[MAX_URL_SIZE];
++    int64_t now = av_gettime_relative();
++    int ret = AVERROR(EINVAL);
++    if (expected_size != sizeof(*expected))
++        return ret;
++    if (!expected || !out || *out || !max_bytes ||
++        max_bytes > VORTX_REFERENCE_READER_MAX_BYTES || remaining_us <= 0 ||
++        remaining_us > VORTX_REFERENCE_READER_MAX_US ||
++        now > INT64_MAX - remaining_us ||
++        !http_reference_strong_etag(expected_etag) ||
++        !http_response_location_valid(prepared_url))
++        return ret;
++    ret = avpriv_vortx_http_copy_sent_request_v2(owner,
++                                               expected->response_generation,
++                                               &current);
++    if (ret < 0)
++        goto done;
++    ret = AVERROR(EAGAIN);
++    h = ffio_geturlcontext(owner);
++    s = h->priv_data;
++    if (h->vortx_reference_pin || !http_reference_sent_equal(expected, &current) ||
++        !http_reference_transport_eligible(&current) ||
++        s->reference_original_total.generation != current.response_generation ||
++        strcmp(current.location, prepared_url) || !s->response_etag ||
++        strcmp(s->response_etag, expected_etag))
++        goto done;
++    headers = http_reference_prepared_headers(&current, expected_etag, max_bytes);
++    if (!headers || !http_reference_prepared_options(prepared_options, headers,
++                      max_bytes, remaining_us, !strncmp(prepared_url, "https://", 8)))
++        goto done;
++    recipe = av_mallocz(sizeof(*recipe));
++    if (!recipe) {
++        ret = AVERROR(ENOMEM);
++        goto done;
++    }
++    recipe->sent = current;
++    current = (struct avpriv_vortx_http_sent_request){0};
++    recipe->lifetime = http_reference_lifetime_retain(s->reference_lifetime);
++    if (!recipe->lifetime) {
++        ret = AVERROR(EAGAIN);
++        goto done;
++    }
++    recipe->etag = av_strdup(expected_etag);
++    recipe->url = av_strdup(prepared_url);
++    ret = av_dict_copy(&recipe->options, prepared_options, 0);
++    if (!recipe->etag || !recipe->url || ret < 0) {
++        ret = AVERROR(ENOMEM);
++        goto done;
++    }
++    av_url_split(proto, sizeof(proto), NULL, 0,
++                 recipe->pin.hostname, sizeof(recipe->pin.hostname),
++                 &recipe->pin.port, path, sizeof(path), recipe->url);
++    if (recipe->pin.port < 0)
++        recipe->pin.port = !strcmp(proto, "https") ? 443 : 80;
++    recipe->pin.transport = recipe->sent.transport;
++    recipe->pin.etag = recipe->etag;
++    recipe->pin.max_bytes = max_bytes;
++    recipe->pin.entity_total_known = s->reference_original_total.known;
++    recipe->pin.entity_total = s->reference_original_total.value;
++    recipe->deadline_us = now + remaining_us;
++    ret = http_reference_owner_peer(s, &recipe->pin.peer, &recipe->pin.peer_len,
++                                     &recipe->pin.local, &recipe->pin.local_len);
++    if (ret < 0 || (ret = avpriv_vortx_reference_revalidate_v1(
++                            owner, expected, expected_size, recipe)) < 0)
++        goto done;
++    *out = recipe;
++    recipe = NULL;
++    ret = 0;
++done:
++    av_free(headers);
++    avpriv_vortx_http_sent_request_clear_v2(&current);
++    avpriv_vortx_reference_recipe_release_v1(&recipe);
++    return ret;
++}
++
++/* Private raw CRLF and byte-budget enforcement, before every header byte.
++ * Normal HTTP keeps its existing parser. No body prefetch or huge buffer. */
++static int http_reference_line(HTTPContext *s, char *line, size_t size,
++                               unsigned *header_bytes)
++{
++    size_t n = 0;
++    for (;;) {
++        unsigned char c;
++        int ret;
++        if (*header_bytes >= VORTX_REFERENCE_HEADER_MAX)
++            return AVERROR(ENOBUFS);
++        ret = ffurl_read(s->hd, &c, 1);
++        if (ret != 1)
++            return ret < 0 && ret != AVERROR_EOF ? ret : AVERROR_INVALIDDATA;
++        ++*header_bytes;
++        if (c == '\r') {
++            if (*header_bytes >= VORTX_REFERENCE_HEADER_MAX)
++                return AVERROR(ENOBUFS);
++            ret = ffurl_read(s->hd, &c, 1);
++            if (ret != 1 || c != '\n')
++                return ret < 0 && ret != AVERROR_EOF ? ret : AVERROR_INVALIDDATA;
++            ++*header_bytes;
++            line[n] = 0;
++            return 0;
++        }
++        if (c == '\n' || !c || c == 0x7f || (c < 0x20 && c != '\t') ||
++            n + 1 >= size)
++            return AVERROR_INVALIDDATA;
++        line[n++] = c;
++    }
++}
++
++static int http_reference_read_header(URLContext *h)
++{
++    HTTPContext *s = h->priv_data;
++    const struct FFVortXReferencePin *pin = h->vortx_reference_pin;
++    char line[MAX_URL_SIZE];
++    unsigned bytes = 0, etag_seen = 0, length_seen = 0, range_seen = 0;
++    unsigned encoding_seen = 0;
++    uint64_t length = 0, start = 0, end = 0, total = 0;
++    int ret;
++    s->reference_admitted = s->reference_complete_entity = 0;
++    if ((ret = http_reference_line(s, line, sizeof(line), &bytes)) < 0)
++        return ret;
++    if (!http_response_status_valid(line) ||
++        (memcmp(line + 9, "200", 3) && memcmp(line + 9, "206", 3)))
++        return AVERROR_INVALIDDATA;
++    s->http_code = line[11] == '0' ? 200 : 206;
++    for (;;) {
++        char *colon, *value, *last;
++        const char *p, *value_end;
++        size_t name_bytes;
++        if ((ret = http_reference_line(s, line, sizeof(line), &bytes)) < 0)
++            return ret;
++        if (!line[0])
++            break;
++        colon = strchr(line, ':');
++        if (!colon || colon == line)
++            return AVERROR_INVALIDDATA;
++        name_bytes = colon - line;
++        for (const unsigned char *c = (const unsigned char *)line;
++             c < (const unsigned char *)colon; c++) {
++            if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
++                  (*c >= '0' && *c <= '9') || strchr("!#$%&'*+-.^_`|~", *c)))
++                return AVERROR_INVALIDDATA;
++        }
++        value = colon + 1;
++        while (*value == ' ' || *value == '\t')
++            value++;
++        last = value + strlen(value);
++        while (last > value && (last[-1] == ' ' || last[-1] == '\t'))
++            --last;
++        *last = 0;
++        if (http_reference_field(line, name_bytes, "ETag")) {
++            if (etag_seen++ || !http_reference_strong_etag(value) ||
++                strcmp(value, pin->etag))
++                return AVERROR_INVALIDDATA;
++        } else if (http_reference_field(line, name_bytes, "Content-Length")) {
++            if (length_seen++ || !http_reference_number(value, &length))
++                return AVERROR_INVALIDDATA;
++        } else if (http_reference_field(line, name_bytes, "Content-Range")) {
++            if (range_seen++ || strncmp(value, "bytes ", 6))
++                return AVERROR_INVALIDDATA;
++            p = value + 6;
++            value_end = value + strlen(value);
++            if (!http_reference_decimal(&p, value_end, &start) ||
++                p == value_end || *p++ != '-' ||
++                !http_reference_decimal(&p, value_end, &end) ||
++                p == value_end || *p++ != '/' ||
++                !http_reference_decimal(&p, value_end, &total) || p != value_end)
++                return AVERROR_INVALIDDATA;
++        } else if (http_reference_field(line, name_bytes, "Content-Encoding")) {
++            if (encoding_seen++ || av_strcasecmp(value, "identity"))
++                return AVERROR_INVALIDDATA;
++        } else if (http_reference_field(line, name_bytes, "Transfer-Encoding") ||
++                   http_reference_field(line, name_bytes, "Location") ||
++                   http_reference_field(line, name_bytes, "Icy-MetaInt") ||
++                   http_reference_field(line, name_bytes, "Trailer") ||
++                   (http_reference_field(line, name_bytes, "Content-Type") &&
++                    av_stristart(value, "multipart/", NULL))) {
++            return AVERROR_INVALIDDATA;
++        }
++    }
++    if (etag_seen != 1 || length_seen != 1 || length > pin->max_bytes ||
++        (s->http_code == 200 && range_seen) ||
++        (s->http_code == 206 && (range_seen != 1 || start != 0 ||
++         end < start || end >= pin->max_bytes || !total || end >= total ||
++         length != end + 1)))
++        return AVERROR_INVALIDDATA;
++    if (s->http_code == 200)
++        total = length;
++    if (pin->entity_total_known && total != pin->entity_total)
++        return AVERROR_INVALIDDATA;
++    s->reference_body_bytes = length;
++    s->reference_total_bytes = total;
++    s->reference_complete_entity = length == total;
++    s->reference_admitted = 1;
++    s->off = 0;
++    s->end_header = 1;
++    s->filesize = total;
++    s->range_end = length;
++    s->chunksize = UINT64_MAX;
++    return 0;
++}
++
++static int http_reference_interrupt(void *opaque)
++{
++    struct avpriv_vortx_reference_reader *reader = opaque;
++    return !avpriv_vortx_reference_recipe_current(reader->recipe) ||
++        av_gettime_relative() >= reader->recipe->deadline_us ||
++        (reader->owned_interrupt.callback && reader->owned_interrupt.callback(
++                                               reader->owned_interrupt.opaque));
++}
++
++void avpriv_vortx_reference_reader_close_v1(
++    struct avpriv_vortx_reference_reader **value)
++{
++    struct avpriv_vortx_reference_reader *reader;
++    if (!value || !(reader = *value))
++        return;
++    *value = NULL;
++    ffurl_closep(&reader->h); /* recipe and callback remain alive here */
++    av_free(reader);
++}
++
++int avpriv_vortx_reference_open_prefix_v1(
++    const struct avpriv_vortx_reference_recipe *recipe,
++    const AVIOInterruptCB *interrupt, struct avpriv_vortx_reference_reader **out)
++{
++    struct avpriv_vortx_reference_reader *reader = NULL;
++    AVDictionary *options = NULL;
++    AVIOInterruptCB callback;
++    HTTPContext *s;
++    int ret = AVERROR(EINVAL);
++    if (!recipe || !interrupt || !out || *out)
++        return ret;
++    reader = av_mallocz(sizeof(*reader));
++    if (!reader)
++        return AVERROR(ENOMEM);
++    reader->recipe = recipe;
++    reader->owned_interrupt = *interrupt;
++    if (http_reference_interrupt(reader)) {
++        ret = AVERROR_EXIT;
++        goto done;
++    }
++    callback = (AVIOInterruptCB){http_reference_interrupt, reader};
++    if ((ret = av_dict_copy(&options, recipe->options, 0)) < 0 ||
++        (ret = ffurl_alloc(&reader->h, recipe->url, AVIO_FLAG_READ, &callback)) < 0)
++        goto done;
++    reader->h->vortx_reference_pin = &recipe->pin;
++    /* Real alloc/options/connect path, with the recipe pin attached before
++     * HTTP can open TLS/TCP. No fabricated parent context or numeric URL. */
++    if ((ret = av_opt_set_dict(reader->h, &options)) < 0 ||
++        (ret = av_opt_set_dict(reader->h->priv_data, &options)) < 0 ||
++        (ret = ffurl_connect(reader->h, &options)) < 0)
++        goto done;
++    s = reader->h->priv_data;
++    if (!s->reference_admitted || !s->location || strcmp(s->location, recipe->url) ||
++        s->new_location || !http_reference_transport_matches(reader->h) ||
++        http_reference_interrupt(reader)) {
++        ret = AVERROR_INVALIDDATA;
++        goto done;
++    }
++    reader->declared_body_bytes = s->reference_body_bytes;
++    reader->complete_entity = s->reference_complete_entity;
++    *out = reader;
++    reader = NULL;
++    ret = 0;
++done:
++    av_dict_free(&options);
++    avpriv_vortx_reference_reader_close_v1(&reader);
++    return ret;
++}
++
++static int http_reference_terminal(struct avpriv_vortx_reference_reader *reader,
++                                   int error)
++{
++    if (error >= 0 || error == AVERROR_EOF)
++        error = AVERROR_INVALIDDATA;
++    reader->terminal_error = error;
++    return error;
++}
++
++int avpriv_vortx_reference_read_v1(struct avpriv_vortx_reference_reader *reader,
++                                  unsigned char *buffer, int buffer_size)
++{
++    uint64_t remaining;
++    HTTPContext *s;
++    int ret;
++    if (!reader)
++        return AVERROR(EINVAL);
++    if (reader->terminal_error)
++        return reader->terminal_error;
++    if (!buffer || buffer_size <= 0)
++        return http_reference_terminal(reader, AVERROR(EINVAL));
++    if (http_reference_interrupt(reader))
++        return http_reference_terminal(reader, AVERROR_EXIT);
++    if (reader->body_bytes > reader->declared_body_bytes ||
++        reader->body_bytes > reader->recipe->pin.max_bytes)
++        return http_reference_terminal(reader, AVERROR_INVALIDDATA);
++    remaining = reader->declared_body_bytes - reader->body_bytes;
++    if (!remaining) {
++        if (!reader->complete_entity)
++            return http_reference_terminal(reader, AVERROR(ENOBUFS));
++        reader->reached_entity_eof = 1;
++        return AVERROR_EOF; /* known complete entity framing, fully consumed */
++    }
++    if (reader->body_bytes == reader->recipe->pin.max_bytes)
++        return http_reference_terminal(reader, AVERROR(ENOBUFS));
++    buffer_size = FFMIN((uint64_t)buffer_size, remaining);
++    buffer_size = FFMIN((uint64_t)buffer_size,
++                        reader->recipe->pin.max_bytes - reader->body_bytes);
++    s = reader->h->priv_data;
++    ret = ffurl_read(s->hd, buffer, buffer_size);
++    if (ret <= 0)
++        return http_reference_terminal(reader, ret == AVERROR_EOF || !ret ?
++                                                AVERROR_INVALIDDATA : ret);
++    if (ret > buffer_size)
++        return http_reference_terminal(reader, AVERROR_INVALIDDATA);
++    reader->body_bytes += ret;
++    if (http_reference_interrupt(reader))
++        return http_reference_terminal(reader, AVERROR_EXIT);
++    return ret;
++}
++
++int avpriv_vortx_reference_stats_v1(
++    const struct avpriv_vortx_reference_reader *reader,
++    struct avpriv_vortx_reference_stats *out, size_t out_size)
++{
++    if (out_size != sizeof(*out))
++        return AVERROR(EINVAL);
++    if (!reader || !out || out->body_bytes || out->max_bytes ||
++        out->complete_entity || out->reached_entity_eof || out->terminal_error)
++        return AVERROR(EINVAL);
++    *out = (struct avpriv_vortx_reference_stats){
++        .body_bytes = reader->body_bytes,
++        .max_bytes = reader->recipe->pin.max_bytes,
++        .complete_entity = reader->complete_entity,
++        .reached_entity_eof = reader->reached_entity_eof,
++        .terminal_error = reader->terminal_error,
++    };
++    return 0;
++}
+diff --git a/libavformat/vortx_reference_pin.h b/libavformat/vortx_reference_pin.h
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_reference_pin.h
+@@ -0,0 +1,104 @@
++/* VortX source-private finite reader pin. SOURCE PROPOSAL, UNCOMPILED/UNRUN.
++ * No public option/symbol or global destination policy. The owning immutable
++ * recipe outlives all synchronous contexts borrowing this structure. */
++#ifndef AVFORMAT_VORTX_REFERENCE_PIN_H
++#define AVFORMAT_VORTX_REFERENCE_PIN_H
++
++#include <string.h>
++#include "network.h"
++struct avpriv_vortx_reference_sparse_reader;
++
++struct FFVortXReferencePin {
++    char hostname[1024];
++    int port;
++    struct sockaddr_storage peer;
++    socklen_t peer_len;
++    struct sockaddr_storage local;
++    socklen_t local_len;
++    struct avpriv_vortx_http_transport transport;
++    const char *etag;
++    uint32_t max_bytes;
++    int entity_total_known;
++    uint64_t entity_total;
++    /* NULL for the validated prefix API. A sparse open borrows this one
++     * worker-owned handle only through synchronous nested open/read/close;
++     * its copied request plan is immutable, its shared budget is worker-only. */
++    struct avpriv_vortx_reference_sparse_reader *sparse;
++};
++
++static inline int ff_vortx_reference_peer_valid(
++    const struct sockaddr_storage *peer, socklen_t peer_len)
++{
++    if (!peer || peer_len < sizeof(peer->ss_family) || peer_len > sizeof(*peer))
++        return 0;
++    if (peer->ss_family == AF_INET) {
++        const struct sockaddr_in *v4;
++        if (peer_len != sizeof(struct sockaddr_in))
++            return 0;
++        v4 = (const struct sockaddr_in *)peer;
++        return v4->sin_port != 0;
++    }
++#if HAVE_STRUCT_SOCKADDR_IN6
++    if (peer->ss_family == AF_INET6) {
++        const struct sockaddr_in6 *v6;
++        if (peer_len != sizeof(struct sockaddr_in6))
++            return 0;
++        v6 = (const struct sockaddr_in6 *)peer;
++        return v6->sin6_port != 0;
++    }
++#endif
++    return 0;
++}
++
++static inline int ff_vortx_reference_peer_equal(
++    const struct sockaddr_storage *a, socklen_t a_len,
++    const struct sockaddr_storage *b, socklen_t b_len)
++{
++    if (!ff_vortx_reference_peer_valid(a, a_len) ||
++        !ff_vortx_reference_peer_valid(b, b_len) ||
++        a->ss_family != b->ss_family)
++        return 0;
++    if (a->ss_family == AF_INET) {
++        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
++        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
++        return a4->sin_port == b4->sin_port &&
++               a4->sin_addr.s_addr == b4->sin_addr.s_addr;
++    }
++#if HAVE_STRUCT_SOCKADDR_IN6
++    if (a->ss_family == AF_INET6) {
++        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
++        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
++        return a6->sin6_port == b6->sin6_port &&
++               a6->sin6_scope_id == b6->sin6_scope_id &&
++               !memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr));
++    }
++#endif
++    return 0;
++}
++
++/* Kernel source endpoint equality, excluding the per-open ephemeral port.
++ * This proves no physical interface, route, namespace or VPN affinity. */
++static inline int ff_vortx_reference_local_equal(
++    const struct sockaddr_storage *a, socklen_t a_len,
++    const struct sockaddr_storage *b, socklen_t b_len)
++{
++    if (!ff_vortx_reference_peer_valid(a, a_len) ||
++        !ff_vortx_reference_peer_valid(b, b_len) ||
++        a->ss_family != b->ss_family)
++        return 0;
++    if (a->ss_family == AF_INET) {
++        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
++        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
++        return a4->sin_addr.s_addr == b4->sin_addr.s_addr;
++    }
++#if HAVE_STRUCT_SOCKADDR_IN6
++    if (a->ss_family == AF_INET6) {
++        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
++        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
++        return a6->sin6_scope_id == b6->sin6_scope_id &&
++               !memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr));
++    }
++#endif
++    return 0;
++}
++#endif
+diff --git a/libavformat/vortx_reference_reader_stream.h b/libavformat/vortx_reference_reader_stream.h
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_reference_reader_stream.h
+@@ -0,0 +1,97 @@
++/* Proposed source-private matched-component API; UNCOMPILED/UNRUN.
++ * No public Swift/AVOption API and no current reader activation. */
++#ifndef VORTX_PRIVATE_REFERENCE_READER_STREAM_H
++#define VORTX_PRIVATE_REFERENCE_READER_STREAM_H
++#include <stddef.h>
++#include <stdint.h>
++#include <libavformat/avio.h>
++#include <libavutil/dict.h>
++#include "vortx_http_request.h"
++
++#define VORTX_REFERENCE_READER_MAX_BYTES (128u * 1024u * 1024u)
++#define VORTX_REFERENCE_READER_MAX_US 30000000LL
++
++struct avpriv_vortx_reference_recipe;
++struct avpriv_vortx_reference_reader;
++struct avpriv_vortx_reference_stats {
++    uint64_t body_bytes;
++    uint32_t max_bytes;
++    int complete_entity;       /* admitted response covers whole entity */
++    int reached_entity_eof;    /* true media EOF actually reached */
++    int terminal_error;        /* non-EOF failure; partial data is unusable */
++};
++
++/* Original live AVIO owner only, excluded from I/O/seek/replace/teardown.
++ * expected is its retained exact v2 snapshot. Prepared URL/options come only
++ * from stream_reference_source_prepare_prefix_request, not current globals.
++ * Own all copies plus actual connected direct peer; retain no live owner/FD/
++ * cancel/options. Require plain HTTP or supported default verified TLS; proxy,
++ * custom CA/identity/host override and numeric TLS stay unavailable until
++ * reproducible. This restricts optional alignment, never ordinary playback or
++ * user-chosen private/Tailscale destinations. No network I/O. NULL out only;
++ * failure changes nothing. Check expected_size BEFORE structure access. */
++int avpriv_vortx_reference_capture_v1(
++    struct AVIOContext *owner,
++    const struct avpriv_vortx_http_sent_request *expected, size_t expected_size,
++    const char *expected_etag, const char *prepared_url,
++    const struct AVDictionary *prepared_options, uint32_t max_bytes,
++    int64_t remaining_us, struct avpriv_vortx_reference_recipe **out);
++
++/* Same original-owner exclusion. Compare current exact sent response, source
++ * peer, transport policy and strong validator; no network I/O. This remains
++ * only one part of final source/epoch/demux/selected-track/intent admission. */
++int avpriv_vortx_reference_revalidate_v1(
++    struct AVIOContext *owner,
++    const struct avpriv_vortx_http_sent_request *expected, size_t expected_size,
++    const struct avpriv_vortx_reference_recipe *recipe);
++
++/* Persistent publication-current check. Caller owns recipe throughout this
++ * call (publication/request lease remains retained until renderer quiescence).
++ * Read only the recipe's retained response-lifetime token; never borrow AVIO,
++ * socket, mutable options/job/result or an original owner pointer. Retirement
++ * is sticky and precedes original response/transport replacement or teardown.
++ * This has NO work-deadline expiry: the 30-second read limit is separate from
++ * how long a published timing map may remain valid. Returns 1 only while this
++ * exact original completed response is current, 0 after retirement/unavailable.
++ * Supported implementation requires compile-time always-lock-free atomic_uint
++ * and atomic_bool, bounded references, and matched target/build verification.
++ * Unsupported atomic policy or allocation/ref saturation disables optional
++ * capture only; it never alters normal HTTP playback. */
++int avpriv_vortx_reference_recipe_current(
++    const struct avpriv_vortx_reference_recipe *recipe);
++
++/* One utility worker only. The owned job keeps recipe and the callback's owned
++ * cancellation state alive until close. No borrowed original source pointer.
++ * Allocate a SMALL reader, never a max_bytes body buffer. Keep original URL,
++ * Host and SNI; enforce the captured numeric peer BEFORE connect/credentials.
++ * No DNS broadening, redirects, reconnects or nested requests. Validate exact
++ * conditional response/range/identity encoding and TLS before open succeeds.
++ * No request/URL/header/auth value may appear in new logs. */
++int avpriv_vortx_reference_open_prefix_v1(
++    const struct avpriv_vortx_reference_recipe *recipe,
++    const AVIOInterruptCB *interrupt,
++    struct avpriv_vortx_reference_reader **out);
++
++/* Incremental body reads only. Count actual returned bytes against max_bytes,
++ * enforce the same deadline/callback each time, and do not retry/reopen/seek.
++ * Return AVERROR_EOF only after an admitted COMPLETE ENTITY actually ends.
++ * EOF of a partial range or exhausted byte cap is an error, never media EOF.
++ * A failure invalidates every partial timing result. Caller must stop reading
++ * as soon as a useful complete timing prefix is obtained, then close. */
++int avpriv_vortx_reference_read_v1(
++    struct avpriv_vortx_reference_reader *reader,
++    unsigned char *buffer, int buffer_size);
++
++/* Worker-owned scalars only; out zeroed and exact size checked before access.
++ * Must be called before close. No readiness/permission is inferred from stats. */
++int avpriv_vortx_reference_stats_v1(
++    const struct avpriv_vortx_reference_reader *reader,
++    struct avpriv_vortx_reference_stats *out, size_t out_size);
++
++/* Close ALL new contexts before recipe/callback storage may be released.
++ * Never closes or interrupts the original playback AVIO/socket. */
++void avpriv_vortx_reference_reader_close_v1(
++    struct avpriv_vortx_reference_reader **reader);
++void avpriv_vortx_reference_recipe_release_v1(
++    struct avpriv_vortx_reference_recipe **recipe);
++#endif
+diff --git a/libavformat/vortx_reference_sparse.h b/libavformat/vortx_reference_sparse.h
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_reference_sparse.h
+@@ -0,0 +1,100 @@
++/* Source-private matched-component sparse HTTP API. SOURCE PROPOSAL ONLY;
++ * UNCOMPILED/UNRUN. This additive header preserves the adaeb9 prefix contract.
++ * Recipe remains opaque/native: no Swift/public option/serialized carrier. */
++#ifndef VORTX_PRIVATE_REFERENCE_SPARSE_H
++#define VORTX_PRIVATE_REFERENCE_SPARSE_H
++#include <stddef.h>
++#include <stdint.h>
++#include <libavformat/avio.h>
++
++#define VORTX_SPARSE_MAX_HTTP_BYTES (128u * 1024u * 1024u)
++#define VORTX_SPARSE_MAX_REQUESTS 256u
++#define VORTX_SPARSE_MAX_SPANS 1024u
++#define VORTX_SPARSE_MAX_SPAN_BYTES (1024u * 1024u)
++#define VORTX_SPARSE_MAX_BATCH_BYTES (4u * 1024u * 1024u)
++#define VORTX_SPARSE_MAX_RANGE_VALUE (32u * 1024u)
++
++struct avpriv_vortx_reference_recipe;
++struct avpriv_vortx_reference_sparse_budget;
++struct avpriv_vortx_reference_sparse_reader;
++struct avpriv_vortx_reference_sparse_span {
++    uint64_t start; /* absolute entity offset */
++    uint32_t bytes; /* 1..1MiB, end=start+bytes-1 checked before addition */
++};
++struct avpriv_vortx_reference_sparse_info {
++    uint64_t entity_bytes; /* known original total; never inferred from prefix */
++    uint64_t http_plaintext_bytes; /* outgoing request + ALL incoming HTTP */
++    uint32_t requests_started;
++    int active_handle;
++    int terminal_error;
++};
++struct avpriv_vortx_reference_sparse_part {
++    uint32_t plan_index;
++    uint64_t start;
++    uint32_t bytes;
++    uint64_t entity_bytes;
++};
++struct avpriv_vortx_reference_sparse_stats {
++    uint64_t payload_bytes;
++    uint32_t parts_complete;
++    int batch_validated; /* all parts, final delimiter, exact outer body length */
++    int terminal_error;
++};
++
++/* One worker owns budget and every handle, no concurrent budget operations.
++ * Create owns a complete immutable native recipe copy plus retained response
++ * lifetime token. Caller owns the input recipe throughout create; the budget
++ * retains no original owner/FD and thereafter owns its copy until release.
++ * Job owns callback storage until last close/budget release. Native publication
++ * ownership of the original recipe remains separate. Require known nonzero
++ * original total and current response lifetime. No network here. Inherit exact
++ * captured deadline, never renew30s or bytes/attempts on another open/close. */
++int avpriv_vortx_reference_sparse_budget_create_v1(
++    const struct avpriv_vortx_reference_recipe *recipe,
++    const AVIOInterruptCB *owned_interrupt,
++    struct avpriv_vortx_reference_sparse_budget **out);
++int avpriv_vortx_reference_sparse_budget_info_v1(
++    const struct avpriv_vortx_reference_sparse_budget *budget,
++    struct avpriv_vortx_reference_sparse_info *out, size_t out_size);
++
++/* Validate count<=1024 BEFORE multiplication/access; spans_size must exactly
++ * match. Copy ascending nonoverlapping spans, every end below original total.
++ * Each<=1MiB, sum<=4MiB; Range value<=32KiB and whole request still bounded.
++ * One active handle. Charge attempt before connection, request bytes before
++ * write and every received HTTP byte before read. 256attempts/128MiB shared.
++ * One span requires exact single206. Multiple require strict multipart206.
++ * Original URL/Host/SNI, credentials, strongETag, knownTOTAL, pinned endpoints
++ * and supported verified TLS remain exact. No redirect/retry/reconnect/seek. */
++int avpriv_vortx_reference_sparse_open_v1(
++    struct avpriv_vortx_reference_sparse_budget *budget,
++    const struct avpriv_vortx_reference_sparse_span *spans,
++    size_t spans_size, uint32_t span_count,
++    struct avpriv_vortx_reference_sparse_reader **out);
++
++/* All output structures must be cleared; exact out_size checked before access.
++ * 1=next strict admitted part header; 0=ENTIRE batch framing validated;
++ * negative=sticky operation failure. Prior part must be fully drained.
++ * A zero result is NEVER media EOF. No unrequested/coalesced/reordered parts. */
++int avpriv_vortx_reference_sparse_next_part_v1(
++    struct avpriv_vortx_reference_sparse_reader *reader,
++    struct avpriv_vortx_reference_sparse_part *out, size_t out_size);
++/* Positive current-part payload bytes; zero=current exact part drained;
++ * negative=sticky failure. Payload stays tentative until entire batch validates.
++ * Every operation checks current token, original deadline and owned callback.
++ * No binary boundary search, body-sized eager allocation, or synthetic holes. */
++int avpriv_vortx_reference_sparse_read_part_v1(
++    struct avpriv_vortx_reference_sparse_reader *reader,
++    unsigned char *buffer, int buffer_size);
++int avpriv_vortx_reference_sparse_stats_v1(
++    const struct avpriv_vortx_reference_sparse_reader *reader,
++    struct avpriv_vortx_reference_sparse_stats *out, size_t out_size);
++
++/* Close ALL duplicate contexts before recipe/callback release. An incomplete
++ * close invalidates the operation; bytes/attempts are never replenished.
++ * Budget release requires no active handle; misuse leaves budget owned and
++ * terminal rather than freeing storage underneath a live handle. */
++void avpriv_vortx_reference_sparse_close_v1(
++    struct avpriv_vortx_reference_sparse_reader **reader);
++void avpriv_vortx_reference_sparse_budget_release_v1(
++    struct avpriv_vortx_reference_sparse_budget **budget);
++#endif
+diff --git a/libavformat/vortx_reference_sparse.inc b/libavformat/vortx_reference_sparse.inc
+new file mode 100644
+--- /dev/null
++++ b/libavformat/vortx_reference_sparse.inc
+@@ -0,0 +1,820 @@
++/* SOURCE PROPOSAL ONLY, UNCOMPILED/UNRUN. Included immediately after the
++ * matched vortx_reference_reader.inc inside http.c. No public options/logs,
++ * borrowed original AVIO/FD, generic seek adapter, or media-EOF inference. */
++#include "vortx_reference_sparse.h"
++
++#define VORTX_SPARSE_OUTER_HEADERS (32u * 1024u)
++#define VORTX_SPARSE_PART_HEADERS (8u * 1024u)
++#define VORTX_SPARSE_BOUNDARY_MAX 70u
++
++struct avpriv_vortx_reference_sparse_budget {
++    struct avpriv_vortx_reference_recipe *recipe; /* owned immutable clone */
++    AVIOInterruptCB owned_interrupt;
++    struct avpriv_vortx_reference_sparse_reader *active;
++    uint64_t http_bytes;
++    uint32_t attempts;
++    int terminal_error;
++};
++
++struct avpriv_vortx_reference_sparse_reader {
++    struct avpriv_vortx_reference_sparse_budget *budget;
++    URLContext *h;
++    struct FFVortXReferencePin pin;
++    struct avpriv_vortx_reference_sparse_span spans[VORTX_SPARSE_MAX_SPANS];
++    uint32_t span_count;
++    uint32_t parts_complete;
++    uint64_t requested_bytes;
++    uint64_t outer_length;
++    uint64_t outer_read;
++    uint64_t payload_read;
++    uint32_t part_remaining;
++    char *range_value;
++    char *headers;
++    char boundary[VORTX_SPARSE_BOUNDARY_MAX + 1];
++    int request_charged;
++    int outer_admitted;
++    int multipart;
++    int part_active;
++    int batch_validated;
++};
++
++typedef struct HTTPVortXSparseReceipt {
++    uint64_t length, first, last, total;
++    unsigned lengths, ranges, etags, encodings, types;
++    char boundary[VORTX_SPARSE_BOUNDARY_MAX + 1];
++} HTTPVortXSparseReceipt;
++
++static int http_sparse_fail(struct avpriv_vortx_reference_sparse_budget *budget,
++                            int error)
++{
++    if (error >= 0 || error == AVERROR_EOF)
++        error = AVERROR_INVALIDDATA;
++    if (budget && !budget->terminal_error)
++        budget->terminal_error = error;
++    return budget && budget->terminal_error ? budget->terminal_error : error;
++}
++
++static int http_sparse_check(struct avpriv_vortx_reference_sparse_budget *budget)
++{
++    if (!budget)
++        return AVERROR(EINVAL);
++    if (budget->terminal_error)
++        return budget->terminal_error;
++    if (!avpriv_vortx_reference_recipe_current(budget->recipe) ||
++        av_gettime_relative() >= budget->recipe->deadline_us ||
++        (budget->owned_interrupt.callback && budget->owned_interrupt.callback(
++                                                 budget->owned_interrupt.opaque)))
++        return http_sparse_fail(budget, AVERROR_EXIT);
++    return 0;
++}
++
++static int http_sparse_interrupt(void *opaque)
++{
++    return http_sparse_check(opaque) < 0;
++}
++
++static int http_sparse_charge(struct avpriv_vortx_reference_sparse_budget *budget,
++                              uint64_t bytes)
++{
++    int ret = http_sparse_check(budget);
++    if (ret < 0)
++        return ret;
++    if (budget->http_bytes > VORTX_SPARSE_MAX_HTTP_BYTES ||
++        bytes > VORTX_SPARSE_MAX_HTTP_BYTES - budget->http_bytes)
++        return http_sparse_fail(budget, AVERROR(ENOBUFS));
++    budget->http_bytes += bytes;
++    return 0;
++}
++
++/* Reserve the maximum plaintext that this read can consume BEFORE calling the
++ * lower protocol. Release only the unused reservation; consumed bytes survive
++ * errors, cancellation, close and later requests. TLS wire overhead is not an
++ * HTTP plaintext byte and is not represented by this counter. */
++static int http_sparse_raw(struct avpriv_vortx_reference_sparse_reader *reader,
++                           unsigned char *buffer, int bytes, int body)
++{
++    struct avpriv_vortx_reference_sparse_budget *budget = reader->budget;
++    HTTPContext *s;
++    int ret;
++    if (bytes <= 0 || !buffer || !reader->h ||
++        !(s = reader->h->priv_data) || !s->hd)
++        return http_sparse_fail(budget, AVERROR(EINVAL));
++    if (body && (reader->outer_read > reader->outer_length ||
++                 (uint64_t)bytes > reader->outer_length - reader->outer_read))
++        return http_sparse_fail(budget, AVERROR_INVALIDDATA);
++    if ((ret = http_sparse_charge(budget, bytes)) < 0)
++        return ret;
++    ret = ffurl_read(s->hd, buffer, bytes);
++    if (ret <= 0 || ret > bytes) {
++        budget->http_bytes -= bytes; /* no accepted lower bytes consumed */
++        return http_sparse_fail(budget, ret <= 0 && ret != AVERROR_EOF ? ret :
++                                                               AVERROR_INVALIDDATA);
++    }
++    budget->http_bytes -= bytes - ret;
++    if (body)
++        reader->outer_read += ret;
++    if (http_sparse_check(budget) < 0)
++        return budget->terminal_error;
++    return ret;
++}
++
++static int http_sparse_literal(struct avpriv_vortx_reference_sparse_reader *reader,
++                               const char *text, size_t bytes)
++{
++    for (size_t n = 0; n < bytes; n++) {
++        unsigned char value;
++        int ret = http_sparse_raw(reader, &value, 1, 1);
++        if (ret < 0)
++            return ret;
++        if (value != (unsigned char)text[n])
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    }
++    return 0;
++}
++
++/* Raw strict CRLF, read only at the next declared header/delimiter position.
++ * The parser never searches binary media for a MIME boundary. */
++static int http_sparse_line(struct avpriv_vortx_reference_sparse_reader *reader,
++                            char *line, size_t size, unsigned *used,
++                            unsigned limit, int body)
++{
++    size_t n = 0;
++    for (;;) {
++        unsigned char c;
++        int ret;
++        if (*used >= limit)
++            return http_sparse_fail(reader->budget, AVERROR(ENOBUFS));
++        if ((ret = http_sparse_raw(reader, &c, 1, body)) < 0)
++            return ret;
++        ++*used;
++        if (c == '\r') {
++            if (*used >= limit)
++                return http_sparse_fail(reader->budget, AVERROR(ENOBUFS));
++            if ((ret = http_sparse_raw(reader, &c, 1, body)) < 0)
++                return ret;
++            ++*used;
++            if (c != '\n')
++                return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++            line[n] = 0;
++            return 0;
++        }
++        if (c == '\n' || !c || c == 0x7f || (c < 0x20 && c != '\t') ||
++            n + 1 >= size)
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        line[n++] = c;
++    }
++}
++
++static int http_sparse_boundary_char(unsigned char c, int quoted)
++{
++    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++        (c >= '0' && c <= '9') || strchr("'+_-.", c))
++        return 1;
++    return quoted && strchr("(),/:=?", c) != NULL;
++}
++
++/* Deliberately small parameter grammar: one boundary, safe nonspace ASCII,
++ * no escapes, no extra parameters. Unsupported valid MIME remains optional. */
++static int http_sparse_boundary(const char *value, char *out)
++{
++    const char *p = value;
++    size_t n = 0;
++    int quoted;
++    if (av_strncasecmp(p, "multipart/byteranges", 20))
++        return 0;
++    p += 20;
++    while (*p == ' ' || *p == '\t')
++        p++;
++    if (*p++ != ';')
++        return 0;
++    while (*p == ' ' || *p == '\t')
++        p++;
++    if (av_strncasecmp(p, "boundary", 8))
++        return 0;
++    p += 8;
++    while (*p == ' ' || *p == '\t')
++        p++;
++    if (*p++ != '=')
++        return 0;
++    while (*p == ' ' || *p == '\t')
++        p++;
++    quoted = *p == '"';
++    if (quoted)
++        p++;
++    while (*p && (!quoted || *p != '"') && *p != ' ' && *p != '\t') {
++        if (n == VORTX_SPARSE_BOUNDARY_MAX ||
++            !http_sparse_boundary_char((unsigned char)*p, quoted))
++            return 0;
++        out[n++] = *p++;
++    }
++    if (!n || (quoted && *p++ != '"'))
++        return 0;
++    while (*p == ' ' || *p == '\t')
++        p++;
++    if (*p)
++        return 0;
++    out[n] = 0;
++    return 1;
++}
++
++static int http_sparse_range_value(const char *value,
++                                   HTTPVortXSparseReceipt *receipt)
++{
++    const char *p = value, *end = value + strlen(value);
++    if (end - p < 6 || memcmp(p, "bytes ", 6))
++        return 0;
++    p += 6;
++    return http_reference_decimal(&p, end, &receipt->first) &&
++        p < end && *p++ == '-' &&
++        http_reference_decimal(&p, end, &receipt->last) &&
++        p < end && *p++ == '/' &&
++        http_reference_decimal(&p, end, &receipt->total) && p == end &&
++        receipt->first <= receipt->last && receipt->last < receipt->total;
++}
++
++static int http_sparse_header_field(
++    struct avpriv_vortx_reference_sparse_reader *reader, char *line,
++    HTTPVortXSparseReceipt *receipt, int outer)
++{
++    char *colon = strchr(line, ':'), *value, *last;
++    size_t name_bytes;
++    if (!colon || colon == line)
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    name_bytes = colon - line;
++    for (const unsigned char *p = (const unsigned char *)line;
++         p < (const unsigned char *)colon; p++) {
++        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
++              (*p >= '0' && *p <= '9') || strchr("!#$%&'*+-.^_`|~", *p)))
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    }
++    value = colon + 1;
++    while (*value == ' ' || *value == '\t')
++        value++;
++    last = value + strlen(value);
++    while (last > value && (last[-1] == ' ' || last[-1] == '\t'))
++        --last;
++    *last = 0;
++    if (http_reference_field(line, name_bytes, "ETag")) {
++        if (receipt->etags++ || !http_reference_strong_etag(value) ||
++            strcmp(value, reader->budget->recipe->etag))
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    } else if (http_reference_field(line, name_bytes, "Content-Length")) {
++        if (receipt->lengths++ || !http_reference_number(value, &receipt->length))
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    } else if (http_reference_field(line, name_bytes, "Content-Range")) {
++        if (receipt->ranges++ || !http_sparse_range_value(value, receipt))
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    } else if (http_reference_field(line, name_bytes, "Content-Encoding")) {
++        if (receipt->encodings++ || av_strcasecmp(value, "identity"))
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    } else if (http_reference_field(line, name_bytes, "Content-Type")) {
++        if (receipt->types++)
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        if (outer && reader->span_count > 1) {
++            if (!http_sparse_boundary(value, receipt->boundary))
++                return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        } else if (av_stristart(value, "multipart/", NULL)) {
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        }
++    } else if (http_reference_field(line, name_bytes, "Transfer-Encoding") ||
++               http_reference_field(line, name_bytes, "Content-Transfer-Encoding") ||
++               http_reference_field(line, name_bytes, "Location") ||
++               http_reference_field(line, name_bytes, "Content-Location") ||
++               http_reference_field(line, name_bytes, "Trailer") ||
++               http_reference_field(line, name_bytes, "Icy-MetaInt") ||
++               http_reference_field(line, name_bytes, "Upgrade")) {
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    }
++    return 0;
++}
++
++static int http_sparse_read_header(URLContext *h)
++{
++    HTTPContext *s = h->priv_data;
++    struct avpriv_vortx_reference_sparse_reader *reader =
++        h->vortx_reference_pin ? h->vortx_reference_pin->sparse : NULL;
++    HTTPVortXSparseReceipt receipt = {0};
++    char line[MAX_URL_SIZE];
++    unsigned used = 0;
++    int ret;
++    if (!reader || reader->h != h || !reader->request_charged ||
++        reader->outer_admitted || !http_reference_transport_matches(h))
++        return http_sparse_fail(reader ? reader->budget : NULL, AVERROR(EINVAL));
++    s->reference_admitted = s->reference_complete_entity = 0;
++    if ((ret = http_sparse_line(reader, line, sizeof(line), &used,
++                                VORTX_SPARSE_OUTER_HEADERS, 0)) < 0)
++        return ret;
++    if (!http_response_status_valid(line) || memcmp(line + 9, "206", 3))
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    for (;;) {
++        if ((ret = http_sparse_line(reader, line, sizeof(line), &used,
++                                    VORTX_SPARSE_OUTER_HEADERS, 0)) < 0)
++            return ret;
++        if (!line[0])
++            break;
++        if ((ret = http_sparse_header_field(reader, line, &receipt, 1)) < 0)
++            return ret;
++    }
++    if (receipt.etags != 1 || receipt.lengths != 1 || !receipt.length)
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    if (receipt.length > VORTX_SPARSE_MAX_HTTP_BYTES - reader->budget->http_bytes)
++        return http_sparse_fail(reader->budget, AVERROR(ENOBUFS));
++    if (reader->span_count == 1) {
++        const struct avpriv_vortx_reference_sparse_span *span = &reader->spans[0];
++        if (receipt.ranges != 1 || receipt.length != span->bytes ||
++            receipt.first != span->start ||
++            receipt.last != span->start + span->bytes - 1 ||
++            receipt.total != reader->pin.entity_total)
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        s->off = span->start;
++        s->range_end = span->start + span->bytes;
++    } else {
++        if (receipt.ranges || receipt.types != 1 || !receipt.boundary[0] ||
++            receipt.length <= reader->requested_bytes)
++            return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++        av_strlcpy(reader->boundary, receipt.boundary, sizeof(reader->boundary));
++        reader->multipart = 1;
++        s->off = s->range_end = 0;
++    }
++    reader->outer_length = receipt.length;
++    reader->outer_admitted = 1;
++    s->http_code = 206;
++    s->end_header = 1;
++    s->filesize = reader->pin.entity_total;
++    s->chunksize = UINT64_MAX;
++    s->reference_admitted = 1;
++    s->reference_body_bytes = receipt.length;
++    s->reference_total_bytes = reader->pin.entity_total;
++    return http_sparse_check(reader->budget);
++}
++
++static int http_sparse_before_request(URLContext *h, const char *wire, size_t bytes)
++{
++    struct avpriv_vortx_reference_sparse_reader *reader =
++        h->vortx_reference_pin ? h->vortx_reference_pin->sparse : NULL;
++    const char *line, *original_line;
++    size_t prefix, headers_bytes;
++    int ret;
++    if (!reader || reader->h != h || reader->request_charged ||
++        !http_sent_request_wire_valid(wire, bytes) ||
++        bytes > VORTX_HTTP_SENT_REQUEST_MAX_BYTES)
++        return http_sparse_fail(reader ? reader->budget : NULL, AVERROR(EINVAL));
++    line = strstr(wire, "\r\n");
++    original_line = strstr(reader->budget->recipe->sent.request, "\r\n");
++    if (!line || !original_line || line - wire !=
++        original_line - reader->budget->recipe->sent.request ||
++        memcmp(wire, reader->budget->recipe->sent.request, line - wire))
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    prefix = line - wire + 2;
++    headers_bytes = strlen(reader->headers);
++    if (bytes < prefix || bytes - prefix != headers_bytes + 2 ||
++        memcmp(wire + prefix, reader->headers, headers_bytes) ||
++        memcmp(wire + prefix + headers_bytes, "\r\n", 2))
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    if ((ret = http_sparse_charge(reader->budget, bytes)) < 0)
++        return ret;
++    /* Conservatively retain this reservation even on short/failed write.
++     * The parent hook rejects such writes and invalidates the whole budget. */
++    reader->request_charged = 1;
++    return 0;
++}
++
++static int http_sparse_after_request(URLContext *h)
++{
++    struct avpriv_vortx_reference_sparse_reader *reader =
++        h->vortx_reference_pin ? h->vortx_reference_pin->sparse : NULL;
++    if (!reader || reader->h != h || !reader->request_charged)
++        return http_sparse_fail(reader ? reader->budget : NULL, AVERROR(EINVAL));
++    return http_sparse_check(reader->budget);
++}
++
++static char *http_sparse_request_headers(
++    struct avpriv_vortx_reference_sparse_reader *reader)
++{
++    AVDictionaryEntry *entry = av_dict_get(reader->budget->recipe->options,
++                                          "headers", NULL, AV_DICT_MATCH_CASE);
++    AVBPrint range, headers;
++    const char *line, *end;
++    char *out = NULL;
++    unsigned replaced = 0;
++    if (!entry || strnlen(entry->value, VORTX_HTTP_SENT_REQUEST_MAX_BYTES + 1) >
++                  VORTX_HTTP_SENT_REQUEST_MAX_BYTES)
++        return NULL;
++    av_bprint_init(&range, 0, VORTX_SPARSE_MAX_RANGE_VALUE + 1);
++    av_bprintf(&range, "bytes=");
++    for (uint32_t n = 0; n < reader->span_count; n++) {
++        const struct avpriv_vortx_reference_sparse_span *span = &reader->spans[n];
++        av_bprintf(&range, "%s%"PRIu64"-%"PRIu64, n ? "," : "",
++                   span->start, span->start + span->bytes - 1);
++    }
++    if (!av_bprint_is_complete(&range) || range.len > VORTX_SPARSE_MAX_RANGE_VALUE) {
++        av_bprint_finalize(&range, NULL);
++        return NULL;
++    }
++    if (av_bprint_finalize(&range, &reader->range_value) < 0)
++        return NULL;
++    av_bprint_init(&headers, 0, VORTX_HTTP_SENT_REQUEST_MAX_BYTES);
++    line = entry->value;
++    end = line + strlen(line);
++    while (line < end) {
++        const char *next = strstr(line, "\r\n");
++        const char *colon = next ? memchr(line, ':', next - line) : NULL;
++        if (!next || !colon || colon == line)
++            goto fail;
++        if (http_reference_field(line, colon - line, "Range")) {
++            if (replaced++)
++                goto fail;
++            av_bprintf(&headers, "Range: %s\r\n", reader->range_value);
++        } else {
++            av_bprint_append_data(&headers, line, next - line + 2);
++        }
++        line = next + 2;
++    }
++    if (line != end || replaced != 1 || !av_bprint_is_complete(&headers))
++        goto fail;
++    if (av_bprint_finalize(&headers, &out) < 0) {
++        av_free(out);
++        return NULL;
++    }
++    return out;
++fail:
++    av_bprint_finalize(&headers, NULL);
++    return NULL;
++}
++
++static int http_sparse_recipe_clone(
++    const struct avpriv_vortx_reference_recipe *source,
++    struct avpriv_vortx_reference_recipe **out)
++{
++    struct avpriv_vortx_reference_recipe *copy;
++    int ret;
++    if (!avpriv_vortx_reference_recipe_current(source))
++        return AVERROR_EXIT;
++    copy = av_mallocz(sizeof(*copy));
++    if (!copy)
++        return AVERROR(ENOMEM);
++    copy->lifetime = http_reference_lifetime_retain(source->lifetime);
++    if (!copy->lifetime) {
++        ret = AVERROR_EXIT;
++        goto fail;
++    }
++    copy->pin = source->pin;
++    copy->pin.etag = NULL;
++    copy->pin.sparse = NULL;
++    copy->deadline_us = source->deadline_us;
++    copy->sent.request_bytes = source->sent.request_bytes;
++    copy->sent.response_generation = source->sent.response_generation;
++    copy->sent.version = source->sent.version;
++    copy->sent.transport = source->sent.transport;
++    copy->sent.location = av_strdup(source->sent.location);
++    copy->sent.request = av_strndup(source->sent.request, source->sent.request_bytes);
++    copy->etag = av_strdup(source->etag);
++    copy->url = av_strdup(source->url);
++    if (!copy->sent.location || !copy->sent.request || !copy->etag || !copy->url) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    copy->pin.etag = copy->etag;
++    if ((ret = av_dict_copy(&copy->options, source->options, 0)) < 0)
++        goto fail;
++    if (!avpriv_vortx_reference_recipe_current(copy)) {
++        ret = AVERROR_EXIT;
++        goto fail;
++    }
++    *out = copy;
++    return 0;
++fail:
++    avpriv_vortx_reference_recipe_release_v1(&copy);
++    return ret;
++}
++
++int avpriv_vortx_reference_sparse_budget_create_v1(
++    const struct avpriv_vortx_reference_recipe *recipe,
++    const AVIOInterruptCB *owned_interrupt,
++    struct avpriv_vortx_reference_sparse_budget **out)
++{
++    struct avpriv_vortx_reference_sparse_budget *budget;
++    if (!recipe || !owned_interrupt || !out || *out ||
++        !recipe->pin.entity_total_known || !recipe->pin.entity_total ||
++        recipe->pin.entity_total > INT64_MAX ||
++        !http_reference_transport_eligible(&recipe->sent) ||
++        !http_reference_strong_etag(recipe->etag) ||
++        !avpriv_vortx_reference_recipe_current(recipe) ||
++        av_gettime_relative() >= recipe->deadline_us)
++        return AVERROR(EINVAL);
++    budget = av_mallocz(sizeof(*budget));
++    if (!budget)
++        return AVERROR(ENOMEM);
++    {
++        int ret = http_sparse_recipe_clone(recipe, &budget->recipe);
++        if (ret < 0) {
++            av_free(budget);
++            return ret;
++        }
++    }
++    budget->owned_interrupt = *owned_interrupt;
++    if (http_sparse_check(budget) < 0) {
++        int ret = budget->terminal_error;
++        avpriv_vortx_reference_recipe_release_v1(&budget->recipe);
++        av_free(budget);
++        return ret;
++    }
++    *out = budget;
++    return 0;
++}
++
++int avpriv_vortx_reference_sparse_budget_info_v1(
++    const struct avpriv_vortx_reference_sparse_budget *budget,
++    struct avpriv_vortx_reference_sparse_info *out, size_t out_size)
++{
++    if (out_size != sizeof(*out))
++        return AVERROR(EINVAL);
++    if (!budget || !out || out->entity_bytes || out->http_plaintext_bytes ||
++        out->requests_started || out->active_handle || out->terminal_error)
++        return AVERROR(EINVAL);
++    *out = (struct avpriv_vortx_reference_sparse_info){
++        .entity_bytes = budget->recipe->pin.entity_total,
++        .http_plaintext_bytes = budget->http_bytes,
++        .requests_started = budget->attempts,
++        .active_handle = budget->active != NULL,
++        .terminal_error = budget->terminal_error,
++    };
++    return 0;
++}
++
++static void http_sparse_dispose(struct avpriv_vortx_reference_sparse_reader *reader)
++{
++    if (!reader)
++        return;
++    ffurl_closep(&reader->h); /* pin/recipe/budget/callback still alive */
++    if (reader->budget->active == reader)
++        reader->budget->active = NULL;
++    av_free(reader->range_value);
++    av_free(reader->headers);
++    av_free(reader);
++}
++
++int avpriv_vortx_reference_sparse_open_v1(
++    struct avpriv_vortx_reference_sparse_budget *budget,
++    const struct avpriv_vortx_reference_sparse_span *spans,
++    size_t spans_size, uint32_t span_count,
++    struct avpriv_vortx_reference_sparse_reader **out)
++{
++    struct avpriv_vortx_reference_sparse_reader *reader = NULL;
++    AVDictionary *options = NULL;
++    AVIOInterruptCB callback;
++    HTTPContext *s;
++    uint64_t previous_end = 0, total = 0;
++    int ret = http_sparse_check(budget);
++    if (ret < 0)
++        return ret;
++    if (!out || *out || !spans || budget->active || !span_count ||
++        span_count > VORTX_SPARSE_MAX_SPANS)
++        return http_sparse_fail(budget, AVERROR(EINVAL));
++    if (spans_size != (size_t)span_count * sizeof(*spans))
++        return http_sparse_fail(budget, AVERROR(EINVAL));
++    reader = av_mallocz(sizeof(*reader));
++    if (!reader)
++        return http_sparse_fail(budget, AVERROR(ENOMEM));
++    reader->budget = budget;
++    reader->span_count = span_count;
++    memcpy(reader->spans, spans, spans_size);
++    for (uint32_t n = 0; n < span_count; n++) {
++        const struct avpriv_vortx_reference_sparse_span *span = &reader->spans[n];
++        uint64_t end;
++        if (!span->bytes || span->bytes > VORTX_SPARSE_MAX_SPAN_BYTES ||
++            span->start >= budget->recipe->pin.entity_total ||
++            span->bytes > budget->recipe->pin.entity_total - span->start ||
++            total > VORTX_SPARSE_MAX_BATCH_BYTES - span->bytes) {
++            ret = http_sparse_fail(budget, AVERROR(EINVAL));
++            goto done;
++        }
++        end = span->start + span->bytes - 1;
++        if (n && span->start <= previous_end) {
++            ret = http_sparse_fail(budget, AVERROR(EINVAL));
++            goto done;
++        }
++        previous_end = end;
++        total += span->bytes;
++    }
++    reader->requested_bytes = total;
++    reader->pin = budget->recipe->pin;
++    reader->pin.sparse = reader;
++    reader->headers = http_sparse_request_headers(reader);
++    if (!reader->headers) {
++        ret = http_sparse_fail(budget, AVERROR(ENOMEM));
++        goto done;
++    }
++    if (budget->attempts >= VORTX_SPARSE_MAX_REQUESTS) {
++        ret = http_sparse_fail(budget, AVERROR(ENOBUFS));
++        goto done;
++    }
++    ++budget->attempts;
++    budget->active = reader;
++    callback = (AVIOInterruptCB){http_sparse_interrupt, budget};
++    if ((ret = av_dict_copy(&options, budget->recipe->options, 0)) < 0 ||
++        (ret = av_dict_set(&options, "headers", reader->headers, 0)) < 0 ||
++        (ret = av_dict_set_int(&options, "offset", span_count == 1 ?
++                                                    reader->spans[0].start : 0, 0)) < 0 ||
++        (ret = av_dict_set_int(&options, "end_offset", span_count == 1 ?
++                           reader->spans[0].start + reader->spans[0].bytes : 0, 0)) < 0 ||
++        (ret = ffurl_alloc(&reader->h, budget->recipe->url, AVIO_FLAG_READ, &callback)) < 0)
++        goto fail;
++    reader->h->vortx_reference_pin = &reader->pin;
++    if ((ret = av_opt_set_dict(reader->h, &options)) < 0 ||
++        (ret = av_opt_set_dict(reader->h->priv_data, &options)) < 0 ||
++        (ret = ffurl_connect(reader->h, &options)) < 0)
++        goto fail;
++    s = reader->h->priv_data;
++    if (!reader->outer_admitted || !s->location ||
++        strcmp(s->location, budget->recipe->url) || s->new_location ||
++        !http_reference_transport_matches(reader->h)) {
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    if ((ret = http_sparse_check(budget)) < 0)
++        goto done;
++    *out = reader;
++    reader = NULL;
++    ret = 0;
++    goto done;
++fail:
++    ret = http_sparse_fail(budget, ret);
++done:
++    av_dict_free(&options);
++    http_sparse_dispose(reader);
++    return ret;
++}
++
++static int http_sparse_delimiter(
++    struct avpriv_vortx_reference_sparse_reader *reader, int closing)
++{
++    char expected[VORTX_SPARSE_BOUNDARY_MAX + 5];
++    char line[VORTX_SPARSE_BOUNDARY_MAX + 5];
++    unsigned used = 0;
++    int ret;
++    if ((ret = http_sparse_line(reader, line, sizeof(line), &used,
++                                sizeof(line) + 1, 1)) < 0)
++        return ret;
++    av_strlcpy(expected, "--", sizeof(expected));
++    av_strlcat(expected, reader->boundary, sizeof(expected));
++    if (closing)
++        av_strlcat(expected, "--", sizeof(expected));
++    if (strcmp(line, expected))
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    return 0;
++}
++
++static int http_sparse_part_header(
++    struct avpriv_vortx_reference_sparse_reader *reader)
++{
++    HTTPVortXSparseReceipt receipt = {0};
++    const struct avpriv_vortx_reference_sparse_span *span =
++        &reader->spans[reader->parts_complete];
++    char line[VORTX_SPARSE_PART_HEADERS];
++    unsigned used = 0;
++    int ret;
++    for (;;) {
++        if ((ret = http_sparse_line(reader, line, sizeof(line), &used,
++                                    VORTX_SPARSE_PART_HEADERS, 1)) < 0)
++            return ret;
++        if (!line[0])
++            break;
++        if ((ret = http_sparse_header_field(reader, line, &receipt, 0)) < 0)
++            return ret;
++    }
++    if (receipt.ranges != 1 || receipt.first != span->start ||
++        receipt.last != span->start + span->bytes - 1 ||
++        receipt.total != reader->pin.entity_total ||
++        (receipt.lengths && receipt.length != span->bytes))
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    return 0;
++}
++
++static int http_sparse_complete(
++    struct avpriv_vortx_reference_sparse_reader *reader)
++{
++    int ret;
++    if (reader->parts_complete != reader->span_count ||
++        reader->outer_read != reader->outer_length)
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    if ((ret = http_sparse_check(reader->budget)) < 0)
++        return ret;
++    reader->batch_validated = 1;
++    return 0;
++}
++
++int avpriv_vortx_reference_sparse_next_part_v1(
++    struct avpriv_vortx_reference_sparse_reader *reader,
++    struct avpriv_vortx_reference_sparse_part *out, size_t out_size)
++{
++    int ret;
++    if (out_size != sizeof(*out))
++        return http_sparse_fail(reader ? reader->budget : NULL, AVERROR(EINVAL));
++    if (!reader || !out || out->plan_index || out->start || out->bytes ||
++        out->entity_bytes)
++        return http_sparse_fail(reader ? reader->budget : NULL, AVERROR(EINVAL));
++    if ((ret = http_sparse_check(reader->budget)) < 0)
++        return ret;
++    if (reader->batch_validated)
++        return 0;
++    if (!reader->outer_admitted || reader->parts_complete >= reader->span_count)
++        return http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    if (reader->part_active) {
++        if (reader->part_remaining)
++            return http_sparse_fail(reader->budget, AVERROR(EINVAL));
++        if (reader->multipart) {
++            if ((ret = http_sparse_literal(reader, "\r\n", 2)) < 0 ||
++                (ret = http_sparse_delimiter(reader,
++                         reader->parts_complete + 1 == reader->span_count)) < 0)
++                return ret;
++        }
++        reader->part_active = 0;
++        ++reader->parts_complete;
++        if (reader->parts_complete == reader->span_count)
++            return http_sparse_complete(reader);
++    } else if (reader->multipart) {
++        if ((ret = http_sparse_delimiter(reader, 0)) < 0)
++            return ret; /* first boundary only; no preamble scanning */
++    }
++    if (reader->multipart && (ret = http_sparse_part_header(reader)) < 0)
++        return ret;
++    reader->part_remaining = reader->spans[reader->parts_complete].bytes;
++    reader->part_active = 1;
++    *out = (struct avpriv_vortx_reference_sparse_part){
++        .plan_index = reader->parts_complete,
++        .start = reader->spans[reader->parts_complete].start,
++        .bytes = reader->part_remaining,
++        .entity_bytes = reader->pin.entity_total,
++    };
++    return 1;
++}
++
++int avpriv_vortx_reference_sparse_read_part_v1(
++    struct avpriv_vortx_reference_sparse_reader *reader,
++    unsigned char *buffer, int buffer_size)
++{
++    int ret;
++    if (!reader)
++        return AVERROR(EINVAL);
++    if ((ret = http_sparse_check(reader->budget)) < 0)
++        return ret;
++    if (!buffer || buffer_size <= 0 || !reader->part_active ||
++        reader->batch_validated)
++        return http_sparse_fail(reader->budget, AVERROR(EINVAL));
++    if (!reader->part_remaining)
++        return 0; /* exact part boundary, never AVERROR_EOF */
++    buffer_size = FFMIN((uint32_t)buffer_size, reader->part_remaining);
++    ret = http_sparse_raw(reader, buffer, buffer_size, 1);
++    if (ret < 0)
++        return ret;
++    reader->part_remaining -= ret;
++    reader->payload_read += ret;
++    return ret;
++}
++
++int avpriv_vortx_reference_sparse_stats_v1(
++    const struct avpriv_vortx_reference_sparse_reader *reader,
++    struct avpriv_vortx_reference_sparse_stats *out, size_t out_size)
++{
++    if (out_size != sizeof(*out))
++        return AVERROR(EINVAL);
++    if (!reader || !out || out->payload_bytes || out->parts_complete ||
++        out->batch_validated || out->terminal_error)
++        return AVERROR(EINVAL);
++    *out = (struct avpriv_vortx_reference_sparse_stats){
++        .payload_bytes = reader->payload_read,
++        .parts_complete = reader->parts_complete,
++        .batch_validated = reader->batch_validated,
++        .terminal_error = reader->budget->terminal_error,
++    };
++    return 0;
++}
++
++void avpriv_vortx_reference_sparse_close_v1(
++    struct avpriv_vortx_reference_sparse_reader **value)
++{
++    struct avpriv_vortx_reference_sparse_reader *reader;
++    if (!value || !(reader = *value))
++        return;
++    *value = NULL;
++    http_sparse_check(reader->budget);
++    if (!reader->batch_validated)
++        http_sparse_fail(reader->budget, AVERROR_INVALIDDATA);
++    http_sparse_dispose(reader);
++}
++
++void avpriv_vortx_reference_sparse_budget_release_v1(
++    struct avpriv_vortx_reference_sparse_budget **value)
++{
++    struct avpriv_vortx_reference_sparse_budget *budget;
++    if (!value || !(budget = *value))
++        return;
++    if (budget->active) {
++        http_sparse_fail(budget, AVERROR(EINVAL));
++        return; /* fail closed, do not free beneath the still-owned handle */
++    }
++    *value = NULL;
++    avpriv_vortx_reference_recipe_release_v1(&budget->recipe);
++    av_free(budget);
++}

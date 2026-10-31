@@ -21,6 +21,12 @@ internal data class PlaybackQueueState(
     val error: String? = null,
 )
 
+/** Bounded catalog-only snapshot for playlist save/import UI; never a playback capability. */
+internal data class PlaybackQueuePlaylistSnapshot(
+    val items: List<MetaItem>,
+    val remainingCapacity: Int,
+)
+
 /** An in-memory capability: every queue edit and every original owner transition revokes it. */
 internal class PlaybackQueueToken internal constructor(
     val owner: ContinueWatchingOwner,
@@ -45,6 +51,28 @@ internal object PlaybackQueueModel {
             state.entries.any { it.id == newId }) return null
         val entry = PlaybackQueueEntry(validUuid(newId), catalogOnly(item))
         return changed(state, if (playNext) listOf(entry) + state.entries else state.entries + entry)
+    }
+
+    /**
+     * One playlist import is one immutable state transition. The caller supplies catalog candidates only;
+     * production IDs are minted here and never accepted from the cloud playlist wire.
+     */
+    fun appendCandidates(
+        state: PlaybackQueueState,
+        owner: ContinueWatchingOwner,
+        items: List<MetaItem>,
+        newId: () -> String = { UUID.randomUUID().toString() },
+    ): PlaybackQueueState? {
+        if (!state.ready || state.owner != owner || items.isEmpty() ||
+            items.size > MAX_ENTRIES - state.entries.size) return null
+        val knownIds = state.entries.mapTo(mutableSetOf()) { it.id }
+        val appended = ArrayList<PlaybackQueueEntry>(items.size)
+        items.forEach { item ->
+            val id = validUuid(newId())
+            if (!knownIds.add(id)) return null
+            appended += PlaybackQueueEntry(id, catalogOnly(item))
+        }
+        return changed(state, state.entries + appended)
     }
 
     fun remove(state: PlaybackQueueState, owner: ContinueWatchingOwner, id: String): PlaybackQueueState? {

@@ -81,7 +81,8 @@ internal fun preparedEpisodeHandoff(
         },
         commitRejected = {
             try { adoption?.rollback(); rollback() } finally { prepared.close() }
-        })
+        },
+        commitPublished = { adoption?.commitPublished() })
 }
 
 /** Single prepared value; a claimed ticket stays fenced until acceptance or a newer intent invalidates it. */

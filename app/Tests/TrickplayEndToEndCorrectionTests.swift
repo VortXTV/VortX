@@ -24,6 +24,8 @@ private enum TrickplayEndToEndCorrectionTests {
         testCommunityConsentBlocksUploadAdmission()
         testCommunityConsentRevocationBlocksPost()
         testCommunityFetchContract()
+        testDownloadedBodiesStayBounded()
+        testDownloadedSpriteGeometry()
         testStoreAndUICompletionContract()
         testProtectedUHDHDRCaptureContract()
         testProductionWiringUsesThePolicies()
@@ -530,6 +532,76 @@ private enum TrickplayEndToEndCorrectionTests {
         expect(fetch.contains("guard isEnabled else { return .unavailable(.metadataUnavailable) }")
                 && fetch.components(separatedBy: "guard isEnabled else").count >= 4,
                "give-to-get consent must prevent both new fetches and later community asset consumption")
+        expect(fetch.contains("session.bytes(for: request)") && !fetch.contains(".data(for:")
+                && fetch.contains("defer { session.invalidateAndCancel() }")
+                && fetch.contains("TrickplayDownloadBody(maximumBytes: maximumBytes")
+                && fetch.contains("guard body.append(byte) else")
+                && fetch.contains("TrickplayDownloadBudget.metadataBytes")
+                && fetch.contains("TrickplayDownloadBudget.indexBytes")
+                && fetch.contains("TrickplayDownloadBudget.spriteBytes"),
+               "every mounted community request must stream into its bounded accumulator and cancel rejected transfers")
+        guard let geometry = fetch.range(of: "TrickplayDownloadBudget.permitsSprite"),
+              let decode = fetch.range(of: "CGImageSourceCreateImageAtIndex") else {
+            fatalError("cannot inspect sprite geometry/decode ordering")
+        }
+        expect(geometry.lowerBound < decode.lowerBound
+                && fetch.contains("kCGImageSourceShouldCache: false")
+                && fetch.contains("kCGImageSourceShouldCacheImmediately: true")
+                && !fetch.contains("ScrubImage(data: spriteData)"),
+               "downloaded dimensions and declared tile grid must be admitted before eager image materialization")
+    }
+
+    private static func testDownloadedBodiesStayBounded() {
+        expect(TrickplayDownloadBudget.metadataBytes == 64 * 1024
+                && TrickplayDownloadBudget.indexBytes == 256 * 1024
+                && TrickplayDownloadBudget.spriteBytes == 3 * 1024 * 1024,
+               "descriptor, index, and image budgets must remain explicit and independent")
+        expect(TrickplayDownloadBody(maximumBytes: 0, expectedContentLength: -1) == nil,
+               "an invalid capacity must be rejected")
+        expect(TrickplayDownloadBody(maximumBytes: 4, expectedContentLength: -2) == nil,
+               "only the standard unknown content length may bypass header admission")
+        expect(TrickplayDownloadBody(maximumBytes: 4, expectedContentLength: 5) == nil,
+               "an oversized declared length must be rejected before retaining response bytes")
+        expect(TrickplayDownloadBody(maximumBytes: 4, expectedContentLength: Int64.max) == nil,
+               "an extreme declared length must not overflow a reservation")
+        for declared in [Int64(-1), 0, 1, 4] {
+            guard var body = TrickplayDownloadBody(maximumBytes: 4, expectedContentLength: declared) else {
+                fatalError("valid bounded body rejected")
+            }
+            expect(body.data.isEmpty, "an admitted stream starts empty")
+            for byte in UInt8(1)...UInt8(4) {
+                expect(body.append(byte), "a body at or below the exact budget must be retained")
+            }
+            expect(!body.append(5) && !body.append(6)
+                    && body.data == Data([1, 2, 3, 4]),
+                   "unknown or dishonest lengths cannot retain even one overflow byte")
+        }
+    }
+
+    private static func testDownloadedSpriteGeometry() {
+        func permits(_ width: Int, _ height: Int, _ frames: Int, _ cols: Int,
+                     _ tileW: Int = 320, _ tileH: Int = 180) -> Bool {
+            TrickplayDownloadBudget.permitsSprite(width: width, height: height,
+                frameCount: frames, cols: cols, tileW: tileW, tileH: tileH)
+        }
+        expect(permits(2880, 1620, 80, 9), "the normal 80-tile sheet must remain readable")
+        expect(permits(960, 360, 5, 3), "a partial final row must retain its full rendered row")
+        expect(permits(1000, 400, 5, 3), "bounded producer padding must remain valid")
+        expect(permits(4320, 2430, 80, 9, 480, 270), "older 480x270 sheets must remain valid")
+        expect(permits(6400, 3600, 400, 20), "the largest current Apple-generated sheet must remain readable")
+        expect(!permits(959, 360, 5, 3) && !permits(960, 359, 5, 3),
+               "the declared grid must fit completely before image decode")
+        expect(!permits(100_000, 100_000, 1, 1), "small compressed image bombs must fail pixel admission")
+        expect(!permits(Int.max, 2, 1, 1) && !permits(1, Int.max, 1, 1),
+               "overflowing or oversized pixel counts must fail closed")
+        expect(!permits(320, 180, Int.max, 1) && !permits(320, 180, 1, Int.max)
+                && !permits(320, 180, 1, 2, Int.max, 180)
+                && !permits(320, 180, 2, 1, 320, Int.max),
+               "extreme metadata must not overflow row or grid arithmetic")
+        expect(!permits(0, 180, 1, 1) && !permits(320, 0, 1, 1)
+                && !permits(320, 180, 0, 1) && !permits(320, 180, 1, 0)
+                && !permits(320, 180, 1, 1, 0, 180) && !permits(320, 180, 1, 1, 320, -1),
+               "nonpositive dimensions or metadata must fail soft")
     }
 
     private static func testStoreAndUICompletionContract() {
@@ -539,14 +611,28 @@ private enum TrickplayEndToEndCorrectionTests {
               let clearEnd = store.range(of: "private func previewStateForRemoteState", range: clearStart.upperBound..<store.endIndex),
               let completionStart = store.range(of: "private func completeCommunityFetch("),
               let completionEnd = store.range(of: "/// The raw `tmdb:", range: completionStart.upperBound..<store.endIndex),
+              let deinitStart = store.range(of: "    deinit {"),
+              let deinitEnd = store.range(of: "\n    }", range: deinitStart.upperBound..<store.endIndex),
               let uiStart = tv.range(of: "private var trickplayControls"), let bubbleStart = tv.range(of: "private func trickplayBubble", range: uiStart.upperBound..<tv.endIndex) else {
             fatalError("cannot inspect trickplay completion boundaries")
         }
         let show = store[showStart.lowerBound..<clearStart.lowerBound]; let clear = store[clearStart.lowerBound..<clearEnd.lowerBound]
         let completion = store[completionStart.lowerBound..<completionEnd.lowerBound]; let ui = tv[uiStart.lowerBound..<bubbleStart.lowerBound]
-        expect(["private var communityFetchTask: Task<Void, Never>?", "private var communityFetchEpoch", "private var communityFetchKey: String?", "private enum CommunityRemotePhase", "enum PreviewState", "private var activeScrubTime: Double?", "private var pendingLocalReadToken: Int?"].allSatisfy { store.contains($0) } && store.contains("private func cancelCommunityFetch()") && store.contains("deinit { communityFetchTask?.cancel() }") && !store.contains("deinit { cancelCommunityFetch() }") && store.contains("private func completeCommunityFetch("), "the store must own one keyed task, cancellation, epoch, phase, state, and pending read")
+        let teardown = store[deinitStart.upperBound..<deinitEnd.lowerBound]
+        guard let leaseCancellation = teardown.range(of: "pendingLocalReadLease?.cancel()"),
+              let fetchCancellation = teardown.range(of: "communityFetchTask?.cancel()") else {
+            fatalError("store deinit must directly cancel its pending local-read lease and community fetch task")
+        }
+        expect(["private var communityFetchTask: Task<Void, Never>?", "private var communityFetchEpoch", "private var communityFetchKey: String?", "private enum CommunityRemotePhase", "enum PreviewState", "private var activeScrubTime: Double?", "private var pendingLocalReadToken: Int?", "private var pendingLocalReadLease: TrickplayLocalReadLease?"].allSatisfy { store.contains($0) } && store.contains("private func cancelCommunityFetch()") && store.contains("private func completeCommunityFetch("), "the store must own one keyed task, cancellation, epoch, phase, state, and pending read")
+        expect(leaseCancellation.lowerBound < fetchCancellation.lowerBound
+                && !teardown.contains("cancelCommunityFetch(") && !teardown.contains("Task {"),
+               "deinit must synchronously retire the local-read lease before cancelling the fetch without scheduling actor cleanup")
         let communityAt = show.range(of: "communitySheet")!.lowerBound
         let memoryAt = show.range(of: "memoryImage")!.lowerBound
+        expect(show.range(of: "cancelPendingLocalRead()")!.lowerBound < communityAt
+                && show.contains("self.pendingLocalReadLease === lease")
+                && clear.contains("cancelPendingLocalRead()"),
+               "a newer warm preview or hidden scrub must retire the old lease, and only that original lease may publish")
         expect(!show.contains("CommunityTrickplay.fetch") && show.contains("activeScrubTime = time") && show.contains("image = nil") && communityAt < memoryAt && memoryAt < show.range(of: "imageAsync")!.lowerBound,
                "show(time:) must never fetch and must retain community, memory, then disk fallback order")
         expect(store.contains("TrickplayFetchClaim.accepts(") && store.contains("if let activeTime = activeScrubTime") && store.contains("show(time: activeTime)")
@@ -558,7 +644,7 @@ private enum TrickplayEndToEndCorrectionTests {
                "stale completion must be rejected before it can clear a newer task")
         guard let stateStart = store.range(of: "private func previewStateForRemoteState"), let stateEnd = store.range(of: "/// Heavy frame processing", range: stateStart.upperBound..<store.endIndex) else { fatalError("cannot inspect preview-state aggregation") }
         let state = store[stateStart.lowerBound..<stateEnd.lowerBound]
-        expect(clear.contains("showToken &+= 1") && clear.contains("activeScrubTime = nil") && clear.contains("pendingLocalReadToken = nil") && clear.contains("previewState = .hidden") && show.contains("resolved == nil ? self.previewStateForRemoteState() : .ready") && state.contains("case .idle: return .unavailable") && state.contains("case .loading: return .loading") && state.contains("case .settled: return .unavailable") && store.contains("communityRemotePhase = .loading"), "clear must hide, while a completed local miss aggregates idle/settled as unavailable and loading as loading")
+        expect(clear.contains("showToken &+= 1") && clear.contains("activeScrubTime = nil") && clear.contains("pendingLocalReadToken = nil") && clear.contains("previewState = .hidden") && show.contains("else if self.image == nil") && show.contains("self.previewState = self.previewStateForRemoteState()") && state.contains("case .idle: return .unavailable") && state.contains("case .loading: return .loading") && state.contains("case .settled: return .unavailable") && store.contains("communityRemotePhase = .loading"), "clear must hide, while a completed local miss aggregates idle/settled as unavailable and loading as loading")
         expect(ui.contains("Loading previews…") && ui.contains("Previews unavailable") && ui.contains("previewState")
             && ui.contains("scrubThumbnails.previewState != .hidden") && ui.contains("value: scrubThumbnails.previewState") && !ui.contains("image != nil || scrubThumbnails.previewStatus"),
                "the TV scrubber must use PreviewState for text-only states and height")
@@ -604,7 +690,9 @@ private enum TrickplayEndToEndCorrectionTests {
         )
         expect(
             store.contains("intervalS: sessionNominalInterval")
-                && store.contains("interval: sessionNominalInterval")
+                && store.contains("interval: durable.map { value in")
+                && store.contains("fallbackInterval: value.snapshot.context.nominalInterval)")
+                && store.contains("} ?? sessionNominalInterval,")
                 && community.contains("let retainedInterval = TrickplayTimeline.nominalCadence(")
                 && community.contains("effectiveInterval = retainedInterval * Double(stride)")
                 && community.contains("TrickplayTimeline.selectedCueEndFences(")

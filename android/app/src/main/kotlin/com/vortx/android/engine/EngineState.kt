@@ -609,14 +609,42 @@ internal object EngineState {
     /// (`streams`), in the engine's own `[metaStreams, streams]` order. Catalog add-ons that serve plain
     /// HTTP/HLS links usually inline them in the meta's videos instead of implementing a separate
     /// `stream` resource, so official clients list `metaStreams` alongside `streams`. Reading only
-    /// `streams` made every such add-on show ZERO sources (#122). One [StreamGroup] per source add-on
-    /// (named by the request base host), best-effort, in engine order.
+    /// `streams` made every such add-on show ZERO sources (#122). One [StreamGroup] per exact configured
+    /// request base, with meta-embedded rows first and first-seen configuration order retained.
     fun parseStreamGroups(json: String, streamId: String? = null): List<StreamGroup> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
         // #122: metaStreams FIRST, then the stream-resource groups, matching Apple's concat order. A
         // payload with only `metaStreams` (no `streams`) is now surfaced instead of dropped.
-        return parseStreamGroupArray(root.optJSONArray("metaStreams"), streamId) +
+        val groups = parseStreamGroupArray(root.optJSONArray("metaStreams"), streamId) +
             parseStreamGroupArray(root.optJSONArray("streams"), streamId)
+        val result = mutableListOf<StreamGroup>()
+        val indexByBase = mutableMapOf<String, Int>()
+        val merges = mutableMapOf<String, Pair<MutableList<StreamSource>, MutableSet<StreamSource>>>()
+        for (group in groups) {
+            // Missing bases cannot establish that two groups came from the same configuration.
+            if (group.base.isEmpty()) {
+                result += group
+                continue
+            }
+            val index = indexByBase[group.base]
+            if (index == null) {
+                indexByBase[group.base] = result.size
+                result += group
+                continue
+            }
+            // Unique configurations retain their original group/list. Allocate only when lanes collide.
+            val (streams, seen) = merges.getOrPut(group.base) {
+                val first = result[index].streams
+                first.toMutableList() to first.toMutableSet()
+            }
+            // Preserve the first ready group's repeats; compare later records using full data-class equality.
+            for (stream in group.streams) if (seen.add(stream)) streams += stream
+        }
+        for ((base, merged) in merges) {
+            val index = indexByBase.getValue(base)
+            result[index] = result[index].copy(streams = merged.first)
+        }
+        return result
     }
 
     /**

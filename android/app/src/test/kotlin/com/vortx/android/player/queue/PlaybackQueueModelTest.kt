@@ -48,6 +48,39 @@ class PlaybackQueueModelTest {
         assertEquals(listOf(id(1), id(2)), duplicateTitle.entries.map { it.id })
     }
 
+    @Test fun `playlist batch appends once in order with fresh local identities`() {
+        val before = requireNotNull(PlaybackQueueModel.add(initial(), owner, movie(1), false, id(1)))
+        val generated = mutableListOf(id(20), id(21))
+        val after = requireNotNull(PlaybackQueueModel.appendCandidates(
+            before, owner, listOf(movie(2), movie(2)),
+        ) { generated.removeAt(0) })
+        assertEquals(listOf("tt1", "tt2", "tt2"), after.entries.map { it.item.id })
+        assertEquals(listOf(id(1), id(20), id(21)), after.entries.map { it.id })
+        assertEquals(before.revision + 1, after.revision)
+        assertEquals(listOf(id(1)), before.entries.map { it.id })
+    }
+
+    @Test fun `playlist batch rejects capacity and generated-ID collision without partial state`() {
+        val nearCapacity = (1 until PlaybackQueueModel.MAX_ENTRIES).fold(initial()) { state, n ->
+            requireNotNull(PlaybackQueueModel.add(state, owner, movie(n), false, id(n)))
+        }
+        var capacityFactoryCalls = 0
+        assertNull(PlaybackQueueModel.appendCandidates(
+            nearCapacity, owner, listOf(movie(100), movie(101)),
+        ) {
+            capacityFactoryCalls += 1
+            id(100 + capacityFactoryCalls)
+        })
+        assertEquals(0, capacityFactoryCalls)
+        assertEquals((1 until PlaybackQueueModel.MAX_ENTRIES).map(::id), nearCapacity.entries.map { it.id })
+
+        val collision = requireNotNull(PlaybackQueueModel.add(initial(), owner, movie(1), false, id(1)))
+        assertNull(PlaybackQueueModel.appendCandidates(collision, owner, listOf(movie(2))) { id(1) })
+        assertEquals(listOf(id(1)), collision.entries.map { it.id })
+        assertNull(PlaybackQueueModel.appendCandidates(collision, owner, emptyList()))
+        assertEquals(listOf(id(1)), collision.entries.map { it.id })
+    }
+
     @Test fun `move and remove address one UUID rather than every equal title`() {
         val duplicate = requireNotNull(PlaybackQueueModel.add(populated(), owner, movie(1), false, id(4)))
         val moved = requireNotNull(PlaybackQueueModel.move(duplicate, owner, id(4), -1))
@@ -82,9 +115,10 @@ class PlaybackQueueModelTest {
         val before = populated()
         val token = requireNotNull(PlaybackQueueModel.capture(before, owner, id(1)))
         val appended = requireNotNull(PlaybackQueueModel.add(before, owner, movie(4), false, id(4)))
+        val batch = requireNotNull(PlaybackQueueModel.appendCandidates(before, owner, listOf(movie(4))) { id(4) })
         val moved = requireNotNull(PlaybackQueueModel.move(before, owner, id(3), -1))
         val removed = requireNotNull(PlaybackQueueModel.remove(before, owner, id(3)))
-        for (after in listOf(appended, moved, removed)) {
+        for (after in listOf(appended, batch, moved, removed)) {
             assertFalse(PlaybackQueueModel.accepts(after, owner, token))
             assertNull(PlaybackQueueModel.consumeAfterAccepted(after, owner, token))
         }

@@ -3,10 +3,12 @@ package com.vortx.android.engine
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.data.*
 import com.vortx.android.model.*
+import com.vortx.android.xperience.XperienceAddonBinding
 import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -24,6 +26,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
@@ -48,6 +52,73 @@ internal fun nativeContinueWatchingItem(item: JSONObject, saved: List<MetaItem>)
         continueWatchingActivityAtMillis = item.optLong("updatedAt", 0).takeIf { it > 0 })
 }
 
+/** Immutable installed projection bound to one original owner/bucket. Neither candidates nor
+ * rejected identities grant fetch/write authority. The private pairings keep the exact original
+ * configured addon with its Candidate object; filtering never creates an index-based fallback. */
+internal class XperienceInstalledCatalogSnapshot private constructor(
+    val owner: VortxNativeOwner,
+    val installedAddonProfileID: String,
+    pairings: List<Pair<XperienceAddonBinding.Candidate, VortxResourceAddon>>,
+    rejectedIDs: Set<String>,
+    rejectedConfiguredIdentities: Map<String, Set<String>>,
+) {
+    private val pairings = pairings.toList()
+    val candidates: List<XperienceAddonBinding.Candidate> = java.util.Collections.unmodifiableList(this.pairings.map { it.first })
+    // Strings have already passed scalar admission. Java String equality is exact UTF16;
+    // no NFC/casefold/name/URL normalization is used to identify a rejected manifest.
+    private val rejectedIDs = rejectedIDs.toSet()
+    private val rejectedConfiguredIdentities = rejectedConfiguredIdentities.mapValues { it.value.toSet() }
+
+    fun resolve(source: com.vortx.android.xperience.XperienceCollections.Source,
+                mapping: XperienceAddonBinding.Mapping? = null): XperienceAddonBinding.Resolution {
+        val result = XperienceAddonBinding.resolve(source, candidates, mapping)
+        if (mapping == null && source.isAddon && (source.addonId?.let { it in rejectedIDs } == true)) {
+            return XperienceAddonBinding.Resolution.InvalidRegistry
+        }
+        if (result is XperienceAddonBinding.Resolution.Resolved &&
+            result.candidate.transportFingerprint in rejectedConfiguredIdentities[result.candidate.manifestID].orEmpty()) {
+            return XperienceAddonBinding.Resolution.InvalidRegistry
+        }
+        return result
+    }
+    /** Only the same captured Candidate OBJECT selects its original immutable configured addon.
+     * This is pairing evidence, not a reusable load/owner capability. */
+    fun pairedAddon(candidate: XperienceAddonBinding.Candidate): VortxResourceAddon =
+        pairings.singleOrNull { it.first === candidate }?.second
+            ?: throw IllegalArgumentException("Installed addon snapshot changed")
+
+    companion object {
+        internal fun capture(owner: VortxNativeOwner, bucket: String,
+            pairings: List<Pair<XperienceAddonBinding.Candidate, VortxResourceAddon>>,
+            rejectedIDs: Set<String>, rejectedConfiguredIdentities: Map<String, Set<String>>,
+        ) = XperienceInstalledCatalogSnapshot(owner, bucket, pairings, rejectedIDs, rejectedConfiguredIdentities)
+    }
+}
+
+/** A live guarded request result. A resolved candidate is paired only for this result; it does not
+ * create a reusable install, fetch, or profile-write capability. */
+internal sealed interface XperienceCatalogRequestOutcome {
+    data class Loaded(
+        val candidate: XperienceAddonBinding.Candidate,
+        val response: VortxResourceSnapshot,
+        val items: List<MetaItem>,
+        val rawItemCount: Int,
+        val supportsSkip: Boolean,
+    ) : XperienceCatalogRequestOutcome
+
+    data class Unresolved(val resolution: XperienceAddonBinding.Resolution) : XperienceCatalogRequestOutcome
+}
+
+/** Opaque fixed-size identity for one long-lived catalog consumer. Reuse it across refreshes;
+ * distinct consumers must allocate distinct IDs. It contains no URL or source authority. */
+@JvmInline
+internal value class XperienceCatalogConsumerID private constructor(val slotToken: String) {
+    companion object {
+        fun create(): XperienceCatalogConsumerID =
+            XperienceCatalogConsumerID(java.util.UUID.randomUUID().toString())
+    }
+}
+
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
  * The authenticated host provides the session; absence/unavailable/migration required is an error.
  * VortX authentication and complete legacy bootstrap are admitted only by the captured account host.
@@ -61,6 +132,7 @@ internal class NativeCatalogRepository(
     private val captureReclaimAdmission: ((VortxNativeSession, VortxNativeOwner) -> ((() -> Boolean) -> Boolean)?)? = null,
     private val withReclaimLifecycle: ((() -> Boolean) -> Boolean) = { action -> action() },
     private val nzbSourceAggregator: NzbSourceAggregator? = null,
+    private val sourceIndexSource: NativeSourceIndexSource? = null,
     /** Mirrors a deliberate save or removal to Trakt/SIMKL watchlists once the native checkpoint persisted it
      *  (Apple `ScrobbleCoordinator.addedToLibrary` / `removedFromLibrary`): added, type, id. */
     private val mirrorLibrary: (Boolean, MediaType, String) -> Unit = { _, _, _ -> },
@@ -93,14 +165,49 @@ internal class NativeCatalogRepository(
     private data class DurableWatchProof(val owner: VortxNativeOwner, val token: PlaybackSessionToken, val watchedAt: Long,
                                         val admit: (() -> Boolean) -> Boolean)
     private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
-    private class SourceBinding(val owner: VortxNativeOwner, @Volatile var context: PlaybackContext)
+    private class SourceBinding(val owner: VortxNativeOwner, @Volatile var context: PlaybackContext,
+        val pooled: NativeSourceIndexBinding? = null)
     private sealed interface StreamEvent {
         data class Providers(val update: NativeProviderUpdate, val ticket: java.util.UUID,
             val accepted: CompletableDeferred<Unit>) : StreamEvent
         data class Indexer(val result: Result<NzbSourceAggregation>) : StreamEvent
+        data class Pool(val result: NativeSourceIndexResult?) : StreamEvent
+        data object PoolRevoked : StreamEvent
         data object ProvidersFinished : StreamEvent
     }
     private var foregroundSources: SourceContext? = null
+    private val sourcePublications = mutableMapOf<String, java.lang.ref.WeakReference<SourceContext>>()
+    private data class SourceInvalidation(val sequence: Long, val publicationId: String)
+    private var sourceInvalidationSequence = 0L
+    private val sourceInvalidations = MutableStateFlow<SourceInvalidation?>(null)
+    override fun sourceInvalidations(): Flow<String> = sourceInvalidations.filterNotNull().map { it.publicationId }
+    override fun isSourcePoolPublicationCurrent(sourcePublicationId: String): Boolean = synchronized(this) {
+        val context = sourcePublications[sourcePublicationId]?.get()
+        if (context == null) { sourcePublications.remove(sourcePublicationId); false }
+        else !context.isPoolRetired()
+    }
+
+    private fun revokePool(context: SourceContext) {
+        val retired = synchronized(this) {
+            val jobs = listOfNotNull(context.poolJob, context.hoardJob)
+            context.poolJob = null
+            context.hoardJob = null
+            context.poolResult = null
+            sourcePublications.remove(context.sourcePublicationId)
+            context.poolTokens.forEach(context.bindings::remove)
+            context.poolTokens.clear()
+            context.latestGroups = context.latestGroups.filterNot { it.base == com.vortx.android.singularity.SourceIndexClient.GROUP_ID }
+            val notification = if (foregroundSources === context)
+                SourceInvalidation(++sourceInvalidationSequence, context.sourcePublicationId) else null
+            Triple(jobs, context.poolRevoked, notification)
+        }
+        // Job cancellation can invoke a blocking transport disconnect; never do it under repository/host locks.
+        retired.first.forEach { it.cancel() }
+        retired.second?.invoke()
+        retired.third?.let { notification -> sourceInvalidations.update { previous ->
+            if (previous == null || previous.sequence < notification.sequence) notification else previous
+        } }
+    }
 
     /** Loading, bindings and resolver authority are private to one source consumer. */
     private inner class SourceContext(
@@ -116,6 +223,17 @@ internal class NativeCatalogRepository(
         val addons = registry(read)
         // Capture nullable scope before any provider suspension; never retarget an absent participant.
         val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
+        private var poolAuthorization: com.vortx.android.singularity.SourceIndexAuthorization? = null
+        private var poolCaptureAttempted = false
+        override val sourcePublicationId: String = java.util.UUID.randomUUID().toString()
+        @Volatile var poolTarget: NativeSourceIndexTarget? = null
+        @Volatile var poolResult: NativeSourceIndexResult? = null
+        val poolTokens = mutableSetOf<String>()
+        @Volatile var poolJob: Job? = null
+        @Volatile var hoardJob: Job? = null
+        var hoardPending = emptyList<com.vortx.android.singularity.SourceIndexClient.Descriptor>()
+        @Volatile var poolRevoked: (() -> Unit)? = null
+        private var poolRetirement: AutoCloseable? = null
         val bindings = mutableMapOf<String, SourceBinding>()
         val resolutionSequence = AtomicLong()
         var ticket: java.util.UUID? = null
@@ -124,13 +242,45 @@ internal class NativeCatalogRepository(
         var adopted = false
         var latestGroups = emptyList<StreamGroup>()
         var indexerResult = NzbSourceAggregation.empty()
+        @Volatile private var preparedPoolSelection: NativeSourceIndexBinding? = null
+        fun capturePoolOnce() {
+            // sourceUpdates runs on IO. Capture once before provider suspension, not on a UI preparation call.
+            if (poolCaptureAttempted) return
+            poolCaptureAttempted = true
+            val captured = sourceIndexSource?.capture(session, read.owner)
+            val admitted = synchronized(this@NativeCatalogRepository) {
+                if (closed) false else {
+                    poolAuthorization = captured
+                    if (!isPoolRetired()) sourcePublications[sourcePublicationId] = java.lang.ref.WeakReference(this)
+                    true
+                }
+            }
+            if (!admitted) { sourceIndexSource?.retire(captured); return }
+            poolRetirement = captured?.onRevoked {
+                com.vortx.android.singularity.SourceIndexLifecycle.dispatchTeardown { revokePool(this@SourceContext) }
+            }
+        }
+        fun poolAdmission() = poolAuthorization?.takeIf { it.isCurrent() }
+        // Pending authorized publications must stay eligible before their asynchronous pool result arrives.
+        fun isPoolRetired(): Boolean = poolAuthorization?.isRetired() != false
+        fun retirePool() {
+            sourceIndexSource?.retire(poolAuthorization)
+            synchronized(this@NativeCatalogRepository) { sourcePublications.remove(sourcePublicationId) }
+            poolRetirement?.close()
+            poolRetirement = null
+            com.vortx.android.singularity.SourceIndexLifecycle.dispatchTeardown { revokePool(this@SourceContext) }
+        }
         override val owner: ContinueWatchingOwner get() = owner(read.owner)
-        override val groups: List<StreamGroup> get() = synchronized(this@NativeCatalogRepository) { latestGroups }
+        private fun visibleGroups(groups: List<StreamGroup>): List<StreamGroup> =
+            if (poolResult?.isRetired(poolTarget) != false)
+                groups.filterNot { it.base == com.vortx.android.singularity.SourceIndexClient.GROUP_ID } else groups
+        override val groups: List<StreamGroup> get() = synchronized(this@NativeCatalogRepository) { visibleGroups(latestGroups) }
 
         override fun isCurrent(): Boolean = runCatching {
             session.owned(read.owner) { synchronized(this@NativeCatalogRepository) {
                 sessionProvider() === session && !closed && (!adopted || foregroundSources === this) &&
-                    (nzbSourceAggregator?.isAdmitted(indexerResult) != false)
+                    (nzbSourceAggregator?.isAdmitted(indexerResult) != false) &&
+                    (!prepared || preparedPoolSelection?.isRetired() != true)
             } }
         }.getOrDefault(false)
 
@@ -140,23 +290,31 @@ internal class NativeCatalogRepository(
             check(isCurrent()) { "Native preparation expired" }
             val binding = synchronized(this@NativeCatalogRepository) { bindings[source.nativePlaybackToken] }
             check(binding != null && binding.owner == read.owner && binding.context.videoId == episodeId) { "Native prepared source expired" }
-            resolveOwned(session, read, source, episode, binding, this, resolutionSequence)
-                .copy(playbackContext = binding.context)
+            val playable = resolveOwned(session, read, source, episode, binding, this, resolutionSequence)
+            preparedPoolSelection = binding.pooled
+            playable.copy(playbackContext = binding.context)
         }
 
         override fun adopt(): SourcePreparationAdoption? = runCatching {
             session.owned(read.owner) { synchronized(this@NativeCatalogRepository) {
-                if (!prepared || adopted || !isCurrent() || latestGroups.isEmpty()) return@owned null
+                if (!prepared || adopted || !isCurrent() || latestGroups.isEmpty() ||
+                    preparedPoolSelection?.isRetired() == true) return@owned null
                 val previous = foregroundSources
                 adopted = true
                 foregroundSources = this
                 resolveSequence.incrementAndGet()
                 object : SourcePreparationAdoption {
-                    override val groups = latestGroups
+                    private val adoptedGroups = latestGroups
+                    override val groups: List<StreamGroup> get() = synchronized(this@NativeCatalogRepository) { visibleGroups(adoptedGroups) }
+                    override val sourcePublicationId = this@SourceContext.sourcePublicationId
                     private var rolledBack = false
+                    private val published = java.util.concurrent.atomic.AtomicBoolean(false)
+                    override fun commitPublished() {
+                        if (published.compareAndSet(false, true)) previous?.takeIf { it !== this@SourceContext }?.retirePool()
+                    }
                     override fun rollback() {
                         synchronized(this@NativeCatalogRepository) {
-                            if (rolledBack) return
+                            if (rolledBack || published.get()) return
                             rolledBack = true
                             if (foregroundSources === this@SourceContext) {
                                 foregroundSources = previous
@@ -165,6 +323,7 @@ internal class NativeCatalogRepository(
                             closed = true
                             resolutionSequence.incrementAndGet()
                         }
+                        retirePool()
                         retireTicket()
                     }
                 }
@@ -183,6 +342,7 @@ internal class NativeCatalogRepository(
                 resolutionSequence.incrementAndGet()
             }
             retireTicket()
+            retirePool()
         }
     }
 
@@ -229,25 +389,246 @@ internal class NativeCatalogRepository(
     private fun library(read: VortxNativeRead) = read.state.getJSONObject("libraries").getJSONObject(read.owner.profileID)
     private fun profile(read: VortxNativeRead) = read.state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(read.owner.profileID)
     private fun addonOwner(read: VortxNativeRead): String = if (profile(read).getString("addons") == "share_primary") read.owner.scope.ownerProfileID else read.owner.profileID
-    private fun addonDescriptors(read: VortxNativeRead): List<JSONObject> {
-        val response = session().resolve(JSONObject().put("kind", "installed_addons").put("profileId", addonOwner(read)), read.owner)
-        check(response.getString("kind") == "installed_addons" && response.getString("profileId") == addonOwner(read)) { "Native addon projection unavailable" }
+    private fun addonDescriptors(read: VortxNativeRead): List<JSONObject> = addonDescriptors(session(), read)
+    /** Use the caller's captured Session. Xperience never resolves through a late sessionProvider sample. */
+    private fun addonDescriptors(session: VortxNativeSession, read: VortxNativeRead): List<JSONObject> {
+        require(session.scope == read.owner.scope) { "Native owner changed" }
+        val profileId = addonOwner(read)
+        val response = session.resolve(JSONObject().put("kind", "installed_addons").put("profileId", profileId), read.owner)
+        check(response.getString("kind") == "installed_addons" && response.getString("profileId") == profileId) { "Native addon projection unavailable" }
         return response.getJSONArray("addons").objects()
     }
-    private fun registry(read: VortxNativeRead): List<VortxResourceAddon> {
+    private fun registry(read: VortxNativeRead): List<VortxResourceAddon> = registry(session(), read)
+    private fun registry(session: VortxNativeSession, read: VortxNativeRead): List<VortxResourceAddon> =
+        registry(read, addonDescriptors(session, read))
+    /** Shared installed-snapshot projection; also lets focused tests feed synthetic raw descriptors. */
+    private fun registry(read: VortxNativeRead, descriptors: List<JSONObject>): List<VortxResourceAddon> {
         val disabled = NativeAddonPreferences.disabled(read)
         val order = NativeAddonPreferences.order(read)
-        val descriptors = addonDescriptors(read).let { values -> if (order == null) values else values.sortedBy {
+        val ordered = if (order == null) descriptors else descriptors.sortedBy {
             order.indexOf(AddonOrder.normalize(it.getString("transportUrl"))).let { index -> if (index < 0) Int.MAX_VALUE else index }
-        } }
-        return descriptors.filterNot { AddonOrder.normalize(it.getString("transportUrl")) in disabled }.map {
+        }
+        return ordered.filterNot { AddonOrder.normalize(it.getString("transportUrl")) in disabled }.map {
             // Transport is the stable membership identity; duplicate manifest IDs are valid configurations.
-            VortxResourceAddon(it.getString("transportUrl"), it.getString("transportUrl"), it.getJSONObject("manifest").toString())
+            VortxResourceAddon.fromTransportUrl(it.getString("transportUrl"), it.getJSONObject("manifest").toString())
         }
     }
+    private fun catalogSpecs(addon: VortxResourceAddon, allowMissingCatalogs: Boolean = false): List<CatalogSpec> {
+        val manifest = JSONObject(requireNotNull(addon.manifestJson))
+        if (allowMissingCatalogs && !manifest.has("catalogs")) return emptyList()
+        return manifest.getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
+    }
     private fun catalogs(read: VortxNativeRead) = catalogs(registry(read))
-    private fun catalogs(addons: List<VortxResourceAddon>) = addons.flatMap { addon ->
-        JSONObject(requireNotNull(addon.manifestJson)).getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
+    private fun catalogs(addons: List<VortxResourceAddon>) = addons.flatMap { catalogSpecs(it) }
+
+    /**
+     * Resolve/project from one caller-supplied admitted read and its owning Session. Call only inside
+     * that Session's existing withCurrentRead admission; this method performs the existing
+     * installed_addons native projection but never recaptures Session/current owner or issues a fetch.
+     */
+    internal fun xperienceCandidates(session: VortxNativeSession, read: VortxNativeRead): XperienceInstalledCatalogSnapshot =
+        projectXperienceCandidates(read, addonDescriptors(session, read))
+
+    /** Snapshot-only projection seam shared with xperienceCandidates; it does not acquire a Session. */
+    internal fun xperienceCandidatesFromDescriptorSnapshot(
+        read: VortxNativeRead,
+        descriptors: List<JSONObject>,
+    ): XperienceInstalledCatalogSnapshot = projectXperienceCandidates(read, descriptors)
+
+    /**
+     * Resolves and requests one imported Xperience source from the exact caller-owned Session/read.
+     * Candidate projection and configured addon pairing happen in one current-read admission. The
+     * request then uses the existing per-Session guarded resource bridge and re-admits the original
+     * owner before the response is returned. Collection URLs never enter this path.
+     * Only a RESOLVED call reaches session.load and can replace a prior request for this consumer.
+     * Missing/ambiguous results return before opening a slot, so the caller must cancel its prior
+     * coroutine and retain a selection-generation fence for every selection outcome.
+     */
+    internal suspend fun requestXperienceCatalog(
+        session: VortxNativeSession,
+        read: VortxNativeRead,
+        source: com.vortx.android.xperience.XperienceCollections.Source,
+        consumer: XperienceCatalogConsumerID,
+        mapping: XperienceAddonBinding.Mapping? = null,
+        skip: Int? = null,
+        originalCurrent: () -> Boolean = { true },
+    ): Result<XperienceCatalogRequestOutcome> = attempt {
+        check(read.owner.scope == session.scope) { "Native owner changed" }
+        data class Prepared(
+            val read: VortxNativeRead,
+            val resolution: XperienceAddonBinding.Resolution,
+            val candidate: XperienceAddonBinding.Candidate? = null,
+            val addon: VortxResourceAddon? = null,
+            val request: VortxResourceRequest? = null,
+        )
+        val prepared = session.withCurrentRead { currentRead ->
+            check(originalCurrent()) { "Original Xperience snapshot changed" }
+            check(currentRead.owner == read.owner) { "Native owner changed" }
+            val snapshot = projectXperienceCandidates(currentRead, addonDescriptors(session, currentRead))
+            val resolution = snapshot.resolve(source, mapping)
+            if (resolution !is XperienceAddonBinding.Resolution.Resolved) {
+                Prepared(currentRead, resolution)
+            } else {
+                // The same capture seals candidate -> original configured addon directly.
+                // A rejected descriptor before this entry cannot shift the request to its index.
+                val configuredAddon = snapshot.pairedAddon(resolution.candidate)
+                val type = requireNotNull(source.type)
+                val catalogId = requireNotNull(source.catalogId)
+                val catalog = resolution.candidate.catalogs.single { it.type == type && it.id == catalogId }
+                require(skip == null || (skip >= 0 && catalog.supportsSkip)) { "Catalog does not support this cursor" }
+                val extras = source.genre?.let { listOf("genre" to it) }.orEmpty() +
+                    skip?.let { listOf("skip" to it.toString()) }.orEmpty()
+                Prepared(currentRead, resolution, resolution.candidate, configuredAddon,
+                    VortxResourceRequest(VortxResourceRequest.Resource.CATALOG, type, catalogId, extras))
+            }
+        }
+        if (prepared.resolution !is XperienceAddonBinding.Resolution.Resolved) {
+            return@attempt XperienceCatalogRequestOutcome.Unresolved(prepared.resolution)
+        }
+        val candidate = requireNotNull(prepared.candidate)
+        val addon = requireNotNull(prepared.addon)
+        val request = requireNotNull(prepared.request)
+        // Only a resolved load reaches this stable per-consumer slot. Independent consumers stay
+        // isolated even for the same source; unresolved outcomes above do not retire a prior slot.
+        val slot = "xperience:${consumer.slotToken}"
+        currentCoroutineContext().ensureActive()
+        check(originalCurrent()) { "Original Xperience snapshot changed" }
+        val response = session.load(slot, prepared.read.owner, listOf(request to listOf(addon))).single()
+        currentCoroutineContext().ensureActive()
+        check(originalCurrent()) { "Original Xperience snapshot changed" }
+        requireSettled(response)
+        val originalCount = rawCount(response) // Before parental filtering; visible count is not a cursor.
+        val admitted = policyPage(session, response, prepared.read, slot, listOf(response))
+        val items = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(admitted), listOf(addon)))
+            .flatMap { it.items }.distinctBy { it.type to it.id }
+        val supportsSkip = candidate.catalogs.single { it.type == source.type && it.id == source.catalogId }.supportsSkip
+        currentCoroutineContext().ensureActive()
+        session.publish(slot, prepared.read.owner, listOf(response)) {
+            check(originalCurrent()) { "Original Xperience snapshot changed" }
+            XperienceCatalogRequestOutcome.Loaded(candidate, admitted, items, originalCount, supportsSkip)
+        }
+    }
+
+    private class XperienceDescriptorFault : Exception()
+    private class XperienceIdentityBudget {
+        // Existing native/source JSON bound, not a new small manifest-ID/URL quota.
+        private var remaining = OHJson.MAX
+        fun admit(id: String) {
+            var count = 0
+            var index = 0
+            while (index < id.length) {
+                val first = id[index]
+                val width = when {
+                    Character.isHighSurrogate(first) -> {
+                        require(index + 1 < id.length && Character.isLowSurrogate(id[index + 1])) { "Invalid installed registry" }
+                        index += 2; 4
+                    }
+                    Character.isLowSurrogate(first) -> throw IllegalArgumentException("Invalid installed registry")
+                    else -> { index++; if (first.code < 128) 1 else if (first.code < 2048) 2 else 3 }
+                }
+                require(count <= remaining - width) { "Invalid installed registry" }
+                count += width
+            }
+            require(id.isNotBlank() && count < remaining) { "Invalid installed registry" }
+            remaining -= count + 1
+        }
+    }
+    private fun xperienceString(value: Any?): String {
+        val text = value as? String ?: throw XperienceDescriptorFault()
+        if (text.isEmpty()) throw XperienceDescriptorFault()
+        var index = 0
+        while (index < text.length) {
+            val char = text[index++]
+            if (Character.isHighSurrogate(char)) {
+                if (index >= text.length || !Character.isLowSurrogate(text[index++])) throw XperienceDescriptorFault()
+            } else if (Character.isLowSurrogate(char)) throw XperienceDescriptorFault()
+        }
+        return text
+    }
+    private fun xperienceCandidate(id: String, transport: String, catalogs: List<XperienceAddonBinding.Catalog>): XperienceAddonBinding.Candidate {
+        // Catch only this pure factory's documented input rejection, not repository/JNI,
+        // programmer, cancellation, linkage or memory failures from a wider operation.
+        return try { XperienceAddonBinding.Candidate.fromInstalled(XperienceAddonBinding.InstalledDescriptor(id, transport, catalogs)) }
+        catch (_: IllegalArgumentException) { throw XperienceDescriptorFault() }
+    }
+    private fun xperienceCatalogs(manifest: JSONObject): List<XperienceAddonBinding.Catalog> {
+        val catalogs = manifest.opt("catalogs") as? JSONArray ?: throw XperienceDescriptorFault()
+        return (0 until catalogs.length()).mapNotNull { index ->
+            val catalog = catalogs.opt(index) as? JSONObject ?: throw XperienceDescriptorFault()
+            val type = xperienceString(catalog.opt("type"))
+            val id = xperienceString(catalog.opt("id"))
+            val supported = mutableSetOf<String>()
+            val required = mutableSetOf<String>()
+            if (catalog.has("extra")) {
+                val extras = catalog.opt("extra") as? JSONArray ?: throw XperienceDescriptorFault()
+                for (at in 0 until extras.length()) {
+                    val extra = extras.opt(at) as? JSONObject ?: throw XperienceDescriptorFault()
+                    val name = xperienceString(extra.opt("name")); supported.add(name)
+                    if (extra.has("isRequired")) {
+                        val needed = extra.opt("isRequired") as? Boolean ?: throw XperienceDescriptorFault()
+                        if (needed) required.add(name)
+                    }
+                }
+            }
+            for ((key, needed) in listOf("extraSupported" to false, "extraRequired" to true)) {
+                if (catalog.has(key)) {
+                    val extras = catalog.opt(key) as? JSONArray ?: throw XperienceDescriptorFault()
+                    for (at in 0 until extras.length()) {
+                        val name = xperienceString(extras.opt(at))
+                        if (needed) required.add(name) else supported.add(name)
+                    }
+                }
+            }
+            if (required.any { it != "genre" }) return@mapNotNull null
+            XperienceAddonBinding.Catalog(type, id, "genre" in supported || "genre" in required,
+                "genre" in required, "skip" in supported)
+        }
+    }
+    private fun projectXperienceCandidates(
+        read: VortxNativeRead,
+        descriptors: List<JSONObject>,
+    ): XperienceInstalledCatalogSnapshot {
+        data class Identified(val descriptor: JSONObject, val manifest: JSONObject, val id: String)
+        val budget = XperienceIdentityBudget()
+        // Missing/malformed/scalar-invalid or unbounded identity is global denial, even
+        // when some earlier descriptors happened to be usable. No partial capture escapes.
+        val identified = descriptors.map { descriptor ->
+            val manifest = descriptor.opt("manifest") as? JSONObject
+                ?: throw IllegalArgumentException("Invalid installed registry")
+            val id = manifest.opt("id") as? String ?: throw IllegalArgumentException("Invalid installed registry")
+            budget.admit(id)
+            Identified(descriptor, manifest, id)
+        }
+        val disabled = NativeAddonPreferences.disabled(read)
+        val order = NativeAddonPreferences.order(read)
+        val pairings = mutableListOf<Pair<XperienceAddonBinding.Candidate, VortxResourceAddon>>()
+        val rejectedIDs = mutableSetOf<String>()
+        val rejectedConfigurations = mutableMapOf<String, MutableSet<String>>()
+        for (entry in identified) {
+            val url = entry.descriptor.opt("transportUrl") as? String
+            // Existing profile visibility/order policy only. This normalized preference key
+            // is never a manifest identity, configured request endpoint, or candidate pairing.
+            if (url != null && AddonOrder.normalize(url) in disabled) continue
+            // No catalogs means no endpoint. It is not a malformed catalog sibling.
+            if (!entry.manifest.has("catalogs")) continue
+            var transportIdentity: XperienceAddonBinding.Candidate? = null
+            try {
+                if (url == null) throw XperienceDescriptorFault()
+                transportIdentity = xperienceCandidate(entry.id, url, emptyList())
+                val candidate = xperienceCandidate(entry.id, url, xperienceCatalogs(entry.manifest))
+                val addon = VortxResourceAddon.fromTransportUrl(url, entry.manifest.toString())
+                pairings.add(candidate to addon)
+            } catch (_: XperienceDescriptorFault) {
+                rejectedIDs.add(entry.id)
+                transportIdentity?.transportFingerprint?.let { fingerprint ->
+                    rejectedConfigurations.getOrPut(entry.id) { mutableSetOf() }.add(fingerprint)
+                }
+            }
+        }
+        val ordered = if (order == null) pairings else pairings.sortedBy { (_, addon) ->
+            order.indexOf(AddonOrder.normalize(addon.transportUrl)).let { if (it < 0) Int.MAX_VALUE else it }
+        }
+        return XperienceInstalledCatalogSnapshot.capture(read.owner, addonOwner(read), ordered, rejectedIDs, rejectedConfigurations)
     }
     private fun canLoad(spec: CatalogSpec, extras: Set<String>) = spec.extras.none { it.optBoolean("isRequired") && it.getString("name") !in extras }
     private fun parental(read: VortxNativeRead): Boolean = profile(read).getJSONObject("parental").let {
@@ -256,9 +637,22 @@ internal class NativeCatalogRepository(
     private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
                            completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
         if (!parental(read)) return page
+        // Keep the existing generic path's provider resampling behavior unchanged.
+        return policyPageUsing({ session() }, page, read, slot, completed, ticket)
+    }
+
+    /** Exact-session overload for operations that must not sample sessionProvider after suspension. */
+    private fun policyPage(session: VortxNativeSession, page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
+                           completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
+        if (!parental(read)) return page
+        return policyPageUsing({ session }, page, read, slot, completed, ticket)
+    }
+
+    private fun policyPageUsing(currentSession: () -> VortxNativeSession, page: VortxResourceSnapshot, read: VortxNativeRead,
+                                slot: String, completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
         // A completed load can be superseded while its caller parses. Policy evidence is itself
         // publication: fence the complete admission/revocation, including blocked/null outcomes.
-        return session().publish(slot, read.owner, completed, ticket) {
+        return currentSession().publish(slot, read.owner, completed, ticket) {
         val kind = when (page.request.resource) {
             VortxResourceRequest.Resource.CATALOG -> "catalog"
             VortxResourceRequest.Resource.META -> "meta"
@@ -276,7 +670,7 @@ internal class NativeCatalogRepository(
                 require(identities.distinct().size == identities.size) { "Ambiguous parental catalog identity" }
             }
             val response = if (kind == "meta" && raw.isNull("meta")) JSONObject().put("kind", kind).put("meta", JSONObject.NULL)
-            else session().resolve(JSONObject().put("kind", kind).also {
+            else currentSession().resolve(JSONObject().put("kind", kind).also {
                 if (kind == "catalog") it.put("metas", raw.getJSONArray("metas"))
                 else it.put("meta", raw.get("meta"))
             }, read.owner)
@@ -297,7 +691,7 @@ internal class NativeCatalogRepository(
             }
             val observed = if (kind == "meta") setOf(page.request.type to page.request.id) else
                 raw.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet()
-            session().owned(read.owner) { synchronized(this) {
+            currentSession().owned(read.owner) { synchronized(this) {
                 val prior = admittedResources?.takeIf { it.first == read.owner }?.second.orEmpty()
                 admittedResources = read.owner to (prior - observed + admitted).takeLastBounded(20_000)
                 detailCache.entries.removeAll { (identity, entry) -> entry.first == read.owner &&
@@ -333,7 +727,7 @@ internal class NativeCatalogRepository(
 
     private fun savedItems(read: VortxNativeRead): List<MetaItem> = library(read).getJSONArray("items").objects().filter {
         it.getString("kind") == "standard"
-    }.map { MetaItem(it.getString("id"), MediaType.fromId(it.getString("type")), it.getString("name"), poster = it.optStringOrNull("poster")) }
+    }.map(::nativeSavedLibraryItem)
     private fun cw(read: VortxNativeRead): List<MetaItem> {
         val saved = savedItems(read)
         return visibleLocal(playback(read).getJSONArray("continueWatching").objects().map { item ->
@@ -542,6 +936,7 @@ internal class NativeCatalogRepository(
             check(!context.started && !context.closed) { "Native source consumer already used" }
             context.started = true
         }
+        context.capturePoolOnce()
         val session = context.session; val read = context.read; val addons = context.addons
         val type = context.type; val id = context.id; val episodeId = context.episodeId
         val indexerScope = context.indexerScope
@@ -583,9 +978,16 @@ internal class NativeCatalogRepository(
             // indexer query. Wait for this request's identity-checked, parental-approved metadata.
             if (currentDetail != null) approvedSearch = nativeNzbSearch(currentDetail, type, id, episodeId)
             val rawGroups = EngineState.parseStreamGroups(projection, episodeId ?: id)
+            if (currentDetail != null) {
+                val target = nativeSourceIndexTarget(currentDetail, type, id, episodeId, context.episode)
+                val prior = context.poolTarget
+                if (prior != null && prior != target) context.retirePool()
+                else if (prior == null && target != null) context.poolTarget = target
+            }
             val selectedEpisode = detail?.videos?.find { it.id == episodeId }
             val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
-            val combined = mergeNzbGroups(rawGroups, indexerGroups)
+            val pooled = context.poolResult?.takeIf { it.isCurrent(context.poolTarget) }
+            val combined = mergeNzbGroups(rawGroups, indexerGroups) + (pooled?.groups() ?: emptyList())
             val groups = if (parental(read)) combined.map { group -> group.copy(streams = group.streams.filter {
                 StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
             }) } else combined
@@ -596,6 +998,7 @@ internal class NativeCatalogRepository(
                 if (detail != null) detailCache[type to id] = read.owner to detail
                 if (!initializedBindings) {
                     if (!context.prepared) {
+                        foregroundSources?.takeIf { it !== context }?.retirePool()
                         foregroundSources = context
                         resolveSequence.incrementAndGet()
                     }
@@ -603,12 +1006,16 @@ internal class NativeCatalogRepository(
                 }
                 groups.map { group -> group.copy(streams = group.streams.map { source ->
                     // A later partial must not revoke the source token already being resolved.
-                    val token = tokens.getOrPut(source.addon to source.id) { java.util.UUID.randomUUID().toString() }
+                    val poolBinding = if (group.base == com.vortx.android.singularity.SourceIndexClient.GROUP_ID)
+                        requireNotNull(pooled?.binding(source)) { "Unadmitted pooled source" } else null
+                    val tokenKey = if (poolBinding != null) "repository-pool" to source.id else source.addon to source.id
+                    val token = tokens.getOrPut(tokenKey) { java.util.UUID.randomUUID().toString() }
                     val playbackContext = PlaybackContext(
                         PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
                         selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
                         PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision)
-                    val binding = context.bindings.getOrPut(token) { SourceBinding(read.owner, playbackContext) }
+                    val binding = context.bindings.getOrPut(token) { SourceBinding(read.owner, playbackContext, poolBinding) }
+                    if (poolBinding != null) context.poolTokens += token
                     check(binding.owner == read.owner && binding.context.identityKey == playbackContext.identityKey) { "Native source identity changed" }
                     // Metadata may arrive after this stream. Enrich the stable binding, never replace its
                     // admission identity or revoke a resolver that already captured that exact object.
@@ -616,17 +1023,50 @@ internal class NativeCatalogRepository(
                     source.copy(nativePlaybackToken = token)
                 }) }
             }
+            val authorization = context.poolAdmission()
             synchronized(this@NativeCatalogRepository) {
                 context.latestGroups = bound
                 context.indexerResult = direct
+                if (context.poolResult?.isRetired(context.poolTarget) == false) {
+                    sourcePublications[context.sourcePublicationId] = java.lang.ref.WeakReference(context)
+                }
+                val target = context.poolTarget
+                val sourceIndex = sourceIndexSource
+                if (target != null && authorization != null && sourceIndex != null && rawGroups.isNotEmpty()) {
+                    context.hoardPending = com.vortx.android.singularity.SourceIndexClient.descriptors(rawGroups)
+                    if (context.hoardJob?.isActive != true) {
+                        val nextWorker = sourceIndex.launch(start = CoroutineStart.LAZY) {
+                            val worker = currentCoroutineContext()[Job]
+                            while (authorization.isCurrent()) {
+                                val descriptors = synchronized(this@NativeCatalogRepository) {
+                                    if (context.hoardPending.isEmpty()) {
+                                        // Release the worker slot with the empty decision, before Job completion.
+                                        if (context.hoardJob === worker) context.hoardJob = null
+                                        null
+                                    } else context.hoardPending.also { context.hoardPending = emptyList() }
+                                }
+                                if (descriptors == null) break
+                                sourceIndex.hoard(target, descriptors, authorization)
+                            }
+                        }
+                        // Install ownership before IO can finish the worker body or release its slot.
+                        context.hoardJob = nextWorker
+                        nextWorker.start()
+                    }
+                }
             }
             StreamLoadUpdate(bound, update.settled, update.total, terminal,
                 selectionReady = terminal || indexerFinished && bound.any { it.streams.isNotEmpty() } &&
-                    update.resourceSettled(VortxResourceRequest.Resource.STREAM, addons.size))
+                    update.resourceSettled(VortxResourceRequest.Resource.STREAM, addons.size),
+                sourcePublicationId = context.sourcePublicationId)
         }
         try { coroutineScope {
             val events = Channel<StreamEvent>(capacity = 1)
+            val coordinatorScope = this
             var indexerJob: Job? = null
+            var poolStarted = false
+            var poolFinished = context.poolAdmission() == null
+            context.poolRevoked = { coordinatorScope.launch { runCatching { events.send(StreamEvent.PoolRevoked) } } }
             val ownerWatcher = launch {
                 session.updates.first { !session.accepts(read.owner) || sessionProvider() !== session }
                 error("Native account changed")
@@ -645,7 +1085,7 @@ internal class NativeCatalogRepository(
                 events.send(StreamEvent.ProvidersFinished)
             }
             try {
-                while (!providersFinished || !indexerFinished) {
+                while (!providersFinished || !indexerFinished || !poolFinished) {
                     val event = events.receive()
                     when (event) {
                         is StreamEvent.Providers -> {
@@ -666,27 +1106,54 @@ internal class NativeCatalogRepository(
                                     events.send(StreamEvent.Indexer(result))
                                 }
                             }
+                            if (!poolStarted && !poolFinished) context.poolTarget?.let { target ->
+                                val authorization = context.poolAdmission()
+                                if (authorization == null) poolFinished = true else {
+                                    poolStarted = true
+                                    context.poolJob = launch {
+                                        val result = try { sourceIndexSource?.load(target, authorization) }
+                                        catch (cancelled: CancellationException) {
+                                            currentCoroutineContext().ensureActive()
+                                            null
+                                        } catch (_: Exception) { null }
+                                        events.send(StreamEvent.Pool(result))
+                                    }
+                                }
+                            }
                             snapshot?.let { emit(it) }
                             event.accepted.complete(Unit)
                         }
                         is StreamEvent.Indexer -> { direct = event.result.getOrThrow(); indexerFinished = true }
+                        is StreamEvent.Pool -> {
+                            context.poolResult = event.result?.takeIf { it.isCurrent(context.poolTarget) }
+                            poolFinished = true
+                        }
+                        StreamEvent.PoolRevoked -> { context.poolResult = null; poolFinished = true }
                         StreamEvent.ProvidersFinished -> {
                             providersFinished = true
                             // No current approved metadata: suppress, rather than retarget, the query.
                             if (!indexerStarted) indexerFinished = true
+                            if (!poolStarted) poolFinished = true
                         }
                     }
                     if (event !is StreamEvent.Providers) {
                         // A provider may have advanced its receipt just before sending its event.
                         // Defer that one partial; the queued callback will publish the retained direct
                         // result with the newer receipt. Slot/owner replacement still throws.
-                        publish(lastUpdate, requireNotNull(lastTicket), providersFinished && indexerFinished)?.let { emit(it) }
+                        lastTicket?.let { ticket ->
+                            publish(lastUpdate, ticket, providersFinished && indexerFinished && poolFinished)?.let { emit(it) }
+                        }
                     }
                 }
             } finally {
                 providers.cancel(); indexerJob?.cancel(); ownerWatcher.cancel(); events.cancel()
+                context.poolJob?.cancel()
+                context.poolRevoked = null
             }
-        } } finally { context.retireTicket() }
+        } } finally {
+            context.retireTicket()
+            if (!initializedBindings) context.retirePool()
+        }
     }.flowOn(Dispatchers.IO)
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
@@ -731,7 +1198,7 @@ internal class NativeCatalogRepository(
         fun wire(t: String = type, s: String = sort) = JSONObject().put("type", t).put("sort", s).toString()
         session.owned(read.owner) { LibraryResult(items, LibraryFilters(
             types = (listOf("all") + all.map { it.type.id }.distinct()).map { LibraryTypeOption(it, it == type, wire(t = it)) },
-            sorts = listOf("recent", "name").map { LibrarySortOption(it, it == sort, wire(s = it)) })) }
+            sorts = listOf("recent", "name").map { LibrarySortOption(it, it == sort, wire(s = it)) }), owner = owner(read.owner)) }
     }
     override suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> = attempt {
         val session = session(); val read = session.read()
@@ -742,8 +1209,11 @@ internal class NativeCatalogRepository(
                 progress.timeOffsetMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), progress.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), now, detail.watchedVideoIds.toList())
         } }
     }
-    private fun addAction(item: MetaItem, read: VortxNativeRead) = action("add_library_item").put("profileId", read.owner.profileID)
-        .put("item", JSONObject().put("kind", "standard").put("id", item.id).put("type", item.type.id).put("name", item.name).put("poster", item.poster))
+    private fun addAction(item: MetaItem, read: VortxNativeRead): JSONObject {
+        val cached = synchronized(this) { detailCache[item.type to item.id]?.takeIf { it.first == read.owner }?.second }
+        return action("add_library_item").put("profileId", read.owner.profileID)
+            .put("item", nativeLibraryItemPayload(item, cached))
+    }
     override suspend fun addToLibrary(item: MetaItem) = attempt { val session = session(); val read = session.read(); session.dispatch(listOf(addAction(item, read)), read.owner); Unit }
     // A dispatch returns only after the checkpoint committed, so each mirror below follows a persisted change.
     override suspend fun saveToLibrary(item: MetaItem) = addToLibrary(item).onSuccess { mirrorLibrary(true, item.type, item.id) }
@@ -936,7 +1406,7 @@ internal class NativeCatalogRepository(
     override suspend fun installAddon(url: String) = attempt {
         val session = session(); val read = session.read(); val normalized = requireNotNull(normalizedAddonUrl(url))
         check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; install add-ons from the owner profile" }
-        val addon = VortxResourceAddon(normalized, normalized)
+        val addon = VortxResourceAddon.fromTransportUrl(normalized)
         val response = session.load("install", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(addon))).single()
         requireSettled(response)
         val manifest = response.groups.single().items(VortxResourceRequest.Resource.MANIFEST).single()
@@ -963,7 +1433,7 @@ internal class NativeCatalogRepository(
         val targetKey = AddonOrder.normalize(target)
         require(targetKey == oldKey || before.none { AddonOrder.normalize(it.getString("transportUrl")) == targetKey }) { "Replacement endpoint is already installed" }
         val response = session.load("addon-replacement", read.owner,
-            listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(VortxResourceAddon(target, target)))).single()
+            listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(VortxResourceAddon.fromTransportUrl(target)))).single()
         requireSettled(response)
         val manifest = response.groups.single().items(VortxResourceRequest.Resource.MANIFEST).single()
         require(listOf("id", "name", "version").all { manifest.get(it) is String && manifest.getString(it).isNotBlank() }) { "Invalid replacement manifest" }
@@ -1092,29 +1562,29 @@ internal class NativeCatalogRepository(
                     context.type == "movie" && context.videoId == context.contentId && row.optStringOrNull("videoId") == null)
         }.maxOfOrNull { it.getLong("updatedAt") }
 
-    override suspend fun endPlaybackSessionWithDurableWatchReceipt(token: PlaybackSessionToken, positionMs: Long, durationMs: Long): Result<DurableWatchedPlaybackReceipt?> = attempt {
-        val session = session(); val current = synchronized(this) { playing } ?: return@attempt null
-        if (current.token != token) return@attempt null
+    override suspend fun endPlaybackSessionWithDurableWatchReceipt(session: PlaybackSessionToken, positionMs: Long, durationMs: Long): Result<DurableWatchedPlaybackReceipt?> = attempt {
+        val nativeSession = this@NativeCatalogRepository.session(); val current = synchronized(this) { playing } ?: return@attempt null
+        if (current.token != session) return@attempt null
         if (!nativePlaybackIdentityCanRecord(current.context)) return@attempt null
         require(positionMs >= 0 && durationMs >= 0)
-        session.owned(current.owner) { synchronized(this) {
+        nativeSession.owned(current.owner) { synchronized(this) {
             if (playing !== current) return@owned null
             val query = JSONObject().put("kind", "profile_playback").put("profileId", current.owner.profileID)
-            val prior = watchedStamp(session.resolve(query, current.owner), current.context, false) ?: 0L
+            val prior = watchedStamp(nativeSession.resolve(query, current.owner), current.context, false) ?: 0L
             try {
-                session.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
+                nativeSession.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
                     .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
                     .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)
-                val committed = session.resolveCommitted(query, current.owner)
+                val committed = nativeSession.resolveCommitted(query, current.owner)
                 check(committed.getString("kind") == "profile_playback" && committed.getString("profileId") == current.owner.profileID)
                 val stamp = watchedStamp(committed, current.context, true)
                 // The kernel alone decides completion. A prior watch plus a partial/zero terminal
                 // report is not a new durable finish from this playback session.
-                val admission = if (stamp != null && stamp > prior && durationMs > 0L) captureReclaimAdmission?.invoke(session, current.owner) else null
+                val admission = if (stamp != null && stamp > prior && durationMs > 0L) captureReclaimAdmission?.invoke(nativeSession, current.owner) else null
                 if (stamp == null || admission == null) null else {
                     if (durableWatchReceipts.size >= 128) durableWatchReceipts.clear()
                     DurableWatchedPlaybackReceipt(current.context, owner(current.owner)).also {
-                        durableWatchReceipts[it] = DurableWatchProof(current.owner, token, stamp, admission)
+                        durableWatchReceipts[it] = DurableWatchProof(current.owner, session, stamp, admission)
                     }
                 }
             } finally { if (playing === current) playing = null }
@@ -1144,6 +1614,7 @@ internal class NativeCatalogRepository(
         val context = synchronized(this) { foregroundSources }
         val binding = synchronized(this) { context?.bindings?.get(source.nativePlaybackToken) }
         check(binding != null && binding.owner == read.owner) { "Native source selection expired; reload sources" }
+        check(binding.pooled == null || binding.pooled.accepts(source, context?.poolTarget)) { "Pooled source admission expired" }
         check(episode == null || episode.id == binding.context.videoId) { "Native episode selection changed" }
         resolveOwned(session, read, source, episode, binding, context).copy(playbackContext = binding.context)
     }
@@ -1162,7 +1633,11 @@ internal class NativeCatalogRepository(
                 check(context != null && context.isCurrent() && context.bindings[sourceToken] === binding &&
                     (sequenceOwner !== resolveSequence || foregroundSources === context)) { "Native source selection expired" }
             }
+            binding?.pooled?.let { pooled ->
+                check(pooled.accepts(source, context?.poolTarget)) { "Pooled source admission expired" }
+            }
         }
+        session.owned(read.owner) { requireCurrent() }
         val playable = try {
             playbackResolver.resolve(source, episode,
                 isCurrent = { try { session.owned(read.owner) { requireCurrent(); true } } catch (_: Exception) { false } },

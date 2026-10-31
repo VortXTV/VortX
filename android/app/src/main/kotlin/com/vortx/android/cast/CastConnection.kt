@@ -38,4 +38,6 @@ data class CastPlaybackState(
     /// Receiver playhead + media duration in milliseconds (0 until the receiver reports them).
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
+    /** Opaque mounted playback selection; absent until this load is confirmed by the receiver. */
+    val owner: String? = null,
 )

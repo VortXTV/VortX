@@ -26,6 +26,19 @@ class MpvSeam private constructor() {
     private val audioFilterLock = Any()
     private val observers = MpvObserverRegistry<EventObserver>()
     private val logObservers = MpvObserverRegistry<LogObserver>()
+    private val referenceTransport = MpvReferenceTransport(
+        gate = { handleGate },
+        native = object : MpvReferenceNative {
+            override fun property(handle: Long, property: Int): MpvReferenceNode? = try {
+                nativeGetReferenceNode(handle, property)
+            } catch (_: UnsatisfiedLinkError) { null }
+            override fun begin(handle: Long, identifier: Long, command: MpvReferenceCommand): Int =
+                nativeBeginReference(handle, identifier, command.operation, command.integers, command.origin, command.payload)
+            override fun abort(handle: Long, identifier: Long) = nativeAbortReference(handle, identifier)
+            override fun revoke(handle: Long, grant: Long): Boolean = nativeRevokeReference(handle, grant)
+        },
+        forceDestroy = ::destroy,
+    )
 
     companion object {
         private const val NATIVE_CALL_UNAVAILABLE = Int.MIN_VALUE
@@ -71,12 +84,15 @@ class MpvSeam private constructor() {
         handleGate?.bindOriginalOwner(liveness) == true
 
     fun destroy() {
-        val gate = handleGate ?: return
+        val gate = handleGate
         // Close admission synchronously so no observer/thread can race in after destroy. With no active
         // lease, defer the returned action until this callback unwinds. With an active lease, its last
         // releaser owns finalization, so this callback still returns without waiting.
-        val destroyAction = gate.requestDestroy(::nativeDestroy) ?: return
-        destroyDispatcher.dispatchDestroy(destroyAction)
+        // Gate admission closes BEFORE any fast cleanup can invoke a whenClosed callback. An async
+        // lease may make the immediate action null; its independent registry must still be retired.
+        val destroyAction = gate?.requestDestroy(::nativeDestroy)
+        referenceTransport.retire()
+        if (destroyAction != null) destroyDispatcher.dispatchDestroy(destroyAction)
     }
     private external fun nativeDestroy(instance: Long)
 
@@ -107,6 +123,14 @@ class MpvSeam private constructor() {
         handleGate?.withSerializedHandle(audioFilterLock, Unit) { instance -> nativeCommand(instance, cmd) }
     }
     private external fun nativeCommand(instance: Long, cmd: Array<String>)
+
+    /** Full-only v2 reference effect; an older/mismatched component returns unavailable. */
+    fun openSubtitleReference(expectedEntryID: Long): MpvReferenceSession? = referenceTransport.open(expectedEntryID)
+    private external fun nativeGetReferenceNode(instance: Long, property: Int): MpvReferenceNode?
+    private external fun nativeBeginReference(instance: Long, identifier: Long, operation: Int,
+        integers: LongArray, origin: Double, payload: ByteArray?): Int
+    private external fun nativeAbortReference(instance: Long, identifier: Long)
+    private external fun nativeRevokeReference(instance: Long, grant: Long): Boolean
 
     /** Actual loadfile result, not a later read of whichever entry is current. No retry on null. */
     fun loadFileWithEntryID(url: String): Long? = handleGate?.withSerializedHandle(audioFilterLock, -1L) { instance ->
@@ -231,6 +255,13 @@ class MpvSeam private constructor() {
     fun eventEndFile(reason: Int, error: Int) {
         dispatchEvent { it.eventEndFile(reason, error) }
     }
+
+    fun eventReferenceReply(identifier: Long, error: Int, node: MpvReferenceNode?) {
+        destroyDispatcher.withinNativeCallback { referenceTransport.reply(identifier, error, node) }
+    }
+
+    // A JNI copy/callback failure still names the original registered request, never a successor.
+    fun eventReferenceFailure(identifier: Long) { referenceTransport.failedDelivery(identifier) }
 
     fun event(eventId: Int) {
         dispatchEvent { it.event(eventId) }

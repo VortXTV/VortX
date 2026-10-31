@@ -213,12 +213,10 @@ fun PlayerChrome(
     pooledSubtitles: List<SubtitlePoolClient.PooledSubtitle> = emptyList(),
     poolLoadingId: Int? = null,
     onSelectPooledSubtitle: (SubtitlePoolClient.PooledSubtitle) -> Unit = {},
-    /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
-    /// no community sheet (the common case for a title nobody has contributed yet, and always so while
-    /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
-    /// what [com.vortx.android.trickplay.TrickplaySession.previewAt] guarantees: an in-memory crop of an
-    /// already-downloaded sprite. Defaults to no preview so the chrome stays usable in isolation.
-    scrubPreview: (Double) -> Bitmap? = { null },
+    /// Suspendable scrub preview; the session owns bitmap work and any bounded local-cache read on a
+    /// worker dispatcher. Changing the destination cancels the old request before it can reach the UI.
+    scrubPreview: suspend (Double) -> Bitmap? = { null },
+    scrubPreviewRevision: Long = 0L,
     /// Successful in-place switches increment this even when the replacement resolves to the same URL, closing
     /// the old sheet and resetting chrome state with the engine-owned session.
     playbackSessionRevision: Long = 0L,
@@ -557,6 +555,7 @@ fun PlayerChrome(
             seekStepSeconds = seekStepSeconds,
             onInteraction = onInteraction,
             scrubPreview = scrubPreview,
+            scrubPreviewRevision = scrubPreviewRevision,
             seekBarStyle = seekBarStyle,
             chapters = chapters,
             skipBands = skipBands,
@@ -2188,7 +2187,8 @@ private fun TransportBar(
     /// Reported on every scrub drag frame so the host's auto-hide timer cannot expire mid-gesture and
     /// yank the slider out from under the finger. No-op by default.
     onInteraction: () -> Unit = {},
-    scrubPreview: (Double) -> Bitmap? = { null },
+    scrubPreview: suspend (Double) -> Bitmap? = { null },
+    scrubPreviewRevision: Long = 0L,
     seekBarStyle: SeekBarStyle = SeekBarStyle.CLASSIC,
     chapters: List<PlayerChapter> = emptyList(),
     skipBands: List<SkipBand> = emptyList(),
@@ -2210,14 +2210,15 @@ private fun TransportBar(
         else -> 0f
     }
 
-    // The community scrub thumbnail for wherever the finger currently is. Recomputed only when the
-    // scrubbed SECOND changes, not on every pixel of drag: `crop` allocates a bitmap, so keying on the raw
-    // float would allocate on every frame of the gesture and make scrubbing the jankiest thing in the
-    // player. One crop per second of scrubbed time is exactly the tile granularity anyway (tiles are 10s
-    // apart), so nothing visible is lost. This mirrors the SkipButton's per-second recompute key.
+    // Crop/decode runs in the session's worker context. A new destination, source callback, or newly
+    // available sheet/frame cancels the old effect; an old result cannot replace a newer scrub bubble.
     val scrubSeconds = if (duration > 0L) (scrubValue * duration / 1000.0) else 0.0
-    val previewBitmap = remember(scrubbing, scrubSeconds.toLong()) {
-        if (scrubbing && duration > 0L) scrubPreview(scrubSeconds) else null
+    var previewBitmap by remember(scrubbing, duration, scrubSeconds.toLong(), scrubPreview, scrubPreviewRevision) {
+        mutableStateOf<Bitmap?>(null)
+    }
+    LaunchedEffect(scrubbing, duration, scrubSeconds.toLong(), scrubPreview, scrubPreviewRevision) {
+        previewBitmap = null
+        if (scrubbing && duration > 0L) previewBitmap = scrubPreview(scrubSeconds)
     }
 
     Column(

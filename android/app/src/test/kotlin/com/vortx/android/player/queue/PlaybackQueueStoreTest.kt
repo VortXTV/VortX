@@ -88,6 +88,66 @@ class PlaybackQueueStoreTest {
         assertEquals(listOf("tt2"), PlaybackQueueCodec.decode(persistence.values.getValue(PlaybackQueueModel.storageKey(a))).map { it.item.id })
     }
 
+    @Test fun `playlist batch is one admitted state transition and one persistence write`() = runTest {
+        val persistence = MemoryPersistence()
+        val store = PlaybackQueueStore(persistence, this, { a }, StandardTestDispatcher(testScheduler))
+        store.bindOwner(a)
+        runCurrent()
+        assertEquals(PlaybackQueuePlaylistSnapshot(emptyList(), 100), store.playlistSnapshot(a))
+        val beforeRevision = store.state.value.revision
+        assertTrue(store.appendCandidates(a, listOf(movie(1), movie(1), movie(2))))
+        assertEquals(beforeRevision + 1, store.state.value.revision)
+        assertEquals(listOf("tt1", "tt1", "tt2"), store.state.value.entries.map { it.item.id })
+        assertEquals(97, requireNotNull(store.playlistSnapshot(a)).remainingCapacity)
+        assertTrue(persistence.writes.isEmpty())
+        runCurrent()
+        assertEquals(1, persistence.writes.size)
+        assertEquals(listOf("tt1", "tt1", "tt2"),
+            PlaybackQueueCodec.decode(persistence.writes.single().second).map { it.item.id })
+        assertEquals(3, PlaybackQueueCodec.decode(persistence.values.getValue(
+            PlaybackQueueModel.storageKey(a))).map { it.id }.toSet().size)
+    }
+
+    @Test fun `playlist batch rejects overflow invalid input and owner change without a partial write`() = runTest {
+        val persistence = MemoryPersistence().apply {
+            values[PlaybackQueueModel.storageKey(a)] =
+                PlaybackQueueCodec.encode((1 until PlaybackQueueModel.MAX_ENTRIES).map(::entry))
+        }
+        var current = a
+        val store = PlaybackQueueStore(persistence, this, { current }, StandardTestDispatcher(testScheduler))
+        store.bindOwner(a)
+        runCurrent()
+        val before = store.state.value
+        assertEquals(1, requireNotNull(store.playlistSnapshot(a)).remainingCapacity)
+        assertFalse(store.appendCandidates(a, listOf(movie(100), movie(101))))
+        assertEquals(before, store.state.value)
+        assertTrue(persistence.writes.isEmpty())
+        assertFalse(store.appendCandidates(a, listOf(movie(100).copy(name = " "))))
+        assertEquals(before, store.state.value)
+        assertTrue(persistence.writes.isEmpty())
+        current = b
+        assertNull(store.playlistSnapshot(a))
+        assertFalse(store.appendCandidates(a, listOf(movie(100))))
+        assertEquals(before, store.state.value)
+        assertTrue(persistence.writes.isEmpty())
+    }
+
+    @Test fun `failed playlist batch write publishes unavailable and blocks later edits`() = runTest {
+        val persistence = MemoryPersistence().apply { failWrites = true }
+        val store = PlaybackQueueStore(persistence, this, { a }, StandardTestDispatcher(testScheduler))
+        store.bindOwner(a)
+        runCurrent()
+        // True means this one immutable local intent was admitted, not that disk or cloud certified it.
+        assertTrue(store.appendCandidates(a, listOf(movie(1), movie(2))))
+        assertEquals(listOf("tt1", "tt2"), store.state.value.entries.map { it.item.id })
+        runCurrent()
+        assertEquals(1, persistence.writes.size)
+        assertFalse(store.state.value.ready)
+        assertNotNull(store.state.value.error)
+        assertFalse(store.appendCandidates(a, listOf(movie(3))))
+        assertEquals(listOf("tt1", "tt2"), store.state.value.entries.map { it.item.id })
+    }
+
     @Test fun `accepted outgoing-owner write drains to its original key before rapid ABA reload`() = runTest {
         val persistence = MemoryPersistence()
         var current = a

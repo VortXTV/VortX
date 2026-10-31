@@ -53,7 +53,13 @@ class VortXSyncManagerBackupRevisionTest {
         fun coordinator(store: VortxCheckpointStore) = NativeAccountCoordinator(abi, store, { object : VortxResourceTransport {
             override fun makeCancellation(): VortxResourceCancellation = error("No provider network")
             override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No provider network")
-        } }, { it.id == account.id }, { it() }, {})
+        } }, { it.id == account.id }, { it() }, {}, captureOwnAccountAdmission = { captured ->
+            // Synthetic account/transport, genuine ORIGINAL manager operation admission. The
+            // real coordinator/JNI/checkpoint path remains in all fourteen existing methods.
+            manager.captureLocalLibraryMutationAdmission()?.let { original -> { action ->
+                original { manager.sessionOwnerSnapshot() == captured && action() }
+            } }
+        })
         var local = coordinator(disk)
         val peer = coordinator(VortxEncryptedCheckpointStore(directory.resolve("peer")) { SecretKeySpec(key, "AES") })
         val context = RevisionContext()

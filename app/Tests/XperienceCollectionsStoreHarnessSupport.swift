@@ -36,13 +36,17 @@ struct XperiencePreparedExport: Sendable {}
         let lifetime: XperienceImportLifetime
     }
     private struct HeldSave {
-        let edit: XperienceImportNamespace.Edit
+        let edit: XperienceImportNamespace.RawEdit
         let target: NativeXperienceTarget
         let latch: VortxNativeHostFieldCommitLatch
-        let continuation: CheckedContinuation<VortxJSON, Error>
+        let continuation: CheckedContinuation<VortxRawHostRegister, Error>
     }
     var context = Context()
     var registers: [String: VortxJSON] = [:]
+    var installedProjection = XperienceInstalledCatalogs.Snapshot.empty
+    // Synthetic byte fixtures only; genuine encrypted producer/CAS coverage belongs to
+    // XperienceNativeCheckpointTests. Never call a DTO encoding original account evidence.
+    var rawRegisterFixtures: [String: VortxRawHostRegister] = [:]
     var rejectPreparation = false
     var holdPreparation = false
     private(set) var captures: [NativeXperienceTarget] = []
@@ -73,12 +77,14 @@ struct XperiencePreparedExport: Sendable {}
         return result
     }
     func nativeXperienceSnapshot(target: NativeXperienceTarget) throws
-        -> (registers: [String: VortxJSON], candidates: [XperienceAddonBinding.Candidate]) {
+        -> (registers: [String: VortxRawHostRegister], candidates: XperienceInstalledCatalogs.Snapshot) {
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         let waiter = snapshotWaiter
         snapshotWaiter = nil
         waiter?.resume()
-        return (registers, [])
+        var bytes = try registers.mapValues { try VortxRawHostRegister.prepared(VortxNativeHostFieldEvidence.canonicalData($0)) }
+        bytes.merge(rawRegisterFixtures) { _, fixture in fixture }
+        return (bytes, installedProjection)
     }
     func prepareNativeXperienceExportBudget(target: NativeXperienceTarget) async throws -> XperiencePreparedExport {
         preparationCount += 1
@@ -94,8 +100,8 @@ struct XperiencePreparedExport: Sendable {}
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         return .init()
     }
-    func saveNativeXperienceImport(_ edit: XperienceImportNamespace.Edit, target: NativeXperienceTarget,
-                                  validator: XperiencePreparedExport) async throws -> VortxJSON {
+    func saveNativeXperienceImport(_ edit: XperienceImportNamespace.RawEdit, target: NativeXperienceTarget,
+                                  validator: XperiencePreparedExport) async throws -> VortxRawHostRegister {
         try Task.checkCancellation()
         guard nativeXperienceTargetIsCurrent(target) else { throw XperiencePersistenceFailure.staleContext }
         let id = UUID()
@@ -143,6 +149,14 @@ struct XperiencePreparedExport: Sendable {}
         return .object(["clock": .integer(1), "actor": .string("10000000-0000-4000-8000-000000000001"),
                         "value": held.edit.value])
     }
+    func rawReceipt(for id: UUID) throws -> VortxRawHostRegister {
+        guard let held = saves[id] else { preconditionFailure("missing synthetic save") }
+        var register = try OwnerHistoryExactJSON.Object(held.edit.raw.expectedRegister?.bytes ?? Data("{}".utf8))
+        register.set("clock", Data("1".utf8))
+        register.set("actor", try OwnerHistoryExactJSON.string("10000000-0000-4000-8000-000000000001"))
+        register.set("value", held.edit.raw.value)
+        return try VortxRawHostRegister.prepared(register.encoded())
+    }
     /// Models publication before the saving continuation, not a native durable transaction.
     func publish(_ id: UUID, extra: [String: VortxJSON] = [:], alterValue: Bool = false) throws {
         guard let held = saves[id] else { preconditionFailure("missing synthetic save") }
@@ -153,14 +167,17 @@ struct XperiencePreparedExport: Sendable {}
             var receipt = receipt(for: id)
             if alterValue { receipt = .object(["clock": .integer(1), "actor": .string("synthetic"), "value": .null]) }
             registers[held.edit.field] = receipt
+            rawRegisterFixtures[held.edit.field] = alterValue
+                ? try VortxRawHostRegister.prepared(VortxNativeHostFieldEvidence.canonicalData(receipt)) : try rawReceipt(for: id)
             registers.merge(extra) { _, new in new }
             syntheticPublications += 1
         }
     }
     func finish(_ id: UUID, error: Error? = nil) {
-        let value = receipt(for: id)
+        let value = try? rawReceipt(for: id)
         guard let held = saves.removeValue(forKey: id) else { preconditionFailure("missing synthetic save") }
         if let error { held.continuation.resume(throwing: error) }
-        else { held.continuation.resume(returning: value) }
+        else if let value { held.continuation.resume(returning: value) }
+        else { held.continuation.resume(throwing: XperiencePersistenceFailure.invalidSavedImport) }
     }
 }

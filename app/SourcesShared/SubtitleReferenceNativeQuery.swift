@@ -83,11 +83,12 @@ enum SubtitleReferenceNativeQuery {
         guard !externalSRT.isEmpty, externalSRT.count <= 1024 * 1024,
               let text = String(data: externalSRT, encoding: .utf8),
               (8...1024).contains(reference.count) else { return nil }
+        // Equal-start dialogue and long whole cues are real evidence. Keep every occurrence;
+        // the native estimator separately requires independent temporal evidence.
         var previousReferenceStart: UInt64?
         for cue in reference {
             guard cue.startMs < cue.endMs, cue.endMs <= referenceWindowEndMs,
-                  cue.endMs - cue.startMs <= 120_000,
-                  previousReferenceStart.map({ cue.startMs > $0 }) ?? true else { return nil }
+                  previousReferenceStart.map({ cue.startMs >= $0 }) ?? true else { return nil }
             previousReferenceStart = cue.startMs
         }
         let encoder = JSONEncoder()
@@ -131,7 +132,7 @@ enum SubtitleReferenceNativeQuery {
         var previous: UInt64?
         for (index, cue) in cues.enumerated() {
             guard cue.endMs <= 91_000_000, cue.startMs < cue.endMs,
-                  previous.map({ cue.startMs > $0 }) ?? true,
+                  previous.map({ cue.startMs >= $0 }) ?? true,
                   !cue.text.isEmpty, cue.text.utf8.count <= 16_384, !cue.text.contains("\0") else {
                 return nil
             }

@@ -1,0 +1,12 @@
+    @Synchronized fun dispatch(actions: List<JSONObject>, owner: VortxNativeOwner = read().owner,
+                              hostProfiles: JSONObject? = null, notifyMutation: Boolean = true,
+                              hostArchive: JSONObject? = null, remoteHostPreferences: JSONObject? = null,
+                              globalChanges: JSONObject? = null, acknowledgeHostPreferences: JSONObject? = null,
+                              baselineHostProfiles: JSONObject? = null,
+                              verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
+                              beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
+                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
+                              progressOnly: Boolean = false): List<String> = dispatchInternal(
+        actions, owner, hostProfiles, notifyMutation, hostArchive, remoteHostPreferences, globalChanges,
+        acknowledgeHostPreferences, baselineHostProfiles, verifyCandidate, beforeCommit,
+        profileFieldChanges, legacyWatchlists, progressOnly, requireCompleteAccountExportBudget = false)

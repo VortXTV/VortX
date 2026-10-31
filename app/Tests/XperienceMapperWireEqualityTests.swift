@@ -28,7 +28,7 @@ import Foundation
         try XperienceCurationExportMapper.map(XperienceExportConnectorTests.mappedProjection(),
             upstreamCollectionID: "22222222-2222-4222-8222-222222222222",
             sourceID: "33333333-3333-4333-8333-333333333333", into: current,
-            installed: [XperienceExportConnectorTests.candidate()])
+            installed: .init(admittedCandidates: [XperienceExportConnectorTests.candidate()]))
     }
 
     static func run() throws {

@@ -118,6 +118,7 @@ class PlayerSourceSwitchResolution internal constructor(
     private val commitAuthorityIsCurrent: () -> Boolean,
     private val commitAccepted: () -> Unit,
     private val commitRejected: () -> Unit = {},
+    private val commitPublished: () -> Unit = {},
 ) {
     private enum class Ownership { PENDING, ADOPTED, DISCARDED }
     private val ownershipLock = Any()
@@ -136,29 +137,41 @@ class PlayerSourceSwitchResolution internal constructor(
     internal fun commitIfCurrent(
         hostAuthorityIsCurrent: () -> Boolean,
         acceptReplacement: (acknowledgePublished: () -> Unit) -> Unit,
-    ): Boolean = synchronized(ownershipLock) {
-        if (ownership != Ownership.PENDING || accepting) return@synchronized false
-        // Keep an uninstalled resource pending, but block duplicate/reentrant commit callbacks.
-        accepting = true
+    ): Boolean {
+        var published = false
         try {
-            if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
-                discard()
-                return@synchronized false
-            }
-            commitAccepted()
-            if (ownership != Ownership.PENDING) return@synchronized false
-            acceptReplacement {
-                synchronized(ownershipLock) {
-                    if (accepting && ownership == Ownership.PENDING) ownership = Ownership.ADOPTED
+            return synchronized(ownershipLock) {
+                if (ownership != Ownership.PENDING || accepting) return@synchronized false
+                // Keep an uninstalled resource pending, but block duplicate/reentrant commit callbacks.
+                accepting = true
+                try {
+                    if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
+                        discard()
+                        return@synchronized false
+                    }
+                    commitAccepted()
+                    if (ownership != Ownership.PENDING) return@synchronized false
+                    acceptReplacement {
+                        synchronized(ownershipLock) {
+                            if (accepting && ownership == Ownership.PENDING) {
+                                ownership = Ownership.ADOPTED
+                                published = true
+                            }
+                        }
+                    }
+                    check(ownership == Ownership.ADOPTED) { "Player replacement publication was not acknowledged" }
+                    true
+                } catch (failure: Throwable) {
+                    discard()
+                    throw failure
+                } finally {
+                    accepting = false
                 }
             }
-            check(ownership == Ownership.ADOPTED) { "Player replacement publication was not acknowledged" }
-            true
-        } catch (failure: Throwable) {
-            discard()
-            throw failure
         } finally {
-            accepting = false
+            // Acknowledgment is irreversible. Cleanup is once-only, nonthrowing, and outside ownershipLock,
+            // including when the host throws after acknowledging the mounted replacement.
+            if (published) runCatching(commitPublished)
         }
     }
 

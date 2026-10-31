@@ -5,9 +5,10 @@ source scripts/native-watched-swift-inputs.sh
 source scripts/native-owner-history-fixture-inputs.sh
 source scripts/xperience-observation-swift-inputs.sh
 mode="${1:?choose components or checkpoint}"
+subtitle_shell_mode=bridge-shell
 case "$mode" in
   components) entry=app/Tests/XperienceNativePersistenceTests.swift ;;
-  checkpoint) entry=app/Tests/XperienceNativeCheckpointTests.swift ;;
+  checkpoint) entry=app/Tests/XperienceNativeCheckpointTests.swift; subtitle_shell_mode=bridge-extension ;;
   *) printf 'Unsupported test mode\n' >&2; exit 2 ;;
 esac
 header="${VORTX_FFI_HEADER:?point at the reviewed private header}"
@@ -28,9 +29,14 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 } > "$storage_test_dir/Discovery.swift"
 shasum -a 256 scripts/native-owner-history-fixture-inputs.sh test/xperience-harness-inputs.cjs \
   app/SourcesShared/LegacyWatchOwnership.swift \
-  app/SourcesShared/VortXSyncManager.swift > "$storage_test_dir/carrier-sources.sha256"
+  app/SourcesShared/VortXSyncManager.swift app/SourcesShared/CoreBridge.swift \
+  app/SourcesShared/XperienceCollectionsStore.swift scripts/extract-xperience-native-notification-harness.mjs \
+  app/Tests/XperienceNativeNotificationFixture.swift.in > "$storage_test_dir/carrier-sources.sha256"
 node test/xperience-harness-inputs.cjs --owner-history-carriers "$storage_test_dir"
-node scripts/extract-subtitle-proof-hosts.cjs "$PWD" bridge-shell "$storage_test_dir/NativeSubtitleProofHosts.swift" > "$storage_test_dir/native-subtitle-proof-hosts.json"
+if [[ "$mode" == checkpoint ]]; then
+  node scripts/extract-xperience-native-notification-harness.mjs "$PWD" "$storage_test_dir"
+fi
+node scripts/extract-subtitle-proof-hosts.cjs "$PWD" "$subtitle_shell_mode" "$storage_test_dir/NativeSubtitleProofHosts.swift" > "$storage_test_dir/native-subtitle-proof-hosts.json"
 shasum -a 256 --check "$storage_test_dir/carrier-sources.sha256"
 inputs=(
   "${native_owner_history_fixture_swift_inputs[@]}" "$storage_test_dir/OwnerHistoryFixtureCarriers.swift"
@@ -50,6 +56,9 @@ inputs=(
   "${xperience_observation_swift_inputs[@]}"
   "$entry"
 )
+if [[ "$mode" == checkpoint ]]; then
+  inputs+=("$storage_test_dir/XperienceNativeNotificationFixture.swift" app/SourcesShared/XperienceCollectionsStore.swift)
+fi
 # The opt-in real closure overlaps old explicit sources; retain all test entries once.
 storage_owner_unique=("${inputs[0]}")
 for storage_owner_input in "${inputs[@]}"; do
@@ -66,7 +75,11 @@ shasum -a 256 app/SourcesShared/Profiles.swift app/SourcesShared/ProfileDiscover
   scripts/xperience-observation-swift-inputs.sh test/xperience-harness-inputs.cjs \
   scripts/extract-subtitle-proof-hosts.cjs app/SourcesShared/CoreBridge.swift \
   app/SourcesShared/LegacyWatchOwnership.swift \
-  app/SourcesShared/VortXSyncManager.swift "$storage_test_dir/owner-history-carriers.json" "$storage_test_dir/native-subtitle-proof-hosts.json" "$0" "$header" "$library" > "$storage_test_dir/input-sha256.txt"
+  app/SourcesShared/VortXSyncManager.swift scripts/extract-xperience-native-notification-harness.mjs \
+  app/Tests/XperienceNativeNotificationFixture.swift.in "$storage_test_dir/owner-history-carriers.json" "$storage_test_dir/native-subtitle-proof-hosts.json" "$0" "$header" "$library" > "$storage_test_dir/input-sha256.txt"
+if [[ "$mode" == checkpoint ]]; then
+  shasum -a 256 "$storage_test_dir/xperience-native-notification-inputs.json" >> "$storage_test_dir/input-sha256.txt"
+fi
 for input in "${inputs[@]}"; do
   [[ "$input" == -lz ]] || shasum -a 256 "$input" >> "$storage_test_dir/input-sha256.txt"
 done

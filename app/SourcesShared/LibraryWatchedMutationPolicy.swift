@@ -22,10 +22,14 @@ enum LibraryWatchedMutationPolicy {
         let type: String
         let name: String
         let poster: String?
+        var genres: [String]? = nil
 
         var dictionary: [String: Any] {
             var result: [String: Any] = ["id": id, "type": type, "name": name]
             if let poster { result["poster"] = poster }
+            if let genres, !genres.isEmpty {
+                result["links"] = genres.map { ["category": "Genres", "name": $0] }
+            }
             return result
         }
     }
@@ -111,11 +115,12 @@ enum LibraryWatchedMutationPolicy {
 
     /// Prefer only a ready meta for the open title. A ready response for a previous detail page
     /// must never be used to save the title currently on screen.
-    static func detailPreview(targetID: String?, ready: [MetaPreview], catalog: MetaPreview?, decoded: MetaPreview?) -> MetaPreview? {
-        if let targetID, let exact = ready.first(where: { $0.id == targetID }) { return exact }
-        if targetID == nil, let first = ready.first { return first }
-        if let targetID, catalog?.id == targetID { return catalog }
-        if let targetID, decoded?.id == targetID { return decoded }
+    static func detailPreview(targetID: String?, targetType: String? = nil, ready: [MetaPreview], catalog: MetaPreview?, decoded: MetaPreview?) -> MetaPreview? {
+        func matches(_ item: MetaPreview) -> Bool { (targetID == nil || item.id == targetID) && (targetType == nil || item.type == targetType) }
+        if let exact = ready.first(where: matches) { return exact }
+        guard targetID != nil else { return nil }
+        if let catalog, matches(catalog) { return catalog }
+        if let decoded, matches(decoded) { return decoded }
         return nil
     }
 

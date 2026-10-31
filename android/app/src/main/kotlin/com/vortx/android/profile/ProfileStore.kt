@@ -11,6 +11,11 @@ import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceType
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import org.json.JSONArray
 
 internal fun activateProfileInOrder(
@@ -27,6 +32,25 @@ internal fun activateProfileInOrder(
     reloadDependants()
     publishProfile()
     rebuildBoard()
+}
+
+internal enum class PlaylistScopeTransition { PROJECTION_REFRESH, AUTHORITY_BOUNDARY }
+
+/** Immutable, already-admitted scalar witness for playlist receipt ownership decisions. */
+internal data class PlaylistScopeEvidence(
+    val selectedID: String?, val profileID: String?, val accountSlot: String, val usesEngineHistory: Boolean,
+    val nativeAccountID: String?, val nativeAccountGeneration: Long?, val credentialEpoch: Long?,
+)
+
+internal fun playlistScopeTransition(
+    before: PlaylistScopeEvidence, after: PlaylistScopeEvidence,
+): PlaylistScopeTransition {
+    val positivelyKnown = !before.selectedID.isNullOrBlank() && !before.profileID.isNullOrBlank() &&
+        !before.accountSlot.isBlank() && !before.nativeAccountID.isNullOrBlank() && before.nativeAccountGeneration != null &&
+        !after.selectedID.isNullOrBlank() && !after.profileID.isNullOrBlank() && !after.accountSlot.isBlank() &&
+        !after.nativeAccountID.isNullOrBlank() && after.nativeAccountGeneration != null
+    return if (positivelyKnown && before == after) PlaylistScopeTransition.PROJECTION_REFRESH
+    else PlaylistScopeTransition.AUTHORITY_BOUNDARY
 }
 
 /**
@@ -56,6 +80,7 @@ internal fun activateProfileInOrder(
  * isolation becomes real the moment a switch happens.
  */
 class ProfileStore private constructor(context: Context) {
+
 
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
@@ -118,6 +143,7 @@ class ProfileStore private constructor(context: Context) {
 
     private val switchListeners = mutableListOf<() -> Unit>()
     private val homeTransitionListeners = mutableListOf<() -> Unit>()
+    private val playlistScopeListeners = mutableListOf<(PlaylistScopeTransition) -> Unit>()
     private var applyingDiscoveryProjection = false
     private val continueWatchingMigration = ContinueWatchingMigrationCheckpoint<com.vortx.android.sync.SessionOwnerSnapshot.Account>()
     private var acknowledgedNativeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account? = null
@@ -149,25 +175,190 @@ class ProfileStore private constructor(context: Context) {
     private var nativeGateway: NativeProfileGateway? = null
     private var applyingNativeAccountSettings = false
     internal fun <T> withoutNativePreferenceCapture(action: () -> T): T {
+        val previous = applyingNativeAccountSettings
         applyingNativeAccountSettings = true
-        return try { action() } finally { applyingNativeAccountSettings = false }
+        return try { action() } finally { applyingNativeAccountSettings = previous }
     }
-    internal fun attachNativeGateway(gateway: NativeProfileGateway) {
-        nativeGateway = gateway
-        refreshNativeProjection()
+    private var nativeProjectionRequest = 0L
+    private var nativeProjectionMount: Any? = null
+    private var initialNativeMigrationProfile: UserProfile? = null
+    private data class NativeProjectionBasis(
+        val ownerRevision: Long,
+        val profiles: List<UserProfile>, val activeID: String?,
+        val previous: UserProfile?,
+        val checkpoint: ContinueWatchingMigrationCheckpoint.State<com.vortx.android.sync.SessionOwnerSnapshot.Account>,
+        val account: com.vortx.android.sync.SessionOwnerSnapshot.Account?, val traktEpoch: Long?,
+        val flatSourcePresent: Boolean, val legacyEnabled: Boolean,
+    )
+    private data class NativeProjectionEffects(
+        val account: com.vortx.android.sync.SessionOwnerSnapshot.Account?, val traktEpoch: Long?,
+        val checkpoint: ContinueWatchingMigrationCheckpoint.State<com.vortx.android.sync.SessionOwnerSnapshot.Account>,
+        val clearLegacy: Boolean,
+        val providerRevision: Long,
+        val legacyAcknowledgement: NativeLegacyAcknowledgement?,
+    )
+    private data class NativeLegacyAcknowledgement(
+        val account: com.vortx.android.sync.SessionOwnerSnapshot.Account, val profileID: String,
+        val traktEpoch: Long, val discovery: ProfileDiscoveryPreferences,
+    )
+
+    /** Bootstrap remains suspended until a current projection is installed. Expensive captures and
+     * durable legacy migration run on IO; plain host fields and preference listeners stay on Main. */
+    internal suspend fun attachNativeGateway(gateway: NativeProfileGateway, mountIdentity: Any, forceSettings: Boolean = false) {
+        val request = withContext(Dispatchers.Main) {
+            ContinueWatchingOwnerGate.serialized {
+                if (nativeProjectionMount !== mountIdentity) {
+                    val initial = nativeProjectionMount == null
+                    if (initial) initialNativeMigrationProfile = active ?: initialNativeMigrationProfile
+                    clearNativeProjection(retireLegacy = !initial, retireMigration = !initial)
+                }
+                nativeGateway = gateway
+                nativeProjectionMount = mountIdentity
+                ++nativeProjectionRequest
+            }
+        }
+        var legacyAcknowledgement: NativeLegacyAcknowledgement? = null
+        var attempt = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val basis = withContext(Dispatchers.Main) {
+                ContinueWatchingOwnerGate.serialized { revision ->
+                    if (nativeProjectionRequest != request) null else NativeProjectionBasis(
+                        revision, profiles, activeID, active ?: initialNativeMigrationProfile, continueWatchingMigration.snapshot(),
+                        acknowledgedNativeAccount, acknowledgedNativeTraktEpoch,
+                        prefs.contains(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY),
+                        prefs.getBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false))
+                }
+            } ?: return
+            var effects: NativeProjectionEffects? = null
+            val prepared = withContext(Dispatchers.IO) {
+                val operation = currentCoroutineContext()
+                gateway.prepareProjection(mountIdentity) { value ->
+                    operation.ensureActive()
+                    effects = prepareNativeProjection(gateway, value, basis, legacyAcknowledgement)
+                }
+            }
+            effects?.legacyAcknowledgement?.let { legacyAcknowledgement = it }
+            var recoveryRequired = false
+            val published = withContext(Dispatchers.Main) {
+                ContinueWatchingOwnerGate.serialized { revision ->
+                    if (nativeProjectionRequest != request) return@serialized true
+                    // A host switch/edit during capture must obtain its own worker snapshot. No native
+                    // read, secure credential capture or migration write is allowed below this line.
+                    if (revision != basis.ownerRevision || profiles != basis.profiles || activeID != basis.activeID ||
+                        continueWatchingMigration.snapshot() != basis.checkpoint ||
+                        prefs.contains(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY) != basis.flatSourcePresent ||
+                        prefs.getBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false) != basis.legacyEnabled)
+                        return@serialized false
+                    var installed = false
+                    prepared.publishIfCurrent {
+                        val currentEffects = checkNotNull(effects)
+                        if (com.vortx.android.integrations.NativeProviderAccess.revision.value == currentEffects.providerRevision) {
+                            if (prepared.requiresRecovery) {
+                                // Keep the exact qualified witness/pending edit even when the native
+                                // save made its checkpoint uncertain. Do not publish a success roster.
+                                continueWatchingMigration.restore(currentEffects.checkpoint)
+                                recoveryRequired = true
+                            } else applyPreparedNativeProjection(prepared.projection, currentEffects, forceSettings)
+                            installed = true
+                        }
+                    } && installed
+                }
+            }
+            check(!recoveryRequired) { "Native profile checkpoint requires recovery" }
+            if (published) return
+            // Native updates may keep arriving. Bound full-state recaptures, retain durable data and
+            // qualified witness, and let the existing startup/sync error surface offer a fresh retry.
+            check(++attempt < 4) { "Native profile changed while loading. Retry this account." }
+            delay(50L * attempt)
+        }
+    }
+
+    internal suspend fun refreshNativeProjectionInBackground(forceSettings: Boolean = false) {
+        val (gateway, mount) = withContext(Dispatchers.Main) {
+            checkNotNull(nativeGateway) to checkNotNull(nativeProjectionMount)
+        }
+        attachNativeGateway(gateway, mount, forceSettings)
+    }
+
+    /** Worker-only transaction over a detached witness; no ProfileStore field or preference writes. */
+    private fun prepareNativeProjection(gateway: NativeProfileGateway, value: NativeProfileGateway.Projection, basis: NativeProjectionBasis,
+        previousAcknowledgement: NativeLegacyAcknowledgement?): NativeProjectionEffects {
+        val checkpoint = ContinueWatchingMigrationCheckpoint<com.vortx.android.sync.SessionOwnerSnapshot.Account>().also { it.restore(basis.checkpoint) }
+        val previous = basis.previous
+        val incoming = value.profiles.firstOrNull { it.id == value.activeID }
+        val providerRevision = com.vortx.android.integrations.NativeProviderAccess.revision.value
+        val captured = com.vortx.android.integrations.NativeProviderAccess.capture(
+            com.vortx.android.integrations.NativeProviderCredentials.GROUPS[0]) { value }
+        val guard = checkNotNull(captured?.first?.takeIf { captured.second == value }) {
+            "Native provider authority is unavailable. Retry this account."
+        }
+        val epoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+        var acknowledgement = previousAcknowledgement?.takeIf {
+            it.account == guard.owner && it.traktEpoch == epoch && it.profileID == value.activeID && incoming?.discovery == it.discovery
+        }
+        var clearLegacy = previous != null && (previous.id != value.activeID || basis.account != guard.owner)
+        if (clearLegacy) checkpoint.retire()
+        if (checkpoint.witness == null && eligibleLegacyContinueWatchingMigration(previous, incoming, value.activeID,
+                basis.flatSourcePresent, basis.legacyEnabled && !clearLegacy,
+                sameContinueWatchingMigrationAuthority(basis.account, guard.owner, basis.traktEpoch, epoch))) {
+            checkpoint.capture(value.activeID, guard.owner, checkNotNull(epoch))
+        }
+        checkpoint.attempt(incoming, value.activeID, guard.owner, epoch,
+            save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(guard) {
+                if (gateway.read() == value) gateway.save(edited, adding = false) else null
+            } },
+            authorityIsCurrent = { com.vortx.android.integrations.NativeProviderAccess.current(guard) &&
+                com.vortx.android.integrations.TraktAuth.currentSessionEpoch == epoch },
+            readbackIsCurrent = { saved -> gateway.read() == saved },
+        )?.let { saved ->
+            acknowledgement = NativeLegacyAcknowledgement(guard.owner, saved.activeID, checkNotNull(epoch),
+                checkNotNull(saved.profiles.first { it.id == saved.activeID }.discovery))
+        }
+        clearLegacy = clearLegacy || acknowledgement != null
+        return NativeProjectionEffects(guard.owner, epoch, checkpoint.snapshot(), clearLegacy, providerRevision, acknowledgement)
+    }
+
+    /** Only the admitted immutable payload is consumed here. Switch listeners must schedule captures. */
+    private fun applyPreparedNativeProjection(value: NativeProfileGateway.Projection, effects: NativeProjectionEffects, forceSettings: Boolean) {
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(value.profiles, value.activeID), effects.account, effects.traktEpoch),
+        )
+        continueWatchingMigration.restore(effects.checkpoint)
+        withoutNativePreferenceCapture {
+            if (effects.clearLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+            if (forceSettings || profiles != value.profiles || activeID != value.activeID ||
+                transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) {
+                ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+                    profiles = value.profiles; activeID = value.activeID
+                    active?.let { activateProfileState(it, resetUnset = true, playlistTransition = transition) }
+                        ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
+                }
+            }
+        }
+        acknowledgedNativeAccount = effects.account; acknowledgedNativeTraktEpoch = effects.traktEpoch
+        initialNativeMigrationProfile = null
     }
     internal fun refreshNativeProjection(forceSettings: Boolean = false) = ContinueWatchingOwnerGate.serialized {
         checkNotNull(nativeGateway).withCurrentProjection { current ->
             applyNativeProjectionLocked(current, forceSettings)
         }
     }
-    internal fun clearNativeProjection() = ContinueWatchingOwnerGate.serialized {
+    internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) = ContinueWatchingOwnerGate.serialized {
+        nativeProjectionRequest++
+        nativeProjectionMount = null
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
-            continueWatchingMigration.retire()
-            acknowledgedNativeAccount = null; acknowledgedNativeTraktEpoch = null
-            prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+            if (retireMigration) {
+                continueWatchingMigration.retire()
+                acknowledgedNativeAccount = null; acknowledgedNativeTraktEpoch = null
+                initialNativeMigrationProfile = null
+            }
+            if (retireLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
-            notifyHomeTransitionListeners(); publishActiveProfile(); notifySwitchListeners()
+            notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
+            publishActiveProfile(); notifySwitchListeners()
         }
     }
     private fun applyNativeProjection(value: NativeProfileGateway.Projection, forceSettings: Boolean = false) = ContinueWatchingOwnerGate.serialized {
@@ -175,6 +366,9 @@ class ProfileStore private constructor(context: Context) {
     }
     private fun applyNativeProjectionLocked(value: NativeProfileGateway.Projection, forceSettings: Boolean) {
         var acknowledged = value
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val previous = active
         val incoming = value.profiles.firstOrNull { it.id == value.activeID }
         val capturedProvider = com.vortx.android.integrations.NativeProviderAccess.capture(
@@ -206,13 +400,19 @@ class ProfileStore private constructor(context: Context) {
             acknowledged = saved
             prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
         }
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(acknowledged.profiles, acknowledged.activeID), providerGuard?.owner, traktEpoch),
+        )
         if (!forceSettings && profiles == acknowledged.profiles && activeID == acknowledged.activeID) {
+            if (transition == PlaylistScopeTransition.AUTHORITY_BOUNDARY) notifyPlaylistScopeListeners(transition)
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
             return
         }
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             profiles = acknowledged.profiles; activeID = acknowledged.activeID
-            active?.let { activateProfileState(it, resetUnset = true) }
+            active?.let { activateProfileState(it, resetUnset = true, playlistTransition = transition) }
+                ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
             acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
         }
     }
@@ -350,6 +550,23 @@ class ProfileStore private constructor(context: Context) {
         if (!homeTransitionListeners.contains(listener)) homeTransitionListeners.add(listener)
     }
 
+    /** Playlist-specific lifecycle: projection refresh preserves receipt authority; owner changes retire it. */
+    internal fun addPlaylistScopeTransitionListener(listener: (PlaylistScopeTransition) -> Unit) {
+        if (!playlistScopeListeners.contains(listener)) playlistScopeListeners.add(listener)
+    }
+
+    private fun notifyPlaylistScopeListeners(transition: PlaylistScopeTransition) =
+        playlistScopeListeners.forEach { it(transition) }
+
+    private fun playlistScopeEvidence(
+        binding: ActiveProfileBinding,
+        account: com.vortx.android.sync.SessionOwnerSnapshot.Account?,
+        credentialEpoch: Long?,
+    ): PlaylistScopeEvidence {
+        return PlaylistScopeEvidence(binding.selectedID, binding.profileID, binding.accountSlot, binding.usesEngineHistory,
+            account?.id, account?.generation, credentialEpoch)
+    }
+
     internal var selectionRevision = 0L
         private set
 
@@ -363,9 +580,12 @@ class ProfileStore private constructor(context: Context) {
      * Apply every active-profile mutation in privacy-safe order: first invalidate old Home permits,
      * then install the new preferences and watch overlay, then reload dependants and rebuild once.
      */
-    private fun activateProfileState(profile: UserProfile, resetUnset: Boolean = false) {
+    private fun activateProfileState(
+        profile: UserProfile, resetUnset: Boolean = false,
+        playlistTransition: PlaylistScopeTransition = PlaylistScopeTransition.AUTHORITY_BOUNDARY,
+    ) {
         activateProfileInOrder(
-            transitionHome = ::notifyHomeTransitionListeners,
+            transitionHome = { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(playlistTransition) },
             applyPlayback = {
                 applyPlayback(profile, resetUnset = resetUnset, rebuildBoard = false)
                 applyingDiscoveryProjection = true
@@ -435,11 +655,16 @@ class ProfileStore private constructor(context: Context) {
     }
 
     private fun updateLocked(profile: UserProfile, idx: Int, reactivateOverlay: Boolean) {
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         profiles = profiles.toMutableList().also { it[idx] = profile }
         persist()
         if (profile.id == activeID) {
             if (reactivateOverlay) {
-                activateProfileState(profile)
+                val transition = playlistScopeTransition(
+                    playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+                    playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+                )
+                activateProfileState(profile, playlistTransition = transition)
             } else {
                 applyPlayback(profile)
                 publishActiveProfile()
@@ -845,14 +1070,22 @@ class ProfileStore private constructor(context: Context) {
 
     /** Remove any live profile whose id is tombstoned (never the owner). Apple `pruneTombstonedProfiles`. */
     private fun pruneTombstonedProfiles() = ContinueWatchingOwnerGate.serialized {
-        val before = profiles
+        val beforeProfiles = profiles
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val pruned = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
-        if (pruned == before) return@serialized
+        if (pruned == beforeProfiles) return@serialized
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             profiles = pruned
             if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
             persist(touch = false)
-            active?.let(::activateProfileState)
+            val transition = playlistScopeTransition(
+                playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+                playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+            )
+            active?.let { activateProfileState(it, playlistTransition = transition) }
+                ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
         }
     }
 
@@ -864,8 +1097,11 @@ class ProfileStore private constructor(context: Context) {
     /** Adopt a remote roster wholesale (newest side wins). Mirrors Apple `adoptRemoteRoster`. */
     fun adoptRemoteRoster(remote: List<UserProfile>) {
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+            val beforeAccount = acknowledgedNativeAccount
+            val beforeTraktEpoch = acknowledgedNativeTraktEpoch
             profiles = remote
-            afterRosterFold()
+            afterRosterFold(beforeBinding, beforeAccount, beforeTraktEpoch)
         }
     }
 
@@ -889,6 +1125,9 @@ class ProfileStore private constructor(context: Context) {
         incomingModified: Double? = null,
     ) = ContinueWatchingOwnerGate.serialized {
         if (incoming.isEmpty()) return@serialized
+        val beforeBinding = captureActiveProfileBinding(profiles, activeID)
+        val beforeAccount = acknowledgedNativeAccount
+        val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val transition = rosterPullMergeTransition(
             local = profiles,
             incoming = incoming,
@@ -901,7 +1140,7 @@ class ProfileStore private constructor(context: Context) {
             replaceProfiles = { merged ->
                 ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
                     profiles = merged
-                    afterRosterFold()
+                    afterRosterFold(beforeBinding, beforeAccount, beforeTraktEpoch)
                 }
             },
             // The carrier watermark is state too. Persist it even when the roster payload is identical.
@@ -917,11 +1156,20 @@ class ProfileStore private constructor(context: Context) {
     /** Shared tail for a wholesale/union fold: heal the owner, keep the active selection if it survived
      *  (else fall to the first), re-apply the active profile's prefs + fire the reload hooks, persist
      *  without pushing, and re-point the watch overlay. */
-    private fun afterRosterFold() {
+    private fun afterRosterFold(
+        beforeBinding: ActiveProfileBinding,
+        beforeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account?,
+        beforeTraktEpoch: Long?,
+    ) {
         normalizeOwner()
         if (profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
         persist(touch = false)
-        active?.let(::activateProfileState)
+        val transition = playlistScopeTransition(
+            playlistScopeEvidence(beforeBinding, beforeAccount, beforeTraktEpoch),
+            playlistScopeEvidence(captureActiveProfileBinding(profiles, activeID), acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
+        )
+        active?.let { activateProfileState(it, playlistTransition = transition) }
+            ?: run { notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(transition) }
     }
 
     // ---- Owner normalization + duplicate collapse (the hard-won guards) ----

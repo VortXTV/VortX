@@ -324,12 +324,19 @@ enum XperienceCollections {
             case 45, 48...57:
                 let start = cursor
                 while cursor < bytes.count, ![9, 10, 13, 32, 44, 93, 125].contains(bytes[cursor]) { cursor += 1 }
+                try validateNumberToken(start: start, end: cursor)
                 let token = Data(bytes[start..<cursor])
                 let before = String(decoding: token, as: UTF8.self)
                 let normalizedBefore = try normalizedNumber(before)
                 let value: VortxJSON
-                do { value = try JSONDecoder().decode(VortxJSON.self, from: token) }
-                catch { throw Failure.invalidJSON }
+                if let integer = fixedWidthInteger(normalizedBefore) {
+                    // Xperience owns exact bounded integral admission, including decimal/exponent
+                    // spellings, before SDK-specific integer/Decimal/NSNumber conversion paths.
+                    value = integer
+                } else {
+                    do { value = try JSONDecoder().decode(VortxJSON.self, from: token) }
+                    catch { throw Failure.invalidJSON }
+                }
                 switch value {
                 case .integer, .unsigned: break
                 case .number(let number): guard number.isFinite else { throw Failure.unpreservableNumber }
@@ -363,6 +370,51 @@ enum XperienceCollections {
             }
             throw Failure.invalidJSON
         }
+        /// Complete linear JSON number grammar must precede direct integer admission. Numeric
+        /// normalization alone is not syntax validation (for example, 01 or 1. must never pass).
+        private func validateNumberToken(start: Int, end: Int) throws {
+            var at = start
+            if at < end, bytes[at] == 45 { at += 1 }
+            guard at < end else { throw Failure.invalidJSON }
+            if bytes[at] == 48 {
+                at += 1
+                if at < end, (48...57).contains(bytes[at]) { throw Failure.invalidJSON }
+            } else {
+                guard (49...57).contains(bytes[at]) else { throw Failure.invalidJSON }
+                at += 1
+                while at < end, (48...57).contains(bytes[at]) { at += 1 }
+            }
+            if at < end, bytes[at] == 46 {
+                at += 1
+                guard at < end, (48...57).contains(bytes[at]) else { throw Failure.invalidJSON }
+                while at < end, (48...57).contains(bytes[at]) { at += 1 }
+            }
+            if at < end, (bytes[at] == 69 || bytes[at] == 101) {
+                at += 1
+                if at < end, (bytes[at] == 43 || bytes[at] == 45) { at += 1 }
+                guard at < end, (48...57).contains(bytes[at]) else { throw Failure.invalidJSON }
+                while at < end, (48...57).contains(bytes[at]) { at += 1 }
+            }
+            guard at == end else { throw Failure.invalidJSON }
+        }
+
+        /// Only a complete normalized integer with at most20 result digits reaches fixed-width
+        /// parsing. No arbitrary raw lexeme becomes a BigInt/Decimal or an unbounded zero string.
+        private func fixedWidthInteger(_ normalized: String) -> VortxJSON? {
+            if normalized == "0" { return .integer(0) }
+            guard let exponentAt = normalized.lastIndex(of: "e"),
+                  let power = Int(normalized[normalized.index(after: exponentAt)...]),
+                  power >= 0, power <= 20 else { return nil }
+            let coefficient = normalized[..<exponentAt]
+            let negative = coefficient.first == "-"
+            let digitCount = coefficient.utf8.count - (negative ? 1 : 0)
+            guard digitCount <= 20 - power else { return nil }
+            let decimal = String(coefficient) + String(repeating: "0", count: power)
+            if let signed = Int64(decimal) { return .integer(signed) }
+            if !negative, let unsigned = UInt64(decimal) { return .unsigned(unsigned) }
+            return nil
+        }
+
         private func normalizedNumber(_ input: String) throws -> String {
             var text = input.lowercased()
             let negative = text.hasPrefix("-")

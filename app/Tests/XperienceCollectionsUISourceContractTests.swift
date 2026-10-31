@@ -26,13 +26,13 @@ require(view.contains("SecureField(\"Paste JSON export content\"") && view.conta
         "paste JSON input is hidden and cleared")
 require(model.contains("XperienceImportPrivacy.validate(edit)") && model.contains("self.installPreview(document, existingMappings: [:])"),
         "whole raw export passes privacy admission before preview")
-let commit = model.components(separatedBy: "func commitStaged() {").last?.components(separatedBy: "func collection(namespace").first ?? ""
+let commit = model.components(separatedBy: "func commitStaged(_ original: XperienceSaveConfirmation) {").last?.components(separatedBy: "func collection(namespace").first ?? ""
 require(!commit.isEmpty && !commit.contains("store.capture()") && commit.contains("lease: commit.lease"),
         "save retains the original lease and never recaptures a successor")
 require(view.contains("confirmationDialog(\"Replace this saved import?\"") && model.contains("let replacement: XperienceSavedNamespace?"),
         "namespace replacement requires confirmation of staged inputs")
 require(model.contains("namespace.bindings[XperienceAddonBinding.key(for: source)]") &&
-        model.contains("installed: installed, mapping: mapping"), "browsing requires a saved exact installed-instance mapping")
+        model.contains("installed.resolve(source, mapping: mapping)"), "browsing requires a saved exact installed-instance mapping")
 require(view.contains("XperienceCatalogClient.load(source: request.source, candidate: request.candidate") &&
         view.contains("model.accepts(request.generation)"), "guarded catalog results are fenced before publication")
 for forbidden in ["URLSession", "installAddon(", "canonicalTransport", "transportDigest", "safeHost", "AsyncImage", "PosterImageLoader", "seedBackdrop:", "seedLogo:", "autoPlayOnAppear:"] {
@@ -90,8 +90,17 @@ require(view.contains(".accessibilityAddTraits(model.destination == \"append\" ?
         view.contains(".accessibilityAddTraits(row.selection == nil ? .isSelected : [])"),
         "destination and installed-instance choices expose their selected state")
 require(view.contains("Use this installed instance for \\(row.title)") &&
-        model.contains("Installed instance \\(index + 1)"),
+        model.contains("Installed instance \\(installed.displayOrdinal(at: index))"),
         "binding hints identify the safe source label while preserving ordinal instance labels")
+require(model.contains("installed.candidates.enumerated()") &&
+        model.contains("installed.resolve(entry.source, mapping: candidate.mapping)") &&
+        model.contains("installed.mappingMatches(mappings[entry.key], candidate: candidate)") &&
+        model.contains("installed.hasRejectedDescriptor(for: entry.source)"),
+        "every offered installed instance uses rejected-descriptor-aware admission and exact identity selection")
+require(model.contains("Choose a listed valid instance or repair your add-ons.") &&
+        view.contains("loadTask?.cancel(); loadTask = nil") &&
+        view.contains("loadRequestID == requestID"),
+        "unavailable projection has an actionable bounded message and retains original request cancellation fences")
 let routes = view.components(separatedBy: "@ViewBuilder private func destination").last?.components(separatedBy: "private func card").first ?? ""
 require(routes.components(separatedBy: ".macBackAffordance()").count == 5 &&
         view.contains("Return and reload.\")\n                    #if os(macOS)\n                    .macBackAffordance()"),
@@ -118,6 +127,25 @@ require(model.contains("chooserAdmission.permitsPublication(originalTicket.admis
         "the original chooser ticket remains active through file publication")
 require(!view.contains("model.previewFile(url)") && !view.contains("model.cancelInput()"),
         "negative control rejects ticketless result and cancellation calls")
+// Original gesture wiring; runtime schedules are covered separately by lifecycle proposals.
+require(model.contains("@Published private(set) var label") && model.contains("@Published private(set) var destination") &&
+        !view.contains("$model.label") && view.contains("model.setLabel($0, original: original)") &&
+        view.contains("model.setDestination(namespace.field, original: original)"),
+        "preview text and destination callbacks retain the original presentation")
+require(view.contains("previewCard(document, original: identity)") && view.contains("model.stageSave(original)") &&
+        view.contains("model.chooseInstance(row: row.id, choice: choice.id, original: original)") &&
+        model.contains("previewIdentity == original && accepts(original.generation)"),
+        "Save and same-ID binding actions cannot adopt a successor preview")
+let review = model.components(separatedBy: "func reviewSaved(_ field: String, original:").last?.components(separatedBy: "private func installPreview").first ?? ""
+require(review.contains("savedIdentity == original, accepts(original.generation)") && !review.contains("beginImport()") &&
+        !review.contains("store.capture()") && view.contains("model.reviewSaved(namespace.field, original: original)"),
+        "saved-row review checks its rendered list and preserves the original lease")
+require(commit.contains("commit.confirmation == original") &&
+        model.contains("guard pending?.confirmation == original else { return }") &&
+        view.contains("model.commitStaged(original)") && view.contains("model.cancelStaged(original)") &&
+        view.contains("confirmReplacement == original") && view.contains("} message: { _ in") &&
+        view.contains("guard model.previewIdentity == original else { return }"),
+        "confirmation actions and dismissal cannot target or clear successor presentation")
 let defaultsModel = source("app/SourcesShared/CurationDefaultsModel.swift")
 let defaultsShelf = source("app/SourcesShared/CurationDefaultsHomeShelf.swift")
 let appearance = source("app/SourcesShared/CurationAppearanceEditor.swift")

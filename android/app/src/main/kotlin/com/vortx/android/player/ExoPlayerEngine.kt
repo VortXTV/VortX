@@ -8,6 +8,8 @@ import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.view.SurfaceView
+import android.widget.FrameLayout
+import android.os.SystemClock
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -27,6 +29,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DecoderCounters
@@ -41,10 +44,32 @@ import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
+import androidx.media3.ui.SubtitleView
 import com.vortx.android.model.Playable
 import com.vortx.android.communityjs.CommunityJsMedia3DataSourceFactory
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.player.tuning.AdaptiveTuning
+import com.vortx.android.player.subtitles.Media3EmbeddedReferenceCapture
+import com.vortx.android.player.subtitles.Media3ReferenceExtractorsFactory
+import com.vortx.android.player.subtitles.Media3ReferenceDataSourceFactory
+import com.vortx.android.player.subtitles.Media3OwnedSubtitlePresentation
+import com.vortx.android.player.subtitles.SubtitleCuePresentation
+import com.vortx.android.player.subtitles.SubtitleReferencePresentation
+import com.vortx.android.player.subtitles.SubtitleReferenceQuery
+import com.vortx.android.player.subtitles.SubtitleAlignmentWork
+import com.vortx.android.player.subtitles.SubtitleAlignmentFile
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
+import java.io.InputStream
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -100,7 +125,45 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private class PendingSidecar(val formatId: String, val original: PlayerSubtitleSelection)
     private var pendingSidecar: PendingSidecar? = null
     private var subtitleReleased = false
-    private var originalPlaybackOwner: PlaybackOwnerToken? = null
+    @Volatile private var originalPlaybackOwner: PlaybackOwnerToken? = null
+
+    private var embeddedReference: Media3EmbeddedReferenceCapture? = null
+    private var embeddedReferenceLoad: Any? = null
+    private val alignmentScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var alignmentJob: Job? = null
+    private class OwnedSubtitle(
+        val original: PlayerSubtitleSelection,
+        val capture: Media3EmbeddedReferenceCapture,
+        val sourceLoad: Any,
+        val rawPresentation: SubtitleCuePresentation,
+        val requiresReferenceTimeline: Boolean = true,
+        val permitsUse: () -> Boolean = { true },
+    ) {
+        var presentation: SubtitleCuePresentation = rawPresentation
+        var reference: Media3EmbeddedReferenceCapture.Snapshot? = null
+        var referenceTrack: EmbeddedTrack? = null
+    }
+    private var ownedSubtitle: OwnedSubtitle? = null
+    private val ownedSubtitleClock = SubtitleReferencePresentation.Clock()
+    private var ownedSubtitleView: SubtitleView? = null
+    private val ownedSubtitleTicker = object : Runnable {
+        override fun run() {
+            val owned = ownedSubtitle ?: return
+            if (!ownsSubtitle(owned)) { retireOwnedSubtitle(); return }
+            val reference = owned.reference
+            val track = owned.referenceTrack
+            if (reference != null && (!owned.capture.isCurrent(reference) || track == null ||
+                    !exactReferenceStillPresent(track) || !zeroOriginPrimaryPeriod(owned.sourceLoad))) {
+                owned.presentation = owned.rawPresentation
+                owned.reference = null
+                owned.referenceTrack = null
+                ownedSubtitleClock.reset()
+            }
+            val update = ownedSubtitleClock.sample(owned.presentation, player.currentPosition.coerceAtLeast(0L))
+            if (update.changed) ownedSubtitleView?.setCues(update.cues)
+            mainHandler.postDelayed(this, 50L)
+        }
+    }
 
     override fun bindPlaybackOwner(original: PlaybackOwnerToken): Boolean {
         if (subtitleReleased || originalPlaybackOwner != null || Looper.myLooper() !== player.applicationLooper) return false
@@ -132,6 +195,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // Surface an unrecoverable decode/network error so the chrome can fall back to the ranked source
         // list instead of leaving a dead black frame (error-to-sources fallback).
         override fun onPlayerError(error: PlaybackException) {
+            retireOwnedSubtitle()
+            embeddedReference?.retire(); embeddedReference = null; embeddedReferenceLoad = null
             metadataInputs.fail()
             _state.value = _state.value.withPlaybackError().copy(startupEvidence = PlaybackStartupEvidence.UNAVAILABLE)
         }
@@ -341,7 +406,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun load(playable: Playable, playWhenReady: Boolean, remountPositionMs: Long? = null) {
         if (subtitleReleased || originalPlaybackOwner?.isActive != true) return
         val priorPresentation = _state.value.startupEvidence
+        retireOwnedSubtitle()
+        embeddedReference?.retire()
         val metadataLoad = metadataInputs.begin()
+        val reference = Media3EmbeddedReferenceCapture(metadataLoad, requireNotNull(originalPlaybackOwner).nativeLiveness)
+        embeddedReferenceLoad = metadataLoad
+        embeddedReference = reference
+        // A request scoped to a provider-selected byte range is not a complete reference resource.
+        // Playback keeps the exact existing headers; only the optional timing witness is refused.
+        if (playable.headers.keys.any { it.trim().equals("Range", ignoreCase = true) }) reference.fail()
         val presentation = if (remountPositionMs != null && priorPresentation != PlaybackStartupEvidence.AWAITING &&
             priorPresentation != PlaybackStartupEvidence.UNAVAILABLE) PlaybackStartupEvidence.SAME_MEDIA_REMOUNT
             else PlaybackStartupEvidence.AWAITING
@@ -393,8 +466,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 .setUri(playable.url)
                 .setTag(metadataLoad)
                 .build()
-            val videoSource = DefaultMediaSourceFactory(appContext)
-                .setDataSourceFactory(media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), playable.userAgent, playable.communityJsTransport))
+            val videoSource = DefaultMediaSourceFactory(appContext, Media3ReferenceExtractorsFactory(reference))
+                .setDataSourceFactory(Media3ReferenceDataSourceFactory(
+                    media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), playable.userAgent, playable.communityJsTransport), reference))
                 .createMediaSource(videoItem)
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
@@ -415,8 +489,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
         val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
         val videoDataSource = media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), trailerUa, playable.communityJsTransport)
-        val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
-            .setDataSourceFactory(videoDataSource)
+        val mediaSourceFactory = DefaultMediaSourceFactory(appContext, Media3ReferenceExtractorsFactory(reference))
+            .setDataSourceFactory(Media3ReferenceDataSourceFactory(videoDataSource, reference))
 
         val item = MediaItem.Builder()
             .setUri(playable.url)
@@ -544,6 +618,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     override fun beginSubtitleSelection(): PlayerSubtitleSelection? {
         if (subtitleReleased || originalPlaybackOwner?.isActive != true || Looper.myLooper() !== player.applicationLooper) return null
+        retireOwnedSubtitle()
         pendingSidecar = null
         return subtitleSelections.beginChoice()
     }
@@ -552,16 +627,214 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun isSubtitleSelectionCurrent(request: PlayerSubtitleSelection): Boolean =
         !subtitleReleased && originalPlaybackOwner?.isActive == true && Looper.myLooper() === player.applicationLooper && subtitleSelections.isCurrent(request)
 
+    // This reads only the published original owner and synchronized authority. No Player/Looper call
+    // is permitted from the guarded download/parser worker; this is not final mount admission.
+    override fun isSubtitlePreparationCurrent(request: PlayerSubtitleSelection): Boolean =
+        originalPlaybackOwner?.isActive == true && subtitleSelections.isCurrent(request)
+
     override fun selectSubtitleTrack(id: Int?, request: PlayerSubtitleSelection): Boolean {
         if (!isSubtitleSelectionCurrent(request)) return false
+        retireOwnedSubtitle()
         applySubtitleTrack(id)
         return true
+    }
+
+    override suspend fun selectExternalSubtitleAutomatically(
+        url: String,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult {
+        if (!isSubtitleSelectionCurrent(request)) return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        // Only the concrete SRT parser has proved authored-occurrence semantics. Other formats keep
+        // the normal Media3 sidecar path and do not claim a corrected presentation.
+        if (externalSubtitleMimeDecision(url).mimeType != MimeTypes.APPLICATION_SUBRIP) return ordinarySubtitle(url, request)
+        val capture = embeddedReference ?: return ordinarySubtitle(url, request)
+        val sourceLoad = embeddedReferenceLoad ?: return ordinarySubtitle(url, request)
+        val base = lastPlayable ?: return ordinarySubtitle(url, request)
+        val declared = normalizedExternalSubtitles(base)
+        val exact = declared.withIndex().filter { it.value.url == url }
+        if (exact.size > 1) return ordinarySubtitle(url, request)
+        val headers = exact.singleOrNull()?.let { media3RequestHeaderPlan(base, declared).subtitleHeaders(it.index) }.orEmpty()
+        val factory = media3DataSourceFactory(url, headers, communityJsTransport = base.communityJsTransport)
+        val originalOwner = originalPlaybackOwner ?: return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val prepared = runInterruptible(Dispatchers.IO) {
+            if (!originalOwner.isActive || !subtitleSelections.isCurrent(request)) return@runInterruptible null
+            val dataSource = factory.createDataSource()
+            try {
+                val started = SystemClock.elapsedRealtime()
+                val expectedBytes = dataSource.open(DataSpec.Builder().setUri(Uri.parse(url)).build())
+                if (expectedBytes > SubtitleAlignmentFile.MAX_BYTES) return@runInterruptible null
+                val input = object : InputStream() {
+                    override fun read(): Int {
+                        val one = ByteArray(1)
+                        val count = read(one, 0, 1)
+                        return if (count < 0) -1 else one[0].toInt() and 255
+                    }
+                    override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+                        if (!originalOwner.isActive || !subtitleSelections.isCurrent(request) ||
+                            Thread.currentThread().isInterrupted || SystemClock.elapsedRealtime() - started >= 20_000L)
+                            throw java.io.InterruptedIOException("Subtitle acquisition retired or expired")
+                        return dataSource.read(bytes, offset, length)
+                    }
+                }
+                val bytes = SubtitleAlignmentFile.readBounded(input) ?: return@runInterruptible null
+                if (expectedBytes >= 0L && expectedBytes != bytes.size.toLong()) return@runInterruptible null
+                val raw = Media3OwnedSubtitlePresentation.prepareSrt(bytes) ?: return@runInterruptible null
+                bytes to raw
+            } catch (_: java.io.IOException) { null }
+            catch (_: RuntimeException) { null }
+            finally { try { dataSource.close() } catch (_: java.io.IOException) { } }
+        }
+        currentCoroutineContext().ensureActive()
+        if (!isSubtitleSelectionCurrent(request) || embeddedReference !== capture || embeddedReferenceLoad !== sourceLoad)
+            return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        if (prepared == null || !zeroOriginPrimaryPeriod(sourceLoad)) return ordinarySubtitle(url, request)
+        retireOwnedSubtitle()
+        val owned = OwnedSubtitle(request, capture, sourceLoad, prepared.second)
+        ownedSubtitle = owned
+        ownedSubtitleClock.reset()
+        playerView?.subtitleView?.visibility = View.INVISIBLE
+        ownedSubtitleView?.visibility = View.VISIBLE
+        applySubtitleStyle()
+        mainHandler.removeCallbacks(ownedSubtitleTicker)
+        ownedSubtitleTicker.run()
+        // No video remount: the same extractor, primary period and actual HTTP/source load continue.
+        // Unavailable/partial evidence leaves the requested raw SRT visible and never hides it.
+        alignmentJob = alignmentScope.launch {
+            while (ownsSubtitle(owned) && !capture.isComplete && !capture.isUnavailable) delay(250L)
+            if (!ownsSubtitle(owned) || capture.isUnavailable) return@launch
+            val reference = exactEmbeddedReference(capture, sourceLoad, language) ?: return@launch
+            val file = SubtitleAlignmentWork.align(prepared.first, reference.first.occurrences.map {
+                SubtitleReferenceQuery.Timing(it.startUs / 1000L, it.endUs / 1000L)
+            }) ?: return@launch
+            val corrected = withContext(Dispatchers.Default) { SubtitleReferencePresentation.prepare(file) } ?: return@launch
+            if (!ownsSubtitle(owned) || !capture.isCurrent(reference.first) || !exactReferenceStillPresent(reference.second) ||
+                !zeroOriginPrimaryPeriod(sourceLoad)) return@launch
+            owned.reference = reference.first
+            owned.referenceTrack = reference.second
+            owned.presentation = corrected
+            ownedSubtitleClock.reset()
+            mainHandler.removeCallbacks(ownedSubtitleTicker)
+            ownedSubtitleTicker.run()
+        }
+        return PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
+    }
+
+    override suspend fun selectAddonSubtitle(
+        source: PlayerAddonSubtitleSource,
+        language: String,
+        request: PlayerSubtitleSelection,
+    ): PlayerExternalSubtitleSelectionResult {
+        if (!isSubtitleSelectionCurrent(request) || !source.isCurrent())
+            return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val snapshot = source.snapshotIfCurrent() ?: return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        val capture = embeddedReference ?: return PlayerExternalSubtitleSelectionResult.FAILED
+        val sourceLoad = embeddedReferenceLoad ?: return PlayerExternalSubtitleSelectionResult.FAILED
+        // The presentation is already bounded and parsed. There is no Media3 URL datasource, video
+        // remount, installed-origin permission expansion, or second file request at this boundary.
+        if (!isSubtitleSelectionCurrent(request) || !snapshot.isCurrent())
+            return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        retireOwnedSubtitle()
+        pendingSidecar = null
+        val owned = OwnedSubtitle(request, capture, sourceLoad, snapshot.presentation,
+            requiresReferenceTimeline = false, permitsUse = { snapshot.isCurrent() })
+        ownedSubtitle = owned
+        ownedSubtitleClock.reset()
+        playerView?.subtitleView?.visibility = View.INVISIBLE
+        ownedSubtitleView?.visibility = View.VISIBLE
+        applySubtitleStyle()
+        mainHandler.removeCallbacks(ownedSubtitleTicker)
+        ownedSubtitleTicker.run()
+        if (!ownsSubtitle(owned)) return PlayerExternalSubtitleSelectionResult.SUPERSEDED
+        // Only original authored SRT occurrences qualify for timing estimation. VTT/ASS and an
+        // unavailable embedded reference keep their ordinary local presentation on the same load.
+        val alignmentBytes = snapshot.alignmentSrtBytes()
+        if (alignmentBytes != null && zeroOriginPrimaryPeriod(sourceLoad)) {
+            alignmentJob = alignmentScope.launch {
+                while (ownsSubtitle(owned) && !capture.isComplete && !capture.isUnavailable) delay(250L)
+                if (!ownsSubtitle(owned) || capture.isUnavailable) return@launch
+                val reference = exactEmbeddedReference(capture, sourceLoad, language) ?: return@launch
+                val file = SubtitleAlignmentWork.align(alignmentBytes, reference.first.occurrences.map {
+                    SubtitleReferenceQuery.Timing(it.startUs / 1000L, it.endUs / 1000L)
+                }) ?: return@launch
+                val corrected = withContext(Dispatchers.Default) { SubtitleReferencePresentation.prepare(file) } ?: return@launch
+                if (!ownsSubtitle(owned) || !capture.isCurrent(reference.first) ||
+                    !exactReferenceStillPresent(reference.second) || !zeroOriginPrimaryPeriod(sourceLoad)) return@launch
+                owned.reference = reference.first
+                owned.referenceTrack = reference.second
+                owned.presentation = corrected
+                ownedSubtitleClock.reset()
+                mainHandler.removeCallbacks(ownedSubtitleTicker)
+                ownedSubtitleTicker.run()
+            }
+        }
+        return PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
+    }
+
+    private fun ordinarySubtitle(url: String, request: PlayerSubtitleSelection): PlayerExternalSubtitleSelectionResult =
+        if (addExternalSubtitle(url, request)) PlayerExternalSubtitleSelectionResult.SELECTED_WITHOUT_ALIGNMENT
+        else if (isSubtitleSelectionCurrent(request)) PlayerExternalSubtitleSelectionResult.FAILED
+        else PlayerExternalSubtitleSelectionResult.SUPERSEDED
+
+    private fun ownsSubtitle(owned: OwnedSubtitle): Boolean = ownedSubtitle === owned &&
+        isSubtitleSelectionCurrent(owned.original) && owned.permitsUse() && embeddedReference === owned.capture &&
+        embeddedReferenceLoad === owned.sourceLoad &&
+        (if (owned.requiresReferenceTimeline) zeroOriginPrimaryPeriod(owned.sourceLoad)
+         else player.currentMediaItem?.localConfiguration?.tag === owned.sourceLoad)
+
+    private fun retireOwnedSubtitle() {
+        alignmentJob?.cancel(); alignmentJob = null
+        ownedSubtitle = null
+        ownedSubtitleClock.reset()
+        mainHandler.removeCallbacks(ownedSubtitleTicker)
+        ownedSubtitleView?.setCues(emptyList())
+        ownedSubtitleView?.visibility = View.GONE
+        playerView?.subtitleView?.visibility = View.VISIBLE
+    }
+
+    private class EmbeddedTrack(val group: androidx.media3.common.TrackGroup, val index: Int, val formatId: String, val language: String?)
+
+    /** Both the real primary timeline origin and current track-group identity authenticate sample time. */
+    private fun zeroOriginPrimaryPeriod(load: Any): Boolean {
+        if (subtitleReleased || player.isPlayingAd) return false
+        val timeline = player.currentTimeline
+        if (timeline.periodCount != 1 || timeline.windowCount != 1 || player.currentPeriodIndex != 0) return false
+        val period = timeline.getPeriod(0, Timeline.Period(), true)
+        val window = timeline.getWindow(0, Timeline.Window())
+        return period.windowIndex == 0 && period.positionInWindowUs == 0L && window.positionInFirstPeriodUs == 0L &&
+            !window.isDynamic && !window.isLive && window.mediaItem.localConfiguration?.tag === load
+    }
+
+    private fun exactEmbeddedReference(capture: Media3EmbeddedReferenceCapture, load: Any, language: String):
+        Pair<Media3EmbeddedReferenceCapture.Snapshot, EmbeddedTrack>? {
+        if (!zeroOriginPrimaryPeriod(load)) return null
+        val tracks = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
+            .flatMap { group -> (0 until group.length).mapNotNull { index ->
+                val format = group.getTrackFormat(index)
+                val id = format.id?.takeIf { it.isNotEmpty() && !it.startsWith("vortx-sidecar:") } ?: return@mapNotNull null
+                EmbeddedTrack(group.mediaTrackGroup, index, id, format.language)
+            } }
+        if (tracks.size > 4096) return null
+        val ordered = tracks.sortedBy { if (TrackSelector.matches(it.language, language)) 0 else 1 }
+        for (track in ordered) {
+            if (tracks.count { it.formatId == track.formatId } != 1) continue
+            val snapshot = capture.snapshot(load, track.formatId) ?: continue
+            if (capture.isCurrent(snapshot) && exactReferenceStillPresent(track)) return snapshot to track
+        }
+        return null
+    }
+
+    private fun exactReferenceStillPresent(original: EmbeddedTrack): Boolean {
+        val matches = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT && it.mediaTrackGroup === original.group }
+        val group = matches.singleOrNull() ?: return false
+        return original.index in 0 until group.length && group.getTrackFormat(original.index).id == original.formatId
     }
 
     override fun addExternalSubtitle(url: String, request: PlayerSubtitleSelection): Boolean {
         // Player commands and listeners share the application looper. Do not publish a pending
         // selection from another thread or adopt anything after retirement.
         if (!isSubtitleSelectionCurrent(request)) return false
+        retireOwnedSubtitle()
         pendingSidecar = null
         val base = lastPlayable ?: return false
         if (externalSubtitleMimeDecision(url).mimeType == null) return false
@@ -651,11 +924,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // makes our style win over the file's own cue styling, matching mpv where VortX's sub-* options
     // override. No-op until the surface exists (re-applied from the AndroidView factory on creation).
     override fun applySubtitleStyle() {
-        val view = playerView?.subtitleView ?: return
+        val views = listOfNotNull(playerView?.subtitleView, ownedSubtitleView)
         val style = SubtitleStyle.current(appContext)
         val edgeType =
             if (style.isModern) CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW else CaptionStyleCompat.EDGE_TYPE_OUTLINE
-        view.setApplyEmbeddedStyles(false)
+        for (view in views) {
+        view.setApplyEmbeddedStyles(view === ownedSubtitleView)
         view.setStyle(
             CaptionStyleCompat(
                 style.foregroundColorArgb,
@@ -667,6 +941,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             ),
         )
         view.setFractionalTextSize(style.exoTextSizeFraction)
+        }
     }
 
     // Live playback stats from the current formats (ExoPlayer's equivalent of mpv's property reads): only
@@ -735,6 +1010,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun onEnterForeground() { /* resume is the chrome's choice; keep paused-on-return conservative */ }
 
     override fun release() {
+        retireOwnedSubtitle()
+        embeddedReference?.retire(); embeddedReference = null; embeddedReferenceLoad = null
+        alignmentScope.cancel()
         subtitleReleased = true
         subtitleSelections.retire()
         pendingSidecar = null
@@ -752,7 +1030,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         AndroidView(
             modifier = modifier,
             factory = { ctx ->
-                PlayerView(ctx).apply {
+                FrameLayout(ctx).apply {
+                val nativeView = PlayerView(ctx).apply {
                     // PlayerView defaults to SURFACE_TYPE_SURFACE_VIEW when built in code (no TextureView
                     // attr): SurfaceView is required for HDR/DV passthrough and avoids TextureView's extra
                     // GPU copy. We hide the built-in controller because VortX draws its own chrome.
@@ -772,14 +1051,34 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     // Apply the persisted subtitle appearance now the SubtitleView exists.
                     this@ExoPlayerEngine.applySubtitleStyle()
                 }
+                addView(nativeView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                val captions = SubtitleView(ctx).apply { visibility = View.GONE }
+                ownedSubtitleView = captions
+                addView(captions, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                this@ExoPlayerEngine.applySubtitleStyle()
+                val owned = ownedSubtitle
+                if (owned != null && ownsSubtitle(owned)) {
+                    nativeView.subtitleView?.visibility = View.INVISIBLE
+                    captions.visibility = View.VISIBLE
+                    ownedSubtitleClock.reset()
+                    mainHandler.removeCallbacks(ownedSubtitleTicker)
+                    ownedSubtitleTicker.run()
+                }
+                }
             },
-            update = { view ->
-                view.applyEmberScrubber(emberArgb)
-                view.resizeMode = scaleMode.toResizeMode()
+            update = { _ ->
+                playerView?.applyEmberScrubber(emberArgb)
+                playerView?.resizeMode = scaleMode.toResizeMode()
             },
-            onRelease = { view ->
-                view.player = null
-                if (playerView === view) playerView = null
+            onRelease = { host ->
+                val native = (0 until host.childCount).map { host.getChildAt(it) }.filterIsInstance<PlayerView>().singleOrNull()
+                native?.player = null
+                if (playerView === native) playerView = null
+                val captions = (0 until host.childCount).map { host.getChildAt(it) }.filterIsInstance<SubtitleView>().singleOrNull()
+                if (ownedSubtitleView === captions) {
+                    ownedSubtitleView = null
+                    mainHandler.removeCallbacks(ownedSubtitleTicker)
+                }
             },
         )
     }

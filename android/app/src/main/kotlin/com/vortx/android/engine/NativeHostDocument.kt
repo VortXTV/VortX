@@ -94,7 +94,7 @@ internal object NativeHostDocument {
                 // every other field still pass through recursive credential inspection.
                 val websiteAddonID = key == "eventId" && child is String && Regex("[0-9a-f]{32}").matches(child) &&
                     websiteAddonIdentity(value)
-                result.put(key, if (streamingUID || websiteAddonID || (profileName || watchlistName) && cannotBeEncodedText(child as String)) child
+                result.put(key, if (streamingUID || websiteAddonID || (profileName || watchlistName) && cannotBeEncodedText(child)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
                 else if (key == "nativeOwnAccountCandidates")

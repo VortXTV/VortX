@@ -412,6 +412,93 @@ quoted \"words\" & second line
         }
     }
 
+    private struct ContractCue {
+        let start: UInt64
+        let end: UInt64
+        let text: String
+    }
+
+    /// Fixture writer only: independent expected fields below use the authored +2750 ms shift.
+    /// The production adapter still crosses the genuine current C ABI with no resolver substitute.
+    private static func fixtureSRT(_ cues: [ContractCue]) -> Data {
+        func timestamp(_ value: UInt64) -> String {
+            String(format: "%02llu:%02llu:%02llu,%03llu", value / 3_600_000,
+                   value / 60_000 % 60, value / 1_000 % 60, value % 1_000)
+        }
+        return Data(cues.enumerated().map { index, cue in
+            "\(index + 1)\n\(timestamp(cue.start)) --> \(timestamp(cue.end))\n\(cue.text)\n\n"
+        }.joined().utf8)
+    }
+
+    private static func requireEqualStartWholeCueContractDefaultC() throws {
+        let starts: [UInt64] = [
+            10_000, 14_730, 22_190, 30_870, 33_510, 45_640, 61_930, 65_070,
+            79_810, 84_260, 103_540, 112_990, 118_170, 134_380, 141_020, 158_690,
+            167_430, 181_750, 200_810, 207_470, 225_990, 232_180, 251_630, 266_470
+        ]
+        var complete = starts.enumerated().map { index, start in
+            ContractCue(start: start, end: start + 1_200, text: "authored \(index)")
+        }
+        complete[0] = ContractCue(start: 10_000, end: 200_000, text: "whole 190-second cue")
+        complete.insert(ContractCue(start: 10_000, end: 12_000, text: "tie, shorter end"), at: 1)
+        complete.insert(ContractCue(start: 10_000, end: 12_000, text: "same timing, separate text"), at: 2)
+        let tiedReference = complete.map {
+            SubtitleReferenceNativeQuery.Timing(startMs: $0.start + 2_750, endMs: $0.end + 2_750)
+        }
+        // These two cues lie outside the scoring window but must remain in complete output.
+        complete.append(ContractCue(start: 3_600_000, end: 7_200_000, text: "outside-window whole hour"))
+        complete.append(ContractCue(start: 3_600_000, end: 3_800_000, text: "outside-window tied shorter end"))
+        guard let result = SubtitleReferenceNativeQuery.align(
+            externalSRT: fixtureSRT(complete), reference: tiedReference, originalJob: job
+        ) else { throw Failure.check("equal-start whole-cue default-C alignment returned nil") }
+        try require(result.offsetMs == 2_750 && result.driftPpm == 0 && result.confidence == 1_000,
+                    "equal-start complete evidence changed authored correction")
+        try require(result.cues.count == complete.count, "equal-start complete output lost occurrences")
+        for (index, original) in complete.enumerated() {
+            let cue = result.cues[index]
+            try require(cue.startMs == original.start + 2_750 && cue.endMs == original.end + 2_750
+                        && cue.text == original.text, "equal-start output changed cue/order/duration at \(index)")
+        }
+        let expected = complete.map { ContractCue(start: $0.start + 2_750, end: $0.end + 2_750, text: $0.text) }
+        try require(result.srt == fixtureSRT(expected), "equal-start full serialized output mismatch")
+        let presentation = try SubtitleReferencePresentation.prepare(result)
+        var active: [Int] = []
+        presentation.lookup(mediaSeconds: 13, manualDelaySeconds: 0).presentation?.forEachCue { active.append($0.index) }
+        try require(active == [0, 1, 2], "genuine equal-start output failed complete presentation")
+
+        // Extra coincident external cues must remain in coverage. One reference occurrence can
+        // match at most one external cue; 24/26 raw selected entries is 923, not 1000.
+        guard let asymmetric = SubtitleReferenceNativeQuery.align(
+            externalSRT: fixtureSRT(complete), reference: reference, originalJob: job
+        ) else { throw Failure.check("asymmetric equal-start evidence returned nil") }
+        try require(asymmetric.offsetMs == 2_750 && asymmetric.driftPpm == 0
+                    && asymmetric.confidence == 923 && asymmetric.cues.count == complete.count,
+                    "coincident cues inflated confidence or disappeared from complete output")
+
+        var backwardReference = tiedReference
+        backwardReference.swapAt(3, 4)
+        try require(SubtitleReferenceNativeQuery.align(externalSRT: fixtureSRT(complete),
+                    reference: backwardReference, originalJob: job) == nil,
+                    "backward reference starts were accepted")
+        var backwardExternal = complete
+        backwardExternal.swapAt(3, 4)
+        try require(SubtitleReferenceNativeQuery.align(externalSRT: fixtureSRT(backwardExternal),
+                    reference: tiedReference, originalJob: job) == nil,
+                    "backward external starts were silently repaired")
+
+        // Raw eight-cue evidence across a long enough span still has only two distinct onsets.
+        let repeated = (0..<8).map { index in
+            let start: UInt64 = index < 4 ? 10_000 : 100_000
+            return ContractCue(start: start, end: start + 1_000, text: "repeated \(index)")
+        }
+        let repeatedReference = repeated.map {
+            SubtitleReferenceNativeQuery.Timing(startMs: $0.start + 2_750, endMs: $0.end + 2_750)
+        }
+        try require(SubtitleReferenceNativeQuery.align(externalSRT: fixtureSRT(repeated),
+                    reference: repeatedReference, originalJob: job) == nil,
+                    "repeated onsets manufactured independent temporal evidence")
+    }
+
     static func main() async {
         do {
             // One real detached utility task owns every check; each check also verifies that it
@@ -420,6 +507,7 @@ quoted \"words\" & second line
                 try Self.requireLocalRefusals()
                 try Self.requirePositiveDefaultC()
                 try Self.requireCompleteOutsideWindowOutput()
+                try Self.requireEqualStartWholeCueContractDefaultC()
                 try Self.requireUnknownKindRefusalOnDefaultC()
                 try SubtitleReferencePresentationTests.run()
             }

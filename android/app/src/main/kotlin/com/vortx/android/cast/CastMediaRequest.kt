@@ -5,6 +5,7 @@ import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
 import com.google.android.gms.cast.MediaTrack
 import com.vortx.android.model.Playable
+import org.json.JSONObject
 
 /// Assembles the Cast SDK `MediaLoadRequestData` that tells a receiver what to play: the stream URL, its
 /// content type, the title metadata, any sidecar subtitle tracks, and the start position. This is the
@@ -15,10 +16,11 @@ object CastMediaRequest {
 
     /// Base id for generated subtitle tracks. Cast `MediaTrack` ids must be unique longs; the index is
     /// added so a title's N sidecar subtitles get ids BASE, BASE+1, ...
+    internal const val LOAD_ID_KEY = "vortxLoad"
     private const val SUBTITLE_TRACK_BASE_ID = 1L
 
     /// Build the receiver load request for [playable], resuming at [startPositionMs] (clamped to >= 0).
-    fun build(playable: Playable, startPositionMs: Long): MediaLoadRequestData {
+    fun build(playable: Playable, startPositionMs: Long, loadId: String): MediaLoadRequestData {
         val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
             putString(MediaMetadata.KEY_TITLE, playable.title)
         }
@@ -34,8 +36,9 @@ object CastMediaRequest {
 
         val mediaInfo = MediaInfo.Builder(playable.url)
             .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
-            .setContentType(CastEligibility.contentType(playable.url))
+            .setContentType(CastEligibility.receiverContentType(playable))
             .setMetadata(metadata)
+            .setCustomData(JSONObject().put(LOAD_ID_KEY, loadId))
             .apply { if (subtitleTracks.isNotEmpty()) setMediaTracks(subtitleTracks) }
             .build()
 

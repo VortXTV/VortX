@@ -72,6 +72,9 @@ private enum SubtitleEmbeddedExtractor {
         func cancel() { preconditionFailure("Alignment extraction is outside this fixture") }
     }
 }
+private final class MPVRemoteReferenceCancellation: Sendable {
+    func cancel() { preconditionFailure("Remote reading is outside this nil-collaborator manual fixture") }
+}
 private enum CredentialPublicationOutbox {
     struct SubtitleRendererRegistration: Sendable {}
     static func unregisterSubtitleRenderer(_ registration: SubtitleRendererRegistration) {
@@ -128,9 +131,17 @@ private struct PendingSubtitle: Sendable {
 // @source:apply
 // @source:arguments
 // @source:delay
+// @source:enqueueManualSubtitleProperty
+// @source:mountLocalExternalSubtitle
 
     init() { replaceLoad() }
     private func setString(_ name: String, _ value: String) { port.set(name, value) }
+    // The maintained source now queues scalar writes and the extracted source calls this
+    // handle overload. Keep the fake recorder synchronous and queue-owned; it must not bypass
+    // the actual source's load/context guard or invent a new selection generation.
+    private nonisolated func setString(_ name: String, _ value: String, handle: OpaquePointer) {
+        NativeRegistry.port(handle).set(name, value)
+    }
     private nonisolated func checkError(_ status: Int32) { _ = status }
     var snapshot: NativePort.Snapshot { port.snapshot }
     func replaceLoad() {
@@ -150,6 +161,9 @@ private struct PendingSubtitle: Sendable {
     func retireContext() { nativeContext?.retire() }
     func clearContext() { native.update { $0.context = nil } }
     func rejectCommands() { port.rejectCommands() }
+    func settleQueue() async {
+        await withCheckedContinuation { continuation in queue.async { continuation.resume() } }
+    }
     var requestGeneration: UInt64 { native.read { $0.externalSubtitleRequestGeneration } }
 #if VORTX_CURRENT_ALIGNMENT
     var alignmentGeneration: UInt64 {
@@ -194,6 +208,7 @@ private struct PendingSubtitle: Sendable {
         controller.setSubtitleTrack(id)
         gate.open()
         let accepted = await completion.value
+        await controller.settleQueue()
         check(!accepted, name + ": queued external is retired by the actual manual setter")
         check(controller.snapshot.commands.isEmpty, name + ": stale result never issues sub-add")
         check(controller.snapshot.properties[MPVProperty.sid] == (id < 0 ? "no" : String(id)), name + ": manual property remains final")
@@ -210,6 +225,7 @@ private struct PendingSubtitle: Sendable {
             let request = controller.requestGeneration
             check(requested != original, "external intent retires the original alignment")
             controller.setSubDelay(1.25)
+            await controller.settleQueue()
             let delayed = controller.alignmentGeneration
             check(delayed != requested, "manual delay retires prepared alignment")
             check(controller.requestGeneration == request, "manual delay preserves pending download authority")
@@ -254,6 +270,7 @@ private struct PendingSubtitle: Sendable {
             controller.setSubtitleTrack(8)
             controller.setSubtitleTrack(3)
             let accepted = await controller.complete(pending)
+            await controller.settleQueue()
             check(!accepted, "A-to-B-to-A manual selection retires the original generation")
             check(controller.snapshot.commands.isEmpty && controller.snapshot.properties[MPVProperty.sid] == "3", "ABA cannot be mistaken for an unchanged selection")
         }
@@ -281,6 +298,7 @@ private struct PendingSubtitle: Sendable {
             check(await controller.complete(pending), "same-load request without intervening selection succeeds")
             check(controller.snapshot.commands == [["sub-add", pending.file.path, "select", "normal", "eng"]], "actual makeCArgs and strdup/free path preserve selection/title/language")
             controller.setSubtitleTrack(11)
+            await controller.settleQueue()
             check(controller.snapshot.properties[MPVProperty.sid] == "11", "manual choice after an earlier admitted external remains final")
             let fresh = controller.capturePending("after-manual")
             check(await controller.complete(fresh), "a genuinely newer external request can supersede the manual choice")
@@ -315,12 +333,15 @@ private struct PendingSubtitle: Sendable {
             let controller = MPVMetalViewController()
             controller.setSecondarySubtitleTrack(7)
             controller.setSubtitleTrack(7)
+            await controller.settleQueue()
             check(controller.secondarySubtitleID == -1, "primary matching secondary clears the overlapping slot")
             check(controller.snapshot.writes == ["secondary-sid=7", "secondary-sub-pos=0", "secondary-sid=no", "sid=7"], "secondary clear occurs before the retained primary property write")
             controller.setSecondarySubtitleTrack(9)
             controller.setSubtitleTrack(4)
+            await controller.settleQueue()
             check(controller.secondarySubtitleID == 9 && controller.snapshot.properties[MPVProperty.secondarySid] == "9", "nonoverlapping secondary selection is retained")
             controller.setSubtitleTrack(-1)
+            await controller.settleQueue()
             check(controller.snapshot.properties[MPVProperty.sid] == "no", "Off still writes the literal no property")
         }
         do {

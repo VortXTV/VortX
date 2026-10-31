@@ -1,0 +1,85 @@
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -38,6 +38,7 @@
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
++#include "libavutil/thread.h"
+ #include "libavutil/parseutils.h"
+ 
+ #include "avformat.h"
+@@ -91,6 +92,7 @@
+     /* Optional response metadata only. Never changes HTTP playback admission. */
+     char *response_etag;
+     char *response_location; // same completed response, never the mutable routing option
++    int64_t response_generation; // completed header observation, never body/request authority
+     char response_etag_pending[RESPONSE_ETAG_LIMIT + 1];
+     int response_etag_seen;
+     int response_etag_invalid;
+@@ -188,6 +190,7 @@
+     { "http_version", "export the http response version", OFFSET(http_version), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { "response_etag", "export a bounded strong ETag from a complete GET response", OFFSET(response_etag), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { "response_location", "export the complete resource location paired with response_etag", OFFSET(response_location), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { "response_generation", "export the non-reused completed response-header observation token", OFFSET(response_generation), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { "cookies", "set cookies to be sent in applicable future requests, use newline delimited Set-Cookie HTTP field value syntax", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
+     { "icy", "request ICY metadata", OFFSET(icy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+     { "icy_metadata_headers", "return ICY metadata headers", OFFSET(icy_metadata_headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_EXPORT },
+@@ -218,6 +221,32 @@
+     { NULL }
+ };
+ 
++/* A token is unique across HTTP contexts in this producer instance. Use the
++ * existing thread abstraction, not a 64-bit atomic that can add libatomic on
++ * Android32. A build with no real mutex backend has no optional observation.
++ * The lock protects only this scalar counter, never allocation or source I/O.
++ */
++#if HAVE_PTHREADS || HAVE_W32THREADS || HAVE_OS2THREADS
++static AVMutex response_generation_lock = AV_MUTEX_INITIALIZER;
++static int64_t last_response_generation;
++#endif
++
++static int64_t http_response_generation_new(void)
++{
++#if HAVE_PTHREADS || HAVE_W32THREADS || HAVE_OS2THREADS
++    int64_t result = 0;
++    if (ff_mutex_lock(&response_generation_lock))
++        return 0;
++    if (last_response_generation < INT64_MAX)
++        result = ++last_response_generation;
++    if (ff_mutex_unlock(&response_generation_lock))
++        return 0;
++    return result;
++#else
++    return 0;
++#endif
++}
++
+ /* These helpers expose metadata, not a generic resource-identity guarantee.
+  * NULL means unavailable, including malformed, weak, duplicate or oversized
+  * validators. Allocation failure disables only this optional observation. */
+@@ -225,6 +254,7 @@
+ {
+     av_freep(&s->response_etag);
+     av_freep(&s->response_location);
++    s->response_generation = 0;
+     s->response_etag_pending[0] = 0;
+     s->response_etag_seen = 0;
+     s->response_etag_invalid = 0;
+@@ -329,12 +359,15 @@
+         http_response_location_valid(s->location)) {
+         char *etag = av_strdup(s->response_etag_pending);
+         char *location = av_strdup(s->location);
+-        if (etag && location) {
++        int64_t generation = etag && location ? http_response_generation_new() : 0;
++        if (generation) {
+             // Read consecutive getters only on the actual HTTP I/O owner, with
+-            // no intervening I/O. No partial pair is published on allocation failure.
++            // no intervening I/O. A different response/context never reuses a token.
+             s->response_etag = etag;
+             s->response_location = location;
++            s->response_generation = generation;
+         } else {
++            // Exhaustion or unavailable synchronization drops metadata only.
+             av_free(etag);
+             av_free(location);
+         }

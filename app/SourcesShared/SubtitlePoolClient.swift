@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Client for VortX's community-subtitle pool at `subtitles.vortx.tv`.
 ///
@@ -43,6 +44,82 @@ enum SubtitlePoolClient {
         let sessionGeneration: UInt64
         let consentGeneration: UInt64
         let moat: String
+    }
+
+    /// One original player/load lifetime. Retirement linearizes against actual prepared-task admission.
+    fileprivate final class ContributionLifetime: Sendable {
+        private let active = OSAllocatedUnfairLock(initialState: true)
+        var isCurrent: Bool { active.withLock { $0 } }
+        func retire() { active.withLock { $0 = false } }
+        fileprivate func resume(_ task: URLSessionTask, configRevision: UInt64,
+            lifecycle: SourceIndexLifecycleSnapshot, credential: CredentialScopeRegistry.Capture,
+            applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+            active.withLock { current in
+                guard current else { return .stale }
+                return RemoteConfig.resumeSubtitleContributionTask(task, revision: configRevision,
+                    lifecycle: lifecycle, credential: credential, applicationEpoch: applicationEpoch)
+            }
+        }
+    }
+
+    /// Minted by the actual engine for one token/mount; copies share irrevocable retirement.
+    /// A fresh mount may reuse an AV logical token, but can never revive this prior scope.
+    struct ContributionLoad: Sendable {
+        let token: PlayerLoadToken
+        fileprivate let lifetime = ContributionLifetime()
+        init(token: PlayerLoadToken) { self.token = token }
+        var isCurrent: Bool { lifetime.isCurrent }
+        func retire() { lifetime.retire() }
+    }
+
+    /// Original, revocable optional-contribution permission. Contains no bearer or private subtitle URL.
+    struct ContributionPermit: Sendable {
+        let contentKey: String
+        let maximumTextBytes: Int
+        fileprivate let baseURL: URL
+        private let configRevision: UInt64
+        private let credential: CredentialScopeRegistry.Capture
+        private let applicationEpoch: UUID
+        private let lifecycle: SourceIndexLifecycleSnapshot
+        private let load: ContributionLoad
+
+        @MainActor fileprivate init?(contentKey: String, load: ContributionLoad) {
+            guard SubtitlePoolClient.isValidContentKey(contentKey),
+                  let config = RemoteConfig.subtitleContributionConfiguration(),
+                  MoatConsent.contributeAndConsume,
+                  let epoch = LegacyWatchOwnership.captureApplicationEpoch() else { return nil }
+            self.contentKey = contentKey
+            self.credential = CredentialScopeRegistry.shared.capture()
+            self.applicationEpoch = epoch
+            self.lifecycle = SourceIndexLifecycleClock.snapshot()
+            self.load = load
+            self.maximumTextBytes = config.maximumTextBytes
+            self.baseURL = config.baseURL
+            self.configRevision = config.revision
+            guard maximumTextBytes > 0, isCurrent else { return nil }
+        }
+
+        var isCurrent: Bool {
+            let current = SourceIndexLifecycleClock.snapshot()
+            return load.isCurrent && RemoteConfig.subtitleContributionIsCurrent(configRevision) &&
+                MoatConsent.contributeAndConsume &&
+                current.sourceGeneration == lifecycle.sourceGeneration &&
+                current.sessionGeneration == lifecycle.sessionGeneration &&
+                current.consentGeneration == lifecycle.consentGeneration &&
+                CredentialScopeRegistry.shared.isCurrent(credential) &&
+                LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)
+        }
+
+        fileprivate func resume(_ task: URLSessionTask) -> LegacyWatchOwnership.TaskAdmission {
+            guard isCurrent else { return .stale }
+            return load.lifetime.resume(task, configRevision: configRevision,
+                lifecycle: lifecycle, credential: credential, applicationEpoch: applicationEpoch)
+        }
+    }
+
+    /// Capture on the real owner's actor BEFORE extraction/byte preparation, never after an await.
+    @MainActor static func contributionPermit(contentKey: String, load: ContributionLoad) -> ContributionPermit? {
+        ContributionPermit(contentKey: contentKey, load: load)
     }
 
     // MARK: - Public model
@@ -269,6 +346,32 @@ enum SubtitlePoolClient {
         )
     }
 
+    /// Automatic selection consumes this authorized body directly. It neither exposes a shared file
+    /// to a deferred reader nor asks an engine to fetch the gated URL without its moat authorization.
+    static func downloadData(_ pooled: PooledSubtitle, isSignedIn: Bool = false) async -> Data? {
+        await downloadDataUsing(pooled, isSignedIn: isSignedIn,
+            moatProvider: { signedIn in await MoatToken.shared.current(isSignedIn: signedIn) },
+            transport: { request in await liveTransport(request, maxBytes: subtitleBodyMaxBytes) })
+    }
+
+    static func downloadDataUsing(_ pooled: PooledSubtitle, isSignedIn: Bool,
+        moatProvider: @escaping MoatProvider, transport: @escaping Transport
+    ) async -> Data? {
+        guard isValidDownloadURL(pooled.url, contentKey: pooled.contentKey, format: pooled.format),
+              featureCommunitySubtitles, MoatConsent.contributeAndConsume,
+              let authorization = await readAuthorization(isSignedIn: isSignedIn,
+                moatProvider: moatProvider) else { return nil }
+        var request = URLRequest(url: pooled.url,
+            timeoutInterval: RemoteConfig.snapshot.subtitleDownloadTimeout)
+        request.httpMethod = "GET"
+        VortXEdgeAuth.sign(&request)
+        request.setValue(authorization.moat, forHTTPHeaderField: MoatToken.header)
+        guard let data = await performData(request, authorization: authorization,
+            target: .download(contentKey: pooled.contentKey, format: pooled.format),
+            transport: transport), !data.isEmpty else { return nil }
+        return data
+    }
+
     static func downloadUsing(
         _ pooled: PooledSubtitle,
         isSignedIn: Bool,
@@ -331,7 +434,8 @@ enum SubtitlePoolClient {
                        fingerprint: String?,
                        origin: String,
                        format: String,
-                       text: String) async {
+                       text: String,
+                       permit: ContributionPermit) async {
         await uploadUsing(
             contentKey: contentKey,
             lang: lang,
@@ -339,8 +443,9 @@ enum SubtitlePoolClient {
             origin: origin,
             format: format,
             text: text,
+            permit: permit,
             transport: { request in
-                await discardLiveTransport(request)
+                await discardLiveTransport(request, permit: permit)
                 return nil
             }
         )
@@ -353,11 +458,15 @@ enum SubtitlePoolClient {
         origin: String,
         format: String,
         text: String,
+        permit: ContributionPermit? = nil,
         transport: @escaping Transport
     ) async {
-        guard featureCommunitySubtitles, featureSubtitleUpload,
-              MoatConsent.contributeAndConsume else { return }
-        let maxBytes = min(RemoteConfig.snapshot.subtitleUploadMaxBytes, subtitleBodyMaxBytes)
+        guard !Task.isCancelled, let permit, permit.contentKey == contentKey, permit.isCurrent,
+              (1...32).contains(lang.utf8.count),
+              lang.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }),
+              (fingerprint?.utf8.count ?? 0) <= 128,
+              ["embedded", "addon"].contains(origin), subtitleFormats.contains(format) else { return }
+        let maxBytes = min(permit.maximumTextBytes, RemoteConfig.snapshot.subtitleUploadMaxBytes)
         let bytes = text.utf8.count
         guard bytes > 0, bytes <= maxBytes else { return }   // skip empty or oversized text
 
@@ -370,8 +479,8 @@ enum SubtitlePoolClient {
         ]
         if let fingerprint, !fingerprint.isEmpty { body["fingerprint"] = fingerprint }
 
-        VXProbe.log("sing", "sub upload key=\(VXProbeRedaction.identityToken(contentKey)) lang=\(lang) origin=\(origin) fmt=\(format) bytes=\(bytes)")
-        await postJSON(path: "subs", body: body, transport: transport)
+        VXProbe.log("sing", "sub upload origin=\(origin) fmt=\(format) bytes=\(bytes)")
+        await postJSON(path: "subs", body: body, permit: permit, transport: transport)
     }
 
     // MARK: - Post a learned offset: POST /offset (signed)
@@ -550,16 +659,17 @@ enum SubtitlePoolClient {
     private static func postJSON(
         path: String,
         body: [String: Any],
+        permit: ContributionPermit? = nil,
         transport: @escaping Transport
     ) async {
-        guard JSONSerialization.isValidJSONObject(body),
+        guard !Task.isCancelled, permit?.isCurrent != false, JSONSerialization.isValidJSONObject(body),
               let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var req = URLRequest(url: baseURL.appendingPathComponent(path), timeoutInterval: 8)
+        var req = URLRequest(url: (permit?.baseURL ?? baseURL).appendingPathComponent(path), timeoutInterval: 8)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.httpBody = data
         VortXEdgeAuth.sign(&req)
-        guard MoatConsent.contributeAndConsume else { return }
+        guard !Task.isCancelled, MoatConsent.contributeAndConsume, permit?.isCurrent != false else { return }
         _ = await transport(req)
     }
 
@@ -609,6 +719,7 @@ enum SubtitlePoolClient {
     /// exactly once. The lock covers cancellation racing response, data, and completion callbacks.
     private final class BoundedLiveRequest: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         private let policy: LiveBodyPolicy
+        private let contributionPermit: ContributionPermit?
         private let lock = NSLock()
         private var continuation: CheckedContinuation<LiveTransportOutcome, Never>?
         private var session: URLSession?
@@ -618,8 +729,9 @@ enum SubtitlePoolClient {
         private var cancellationRequested = false
         private var completed = false
 
-        init(policy: LiveBodyPolicy) {
+        init(policy: LiveBodyPolicy, contributionPermit: ContributionPermit? = nil) {
             self.policy = policy
+            self.contributionPermit = contributionPermit
             if case let .collect(maxBytes) = policy {
                 self.accumulator = BoundedBodyAccumulator(maxBytes: maxBytes)
             }
@@ -672,8 +784,15 @@ enum SubtitlePoolClient {
             self.continuation = continuation
             self.session = session
             self.task = task
-            task.resume()
+            let admitted: Bool
+            if let contributionPermit {
+                if case .admitted = contributionPermit.resume(task) { admitted = true } else { admitted = false }
+            } else {
+                task.resume()
+                admitted = true
+            }
             lock.unlock()
+            if !admitted { finish(response: nil, cancelTask: true, discardBody: true) }
         }
 
         func cancel() {
@@ -738,6 +857,11 @@ enum SubtitlePoolClient {
             didReceive response: URLResponse,
             completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
         ) {
+            guard contributionPermit?.isCurrent != false else {
+                completionHandler(.cancel)
+                finish(response: nil, cancelTask: true, discardBody: true)
+                return
+            }
             guard let http = response as? HTTPURLResponse else {
                 completionHandler(.cancel)
                 finish(response: nil, cancelTask: true, discardBody: true)
@@ -771,6 +895,10 @@ enum SubtitlePoolClient {
             dataTask: URLSessionDataTask,
             didReceive data: Data
         ) {
+            guard contributionPermit?.isCurrent != false else {
+                finish(response: nil, cancelTask: true, discardBody: true)
+                return
+            }
             lock.lock()
             guard !completed else {
                 lock.unlock()
@@ -794,6 +922,10 @@ enum SubtitlePoolClient {
             task: URLSessionTask,
             didCompleteWithError error: Error?
         ) {
+            guard contributionPermit?.isCurrent != false else {
+                finish(response: nil, cancelTask: true, discardBody: true)
+                return
+            }
             lock.lock()
             guard !completed else {
                 lock.unlock()
@@ -842,8 +974,13 @@ enum SubtitlePoolClient {
         await BoundedLiveRequest(policy: .discard).run(req)
     }
 
-    private static func discardLiveTransport(_ req: URLRequest) async {
-        _ = await liveDiscardTransportOutcome(req)
+    static func liveContributionTransportOutcome(_ req: URLRequest, permit: ContributionPermit) async -> LiveTransportOutcome {
+        await BoundedLiveRequest(policy: .discard, contributionPermit: permit).run(req)
+    }
+
+    private static func discardLiveTransport(_ req: URLRequest, permit: ContributionPermit? = nil) async {
+        if let permit { _ = await liveContributionTransportOutcome(req, permit: permit) }
+        else { _ = await liveDiscardTransportOutcome(req) }
     }
 
     // MARK: - Session-scoped download cache (deterministic temp files, like the player's subtitle fix)

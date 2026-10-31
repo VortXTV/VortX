@@ -109,6 +109,7 @@ import com.vortx.android.player.queue.PlaybackQueueState
 import com.vortx.android.player.queue.PlaybackQueueToken
 import com.vortx.android.player.queue.PlaybackQueueRouteRetirement
 import com.vortx.android.ui.components.PlaybackQueueSheet
+import com.vortx.android.ui.screens.SavedPlaylistScreen
 import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
 import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
@@ -152,6 +153,7 @@ import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LiveScreen
 import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
+import com.vortx.android.ui.screens.XperienceCollectionsEntry
 import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
@@ -386,6 +388,8 @@ fun VortXApp(
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
         var showPlaybackQueue by remember { mutableStateOf(false) }
+        var savedPlaylistOwner by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var savedPlaylistStore by remember { mutableStateOf<com.vortx.android.playlists.SavedPlaylistStore?>(null) }
         val openDetail: (MetaItem?) -> Unit = open@{ item ->
             if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
             if (item?.continueWatchingUnavailableMessage != null) {
@@ -400,6 +404,7 @@ fun VortXApp(
             pendingQueueAccepted = false
             pendingQueueAutomatic = false
             showPlaybackQueue = false
+            savedPlaylistOwner = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
             liveDetailAdmission = item?.continueWatchingAdmission
@@ -485,6 +490,9 @@ fun VortXApp(
         val debridServicesFocusRequester = remember { FocusRequester() }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
+        // An explicit entry is a new original route. Only this non-authoritative ID survives process death.
+        var importedCollectionsEntry by rememberSaveable { mutableStateOf<String?>(null) }
+        val openImportedCollections = { importedCollectionsEntry = java.util.UUID.randomUUID().toString() }
         var showBackup by remember { mutableStateOf(false) }
         var showDiagnostics by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
@@ -563,6 +571,7 @@ fun VortXApp(
             restoreDebridServicesFocus = false
             showLiveTv = false
             showLibraryTransfer = false
+            importedCollectionsEntry = null
             showBackup = false
             showDiagnostics = false
             showProfiles = false
@@ -670,6 +679,19 @@ fun VortXApp(
             PlaybackQueueSheet(
                 state = visibleQueue,
                 onDismiss = { showPlaybackQueue = false },
+                onManageSavedPlaylists = queueOwner?.let { owner ->
+                    {
+                        if (queueOwner == owner) {
+                            val app = appContext as? com.vortx.android.VortXApplication
+                            val controller = app?.savedPlaylistStore
+                            if (controller != null) {
+                                savedPlaylistStore = controller
+                                savedPlaylistOwner = owner
+                                showPlaybackQueue = false
+                            }
+                        }
+                    }
+                },
                 onPlay = { entry -> queueOwner?.let { owner ->
                     if (queueOwnerIsSelected(owner)) playbackQueue?.capture(owner, entry.id)?.let { openQueuePlay(it, false) }
                 } },
@@ -677,6 +699,9 @@ fun VortXApp(
                 onRemove = { id -> queueOwner?.let { if (queueOwnerIsSelected(it)) playbackQueue?.remove(it, id) } },
                 onRetry = { queueOwner?.let { if (queueOwnerIsSelected(it)) playbackQueue?.retryLoad(it) } },
             )
+        }
+        LaunchedEffect(savedPlaylistOwner, queueOwner) {
+            if (savedPlaylistOwner != null && savedPlaylistOwner != queueOwner) savedPlaylistOwner = null
         }
         val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
@@ -785,6 +810,38 @@ fun VortXApp(
         // Player is the topmost layer: when a source resolves to a Playable, it covers everything and
         // back returns to the detail page underneath.
         val playable = playing
+        importedCollectionsEntry?.let { originalEntry -> key(originalEntry) {
+            XperienceCollectionsEntry(
+                entryId = originalEntry,
+                factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext),
+                visible = detail == null && playable == null,
+                tv = false,
+                dialog = true,
+                onBack = { if (importedCollectionsEntry == originalEntry) importedCollectionsEntry = null },
+                onReload = { if (importedCollectionsEntry == originalEntry) openImportedCollections() },
+                onItem = onItem,
+            )
+        } }
+        val playlistOwner = savedPlaylistOwner
+        val playlistStore = savedPlaylistStore
+        if (playlistOwner != null && playlistStore != null && queueOwner == playlistOwner) {
+            BackHandler { savedPlaylistOwner = null }
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { savedPlaylistOwner = null },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                key(playlistOwner) {
+                    SavedPlaylistScreen(
+                        store = playlistStore,
+                        queue = requireNotNull(playbackQueue),
+                        owner = playlistOwner,
+                        ownerIsCurrent = queueOwner == playlistOwner,
+                        onBack = { savedPlaylistOwner = null },
+                    )
+                }
+            }
+        }
+
         if (playable != null) {
             // History identity for the engine playback session. An in-player episode switch stays inside
             // the mounted player (it never changes [playing]), so it advances THIS identity instead, which
@@ -839,9 +896,11 @@ fun VortXApp(
                     Unit
                 }
             }
-            // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. Reset when the history identity changes (new source, or a switched episode).
-            val lastProgress = remember(historyIdentity) { longArrayOf(0L, 0L) }
+            // The final transaction uses the same owner-qualified snapshot as periodic progress.
+            val playbackSession = remember(historyIdentity) { playbackSessions.newHandle() }
+            val lastProgress = remember(historyIdentity) {
+                com.vortx.android.player.PlaybackProgressCache(playbackSessions, playbackSession)
+            }
             // Auto-add-to-Library (D8). One instance per player session; its own SharedPreferences ledger
             // makes the add idempotent ACROSS playbacks (so a later manual removal sticks), while the latch
             // below keeps it to one attempt WITHIN a playback. Reset per source, mirroring Apple's
@@ -900,7 +959,7 @@ fun VortXApp(
                 playing = null
             }
             DisposableEffect(historyIdentity, advanceVm) {
-                onDispose { advanceVm?.recordLastStreamProgress(lastProgress[0], force = true) }
+                onDispose { advanceVm?.recordLastStreamProgress(lastProgress.positionMs, force = true) }
             }
             // Keep the in-player Sources/Quality sheets live as late add-ons settle. The options themselves
             // come from the ViewModel's unified, filtered, ranked assembly, never from an ad-hoc UI sort.
@@ -941,7 +1000,6 @@ fun VortXApp(
             // cap per episode) lives in [DetailViewModel], which survives the swaps.
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
-            val playbackSession = remember(historyIdentity) { playbackSessions.newHandle() }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
@@ -961,7 +1019,7 @@ fun VortXApp(
                 }
                 onDispose {
                     if (!historyPlayable.isTrailer) {
-                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1]) { receipt ->
+                        lastProgress.end { receipt ->
                             onDurableWatchReceipt(receipt)
                         }
                     }
@@ -1095,12 +1153,11 @@ fun VortXApp(
                     } else {
                         null
                     },
-                    onProgress = { pos, dur ->
-                        lastProgress[0] = pos
-                        lastProgress[1] = dur
+                    onProgress = { point ->
+                        lastProgress.report(point)
+                        val pos = point.positionMs
                         // A trailer reports no progress and never auto-adds to the library (it is not the feature).
                         if (playable.isTrailer) return@PlayerScreen
-                        playbackSessions.report(playbackSession, pos, dur)
                         advanceVm?.recordLastStreamProgress(pos)
                         // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                         // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978
@@ -1943,6 +2000,7 @@ fun VortXApp(
                             },
                             onCatalogItem = onCinemaItem,
                             onQuickView = { item -> quickViewItem = item },
+                            onImportedCollections = openImportedCollections,
                         )
                     }
                 }
@@ -2034,6 +2092,7 @@ fun VortXApp(
                         showDebridKeys = true
                     },
                     onLibraryClick = { showLibraryTransfer = true },
+                    onImportedCollectionsClick = openImportedCollections,
                     onBackupClick = { showBackup = true },
                     onWatchStatsClick = { showWatchStats = true },
                     onWhatsNewClick = { showWhatsNew = true },

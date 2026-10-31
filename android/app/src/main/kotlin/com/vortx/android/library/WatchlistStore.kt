@@ -96,17 +96,16 @@ class WatchlistStore internal constructor(
     fun requestReload() = scheduleReload()
 
     suspend fun reload() {
-        reload(currentProfileOperation())
+        val attempt = beginReload()
+        withContext(ioDispatcher) { reloadAttempt(attempt) }
     }
 
     private suspend fun reload(operation: ProfileOperation) {
-        mutex.withLock {
-            val loaded = withContext(ioDispatcher) {
-                operation.native?.let { NativeWatchlistCodec.entries(it.snapshot.registers) }
-                    ?: WatchlistCodec.decode(persistence.read(storageKey(operation.profileId))).take(MAX_ENTRIES)
-            }
-            publishIfCurrent(operation, loaded.map(WatchlistEntry::toMetaItem))
+        val loaded = withContext(ioDispatcher) {
+            operation.native?.let { NativeWatchlistCodec.entries(it.snapshot.registers) }
+                ?: WatchlistCodec.decode(persistence.read(storageKey(operation.profileId))).take(MAX_ENTRIES)
         }
+        publishIfCurrent(operation, loaded.map(WatchlistEntry::toMetaItem))
     }
 
     fun isWatchlisted(id: String): Boolean = _items.value.any { it.id == id }
@@ -170,30 +169,62 @@ class WatchlistStore internal constructor(
     }
 
     private fun scheduleReload(advanceGeneration: Boolean = false) {
-        val attempt = synchronized(publishLock) {
-            if (advanceGeneration) profileGeneration += 1
-            ReloadAttempt(profileGeneration, ++reloadSequence)
+        val attempt = beginReload(advanceGeneration)
+        // Profile publication invokes this listener on Main. Native capture performs full state
+        // reads, so only the cheap lifetime fence belongs to the caller; capture also belongs to IO.
+        scope.launch(ioDispatcher) { reloadAttempt(attempt) }
+    }
+
+    private fun beginReload(advanceGeneration: Boolean = false): ReloadAttempt = synchronized(publishLock) {
+        if (advanceGeneration) {
+            profileGeneration += 1
+            // Retire the previous viewer synchronously; background capture must not leave
+            // their rows visible while the new profile waits for IO.
+            publishedNativeOwner = null
+            publishedProfileId = null
+            _items.value = emptyList()
+            _error.value = null
         }
-        val operation = try { currentProfileOperation().copy(loadTicket = attempt.ticket) } catch (error: Exception) {
+        ReloadAttempt(profileGeneration, ++reloadSequence)
+    }
+
+    private suspend fun reloadAttempt(attempt: ReloadAttempt) {
+        var operation: ProfileOperation? = null
+        try {
+            // Check the ticket after waiting for the existing read/write lane, before any native
+            // read. A burst of superseded notifications must not queue full Session captures.
+            mutex.withLock {
+                val captured = currentProfileOperation(attempt)
+                operation = captured
+                reload(captured)
+            }
+        } catch (_: LinkageError) {
+            // JNI compatibility is unavailable data, never a successful read or a local fallback.
+            // VM/fatal errors (including OutOfMemoryError) are deliberately not caught.
+            reportCaptureFailure(attempt, operation?.generation ?: attempt.generation)
+        } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException) throw error
-            synchronized(publishLock) {
-                if (profileGeneration == attempt.generation && reloadSequence == attempt.ticket) {
-                    _items.value = emptyList()
-                    _error.value = "Watchlist is unavailable for this account. Try again."
-                }
-            }
-            return
-        }
-        scope.launch {
-            try { reload(operation) } catch (error: Exception) {
-                if (error is kotlinx.coroutines.CancellationException) throw error
-                reportLoadFailure(operation)
-            }
+            // Report outside the coroutine mutex: a native publication hook may request a reload.
+            operation?.let(::reportLoadFailure) ?: reportCaptureFailure(attempt)
         }
     }
 
-    private fun currentProfileOperation(): ProfileOperation {
-        val basis = synchronized(publishLock) { CaptureBasis(profileGeneration, nativeGateway, nativeEnabled) }
+    private fun reportCaptureFailure(attempt: ReloadAttempt, generation: Long = attempt.generation) = synchronized(publishLock) {
+        if (profileGeneration == generation && reloadSequence == attempt.ticket) {
+            _items.value = emptyList()
+            _error.value = "Watchlist is unavailable for this account. Try again."
+        }
+    }
+
+    private fun currentProfileOperation(attempt: ReloadAttempt? = null): ProfileOperation {
+        val basis = synchronized(publishLock) {
+            if (attempt != null) {
+                check(profileGeneration == attempt.generation && reloadSequence == attempt.ticket) {
+                    "Watchlist reload was superseded"
+                }
+            }
+            CaptureBasis(profileGeneration, nativeGateway, nativeEnabled)
+        }
         // Session -> publication is the integration lock order. Never invert it by capturing inside
         // publishLock; the synchronous native invalidation hook fences this capture/publication gap.
         val native = if (basis.enabled()) {
@@ -205,6 +236,7 @@ class WatchlistStore internal constructor(
             check(profileGeneration == basis.generation && nativeGateway === basis.gateway && nativeEnabled === basis.enabled) {
                 "Watchlist account or profile changed. Try again."
             }
+            check(attempt == null || reloadSequence == attempt.ticket) { "Watchlist reload was superseded" }
             // Normally the profile listener has already advanced the generation. This branch also
             // makes a direct reload/toggle safe if the active-profile provider changes first.
             if (publishedProfileId != profileId || publishedNativeOwner != native?.snapshot?.owner) {
@@ -214,7 +246,7 @@ class WatchlistStore internal constructor(
                 _items.value = emptyList()
                 _error.value = null
             }
-            ProfileOperation(profileId, profileGeneration, native)
+            ProfileOperation(profileId, profileGeneration, native, attempt?.ticket)
         }
         if (native == null) return record()
         // Bookkeeping/clears are publications too: an older capture cannot clear a newer revision.
@@ -234,7 +266,8 @@ class WatchlistStore internal constructor(
                 if (
                 profileGeneration == operation.generation &&
                 nativeGateway === basis.gateway && nativeEnabled === basis.enabled &&
-                publishedProfileId == operation.profileId
+                publishedProfileId == operation.profileId &&
+                (operation.loadTicket == null || operation.loadTicket == reloadSequence)
                 ) {
                     publishedNativeOwner = operation.native?.snapshot?.owner
                     _items.value = items

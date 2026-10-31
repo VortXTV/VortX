@@ -30,6 +30,22 @@ struct OwnerHistoryAccountExport: Sendable {
         return .init(fields: next)
     }
 
+    /// Generic accounts also retain their authenticated original account slices. The
+    /// acknowledged host Data comes from Session's producer, never its presentation DTO.
+    /// Source-bearing native state remains exclusively the typed coordinator's contract.
+    func projectingGenericHost(native: VortxJSON, host: Data, profileEditResults: VortxJSON) throws -> Self {
+        var original = try Exact.Object(fields["nativeSync"] ?? Data("{}".utf8))
+        guard original["ownerHistory"] == nil else { throw VortxNativeError.invalidSnapshot }
+        let output = try Exact.Object(JSONEncoder().encode(native))
+        let owned: Set<String> = ["schemaVersion", "scope", "ownerProfileId", "profiles", "addons", "libraries", "watches",
+            "legacyImport", "accountSlots", "websiteAddonReceipts", "legacyProfileEditReceipts"]
+        for (key, value) in output.fields where owned.contains(key) { original.set(key, value) }
+        for key in owned where output[key] == nil { original.remove(key) }
+        _ = try Exact.Object(host)
+        return try replacingOwned(["nativeSync": original.encoded(), "nativeHostPreferences": host,
+            "profileEditResults": JSONEncoder().encode(profileEditResults)])
+    }
+
     /// Source-bearing projection includes the complete journal AND unresolved original pending
     /// records. It is one sibling of nativeSync, never an injected mutable kernel field.
     func projecting(_ checkpoint: OwnerHistorySessionCoordinator.Checkpoint) throws -> Self {
@@ -45,9 +61,8 @@ struct OwnerHistoryAccountExport: Sendable {
     /// ownerHistory or raw source archives and is not called for an unchanged progress tick.
     static func hostProjection(_ hostPreferences: Data, scope: VortxAccountScope) throws
         -> (document: Data, profileEditResults: Data) {
-        try VortxNativeHostPreferences.validateSealed(hostPreferences, scope: scope)
         let host = try Exact.Object(hostPreferences)
-        let hostLocal = try JSONDecoder().decode(VortxNativeHostPreferences.Local.self, from: hostPreferences)
+        let hostLocal = try VortxNativeHostPreferences.validatedLocal(hostPreferences, scope: scope)
         guard case .object(var result) = try VortxNativeProfileEditHost.outcome(hostLocal) else {
             throw VortxNativeError.invalidSnapshot
         }

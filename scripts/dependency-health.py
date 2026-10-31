@@ -26,6 +26,16 @@ CARGO_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 CARGO_PUBLIC_SOURCES = {"registry+https://github.com/rust-lang/crates.io-index", "registry+sparse+https://index.crates.io/", "registry+https://index.crates.io/"}
 VERSION = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(.*)$")
 
+class ArchiveHistoryContraction(ValueError):
+    """An archive index has lost versions from its last successful cursor."""
+
+def _archive_adapter():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dependency_archive_adapter", Path(__file__).with_name("dependency_archive_adapter.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 def stable_key(version):
     match = VERSION.fullmatch(version)
@@ -217,14 +227,58 @@ def inventory(config):
                                 else: gaps.append({"source": f"{label}/{rel}", "reason": "Cargo manifest public registry origin not corroborated"})
                 elif name == "pnpm-lock.yaml":
                     import yaml
-                    data = yaml.safe_load(text)
-                    for key, item in data.get("packages", {}).items():
-                        # pnpm v9: scoped/name@version; peers are snapshot suffixes, not versions.
-                        dep, sep, version = key.split("(", 1)[0].rpartition("@")
-                        if not sep or not dep or not version: raise ValueError("Unsupported pnpm package key")
-                        tarball = item.get("resolution", {}).get("tarball")
-                        if public_npm(root, path, dep, tarball): add("npm", dep, version, label, rel, "resolved-transitive")
-                        else: gaps.append({"source": f"{label}/{rel}", "reason": "Non-public pnpm dependency not sent to public registry"})
+                    diagnostics = [0, 0]
+                    def pnpm_gap(reason):
+                        # Keep malformed input diagnostics bounded without hiding their count.
+                        if diagnostics[0] < 32:
+                            gaps.append({"source": f"{label}/{rel}", "reason": reason})
+                            diagnostics[0] += 1
+                        else:
+                            diagnostics[1] += 1
+                    document = 0
+                    try:
+                        # pnpm 12 may prepend a package-manager/environment document.
+                        # Visit every document; a malformed later one must not erase earlier rows.
+                        for document, data in enumerate(yaml.safe_load_all(text), 1):
+                            prefix = f"pnpm document {document}"
+                            if data is None:
+                                pnpm_gap(f"{prefix} is empty"); continue
+                            if not isinstance(data, dict):
+                                pnpm_gap(f"{prefix} is not a mapping"); continue
+                            packages = data.get("packages")
+                            if not isinstance(packages, dict):
+                                pnpm_gap(f"{prefix} has no packages mapping"); continue
+                            for key, item in packages.items():
+                                if not isinstance(key, str):
+                                    pnpm_gap(f"{prefix} contains an unsupported package key"); continue
+                                # pnpm v9: scoped/name@version; peers are snapshot suffixes.
+                                dep, sep, version = key.split("(", 1)[0].rpartition("@")
+                                if not sep or not dep or not version or not PACKAGE.fullmatch(dep):
+                                    pnpm_gap(f"{prefix} contains an unsupported package key"); continue
+                                if not isinstance(item, dict):
+                                    pnpm_gap(f"{prefix} contains invalid package metadata"); continue
+                                resolution = item.get("resolution", {})
+                                if not isinstance(resolution, dict):
+                                    pnpm_gap(f"{prefix} contains invalid resolution metadata"); continue
+                                tarball = resolution.get("tarball")
+                                if tarball is not None and not isinstance(tarball, str):
+                                    pnpm_gap(f"{prefix} contains invalid tarball metadata"); continue
+                                try:
+                                    public = public_npm(root, path, dep, tarball)
+                                except ValueError:
+                                    pnpm_gap(f"{prefix} contains invalid tarball metadata"); continue
+                                if public:
+                                    add("npm", dep, version, label, rel, "resolved-transitive")
+                                else:
+                                    pnpm_gap("Non-public pnpm dependency not sent to public registry")
+                    except (yaml.YAMLError, RecursionError) as error:
+                        # YAML exceptions may include private URLs, paths and source snippets.
+                        pnpm_gap(f"pnpm document {document + 1} parse failed: {type(error).__name__}")
+                    if document == 0 and diagnostics == [0, 0]:
+                        pnpm_gap("pnpm lock contains no documents")
+                    if diagnostics[1]:
+                        gaps.append({"source": f"{label}/{rel}",
+                                     "reason": f"Additional pnpm diagnostics suppressed: {diagnostics[1]}"})
                 elif name == "libs.versions.toml":
                     data = tomllib.loads(text); versions = data.get("versions", {})
                     for alias, item in data.get("libraries", {}).items():
@@ -802,6 +856,9 @@ def maven_versions(raw):
 
 def releases(ecosystem, name, previous=None):
     quote = urllib.parse.quote
+    if ecosystem == "native-archive":
+        archive = _archive_adapter()
+        return archive.releases(name, stable_key)
     if ecosystem == "npm":
         source = f"https://registry.npmjs.org/{quote(name, safe='')}"
         data = json.loads(get(source)); versions = list(data["versions"])
@@ -864,7 +921,7 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, ident
         try:
             if key in blocked:
                 return key, None, "IdentityConflict"
-            metadata = (dict(reuse[key]) if reuse and key in reuse else
+            metadata = (dict(reuse[key]) if reuse and key in reuse and ecosystem != "native-archive" else
                         releases(ecosystem, name, previous=prior.get("releases", {}).get(key))
                         if ecosystem == "github" else releases(ecosystem, name))
             if ecosystem == "github":
@@ -873,6 +930,9 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, ident
                     raise GitHubCoverageError("observation-bound")
                 if metadata["legacy_published_versions"]: raise ValueError("Fresh observation contains retained provenance")
                 if metadata["repository"] != github_repository(name): raise ValueError("Unexpected GitHub repository")
+            if ecosystem == "native-archive":
+                archive = _archive_adapter()
+                if not archive.valid_metadata(name, metadata): raise ValueError("Malformed archive metadata")
             metadata = {**metadata, "observed_at":metadata.get("observed_at", dt.datetime.now(dt.timezone.utc).isoformat())}
             return key, metadata, None
         except Exception as error: return key, None, type(error).__name__
@@ -881,6 +941,13 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, ident
             fetched = data
             previous = prior.get("releases", {}).get(key)
             history_enrolled, events = False, []
+            if not error and previous is not None and key.startswith("native-archive:"):
+                try:
+                    archive = _archive_adapter()
+                    name = key.removeprefix("native-archive:")
+                    if not archive.valid_metadata(name, previous): raise ValueError("Malformed previous archive cursor")
+                    if set(previous["versions"]) - set(data["versions"]): raise ArchiveHistoryContraction()
+                except Exception as failure: error = type(failure).__name__
             if not error and previous is not None and key.startswith("github:"):
                 try:
                     data, events, history_enrolled = merge_github_observations(
@@ -940,7 +1007,16 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, ident
                         ]
                 else:
                     new = sorted(set(data["versions"]) - set(previous["versions"]))
-                if new: changes.append({"component": key, "new_versions": new, "source": data["source"]})
+                    if key.startswith("native-archive:"):
+                        data = {**data, "archive_urls": {
+                            version: sorted(set(data["archive_urls"].get(version, [])) |
+                                            set(previous["archive_urls"].get(version, [])))
+                            for version in data["versions"]}}
+                if new:
+                    change = {"component": key, "new_versions": new, "source": data["source"]}
+                    if key.startswith("native-archive:"):
+                        change["archive_urls"] = {v: data["archive_urls"][v] for v in new}
+                    changes.append(change)
                 observations.extend({"component":key, **event} for event in events)
                 if not key.startswith("github:"):
                     previous_versions = previous.get("versions") if isinstance(previous, dict) else None
@@ -961,7 +1037,7 @@ def compare(inventory_result, prior, workers, checkpoint=None, reuse=None, ident
             successful_observations[key] = {
                 "observed_at": data.get("observed_at"),
                 "source": data.get("source"),
-                "kind": "reused" if reuse and key in reuse else "fresh",
+                "kind": "reused" if reuse and key in reuse and not key.startswith("native-archive:") else "fresh",
             }
     contractions = [{"component":key, "missing_observations":metadata.get("absent_observations", []),
                      "missing_versions":metadata.get("absent_versions", [])}

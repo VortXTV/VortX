@@ -269,6 +269,54 @@ class NativeOwnerHistoryJniTest {
                 onProgressMutation = { notifications++ }, isAccountCurrent = { authority.active }).use { cold ->
                 assertTrue(cold.hasOwnerHistory()); assertFalse(cold.requiresRecovery())
                 assertEquals(owner, cold.read().owner.profileID)
+                val playlistID = "00000000-0000-0000-0000-000000000301"
+                val playlistField = NativePlaylist.field(java.util.UUID.fromString(playlistID))
+                val playlistValue = NativePlaylist.encodedValue(NativePlaylist.Document(playlistID, "Typed saved",
+                    listOf(NativePlaylist.Entry("00000000-0000-0000-0000-000000000302",
+                        "typed-history", "movie", "Typed saved title"))))
+                val playlistOwner = cold.read().owner
+                val receiptScope = cold.withPlaylistReceiptCapture { read, epoch -> read.owner to epoch }
+                assertEquals(playlistOwner, receiptScope.first)
+                assertTrue(cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { true })
+                val playlistRevision = cold.playlistUpdates.value
+                val beforeRejectedPlaylist = coldStore.captureCheckpoint(scope).plaintext
+
+                // Revocation after candidate construction but before the typed commit conserves
+                // both the authenticated checkpoint and the narrow playlist revision.
+                val rejectedPlaylist = runCatching {
+                    cold.dispatchBudgetedPlaylist(playlistOwner,
+                        JSONObject().put(playlistField, playlistValue), beforeCommit = {
+                            authority.active = false
+                            check(authority.active) { "Synthetic original authority revoked" }
+                        })
+                }
+                authority.active = true
+                assertTrue(rejectedPlaylist.isFailure)
+                assertEquals(beforeRejectedPlaylist, coldStore.captureCheckpoint(scope).plaintext)
+                assertEquals(playlistRevision, cold.playlistUpdates.value)
+                assertFalse(cold.requiresRecovery())
+
+                cold.dispatchBudgetedPlaylist(playlistOwner,
+                    JSONObject().put(playlistField, playlistValue), beforeCommit = {
+                        check(authority.active)
+                    })
+                assertEquals(playlistRevision + 1, cold.playlistUpdates.value)
+                assertEquals(playlistOwner, cold.read().owner) // Playlist clocks are not route authority.
+                val playlistRegister = cold.read().state.getJSONObject("nativeHostPreferenceState")
+                    .getJSONObject("document").getJSONObject("profiles")
+                    .getJSONObject(NativeHostPreferences.canonicalProfileID(owner))
+                    .getJSONObject("fields").getJSONObject(playlistField)
+                assertTrue(NativeHostPreferences.equal(playlistRegister.get("value"), playlistValue))
+                val playlistCheckpoint = NativeOwnerHistoryCoordinator.decodeEnvelope(
+                    requireNotNull(coldStore.captureCheckpoint(scope).plaintext).toByteArray(Charsets.UTF_8), scope)
+                val playlistCloudHost = JSONObject(OHJson.utf8(requireNotNull(
+                    NativeOwnerHistoryAccount(playlistCheckpoint.accountBase).raw("nativeHostPreferences"))))
+                val cloudRegister = playlistCloudHost.getJSONObject("profiles")
+                    .getJSONObject(NativeHostPreferences.canonicalProfileID(owner))
+                    .getJSONObject("fields").getJSONObject(playlistField)
+                assertTrue(NativeHostPreferences.equal(cloudRegister.get("value"), playlistValue))
+                assertEquals(1, notifications)
+
                 val results = cold.dispatch(listOf(JSONObject().put("type", "mark_watched").put("metaId", "historical")),
                     verifyCandidate = { candidate ->
                         val staged = JSONObject(candidate.resolve(JSONObject().put("kind", "profile_playback")
@@ -277,7 +325,8 @@ class NativeOwnerHistoryJniTest {
                     })
                 assertTrue(JSONObject(results.single()).getBoolean("ok"))
                 assertTrue(playback(cold).getJSONObject("watchedTitles").getLong("historical") > 0)
-                assertEquals(1, notifications)
+                assertEquals(playlistRevision + 1, cold.playlistUpdates.value)
+                assertEquals(2, notifications)
                 val exported = NativeOwnerHistoryAccount(requireNotNull(cold.rawAccount()))
                 assertArrayEquals(unknown, exported.raw("future"))
                 assertArrayEquals(carrier, exported.raw(NativeOwnerHistoryAccount.ARCHIVE))
@@ -289,6 +338,51 @@ class NativeOwnerHistoryJniTest {
                 assertArrayEquals(local, persisted.localArchive)
                 assertArrayEquals(exported.encoded(), persisted.accountBase)
                 assertTrue(runCatching { coldStore.requireCurrentCheckpoint(scope, coldRead) }.isFailure)
+
+                // Reuse the genuine exported typed account, archive and host state. A same-profile
+                // receive retires mutation revision but preserves the original read-only receipt.
+                cold.receiveOwnerHistory(exported, authority, NativeOwnerHistoryJniBindings, remoteHost = playlistCloudHost)
+                assertTrue(cold.hasOwnerHistory())
+                assertFalse(cold.accepts(playlistOwner))
+                assertTrue(cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { true })
+                authority.active = false
+                assertTrue(runCatching {
+                    cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { error("Retired account admitted") }
+                }.exceptionOrNull()?.message == "Playlist receipt session unavailable")
+                authority.active = true
+
+                // An already published playlist snapshot must receive a narrow invalidation when
+                // an unrelated checkpoint loses its original authority. The failed candidate is
+                // not installed, its mutation callback is not acknowledged, and durable bytes are
+                // conserved even though this Session now requires authenticated reopen.
+                val publishedRegister = JSONObject(playlistRegister.toString())
+                val beforeFailedCheckpoint = coldStore.captureCheckpoint(scope).plaintext
+                val beforeFailureRevision = cold.playlistUpdates.value
+                val failureOwner = cold.read().owner
+                val failedCheckpoint = runCatching {
+                    cold.dispatch(
+                        listOf(JSONObject().put("type", "mark_watched").put("metaId", "failed-checkpoint")),
+                        owner = failureOwner,
+                        beforeCommit = { authority.active = false },
+                    )
+                }
+                authority.active = true
+                assertTrue(failedCheckpoint.isFailure)
+                assertTrue(cold.requiresRecovery())
+                assertEquals("Playlist receipt session unavailable", runCatching {
+                    cold.withPlaylistReceiptEpoch(receiptScope.first, receiptScope.second) { error("Recovering receipt admitted") }
+                }.exceptionOrNull()?.message)
+                assertEquals(beforeFailureRevision + 1, cold.playlistUpdates.value)
+                assertEquals(beforeFailedCheckpoint, coldStore.captureCheckpoint(scope).plaintext)
+                assertEquals(2, notifications)
+                assertTrue(runCatching {
+                    cold.withCompleteAccountExportOwner(playlistOwner) { error("Stale target admitted") }
+                }.isFailure)
+                val conservedRegister = cold.read().state.getJSONObject("nativeHostPreferenceState")
+                    .getJSONObject("document").getJSONObject("profiles")
+                    .getJSONObject(NativeHostPreferences.canonicalProfileID(owner))
+                    .getJSONObject("fields").getJSONObject(playlistField)
+                assertTrue(NativeHostPreferences.equal(publishedRegister, conservedRegister))
             }
             assertTrue(authority.checks > 10)
         } finally {

@@ -84,6 +84,8 @@ if (supportsOwnedRetirement) stateMembers.push(
   '        var subtitleRendererRegistration: CredentialPublicationOutbox.SubtitleRendererRegistration?',
   '        var alignedSubtitle: MPVAlignedSubtitleRecord?'
 );
+const remoteCancellationMember = '        var subtitleRemoteCancellation: MPVRemoteReferenceCancellation?';
+if (fullState.includes(remoteCancellationMember + '\n')) stateMembers.push(remoteCancellationMember);
 for (const member of stateMembers) once(fullState, member + '\n');
 const projectedNative = native.replace(fullState, '    struct State: Sendable {\n' + stateMembers.join('\n') + '\n    }');
 for (const marker of ['let transaction = NSRecursiveLock()', 'OSAllocatedUnfairLock(initialState: State())', 'transaction.lock(); defer { transaction.unlock() }']) {
@@ -97,13 +99,16 @@ const blocks = {
     '    private nonisolated var nativeContext: MPVNativeHandle?',
     '    private nonisolated var loadTokenLock: NSRecursiveLock',
     '    private nonisolated var loadProvenance: PlayerLoadProvenanceState',
-    '    private nonisolated var externalSubtitleRequestGeneration: UInt64'
+  '    private nonisolated var externalSubtitleRequestGeneration: UInt64',
+  '    private nonisolated func callbackLoadToken(requiresLoadedFile: Bool = false)'
   ].map(marker => declaration(controller, marker)).join('\n'),
   primary: declaration(controller, '    func setSubtitleTrack(_ id: Int)'),
   secondary: declaration(controller, '    func setSecondarySubtitleTrack(_ id: Int)'),
   apply: declaration(controller, '    private nonisolated func applyExternalSubtitle('),
   arguments: declaration(controller, '    private nonisolated func makeCArgs(_ command: String, _ args: [String?])'),
   delay: declaration(controller, '    func setSubDelay(_ seconds: Double)'),
+  enqueueManualSubtitleProperty: declaration(controller, '    private func enqueueManualSubtitleProperty('),
+  mountLocalExternalSubtitle: declaration(controller, '    private nonisolated func mountLocalExternalSubtitle('),
   alignmentAccessor: supportsAlignment ? declaration(controller, alignmentMarkers[1]) : '',
   alignmentTake: supportsOwnedRetirement ? declaration(controller, retirementTakeMarker) : '',
   alignmentRetire: supportsAlignment ? declaration(controller, alignmentMarkers[2]) : '',
@@ -129,10 +134,16 @@ if (supportsAlignment) {
     if (!declaration(controller, marker).includes('retireSubtitleAlignment()')) throw new Error('Missing load retirement: ' + marker);
   }
 }
-for (const marker of ['context.withBorrow', 'loadTokenLock.lock(); defer { loadTokenLock.unlock() }', 'nativeContext === context', '!context.isRetired', 'externalSubtitleRequestGeneration == requestGeneration', 'PlayerLoadProvenanceState.accepts(', 'mpv_command(handle, &arguments)', 'free(UnsafeMutablePointer(mutating: pointer!))']) {
+for (const marker of ['context.withBorrow', 'loadTokenLock.lock(); defer { loadTokenLock.unlock() }', 'nativeContext === context', '!context.isRetired', 'externalSubtitleRequestGeneration == requestGeneration', 'PlayerLoadProvenanceState.accepts(', 'return mountLocalExternalSubtitle(localFile, title: title, lang: lang, handle: handle)']) {
   if (!blocks.apply.includes(marker)) throw new Error(`Incomplete final-apply source: ${marker}`);
 }
-if (!blocks.primary.includes('setSecondarySubtitleTrack(-1)') || !blocks.primary.includes('setString(MPVProperty.sid, id < 0 ? "no" : String(id))')) throw new Error('Incomplete actual primary setter');
+for (const marker of ['context.withBorrow', 'self.loadTokenLock.lock(); defer { self.loadTokenLock.unlock() }', 'self.nativeContext === context', 'self.callbackLoadToken(requiresLoadedFile: false) == load', 'self.setString(name, value, handle: handle)']) {
+  if (!blocks.enqueueManualSubtitleProperty.includes(marker)) throw new Error(`Incomplete queued manual-property source: ${marker}`);
+}
+for (const marker of ['mpv_command(handle, &arguments)', 'for case let pointer? in arguments { free(UnsafeMutablePointer(mutating: pointer)) }']) {
+  if (!blocks.mountLocalExternalSubtitle.includes(marker)) throw new Error(`Incomplete exact local-mount source: ${marker}`);
+}
+if (!blocks.primary.includes('setSecondarySubtitleTrack(-1)') || !blocks.primary.includes('enqueueManualSubtitleProperty(MPVProperty.sid, id < 0 ? "no" : String(id))')) throw new Error('Incomplete actual primary setter');
 if (!blocks.secondary.includes('secondarySubtitleID = id') || !blocks.secondary.includes('MPVProperty.secondarySubPos')) throw new Error('Incomplete actual secondary setter');
 let fixture = fs.readFileSync('app/Tests/MPVManualSubtitleRetirementTests.swift', 'utf8');
 inputs['app/Tests/MPVManualSubtitleRetirementTests.swift'] = sha(fixture);

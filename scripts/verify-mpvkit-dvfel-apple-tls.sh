@@ -46,6 +46,8 @@ verified_arches=0
 for config in "${configs[@]}"; do
   grep -Eq '^#define CONFIG_GNUTLS 0$' "$config" ||
     fail "$config does not disable GnuTLS for Libavformat"
+  grep -Eq '^#define CONFIG_OPENSSL 0$' "$config" ||
+    fail "$config does not disable OpenSSL for Libavformat"
   for macro in "${required_macros[@]}"; do
     grep -Eq "^#define $macro 1$" "$config" ||
       fail "$config does not enable $macro"

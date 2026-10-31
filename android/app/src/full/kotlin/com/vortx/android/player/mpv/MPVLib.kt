@@ -3,6 +3,7 @@ package com.vortx.android.player.mpv
 import android.content.Context
 import android.view.Surface
 import com.vortx.android.player.mpv.seam.MpvSeam
+import com.vortx.android.player.mpv.seam.MpvReferenceSession
 
 /// The VortX libmpv CONTRACT. This is the single surface every Android player phase codes against
 /// (Phase 1a defines it, Phase 1b + the player screen implement against it), mirroring the shape of
@@ -81,6 +82,10 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
     fun command(cmd: Array<String>) = delegate.command(cmd)
 
     fun loadFileWithEntryID(url: String): Long? = delegate.loadFileWithEntryID(url)
+
+    /** Captures the exact original native v2 owner; retain/close the effect with its publication. */
+    fun openSubtitleReference(expectedEntryID: Long): MpvReferenceSession? =
+        delegate.openSubtitleReference(expectedEntryID)
 
     /** Enum-only, checked owned-label transaction under one native handle lease. */
     fun setSessionAudioPreset(preset: Int, expectedEntryID: Long): IntArray =

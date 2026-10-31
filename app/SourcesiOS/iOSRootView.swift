@@ -2567,8 +2567,8 @@ private enum LibrarySegment: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The bucket a saved title falls into. Library entries carry no genre field, so Anime is detected
-    /// from an explicit "anime" meta type or an anime-catalog id scheme (Kitsu / AniList / MAL / AniDB);
+    /// Type segmentation stays structural: Anime uses an explicit "anime" type or an anime-catalog
+    /// id scheme (Kitsu / AniList / MAL / AniDB); accepted genre facts are a separate local filter.
     /// everything else splits on movie vs. the rest (series / channel / tv fold into TV).
     static func bucket(id: String, type: String) -> LibrarySegment {
         if type == "anime" { return .anime }
@@ -2641,6 +2641,8 @@ struct iOSLibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    @State private var genreChoice: LibraryGenreFilter.Choice = .all
+    @State private var genreOwner: PlaybackMutationTarget?
 
     // BEGIN RANDOM PICK LIBRARY STATE
     @State private var randomLibrarySession = RandomPickPolicy.Session()
@@ -2823,14 +2825,22 @@ struct iOSLibraryView: View {
                             // segment and sort row. The grid's `RailItem` drops the runtime + watched signal
                             // the predicates need, so they are evaluated on the source `CoreCWItem`s and the
                             // RailItem grid is then narrowed to the matching ids.
-                            smartFilterBar(segmentedSource())
+                            let source = segmentedSource()
+                            let genres = genreProjection(source)
+                            genreFilterBar(genres)
+                            smartFilterBar(source)
                             Button(action: selectRandomLibraryItem) {
                                 Label("Random pick", systemImage: "shuffle")
                             }
                             .buttonStyle(ChipButtonStyle())
                             .padding(.horizontal, Theme.Space.md)
-                            PosterGrid(items: smartFiltered(segmented(libraryItems), pass: smartPassIDs(segmentedSource())),
-                                       onTap: handleTap, onWatch: watchFromQuickView, menu: .library)
+                            let shown = smartFiltered(genres.filter(segmented(libraryItems), selected: genreChoice,
+                                                                   key: { .init(id: $0.id, type: $0.type) }), pass: smartPassIDs(source))
+                            if shown.isEmpty {
+                                Text("Nothing matches these filters.").foregroundStyle(Theme.Palette.textSecondary)
+                                    .padding(.horizontal, Theme.Space.md)
+                            }
+                            PosterGrid(items: shown, onTap: handleTap, onWatch: watchFromQuickView, menu: .library)
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -2914,6 +2924,7 @@ struct iOSLibraryView: View {
             }
         }
         .onReceive(profiles.$activeID) { profileID in
+            genreChoice = .all
             if let ticket = randomLibrarySession.ticket, ticket.profileID != profileID { clearRandomLibraryPick() }
         }
         .onReceive(profiles.$profiles) { incoming in
@@ -2926,10 +2937,12 @@ struct iOSLibraryView: View {
         .onReceive(profiles.$pickedThisLaunch) { picked in
             if !picked, profiles.profiles.count > 1 { clearRandomLibraryPick() }
         }
-        .onValueChange(of: account.credentialBoundaryGeneration) { _ in clearRandomLibraryPick() }
+        .onValueChange(of: account.credentialBoundaryGeneration) { _ in genreOwner = nil; genreChoice = .all; clearRandomLibraryPick() }
         .onValueChange(of: segment) { _ in clearRandomLibraryPick() }
         .onValueChange(of: activeFilters) { _ in clearRandomLibraryPick() }
+        .onValueChange(of: genreChoice) { _ in clearRandomLibraryPick() }
         .onReceive(core.$revision) { _ in
+            resetGenreOwnerIfNeeded()
             if let route = randomLibraryRoute {
                 if !(route.intent?.routeIsCurrent(core: core, profiles: profiles)
                     ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) { clearRandomLibraryPick() }
@@ -2969,6 +2982,7 @@ struct iOSLibraryView: View {
             if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
         }
         .onAppear {
+            resetGenreOwnerIfNeeded()
             #if !os(tvOS)
             // Offline launch routing handoff (#120), fresh-mount case: land directly on the Downloads
             // screen when the shell staged it (the app opened offline and a completed download exists).
@@ -3016,14 +3030,15 @@ struct iOSLibraryView: View {
 
     // BEGIN RANDOM PICK LIBRARY HELPERS
     private var randomLibraryScope: String {
-        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ","))"
+        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ",")):\(genreChoice.id)"
     }
 
     /// Runs on an explicit pick/revalidation, never as a body signature.
     private func randomLibraryCandidates() -> [CoreCWItem] {
-        let items = segmentedSource()
-        let pass = smartPassIDs(items)
-        return RandomPickPolicy.eligibleLibraryItems(items.filter { pass?.contains($0.id) ?? true })
+        let source = segmentedSource()
+        let items = genreProjection(source).filter(source, selected: genreChoice, key: genreKey)
+        let pass = smartPassIDs(source)
+        return RandomPickPolicy.eligibleLibraryItems(items.filter { pass?.contains(genreKey($0)) ?? true })
     }
 
     private func selectRandomLibraryItem() {
@@ -3183,6 +3198,22 @@ struct iOSLibraryView: View {
         return sourceItems.filter { LibrarySegment.bucket(id: $0.id, type: $0.type) == seg }
     }
 
+    private func genreKey(_ item: CoreCWItem) -> LibraryGenreFilter.Key { .init(id: item.id, type: item.type) }
+    private func genreProjection(_ items: [CoreCWItem]) -> LibraryGenreFilter.Projection {
+        .init(items.map { .init(key: genreKey($0), genres: $0.genres) }, selected: genreChoice)
+    }
+    private func resetGenreOwnerIfNeeded() {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        if genreOwner != owner { genreOwner = owner; genreChoice = .all }
+    }
+    private func genreFilterBar(_ genres: LibraryGenreFilter.Projection) -> some View {
+        chipScroll { ForEach(genres.choices) { choice in
+            Button(choice.label) { genreChoice = choice }
+                .buttonStyle(ChipButtonStyle(selected: choice == genreChoice))
+        } }
+        .accessibilityElement(children: .contain).accessibilityLabel(Text("Genres"))
+    }
+
     /// The client-side SMART filter chips (Unwatched / In Progress / Watched / Short), rendered with the
     /// shared `ChipButtonStyle` so they match every other filter chip. Only chips that actually SPLIT the
     /// current grid (match some but not all titles) are shown, so there are never dead or no-op controls.
@@ -3230,21 +3261,21 @@ struct iOSLibraryView: View {
         applicableFilters(items).filter { activeFilters.contains($0) }
     }
 
-    /// The ids of source titles matching EVERY active-and-applicable smart filter (AND-combined), or nil
+    /// The typed keys of source titles matching EVERY active-and-applicable smart filter (AND-combined), or nil
     /// when none is active, so the grid then passes through untouched.
-    private func smartPassIDs(_ items: [CoreCWItem]) -> Set<String>? {
+    private func smartPassIDs(_ items: [CoreCWItem]) -> Set<LibraryGenreFilter.Key>? {
         let eff = effectiveFilters(items)
         guard !eff.isEmpty else { return nil }
-        var ids = Set<String>()
-        for it in items where eff.allSatisfy({ matches($0, it) }) { ids.insert(it.id) }
+        var ids = Set<LibraryGenreFilter.Key>()
+        for it in items where eff.allSatisfy({ matches($0, it) }) { ids.insert(genreKey(it)) }
         return ids
     }
 
-    /// Narrow the RailItem grid to the ids that passed the smart filters. `nil` = no active filter, so the
+    /// Narrow the RailItem grid to typed keys that passed the smart filters. `nil` = no active filter, so the
     /// grid is unchanged.
-    private func smartFiltered(_ items: [RailItem], pass: Set<String>?) -> [RailItem] {
+    private func smartFiltered(_ items: [RailItem], pass: Set<LibraryGenreFilter.Key>?) -> [RailItem] {
         guard let pass else { return items }
-        return items.filter { pass.contains($0.id) }
+        return items.filter { pass.contains(.init(id: $0.id, type: $0.type)) }
     }
 
     /// Toggle a smart filter. Unwatched and Watched are mutually exclusive, so enabling one clears the
@@ -4838,7 +4869,7 @@ private func cinemaHistoryRailItem(_ item: CoreCWItem, catalog: [CoreMeta], resi
                     description: preview?.description ?? meta?.description,
                     releaseInfo: facts.isEmpty ? nil : facts.joined(separator: " · "),
                     imdbRating: preview?.imdbRating ?? meta?.imdbRating,
-                    genres: preview?.genres ?? meta?.genres,
+                    genres: item.genres ?? preview?.genres ?? meta?.genres,
                     cwVideoId: includesResume ? item.state.videoId : nil,
                     cwUpNext: includesResume && item.isUpNext,
                     caption: includesResume ? coordinate : nil,

@@ -9,9 +9,22 @@ import xperienceInputs from './xperience-harness-inputs.cjs';
 
 const members = ['nativeGlobalEdits', 'nativeGlobalValue', 'nativeDirtySettingsForExport', 'nativeDirtySettingIsExported', 'clearPushedDirtySettings', 'ensureNativeCheckpoint',
   'syncUp', 'finishSyncUp', 'mergeLocalIntoDoc', 'pullDocVersionedResult', 'pushSyncDocAt', 'pushDerivedDoc', 'requestSyncSoon'];
+const receiptMembers = ['freezePlaylistAckCandidate', 'acknowledgeNativePlaylistCloudReceipts', 'registerNativePlaylistMutation',
+  'nativePlaylistCloudReceipt', 'invalidateNativePlaylistCloudReceipts', 'isCurrentOwner'];
+const receiptDependencies = ['nativeMutationDidCommit'];
 if (process.argv[2] === '--extract') {
   const source = await readFile(process.argv[3], 'utf8');
-  const selected = members.flatMap(name => {
+  const receiptMethodCount = receiptMembers.filter(name => new RegExp(`^    (?:private )?func ${name}\\(`, 'm').test(source)).length;
+  const receiptLedgerPresent = /^    private var nativePlaylistReceiptLedger = NativePlaylistCloudReceiptLedger\(\)$/m.test(source);
+  const receiptRevisionPresent = /^    @Published private\(set\) var nativePlaylistCloudReceiptRevision: UInt64 = 0$/m.test(source);
+  const receiptProjectionPresent = /NativePlaylistCandidateProjection\?/.test(source)
+    && /nativePlaylistAcceptedVersion: Int\?/.test(source);
+  const hasAnyReceiptFeature = receiptMethodCount > 0 || receiptLedgerPresent || receiptRevisionPresent || receiptProjectionPresent;
+  const hasCompleteReceiptFeature = receiptMethodCount === receiptMembers.length && receiptLedgerPresent
+    && receiptRevisionPresent && receiptProjectionPresent;
+  assert(!hasAnyReceiptFeature || hasCompleteReceiptFeature, 'partial playlist receipt feature graph');
+  const activeMembers = hasCompleteReceiptFeature ? [...members, ...receiptMembers, ...receiptDependencies] : members;
+  const selected = activeMembers.flatMap(name => {
     const start = source.search(new RegExp(`^    (?:private )?func ${name}\\(`, 'm'));
     // Older source settles uploads inline. Do not inject the new completion helper into a
     // baseline that does not call it; current source must still supply its actual helper.
@@ -55,10 +68,21 @@ if (process.argv[2] === '--extract') {
   const backupDecoder = [exactDeclaration(backup, /^    static let formatTag = .*$/gm, 'backup format'),
     ...['    struct Envelope:', '    enum RestoreError:', '    static func decodeDomain('].map(marker => block(backup, marker))].join('\n');
   let peerSource = await readFile('app/Tests/AppleSyncManagerPeer.swift', 'utf8');
+  if (!hasCompleteReceiptFeature) {
+    const receiptFixture = /^[ \t]*\/\/ RECEIPT FIXTURE GRAPH START\n[\s\S]*?^[ \t]*\/\/ RECEIPT FIXTURE GRAPH END\n/gm;
+    peerSource = peerSource.replace(receiptFixture, '');
+    assert(!peerSource.includes('RECEIPT FIXTURE GRAPH'), 'receipt-only peer fixture leaked into pre-receipt baseline');
+  }
   const managerAnchor = '@MainActor private final class ManagerHarness {';
   assert.equal(peerSource.split(managerAnchor).length, 2, 'unique manager environment');
-  // Stored instance declarations cannot be placed in the appended extension.
-  peerSource = peerSource.replace(managerAnchor, managerAnchor + '\n' + commitGeneration);
+  const receiptStorage = hasCompleteReceiptFeature ? [
+    exactDeclaration(source, /^    private var nativePlaylistReceiptLedger = NativePlaylistCloudReceiptLedger\(\)$/gm, 'playlist receipt ledger storage'),
+    exactDeclaration(source, /^    @Published private\(set\) var nativePlaylistCloudReceiptRevision: UInt64 = 0$/gm, 'playlist receipt revision')
+      .replace('@Published private(set) ', '')
+  ].join('\n') : '';
+  // Stored instance declarations cannot be placed in the appended extension. A historical
+  // baseline with no receipt feature gets neither policy methods nor receipt storage.
+  peerSource = peerSource.replace(managerAnchor, managerAnchor + '\n' + commitGeneration + '\n' + receiptStorage);
   selected.push(block(source, '    private struct DerivedSyncDoc {'),
     block(source, '    private static func documentVersion('),
     source.slice(source.indexOf('    private func dirtySettingsKey('), source.indexOf('    private var dirtySettings:')),
@@ -155,7 +179,7 @@ const server = createServer(async (req, res) => {
   assert(body.baseRevision === null || (Number.isSafeInteger(body.baseRevision) && body.baseRevision >= 0));
   assert.equal(body.version, body.baseRevision === null ? 0 : body.baseRevision + 1);
   const previousVersion = stored?.version ?? null;
-  const accepted = body.baseRevision === previousVersion;
+  const accepted = replyMode !== 'reject-always' && body.baseRevision === previousVersion;
   if (accepted) stored = { document: body.document, version: body.version };
   wire.push({ method: 'PUT', baseRevision: body.baseRevision, version: body.version, previousVersion, accepted, replyMode });
   if (replyMode === 'lost-once') { replyMode = 'normal'; res.destroy(); return; }
@@ -520,6 +544,50 @@ try {
       'actual manager rejects retired cloud ACK and generic stamp clearing, then exact successor ACK clears pending generation and stamps');
     check(wire.filter(entry => entry.method === 'PUT').length === putsBeforeGenerations,
       'offline generation and synthetic accepted-callback scenarios perform no cloud upload');
+
+    // Actual extracted manager receipt methods over the same loopback CAS transport.
+    if (process.env.VORTX_SYNC_TEST_BASELINE !== '1') {
+    stored = null; replyMode = 'normal';
+    const receiptSeed = await peer('playlist-receipt-seed', 'playlist-receipt', { playlistReceiptCase: 'accepted' });
+    check(receiptSeed.receiptUploadAccepted && receiptSeed.receiptFirstSaved && receiptSeed.lastVersion === 0,
+      'accepted actual version-zero seed records only its exact frozen playlist register');
+    stored = null; replyMode = 'missing';
+    const receiptMalformed = await peer('playlist-receipt-malformed', 'playlist-receipt', { playlistReceiptCase: 'accepted' });
+    check(!receiptMalformed.receiptUploadAccepted && receiptMalformed.receiptFirstPending && !receiptMalformed.receiptFirstSaved,
+      'malformed accepted verdict leaves the actual local playlist receipt pending');
+    stored = null; replyMode = 'normal';
+    check((await peer('playlist-receipt-retry-base', 'push')).accepted, 'receipt retry fixture establishes an accepted base');
+    replyMode = 'lost-once';
+    const receiptRetry = await peer('playlist-receipt-lost-retry', 'playlist-receipt', { playlistReceiptCase: 'lost-retry' });
+    check(!receiptRetry.receiptUploadAccepted && receiptRetry.receiptLostReplyStayedPending
+      && receiptRetry.receiptRetryAccepted && receiptRetry.putVersions[0] === 1 && receiptRetry.putVersions[1] === 2
+      && receiptRetry.receiptRetryVersion === 2,
+      'lost accepted response stays pending until fresh read and exact retry candidate is accepted');
+    stored = null; replyMode = 'normal';
+    check((await peer('playlist-receipt-reject-base', 'push')).accepted, 'receipt reject fixture establishes an accepted base');
+    replyMode = 'reject-always';
+    const receiptRejected = await peer('playlist-receipt-rejected', 'playlist-receipt', { playlistReceiptCase: 'accepted' });
+    check(!receiptRejected.receiptUploadAccepted && receiptRejected.receiptFirstPending && !receiptRejected.receiptFirstSaved,
+      'rejected optimistic-concurrency outcomes never create cloud playlist receipts');
+    stored = null; replyMode = 'normal';
+    check((await peer('playlist-receipt-owner-base', 'push')).accepted, 'receipt owner fixture establishes an accepted base');
+    const receiptOwnerChanged = await peer('playlist-receipt-owner-changed', 'playlist-receipt', { playlistReceiptCase: 'owner-during-put' });
+    check(receiptOwnerChanged.receiptUploadAccepted && receiptOwnerChanged.receiptRetiredOwnerNotSaved,
+      'owner retirement during accepted PUT prevents an old candidate from becoming saved');
+    stored = null; replyMode = 'normal';
+    check((await peer('playlist-receipt-edit-base', 'push')).accepted, 'receipt edit fixture establishes an accepted base');
+    const receiptEdited = await peer('playlist-receipt-edit-during-put', 'playlist-receipt', { playlistReceiptCase: 'edit-during-put' });
+    check(receiptEdited.receiptUploadAccepted && receiptEdited.receiptNewEditRemainsPendingOrSaved && receiptEdited.receiptOldEditNotSaved,
+      'newer actual local playlist edit during PUT is not acknowledged by the older frozen candidate');
+
+    stored = null; replyMode = 'normal';
+    check((await peer('playlist-receipt-rearm-base', 'push')).accepted, 'post-accept rearm case starts from an accepted base');
+    const receiptRearmed = await peer('playlist-receipt-rearm', 'playlist-receipt', { playlistReceiptCase: 'registration-after-accept' });
+    check(receiptRearmed.receiptUploadAccepted && receiptRearmed.receiptPostAcceptRegistrationArmedNewGeneration
+      && receiptRearmed.receiptPostAcceptNewGenerationUploaded && receiptRearmed.receiptPostAcceptNewGenerationVersion === 2,
+      'receipt registration after an older candidate is accepted arms and drains the exact newer native push generation');
+    replyMode = 'normal';
+    }
 
     const digest = async path => createHash('sha256').update(await readFile(path)).digest('hex');
     await writeFile(join(root, 'receipt.json'), JSON.stringify({ result: failures ? 'FAIL' : 'GREEN', failures, checks, wire, members,

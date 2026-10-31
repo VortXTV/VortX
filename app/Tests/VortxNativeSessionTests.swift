@@ -70,6 +70,17 @@ private final class MutationCounter: @unchecked Sendable {
     var value: Int { lock.withLock { count } }
 }
 
+private final class HostChangeReceiptBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var receipts: [VortxNativeCoreFacade.HostChangeReceipt] = []
+    func append(_ receipt: VortxNativeCoreFacade.HostChangeReceipt) {
+        lock.lock(); defer { lock.unlock() }; receipts.append(receipt)
+    }
+    var values: [VortxNativeCoreFacade.HostChangeReceipt] {
+        lock.lock(); defer { lock.unlock() }; return receipts
+    }
+}
+
 private final class SessionStore: VortxCheckpointStore, @unchecked Sendable {
     private let lock = NSLock()
     private var value: String?
@@ -911,7 +922,10 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let store = SessionStore()
         let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
             store: store, transport: SessionTransport(), allowNewAccount: true)
-        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { _ in })
+        let hostChanges = HostChangeReceiptBox()
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], sourceEvent: { event in
+            if case .hostCarrierChanged(let receipt) = event.kind { hostChanges.append(receipt) }
+        }, changed: { _ in })
         let binding = facade.watchlistBinding!
         let sourceRegistry = facade.captureEpisodeSourceRegistry()!
         let capturedInventory = try JSONDecoder().decode(VortxJSON.self, from: sourceRegistry.data)
@@ -926,6 +940,15 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let add = Task { try await facade.setWatchlist(entry, present: true, expected: binding) }
         store.release.signal(); try await pending.value
         check(try await add.value)
+        await facade.settled()
+        try await eventually { !hostChanges.values.isEmpty }
+        let firstHostChange = hostChanges.values.last!
+        check(firstHostChange.sourceID == facade.sourceID && facade.acceptsHostChange(firstHostChange),
+              "actual acknowledged host-carrier event admits a data-free receipt")
+        let hostEventCountBeforeSeed = hostChanges.values.count
+        _ = facade.captureHostChange(fields: ["native_host_preferences"])
+        check(hostChanges.values.count == hostEventCountBeforeSeed,
+              "HOST read seed does not publish an additional changed-carrier event")
         check(facade.watchlistBinding == binding)
         check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: profile) == [entry])
         // Another busy host edit does not invalidate a durable add receipt or its owner's target.
@@ -937,6 +960,11 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let remove = Task { try await facade.setWatchlist(entry, present: false, expected: binding) }
         store.release.signal(); try await later.value
         check(try await !remove.value)
+        await facade.settled()
+        try await eventually { hostChanges.values.count >= 2 }
+        let secondHostChange = hostChanges.values.last!
+        check(!facade.acceptsHostChange(firstHostChange) && facade.acceptsHostChange(secondHostChange),
+              "newer acknowledged host event retires prior data-free receipt")
         check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: profile).isEmpty)
         check(sourceRegistry.isCurrent()) // unrelated busy/acknowledged host and watchlist writes do not retire resource authority
         try await facade.rebindRegistry([], expected: facade.registryBinding!)

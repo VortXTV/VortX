@@ -20,3 +20,12 @@ enum XperienceImportPrivacy {
         }
     }
 }
+
+extension XperienceImportPrivacy {
+    static func validate(_ edit: XperienceImportNamespace.RawEdit) throws {
+        guard edit.field == XperienceImportNamespace.field(edit.namespace),
+              edit.raw.value.count <= XperienceCollections.maximumBytes else { throw XperienceCollections.Failure.tooLarge }
+        do { try VortxRawHostRegister.validateValue(field: edit.field, bytes: edit.raw.value) }
+        catch { throw XperienceCollections.Failure.unsafeHostValue }
+    }
+}

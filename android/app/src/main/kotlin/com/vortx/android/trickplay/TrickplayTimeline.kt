@@ -283,6 +283,54 @@ object TrickplayTimeline {
         )
     }
 
+    /**
+     * Last-resort approximate preview, never a claim of coverage at [time]. Validated VTT cues are
+     * sorted and nonoverlapping, so only the two binary-search neighbors can be nearest. Empty
+     * advertised VTT remains unavailable; this does not invent interval coverage for bad metadata.
+     */
+    fun nearestCue(
+        time: Double,
+        parsedCues: List<TrickplayTimelineCue>?,
+        frameCount: Int,
+        legacyInterval: Double,
+        cols: Int,
+        tileW: Int,
+        tileH: Int,
+    ): TrickplayTimelineCue? {
+        if (!time.isFinite() || time < 0.0) return null
+        cue(time, parsedCues, frameCount, legacyInterval, cols, tileW, tileH)?.let { return it }
+        if (parsedCues != null) {
+            if (parsedCues.isEmpty()) return null
+            var lower = 0
+            var upper = parsedCues.size
+            while (lower < upper) {
+                val middle = lower + (upper - lower) / 2
+                if (parsedCues[middle].start <= time) lower = middle + 1 else upper = middle
+            }
+            if (lower == 0) return parsedCues.first()
+            if (lower == parsedCues.size) return parsedCues.last()
+            val before = parsedCues[lower - 1]
+            val after = parsedCues[lower]
+            return if (time - before.end <= after.start - time) before else after
+        }
+        if (frameCount <= 0 || cols <= 0 || tileW <= 0 || tileH <= 0 ||
+            !legacyInterval.isFinite() || legacyInterval <= 0.0
+        ) return null
+        val end = frameCount.toDouble() * legacyInterval
+        if (!end.isFinite()) return null
+        // Exact legacy lookup failed only past its finite final half-open interval.
+        val tileIndex = frameCount - 1
+        return TrickplayTimelineCue(
+            start = tileIndex * legacyInterval,
+            end = end,
+            x = (tileIndex % cols) * tileW,
+            y = (tileIndex / cols) * tileH,
+            width = tileW,
+            height = tileH,
+            tileIndex = tileIndex,
+        )
+    }
+
     /** Keep both timeline endpoints and evict the most temporally redundant interior samples. */
     fun retainedIndices(captureTimes: List<Double>, limit: Int): List<Int> {
         if (limit <= 0) return emptyList()

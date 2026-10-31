@@ -203,12 +203,14 @@ enum ExternalPlayer {
         return installed.first { $0.id == id }
     }
 
-    /// Whether `stream` can be handed to an external app: external players need a DIRECT remote URL
-    /// (debrid / CDN), not the embedded server's loopback torrent/proxy URL (they can't apply our request
-    /// headers or reach an in-process torrent). So torrents and 127.0.0.1/localhost URLs stay built-in.
+    /// Explicit handoffs accept a self-contained remote URL or a torrent file on the user's selected
+    /// remote streaming server. Embedded loopback, link-local and metadata endpoints remain ineligible.
+    /// Header-dependent sources are rejected by the source-menu/player caller before this routing gate.
     static func canRouteExternally(_ stream: URL, isTorrent: Bool) -> Bool {
-        guard !isTorrent, let host = stream.host else { return false }
-        return host != "127.0.0.1" && host != "localhost"
+        SourcePlayerChoicePolicy.canHandOffExternally(
+            url: stream, isTorrent: isTorrent, isUsenet: false, requestHeaders: nil,
+            selectedServerURL: StremioServer.isCustom ? URL(string: StremioServer.base) : nil
+        )
     }
 
     /// If a default external player is set and `stream` is eligible, open it there and report the launch
@@ -221,7 +223,7 @@ enum ExternalPlayer {
         durationSeconds: Double? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
-        guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
+        guard !isTorrent, canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
         open(target, stream: stream, metadata: metadata, startSeconds: startSeconds,
              durationSeconds: durationSeconds, completion: completion)
     }

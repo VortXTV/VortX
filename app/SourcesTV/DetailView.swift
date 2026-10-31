@@ -4854,7 +4854,8 @@ struct CoreStreamList: View {
                url: url,
                isTorrent: stream.isTorrent,
                isUsenet: stream.isUsenet,
-               requestHeaders: stream.requestHeaders
+               requestHeaders: stream.requestHeaders,
+               selectedServerURL: StremioServer.isCustom ? URL(string: StremioServer.base) : nil
            ) {
             ForEach(ExternalPlayers.detected()) { player in
                 Button("Play in \(player.name)") {

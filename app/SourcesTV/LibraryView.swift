@@ -16,8 +16,8 @@ private enum LibrarySegment: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The bucket a saved title falls into. Library entries carry no genre field, so Anime is detected
-    /// from an explicit "anime" meta type or an anime-catalog id scheme (Kitsu / AniList / MAL / AniDB);
+    /// Type segmentation stays structural: Anime uses an explicit "anime" type or an anime-catalog
+    /// id scheme (Kitsu / AniList / MAL / AniDB); accepted genre facts are a separate local filter.
     /// everything else splits on movie vs. the rest (series / channel / tv fold into TV).
     static func bucket(id: String, type: String) -> LibrarySegment {
         if type == "anime" { return .anime }
@@ -85,6 +85,8 @@ struct LibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    @State private var genreChoice: LibraryGenreFilter.Choice = .all
+    @State private var genreOwner: PlaybackMutationTarget?
 
     // BEGIN RANDOM PICK LIBRARY STATE
     @State private var randomLibrarySession = RandomPickPolicy.Session()
@@ -151,8 +153,13 @@ struct LibraryView: View {
                                 if library.catalog.isEmpty {
                                     hint("Your library is empty. Add titles to your library in Stremio and they will show up here.")
                                 } else {
-                                    smartFilterBar(segmented(library.catalog))
-                                    grid(smartFiltered(segmented(library.catalog)))
+                                    let source = segmented(library.catalog)
+                                    let genres = genreProjection(source)
+                                    genreFilterBar(genres)
+                                    smartFilterBar(source)
+                                    let shown = genres.filter(smartFiltered(source), selected: genreChoice, key: genreKey)
+                                    if shown.isEmpty { hint(String(localized: "Nothing matches these filters.")) }
+                                    grid(shown)
                                 }
                             } else if vortxSync.isSignedIn, vortxSync.accountReconnectRequired {
                                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -195,8 +202,13 @@ struct LibraryView: View {
                                 hint("This profile's library is empty. Titles it watches show up here.")
                             } else {
                                 segmentBar(items)
-                                smartFilterBar(segmented(items))
-                                grid(smartFiltered(segmented(items)))
+                                let source = segmented(items)
+                                let genres = genreProjection(source)
+                                genreFilterBar(genres)
+                                smartFilterBar(source)
+                                let shown = genres.filter(smartFiltered(source), selected: genreChoice, key: genreKey)
+                                if shown.isEmpty { hint(String(localized: "Nothing matches these filters.")) }
+                                grid(shown)
                             }
                         }
                     }
@@ -226,6 +238,7 @@ struct LibraryView: View {
             }
         }
         .onReceive(profiles.$activeID) { profileID in
+            genreChoice = .all
             if let ticket = randomLibrarySession.ticket, ticket.profileID != profileID { clearRandomLibraryPick() }
         }
         .onReceive(profiles.$profiles) { incoming in
@@ -238,10 +251,12 @@ struct LibraryView: View {
         .onReceive(profiles.$pickedThisLaunch) { picked in
             if !picked, profiles.profiles.count > 1 { clearRandomLibraryPick() }
         }
-        .onChange(of: account.credentialBoundaryGeneration) { clearRandomLibraryPick() }
+        .onChange(of: account.credentialBoundaryGeneration) { genreOwner = nil; genreChoice = .all; clearRandomLibraryPick() }
         .onChange(of: segment) { clearRandomLibraryPick() }
         .onChange(of: activeFilters) { clearRandomLibraryPick() }
+        .onChange(of: genreChoice) { clearRandomLibraryPick() }
         .onReceive(core.$revision) { _ in
+            resetGenreOwnerIfNeeded()
             if let route = randomLibraryRoute {
                 if !(route.intent?.routeIsCurrent(core: core, profiles: profiles)
                     ?? route.access.isNavigationCurrent(profiles: profiles, core: core)) { clearRandomLibraryPick() }
@@ -262,7 +277,7 @@ struct LibraryView: View {
         // END RANDOM PICK LIBRARY LIFECYCLE
         // Reload while empty: the library syncs from the API asynchronously after sign-in, so the
         // first load can land before ctx.library is populated. Revisiting the tab refills it.
-        .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
+        .onAppear { resetGenreOwnerIfNeeded(); if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
         .onChange(of: core.library?.catalog.first?.id) { seed() }
         .onChange(of: profiles.activeID) { seed() }
     }
@@ -270,14 +285,14 @@ struct LibraryView: View {
 
     // BEGIN RANDOM PICK LIBRARY HELPERS
     private var randomLibraryScope: String {
-        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ","))"
+        "library:\(segment.rawValue):\(activeFilters.map(\.rawValue).sorted().joined(separator: ",")):\(genreChoice.id)"
     }
 
     /// Runs on an explicit pick/revalidation, never as a body signature.
     private func randomLibraryCandidates() -> [CoreCWItem] {
         let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
             ? (core.library?.catalog ?? []) : profiles.libraryItems
-        return RandomPickPolicy.eligibleLibraryItems(smartFiltered(segmented(source)))
+        return RandomPickPolicy.eligibleLibraryItems(genreFiltered(smartFiltered(segmented(source))))
     }
 
     private func selectRandomLibraryItem() {
@@ -418,6 +433,30 @@ struct LibraryView: View {
         let seg = effectiveSegment(availableSegments(items))
         guard seg != .all else { return items }
         return items.filter { LibrarySegment.bucket(id: $0.id, type: $0.type) == seg }
+    }
+
+    private func genreKey(_ item: CoreCWItem) -> LibraryGenreFilter.Key { .init(id: item.id, type: item.type) }
+    private func genreProjection(_ items: [CoreCWItem]) -> LibraryGenreFilter.Projection {
+        .init(items.map { .init(key: genreKey($0), genres: $0.genres) }, selected: genreChoice)
+    }
+    private func genreFiltered(_ items: [CoreCWItem]) -> [CoreCWItem] {
+        genreProjection(items).filter(items, selected: genreChoice, key: genreKey)
+    }
+    private func resetGenreOwnerIfNeeded() {
+        let owner = PlaybackMutationTarget.capture(core: core)
+        if genreOwner != owner { genreOwner = owner; genreChoice = .all }
+    }
+    private func genreFilterBar(_ genres: LibraryGenreFilter.Projection) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.sm) {
+                ForEach(genres.choices) { choice in
+                    Button { genreChoice = choice } label: { Text(choice.label) }
+                        .buttonStyle(ChipButtonStyle(selected: choice == genreChoice))
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xs / 2)
+        }
+        .accessibilityElement(children: .contain).accessibilityLabel(Text("Genres"))
     }
 
     /// The client-side SMART filter chips (Unwatched / In Progress / Watched / Short), rendered with the

@@ -1,0 +1,149 @@
+--- a/misc/thread_tools.c
++++ b/misc/thread_tools.c
+@@ -31,6 +31,7 @@
+ #include "osdep/timer.h"
+ 
+ #include "thread_tools.h"
++#include "ta/ta.h"
+ 
+ uintptr_t mp_waiter_wait(struct mp_waiter *waiter)
+ {
+@@ -133,6 +134,31 @@
+     return c;
+ }
+ 
++// Optional consumers must not add an abort-on-allocation-failure path to playback.
++// Keep the established mp_cancel_new() contract and callers unchanged.
++struct mp_cancel *mp_cancel_try_new(void *talloc_ctx)
++{
++    struct mp_cancel *c = ta_new(talloc_ctx, struct mp_cancel);
++    if (!c)
++        return NULL;
++    *c = (struct mp_cancel){
++        .triggered = false,
++        .wakeup_pipe = {-1, -1},
++    };
++    if (mp_mutex_init(&c->lock)) {
++        talloc_free(c);
++        return NULL;
++    }
++    if (mp_cond_init(&c->wakeup)) {
++        mp_mutex_destroy(&c->lock);
++        talloc_free(c);
++        return NULL;
++    }
++    // No destructor runs on partially initialized synchronization objects.
++    talloc_set_destructor(c, cancel_destroy);
++    return c;
++}
++
+ static void trigger_locked(struct mp_cancel *c)
+ {
+     atomic_store(&c->triggered, true);
+--- a/misc/thread_tools.h
++++ b/misc/thread_tools.h
+@@ -46,6 +46,10 @@
+ 
+ struct mp_cancel *mp_cancel_new(void *talloc_ctx);
+ 
++// Optional internal consumer: NULL on allocation or returned synchronization
++// initialization failure. Existing platform synchronization assertions remain.
++struct mp_cancel *mp_cancel_try_new(void *talloc_ctx);
++
+ // Request abort.
+ void mp_cancel_trigger(struct mp_cancel *c);
+ 
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -76,6 +76,9 @@
+     int64_t generation; // assigned once, before the stream is published
+     char *url;
+     AVDictionary *options; // immutable ORIGINAL pre-open options
++    // Owned observer, never a borrowed original cancel. The stream owner alone
++    // changes its parent and detaches it before dropping the stream reference.
++    struct mp_cancel *original_cancel;
+ };
+ 
+ #define REFERENCE_URL_LIMIT (16 * 1024)
+@@ -94,6 +97,10 @@
+                                                   memory_order_acq_rel);
+     mp_assert(previous > 0);
+     if (previous == 1) {
++        // After publication, the last release can be on a worker only AFTER
++        // source_close detached the parent while the original owner was alive.
++        // An unpublished construction/open failure still owns its live stream.
++        talloc_free(source->original_cancel);
+         av_dict_free(&source->options);
+         av_free(source->url);
+         av_free(source);
+@@ -167,7 +174,7 @@
+     // Pointer identity matters: the unsafe descriptor has the same name and
+     // open function. Curl, wrappers and every other backend remain unsupported.
+     if (s->info != &stream_info_ffmpeg || s->mode != STREAM_READ ||
+-        s->stream_origin != STREAM_ORIGIN_NET || !url ||
++        s->stream_origin != STREAM_ORIGIN_NET || !s->cancel || !url ||
+         (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) ||
+         strnlen(url, REFERENCE_URL_LIMIT + 1) > REFERENCE_URL_LIMIT ||
+         !reference_options_valid(options))
+@@ -183,6 +190,14 @@
+         reference_source_unref(source);
+         return NULL;
+     }
++    source->original_cancel = mp_cancel_try_new(NULL);
++    if (!source->original_cancel) {
++        reference_source_unref(source);
++        return NULL;
++    }
++    // Establish only on the real stream owner, before any lease is published.
++    // An already-triggered parent immediately triggers this sticky observer.
++    mp_cancel_set_parent(source->original_cancel, s->cancel);
+     return source;
+ }
+ 
+@@ -200,6 +215,12 @@
+     s->reference_source = NULL;
+     s->original_source_backend = STREAM_REFERENCE_UNAVAILABLE;
+     reference_source_retire(source);
++    if (source) {
++        // Do not hold the child lock while acquiring its parent's lock. Trigger
++        // first, then detach before the original stream/cancel may be freed.
++        mp_cancel_trigger(source->original_cancel);
++        mp_cancel_set_parent(source->original_cancel, NULL);
++    }
+     reference_source_unref(source);
+ }
+ 
+@@ -239,6 +260,7 @@
+     return !source || lease->authority != STREAM_REFERENCE_INITIAL_REQUEST_ONLY ||
+         lease->source_generation <= 0 || !lease->epoch ||
+         source->generation != lease->source_generation ||
++        mp_cancel_test(source->original_cancel) ||
+         atomic_load_explicit(&source->retired, memory_order_acquire) ||
+         atomic_load_explicit(&source->epoch, memory_order_acquire) != lease->epoch;
+ }
+--- a/stream/reference_source.h
++++ b/stream/reference_source.h
+@@ -43,15 +43,19 @@
+     struct stream *s, struct stream_reference_lease *out);
+ 
+ // Transport seek interruption invalidates all previous epochs. Close retires
+-// the source permanently before the backend or its borrowed cancel is freed.
++// the source and detaches its owned cancellation observer from the original
++// cancel BEFORE the backend, stream or original cancel can be freed. Only the
++// original stream owner calls close; worker lease release never reparents.
+ // These functions require the existing stream lifetime/owner discipline.
+ void stream_reference_source_invalidate(struct stream *s);
+ void stream_reference_source_close(struct stream *s);
+ 
+ // These operate only on a retained lease and are safe off the stream owner.
+-// The cancellation query covers close/retirement and transport-epoch changes.
+-// It does NOT retain or poll the old stream's cancel. A future reader must also
+-// combine its independently owned request/source cancellation and deadline.
++// The cancellation query covers the ORIGINAL cancel (including after acquire),
++// close/retirement and transport-epoch changes through an owned sticky observer.
++// It never borrows/polls the old stream's cancel. A future reader must still
++// combine its independently owned request cancellation and finite deadline.
++// Cancellation stays terminal even if the original parent is later reset.
+ bool stream_reference_lease_cancelled(const struct stream_reference_lease *lease);
+ void stream_reference_lease_release(struct stream_reference_lease *lease);
+ 

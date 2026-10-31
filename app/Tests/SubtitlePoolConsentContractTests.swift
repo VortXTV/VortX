@@ -1,15 +1,53 @@
 // Standalone authorization and zero-transport harness for the production SubtitlePoolClient.swift.
 //
-//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/subtitle-pool-consent-test \
+// From the canonical app repository/worktree root (UNRUN proposal):
+//   mkdir -p app/build/subtitle-pool-consent/tmp
+//   env TMPDIR="$PWD/app/build/subtitle-pool-consent/tmp" \
+//     xcrun swiftc -j 1 -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+//     -module-cache-path app/build/subtitle-pool-consent/module-cache \
+//     -o app/build/subtitle-pool-consent/contract-tests \
 //     app/SourcesShared/VXProbeRedaction.swift \
 //     app/SourcesShared/SubtitlePoolClient.swift \
-//     app/Tests/SubtitlePoolConsentContractTests.swift && /tmp/subtitle-pool-consent-test
+//     app/Tests/SubtitlePoolConsentContractTests.swift
+//   env TMPDIR="$PWD/app/build/subtitle-pool-consent/tmp" app/build/subtitle-pool-consent/contract-tests
 //
-// VXProbeRedaction is a REQUIRED input: the producer-cleanup wave routed this file's three probe lines
-// through identityToken, so the harness no longer compiles without it. A header command that does not
+// VXProbeRedaction remains a REQUIRED input for the client's redacted read/offset probes.
+// The dependency controls below are synthetic. A header command that does not
 // run is not a receipt, which is how this regression reached review unnoticed.
 
 import Foundation
+import os
+
+// Synthetic dependency controls for the production CLIENT's immutable-permit tests only.
+// These are not the actual registry/config/clock/profile prepared-task gates and prove no lock integration.
+// Token identities below are synthetic too; no actual AV/MPV controller is compiled by this route.
+struct PlayerLoadToken: Hashable, Sendable { private let value = UUID() }
+enum LegacyWatchOwnership {
+    enum TaskAdmission { case admitted, transitioning, stale }
+    private static let epoch = OSAllocatedUnfairLock(initialState: UUID())
+    static func captureApplicationEpoch() -> UUID? { epoch.withLock { $0 } }
+    static func applicationEpochIsCurrent(_ value: UUID) -> Bool { epoch.withLock { $0 == value } }
+    static func rotate() { epoch.withLock { $0 = UUID() } }
+    static func resumeApplicationTask(_ task: URLSessionTask, ifCurrent value: UUID) -> TaskAdmission {
+        epoch.withLock { guard $0 == value else { return .stale }; task.resume(); return .admitted }
+    }
+}
+
+final class CredentialScopeRegistry: Sendable {
+    static let shared = CredentialScopeRegistry()
+    struct Capture: Sendable { let generation: UInt64 }
+    private let generation = OSAllocatedUnfairLock(initialState: UInt64(0))
+    func capture() -> Capture { generation.withLock { .init(generation: $0) } }
+    func isCurrent(_ value: Capture) -> Bool { generation.withLock { $0 == value.generation } }
+    func rotate() { generation.withLock { $0 &+= 1 } }
+    func resumeContributionTask(_ task: URLSessionTask, ifCurrent value: Capture,
+                                applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        generation.withLock {
+            guard $0 == value.generation else { return .stale }
+            return LegacyWatchOwnership.resumeApplicationTask(task, ifCurrent: applicationEpoch)
+        }
+    }
+}
 
 enum MoatConsent {
     nonisolated(unsafe) static var contributeAndConsume = true
@@ -56,6 +94,16 @@ enum SourceIndexLifecycleClock {
             consentGeneration &+= 1
         }
     }
+
+    static func closeSource() { lock.withLock { sourceGeneration &+= 1 } }
+    static func resumeContributionTask(_ task: URLSessionTask, ifCurrent original: SourceIndexLifecycleSnapshot,
+        credential: CredentialScopeRegistry.Capture, applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        lock.withLock {
+            guard sourceGeneration == original.sourceGeneration, sessionGeneration == original.sessionGeneration,
+                  consentGeneration == original.consentGeneration, MoatConsent.contributeAndConsume else { return .stale }
+            return CredentialScopeRegistry.shared.resumeContributionTask(task, ifCurrent: credential, applicationEpoch: applicationEpoch)
+        }
+    }
 }
 
 struct RemoteConfigSnapshot {
@@ -71,6 +119,35 @@ struct RemoteConfigSnapshot {
 
 enum RemoteConfig {
     static let snapshot = RemoteConfigSnapshot()
+    struct SubtitleContributionConfiguration: Sendable {
+        let revision: UInt64
+        let maximumTextBytes: Int
+        let baseURL: URL
+    }
+    private struct ContributionState: Sendable { var revision: UInt64 = 0; var enabled = true }
+    private static let contribution = OSAllocatedUnfairLock(initialState: ContributionState())
+    static func setContributionEnabled(_ value: Bool) {
+        contribution.withLock { if $0.enabled != value { $0.revision &+= 1; $0.enabled = value } }
+    }
+    static func subtitleContributionConfiguration() -> SubtitleContributionConfiguration? {
+        contribution.withLock {
+            guard $0.enabled else { return nil }
+            return .init(revision: $0.revision, maximumTextBytes: 1_048_576,
+                         baseURL: URL(string: "https://public-base.invalid")!)
+        }
+    }
+    static func subtitleContributionIsCurrent(_ revision: UInt64) -> Bool {
+        contribution.withLock { $0.enabled && $0.revision == revision }
+    }
+    static func resumeSubtitleContributionTask(_ task: URLSessionTask, revision: UInt64,
+        lifecycle: SourceIndexLifecycleSnapshot, credential: CredentialScopeRegistry.Capture,
+        applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        contribution.withLock {
+            guard $0.enabled, $0.revision == revision else { return .stale }
+            return SourceIndexLifecycleClock.resumeContributionTask(task, ifCurrent: lifecycle,
+                credential: credential, applicationEpoch: applicationEpoch)
+        }
+    }
 }
 
 enum RemoteConfigDefaults {
@@ -645,6 +722,9 @@ struct SubtitlePoolConsentContractTests {
                "directly crafted off-origin subtitle is zero-provider and zero-transport")
 
         let oversizedUpload = SubtitleTransportProbe()
+        let oversizedPermit = SubtitlePoolClient.contributionPermit(contentKey: contentKey,
+            load: SubtitlePoolClient.ContributionLoad(token: PlayerLoadToken()))
+        expect(oversizedPermit?.isCurrent == true, "oversized upload test has a current original permission")
         await SubtitlePoolClient.uploadUsing(
             contentKey: contentKey,
             lang: "en",
@@ -652,6 +732,7 @@ struct SubtitlePoolConsentContractTests {
             origin: "embedded",
             format: "srt",
             text: String(repeating: "x", count: SubtitlePoolClient.subtitleBodyMaxBytes + 1),
+            permit: oversizedPermit,
             transport: { request in await oversizedUpload.perform(request) }
         )
         let oversizedUploadCount = await oversizedUpload.count()
@@ -669,6 +750,92 @@ struct SubtitlePoolConsentContractTests {
         )
         expect(redirectResult.subs.isEmpty && redirectResult.offsetMs == nil,
                "3xx subtitle index response fails soft")
+    }
+
+    @MainActor
+    private static func testContributionPermits() async {
+        MoatConsent.contributeAndConsume = true
+        let positive = SubtitleTransportProbe()
+        let load = SubtitlePoolClient.ContributionLoad(token: PlayerLoadToken())
+        let current = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: load)
+        expect(current?.isCurrent == true, "current contribution permission captures before producer work")
+        await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+            origin: "embedded", format: "srt", text: "complete synthetic subtitle", permit: current,
+            transport: { await positive.perform($0) })
+        let positiveCount = await positive.count()
+        expect(positiveCount == 1, "current original permission reaches injected transport once")
+        let absent = SubtitleTransportProbe()
+        await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+            origin: "embedded", format: "srt", text: "text", transport: { await absent.perform($0) })
+        let absentCount = await absent.count()
+        expect(absentCount == 0, "permission-free contribution is zero transport")
+        let deniedLoad = SubtitlePoolClient.ContributionLoad(token: PlayerLoadToken())
+        let denied = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: deniedLoad)
+        if let denied {
+            deniedLoad.retire() // The actual engine calls this before retirement, not at a later UI reset.
+            let outcome = await SubtitlePoolClient.liveContributionTransportOutcome(
+                URLRequest(url: URL(string: "https://never-issued.invalid/subs")!), permit: denied)
+            expect(outcome.didCancelTask && outcome.response == nil && outcome.bufferedByteCount == 0,
+                   "retired load settles the actual prepared unresumed task without transport")
+        } else { expect(false, "prepared-task denial test captures its original permission") }
+        for boundary in ["source", "session", "consent", "credential", "profile", "config", "lifetime"] {
+            let originalLoad = SubtitlePoolClient.ContributionLoad(token: PlayerLoadToken())
+            let original = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: originalLoad)
+            switch boundary {
+            case "source": SourceIndexLifecycleClock.closeSource()
+            case "session": SourceIndexLifecycleClock.rotateSession()
+            case "consent":
+                MoatConsent.contributeAndConsume = false; SourceIndexLifecycleClock.rotateConsent()
+                MoatConsent.contributeAndConsume = true; SourceIndexLifecycleClock.rotateConsent()
+            case "credential": CredentialScopeRegistry.shared.rotate()
+            case "profile": LegacyWatchOwnership.rotate(); LegacyWatchOwnership.rotate()
+            case "config": RemoteConfig.setContributionEnabled(false); RemoteConfig.setContributionEnabled(true)
+            default: originalLoad.retire()
+            }
+            let stale = SubtitleTransportProbe()
+            await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+                origin: "embedded", format: "srt", text: "late producer", permit: original,
+                transport: { await stale.perform($0) })
+            let staleCount = await stale.count()
+            expect(staleCount == 0, "original permission remains retired across \(boundary) reopening")
+        }
+        RemoteConfig.setContributionEnabled(false)
+        let disabled = SubtitlePoolClient.contributionPermit(contentKey: contentKey,
+            load: SubtitlePoolClient.ContributionLoad(token: PlayerLoadToken()))
+        expect(disabled?.isCurrent == nil, "disabled contribution cannot start producer work")
+        RemoteConfig.setContributionEnabled(true)
+
+        let reusedToken = PlayerLoadToken()
+        let oldMount = SubtitlePoolClient.ContributionLoad(token: reusedToken)
+        let oldPermit = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: oldMount)
+        oldMount.retire() // Stop/item replacement wins; the later UI cleanup is deliberately absent.
+        let newMount = SubtitlePoolClient.ContributionLoad(token: reusedToken)
+        expect(oldMount.token == newMount.token && !oldMount.isCurrent && newMount.isCurrent,
+               "same AV logical token cannot revive the prior mount's sharing scope")
+        let remountTransport = SubtitleTransportProbe()
+        await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+            origin: "embedded", format: "srt", text: "old completed producer", permit: oldPermit,
+            transport: { await remountTransport.perform($0) })
+        let oldCount = await remountTransport.count()
+        expect(oldCount == 0, "actual scope retirement blocks upload before any later UI reset")
+        let newPermit = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: newMount)
+        await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+            origin: "embedded", format: "srt", text: "new complete producer", permit: newPermit,
+            transport: { await remountTransport.perform($0) })
+        let newCount = await remountTransport.count()
+        expect(newCount == 1, "fresh mount captures its own independent original permission")
+
+        let retainedPlaybackToken = PlayerLoadToken()
+        let refusedSharing = SubtitlePoolClient.ContributionLoad(token: retainedPlaybackToken)
+        let refusedPermit = SubtitlePoolClient.contributionPermit(contentKey: contentKey, load: refusedSharing)
+        refusedSharing.retire() // A refused load intent may fail closed for donation only.
+        let refusedTransport = SubtitleTransportProbe()
+        await SubtitlePoolClient.uploadUsing(contentKey: contentKey, lang: "en", fingerprint: nil,
+            origin: "embedded", format: "srt", text: "late after refused intent", permit: refusedPermit,
+            transport: { await refusedTransport.perform($0) })
+        let refusedCount = await refusedTransport.count()
+        expect(refusedCount == 0 && refusedSharing.token == retainedPlaybackToken,
+               "refused replacement cannot renew donation permission or rewrite the retained token")
     }
 
     @MainActor
@@ -1236,6 +1403,7 @@ struct SubtitlePoolConsentContractTests {
     static func main() async {
         testURLGrammar()
         await testAuthorizationAndDecode()
+        await testContributionPermits()
         await testTransportLifecycleFences()
         await testDiskCacheLifecycle()
         testCallerRequestOwnership()

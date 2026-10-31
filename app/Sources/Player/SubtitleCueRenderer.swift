@@ -481,6 +481,94 @@ private enum SubtitleRemoteURLPolicy {
 }
 
 #if canImport(UIKit)
+private typealias SubtitleOverlayFont = UIFont
+private typealias SubtitleOverlayColor = UIColor
+#elseif canImport(AppKit)
+private typealias SubtitleOverlayFont = NSFont
+private typealias SubtitleOverlayColor = NSColor
+#endif
+
+/// Converts only the current immutable active set, once per identity/style change. The preparation
+/// layer has already validated the complete native result; this seam must not parse, trim, sort,
+/// merge, or apply the ordinary renderer's smaller text/overlap limits to its cues.
+@MainActor
+private enum SubtitlePreparedOverlayText {
+    static func make(
+        _ presentation: SubtitleReferencePresentation.Presentation,
+        defaultFont: SubtitleOverlayFont,
+        defaultColor: SubtitleOverlayColor
+    ) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byWordWrapping
+        let result = NSMutableAttributedString(string: "")
+        // Only four font combinations are needed. This cache lives for one active-set build;
+        // it does not accumulate attributed strings for the full subtitle timeline.
+        var fonts: [Int: [NSAttributedString.Key: Any]] = [:]
+        var firstCue = true
+        presentation.forEachCue { cue in
+            if !firstCue {
+                result.append(NSAttributedString(string: "\n", attributes: [
+                    .font: defaultFont, .foregroundColor: defaultColor, .paragraphStyle: paragraph
+                ]))
+            }
+            firstCue = false
+            for run in cue.runs {
+                let key = (run.style.bold ? 1 : 0) | (run.style.italic ? 2 : 0)
+                var attributes: [NSAttributedString.Key: Any]
+                if let cached = fonts[key] {
+                    attributes = cached
+                } else {
+                    attributes = fontAttributes(
+                        defaultFont, bold: run.style.bold, italic: run.style.italic)
+                    fonts[key] = attributes
+                }
+                let foreground = run.style.foregroundRGB.map { Self.color(fromRGB: $0) } ?? defaultColor
+                attributes[.foregroundColor] = foreground
+                attributes[.paragraphStyle] = paragraph
+                if run.style.underline {
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    attributes[.underlineColor] = foreground
+                }
+                result.append(NSAttributedString(string: run.text, attributes: attributes))
+            }
+        }
+        return result
+    }
+
+    private static func fontAttributes(
+        _ base: SubtitleOverlayFont, bold: Bool, italic: Bool
+    ) -> [NSAttributedString.Key: Any] {
+        #if canImport(UIKit)
+        let weighted = bold ? UIFont.systemFont(ofSize: base.pointSize, weight: .bold) : base
+        guard italic else { return [.font: weighted] }
+        let traits = weighted.fontDescriptor.symbolicTraits.union(.traitItalic)
+        if let descriptor = weighted.fontDescriptor.withSymbolicTraits(traits) {
+            return [.font: UIFont(descriptor: descriptor, size: weighted.pointSize)]
+        }
+        // Keep authored italic visible even if a future default font lacks an italic face.
+        return [.font: weighted, .obliqueness: 0.2]
+        #elseif canImport(AppKit)
+        var font = base
+        if bold { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+        if italic { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+        return [.font: font]
+        #endif
+    }
+
+    private static func color(fromRGB value: UInt32) -> SubtitleOverlayColor {
+        let red = CGFloat((value >> 16) & 0xFF) / 255
+        let green = CGFloat((value >> 8) & 0xFF) / 255
+        let blue = CGFloat(value & 0xFF) / 255
+        #if canImport(UIKit)
+        return UIColor(red: red, green: green, blue: blue, alpha: 1)
+        #elseif canImport(AppKit)
+        return NSColor(srgbRed: red, green: green, blue: blue, alpha: 1)
+        #endif
+    }
+}
+
+#if canImport(UIKit)
 /// Bottom-centre subtitle overlay for the AVPlayer engine (iOS + tvOS). A plain, non-interactive `UILabel`
 /// host that sits ABOVE the `AVPlayerLayer`; the engine's periodic time observer pushes the active cue text in.
 /// Styling mirrors the app's `SubtitleStyle` (colour + a shaded/box/outline background) so external subs on
@@ -498,6 +586,13 @@ final class SubtitleOverlayView: UIView {
     /// Last text pushed into the label, so `setText` can skip the reassign (and its layout invalidation) on the
     /// ~99% of ~4 Hz ticks where the active cue is unchanged.
     private var lastText: String?
+    /// Retain the exact active-set object, not just its boundary number (numbers repeat per file).
+    private var preparedPresentation: SubtitleReferencePresentation.Presentation?
+    /// Distinguishes a prepared clear from ordinary text, so either path can always replace the other.
+    private var usesPreparedPresentation = false
+    /// Never inherit the preceding attributed run's font/colour from the platform label accessors.
+    private var preparedDefaultFont: SubtitleOverlayFont = .systemFont(ofSize: 17)
+    private var preparedDefaultColor: SubtitleOverlayColor = .white
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -544,11 +639,42 @@ final class SubtitleOverlayView: UIView {
     /// the vast majority of ticks (a cue spans many ticks); early-return on an unchanged value so we don't
     /// invalidate the label's intrinsic size / re-run auto-layout on every tick for no visual change.
     func setText(_ text: String?) {
+        let wasPrepared = usesPreparedPresentation
+        usesPreparedPresentation = false
+        preparedPresentation = nil
         let value = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard value != lastText else { return }
+        guard wasPrepared || value != lastText else { return }
         lastText = value
+        label.attributedText = nil
+        if wasPrepared {
+            label.font = preparedDefaultFont
+            label.textColor = preparedDefaultColor
+        }
         label.text = value
         label.isHidden = value.isEmpty
+    }
+
+    /// Render the complete prepared active set. Identical ticks perform no string/font/layout work.
+    func setPreparedPresentation(_ presentation: SubtitleReferencePresentation.Presentation?) {
+        guard !usesPreparedPresentation || preparedPresentation !== presentation else { return }
+        usesPreparedPresentation = true
+        preparedPresentation = presentation
+        lastText = nil
+        redrawPreparedPresentation()
+    }
+
+    private func redrawPreparedPresentation() {
+        guard let presentation = preparedPresentation else {
+            label.attributedText = nil
+            label.text = nil
+            label.isHidden = true
+            return
+        }
+        label.attributedText = SubtitlePreparedOverlayText.make(
+            presentation,
+            defaultFont: preparedDefaultFont,
+            defaultColor: preparedDefaultColor)
+        label.isHidden = false
     }
 
     /// Apply the current `SubtitleStyle` (size / colour / background). Re-called live when the user changes it.
@@ -562,7 +688,10 @@ final class SubtitleOverlayView: UIView {
         // (always systemFont/.semibold). Mirror the libmpv distinction instead: Modern = a lighter weight with a
         // thin shadow outline (sub-border-size 2 + soft shadow); Classic = a heavier weight and a stronger
         // border-like shadow (sub-border-size 3). So the Font toggle visibly changes AVPlayer subtitles too.
-        label.font = .systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
+        let font = UIFont.systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
+        preparedDefaultFont = font
+        preparedDefaultColor = color
+        label.font = font
         switch SubtitleStyle.backgroundId {
         case "box":
             label.backgroundColor = UIColor.black
@@ -574,6 +703,7 @@ final class SubtitleOverlayView: UIView {
             label.backgroundColor = .clear
             setShadow(on: true, heavy: classic)
         }
+        if usesPreparedPresentation { redrawPreparedPresentation() }
     }
 
     private var fontScale: CGFloat {
@@ -612,6 +742,13 @@ final class SubtitleOverlayView: NSView {
     /// Last text pushed into the label; lets `setText` skip the reassign (and its layout invalidation) on the
     /// ~99% of ~4 Hz ticks where the active cue is unchanged. See the UIKit twin.
     private var lastText: String?
+    /// Retain the exact active-set object, not just its boundary number (numbers repeat per file).
+    private var preparedPresentation: SubtitleReferencePresentation.Presentation?
+    /// Distinguishes a prepared clear from ordinary text, so either path can always replace the other.
+    private var usesPreparedPresentation = false
+    /// Never inherit the preceding attributed run's font/colour from the platform label accessors.
+    private var preparedDefaultFont: SubtitleOverlayFont = .systemFont(ofSize: 17)
+    private var preparedDefaultColor: SubtitleOverlayColor = .white
     private static let baseInset: CGFloat = 44
 
     override init(frame frameRect: NSRect) {
@@ -649,11 +786,40 @@ final class SubtitleOverlayView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func setText(_ text: String?) {
+        let wasPrepared = usesPreparedPresentation
+        usesPreparedPresentation = false
+        preparedPresentation = nil
         let value = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard value != lastText else { return }
+        guard wasPrepared || value != lastText else { return }
         lastText = value
         label.stringValue = value
+        if wasPrepared {
+            label.font = preparedDefaultFont
+            label.textColor = preparedDefaultColor
+        }
         label.isHidden = value.isEmpty
+    }
+
+    /// AppKit uses the same complete active-set projection as UIKit, without a parser round trip.
+    func setPreparedPresentation(_ presentation: SubtitleReferencePresentation.Presentation?) {
+        guard !usesPreparedPresentation || preparedPresentation !== presentation else { return }
+        usesPreparedPresentation = true
+        preparedPresentation = presentation
+        lastText = nil
+        redrawPreparedPresentation()
+    }
+
+    private func redrawPreparedPresentation() {
+        guard let presentation = preparedPresentation else {
+            label.stringValue = ""
+            label.isHidden = true
+            return
+        }
+        label.attributedStringValue = SubtitlePreparedOverlayText.make(
+            presentation,
+            defaultFont: preparedDefaultFont,
+            defaultColor: preparedDefaultColor)
+        label.isHidden = false
     }
 
     func applyStyle() {
@@ -662,7 +828,10 @@ final class SubtitleOverlayView: NSView {
         label.textColor = color
         let scaled = CGFloat(SubtitleStyle.fontSize) * 0.42
         // Font choice (Gap 6): mirror the libmpv Modern/Classic distinction on the overlay (see the UIKit twin).
-        label.font = .systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
+        let font = NSFont.systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
+        preparedDefaultFont = font
+        preparedDefaultColor = color
+        label.font = font
         switch SubtitleStyle.backgroundId {
         case "box":
             label.drawsBackground = true
@@ -676,6 +845,7 @@ final class SubtitleOverlayView: NSView {
             label.drawsBackground = false
             setShadow(on: true, heavy: classic)
         }
+        if usesPreparedPresentation { redrawPreparedPresentation() }
     }
 
     private func setShadow(on: Bool, heavy: Bool = false) {

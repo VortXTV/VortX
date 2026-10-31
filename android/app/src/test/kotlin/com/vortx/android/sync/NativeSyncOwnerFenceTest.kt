@@ -43,6 +43,19 @@ class NativeSyncOwnerFenceTest {
         var onPut: (() -> Unit)? = null
         val gateway = object : NativeAccountGateway {
             override fun retire() {}
+            // Explicit synthetic absence currency; original real manager lease fences auth here.
+            override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
+                object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
+            override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+                originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+                action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+                val currency = object : NativeAccountUploadCurrency {
+                    override fun isCurrent() = original.isCurrent()
+                    override fun <T> withCurrentSession(action: () -> T): T = action()
+                }
+                val exported = exportDocument(account)
+                return if (original.isCurrent() && isCurrent()) action(exported, null, null, null, currency) else null
+            }
             override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean {
                 if (!isCurrent()) return false
                 applies++
@@ -60,7 +73,8 @@ class NativeSyncOwnerFenceTest {
                 acknowledgements++
                 return true
             }
-            override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject) = true
+            override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject,
+                original: NativeAccountUploadCurrency.Origin) = original.isCurrent()
         }
 
         init {

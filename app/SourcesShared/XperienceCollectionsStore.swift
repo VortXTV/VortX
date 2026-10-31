@@ -14,11 +14,11 @@ struct XperienceImportLease {
     private let core: CoreBridge
     private var subscriptions = Set<AnyCancellable>()
     private var observedLease: XperienceImportLease?
-    private var observedRegisters: [String: VortxJSON]?
+    private var observedRegisters: [String: VortxRawHostRegister]?
     private struct PendingSave {
         let id = UUID()
         let leaseID: UUID
-        let edit: XperienceImportNamespace.Edit
+        let edit: XperienceImportNamespace.RawEdit
         var nativeSubmitted = false
     }
     private var pendingSave: PendingSave?
@@ -60,14 +60,21 @@ struct XperienceImportLease {
     func capture() throws -> XperienceImportLease {
         if observedLease != nil { invalidate() } // A superseding gesture retires the old worker authority too.
         let lease = XperienceImportLease(target: try core.captureNativeXperienceTarget())
-        observedLease = lease
-        observedRegisters = try core.nativeXperienceSnapshot(target: lease.target).registers
-        return lease
+        do {
+            let registers = try core.nativeXperienceSnapshot(target: lease.target).registers
+            observedLease = lease; observedRegisters = registers
+            return lease
+        } catch {
+            // Failed whole-registry admission cannot leave an undisclosed original gesture
+            // active. Cleanup preserves the original failure, including cancellation.
+            core.retireNativeXperienceTarget(lease.target)
+            throw error
+        }
     }
     func isCurrent(_ lease: XperienceImportLease) -> Bool {
         return observedLease?.identity == lease.identity && core.nativeXperienceTargetIsCurrent(lease.target)
     }
-    func candidates(_ lease: XperienceImportLease) throws -> [XperienceAddonBinding.Candidate] {
+    func candidates(_ lease: XperienceImportLease) throws -> XperienceInstalledCatalogs.Snapshot {
         guard isCurrent(lease) else { throw XperiencePersistenceFailure.staleContext }
         return try core.nativeXperienceSnapshot(target: lease.target).candidates
     }
@@ -80,14 +87,14 @@ struct XperienceImportLease {
         guard !(try namespaces(lease)).contains(where: { $0.document.fingerprint == document.fingerprint }) else {
             throw XperiencePersistenceFailure.alreadyImported
         }
-        let edit = try XperienceImportNamespace.append(document: document, label: label, bindings: bindings)
+        let edit = try XperienceImportNamespace.appendRaw(document: document, label: label, bindings: bindings)
         return try await commit(edit, lease: lease)
     }
     func replace(namespace: XperienceSavedNamespace, document: XperienceCollections.Document, label: String,
                  bindings: [String: XperienceAddonBinding.Mapping], lease: XperienceImportLease) async throws -> XperienceSavedNamespace {
-        try await commit(namespace.replacement(document: document, label: label, bindings: bindings), lease: lease)
+        try await commit(namespace.rawReplacement(document: document, label: label, bindings: bindings), lease: lease)
     }
-    private func commit(_ edit: XperienceImportNamespace.Edit, lease: XperienceImportLease) async throws -> XperienceSavedNamespace {
+    private func commit(_ edit: XperienceImportNamespace.RawEdit, lease: XperienceImportLease) async throws -> XperienceSavedNamespace {
         try Task.checkCancellation()
         guard isCurrent(lease) else { throw XperiencePersistenceFailure.staleContext }
         guard pendingSave == nil else { throw XperiencePersistenceFailure.busy }
@@ -95,7 +102,7 @@ struct XperienceImportLease {
         pendingSave = pending
         defer { if pendingSave?.id == pending.id { pendingSave = nil } }
         // This uses the original gesture's owner; it NEVER captures current ownership at Save.
-        let register: VortxJSON
+        let register: VortxRawHostRegister
         do {
             let budget = try await core.prepareNativeXperienceExportBudget(target: lease.target)
             guard isCurrent(lease), pendingSave?.id == pending.id else { throw XperiencePersistenceFailure.staleContext }

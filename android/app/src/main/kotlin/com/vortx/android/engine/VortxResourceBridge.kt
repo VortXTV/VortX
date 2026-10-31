@@ -3,6 +3,7 @@ package com.vortx.android.engine
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -35,6 +36,15 @@ internal data class VortxResourceRequest(
 
 /** Manifest bytes are retained only for this in-memory request, including configured transport URLs. */
 internal data class VortxResourceAddon(val id: String, val transportUrl: String, val manifestJson: String? = null) {
+    companion object {
+        /** Ephemeral wire identity; retain the exact configured URL separately for transport and records. */
+        fun fromTransportUrl(transportUrl: String, manifestJson: String? = null): VortxResourceAddon {
+            val id = MessageDigest.getInstance("SHA-256").digest(transportUrl.toByteArray(Charsets.UTF_8))
+                .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+            return VortxResourceAddon(id, transportUrl, manifestJson)
+        }
+    }
+
     fun json(): JSONObject = JSONObject().put("id", id).put("transportUrl", transportUrl).also {
         if (manifestJson != null) it.put("manifest", JSONObject(manifestJson))
     }

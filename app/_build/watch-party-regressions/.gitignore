@@ -1,0 +1,3 @@
+# Keep generated source receipts, test binaries, logs, locks and module cache local.
+*
+!.gitignore

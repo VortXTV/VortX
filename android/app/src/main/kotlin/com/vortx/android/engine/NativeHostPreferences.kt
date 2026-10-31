@@ -31,6 +31,40 @@ internal object NativeHostPreferences {
     }
     private val nativeFields = setOf("id", "name", "isOwner", "pin", "isKids", "familyEdit", "accentID", "oled", "textScale",
         "disabledAddons", "usesOwnAccount", "account", "addons", "settings", "parental", "rev", "updatedAt", "deleted")
+    // Dedicated raw import records never become profile DTO attributes or generic DTO edits.
+    private const val rawImportPrefix = "xperience.import."
+    private const val playbackDecimals = "subSizeScale maxFileSizeGB"
+    private const val playbackIntegers = "maxResolution minResolution"
+    private const val discoveryIntegerArrays = "selectedProviders providerOrder"
+    internal enum class NumericValueKind { SCALAR, INTEGER_ARRAY }
+
+    /** The raw carrier reuses this schema ownership, never infers semantics for future values. */
+    internal fun numericValueKind(profile: Boolean, field: String, path: List<String>): NumericValueKind? {
+        if (profile && com.vortx.android.foryou.ForYouEditFields.numeric(field, path)) return NumericValueKind.SCALAR
+        if (!profile && path.isEmpty()) return when (SettingsBackup.SYNCABLE_SETTING_TYPES[field]) {
+            SettingsBackup.SettingType.INT, SettingsBackup.SettingType.FLOAT -> NumericValueKind.SCALAR
+            else -> null
+        }
+        if (profile && path.size == 1) {
+            // validateFields delegates this exact, closed entry shape to NativeWatchlistCodec;
+            // addedAt is its existing sole numeric value member, not a future-field inference.
+            if (field.startsWith(NativeWatchlistCodec.PREFIX) && path.single() == "addedAt")
+                return NumericValueKind.SCALAR
+            if (field == "playback" && path.single() in (playbackDecimals + " " + playbackIntegers).split(' '))
+                return NumericValueKind.SCALAR
+            if (field == "discovery" && path.single() in discoveryIntegerArrays.split(' '))
+                return NumericValueKind.INTEGER_ARRAY
+        }
+        return null
+    }
+    /** Deliberate per-record removal only; absence and unsupported playlist/future records do
+     * not acquire deletion meaning. Callers still hold their original observed-field authority. */
+    internal fun explicitRecordTombstone(field: String, before: JSONObject): Boolean = when {
+        com.vortx.android.foryou.ForYouSync.isCollectionField(field) ->
+            com.vortx.android.foryou.SmartCollection.fromJson(before)?.field == field
+        field.startsWith(NativeWatchlistCodec.PREFIX) -> runCatching { NativeWatchlistCodec.validate(field, before) }.isSuccess
+        else -> false
+    }
     private val forbiddenGlobals = setOf("activeprofileid", "activeid", "profiles", "roster", "nativesync", "nativehostpreferences",
         "account", "scope", "ownerprofileid", "stremiox.profiles", "stremiox.profiles.modified", "stremiox.activeprofileid", "stremiox.profiles.active",
         "stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textscale")
@@ -72,6 +106,7 @@ internal object NativeHostPreferences {
     private fun validateFields(fields: JSONObject, profile: Boolean) {
         for (field in fields.keys()) {
             val watchlist = field.startsWith(NativeWatchlistCodec.PREFIX)
+            val playlist = field.startsWith(NativePlaylist.PREFIX)
             require(field.isNotBlank() && field.length <= (if (watchlist) NativeWatchlistCodec.MAX_FIELD_LENGTH else 512))
             require(!watchlist || profile) { "Watchlist is profile-scoped" }
             require(!authority(field)) { "Host field conflicts with native authority" }
@@ -79,6 +114,7 @@ internal object NativeHostPreferences {
             require(entry.keys().asSequence().toSet() == setOf("clock", "actor", "value"))
             clock(entry.get("clock")); actor(entry.getString("actor"))
             val value = entry.get("value")
+            if (playlist) NativePlaylist.validateEnvelope(field, value, global = !profile)
             if (watchlist) NativeWatchlistCodec.validate(field, value)
             if (field.startsWith(com.vortx.android.foryou.ForYouSync.PREFIX)) {
                 require(profile) { "For You is profile-scoped" }
@@ -120,15 +156,15 @@ internal object NativeHostPreferences {
             "playback" -> {
                 strings("audioLang subtitleLang forcedPolicy subFont subSize subColor subBackground subBrightness safetyMode excludeKeywords includeKeywords preferKeywords avoidBehavior")
                 bools("useAddonOrder instantOnly hideDeadTorrents hdrOnly excludeAV1 keywordsAreRegex hideUnknownResolution preferredAudioOnly autoPickBest")
-                fields("subSizeScale maxFileSizeGB", ::decimal)
-                fields("maxResolution minResolution", ::integer)
+                fields(playbackDecimals, ::decimal)
+                fields(playbackIntegers, ::integer)
                 fields("sourceTypeOrder", ::stringArray)
             }
             "discovery" -> {
                 strings("regionOverride filtersData continueWatchingSource continueWatchingWindow")
                 bools("regionOverrideCaptured filtersCaptured tabVisibilityCaptured hideLiveTab hideDiscoverTab hideLibraryTab hideSearchTab showCollectionsHome showCollectionsDiscover")
                 fields("hiddenCatalogs catalogOrder hiddenHubCategories", ::stringArray)
-                fields("selectedProviders providerOrder") { array ->
+                fields(discoveryIntegerArrays) { array ->
                     require(array is JSONArray); (0 until array.length()).forEach { integer(array.get(it)) }
                 }
             }
@@ -195,7 +231,8 @@ internal object NativeHostPreferences {
         for (id in nextProfiles.keys().asSequence().filter { it != "modifiedSeconds" }.sorted()) {
             val old = oldProfiles.optJSONObject(id) ?: JSONObject(); val next = nextProfiles.getJSONObject(id)
             for (field in (old.keys().asSequence().toSet() + next.keys().asSequence().toSet()).sorted()) {
-                if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) || equal(old.opt(field), next.opt(field))) continue
+                if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) ||
+                    field.startsWith(NativePlaylist.PREFIX) || field.startsWith(rawImportPrefix) || equal(old.opt(field), next.opt(field))) continue
                 val bucket = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
                 record(result, bucket.getJSONObject("fields"), field, next.opt(field))
             }
@@ -214,6 +251,9 @@ internal object NativeHostPreferences {
         return result
     }
     fun recordProfileFields(scope: VortxAccountScope, local: JSONObject, profileID: String, changes: JSONObject): JSONObject {
+        require(changes.keys().asSequence().none { it.startsWith(rawImportPrefix) }) {
+            "Xperience imports require a captured raw domain operation"
+        }
         val result = local(scope, local)
         val profiles = result.getJSONObject("document").getJSONObject("profiles")
         val id = canonicalProfileID(profileID)
@@ -253,6 +293,11 @@ internal object NativeHostPreferences {
     }
     fun projectProfiles(local: JSONObject, base: JSONObject, roster: JSONObject): JSONObject {
         val result = canonicalGroups(base)
+        // Remove obsolete DTO copies from older sessions as well as suppressing new projection.
+        result.keys().asSequence().filter { it != "modifiedSeconds" }.toList().forEach { id ->
+            result.optJSONObject(id)?.let { profile -> profile.keys().asSequence()
+                .filter { it.startsWith(rawImportPrefix) }.toList().forEach(profile::remove) }
+        }
         val profiles = canonicalGroups(local.getJSONObject("document").getJSONObject("profiles"))
         val nativeRoster = canonicalGroups(roster)
         for (id in profiles.keys()) {
@@ -261,7 +306,9 @@ internal object NativeHostPreferences {
             val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", nativeRoster.getJSONObject(id).getString("name"))
             val fields = profiles.getJSONObject(id).getJSONObject("fields")
             for (field in fields.keys()) {
-                if (field.startsWith(NativeWatchlistCodec.PREFIX)) continue // Separate per-item ledger, not profile DTO attributes.
+                // Dedicated per-item ledgers never become generic profile DTO attributes.
+                if (field.startsWith(NativeWatchlistCodec.PREFIX) || field.startsWith(NativePlaylist.PREFIX) ||
+                    field.startsWith(rawImportPrefix)) continue
                 val value = fields.getJSONObject(field).get("value")
                 if (value == JSONObject.NULL) target.remove(field) else target.put(field, value)
             }

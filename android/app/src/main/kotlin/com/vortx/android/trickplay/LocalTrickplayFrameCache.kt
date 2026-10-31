@@ -3,8 +3,13 @@ package com.vortx.android.trickplay
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.SystemClock
 import android.util.LruCache
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.floor
@@ -36,7 +41,14 @@ class LocalTrickplayFrameCache(context: Context) {
         override fun sizeOf(key: String, value: Bitmap): Int = 1
     }
 
-    private fun bucketFor(timeSeconds: Double): Int = max(0.0, floor(timeSeconds / BUCKET_SECONDS)).toInt()
+    /** One cold decode at a time; cancelled scrub destinations do not queue native bitmap decoders. */
+    private val coldReadMutex = Mutex()
+
+    private fun bucketFor(timeSeconds: Double): Int? {
+        if (!timeSeconds.isFinite() || timeSeconds < 0.0) return null
+        val bucket = floor(timeSeconds / BUCKET_SECONDS)
+        return bucket.takeIf { it <= Int.MAX_VALUE }?.toInt()
+    }
 
     private fun memKey(key: String, bucket: Int): String = "$key#$bucket"
 
@@ -51,8 +63,8 @@ class LocalTrickplayFrameCache(context: Context) {
      * decode failure stores nothing (never throws).
      */
     fun store(key: String, timeSeconds: Double, jpeg: ByteArray) {
-        val bucket = bucketFor(timeSeconds)
-        val bitmap = runCatching { BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) }.getOrNull() ?: return
+        val bucket = bucketFor(timeSeconds) ?: return
+        val bitmap = decodeThumbnail(jpeg) ?: return
         memory.put(memKey(key, bucket), bitmap)
         runCatching {
             if (cacheDir.exists() || cacheDir.mkdirs()) diskFile(key, bucket).writeBytes(jpeg)
@@ -66,7 +78,7 @@ class LocalTrickplayFrameCache(context: Context) {
      * most recent frame. Mirrors Apple's synchronous `preview(for:time:)` fast path.
      */
     fun previewAt(key: String, timeSeconds: Double): Bitmap? {
-        val target = bucketFor(timeSeconds)
+        val target = bucketFor(timeSeconds) ?: return null
         val minBucket = max(0, target - MAX_LOOKBACK_BUCKETS)
         for (bucket in target downTo minBucket) {
             memory.get(memKey(key, bucket))?.let { return it }
@@ -79,20 +91,94 @@ class LocalTrickplayFrameCache(context: Context) {
      * serves their own previews immediately (before any fresh capture). Prunes expired / over-cap files first.
      * Off the main thread; bounded to [MEMORY_ENTRIES] most-recent buckets so a long title cannot flood memory.
      */
-    suspend fun warm(key: String) = withContext(Dispatchers.IO) {
-        prune()
-        val prefix = "${safeKey(key)}_"
-        val files = cacheDir.listFiles { f -> f.name.startsWith(prefix) && f.name.endsWith(".jpg") }
-            ?.sortedByDescending { bucketOf(it.name, prefix) }
-            ?.take(MEMORY_ENTRIES)
-            ?: return@withContext
-        for (file in files) {
-            val bucket = bucketOf(file.name, prefix) ?: continue
-            if (memory.get(memKey(key, bucket)) != null) continue
-            val bytes = runCatching { file.readBytes() }.getOrNull() ?: continue
-            val bitmap = runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull() ?: continue
-            memory.put(memKey(key, bucket), bitmap)
+    suspend fun warm(key: String, isCurrent: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
+        coldReadMutex.withLock {
+            currentCoroutineContext().ensureActive()
+            if (!isCurrent()) return@withLock
+            prune()
+            val deadline = SystemClock.elapsedRealtime() + READ_BUDGET_MS
+            val prefix = "${safeKey(key)}_"
+            val files = cacheDir.listFiles { f -> f.name.startsWith(prefix) && f.name.endsWith(".jpg") }
+                ?.sortedByDescending { bucketOf(it.name, prefix) }
+                ?.take(MEMORY_ENTRIES)
+                ?: return@withLock
+            for (file in files) {
+                currentCoroutineContext().ensureActive()
+                if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock
+                val bucket = bucketOf(file.name, prefix)?.takeIf { it >= 0 } ?: continue
+                if (memory.get(memKey(key, bucket)) != null) continue
+                val bytes = readJpeg(file) ?: continue
+                currentCoroutineContext().ensureActive()
+                if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock
+                val bitmap = decodeThumbnail(bytes) ?: continue
+                currentCoroutineContext().ensureActive()
+                if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock
+                memory.put(memKey(key, bucket), bitmap)
+            }
         }
+    }
+
+    /**
+     * Load the requested part of a long title after the resident cache missed. Warm-up retains only the
+     * newest 128 frames, so it cannot stand in for this bounded per-position disk fallback. Cancellation
+     * and the original publication claim are checked between probes and before caching any decode.
+     */
+    suspend fun loadPreviewAt(key: String, timeSeconds: Double, isCurrent: () -> Boolean): Bitmap? {
+        val target = bucketFor(timeSeconds) ?: return null
+        val deadline = SystemClock.elapsedRealtime() + READ_BUDGET_MS
+        return withContext(Dispatchers.IO) {
+            coldReadMutex.withLock {
+                val minBucket = max(0, target - MAX_LOOKBACK_BUCKETS)
+                for (bucket in target downTo minBucket) {
+                    currentCoroutineContext().ensureActive()
+                    if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock null
+                    memory.get(memKey(key, bucket))?.let { return@withLock it }
+                    val file = diskFile(key, bucket)
+                    if (System.currentTimeMillis() - file.lastModified() > TTL_MS) continue
+                    val bytes = readJpeg(file) ?: continue
+                    currentCoroutineContext().ensureActive()
+                    if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock null
+                    val bitmap = decodeThumbnail(bytes) ?: continue
+                    currentCoroutineContext().ensureActive()
+                    if (!isCurrent() || SystemClock.elapsedRealtime() >= deadline) return@withLock null
+                    memory.put(memKey(key, bucket), bitmap)
+                    return@withLock bitmap
+                }
+                null
+            }
+        }
+    }
+
+    /** Read at most one encoded-frame budget, even when a file grows after its initial size check. */
+    private fun readJpeg(file: File): ByteArray? = runCatching {
+        val length = file.length()
+        if (length !in 1..MAX_JPEG_BYTES.toLong()) return@runCatching null
+        file.inputStream().use { input ->
+            val bytes = ByteArray(length.toInt() + 1)
+            var count = 0
+            while (count < bytes.size) {
+                val read = input.read(bytes, count, bytes.size - count)
+                if (read <= 0) break
+                count += read
+            }
+            if (count !in 1..length.toInt()) null else bytes.copyOf(count)
+        }
+    }.getOrNull()
+
+    /** Bound both encoded input and decoded resident dimensions before invoking the real decoder. */
+    private fun decodeThumbnail(jpeg: ByteArray): Bitmap? {
+        if (jpeg.size !in 1..MAX_JPEG_BYTES) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        runCatching { BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds) }.getOrNull()
+        if (bounds.outWidth !in 1..MAX_SOURCE_EDGE || bounds.outHeight !in 1..MAX_SOURCE_EDGE ||
+            bounds.outWidth.toLong() * bounds.outHeight > MAX_SOURCE_PIXELS
+        ) return null
+        val options = BitmapFactory.Options().apply { inSampleSize = 1 }
+        while (max(bounds.outWidth, bounds.outHeight) / options.inSampleSize > MAX_THUMBNAIL_EDGE) {
+            options.inSampleSize *= 2
+        }
+        return runCatching { BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, options) }.getOrNull()
+            ?.takeIf { it.width <= MAX_THUMBNAIL_EDGE && it.height <= MAX_THUMBNAIL_EDGE }
     }
 
     /** The bucket index encoded in a `<safeKey>_<bucket>.jpg` file name, or null when it does not parse. */
@@ -129,6 +215,11 @@ class LocalTrickplayFrameCache(context: Context) {
 
         /** Resident thumbnail count. Kept modest so the cache never adds to jetsam pressure. */
         private const val MEMORY_ENTRIES = 128
+        private const val MAX_JPEG_BYTES = 1024 * 1024
+        private const val MAX_THUMBNAIL_EDGE = 480
+        private const val MAX_SOURCE_EDGE = 16_384
+        private const val MAX_SOURCE_PIXELS = 64L * 1024 * 1024
+        private const val READ_BUDGET_MS = 250L
 
         /** Files older than this are dropped on [warm]. Apple's 48h. */
         private const val TTL_MS = 48L * 3600 * 1000

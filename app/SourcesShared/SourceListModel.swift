@@ -139,7 +139,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private func currentPlaybackSignature(context ctx: Context) -> Signature? {
         guard let core, let torbox, let singularity, let mediaServers, let debridCache else { return nil }
         let cachedHashes = debridCache.cachedHashes
-        let tombstones = AddonTombstones.all()
+        let tombstones: Set<String> = core.usesNativeProfileState ? [] : AddonTombstones.all()
         let sticky: (addon: String?, bingeGroup: String?)? = ctx.streamId != nil && !ctx.metaId.isEmpty
             ? SeriesSourceSticky.preference(for: ctx.metaId) : nil
         // O(1)-ish signature: three epochs + one fold of the small inputs. No per-stream work.
@@ -402,7 +402,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private func rebuild() {
         guard let core, let torbox, let singularity, let mediaServers, let debridCache else { return }
         let ctx = context
-        let tombstones = AddonTombstones.all()
+        let tombstones: Set<String> = core.usesNativeProfileState ? [] : AddonTombstones.all()
         let cachedHashes = debridCache.cachedHashes
 
         // The remembered manual pick + the just-failed-provider demotion, snapshotted HERE on the main actor
@@ -503,9 +503,9 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let metaToken = VXProbeRedaction.identityToken(ctx.metaId.isEmpty ? nil : ctx.metaId)
 
         Task.detached(priority: .userInitiated) { [weak owner] in
-            // STEP 3 (delete fix), belt and suspenders: CoreBridge.streamGroups() already subtracts
-            // tombstoned add-ons at the streams layer; re-filtering the snapshot here keeps the model
-            // correct even for a caller that fed it un-subtracted groups.
+            // The concrete CoreBridge native route already resolves installation membership in the
+            // kernel. Only a legacy route may subtract its legacy removal carrier; applying that
+            // carrier again could hide an active configured instance behind a stale/case-folded key.
             var assembled = raw
             if !tombstones.isEmpty {
                 assembled = assembled.filter { !tombstones.contains(AddonTombstones.normalize($0.id)) }

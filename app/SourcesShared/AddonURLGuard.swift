@@ -56,24 +56,43 @@ enum AddonURLGuard {
     /// Hard upper bound for a manifest response. The check is applied to Content-Length when present and again
     /// while consuming the streamed body, so chunked/lying responses cannot grow an unbounded Data buffer.
     static let maxManifestBytes = 2 * 1024 * 1024
+    /// Separate fixed purpose limit so later manifest tuning cannot silently change subtitle index budgets.
+    static let maxSubtitleIndexBytes = 2 * 1024 * 1024
+    /// Subtitle payloads share the player parser ceiling and remain raw text only.
+    static let maxSubtitleFileBytes = 8 * 1024 * 1024
 
     /// Callers select a known response purpose; a supplied URL cannot choose an arbitrary body cap.
     enum ResponseContext: Sendable {
         case manifest
         case xperienceCatalog
         case xperienceArtwork
+        case subtitleIndex
+        case subtitleFile
 
         var maximumBytes: Int {
             switch self {
             case .manifest: return AddonURLGuard.maxManifestBytes
             case .xperienceCatalog: return 4 * 1024 * 1024
             case .xperienceArtwork: return 8 * 1024 * 1024
+            case .subtitleIndex: return AddonURLGuard.maxSubtitleIndexBytes
+            case .subtitleFile: return AddonURLGuard.maxSubtitleFileBytes
+            }
+        }
+
+        /// A resource path includes encoded metadata in addition to the installed endpoint.
+        /// Keep QR/manifest admission separate from this bounded subtitle request envelope.
+        var maximumURLBytes: Int {
+            switch self {
+            case .subtitleIndex, .subtitleFile: return 128 * 1024
+            case .manifest, .xperienceCatalog, .xperienceArtwork:
+                return AddonPairingProtocol.maxManifestURLBytes
             }
         }
 
         fileprivate var accept: String {
             switch self {
-            case .manifest, .xperienceCatalog: return "application/json"
+            case .manifest, .xperienceCatalog, .subtitleIndex: return "application/json"
+            case .subtitleFile: return "text/vtt,text/plain,application/x-subrip,text/x-ass,application/x-ass"
             case .xperienceArtwork: return "image/png,image/jpeg,image/webp,image/heic,image/heif"
             }
         }
@@ -83,6 +102,19 @@ enum AddonURLGuard {
         let data: Data
         let finalURL: URL
         let mimeType: String?
+    }
+
+    /// A route rejection is meaningful only to the subtitle index's metadata-to-ID-only fallback.
+    /// It is deliberately separate from the general Rejection cases and their retry policy.
+    struct SubtitleIndexRouteRejection: Error, Equatable, Sendable {
+        let statusCode: Int
+    }
+
+    /// Immutable fixture hook for URLProtocol-based tests. Supplying it does not skip URL validation,
+    /// redirect handling, deadlines, response limits, or the production session delegate.
+    struct TestURLProtocolClasses: @unchecked Sendable {
+        fileprivate let values: [AnyClass]
+        init(_ values: [AnyClass]) { self.values = values }
     }
 
     /// Return whether appending a streamed chunk remains inside this purpose's cap without overflow.
@@ -104,7 +136,8 @@ enum AddonURLGuard {
 
     /// Require HTTP(S) and validate literal/resolved destinations. Public resources reject private ranges;
     /// a selected add-on can use ordinary private addresses only at its selected origin.
-    static func validate(_ url: URL, access: AccessScope = .publicNetwork) async -> Rejection? {
+    static func validate(_ url: URL, access: AccessScope = .publicNetwork,
+                         context: ResponseContext = .manifest) async -> Rejection? {
         guard let scheme = url.scheme?.lowercased(),
               let host = url.host, !host.isEmpty,
               url.user == nil,
@@ -124,14 +157,14 @@ enum AddonURLGuard {
             // well-hosted addons kept working. Public hosts may use http again - every private-address
             // check below still applies to BOTH schemes, so the SSRF posture is unchanged.
             guard scheme == "http" || scheme == "https",
-                  Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+                  url.absoluteString.utf8.count <= context.maximumURLBytes else {
                 return .invalidScheme
             }
             return nil
         }
 
         guard scheme == "http" || scheme == "https",
-              Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+              url.absoluteString.utf8.count <= context.maximumURLBytes else {
             return .invalidScheme
         }
 
@@ -161,12 +194,13 @@ enum AddonURLGuard {
     /// Resource purpose never grants private access; only the selected add-on origin does.
     static func fetch(_ url: URL, context: ResponseContext,
                       access: AccessScope = .publicNetwork,
-                      timeout: TimeInterval = 15) async throws -> Response {
+                      timeout: TimeInterval = 15,
+                      testURLProtocolClasses: TestURLProtocolClasses? = nil) async throws -> Response {
         let deadline = Date().addingTimeInterval(timeout)
         var current = url
         for _ in 0...maxRedirects {
             try Task.checkCancellation()
-            let validationFailure = await validate(current, access: access)
+            let validationFailure = await validate(current, access: access, context: context)
             try Task.checkCancellation()
             if let validationFailure { throw validationFailure }
             let remaining = deadline.timeIntervalSinceNow
@@ -186,6 +220,9 @@ enum AddonURLGuard {
             configuration.urlCredentialStorage = nil
             configuration.urlCache = nil
             configuration.timeoutIntervalForResource = remaining
+            if let testURLProtocolClasses {
+                configuration.protocolClasses = testURLProtocolClasses.values
+            }
             let delegate = NoRedirectDelegate()
             let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
             defer { session.invalidateAndCancel() }
@@ -199,6 +236,9 @@ enum AddonURLGuard {
                    let next = redirectTarget(from: current, location: location) {
                     current = next
                     continue
+                }
+                if case .subtitleIndex = context, [404, 405].contains(http.statusCode) {
+                    throw SubtitleIndexRouteRejection(statusCode: http.statusCode)
                 }
                 guard (200...299).contains(http.statusCode),
                       http.expectedContentLength <= Int64(context.maximumBytes) else {
@@ -220,9 +260,11 @@ enum AddonURLGuard {
                 // This is a second resolution check, not connection IP pinning. The accepted
                 // resolve-then-connect rebinding limitation above still applies.
                 let finalURL = http.url ?? current
-                if let rejection = await validate(finalURL, access: access) { throw rejection }
+                if let rejection = await validate(finalURL, access: access, context: context) { throw rejection }
                 try Task.checkCancellation()
                 return Response(data: data, finalURL: finalURL, mimeType: http.mimeType)
+            } catch let routeRejection as SubtitleIndexRouteRejection {
+                throw routeRejection
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

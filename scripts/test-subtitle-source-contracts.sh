@@ -25,9 +25,11 @@ swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/SubtitleStyle.swift app/Tests/SubtitleStyleBackgroundTests.swift \
   -o "$build_dir/subtitle-style-background"
 "$build_dir/subtitle-style-background"
-swiftc -strict-concurrency=complete -warnings-as-errors \
-  app/SourcesShared/SubtitleRequestMetadata.swift app/SourcesShared/SubtitleAddons.swift \
-  app/Tests/SubtitleAddonFileMatchingTests.swift -o "$build_dir/subtitle-file-matching"
+/usr/bin/nice -n 15 swiftc -parse-as-library -swift-version 6 \
+  -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
+  app/SourcesShared/AddonURLGuard.swift app/SourcesShared/SubtitleRequestMetadata.swift \
+  app/SourcesShared/SubtitleAddons.swift app/Tests/SubtitleAddonFileMatchingTests.swift \
+  -o "$build_dir/subtitle-file-matching"
 "$build_dir/subtitle-file-matching"
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/BatchMetaSlotPolicy.swift app/Tests/BatchMetaSlotPolicyTests.swift \

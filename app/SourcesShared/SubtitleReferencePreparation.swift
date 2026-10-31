@@ -50,6 +50,37 @@ enum SubtitleReferencePreparation {
         case presentation(SubtitleReferencePresentation.Failure)
     }
 
+    /// One lossless projection policy for every whole reference occurrence. This is called by
+    /// the real worker after its extraction/owner receipt checks; it grants no source authority.
+    nonisolated static func referenceTimings(
+        from cues: [SubtitleEmbeddedExtractor.TimingCue],
+        window: SubtitleEmbeddedExtractor.TimingWindow
+    ) -> [SubtitleReferenceNativeQuery.Timing]? {
+        guard window.purpose == .reference,
+              window.startSeconds == Double(SubtitleReferenceNativeQuery.scoringWindowStartMs) / 1000,
+              window.endSeconds == Double(SubtitleReferenceNativeQuery.referenceWindowEndMs) / 1000,
+              (8...1024).contains(cues.count) else { return nil }
+        var timings: [SubtitleReferenceNativeQuery.Timing] = []
+        timings.reserveCapacity(cues.count)
+        var previous: UInt64?
+        var previousSeconds: Double?
+        for cue in cues {
+            guard cue.startSeconds.isFinite, cue.endSeconds.isFinite,
+                  cue.startSeconds >= window.startSeconds, cue.endSeconds <= window.endSeconds,
+                  cue.endSeconds > cue.startSeconds,
+                  previousSeconds.map({ cue.startSeconds >= $0 }) ?? true else { return nil }
+            let start = UInt64((cue.startSeconds * 1000).rounded())
+            let end = UInt64((cue.endSeconds * 1000).rounded())
+            // Distinct real starts may round to the same millisecond. Preserve all occurrences,
+            // while still rejecting backward original order and zero-width represented cues.
+            guard start < end, previous.map({ start >= $0 }) ?? true else { return nil }
+            timings.append(.init(startMs: start, endMs: end))
+            previous = start
+            previousSeconds = cue.startSeconds
+        }
+        return timings
+    }
+
     /// Blocking utility-worker operation. No owner lock, MainActor hop, user callback, player seek,
     /// native sub-add, live query, credentials, upload, account write or checkpoint is permitted here.
     nonisolated static func prepare(_ request: Request) -> Result<Prepared, Failure> {
@@ -98,23 +129,8 @@ enum SubtitleReferencePreparation {
               (1...100_000).contains(result.packetsRead) else {
             return .failure(.originalExtractionMismatch)
         }
-        var timings: [SubtitleReferenceNativeQuery.Timing] = []
-        timings.reserveCapacity(result.cues.count)
-        var previous: UInt64?
-        for cue in result.cues {
-            guard cue.startSeconds.isFinite, cue.endSeconds.isFinite,
-                  cue.startSeconds >= request.referenceWindow.startSeconds,
-                  cue.endSeconds <= request.referenceWindow.endSeconds,
-                  cue.endSeconds > cue.startSeconds, cue.endSeconds - cue.startSeconds <= 120 else {
-                return .failure(.originalExtractionMismatch)
-            }
-            let start = UInt64((cue.startSeconds * 1000).rounded())
-            let end = UInt64((cue.endSeconds * 1000).rounded())
-            guard start < end, previous.map({ start > $0 }) ?? true else {
-                return .failure(.originalExtractionMismatch)
-            }
-            timings.append(.init(startMs: start, endMs: end))
-            previous = start
+        guard let timings = referenceTimings(from: result.cues, window: request.referenceWindow) else {
+            return .failure(.originalExtractionMismatch)
         }
         guard let file = SubtitleReferenceNativeQuery.align(
             externalSRT: request.externalSRT,

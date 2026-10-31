@@ -22,6 +22,7 @@ import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 
 /**
@@ -127,6 +128,8 @@ data class StreamLoadUpdate(
     val timedOut: Boolean = false,
     /** True when automatic next-episode selection may consume this snapshot without skipping its continuity hint. */
     val selectionReady: Boolean = terminal || groups.isNotEmpty(),
+    /** Opaque repository context for matching read-only invalidations; conveys no native binding authority. */
+    val sourcePublicationId: String? = null,
 )
 
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the
@@ -137,6 +140,15 @@ data class StreamLoadUpdate(
 ///   - [meta]               -> `meta_details.meta`
 ///   - [streams]            -> `meta_details` stream groups (one per stream add-on)
 interface CatalogRepository {
+    /**
+     * Permanently revoked pool publications, independently observed after finite [streamUpdates] completes.
+     * Implementations replay their latest revoked opaque context id; ordinary add-on rows remain valid.
+     */
+    fun sourceInvalidations(): Flow<String> = emptyFlow()
+
+    /** Read-only scalar witness for this exact pool context; no authentication, native, IO, or row attachment. */
+    fun isSourcePoolPublicationCurrent(sourcePublicationId: String): Boolean = false
+
     /** Final owner-bound admission for host-generated rails whose lossy items lack provider certification. */
     fun admitClientHomeRows(rows: List<Catalog>, expectedOwner: ContinueWatchingOwner): Result<List<Catalog>> = Result.success(rows)
 

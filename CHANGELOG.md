@@ -4,6 +4,11 @@ Notable VortX changes, newest first. VortX is Apple TV first, with iPhone/iPad, 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased
+
+- **Imported Stremio titles in Library ([#267](https://github.com/VortXTV/VortX/issues/267)).** Apple apps now display the native engine’s combined Library view, including imported saved titles and eligible watched history. Continue Watching, detail membership, filters and search use the same accepted snapshot. Removed titles stay removed, and movies and series with the same ID keep their own resume state. A connected account also has an explicit **Refresh Stremio import** action, including after relaunch.
+- **Less work blocking Android sign-in ([#277](https://github.com/VortXTV/VortX/issues/277)).** Initial profile reads and recovery run in the background; the screen applies only a result that still belongs to the current account and profile. Dependent For You reloads are asynchronous, stale retries are bounded, and failed recovery retains pending saved changes. The reported customer crash still needs confirmation on the affected device.
+
 ## 0.5.6 - Native all the way, safer profiles and lighter playback
 
 Build **280** across Apple and Android. This brings the 0.5.6 beta repairs together, removes the old comparison engine and Node runtime from the native apps, and keeps your add-ons, profiles and saved data on the VortX engine. Stremio-compatible add-ons, optional Stremio account/library import and Cinemeta are still supported.

@@ -60,6 +60,17 @@ internal class VortxNativeRuntime private constructor(
         return true
     }
 
+    /** Actual prepared raw account admission, additive to the longstanding delegate ABI. A typed
+     * view without this capability fails closed; a generic handle cannot acquire it. */
+    @Synchronized internal fun commitTypedPreparedCheckpoint(snapshot: String,
+        archiveChanges: Map<String, ByteArray>, admission: NativePreparedAccountAdmission): Boolean {
+        check(!closed) { "Native engine closed" }
+        val target = delegate ?: return false
+        check(target is VortxPreparedAccountDelegate) { "Typed prepared-account admission unavailable" }
+        target.commitPreparedCheckpoint(snapshot, archiveChanges, admission)
+        return true
+    }
+
     val isTyped: Boolean get() = delegate != null
 
     @Synchronized fun replaceFromSnapshot(snapshot: String) {

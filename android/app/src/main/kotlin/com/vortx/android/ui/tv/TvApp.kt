@@ -9,6 +9,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -35,6 +36,9 @@ import com.vortx.android.player.queue.PlaybackQueueToken
 import com.vortx.android.player.queue.PlaybackQueueAcceptedTarget
 import com.vortx.android.ui.components.PlaybackQueueSheet
 import com.vortx.android.ui.components.rememberPlaybackQueuePresentation
+import com.vortx.android.ui.screens.SavedPlaylistScreen
+import com.vortx.android.ui.screens.XperienceCollectionsEntry
+import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.NextEpisodePreloadPolicy
@@ -127,11 +131,20 @@ fun TvApp(
                 confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
+        var importedCollectionsEntry by rememberSaveable { mutableStateOf<String?>(null) }
+        var importedFromHome by rememberSaveable { mutableStateOf(true) }
+        var importedReturnSignal by remember { mutableStateOf(0) }
+        fun openImportedCollections(fromHome: Boolean) {
+            importedFromHome = fromHome
+            importedCollectionsEntry = java.util.UUID.randomUUID().toString()
+        }
         var pendingLibraryPlay by remember { mutableStateOf<RandomTitlePlayRequest?>(null) }
         var pendingQueuePlay by remember { mutableStateOf<PlaybackQueueToken?>(null) }
         var pendingQueueAccepted by remember { mutableStateOf(false) }
         var pendingQueueAutomatic by remember { mutableStateOf(false) }
         var showingPlaybackQueueFor by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var showingSavedPlaylistFor by remember { mutableStateOf<ContinueWatchingOwner?>(null) }
+        var savedPlaylistStore by remember { mutableStateOf<com.vortx.android.playlists.SavedPlaylistStore?>(null) }
         var queuePolicyEpoch by remember(repo) { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
@@ -217,6 +230,7 @@ fun TvApp(
                 val owner = repo.continueWatchingOwner()
                 playbackQueue?.bindOwner(owner)
                 if (showingPlaybackQueueFor != null && showingPlaybackQueueFor != owner) showingPlaybackQueueFor = null
+                if (showingSavedPlaylistFor != null && showingSavedPlaylistFor != owner) showingSavedPlaylistFor = null
                 val request = pendingLibraryPlay ?: return
                 if (!isLibraryPlayCurrent(request)) retireLibraryPlayRoute()
             }
@@ -231,6 +245,7 @@ fun TvApp(
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
             retireLibraryPlayRoute()
+            importedCollectionsEntry = null
             showingPlaybackQueueFor = null
             playing = null
             playingMeta = null
@@ -268,6 +283,26 @@ fun TvApp(
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
+        val onImportedItem: (MetaItem) -> Unit = { item ->
+            retireLibraryPlayRoute()
+            if (item.continueWatchingAdmission?.isCurrent() != false) {
+                if (item.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${item.name}\n\n${item.continueWatchingUnavailableMessage}"
+                else { detailGeneration += 1; detail = item }
+            }
+        }
+        // The ordinary shell is removed by Detail and Player. Keep the original import entry ABOVE those
+        // branches, hide only its dialog while covered, and retire only on explicit exit/reload/disposal.
+        importedCollectionsEntry?.let { originalEntry -> key(originalEntry) {
+            TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
+                XperienceCollectionsEntry(entryId = originalEntry,
+                    factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = queueApplicationContext,
+                        homeSurface = HomeRailSurface.TV),
+                    visible = detail == null && playable == null, tv = true, dialog = true,
+                    onBack = { if (importedCollectionsEntry == originalEntry) { importedCollectionsEntry = null; importedReturnSignal++ } },
+                    onReload = { if (importedCollectionsEntry == originalEntry) openImportedCollections(importedFromHome) },
+                    onItem = onImportedItem)
+            }
+        } }
         val playerDetail = detail
         val playerVm: DetailViewModel? = if (playable != null && playerDetail != null && !playable.isTrailer) {
             viewModel(
@@ -350,10 +385,26 @@ fun TvApp(
             showingPlaybackQueueFor = null
             return true
         }
+        LaunchedEffect(showingSavedPlaylistFor, currentQueueOwner) {
+            if (showingSavedPlaylistFor != null && showingSavedPlaylistFor != currentQueueOwner) {
+                showingSavedPlaylistFor = null
+            }
+        }
         if (showingPlaybackQueueFor == currentQueueOwner && visibleQueueState != null) {
             PlaybackQueueSheet(
                 state = visibleQueueState,
                 onDismiss = { if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = null },
+                onManageSavedPlaylists = {
+                    if (showingPlaybackQueueFor == currentQueueOwner) {
+                        val app = queueApplicationContext as? VortXApplication
+                        val controller = app?.savedPlaylistStore
+                        if (controller != null) {
+                            savedPlaylistStore = controller
+                            showingSavedPlaylistFor = currentQueueOwner
+                            showingPlaybackQueueFor = null
+                        }
+                    }
+                },
                 onPlay = { entry ->
                     if (queueOwnerIsSelected(currentQueueOwner)) {
                         playbackQueue?.capture(currentQueueOwner, entry.id)?.let { openQueuePlay(it) }
@@ -370,6 +421,26 @@ fun TvApp(
                 },
             )
         }
+        val playlistOwner = showingSavedPlaylistFor
+        val playlistStore = savedPlaylistStore
+        if (playlistOwner != null && playlistStore != null && playlistOwner == currentQueueOwner) {
+            BackHandler { showingSavedPlaylistFor = null }
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { showingSavedPlaylistFor = null },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                androidx.compose.runtime.key(playlistOwner) {
+                    SavedPlaylistScreen(
+                        store = playlistStore,
+                        queue = requireNotNull(playbackQueue),
+                        owner = playlistOwner,
+                        ownerIsCurrent = currentQueueOwner == playlistOwner,
+                        onBack = { showingSavedPlaylistFor = null },
+                    )
+                }
+            }
+        }
+
         if (playable != null) {
             // The player is a separate early-return branch, so it must enter the TV Material scope here
             // rather than inheriting the browse shell's scope below. This keeps TV focus surfaces and their
@@ -599,8 +670,8 @@ fun TvApp(
                 } else {
                     null
                 },
-                onProgress = { pos, dur ->
-                    playbackHistory.report(pos, dur)
+                onProgress = { point ->
+                    playbackHistory.report(point)
                 },
                 // TV player additions: the per-stream Share QR (a magnet for a torrent, else the raw URL) and
                 // the 10-foot audio/subtitle language + forced-policy sheets and hidden-chrome D-pad skip pill.
@@ -817,6 +888,10 @@ fun TvApp(
                     },
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
+                    onImportedCollections = ::openImportedCollections,
+                    importedCollectionsOpen = importedCollectionsEntry != null,
+                    importedFromHome = importedFromHome,
+                    importedReturnSignal = importedReturnSignal,
                     onItem = {
                         retireLibraryPlayRoute()
                         if (it.continueWatchingAdmission?.isCurrent() != false) {
@@ -865,24 +940,24 @@ internal class TvPlaybackHistorySession(
     /// shell or engine state changes cannot retarget the session's history writes.
     private val boundContext = if (historyIdentity.playable.isTrailer) null else historyIdentity.playable.playbackContext
 
-    private var lastPositionMs = 0L
-    private var lastDurationMs = 0L
+    private val progress = handle?.let { com.vortx.android.player.PlaybackProgressCache(playbackSessions, it) }
+    private val localProgressOwner = java.util.UUID.randomUUID().toString()
+    internal val lastProgress: com.vortx.android.player.PlayerProgressSnapshot? get() = progress?.snapshot
 
     fun begin() {
         val activeHandle = handle ?: return
         playbackSessions.begin(activeHandle, boundContext, ownerToken)
     }
 
-    fun report(positionMs: Long, durationMs: Long) {
-        val activeHandle = handle ?: return
-        lastPositionMs = positionMs
-        lastDurationMs = durationMs
-        playbackSessions.report(activeHandle, positionMs, durationMs)
+    fun report(positionMs: Long, durationMs: Long) = report(
+        com.vortx.android.player.PlayerProgressSnapshot(localProgressOwner, positionMs, durationMs))
+
+    fun report(point: com.vortx.android.player.PlayerProgressSnapshot) {
+        progress?.report(point)
     }
 
     fun end() {
-        val activeHandle = handle ?: return
-        playbackSessions.end(activeHandle, lastPositionMs, lastDurationMs)
+        progress?.end()
     }
 }
 

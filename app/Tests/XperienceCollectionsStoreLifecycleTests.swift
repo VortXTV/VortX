@@ -221,7 +221,8 @@ import Foundation
         }
         subscription?.cancel()
         try require(model.preview != nil && model.isLive, "actual ViewModel preview activates the UI cancellation fixture")
-        _ = model.stageSave()
+        guard let original = model.previewIdentity else { throw Failure.assertion("missing preview identity") }
+        _ = model.stageSave(original)
         let id = await core.waitForSave(at: 0)
         // Read the actual private owner without widening a production API or adding test flags.
         // Fail closed if its name/type changes, rather than guessing that queued work settled.
@@ -240,12 +241,188 @@ import Foundation
         try require(core.syntheticPublications == 0, "UI stop before synthetic checkpoint leaves no publication")
     }
 
+    static func rawObservation() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let source = try XperienceImportNamespace.appendRaw(document: document("raw-observation"), label: "Original", bindings: [:])
+        let exact = Data("340282366920938463463374607431768211455".utf8)
+        var value = try OwnerHistoryExactJSON.Object(source.raw.value); value.set("futureExact", exact)
+        var register = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        register.set("clock", Data("7".utf8))
+        register.set("actor", try OwnerHistoryExactJSON.string("10000000-0000-4000-8000-000000000001"))
+        register.set("value", try value.encoded()); register.set("futureRegister", exact)
+        let original = try register.encoded()
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(original)
+        let lease = try store.capture(), revision = store.revision
+        // Whitespace is not a change in the observed register structure. Exact numeric
+        // tokens and every unknown sibling still participate in the immutable evidence.
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(Data(" \n".utf8) + original + Data(" \n".utf8))
+        await core.observeNotification { core.notify() }
+        try require(store.isCurrent(lease) && store.revision == revision, "raw semantic observation keeps unchanged whitespace publication conflated")
+        let saved = try store.namespaces(lease)[0]
+        let replacement = Task {
+            try await store.replace(namespace: saved, document: document("raw-renamed"), label: "Renamed", bindings: [:], lease: lease)
+        }
+        let id = await core.waitForSave(at: 0)
+        try core.publish(id)
+        await core.observeNotification { core.notify() }
+        try require(store.isCurrent(lease), "complete raw own ACK retains original Store lifetime")
+        core.finish(id)
+        _ = try await replacement.value
+        let acknowledged = core.rawRegisterFixtures[source.field]!
+        let acknowledgedRegister = try OwnerHistoryExactJSON.Object(acknowledged.bytes)
+        let acknowledgedValue = try OwnerHistoryExactJSON.Object(acknowledged.value)
+        try require(acknowledgedRegister["futureRegister"] == exact && acknowledgedValue["futureExact"] == exact,
+                    "actual Store replacement retains complete raw future value and metadata through its synthetic boundary")
+        var changed = acknowledgedRegister
+        changed.set("futureRegister", Data("340282366920938463463374607431768211454".utf8))
+        core.rawRegisterFixtures[source.field] = try VortxRawHostRegister.prepared(changed.encoded())
+        await core.observeNotification { core.notify() }
+        try require(!store.isCurrent(lease) && !core.captures[0].lifetime.isActive && core.captures.count == 1,
+                    "unknown raw metadata change retires the actual Store observation without successor recapture")
+    }
+
+    static func isolatedInstalledBindingChoice() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let catalogs: VortxJSON = .array([.object(["type": .string("movie"), "id": .string("popular")])])
+        core.installedProjection = try XperienceInstalledCatalogs.project([
+            .init(id: "bad", transportUrl: "https://catalog.example.invalid/a bad/manifest.json",
+                manifest: .object(["id": .string("fixture.a"), "catalogs": catalogs])),
+            .init(id: "valid", transportUrl: "https://catalog.example.invalid/a/manifest.json?configuration=synthetic",
+                manifest: .object(["id": .string("fixture.a"), "catalogs": catalogs]))
+        ])
+        let admitted = try XperienceCollections.project(.array([.object(["id": .string("collection"),
+            "title": .string("Synthetic"), "futureOpaque": .string("retain"), "folders": .array([
+                .object(["id": .string("folder"), "title": .string("Folder"), "sources": .array([
+                    .object(["provider": .string("addon"), "addonId": .string("fixture.a"),
+                        "type": .string("movie"), "catalogId": .string("popular")])])])])])]))
+        let model = XperienceCollectionsViewModel(store: store)
+        var subscription: AnyCancellable?
+        let text = String(decoding: try XperienceCollections.canonicalData(admitted.raw), as: UTF8.self)
+        await withCheckedContinuation { continuation in
+            subscription = model.$preview.compactMap { $0 }.first().sink { _ in continuation.resume() }
+            model.previewPaste(text)
+        }
+        subscription?.cancel()
+        guard let row = model.bindingRows.first else { throw Failure.assertion("missing isolated installed row") }
+        try require(row.selection == nil && model.unavailableSourceCount == 1,
+                    "actual ViewModel does not auto-map a surviving malformed-same-ID sibling")
+        try require(row.choices.count == 1 && row.choices[0].title == "Installed instance 2",
+                    "actual ViewModel offers only the valid original installed position")
+        try require(row.status.contains("unavailable") && !row.status.contains("https://"),
+                    "unresolved installed state is bounded and actionable without config output")
+        guard let original = model.previewIdentity else { throw Failure.assertion("missing preview identity") }
+        model.chooseInstance(row: row.id, choice: row.choices[0].id, original: original)
+        try require(model.bindingRows[0].selection != nil && model.unavailableSourceCount == 0,
+                    "explicit valid original mapping resolves through actual ViewModel wrapper")
+        try require(model.preview?.raw == admitted.raw && core.captures.count == 1 && core.syntheticPublications == 0,
+                    "binding choice preserves raw preview and original capture without a write")
+        let successor = try await loadPreview(model, admitted)
+        model.chooseInstance(row: row.id, choice: row.choices[0].id, original: successor)
+        let currentSelection = model.bindingRows[0].selection
+        model.chooseInstance(row: row.id, choice: "unavailable", original: original)
+        try require(currentSelection != nil && model.bindingRows[0].selection == currentSelection,
+                    "same-ID old binding action cannot clear successor preview mapping")
+        model.stop()
+    }
+
+    static func loadPreview(_ model: XperienceCollectionsViewModel, _ value: XperienceCollections.Document) async throws -> XperiencePresentationIdentity {
+        let text = String(decoding: try XperienceCollections.canonicalData(value.raw), as: UTF8.self)
+        let previous = model.previewIdentity
+        var subscription: AnyCancellable?
+        await withCheckedContinuation { continuation in
+            subscription = model.$previewIdentity.compactMap { $0 }.filter { $0 != previous }.first().sink { _ in continuation.resume() }
+            model.previewPaste(text)
+        }
+        subscription?.cancel()
+        guard let original = model.previewIdentity else { throw Failure.assertion("missing installed preview identity") }
+        return original
+    }
+
+    static func originalPreviewGestures() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let model = XperienceCollectionsViewModel(store: store)
+        let document = try document("same-rendered-identifiers")
+        let first = try await loadPreview(model, document)
+        model.setLabel("Original edited label", original: first)
+        try require(model.label == "Original edited label", "current preview label gesture remains usable")
+        let second = try await loadPreview(model, document)
+        try require(first != second && core.captures.count == 2, "same document receives a distinct original preview identity")
+        model.setLabel("STALE", original: first)
+        model.setDestination("append", original: first)
+        model.chooseInstance(row: "unused", choice: "unavailable", original: first)
+        let staleConfirmation = model.stageSave(first)
+        try require(model.label == "Imported collections" && model.destination == "append" && staleConfirmation == nil && !model.busy,
+                    "old label, destination, mapping and Save actions cannot target successor preview")
+        try require(model.previewIdentity == second && core.captures.count == 2 && core.saveIDs.isEmpty,
+                    "denied old gestures neither recapture ownership nor start a save")
+        model.stop()
+        model.setLabel("AFTER STOP", original: second)
+        _ = model.stageSave(second)
+        try require(model.previewIdentity == nil && model.preview == nil && !model.busy && core.saveIDs.isEmpty,
+                    "stop retires preview gesture authority before delayed edits or Save")
+    }
+
+    static func originalSavedReviewAndConfirmation() async throws {
+        resetPublishedContext()
+        let core = CoreBridge(), store = XperienceCollectionsStore(core: core)
+        let edit = try XperienceImportNamespace.appendRaw(document: document("saved-gesture"), label: "Original saved import", bindings: [:])
+        var register = try OwnerHistoryExactJSON.Object(Data("{}".utf8))
+        register.set("clock", Data("7".utf8))
+        register.set("actor", try OwnerHistoryExactJSON.string("10000000-0000-4000-8000-000000000001"))
+        register.set("value", edit.raw.value)
+        core.rawRegisterFixtures[edit.field] = try VortxRawHostRegister.prepared(register.encoded())
+        let model = XperienceCollectionsViewModel(store: store)
+        model.reload()
+        guard let oldList = model.savedIdentity else { throw Failure.assertion("missing original saved list") }
+        model.reload()
+        guard let list = model.savedIdentity else { throw Failure.assertion("missing successor saved list") }
+        model.reviewSaved(edit.field, original: oldList)
+        try require(model.preview == nil && model.savedIdentity == list && core.captures.count == 2,
+                    "old saved-row callback cannot recapture or resolve against successor list")
+        model.reviewSaved(edit.field, original: list)
+        guard let previewA = model.previewIdentity, let confirmA = model.stageSave(previewA) else {
+            throw Failure.assertion("missing original replacement confirmation")
+        }
+        try require(core.captures.count == 2 && model.destination == edit.field,
+                    "current saved review retains its original lease and raw replacement namespace")
+        model.reviewSaved(edit.field, original: list)
+        guard let previewB = model.previewIdentity, let confirmB = model.stageSave(previewB) else {
+            throw Failure.assertion("missing successor replacement confirmation")
+        }
+        model.setDestination("append", original: previewA)
+        model.setLabel("STALE REPLACEMENT", original: previewA)
+        try require(model.destination == edit.field && model.label == "Original saved import",
+                    "old preview cannot redirect or relabel the new replacement")
+        model.cancelStaged(confirmA)
+        model.commitStaged(confirmA)
+        try require(!model.busy && core.saveIDs.isEmpty && previewA != previewB && confirmA != confirmB,
+                    "old confirm and cancel cannot submit or clear successor confirmation")
+        model.commitStaged(confirmB)
+        let id = await core.waitForSave(at: 0)
+        let tasks = Mirror(reflecting: model).children.filter { $0.label == "saveTask" }
+        guard tasks.count == 1, let task = tasks[0].value as? Task<Void, Never>?, let task else {
+            throw Failure.assertion("missing exact successor save task")
+        }
+        try core.publish(id); core.finish(id)
+        await task.value
+        try require(core.syntheticPublications == 1 && core.captures.count == 2 && model.preview == nil && model.savedIdentity != list,
+                    "current confirmation saves once and rotates saved-row identity without owner recapture")
+        model.reviewSaved(edit.field, original: list)
+        try require(model.preview == nil && core.captures.count == 2,
+                    "acknowledged list revision retires previously rendered row actions")
+        model.stop()
+    }
+
     static func run() async throws {
         let selected = CommandLine.arguments.dropFirst().first ?? "all"
         let cases: [(String, () async throws -> Void)] = [
             ("own-ack", ownACK), ("changed-registers", changedRegisters), ("profile-aba", profileABA),
             ("context-retirement", contextRetirement), ("pending-identity", pendingIdentity),
-            ("cancellation", cancellation), ("ui-stop", viewModelStop)
+            ("cancellation", cancellation), ("ui-stop", viewModelStop), ("raw-observation", rawObservation), ("installed-isolation", isolatedInstalledBindingChoice),
+            ("original-preview", originalPreviewGestures), ("original-saved-confirmation", originalSavedReviewAndConfirmation)
         ]
         guard selected == "all" || cases.contains(where: { $0.0 == selected }) else { throw Failure.assertion("unknown case") }
         for (name, operation) in cases where selected == "all" || selected == name {

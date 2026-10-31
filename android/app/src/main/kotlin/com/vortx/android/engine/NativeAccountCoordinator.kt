@@ -4,19 +4,33 @@ import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.NativeAccountGateway
+import com.vortx.android.sync.NativeAccountReadCapture
 import com.vortx.android.sync.NativeAccountExport
 import com.vortx.android.sync.NativeAccountMountToken
+import com.vortx.android.sync.NativeAccountUploadCurrency
+import com.vortx.android.sync.NativePlaylistProfileGateway
+import com.vortx.android.sync.NativeXperienceProfileGateway
+import com.vortx.android.sync.NativeHostUploadAcknowledgment
+import com.vortx.android.xperience.XperienceImportNamespace
 import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.sync.LocalLibraryMutationAuthority
 import com.vortx.android.sync.VortXSyncDoc
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.json.JSONArray
 
@@ -38,8 +52,53 @@ internal class NativeAccountCoordinator(
     /** A committed playback-progress report; defaults to the ordinary mutation callback. */
     private val onProgressMutation: (SessionOwnerSnapshot.Account) -> Unit = onMutation,
     private val historyBindings: NativeOwnerHistoryBindings = NativeOwnerHistoryJniBindings,
-) : NativeAccountGateway {
-    private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
+    /** Read-only metadata admission, captured on IO. Never reused for a native mutation. */
+    private val captureProfilePresentationAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = captureOwnAccountAdmission,
+    /** For You command identity includes auth/session/operation scope, independent of read stamps. */
+    private val captureForYouAccountAuthority: (SessionOwnerSnapshot.Account) -> LocalLibraryMutationAuthority? = { null },
+) : NativeAccountGateway, NativePlaylistProfileGateway, NativeXperienceProfileGateway {
+    private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession) {
+        private var retired = false
+        private var authenticatedRead: NativeAccountReadCapture? = null
+        private var sourceNativeProjection: ByteArray? = null
+
+        @Synchronized fun retain(read: NativeAccountReadCapture, projection: ByteArray): Boolean {
+            if (retired || read.account != account) return false
+            val old = authenticatedRead
+            authenticatedRead = read
+            sourceNativeProjection?.fill(0)
+            sourceNativeProjection = projection.copyOf()
+            if (old !== read) old?.retire()
+            return true
+        }
+
+        @Synchronized fun clearRead(expected: NativeAccountReadCapture? = null) {
+            if (expected == null || authenticatedRead === expected) {
+                authenticatedRead?.retire()
+                authenticatedRead = null
+                sourceNativeProjection?.fill(0); sourceNativeProjection = null
+            }
+        }
+
+        @Synchronized fun retireRead() {
+            retired = true
+            authenticatedRead?.retire()
+            authenticatedRead = null
+            sourceNativeProjection?.fill(0); sourceNativeProjection = null
+        }
+        @Synchronized fun readIdentity(): NativeAccountReadCapture? = authenticatedRead.takeUnless { retired }
+        @Synchronized fun sourceProjection(): ByteArray? = sourceNativeProjection?.copyOf().takeUnless { retired }
+        @Synchronized fun <T> withRead(expected: NativeAccountReadCapture, action: (ByteArray, ByteArray) -> T): T {
+            check(!retired && authenticatedRead === expected) { "Authenticated raw observation changed" }
+            val raw = expected.copyRawForApply(account)
+            val projection = checkNotNull(sourceNativeProjection).copyOf()
+            return try { action(raw, projection) } finally { raw.fill(0); projection.fill(0) }
+        }
+    }
+    @Volatile private var playlistAccountProducer: com.vortx.android.sync.NativePlaylistAccountProducer? = null
+    override fun installPlaylistAccountProducer(producer: com.vortx.android.sync.NativePlaylistAccountProducer) {
+        playlistAccountProducer = producer
+    }
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
     private val lifecycleLock = Any()
@@ -61,7 +120,83 @@ internal class NativeAccountCoordinator(
         fun matches(other: OwnerAuthTarget) = account == other.account && session === other.session && owner == other.owner &&
             selection.raw == other.selection.raw && hasCredential == other.hasCredential
     }
+    /** Revocation never calls Session/auth/lifecycle while holding this scalar monitor. */
+    private class PlaylistLifetime {
+        private val lock = Any()
+        private var active = true
+        fun admit(action: () -> Boolean): Boolean = synchronized(lock) { active && action() }
+        fun revoke() = synchronized(lock) { active = false }
+    }
+    private class CapturedPlaylistTarget(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val lifetime: PlaylistLifetime,
+        override val receiptOwner: CapturedReceiptOwner,
+        val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer?,
+    ) : NativePlaylistProfileGateway.Target {
+        override val accountId get() = account.id
+        override val profileId get() = owner.profileID
+    }
+    private class CapturedReceiptOwner(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val profileEpoch: Long,
+        val lifetime: PlaylistLifetime = PlaylistLifetime(),
+    ) : NativePlaylistProfileGateway.ReceiptOwner
+    private class CapturedPlaylistSnapshot(
+        override val target: CapturedPlaylistTarget,
+        rawRegisters: JSONObject,
+        override val receipt: NativePlaylistCloudReceiptLedger.Ticket? = null,
+    ) : NativePlaylistProfileGateway.Snapshot {
+        private val acceptedRegisters = JSONObject(rawRegisters.toString())
+        override val registers get() = JSONObject(acceptedRegisters.toString())
+        fun matches(fields: JSONObject) = NativeHostPreferences.equal(acceptedRegisters, fields)
+    }
+    private data class DetachedPlaylistEdit(val field: String, val expectedRegister: JSONObject?, val value: Any)
+    private class CapturedXperienceTarget(
+        val account: SessionOwnerSnapshot.Account,
+        val session: VortxNativeSession,
+        val owner: VortxNativeOwner,
+        val installation: Mounted,
+        val admission: (() -> Boolean) -> Boolean,
+        val lifetime: PlaylistLifetime,
+        val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer,
+        val context: String,
+    ) : NativeXperienceProfileGateway.Target {
+        override val accountId get() = account.id
+        override val profileId get() = owner.profileID
+    }
+    private class CapturedXperienceSnapshot(
+        override val target: CapturedXperienceTarget,
+        fields: Map<String, ByteArray>,
+    ) : NativeXperienceProfileGateway.Snapshot {
+        private val raw = fields.mapValues { it.value.copyOf() }
+        override fun registers() = raw.mapValues { it.value.copyOf() }
+        fun matches(fields: Map<String, ByteArray>) = raw.keys == fields.keys &&
+            raw.all { (key, value) -> value.contentEquals(fields.getValue(key)) }
+    }
+    private val playlistReceipts = NativePlaylistCloudReceiptLedger()
+    override val playlistReceiptChanges = MutableStateFlow(0L)
+
     val changes = MutableStateFlow(0L)
+    private val playlistMountRevisions = MutableStateFlow(0L)
+    override val playlistChanges = channelFlow {
+        playlistMountRevisions.collectLatest {
+            val current = mounted.get()
+            if (current == null || !accountCurrent(current.account)) send(Unit)
+            else current.session.playlistUpdates.collect {
+                if (mounted.get() === current && accountCurrent(current.account)) send(Unit)
+            }
+        }
+    }
 
     internal data class MigrationStatus(val pendingRows: Int, val setupRequired: Boolean, val watchlistPending: Int = 0)
     internal class MigrationTarget internal constructor(internal val account: SessionOwnerSnapshot.Account,
@@ -203,6 +338,34 @@ internal class NativeAccountCoordinator(
         fun publishIfCurrent(action: () -> Unit): Boolean = admission(action)
     }
 
+    /** Captured while Session is held by the worker, admitted later without reacquiring it.
+     * The exact Mounted object, authenticated generation and both monotone stamps reject ABA. */
+    internal fun captureProfilePresentation(session: VortxNativeSession): com.vortx.android.profile.NativeProfileGateway.PreparedProjection =
+        synchronized(session) {
+            // Read-only failure handoff also retains a qualified migration witness after checkpoint
+            // uncertainty. It never grants a command capability or reports recovery as success.
+            val read = session.read()
+            val current = checkNotNull(mounted.get()) { "Native account changed" }
+            check(current.session === session && accountCurrent(current.account)) { "Native account changed" }
+            val epoch = changes.value
+            val version = session.updates.value
+            val recovery = session.requiresRecovery()
+            val authenticated = captureProfilePresentationAdmission(current.account)
+            check(authenticated != null || ownCredentials == null) { "Native profile authentication unavailable" }
+            com.vortx.android.profile.NativeProfileGateway.PreparedProjection(NativeProfileAccess.projection(read), recovery) { action ->
+                val publish = {
+                    synchronized(lifecycleLock) {
+                        if (mounted.get() === current && changes.value == epoch && session.updates.value == version) {
+                            action(); true
+                        } else false
+                    }
+                }
+                // Production admission is already captured. Neither secure persistence nor Session
+                // is consulted in the Main window. The fallback is for deterministic fixtures only.
+                if (authenticated != null) authenticated(publish) else accountCurrent(current.account) && publish()
+            }
+        }
+
     /** Expensive work belongs to the caller's background refresh lane, never a Compose/init callback.
      * One native read supplies all three views. Final publication checks only auth, mount identity
      * and the atomic update stamp; it does not reacquire Session or serialize state on Main. */
@@ -301,6 +464,437 @@ internal class NativeAccountCoordinator(
     /** Caller already holds ContinueWatchingOwnerGate -> Session, never acquire either inside auth. */
     fun withProfileMutation(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean =
         withAccountAdmission(account, { true }) { withMountedSession(session, account, action) }
+
+    /**
+     * Playlist lock order is Session -> captured authenticated account admission -> mounted
+     * lifecycle -> captured consumer lifetime. Session.dispatch is reentrant at the tail. Target
+     * revocation takes only its lifetime monitor, so a commit already inside that monitor
+     * linearizes before revocation; a revocation that wins first prevents the commit. The admitted
+     * helper is called only while Session is held with its single validated presentation read.
+     */
+    private fun <T> withAdmittedPlaylistTarget(
+        target: CapturedPlaylistTarget,
+        read: VortxNativeRead,
+        action: (VortxNativeRead) -> T,
+    ): T {
+        var result: Result<T>? = null
+        val admitted = target.admission {
+            if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                    if (read.owner != target.owner) false else {
+                        result = runCatching { action(read) }
+                        true
+                    }
+                }
+            }
+        }
+        check(admitted) { "Native playlist target changed" }
+        return requireNotNull(result).getOrThrow()
+    }
+
+    private fun <T> withCapturedPlaylistTarget(target: CapturedPlaylistTarget, action: (VortxNativeRead) -> T): T =
+        target.session.withCompleteAccountExportOwner(target.owner, target.originalRead != null) { read ->
+            check(target.originalRead == null || (target.installation.readIdentity() === target.originalRead &&
+                playlistAccountProducer === target.producer)) { "Original complete-account observation changed" }
+            withAdmittedPlaylistTarget(target, read, action)
+        }
+
+    /** The acknowledged carrier has already crossed complete host validation. Clone only this
+     * bounded family so callers cannot mutate Session-owned JSON or rewrite unknown siblings. */
+    private fun playlistFields(read: VortxNativeRead, profileID: String): JSONObject {
+        val profiles = read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document")
+            .getJSONObject("profiles")
+        val bucket = profiles.optJSONObject(NativeHostPreferences.canonicalProfileID(profileID)) ?: return JSONObject()
+        val fields = bucket.getJSONObject("fields")
+        return JSONObject().also { detached ->
+            fields.keys().asSequence().filter { it.startsWith(NativePlaylist.PREFIX) }.forEach { field ->
+                detached.put(field, JSONObject(fields.getJSONObject(field).toString()))
+            }
+        }
+    }
+
+    private fun playlistSnapshot(target: CapturedPlaylistTarget, read: VortxNativeRead): CapturedPlaylistSnapshot =
+        CapturedPlaylistSnapshot(target, playlistFields(read, target.profileId))
+
+    private inline fun <T> playlistResult(action: () -> T): Result<T> = try {
+        Result.success(action())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Throwable) {
+        Result.failure(error)
+    }
+
+    override fun capturePlaylistProfile(): Result<NativePlaylistProfileGateway.Snapshot> = playlistResult {
+        val installation = checkNotNull(mounted.get()) { "Native account has not completed authenticated bootstrap" }
+        // This exact closure freezes sync operation generation, account owner epoch and session.
+        // Playlist authority is unavailable rather than falling back to accountCurrent alone.
+        val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) {
+            "Native playlist account admission unavailable"
+        }
+        val originalRead = installation.readIdentity()
+        val producer = playlistAccountProducer
+        installation.session.withPlaylistReceiptCapture(originalRead != null && producer != null) { read, receiptEpoch ->
+            val receiptOwner = CapturedReceiptOwner(installation.account, installation.session, read.owner,
+                installation, admission, receiptEpoch)
+            val target = CapturedPlaylistTarget(installation.account, installation.session, read.owner,
+                installation, admission, PlaylistLifetime(), receiptOwner, originalRead, producer)
+            withAdmittedPlaylistTarget(target, read) { playlistSnapshot(target, it) }
+        }
+    }
+
+    override fun playlistTargetIsCurrent(target: NativePlaylistProfileGateway.Target): Boolean {
+        val captured = target as? CapturedPlaylistTarget ?: return false
+        return runCatching { withCapturedPlaylistTarget(captured) { true } }.getOrDefault(false)
+    }
+
+    override fun playlistSnapshot(target: NativePlaylistProfileGateway.Target): Result<NativePlaylistProfileGateway.Snapshot> {
+        val captured = target as? CapturedPlaylistTarget
+            ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
+        return playlistResult { withCapturedPlaylistTarget(captured) { read -> playlistSnapshot(captured, read) } }
+    }
+
+    override fun publishPlaylistIfCurrent(snapshot: NativePlaylistProfileGateway.Snapshot, publication: () -> Unit): Boolean {
+        val capturedSnapshot = snapshot as? CapturedPlaylistSnapshot ?: return false
+        val captured = capturedSnapshot.target
+        return runCatching { withCapturedPlaylistTarget(captured) { read ->
+            if (!capturedSnapshot.matches(playlistFields(read, captured.profileId))) false
+            else { publication(); true }
+        } }.getOrDefault(false)
+    }
+
+    override fun retirePlaylistTarget(target: NativePlaylistProfileGateway.Target) {
+        (target as? CapturedPlaylistTarget)?.lifetime?.revoke()
+    }
+    override fun retirePlaylistReceiptOwner(owner: NativePlaylistProfileGateway.ReceiptOwner) {
+        (owner as? CapturedReceiptOwner)?.let {
+            it.lifetime.revoke(); playlistReceipts.retire(it); playlistReceiptChanges.update { value -> value + 1 }
+        }
+    }
+
+    private fun <T> withReceiptOwner(target: CapturedReceiptOwner, action: () -> T): T =
+        target.session.withPlaylistReceiptEpoch(target.owner, target.profileEpoch) {
+            var result: Result<T>? = null
+            check(target.admission {
+                if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                    if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                        result = runCatching(action); true
+                    }
+                }
+            }) { "Native playlist target changed" }
+            requireNotNull(result).getOrThrow()
+        }
+
+    override fun playlistReceiptState(owner: NativePlaylistProfileGateway.ReceiptOwner,
+        ticket: NativePlaylistCloudReceiptLedger.Ticket,
+        current: NativePlaylistCloudReceiptLedger.Fingerprint): NativePlaylistCloudReceiptLedger.State {
+        val captured = owner as? CapturedReceiptOwner ?: return NativePlaylistCloudReceiptLedger.State.Unknown
+        return runCatching { withReceiptOwner(captured) { playlistReceipts.state(captured, ticket, current) } }
+            .getOrDefault(NativePlaylistCloudReceiptLedger.State.Unknown)
+    }
+
+    override fun freezePlaylistReceipts(account: SessionOwnerSnapshot.Account): Any? =
+        playlistReceipts.freeze().filter { (playlistReceipts.owner(it) as? CapturedReceiptOwner)?.account == account }
+
+    override fun acceptPlaylistReceipts(account: SessionOwnerSnapshot.Account, frozen: Any?,
+        acceptedCandidate: String, version: Long) {
+        if (acceptedCandidate.length > 7 * 1024 * 1024 || version < 0) return
+        val entries = (frozen as? List<*>)?.filterIsInstance<NativePlaylistCloudReceiptLedger.Frozen>() ?: return
+        if (entries.size > 64) return
+        val host = runCatching { JSONObject(acceptedCandidate).getJSONObject("nativeHostPreferences") }.getOrNull() ?: return
+        val firstOwner = entries.firstNotNullOfOrNull { playlistReceipts.owner(it) as? CapturedReceiptOwner } ?: return
+        val scope = firstOwner.owner.scope
+        if (runCatching { NativeHostPreferences.validate(scope, host) }.isFailure) return
+        val profiles = host.getJSONObject("profiles")
+        val profileIndex = NativeHostPreferences.profileKeyIndex(profiles)
+        val groups = entries.mapNotNull { entry ->
+            (playlistReceipts.owner(entry) as? CapturedReceiptOwner)?.let { it to entry }
+        }.groupBy({ it.first }, { it.second })
+        for ((session, owners) in groups.entries.groupBy { it.key.session }) {
+            runCatching {
+                synchronized(session) {
+                    val read = session.read()
+                    val currentFields = playlistFields(read, read.owner.profileID)
+                    for ((target, ownedEntries) in owners) {
+                        if (target.account != account || target.owner.scope != scope) continue
+                        runCatching { withReceiptOwner(target) {
+                            if (read.owner.profileID != target.owner.profileID) return@withReceiptOwner
+                            val profileKey = profileIndex[NativeHostPreferences.canonicalProfileID(target.owner.profileID)]
+                                ?: return@withReceiptOwner
+                            val acceptedFields = profiles.getJSONObject(profileKey).getJSONObject("fields")
+                            for (entry in ownedEntries) {
+                                val accepted = acceptedFields.optJSONObject(entry.field) ?: continue
+                                val current = currentFields.optJSONObject(entry.field) ?: continue
+                                val acceptedBytes = NativePlaylist.canonicalReceiptRegister(accepted) ?: continue
+                                val currentBytes = NativePlaylist.canonicalReceiptRegister(current) ?: continue
+                                if (java.security.MessageDigest.isEqual(acceptedBytes, currentBytes) &&
+                                    playlistReceipts.acknowledge(entry, acceptedBytes, version))
+                                    playlistReceiptChanges.update { value -> value + 1 }
+                            }
+                        } }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Validate before the first JSON serialization, then validate the detached immutable copy
+     * again so a queued operation never observes later caller mutation. */
+    private fun detachPlaylistEdit(field: String, expectedRegister: JSONObject?, value: Any,
+                                   fields: JSONObject): DetachedPlaylistEdit {
+        NativePlaylist.validateMutation(field, expectedRegister, value, fields)
+        val expected = expectedRegister?.let { JSONObject(it.toString()) }
+        val detachedValue = when (value) {
+            JSONObject.NULL -> JSONObject.NULL
+            is JSONObject -> JSONObject(value.toString())
+            else -> throw IllegalArgumentException("Invalid playlist value")
+        }
+        NativePlaylist.validateMutation(field, expected, detachedValue, fields)
+        return DetachedPlaylistEdit(field, expected, detachedValue)
+    }
+
+    override suspend fun compareAndSetPlaylistField(
+        target: NativePlaylistProfileGateway.Target,
+        editId: String,
+        field: String,
+        expectedRegister: JSONObject?,
+        value: Any,
+    ): Result<NativePlaylistProfileGateway.Snapshot> {
+        val captured = target as? CapturedPlaylistTarget
+            ?: return Result.failure(IllegalArgumentException("Invalid native playlist target"))
+        val edit = runCatching { UUID.fromString(editId).takeIf { it.toString() == editId } }.getOrNull()
+            ?: return Result.failure(IllegalArgumentException("Invalid playlist edit identity"))
+        var accountWrite: com.vortx.android.sync.NativePlaylistAccountWrite? = null
+        var originalCheckpoint: NativeCheckpointRead? = null
+        val prepared = playlistResult {
+            withCapturedPlaylistTarget(captured) { read ->
+                val detached = detachPlaylistEdit(field, expectedRegister, value, playlistFields(read, captured.profileId))
+                originalCheckpoint = captured.session.captureGenericPlaylistCheckpoint(captured.owner)
+                if (!captured.session.hasOwnerHistory()) {
+                    accountWrite = checkNotNull(captured.producer?.capture(captured.account)) {
+                        "Complete account write admission unavailable"
+                    }
+                }
+                detached
+            }
+        }.getOrElse { accountWrite?.close(); return Result.failure(it) }
+        val operationJob = currentCoroutineContext()[Job]
+        return try { withContext(Dispatchers.IO) {
+            playlistResult {
+                operationJob?.ensureActive()
+                withCapturedPlaylistTarget(captured) { read ->
+                    operationJob?.ensureActive()
+                    val liveFields = playlistFields(read, captured.profileId)
+                    NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value, liveFields)
+                    captured.session.dispatchBudgetedPlaylist(captured.owner,
+                        JSONObject().put(prepared.field, prepared.value),
+                        prospectiveGlobalChanges = accountWrite?.pendingGlobalValues(),
+                        genericCheckpoint = originalCheckpoint,
+                        genericAdmission = accountWrite?.let { write -> { native: ByteArray, host: ByteArray, commit: () -> Unit ->
+                            captured.installation.withRead(checkNotNull(captured.originalRead)) { raw, projection ->
+                                write.commitCandidate(raw, projection, native, host) {
+                                    operationJob?.ensureActive()
+                                    check(mounted.get() === captured.installation && accountCurrent(captured.account) &&
+                                        playlistAccountProducer === captured.producer)
+                                    NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value,
+                                        playlistFields(captured.session.read(), captured.profileId))
+                                    commit()
+                                }
+                            }
+                        } }, beforeCommit = {
+                            operationJob?.ensureActive()
+                            check(mounted.get() === captured.installation && accountCurrent(captured.account)) {
+                                "Native playlist target changed"
+                            }
+                            // Session is still on the original state here. This is the final raw
+                            // register CAS/domain admission after candidate construction and before
+                            // its complete-account checkpoint is allowed to replace durable state.
+                            NativePlaylist.validateMutation(prepared.field, prepared.expectedRegister, prepared.value,
+                                playlistFields(captured.session.read(), captured.profileId))
+                        })
+                    val acceptedRead = captured.session.read()
+                    check(acceptedRead.owner == captured.owner) { "Native playlist owner changed during commit" }
+                    val acceptedFields = playlistFields(acceptedRead, captured.profileId)
+                    val register = acceptedFields.optJSONObject(prepared.field)
+                        ?: error("Native playlist register was not acknowledged")
+                    check(NativeHostPreferences.equal(register.opt("value"), prepared.value)) {
+                        "Native playlist register readback did not match"
+                    }
+                    val receipt = runCatching { NativePlaylist.canonicalReceiptRegister(register)?.let {
+                        playlistReceipts.register(captured.receiptOwner, edit, prepared.field, it)
+                    } }.getOrNull()
+                    // The ordinary Session notification has already fired. Re-arm after registration
+                    // under this original admission so a fast earlier upload cannot miss this edit.
+                    if (receipt != null) {
+                        playlistReceiptChanges.update { value -> value + 1 }
+                        runCatching { onMutation(captured.account) }
+                    }
+                    CapturedPlaylistSnapshot(captured, acceptedFields, receipt)
+                }
+            }
+        } } finally { accountWrite?.close() }
+    }
+
+    /** The Session -> original auth admission -> mount -> lifetime order matches other writers.
+     * No callback samples a new account, producer, owner, GET or logical registry on resume. */
+    private fun <T> withCapturedXperienceTarget(target: CapturedXperienceTarget, action: (VortxNativeRead) -> T): T =
+        target.session.withCompleteAccountExportOwner(target.owner, target.originalRead != null) { read ->
+            check(target.installation.readIdentity() === target.originalRead && playlistAccountProducer === target.producer) {
+                "Original Xperience account observation changed"
+            }
+            check(target.session.xperienceContext(read) == target.context) { "Original Xperience context changed" }
+            var result: Result<T>? = null
+            check(target.admission {
+                if (!accountCurrent(target.account)) false else synchronized(lifecycleLock) {
+                    if (mounted.get() !== target.installation) false else target.lifetime.admit {
+                        result = runCatching { action(read) }; true
+                    }
+                }
+            }) { "Original Xperience target changed" }
+            requireNotNull(result).getOrThrow()
+        }
+
+    private fun xperienceSnapshot(target: CapturedXperienceTarget) = CapturedXperienceSnapshot(target,
+        target.session.xperienceFields(target.owner))
+
+    private class XperienceOpening(val issuer: NativeAccountCoordinator, val installation: Mounted,
+        val update: Long, val originalRead: NativeAccountReadCapture?,
+        val producer: com.vortx.android.sync.NativePlaylistAccountProducer, val admission: (() -> Boolean) -> Boolean) : NativeXperienceCatalogGateway.OpeningStage {
+        val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        val used = java.util.concurrent.atomic.AtomicBoolean(false)
+        override fun close() { live.set(false) }
+    }
+    /** Scalars only on the UI event lane. Do NOT enter Session or durable auth/file admission. */
+    internal fun stageXperienceOpening(): NativeXperienceCatalogGateway.OpeningStage? {
+        val installation = mounted.get() ?: return null
+        val update = installation.session.updates.value
+        val originalRead = installation.readIdentity()
+        val producer = playlistAccountProducer ?: return null
+        val admission = captureOwnAccountAdmission(installation.account) ?: return null
+        return if (mounted.get() === installation && installation.session.updates.value == update &&
+            installation.readIdentity() === originalRead && playlistAccountProducer === producer)
+            XperienceOpening(this, installation, update, originalRead, producer, admission) else null
+    }
+    /** IO caller consumes one original stage. A→B→A, update, mount/read/producer or auth drift
+     * cannot be replaced by whichever account happens to be current after the hop. */
+    internal fun openXperienceSnapshot(stage: NativeXperienceCatalogGateway.OpeningStage): NativeXperienceProfileGateway.Snapshot {
+        val original = stage as? XperienceOpening ?: error("Invalid Xperience opening")
+        check(original.issuer === this && original.live.get() && original.used.compareAndSet(false, true))
+        val installation = original.installation
+        fun current() = original.live.get() && mounted.get() === installation &&
+            installation.session.updates.value == original.update && installation.readIdentity() === original.originalRead &&
+            playlistAccountProducer === original.producer
+        var created: CapturedXperienceTarget? = null
+        var transferred = false
+        return try { installation.session.withCompleteAccountExportRead(original.originalRead != null) { read ->
+            var snapshot: NativeXperienceProfileGateway.Snapshot? = null
+            check(original.admission {
+                if (!current() || !accountCurrent(installation.account)) false else {
+                    val target = CapturedXperienceTarget(installation.account, installation.session, read.owner, installation,
+                        original.admission, PlaylistLifetime(), original.originalRead, original.producer, installation.session.xperienceContext(read))
+                    created = target
+                    snapshot = withCapturedXperienceTarget(target) { xperienceSnapshot(target) }
+                    current()
+                }
+            }) { "Original Xperience opening changed" }
+            check(current()) { "Original Xperience opening changed" }
+            checkNotNull(snapshot).also { transferred = true }
+        } } finally { if (!transferred) created?.lifetime?.revoke() }
+    }
+
+    /** Read-only adapter admission. Target context does NOT contain saved raw registers: the
+     * genuine original Snapshot must also match before and after the synchronous callback. */
+    internal fun <T> withXperienceSnapshotRead(snapshot: NativeXperienceProfileGateway.Snapshot,
+        action: (VortxNativeSession, VortxNativeRead) -> T): T {
+        val original = snapshot as? CapturedXperienceSnapshot ?: error("Invalid Xperience snapshot")
+        return withCapturedXperienceTarget(original.target) { read ->
+            fun current(): Boolean {
+                val fields = original.target.session.xperienceFields(original.target.owner)
+                return try { original.matches(fields) } finally { fields.values.forEach { it.fill(0) } }
+            }
+            check(current()) { "Original Xperience snapshot changed" }
+            action(original.target.session, read).also {
+                check(current()) { "Original Xperience snapshot changed" }
+            }
+        }
+    }
+
+    override fun captureXperienceProfile(): Result<NativeXperienceProfileGateway.Snapshot> = playlistResult {
+        val installation = checkNotNull(mounted.get()) { "Open the authenticated native account first" }
+        val admission = checkNotNull(captureOwnAccountAdmission(installation.account)) { "Xperience account admission unavailable" }
+        val originalRead = installation.readIdentity()
+        val producer = checkNotNull(playlistAccountProducer) { "Complete account write admission unavailable" }
+        installation.session.withCompleteAccountExportRead(originalRead != null) { read ->
+            val target = CapturedXperienceTarget(installation.account, installation.session, read.owner, installation,
+                admission, PlaylistLifetime(), originalRead, producer, installation.session.xperienceContext(read))
+            withCapturedXperienceTarget(target) { xperienceSnapshot(target) }
+        }
+    }
+    override fun xperienceSnapshot(target: NativeXperienceProfileGateway.Target): Result<NativeXperienceProfileGateway.Snapshot> =
+        playlistResult {
+            val captured = target as? CapturedXperienceTarget ?: error("Invalid Xperience target")
+            withCapturedXperienceTarget(captured) { xperienceSnapshot(captured) }
+        }
+    override fun xperienceTargetIsCurrent(target: NativeXperienceProfileGateway.Target): Boolean =
+        (target as? CapturedXperienceTarget)?.let { runCatching { withCapturedXperienceTarget(it) { true } }.getOrDefault(false) } ?: false
+    override fun publishXperienceIfCurrent(snapshot: NativeXperienceProfileGateway.Snapshot, publication: () -> Unit): Boolean {
+        val captured = snapshot as? CapturedXperienceSnapshot ?: return false
+        return runCatching { withCapturedXperienceTarget(captured.target) {
+            if (!captured.matches(captured.target.session.xperienceFields(captured.target.owner))) false
+            else { publication(); true }
+        } }.getOrDefault(false)
+    }
+    override fun retireXperienceTarget(target: NativeXperienceProfileGateway.Target) {
+        (target as? CapturedXperienceTarget)?.lifetime?.revoke()
+    }
+    override suspend fun writeXperience(target: NativeXperienceProfileGateway.Target,
+        edit: XperienceImportNamespace.Edit): Result<NativeXperienceProfileGateway.Snapshot> =
+        persistXperience(target) { NativeXperienceWrite.Change.edit(edit) }
+    override suspend fun deleteXperience(target: NativeXperienceProfileGateway.Target,
+        saved: XperienceImportNamespace.Saved): Result<NativeXperienceProfileGateway.Snapshot> =
+        persistXperience(target) { NativeXperienceWrite.Change.delete(saved) }
+
+    private suspend fun persistXperience(target: NativeXperienceProfileGateway.Target,
+        change: () -> NativeXperienceWrite.Change): Result<NativeXperienceProfileGateway.Snapshot> {
+        val captured = target as? CapturedXperienceTarget ?: return Result.failure(IllegalArgumentException("Invalid Xperience target"))
+        var accountWrite: com.vortx.android.sync.NativePlaylistAccountWrite? = null
+        val operation = playlistResult {
+            withCapturedXperienceTarget(captured) {
+                // Capture both the actual complete-account producer and exact Session checkpoint
+                // before the first suspension. Typed and generic routes share this requirement.
+                accountWrite = checkNotNull(captured.producer.capture(captured.account)) { "Complete account write admission unavailable" }
+                captured.session.captureXperienceOperation(captured.owner, captured.context, change(), captured.originalRead != null)
+            }
+        }.getOrElse { accountWrite?.close(); return Result.failure(it) }
+        val write = checkNotNull(accountWrite)
+        val operationJob = currentCoroutineContext()[Job]
+        return try { withContext(Dispatchers.IO) {
+            playlistResult {
+                operationJob?.ensureActive()
+                withCapturedXperienceTarget(captured) {
+                    fun recheck() {
+                        operationJob?.ensureActive()
+                        // Re-enter only this target, whose exact original admission/lifetime is
+                        // still held across the full budget preview and durable callback.
+                        withCapturedXperienceTarget(captured) { }
+                    }
+                    captured.session.dispatchXperience(operation, write.pendingGlobalValues(),
+                        genericAdmission = { native, host, commit ->
+                            captured.installation.withRead(checkNotNull(captured.originalRead)) { raw, projection ->
+                                write.commitXperienceCandidate(raw, projection, native, host) { recheck(); commit() }
+                            }
+                        },
+                        typedAdmission = { account, host, commit ->
+                            write.commitPreparedCandidate(account, host) { recheck(); commit() }
+                        }, beforeCommit = { recheck() })
+                    // Session has checked exact raw register readback AFTER the existing
+                    // authenticated checkpoint readback/native acceptance and in-memory swap.
+                    check(captured.session.read().owner == captured.owner) { "Xperience owner changed during commit" }
+                    xperienceSnapshot(captured)
+                }
+            }
+        } } finally { operation.close(); write.close() }
+    }
+
     suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
         val credentials = checkNotNull(ownCredentials) { "Native streaming sign-in unavailable" }
         val admission = checkNotNull(captureOwnAccountAdmission(target.account)) { "Native account authentication changed" }
@@ -331,6 +925,28 @@ internal class NativeAccountCoordinator(
     internal fun accountFor(session: VortxNativeSession): SessionOwnerSnapshot.Account? = synchronized(lifecycleLock) {
         mounted.get()?.takeIf { it.session === session }?.account
     }
+    internal class ForYouMutationAdmission(val identity: Any, private val admission: (() -> Boolean) -> Boolean) {
+        fun admit(action: () -> Boolean): Boolean = admission(action)
+    }
+
+    /** Capture under Session. Retain full account generation, exact mount and auth/session/operation scope. */
+    internal fun captureForYouMutationAdmission(session: VortxNativeSession): ForYouMutationAdmission {
+        check(Thread.holdsLock(session)) { "For You capture must hold Session" }
+        val current = checkNotNull(mounted.get()) { "Native account changed" }
+        check(current.session === session && accountCurrent(current.account)) { "Native account changed" }
+        val account = current.account
+        val authenticated = captureForYouAccountAuthority(account)
+        check(authenticated != null || ownCredentials == null) { "For You authentication unavailable" }
+        val identity = listOf(com.vortx.android.foryou.ForYouIdentityRef(current), account,
+            authenticated?.identity ?: com.vortx.android.foryou.ForYouIdentityRef(current))
+        return ForYouMutationAdmission(identity) { action ->
+            val mountedAction = {
+                synchronized(lifecycleLock) { if (mounted.get() === current) action() else false }
+            }
+            if (authenticated != null) authenticated.admit(mountedAction)
+            else accountCurrent(account) && mountedAction() // deterministic fixtures only
+        }
+    }
     /**
      * Final reclaim fence. Deliberately contains no auth or session calls: writers enter in the
      * established Session -> authenticated-admission -> lifecycle order and retire never waits
@@ -342,10 +958,15 @@ internal class NativeAccountCoordinator(
     override fun retire() {
         pendingImport = null
         val old = synchronized(lifecycleLock) {
+            // Purge volatile register bytes before authority/retirement callbacks can expose the
+            // transition. Lifecycle -> ledger matches the captured admission lock order.
+            playlistReceipts.retire()
             onAuthorityChanged()
             if (mounted.get() != null) com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-            mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
+            mounted.getAndSet(null).also { if (it != null) { it.retireRead(); retired.add(it.session) } }
         }
+        playlistReceiptChanges.update { value -> value + 1 }
+        if (old != null) playlistMountRevisions.value += 1
         changes.value += 1
         onRetired()
         if (old != null) {
@@ -360,7 +981,11 @@ internal class NativeAccountCoordinator(
         return if (mounted.get() === current && accountCurrent(account)) NativeAccountMountToken(current, revision) else null
     }
 
-    override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+    override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean =
+        reopenCheckpoint(account, isCurrent, null)
+
+    private suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        onInstalled: ((Mounted) -> Unit)?): Boolean = mutex.withLock {
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }?.let { return@withLock true }
@@ -400,11 +1025,15 @@ internal class NativeAccountCoordinator(
             }
         try { withAccountAdmission(account, isCurrent) { checkpoints.remember(scope) } }
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
-        publish(account, candidate, isCurrent)
+        publish(account, candidate, isCurrent, onInstalled)
     }
 
-    override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject {
-        if (reopenCheckpoint(account, isCurrent)) {
+    override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject =
+        prepareEmptyAccount(account, isCurrent, null)
+
+    private suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        onInstalled: ((Mounted) -> Unit)?): JSONObject {
+        if (reopenCheckpoint(account, isCurrent, onInstalled)) {
             require(!session().hasOwnerHistory()) { "Existing owner-history backup disappeared" }
             val read = session().read()
             return session().owned(read.owner) {
@@ -422,8 +1051,8 @@ internal class NativeAccountCoordinator(
             val retained = scope.validateSnapshot(snapshot)
             val baseline = retained.getJSONObject("hostDocument")
             require(baseline.optString("nativeAccountBootstrap") == "authenticated-empty-v1") { "Existing account backup disappeared" }
-            check(mutex.withLock { applyDocumentLocked(account, baseline, isCurrent) })
-            return prepareEmptyAccount(account, isCurrent)
+            check(mutex.withLock { applyDocumentLocked(account, baseline, isCurrent, onInstalled = onInstalled) })
+            return prepareEmptyAccount(account, isCurrent, onInstalled)
         }
         checkpoints.verifyFreshAccount(scope)
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
@@ -456,7 +1085,8 @@ internal class NativeAccountCoordinator(
         }
     }
 
-    private suspend fun publish(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession, isCurrent: () -> Boolean): Boolean {
+    private suspend fun publish(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession, isCurrent: () -> Boolean,
+        onInstalled: ((Mounted) -> Unit)? = null): Boolean {
         try { currentCoroutineContext().ensureActive() }
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         val next = Mounted(account, candidate)
@@ -466,7 +1096,7 @@ internal class NativeAccountCoordinator(
             onAuthorityChanged()
             if (mounted.get() != null) false else {
                 com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-                mounted.compareAndSet(null, next)
+                mounted.compareAndSet(null, next).also { if (it) onInstalled?.invoke(next) }
             }
         }
         if (!installed) {
@@ -475,6 +1105,7 @@ internal class NativeAccountCoordinator(
         try {
             project(candidate)
             check(isCurrent() && accountCurrent(account) && mounted.get() === next) { "Native account changed" }
+            playlistMountRevisions.value += 1
             changes.value += 1
             return true
         } catch (error: Throwable) {
@@ -496,10 +1127,74 @@ internal class NativeAccountCoordinator(
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local migration evidence is not an authenticated cloud source" }
         applyDocumentLocked(account, document, isCurrent)
     }
-    override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, raw: ByteArray, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+
+    /** Retain provenance only on the exact accepted generic mount; it is not mutation authority. */
+    private fun retainAuthenticatedRead(
+        account: SessionOwnerSnapshot.Account,
+        captured: NativeAccountReadCapture,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        if (captured.account != account || !isCurrent() || !accountCurrent(account)) return false
+        val current = mounted.get()?.takeIf {
+            it.account == account && !it.session.requiresRecovery() && !it.session.hasOwnerHistory()
+        } ?: return false
+        val retained = runCatching { captured.retainedCopyFor(account) }.getOrNull() ?: return false
+        val raw = captured.copyRawForApply(account)
+        val projection = try {
+            val native = NativeProfileOverlayWitness.parseAccountDocument(raw).getJSONObject("nativeSync")
+            // Same public generic create/bind/merge path used by NativeOwnAccountBaseline.validate.
+            // This is the source-only projection, before any local pending state was merged into it.
+            VortxNativeRuntime.create(bindings, current.session.scope.ownerProfileID, "Owner").use { runtime ->
+                for (action in listOf(JSONObject().put("type", "bind_sync_scope").put("scope", current.session.scope.accountID),
+                    JSONObject().put("type", "merge_native_sync").put("document", native))) {
+                    check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Generic source projection rejected" }
+                }
+                JSONObject(runtime.stateJson()).getJSONObject("nativeSync").toString().toByteArray(Charsets.UTF_8)
+            }
+        } catch (cancelled: CancellationException) { retained.retire(); throw cancelled }
+        catch (failure: Throwable) { retained.retire(); return false }
+        finally { raw.fill(0) }
+        try { if (!current.retain(retained, projection)) { retained.retire(); return false } }
+        finally { projection.fill(0) }
+        if (mounted.get() !== current || !isCurrent() || !accountCurrent(account)) {
+            current.clearRead(retained)
+            return false
+        }
+        return true
+    }
+
+    override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, raw: ByteArray, isCurrent: () -> Boolean): Boolean =
+        applyRawDocumentInternal(account, raw, null, isCurrent)
+
+    override suspend fun applyRawDocument(
+        account: SessionOwnerSnapshot.Account,
+        captured: NativeAccountReadCapture,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        val raw = captured.copyRawForApply(account)
+        return try {
+            applyRawDocumentInternal(account, raw, captured, isCurrent)
+        } finally {
+            raw.fill(0)
+            captured.retire()
+        }
+    }
+
+    private suspend fun applyRawDocumentInternal(
+        account: SessionOwnerSnapshot.Account,
+        raw: ByteArray,
+        captured: NativeAccountReadCapture?,
+        isCurrent: () -> Boolean,
+    ): Boolean = mutex.withLock {
+        if (captured != null) check(captured.account == account) { "Authenticated account read owner changed" }
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
+        // Revoke the exact current mount's old baseline before parsing into any mutation path.
+        // A later native dispatch/projection/checkpoint failure must not leave old provenance usable.
+        mounted.get()?.takeIf { it.account == account }?.clearRead()
         val exact = NativeOwnerHistoryAccount(raw)
+        // Retain the original register bytes BEFORE decoding the account presentation.
+        val originalHostPreferences = exact.raw("nativeHostPreferences")
         val document = NativeProfileOverlayWitness.parseAccountDocument(raw)
         require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local evidence is not a cloud source" }
         val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
@@ -511,7 +1206,14 @@ internal class NativeAccountCoordinator(
         val incoming = exact.raw("nativeSync")?.let { OHJson.Obj(it) }
         val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
         if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
-            return@withLock applyDocumentLocked(account, document, isCurrent)
+            return@withLock applyDocumentLocked(account, document, isCurrent,
+                originalHostPreferences = originalHostPreferences).let { applied ->
+                if (!applied) return@let false
+                // The primary sync apply has already succeeded. Baseline retention is optional and
+                // limited to known schema 1–5; it must not make ordinary sync acceptance fail.
+                if (captured != null && schema?.let { it in 1L..5L } == true) retainAuthenticatedRead(account, captured, isCurrent)
+                true
+            }
         val native = requireNotNull(incoming) { "Owner-history native carrier missing" }
         require(native.text("scope") == namespace)
         val scope = VortxAccountScope(namespace, native.text("ownerProfileId"))
@@ -537,6 +1239,7 @@ internal class NativeAccountCoordinator(
             applyTypedWebsiteEvents(current.session, account, document, active)
             project(current.session)
             check(active() && mounted.get() === current)
+            current.clearRead()
             pendingImport = null
             return@withLock true
         }
@@ -562,15 +1265,16 @@ internal class NativeAccountCoordinator(
                 val carrier = requireNotNull(exact.raw(NativeOwnerHistoryAccount.ARCHIVE))
                 val uid = NativeOwnerHistorySources.readOwnerUID(scope, carrier)
                 val host = NativeHostPreferences.merge(scope, NativeHostPreferences.local(scope), remoteHost)
+                val rawHost = NativeRawHostPreferences.reconcile(scope, null, host, remoteHost, originalHostPreferences)
                 val archiveInput = JSONObject(document.toString()).also { it.remove("nativeSync"); it.remove(NativeOwnerHistoryAccount.ARCHIVE) }
                 val archive = preflight?.archive ?: NativeHostDocument.archive(archiveInput)
                 val localObject = OHJson.Obj().set("hostDocument", archive.getJSONObject("document").toString().toByteArray(Charsets.UTF_8))
                     .set("excludedCredentialPaths", archive.getJSONArray("excludedCredentialPaths").toString().toByteArray(Charsets.UTF_8))
-                    .set("nativeHostPreferenceState", host.toString().toByteArray(Charsets.UTF_8))
+                    .set("nativeHostPreferenceState", rawHost)
                 preflight?.let { localObject.set("nativeMigrationPreflightRetained", OHJson.quote(it.raw)) }
                 val local = localObject.encoded()
                 val prepared = NativeOwnerHistoryCoordinator.prepareColdPeer(scope,
-                    NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), exact, host.toString().toByteArray(Charsets.UTF_8),
+                    NativeOwnerHistoryCoordinator.Target(scope.ownerProfileID, uid), exact, rawHost,
                     historyBindings, original, { NativeOwnerHistoryAccount(it).validateBudget(true) },
                     { NativeOwnerHistorySessionAdapter.projection(scope, it) }, local)
                 val committed = original.withActive {
@@ -588,6 +1292,7 @@ internal class NativeAccountCoordinator(
             original.withActive { checkpoints.remember(scope) }
             pendingImport = null
             publish(account, session, active)
+            mounted.get()?.takeIf { it.account == account }?.clearRead()
         } catch (failure: Throwable) {
             if (failure is NativeOwnerHistoryCoordinator.Uncertain) uncertainHistoryAccounts.add(account.id)
             candidate?.let { owned -> runCatching { retireUnpublished(account, owned) }.onFailure { failure.addSuppressed(it) } }
@@ -619,9 +1324,14 @@ internal class NativeAccountCoordinator(
     private suspend fun applyDocumentLocked(account: SessionOwnerSnapshot.Account, incomingDocument: JSONObject, isCurrent: () -> Boolean,
                                            suppliedSources: List<NativeOwnAccountSource> = emptyList(),
                                            retainedWatched: JSONObject? = null,
-                                           operationCurrent: () -> Boolean = isCurrent): Boolean {
+                                           operationCurrent: () -> Boolean = isCurrent,
+                                           originalHostPreferences: ByteArray? = null,
+                                           onInstalled: ((Mounted) -> Unit)? = null): Boolean {
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native account changed" }
+        // All callers share this transaction helper. Revoke the old authenticated baseline before
+        // it can dispatch or checkpoint any native mutation, including calls outside raw sync apply.
+        mounted.get()?.takeIf { it.account == account }?.clearRead()
         val operationJob = currentCoroutineContext()[Job]
         val document = NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(incomingDocument))
         val parsed = VortXSyncDoc.parse(document)
@@ -815,10 +1525,12 @@ internal class NativeAccountCoordinator(
             } else host
             old.session.owned(read.owner) { withNativeOwnAccountSources(sources) {
                 withAccountAdmission(account, migrationCurrent) { check(withMountedSession(old.session, account) {
-                    old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
-                        remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources,
-                        beforeCommit = { operationJob?.ensureActive(); check(migrationCurrent()) { "Native migration changed before commit" } },
-                        legacyWatchlists = watchlists.profiles)
+                    old.session.withRawHostMerge(originalHostPreferences) {
+                        old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
+                            remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources,
+                            beforeCommit = { operationJob?.ensureActive(); check(migrationCurrent()) { "Native migration changed before commit" } },
+                            legacyWatchlists = watchlists.profiles)
+                    }
                     reportLegacyReconciliation(old.session, stage = "sync")
                     true
                 }) { "Native account changed" } }
@@ -854,6 +1566,7 @@ internal class NativeAccountCoordinator(
             VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
             initialHostPreferences = remoteHost, initialLegacyWatchlists = watchlists.profiles,
+            initialRawHostPreferences = originalHostPreferences,
             verifyCandidate = verifySources, onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged,
             onProgressMutation = { onProgressMutation(account) }, ownerHistoryBindings = historyBindings,
             ownerHistoryAuthority = ownerHistoryAuthority(account) { accountCurrent(account) }) { isCurrent() && accountCurrent(account) } } } }
@@ -878,7 +1591,7 @@ internal class NativeAccountCoordinator(
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         try { checkpoints.remember(scope) }
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
-        return publish(account, candidate, isCurrent)
+        return publish(account, candidate, isCurrent, onInstalled)
     }
 
     /** A held old-format delta is reported, never fatal: native sync keeps landing (Apple 0.5.0 Beta 6). */
@@ -931,19 +1644,178 @@ internal class NativeAccountCoordinator(
         val current = mounted.get()?.takeIf { it.account == account && accountCurrent(account) } ?: return null
         val read = current.session.read()
         return current.session.owned(read.owner) {
-            // Active selection is device-local and intentionally absent from this carrier.
-            val profiles = NativeProfileAccess.projection(read).profiles
-            val host = read.state.getJSONObject("hostProfilePreferences")
-            NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
-                read.state.getBoolean("hostProfileSyncPending"), read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document"),
-                read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount())
+            exportDocument(current, read)
         }
     }
 
-    override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean {
+    private fun exportDocument(current: Mounted, read: VortxNativeRead): NativeAccountExport {
+        // Active selection is device-local and intentionally absent from this carrier.
+        val profiles = NativeProfileAccess.projection(read).profiles
+        val host = read.state.getJSONObject("hostProfilePreferences")
+        return NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
+            read.state.getBoolean("hostProfileSyncPending"), read.state.getJSONObject("nativeHostPreferenceState").getJSONObject("document"),
+            read.state.optJSONObject("hostDocument")?.opt("settings"), current.session.rawAccount(),
+            current.sourceProjection(), current.session.rawHostPreferences())
+    }
+
+    /** No Session read occurs in the scalar predicate. All local receipt work starts outside the
+     * manager monitor, takes Session first, then this original auth admission and lifecycle fence. */
+    private inner class UploadOrigin(val account: SessionOwnerSnapshot.Account,
+        private val admission: (() -> Boolean) -> Boolean, private val active: () -> Boolean) : NativeAccountUploadCurrency.Origin {
+        val issuer = this@NativeAccountCoordinator
+        fun withAuthentication(body: () -> Boolean): Boolean = admission {
+            active() && accountCurrent(account) && body()
+        }
+        override fun isCurrent() = withAuthentication { true }
+    }
+
+    private inner class UploadCurrency(val origin: UploadOrigin, val installation: Mounted?) : NativeAccountUploadCurrency {
+        val account get() = origin.account
+        val issuer get() = origin.issuer
+        fun withAuthentication(body: () -> Boolean): Boolean = origin.withAuthentication(body)
+        fun successor(next: Mounted?): UploadCurrency = UploadCurrency(origin, next)
+        override fun isCurrent(): Boolean = origin.withAuthentication {
+            synchronized(lifecycleLock) { mounted.get() === installation }
+        }
+        override fun <T> withCurrentSession(action: () -> T): T? {
+            fun admitted(): T? {
+                var result: Result<T>? = null
+                if (!withAuthentication { synchronized(lifecycleLock) {
+                    if (mounted.get() !== installation) false else { result = runCatching(action); true }
+                } }) return null
+                return requireNotNull(result).getOrThrow()
+            }
+            val session = installation?.session ?: return admitted()
+            return synchronized(session) { if (session.requiresRecovery()) null else admitted() }
+        }
+    }
+
+    override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): NativeAccountUploadCurrency.Origin? {
+        val original = captureOwnAccountAdmission(account) ?: return null
+        return UploadOrigin(account, original, isCurrent).takeIf { it.isCurrent() }
+    }
+
+    override suspend fun prepareUploadSeed(account: SessionOwnerSnapshot.Account, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean):
+        Pair<JSONObject, NativeAccountUploadCurrency>? {
+        val origin = original as? UploadOrigin ?: return null
+        if (origin.issuer !== this || origin.account != account || !origin.isCurrent()) return null
+        val before = mounted.get()
+        if (before != null && before.account != account) return null
+        val captured = UploadCurrency(origin, before)
+        if (captured.withCurrentSession { isCurrent() } != true) return null
+        val produced = AtomicReference<Mounted?>(null)
+        fun current(): Boolean = captured.withAuthentication { isCurrent() && synchronized(lifecycleLock) {
+            mounted.get() === (produced.get() ?: captured.installation)
+        } }
+        // prepare may reopen a genuine bootstrap checkpoint. Only its publication CAS may name
+        // that replacement; an unrelated same-account mount after an await is never adopted.
+        val document = prepareEmptyAccount(account, ::current) { next -> check(produced.compareAndSet(null, next)) }
+        if (!current()) return null
+        val currency = captured.successor(produced.get() ?: captured.installation)
+        return if (currency.withCurrentSession { current() } == true) document to currency else null
+    }
+
+    override suspend fun applyUploadSeed(account: SessionOwnerSnapshot.Account, document: JSONObject,
+        original: NativeAccountUploadCurrency, isCurrent: () -> Boolean): NativeAccountUploadCurrency? {
+        val captured = original as? UploadCurrency ?: return null
+        if (captured.issuer !== this || captured.account != account || captured.withCurrentSession { isCurrent() } != true) return null
+        val produced = AtomicReference<Mounted?>(null)
+        fun current(): Boolean = captured.withAuthentication { isCurrent() && synchronized(lifecycleLock) {
+            mounted.get() === (produced.get() ?: captured.installation)
+        } }
+        val applied = mutex.withLock {
+            require(!document.has(NativeOwnerHistoryAccount.ARCHIVE) && document.optJSONObject("nativeSync")?.optInt("schemaVersion") != 6)
+            require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending"))
+            if (!current()) false else applyDocumentLocked(account, document, ::current,
+                onInstalled = { next -> check(produced.compareAndSet(null, next)) })
+        }
+        if (!applied || !current()) return null
+        val installed = produced.get() ?: captured.installation ?: return null
+        // Reuse ORIGINAL auth, cancellation and operation observations; no new capture after PUT.
+        return captured.successor(installed).takeIf { it.withCurrentSession { current() } == true }
+    }
+
+    private class CapturedHostAcknowledgment(
+        private val session: VortxNativeSession, raw: ByteArray,
+        private val originalAdmission: (() -> Boolean) -> Boolean,
+    ) : NativeHostUploadAcknowledgment {
+        private val lock = Any(); private var active = true; private var armed = false
+        private val sent = raw.copyOf()
+        fun arm() = synchronized(lock) { check(active && !armed); armed = true }
+        private fun usable() = synchronized(lock) { active && armed }
+        override fun isCurrent(): Boolean = usable() && originalAdmission { usable() }
+        override fun acknowledge(isAcceptedCurrent: () -> Boolean): Boolean {
+            val raw = synchronized(lock) { if (!active || !armed) return false else sent.copyOf() }
+            return try { synchronized(session) {
+                originalAdmission {
+                    usable() && isAcceptedCurrent() && !session.requiresRecovery() &&
+                        session.acknowledgeRawHostDocument(raw) { usable() && isAcceptedCurrent() }
+                }
+            } } finally { raw.fill(0) }
+        }
+        override fun close() = synchronized(lock) { active = false; sent.fill(0) }
+    }
+
+    override fun <T> withUploadExport(account: SessionOwnerSnapshot.Account, source: NativeAccountReadCapture,
+        originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
+        action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
+        val current = mounted.get()?.takeIf { it.account == account && accountCurrent(account) } ?: return null
+        val origin = original as? UploadOrigin ?: return null
+        if (origin.issuer !== this || origin.account != account || !origin.isCurrent()) return null
+        val currency = UploadCurrency(origin, current)
+        // Scalar admission deliberately has no Session calls. Frozen wire candidates retain this
+        // original auth/mount fence after their capture checkpoint has legitimately advanced.
+        val originalAdmission: (() -> Boolean) -> Boolean = { body -> origin.withAuthentication {
+            if (!isCurrent() || !accountCurrent(account)) false else synchronized(lifecycleLock) {
+                mounted.get() === current && body()
+            }
+        } }
+        return current.session.withCompleteAccountExportRead(current.readIdentity() != null) { read ->
+            var result: Result<T>? = null
+            check(originalAdmission {
+                result = runCatching {
+                    val exported = exportDocument(current, read)
+                    val mount = NativeAccountMountToken(current, current.session.updates.value)
+                    if (exported.rawAccount != null) action(exported, mount, null, null, currency) // Separate typed path.
+                    else {
+                        val retained = checkNotNull(current.readIdentity()) { "Authenticated generic read unavailable" }
+                        check(retained.sameObservation(source)) { "Original authenticated upload read changed" }
+                        current.withRead(retained) { raw, projection ->
+                            check(raw.contentEquals(originalRaw)) { "Authenticated upload bytes changed" }
+                            current.session.withRawHostExport(read.owner, raw, projection, {
+                                isCurrent() && accountCurrent(account) && mounted.get() === current && current.readIdentity() === retained
+                            }) { snapshot ->
+                                val sent = current.session.rawHostPreferences()
+                                val ack = CapturedHostAcknowledgment(current.session, sent, originalAdmission)
+                                sent.fill(0)
+                                var transferred = false
+                                try {
+                                    action(exported, mount, { providers ->
+                                        val candidate = NativePlaylistAccountComposer.composeExport(raw, projection, snapshot, providers)
+                                        try { ack.arm(); candidate } catch (failure: Throwable) { candidate.fill(0); throw failure }
+                                    }, ack, currency).also { transferred = true }
+                                } finally { if (!transferred) ack.close() }
+                            }
+                        }
+                    }
+                }; true
+            }) { "Original upload account or mount retired" }
+            check(originalAdmission { true }) { "Original upload account or mount retired" }
+            requireNotNull(result).getOrThrow()
+        }
+    }
+
+    override fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject,
+        original: NativeAccountUploadCurrency.Origin): Boolean {
+        val origin = original as? UploadOrigin ?: return false
+        if (origin.issuer !== this || origin.account != account) return false
         val current = mounted.get()?.takeIf { it.account == account && accountCurrent(account) } ?: return false
-        current.session.dispatch(emptyList(), notifyMutation = false, globalChanges = changes)
-        return mounted.get() === current && accountCurrent(account)
+        val currency = UploadCurrency(origin, current)
+        return currency.withCurrentSession {
+            current.session.dispatch(emptyList(), notifyMutation = false, globalChanges = changes,
+                beforeCommit = { check(currency.isCurrent()) { "Original upload authentication or mount retired" } })
+            currency.isCurrent()
+        } == true
     }
     override fun acknowledgeHostPreferences(account: SessionOwnerSnapshot.Account, document: JSONObject): Boolean {
         val current = mounted.get()?.takeIf { it.account == account && accountCurrent(account) } ?: return false

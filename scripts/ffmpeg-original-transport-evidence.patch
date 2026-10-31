@@ -1,0 +1,382 @@
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -98,10 +98,12 @@
+     char *sent_request_pending;
+     char *sent_location_pending;
+     size_t sent_request_pending_bytes;
++    struct avpriv_vortx_http_transport sent_transport_pending;
+     char *sent_request;
+     char *sent_location;
+     size_t sent_request_bytes;
+     int64_t sent_request_generation;
++    struct avpriv_vortx_http_transport sent_transport;
+     char response_etag_pending[RESPONSE_ETAG_LIMIT + 1];
+     int response_etag_seen;
+     int response_etag_invalid;
+@@ -267,6 +269,7 @@
+     av_freep(&s->sent_request_pending);
+     av_freep(&s->sent_location_pending);
+     s->sent_request_pending_bytes = 0;
++    s->sent_transport_pending = (struct avpriv_vortx_http_transport){0};
+ }
+ 
+ static void http_sent_request_current_clear(HTTPContext *s)
+@@ -275,6 +278,7 @@
+     av_freep(&s->sent_location);
+     s->sent_request_bytes = 0;
+     s->sent_request_generation = 0;
++    s->sent_transport = (struct avpriv_vortx_http_transport){0};
+ }
+ 
+ static void http_response_etag_reset(HTTPContext *s)
+@@ -439,6 +443,37 @@
+         line = next + 2;
+     }
+     return line == end - 2 && hosts == 1;
++}
++
++/* Observe only facts sealed by the actual successful lower open. Never infer
++ * direct routing from an empty proxy AVOption: TLS also consults environment.
++ * Unknown backends and incomplete handshakes remain unavailable. */
++static struct avpriv_vortx_http_transport http_sent_transport(HTTPContext *s)
++{
++    struct avpriv_vortx_http_transport zero = {0};
++    if (!s->hd || !s->hd->is_connected || !s->hd->prot || !s->location)
++        return zero;
++    struct avpriv_vortx_http_transport value = s->hd->vortx_transport;
++    if (value.version != VORTX_HTTP_TRANSPORT_VERSION ||
++        (value.tls_policy & ~VORTX_HTTP_TLS_POLICY_MASK))
++        return zero;
++    if (!strncmp(s->location, "https://", 8)) {
++        if (strcmp(s->hd->prot->name, "tls") ||
++            (value.route != VORTX_HTTP_ROUTE_DIRECT_TCP &&
++             value.route != VORTX_HTTP_ROUTE_HTTP_CONNECT) ||
++            (value.tls_backend != VORTX_HTTP_TLS_SECURETRANSPORT &&
++             value.tls_backend != VORTX_HTTP_TLS_MBEDTLS))
++            return zero;
++    } else if (!strncmp(s->location, "http://", 7)) {
++        if (strcmp(s->hd->prot->name, "tcp") || value.tls_backend ||
++            value.tls_policy ||
++            (value.route != VORTX_HTTP_ROUTE_DIRECT_TCP &&
++             value.route != VORTX_HTTP_ROUTE_HTTP_PROXY))
++            return zero;
++    } else {
++        return zero;
++    }
++    return value;
+ }
+ 
+ static void http_sent_request_capture(URLContext *h, const char *wire, size_t bytes,
+@@ -479,6 +514,7 @@
+     s->sent_request_pending = copy;
+     s->sent_location_pending = location;
+     s->sent_request_pending_bytes = bytes;
++    s->sent_transport_pending = http_sent_transport(s);
+ }
+ 
+ static void http_sent_request_complete(HTTPContext *s)
+@@ -494,6 +530,7 @@
+         s->sent_location = s->sent_location_pending;
+         s->sent_request_bytes = s->sent_request_pending_bytes;
+         s->sent_request_generation = s->response_generation;
++        s->sent_transport = s->sent_transport_pending;
+         s->sent_request_pending = s->sent_location_pending = NULL;
+     }
+     http_sent_request_pending_clear(s);
+@@ -636,6 +673,16 @@
+         err = ffurl_open_whitelist(&s->hd, buf, AVIO_FLAG_READ_WRITE,
+                                    &h->interrupt_callback, options,
+                                    h->protocol_whitelist, h->protocol_blacklist, h);
++        if (err >= 0 && s->hd && s->hd->is_connected && s->hd->prot &&
++            !strcmp(lower_proto, "tcp") && !strcmp(s->hd->prot->name, "tcp")) {
++            /* The actual HTTP direct/proxy branch used for this new socket,
++             * retained on connection reuse even if environment later changes. */
++            s->hd->vortx_transport = (struct avpriv_vortx_http_transport){
++                .version = VORTX_HTTP_TRANSPORT_VERSION,
++                .route = use_proxy ? VORTX_HTTP_ROUTE_HTTP_PROXY :
++                                     VORTX_HTTP_ROUTE_DIRECT_TCP,
++            };
++        }
+     }
+ 
+ end:
+@@ -2636,7 +2683,7 @@
+ };
+ #endif /* CONFIG_HTTPS_PROTOCOL */
+ 
+-void avpriv_vortx_http_sent_request_clear(
++void avpriv_vortx_http_sent_request_clear_v2(
+     struct avpriv_vortx_http_sent_request *value)
+ {
+     if (!value)
+@@ -2646,7 +2693,7 @@
+     *value = (struct avpriv_vortx_http_sent_request){0};
+ }
+ 
+-int avpriv_vortx_http_copy_sent_request(
++int avpriv_vortx_http_copy_sent_request_v2(
+     AVIOContext *owner, int64_t expected_generation,
+     struct avpriv_vortx_http_sent_request *out)
+ {
+@@ -2655,7 +2702,9 @@
+     int recognized = 0;
+     struct avpriv_vortx_http_sent_request copy = {0};
+     if (!out || out->location || out->request || out->request_bytes ||
+-        out->response_generation || out->version || expected_generation <= 0 ||
++        out->response_generation || out->version || out->transport.version ||
++        out->transport.route || out->transport.tls_backend ||
++        out->transport.tls_policy || expected_generation <= 0 ||
+         !owner || owner->av_class != &ff_avio_class ||
+         !(h = ffio_geturlcontext(owner)) || !h->priv_data)
+         return AVERROR(EINVAL);
+@@ -2672,25 +2721,30 @@
+     if (!recognized)
+         return AVERROR(ENOSYS);
+     s = h->priv_data; // private typed access only after exact protocol/class/size
++    struct avpriv_vortx_http_transport transport = http_sent_transport(s);
+     if (s->class != h->prot->priv_data_class ||
+         s->response_generation != expected_generation ||
+         s->sent_request_generation != expected_generation ||
+         !s->sent_request || !s->sent_location || !s->response_location ||
+         strcmp(s->sent_location, s->response_location) ||
+-        !http_sent_request_wire_valid(s->sent_request, s->sent_request_bytes))
++        !http_sent_request_wire_valid(s->sent_request, s->sent_request_bytes) ||
++        !avpriv_vortx_http_transport_equal(&s->sent_transport, &transport))
+         return AVERROR(EAGAIN);
+     copy.location = av_strdup(s->sent_location);
+     copy.request = av_strndup(s->sent_request, s->sent_request_bytes);
+     if (!copy.location || !copy.request) {
+-        avpriv_vortx_http_sent_request_clear(&copy);
++        avpriv_vortx_http_sent_request_clear_v2(&copy);
+         return AVERROR(ENOMEM);
+     }
+     copy.request_bytes = s->sent_request_bytes;
+     copy.response_generation = expected_generation;
+     copy.version = VORTX_HTTP_SENT_REQUEST_VERSION;
++    copy.transport = s->sent_transport;
++    transport = http_sent_transport(s);
+     if (s->response_generation != expected_generation ||
+-        s->sent_request_generation != expected_generation) {
+-        avpriv_vortx_http_sent_request_clear(&copy);
++        s->sent_request_generation != expected_generation ||
++        !avpriv_vortx_http_transport_equal(&copy.transport, &transport)) {
++        avpriv_vortx_http_sent_request_clear_v2(&copy);
+         return AVERROR(EAGAIN);
+     }
+     *out = copy;
+--- a/libavformat/url.h
++++ b/libavformat/url.h
+@@ -25,6 +25,7 @@
+ #define AVFORMAT_URL_H
+ 
+ #include "avio.h"
++#include "vortx_http_request.h"
+ 
+ #include "libavutil/dict.h"
+ #include "libavutil/log.h"
+@@ -46,6 +47,10 @@
+     const char *protocol_whitelist;
+     const char *protocol_blacklist;
+     int min_packet_size;        /**< if non zero, the stream is packetized with this min packet size */
++    /* Source-private observation owned by this exact transport. Matched
++     * libavformat rebuild required: never mix old URLContext allocations.
++     * No AVOption/public getter, live handle or replay authority. */
++    struct avpriv_vortx_http_transport vortx_transport;
+ } URLContext;
+ 
+ typedef struct URLProtocol {
+--- a/libavformat/tls.c
++++ b/libavformat/tls.c
+@@ -61,6 +61,8 @@
+     int use_proxy;
+     int ret;
+ 
++    parent->vortx_transport = (struct avpriv_vortx_http_transport){0};
++
+     p = strchr(uri, '?');
+     if (p) {
+         ret = ff_parse_opts_from_query_string(c, p, 1);
+@@ -119,6 +121,14 @@
+     ret = ffurl_open_whitelist(c->is_dtls ? &c->udp : &c->tcp, buf, AVIO_FLAG_READ_WRITE,
+                                &parent->interrupt_callback, options,
+                                parent->protocol_whitelist, parent->protocol_blacklist, parent);
++    if (ret >= 0 && !c->is_dtls && !c->listen && !c->external_sock &&
++        c->tcp && c->tcp->is_connected && c->tcp->prot &&
++        !strcmp(c->tcp->prot->name, use_proxy ? "httpproxy" : "tcp")) {
++        /* This is the actual branch selected from options/environment above.
++         * Remain incomplete until the TLS backend has accepted its handshake. */
++        parent->vortx_transport.route = use_proxy ?
++            VORTX_HTTP_ROUTE_HTTP_CONNECT : VORTX_HTTP_ROUTE_DIRECT_TCP;
++    }
+     return ret;
+ }
+ 
+--- a/libavformat/tls.h
++++ b/libavformat/tls.h
+@@ -23,6 +23,8 @@
+ #ifndef AVFORMAT_TLS_H
+ #define AVFORMAT_TLS_H
+ 
++#include <string.h>
++
+ #include "libavutil/bprint.h"
+ #include "libavutil/opt.h"
+ 
+@@ -85,6 +87,43 @@
+     int mtu;
+ } TLSShared;
+ 
++/* Called only AFTER the backend's own successful handshake/trust path.
++ * ff_tls_open_underlying records the actual direct-vs-CONNECT choice first;
++ * external sockets, servers and DTLS have no such evidence. These are facts
++ * about this original connection, not a promise that a future open matches it.
++ * A changed AVOption after the handshake cannot rewrite this observation. */
++static inline void ff_tls_vortx_open_complete(TLSShared *s, URLContext *h,
++                                             unsigned backend)
++{
++    unsigned policy = 0;
++    h->vortx_transport.version = 0;
++    h->vortx_transport.tls_backend = 0;
++    h->vortx_transport.tls_policy = 0;
++    if (s->listen || s->external_sock || s->is_dtls || !s->tcp ||
++        !s->tcp->is_connected || !s->tcp->prot ||
++        (backend != VORTX_HTTP_TLS_SECURETRANSPORT &&
++         backend != VORTX_HTTP_TLS_MBEDTLS) ||
++        (h->vortx_transport.route != VORTX_HTTP_ROUTE_DIRECT_TCP &&
++         h->vortx_transport.route != VORTX_HTTP_ROUTE_HTTP_CONNECT) ||
++        strcmp(s->tcp->prot->name,
++               h->vortx_transport.route == VORTX_HTTP_ROUTE_DIRECT_TCP ?
++               "tcp" : "httpproxy"))
++        return;
++    if (s->verify == 1)
++        policy |= VORTX_HTTP_TLS_VERIFIED;
++    if (s->ca_file)
++        policy |= VORTX_HTTP_TLS_CUSTOM_CA;
++    if (s->cert_file || s->key_file || s->cert_buf || s->key_buf)
++        policy |= VORTX_HTTP_TLS_CLIENT_IDENTITY;
++    if (!s->host || strcmp(s->host, s->underlying_host))
++        policy |= VORTX_HTTP_TLS_HOST_OVERRIDE;
++    if (s->numerichost)
++        policy |= VORTX_HTTP_TLS_NUMERIC_HOST;
++    h->vortx_transport.tls_backend = backend;
++    h->vortx_transport.tls_policy = policy;
++    h->vortx_transport.version = VORTX_HTTP_TRANSPORT_VERSION;
++}
++
+ #define TLS_OPTFL (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
+ 
+ #define FF_TLS_CLIENT_OPTIONS(pstruct, options_field) \
+--- a/libavformat/tls_securetransport.c
++++ b/libavformat/tls_securetransport.c
+@@ -245,6 +245,7 @@
+ static int tls_close(URLContext *h)
+ {
+     TLSContext *c = h->priv_data;
++    h->vortx_transport = (struct avpriv_vortx_http_transport){0};
+     if (c->ssl_context) {
+         SSLClose(c->ssl_context);
+         CFRelease(c->ssl_context);
+@@ -338,6 +339,7 @@
+         }
+     }
+ 
++    ff_tls_vortx_open_complete(s, h, VORTX_HTTP_TLS_SECURETRANSPORT);
+     return 0;
+ fail:
+     tls_close(h);
+--- a/libavformat/tls_mbedtls.c
++++ b/libavformat/tls_mbedtls.c
+@@ -332,6 +332,7 @@
+ {
+     TLSContext *tls_ctx = h->priv_data;
+     TLSShared *shr = &tls_ctx->tls_shared;
++    h->vortx_transport = (struct avpriv_vortx_http_transport){0};
+ 
+     mbedtls_ssl_close_notify(&tls_ctx->ssl_context);
+     mbedtls_pk_free(&tls_ctx->priv_key);
+@@ -512,6 +513,7 @@
+     TLSShared *shr = &tls_ctx->tls_shared;
+     uint32_t verify_res_flags;
+     int ret;
++    h->vortx_transport = (struct avpriv_vortx_http_transport){0};
+ #if defined(MBEDTLS_SSL_DTLS_SRTP)
+     const mbedtls_ssl_srtp_profile profiles[] = {
+         MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80,
+@@ -673,7 +675,7 @@
+         goto fail;
+     }
+ 
+-    if (!shr->listen) {
++    if (!shr->listen && !shr->numerichost) {
+         if ((ret = mbedtls_ssl_set_hostname(&tls_ctx->ssl_context, shr->host)) != 0) {
+             av_log(h, AV_LOG_ERROR, "mbedtls_ssl_set_hostname returned %d\n", ret);
+             goto fail;
+@@ -706,6 +708,7 @@
+         }
+     }
+ 
++    ff_tls_vortx_open_complete(shr, h, VORTX_HTTP_TLS_MBEDTLS);
+     return 0;
+ 
+ fail:
+--- a/libavformat/vortx_http_request.h
++++ b/libavformat/vortx_http_request.h
+@@ -10,14 +10,43 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ struct AVIOContext;
+-#define VORTX_HTTP_SENT_REQUEST_VERSION 1u
++#define VORTX_HTTP_SENT_REQUEST_VERSION 2u
+ #define VORTX_HTTP_SENT_REQUEST_MAX_BYTES (32u * 1024u)
++/* Private observation, not permission to replay. No address, hostname, CA
++ * pathname, certificate or proxy credentials cross this scalar contract.
++ * Direct TCP does NOT prove a DNS result, peer IP or destination admission. */
++#define VORTX_HTTP_TRANSPORT_VERSION 1u
++#define VORTX_HTTP_ROUTE_DIRECT_TCP 1u
++#define VORTX_HTTP_ROUTE_HTTP_PROXY 2u
++#define VORTX_HTTP_ROUTE_HTTP_CONNECT 3u
++#define VORTX_HTTP_TLS_SECURETRANSPORT 1u
++#define VORTX_HTTP_TLS_MBEDTLS 2u
++#define VORTX_HTTP_TLS_VERIFIED 1u
++#define VORTX_HTTP_TLS_CUSTOM_CA 2u
++#define VORTX_HTTP_TLS_CLIENT_IDENTITY 4u
++#define VORTX_HTTP_TLS_HOST_OVERRIDE 8u
++#define VORTX_HTTP_TLS_NUMERIC_HOST 16u
++#define VORTX_HTTP_TLS_POLICY_MASK 31u
++struct avpriv_vortx_http_transport {
++    unsigned version; /* zero means unavailable, never an inferred default */
++    unsigned route;
++    unsigned tls_backend;
++    unsigned tls_policy; /* captured only after successful backend open */
++};
++static inline int avpriv_vortx_http_transport_equal(
++    const struct avpriv_vortx_http_transport *a,
++    const struct avpriv_vortx_http_transport *b)
++{
++    return a->version == b->version && a->route == b->route &&
++           a->tls_backend == b->tls_backend && a->tls_policy == b->tls_policy;
++}
+ struct avpriv_vortx_http_sent_request {
+     char *location;
+     char *request; /* exact successfully written request headers, including GET line */
+     size_t request_bytes; /* excludes the owned terminating NUL */
+     int64_t response_generation;
+     unsigned version;
++    struct avpriv_vortx_http_transport transport;
+ };
+ /* out must be zero/cleared; failure leaves it unchanged. Returns 0 only for an
+  * owned snapshot of the expected current completed response. A nonzero result
+@@ -25,9 +54,11 @@
+  * native memory only: never log, persist or expose these strings as AVOptions.
+  * New matched FFmpeg/MPV components and symbol/header parity are mandatory.
+  */
+-int avpriv_vortx_http_copy_sent_request(
++/* New symbols are mandatory for this larger v2 output. Keeping the old symbol
++ * and checking version after writing would corrupt an old caller's stack. */
++int avpriv_vortx_http_copy_sent_request_v2(
+     struct AVIOContext *owner, int64_t expected_generation,
+     struct avpriv_vortx_http_sent_request *out);
+-void avpriv_vortx_http_sent_request_clear(
++void avpriv_vortx_http_sent_request_clear_v2(
+     struct avpriv_vortx_http_sent_request *value);
+ #endif

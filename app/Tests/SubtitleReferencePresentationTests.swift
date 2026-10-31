@@ -62,6 +62,22 @@ enum SubtitleReferencePresentationTests {
                   "shared edge retires ending cue and begins new cue atomically")
         try check(indices(prepared.lookup(mediaSeconds: 4, manualDelaySeconds: 0).presentation) == [2],
                   "end is exclusive")
+        let equalStarts = try SubtitleReferencePresentation.prepare(file([
+            cue(1_000, 200_000, "long first"), cue(1_000, 4_000, "short second"),
+            cue(1_000, 4_000, "same timing, separate dialogue"), cue(4_000, 5_000, "shared edge")
+        ]))
+        try check(equalStarts.cues.map(\.originalText) == [
+            "long first", "short second", "same timing, separate dialogue", "shared edge"
+        ], "equal-start descending ends retain every cue in original order")
+        try check(indices(equalStarts.lookup(mediaSeconds: 1, manualDelaySeconds: 0).presentation) == [0, 1, 2],
+                  "equal starts become active atomically without deduplicating exact intervals")
+        try check(indices(equalStarts.lookup(mediaSeconds: 4, manualDelaySeconds: 0).presentation) == [0, 3],
+                  "all equal end events retire before the shared-edge cue begins")
+        try check(indices(equalStarts.lookup(mediaSeconds: 150, manualDelaySeconds: 0).presentation) == [0],
+                  "whole cue longer than 120 seconds remains active without clipping")
+        try check(equalStarts.lookup(mediaSeconds: 200, manualDelaySeconds: 0).presentation == nil,
+                  "long equal-start cue retains its exclusive true end")
+
         let decimalBoundary = try SubtitleReferencePresentation.prepare(file([
             cue(1_001, 1_003, "decimal"), cue(1_003, 1_005, "shared")
         ]))

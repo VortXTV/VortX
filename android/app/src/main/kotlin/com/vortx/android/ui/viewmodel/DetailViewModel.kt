@@ -38,6 +38,7 @@ import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PlayerSourceSwitchCommitGate
 import com.vortx.android.player.PlayerSourceSwitchResolution
+import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.LastStreamStore
@@ -284,6 +285,100 @@ internal fun bestSourceForCurrentRequest(
     rankCurrent: (List<StreamGroup>) -> StreamSource?,
 ): StreamSource? = currentAssembledBest(state, request) ?: rankCurrent(currentGroups)
 
+/**
+ * Read-only display ownership for repository source publications. A revoked context can never regain its
+ * pool rows, including when its replayed invalidation beats the first finite update or prepared adoption.
+ * The latest ordinary rows remain intact; an invalidation carries no older row snapshot to replace them.
+ */
+internal class SourceIndexPublicationBridge(
+    private val isPoolPublicationCurrent: (String) -> Boolean = { true },
+) {
+    private data class Publication(
+        val request: SourceRequestFence.Token,
+        val id: String?,
+        val groups: List<StreamGroup>,
+        val revoked: Boolean,
+    )
+
+    private var publication: Publication? = null
+    // One early/replayed event is enough; older contexts are checked against the repository scalar witness.
+    private var pendingRevokedId: String? = null
+
+    fun clear() { publication = null }
+
+    fun publicationId(request: SourceRequestFence.Token?): String? =
+        publication?.takeIf { it.request === request }?.id
+
+    fun accept(
+        request: SourceRequestFence.Token,
+        sourcePublicationId: String?,
+        groups: List<StreamGroup>,
+    ): List<StreamGroup> {
+        val revoked = isRevokedId(sourcePublicationId)
+        return withoutPool(groups, revoked).also {
+            publication = Publication(request, sourcePublicationId, it, revoked)
+        }
+    }
+
+    /** Records an early/unknown id before checking the current publication. */
+    fun revoke(sourcePublicationId: String): SourceRequestFence.Token? {
+        pendingRevokedId = sourcePublicationId
+        val current = publication?.takeIf { it.id == sourcePublicationId } ?: return null
+        publication = current.copy(groups = withoutPool(current.groups, true), revoked = true)
+        return current.request
+    }
+
+    fun currentGroups(request: SourceRequestFence.Token): List<StreamGroup>? {
+        val current = publication?.takeIf { it.request === request } ?: return null
+        return refresh(current).also { publication = it }.groups
+    }
+
+    fun isRevoked(request: SourceRequestFence.Token?): Boolean {
+        val current = publication?.takeIf { it.request === request } ?: return false
+        return refresh(current).also { publication = it }.revoked
+    }
+
+    /** Also filters an older coalescer publication while its raw-input rebuild is pending. */
+    fun visibleGroups(request: SourceRequestFence.Token?, groups: List<StreamGroup>): List<StreamGroup> {
+        val current = publication?.takeIf { it.request === request } ?: return groups
+        val refreshed = refresh(current).also { publication = it }
+        return withoutPool(groups, refreshed.revoked)
+    }
+
+    fun recordDecoration(request: SourceRequestFence.Token, groups: List<StreamGroup>): List<StreamGroup> {
+        val current = publication?.takeIf { it.request === request }
+        val revoked = current?.let { isRevokedId(it.id) } ?: true
+        val visible = withoutPool(groups, revoked)
+        if (current != null) publication = current.copy(groups = visible, revoked = revoked)
+        return visible
+    }
+
+    /** A rank-only language change keeps the repository context, but never crosses profile or target. */
+    fun transferRankingRequest(previous: SourceRequestFence.Token?, current: SourceRequestFence.Token) {
+        publication = publication?.takeIf {
+            it.request === previous && it.request.profileId == current.profileId && it.request.targetId == current.targetId
+        }?.let(::refresh)?.copy(request = current)
+    }
+
+    private fun isRevokedId(id: String?): Boolean {
+        if (id == null) return true
+        return pendingRevokedId == id || publication?.takeIf { it.id == id }?.revoked == true ||
+            !isPoolPublicationCurrent(id)
+    }
+
+    private fun refresh(current: Publication): Publication {
+        val revoked = current.revoked || isRevokedId(current.id)
+        return current.copy(groups = withoutPool(current.groups, revoked), revoked = revoked)
+    }
+
+    private fun withoutPool(groups: List<StreamGroup>, revoked: Boolean): List<StreamGroup> =
+        if (revoked && groups.any { it.base == SourceIndexClient.GROUP_ID }) {
+            groups.filterNot { it.base == SourceIndexClient.GROUP_ID }
+        } else {
+            groups
+        }
+}
+
 /// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
 /// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
 /// provider because its resolve path remains TorBox-only.
@@ -481,6 +576,7 @@ class DetailViewModel(
     }
     private val trackPrefs = TrackPreferencesStore(app)
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
+    private val sourcePublicationBridge = SourceIndexPublicationBridge(repo::isSourcePoolPublicationCurrent)
     private val sourceSwitchCommitGate = PlayerSourceSwitchCommitGate()
     private var sourceLoadJob: Job? = null
     private var automaticEpisodeBudget: Pair<SourceRequestFence.Token, EpisodeResolutionBudget>? = null
@@ -775,6 +871,33 @@ class DetailViewModel(
         // [sourcesReady] so the coalescer's empty first paint (bind paints once immediately, and every new
         // load resets rawGroups to empty) never overwrites the Loading shimmer or a load Error.
         sourceModel.bind(torbox, singularity, communityJs)
+        // This lifetime observer remains active after the target's finite streamUpdates flow terminates.
+        // Replayed ids are recorded even before this screen has accepted that context's first snapshot.
+        viewModelScope.launch {
+            repo.sourceInvalidations().collect { sourcePublicationId ->
+                val request = sourceRequestFence.currentToken()
+                val revokedRequest = sourcePublicationBridge.revoke(sourcePublicationId)
+                if (request == null || revokedRequest !== request ||
+                    !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
+                    request.targetId != _selectedEpisodeId.value
+                ) return@collect
+                val raw = sourcePublicationBridge.currentGroups(request) ?: return@collect
+                // Retire an older account-cache callback before it can republish its captured pool rows.
+                cacheCheckGate.begin()
+                cacheCheckJob?.cancel()
+                debridCacheEvidence = null
+                if (sourceRequestFence.currentToken() !== request ||
+                    !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
+                    request.targetId != _selectedEpisodeId.value
+                ) return@collect
+                sourceModel.setRawGroups(raw)
+                (_streams.value as? UiState.Success)?.data?.let { displayed ->
+                    // Preserve ordinary assembled contributor rows as well as repository add-on rows.
+                    // An empty/nonterminal load keeps its existing Loading state until the finite flow settles.
+                    _streams.value = UiState.Success(sourcePublicationBridge.visibleGroups(request, displayed))
+                }
+            }
+        }
         viewModelScope.launch {
             sourceModel.state.collect { st ->
                 val token = sourceRequestFence.currentToken()
@@ -789,7 +912,7 @@ class DetailViewModel(
                     ) &&
                     sourceRequestFence.accepts(token, sourceSticky.currentProfileId())
                 ) {
-                    _streams.value = UiState.Success(st.groups)
+                    _streams.value = UiState.Success(sourcePublicationBridge.visibleGroups(token, st.groups))
                 }
             }
         }
@@ -949,6 +1072,7 @@ class DetailViewModel(
         } else {
             sourceRequestFence.begin(profileId, episodeId)
         }
+        sourcePublicationBridge.clear()
         sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, _sourceAudioLanguageHint.value)
         // Install the witness before launch: an immediate cached source update may not suspend.
         randomEpisodePlayLease = randomPlay?.let {
@@ -1102,6 +1226,7 @@ class DetailViewModel(
         sourceLoadJob?.cancel()
         cancelPlaybackResolveForSourceTargetInvalidation()
         profileReloadJob?.cancel()
+        sourcePublicationBridge.clear()
         val invalidGeneration = sourceRequestFence.invalidate(profileId)
         sourceSticky.onProfileChanged()
         torbox.reset(invalidGeneration, clearCache = true)
@@ -1185,11 +1310,8 @@ class DetailViewModel(
         } else {
             torbox.reset(request.generation)
         }
-        singularity.refresh(
-            contentId,
-            isSignedIn(),
-            request.generation,
-        )
+        // Repository-owned source contexts carry the pool lane. The legacy frontend fetch stays dormant.
+        singularity.reset(request.generation)
         communityJs.refresh(
             scope = viewModelScope,
             imdbId = imdb,
@@ -1217,13 +1339,13 @@ class DetailViewModel(
                 wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
                 forceRefresh = forceRefresh,
             ).collect { update ->
-                val raw = update.groups
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
                 // the model so the fuller assembled + re-ranked list refines it a beat later.
                 if (
                     episodeId == _selectedEpisodeId.value &&
                     sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
                 ) {
+                    val raw = sourcePublicationBridge.accept(request, update.sourcePublicationId, update.groups)
                     // The assembly coalescer applies this same pure filter later, but immediate paint and the
                     // once-latched Smart Source pick run before that publication. Filter their shared input
                     // now so direct-links-only can never flash or auto-play a raw torrent. Keep [raw] for the
@@ -1263,7 +1385,18 @@ class DetailViewModel(
                                 deadlineMs = episodeBudget?.sourceRemainingMs() ?: AUTO_NEXT_ASSEMBLY_DEADLINE_MS,
                             )
                             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@collect
-                            assembled?.best
+                            assembled?.let { state ->
+                                val visible = sourcePublicationBridge.visibleGroups(request, state.groups)
+                                if (visible === state.groups) state.best else StreamRanking.best(
+                                    visible,
+                                    continuity = hint?.first,
+                                    binge = hint?.second,
+                                    pin = currentPin(),
+                                    sticky = sticky,
+                                    providerPenalty = unhealthy,
+                                    prefs = ctx.prefs,
+                                )
+                            }
                         } else {
                             StreamRanking.best(
                                 displayRaw,
@@ -1359,10 +1492,11 @@ class DetailViewModel(
         val cacheGeneration = cacheCheckGate.begin()
         cacheCheckJob?.cancel()
         cacheCheckJob = viewModelScope.launch {
-            // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
-            // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
+            // Gather over the CURRENT lanes for this title (repository raw groups + TorBox), never an
+            // independent frontend pool snapshot or a possibly-stale prior assembly. Late-arriving TorBox
             // torrents self-badge from the index's own check_cache tag, so they need no account round trip here.
-            val laneStreams = raw.flatMap { it.streams } + torbox.streamsFor(contentId) + singularity.streams.value
+            val laneStreams = sourcePublicationBridge.visibleGroups(request, raw).flatMap { it.streams } +
+                torbox.streamsFor(contentId)
             val hashes = laneStreams
                 .mapNotNull { it.infoHash?.trim()?.lowercase()?.takeIf { h -> h.isNotEmpty() } }
                 .distinct()
@@ -1404,7 +1538,7 @@ class DetailViewModel(
                 debridKeys.currentCredentialRevision() == credentialRevision &&
                 DebridKeys.credentialRevision.value == cacheDisplayRevision
             ) {
-                sourceModel.setRawGroups(decorated)
+                sourceModel.setRawGroups(sourcePublicationBridge.recordDecoration(request, decorated))
             }
         }
     }
@@ -1499,7 +1633,9 @@ class DetailViewModel(
         // source request fence used for episode changes so an in-flight assembly for the old language cannot
         // repaint the list after the viewer has selected a new one.  Keep the current groups visible while
         // the coalesced SourceListModel rebuilds against the new context.
+        val previousRequest = sourceRequestFence.currentToken()
         val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), _selectedEpisodeId.value)
+        sourcePublicationBridge.transferRankingRequest(previousRequest, token)
         sourceLoadJob?.cancel()
         _sourceAudioLanguageHint.value = normalized
         sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, normalized)
@@ -1623,6 +1759,7 @@ class DetailViewModel(
                                 playable.startPositionMs, resumeMs, startPositionOverrideMs),
                             userForcedSource = playable.userForcedSource || manualPick,
                             mediaRef = ref,
+                            watchPartyVideoId = episode?.id ?: id,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
                             isLive = isLivePlayback(),
@@ -1673,6 +1810,7 @@ class DetailViewModel(
             PlayerSourceSwitchResolution(
                 playable = resolved.copy(
                     mediaRef = ref,
+                    watchPartyVideoId = episode?.id ?: id,
                     expectedDurationMs = expectedRuntimeMs(),
                     posterUrl = nowPlayingPoster(episode),
                     isLive = isLivePlayback(),
@@ -1809,10 +1947,11 @@ class DetailViewModel(
                     playable = resolved.copy(
                         startPositionMs = 0L,
                         mediaRef = mediaRef,
+                        watchPartyVideoId = target.id,
                         expectedDurationMs = expectedRuntimeMs(),
                         posterUrl = nowPlayingPoster(target),
                         isLive = isLivePlayback(),
-                        episodeTitle = target?.title?.takeIf { it.isNotBlank() },
+                        episodeTitle = target.title.takeIf { it.isNotBlank() },
                     ),
                     resolvedSource = source,
                     commitGate = sourceSwitchCommitGate,
@@ -1849,6 +1988,7 @@ class DetailViewModel(
         val previousSeason = _selectedSeason.value
         val previousStreams = _streams.value
         val previousContext = lastCtx
+        val previousPublicationId = sourcePublicationBridge.publicationId(sourceRequestFence.currentToken())
         val previousSource = lastPlayedSource
         val previousAcceptedEpisode = lastAcceptedEpisodeId
         val previousManualEpisode = explicitManualEpisodeId
@@ -1858,11 +1998,16 @@ class DetailViewModel(
             prepared = prepared,
             playable = prepared.playable.copy(startPositionMs = 0L,
                 mediaRef = buildMediaRef(type, id, target, detail.name, detail.releaseInfo?.take(4)?.toIntOrNull()),
+                watchPartyVideoId = target.id,
                 expectedDurationMs = expectedRuntimeMs(), posterUrl = nowPlayingPoster(target),
                 isLive = isLivePlayback(), episodeTitle = target.title.takeIf { it.isNotBlank() }),
             commitGate = sourceSwitchCommitGate,
             isCurrent = { preparedEpisodeSlot.accepts(claimed.ticket) },
-            install = { groups ->
+            install = {
+                // adopt() has succeeded. Read the preparation's current scalar-filtered publication here:
+                // cached handoff rows may predate synchronous pool retirement while IO cleanup is queued.
+                val sourcePublicationId = prepared.preparation.sourcePublicationId
+                val adoptedGroups = prepared.preparation.groups
                 sourceLoadJob?.cancel()
                 episodeBudgetJob?.cancel()
                 automaticEpisodeBudget = null
@@ -1872,9 +2017,10 @@ class DetailViewModel(
                 installedRequest = token
                 _selectedEpisodeId.value = target.id
                 _selectedSeason.value = target.season
-                seedPreparedSources(token, groups,
+                seedPreparedSources(token, adoptedGroups,
                     buildContext(target.id, CanonicalContentIdentity.imdb(metaId.takeIf { it.startsWith("tt") }, target.season, target.episode),
-                        token, lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }))
+                        token, lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }),
+                    sourcePublicationId)
                 lastPlayedSource = prepared.source
                 resumeRef = null
                 explicitManualEpisodeId = target.id
@@ -1886,8 +2032,9 @@ class DetailViewModel(
                     _selectedEpisodeId.value = previousEpisode
                     _selectedSeason.value = previousSeason
                     seedPreparedSources(restored, (previousStreams as? UiState.Success)?.data.orEmpty(),
-                        (previousContext ?: SourceListModel.Context()).copy(requestGeneration = restored.generation, streamId = previousEpisode))
-                    _streams.value = previousStreams
+                        (previousContext ?: SourceListModel.Context()).copy(requestGeneration = restored.generation, streamId = previousEpisode),
+                        previousPublicationId)
+                    if (previousStreams !is UiState.Success) _streams.value = previousStreams
                     lastPlayedSource = previousSource
                     lastAcceptedEpisodeId = previousAcceptedEpisode
                     explicitManualEpisodeId = previousManualEpisode
@@ -1898,7 +2045,12 @@ class DetailViewModel(
     }
 
     /** Seed accepted bindings without a provider/cache/contributor fetch or a second player. */
-    private fun seedPreparedSources(request: SourceRequestFence.Token, groups: List<StreamGroup>, ctx: SourceListModel.Context) {
+    private fun seedPreparedSources(
+        request: SourceRequestFence.Token,
+        groups: List<StreamGroup>,
+        ctx: SourceListModel.Context,
+        sourcePublicationId: String? = null,
+    ) {
         sourcesReady = false
         torbox.reset(request.generation)
         singularity.reset(request.generation)
@@ -1906,10 +2058,13 @@ class DetailViewModel(
         debridCacheEvidence = null
         sourceSelectionRevision = DetailSourceSelectionRevision(request.generation, _sourceAudioLanguageHint.value)
         lastCtx = ctx
+        // The handoff calls this only after the exact preparation's adopt() succeeded. Its immutable
+        // repository context id is accepted before any rows, so an earlier opt-out replay also filters adoption.
+        val visible = sourcePublicationBridge.accept(request, sourcePublicationId, groups)
         sourceModel.setContext(ctx)
         sourceModel.setMediaServerGroups(emptyList())
-        sourceModel.setRawGroups(groups)
-        _streams.value = UiState.Success(SourceListModel.directLinkDisplayGroups(groups, ctx.directLinksOnly))
+        sourceModel.setRawGroups(visible)
+        _streams.value = UiState.Success(SourceListModel.directLinkDisplayGroups(visible, ctx.directLinksOnly))
         sourceSettlement.value = EpisodeSourceSettlement(request, settled = true)
         sourcesReady = true
     }
@@ -2097,6 +2252,7 @@ class DetailViewModel(
                             startPositionMs = selectedPlaybackStartPosition(nativeEnabled = true,
                                 playable.startPositionMs, resumeMs, startPositionOverrideMs, fromStart),
                             mediaRef = ref,
+                            watchPartyVideoId = episode?.id ?: id,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
                             isLive = isLivePlayback(),
@@ -2221,8 +2377,12 @@ class DetailViewModel(
     /// the hero Watch button's enabled state.
     fun bestSource(): StreamSource? {
         val request = sourceRequestFence.currentToken()
-        val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
-        return bestSourceForCurrentRequest(sourceModel.state.value, request, groups) { currentGroups ->
+        val groups = sourcePublicationBridge.visibleGroups(request, (_streams.value as? UiState.Success)?.data.orEmpty())
+        val assembled = sourceModel.state.value.let { state ->
+            // The coalescer may still hold its pre-invalidation best until the raw-input rebuild lands.
+            if (sourcePublicationBridge.isRevoked(request)) state.copy(best = null) else state
+        }
+        return bestSourceForCurrentRequest(assembled, request, groups) { currentGroups ->
             currentGroups.takeIf { it.isNotEmpty() }?.let {
                 StreamRanking.best(
                     currentGroups,
@@ -2507,10 +2667,13 @@ class DetailViewModel(
     fun playerQualityOptions(): List<Pair<String, StreamSource>> {
         val request = sourceRequestFence.currentToken() ?: return emptyList()
         val state = sourceModel.state.value
-        if (state.requestGeneration == request.generation && state.streamId == request.targetId) {
+        if (state.requestGeneration == request.generation && state.streamId == request.targetId &&
+            !sourcePublicationBridge.isRevoked(request)
+        ) {
             return state.resolutionOptions
         }
-        val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
+        val groups = sourcePublicationBridge.visibleGroups(request,
+            (_streams.value as? UiState.Success)?.data ?: return emptyList())
         return StreamRanking.resolutionOptions(groups)
     }
 
@@ -2521,7 +2684,8 @@ class DetailViewModel(
         rankedSourceOptions(limit)
 
     private fun rankedSourceOptions(limit: Int): List<StreamSource> {
-        val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
+        val groups = sourcePublicationBridge.visibleGroups(sourceRequestFence.currentToken(),
+            (_streams.value as? UiState.Success)?.data ?: return emptyList())
         val prefs = lastCtx?.prefs
         val sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null
         val ranked = if (prefs != null) {

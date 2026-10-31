@@ -82,6 +82,9 @@ struct VortXiOSApp: App {
         // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
         VortXCrashReporter.install()
+        #if os(iOS)
+        GoogleCastManager.configure()
+        #endif
         // Prior-launch termination evidence (jetsam vs watchdog vs clean exit). See TerminationReceipt.
         TerminationReceipt.install()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the

@@ -62,10 +62,14 @@ object MoatConsent {
      * [contributeAndConsume] returns the stored value instead of the unset default (on).
      */
     fun setContribute(context: Context, enabled: Boolean) {
+        val changed = contributeAndConsume(context) != enabled
+        if (changed) com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
         context.applicationContext
             .getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY, enabled)
             .apply()
+        // Revoke a lease that was issued between the first fence and the preference write too.
+        if (changed) com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
     }
 }

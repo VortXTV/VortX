@@ -5,12 +5,129 @@ import com.vortx.android.model.MetaItem
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collect
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 
 class NativeWatchlistStoreTest {
     private val movie = MetaItem("tt123", MediaType.MOVIE, "Movie")
+
+    @Test fun `native reload capture and publication use IO but click capture stays on caller`() = runBlocking {
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+            Thread(task, "watchlist-native-reload-io")
+        }
+        val dispatcher = executor.asCoroutineDispatcher()
+        val captureThreads = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val publicationThreads = java.util.Collections.synchronizedList(mutableListOf<String>())
+        try {
+            fixture(ioDispatcher = dispatcher).use { f ->
+                f.gateway.beforeCapture = { captureThreads += Thread.currentThread().name }
+                f.gateway.onPublication = { publicationThreads += Thread.currentThread().name }
+                f.gateway.put("tt-ready", "movie")
+                f.install()
+                f.store.reload()
+                assertEquals(listOf("tt-ready"), f.store.items.value.map { it.id })
+                assertTrue(captureThreads.isNotEmpty())
+                assertTrue(captureThreads.all { it == "watchlist-native-reload-io" })
+                assertTrue(publicationThreads.isNotEmpty())
+                assertTrue(publicationThreads.all { it == "watchlist-native-reload-io" })
+                val caller = Thread.currentThread().name
+                f.store.captureToggle(movie)
+                assertEquals(caller, captureThreads.last())
+                assertEquals(caller, publicationThreads.last())
+            }
+        } finally {
+            dispatcher.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test fun `superseded queued reloads skip native capture before entering Session`() {
+        val dispatcher = QueuedDispatcher()
+        fixture(ioDispatcher = dispatcher).use { f ->
+            f.gateway.put("tt-ready", "movie")
+            f.install()
+            dispatcher.runAll()
+            val before = f.gateway.captures
+            repeat(3) { f.store.requestReload() }
+            assertEquals(before, f.gateway.captures)
+            dispatcher.runAll()
+            assertEquals(before + 1, f.gateway.captures)
+            assertEquals(listOf("tt-ready"), f.store.items.value.map { it.id })
+        }
+    }
+
+    @Test fun `profile switch during native capture clears old rows before IO and rejects stale publication`() {
+        val dispatcher = QueuedDispatcher()
+        fixture(ioDispatcher = dispatcher).use { f ->
+            f.gateway.put("tt-old", "movie")
+            f.install()
+            dispatcher.runAll()
+            assertEquals(listOf("tt-old"), f.store.items.value.map { it.id })
+            val observed = mutableListOf<List<String>>()
+            f.scope.launch { f.store.items.collect { observed += it.map { item -> item.id } } }
+            observed.clear()
+            f.gateway.afterCapture = {
+                f.gateway.rebind("NEXT")
+                f.gateway.put("tt-current", "movie")
+                f.switchListener()
+                assertTrue(f.store.items.value.isEmpty())
+            }
+            f.store.requestReload()
+            dispatcher.runNext()
+            assertTrue(f.store.items.value.isEmpty())
+            assertNull(f.store.error.value)
+            dispatcher.runAll()
+            assertEquals(listOf("tt-current"), f.store.items.value.map { it.id })
+            assertFalse(observed.any { "tt-old" in it })
+            assertNull(f.store.error.value)
+            assertEquals(0, f.persistence.reads)
+            assertEquals(0, f.persistence.writes)
+        }
+    }
+
+    @Test fun `suspend reload reports unavailable native capture and recovers without a local fallback`() = runBlocking {
+        fixture().use { f ->
+            f.install()
+            for (failure in listOf(IllegalStateException("fixture unavailable"), UnsatisfiedLinkError("fixture JNI"))) {
+                f.gateway.captureFailure = failure
+                f.store.reload()
+                assertTrue(f.store.items.value.isEmpty())
+                assertNotNull(f.store.error.value)
+                assertEquals(0, f.persistence.reads)
+                assertEquals(0, f.persistence.writes)
+            }
+            f.gateway.captureFailure = null
+            f.gateway.put("tt-recovered", "movie")
+            f.store.reload()
+            assertEquals(listOf("tt-recovered"), f.store.items.value.map { it.id })
+            assertNull(f.store.error.value)
+        }
+    }
+
+    @Test fun `scheduled JNI failure is visible and cancellation or VM errors still propagate`() = runBlocking {
+        fixture().use { f ->
+            f.install()
+            f.gateway.captureFailure = NoSuchMethodError("fixture incompatible adapter")
+            f.store.requestReload()
+            assertNotNull(f.store.error.value)
+            val cancellation = CancellationException("fixture cancellation")
+            f.gateway.captureFailure = cancellation
+            try {
+                f.store.reload()
+                fail("Cancellation was converted into unavailable data")
+            } catch (actual: CancellationException) { assertSame(cancellation, actual) }
+            val fatal = OutOfMemoryError("synthetic VM failure")
+            f.gateway.captureFailure = fatal
+            try {
+                f.store.reload()
+                fail("VM failure was converted into unavailable data")
+            } catch (actual: OutOfMemoryError) { assertSame(fatal, actual) }
+            assertEquals(0, f.persistence.reads)
+            assertEquals(0, f.persistence.writes)
+        }
+    }
 
     @Test fun `native construction with absent gateway never reads or writes unqualified local data`() = runBlocking {
         fixture(native = true).use { f ->
@@ -178,15 +295,23 @@ class NativeWatchlistStoreTest {
         }
     }
 
-    private fun fixture(native: Boolean = true) = Fixture(native)
+    private fun fixture(native: Boolean = true, ioDispatcher: CoroutineDispatcher = Dispatchers.Unconfined) = Fixture(native, ioDispatcher)
 
-    private class Fixture(native: Boolean) : AutoCloseable {
+    private class Fixture(native: Boolean, ioDispatcher: CoroutineDispatcher) : AutoCloseable {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val persistence = Persistence()
         val gateway = Gateway()
-        val store = WatchlistStore(persistence, { "PROFILE" }, {}, scope, Dispatchers.Unconfined, { 123.5 }, { native })
+        var switchListener: () -> Unit = {}
+        val store = WatchlistStore(persistence, { "PROFILE" }, { switchListener = it }, scope, ioDispatcher, { 123.5 }, { native })
         fun install() = store.installNativeGateway(gateway) { true }
         override fun close() = scope.cancel()
+    }
+
+    private class QueuedDispatcher : CoroutineDispatcher() {
+        private val tasks = java.util.ArrayDeque<Runnable>()
+        override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) { tasks.addLast(block) }
+        fun runNext() { check(tasks.isNotEmpty()); tasks.removeFirst().run() }
+        fun runAll() { while (tasks.isNotEmpty()) runNext() }
     }
 
     private class Persistence : WatchlistPersistence {
@@ -200,6 +325,10 @@ class NativeWatchlistStoreTest {
             val session: Int = 0, val revision: Long = 0) : NativeWatchlistGateway.Owner
         var owner = Epoch()
         var registers = JSONObject()
+        var captures = 0
+        var captureFailure: Throwable? = null
+        var beforeCapture: (() -> Unit)? = null
+        var onPublication: (() -> Unit)? = null
         var mutations = 0
         var receivedOwner: NativeWatchlistGateway.Owner? = null
         var awaitAck: CompletableDeferred<Unit>? = null
@@ -210,11 +339,15 @@ class NativeWatchlistStoreTest {
         var afterCapture: (() -> Unit)? = null
         override val changes: Flow<Unit> = MutableSharedFlow()
         override fun capture(): Result<NativeWatchlistGateway.Snapshot> {
+            captures++
+            beforeCapture?.invoke()
+            captureFailure?.let { return Result.failure(it) }
             val read = snapshot()
             afterCapture.also { afterCapture = null }?.invoke()
             return Result.success(read)
         }
         override fun publishIfCurrent(expected: NativeWatchlistGateway.Owner, publication: () -> Unit): Boolean {
+            onPublication?.invoke()
             if (skipPublicationHooks > 0) skipPublicationHooks--
             else beforePublication.also { beforePublication = null }?.invoke()
             if (expected != owner) return false
@@ -238,7 +371,7 @@ class NativeWatchlistStoreTest {
             registers.put(NativeWatchlistCodec.field(id, type), register(NativeWatchlistCodec.value(WatchlistEntry(id, type, id, null, 123.5))))
         }
         fun advanceRevision() { owner = owner.copy(revision = owner.revision + 1) }
-        fun rebind() { owner = owner.copy(session = owner.session + 1, revision = 0); registers = JSONObject() }
+        fun rebind(profileId: String = owner.profileId) { owner = owner.copy(profileId = profileId, session = owner.session + 1, revision = 0); registers = JSONObject() }
         private fun snapshot() = NativeWatchlistGateway.Snapshot(owner, JSONObject(registers.toString()))
         private fun register(value: Any) = JSONObject().put("clock", owner.revision + 1)
             .put("actor", "11111111-1111-1111-1111-111111111111").put("value", value)

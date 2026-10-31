@@ -54,6 +54,9 @@ function generate(repoArgument, runArgument, runnerArgument) {
   if (hash(read(path.join(repo, 'test/mpv-bounded-child.mjs'))) !== supervisorSHA) throw Error('Supervisor changed');
   const json = declaration(donor('VortxResourceBridge.swift'), 'indirect enum VortxJSON:');
   const error = declaration(donor('VortxNativeRuntime.swift'), 'enum VortxNativeError:');
+  const resourceAddon = declaration(donor('VortxResourceBridge.swift'), 'struct VortxResourceAddon:');
+  const installedProjection = declaration(donor('XperienceNativePersistence.swift'), 'enum XperienceInstalledCatalogs {');
+  const projectionFailure = declaration(donor('XperienceExportObservation.swift'), 'enum XperiencePersistenceFailure:');
   const keychain = declaration(donor('Keychain.swift'), 'final class KeychainFailureClosedStore:');
   const preferences = donor('VortxNativeHostPreferences.swift');
   const start = one(preferences, '    static let forYouPrefix = "forYou."');
@@ -62,16 +65,19 @@ function generate(repoArgument, runArgument, runnerArgument) {
   if (validatorStart < start || end < 0) throw Error('Unexpected host-validator boundary');
   const validator = preferences.slice(start, end + 7);
   for (const [name, text] of [['VortxJSON', json], ['VortxNativeError', error],
-      ['KeychainFailureClosedStore', keychain], ['ForYouHostValidator', validator]]) {
+      ['KeychainFailureClosedStore', keychain], ['ForYouHostValidator', validator],
+      ['VortxResourceAddon', resourceAddon], ['XperienceInstalledCatalogs', installedProjection],
+      ['XperiencePersistenceFailure', projectionFailure]]) {
     extracts.push({declaration: name, sha256: hash(text)});
   }
   write('ExactProductionDeclarations.swift', 'import Foundation\n' + json + '\n' + error + '\n'
-    + keychain + '\nenum VortxNativeHostPreferences {\n' + validator + '}\n');
+    + keychain + '\n' + resourceAddon + '\n' + projectionFailure + '\n' + installedProjection
+    + '\nenum VortxNativeHostPreferences {\n' + validator + '}\n');
   // These are complete CURRENT production sources, never stored implementation afterimages.
   for (const name of ['CredentialScope.swift', 'ForYouInterests.swift', 'VortxNativeHostFieldMutation.swift',
       'VortxNativeBootstrapArchive.swift', 'AddonURLGuard.swift', 'AddonPairingProtocol.swift',
       'VortXEdgeAuth.swift', 'CurationCollection.swift', 'CurationDocument.swift', 'CurationEdit.swift',
-      'XperienceCollections.swift', 'XperienceAddonBinding.swift', 'XperienceExportEndpoint.swift',
+      'XperienceCollections.swift', 'XperienceAddonBinding.swift', 'OwnerHistoryExactJSON.swift', 'XperienceExportEndpoint.swift',
       'XperienceExportSystemKeychain.swift', 'XperienceExportHTTP.swift', 'XperienceProfileExportAdmission.swift',
       'XperienceCurationExportMapper.swift', 'XperienceCurationExportController.swift',
       'XperienceCurationExportPromptState.swift']) write(name, donor(name));

@@ -68,6 +68,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import com.vortx.android.party.WatchPartyButton
+import com.vortx.android.party.WatchPartyClientSession
+import com.vortx.android.party.WatchPartyOwnerStamp
+import com.vortx.android.party.WatchPartyPanel
+import com.vortx.android.party.WatchPartyWire
 import com.vortx.android.VortXApplication
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.ui.theme.VortXTheme
@@ -82,12 +87,15 @@ import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.moat.MoatConsent
 import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.player.subtitles.SubtitlePoolClient
 import com.vortx.android.player.subtitles.SubtitleTimingSession
+import com.vortx.android.player.subtitles.runAutomaticPooledSubtitleSelection
 import com.vortx.android.player.subtitles.subtitlePoolPlaybackQuery
 import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.singularity.SourceIndexLifecycle
 import com.vortx.android.skip.AutoSkipCountdownDecision
 import com.vortx.android.skip.AutoSkipCountdownPolicy
 import com.vortx.android.skip.AutoSkipCountdownState
@@ -99,14 +107,18 @@ import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -142,7 +154,7 @@ fun PlayerScreen(
     engineOverride: PlayerEngineRouter.Override = PlayerEngineRouter.Override.AUTO,
     /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
     /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
-    onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    onProgress: (PlayerProgressSnapshot) -> Unit = {},
     /** Fired once only after this screen's final decoder and every bound playback lease are released. */
     onResourcesReleased: () -> Unit = {},
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
@@ -246,8 +258,20 @@ fun PlayerScreen(
             ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         clearWindowBrightness(activity)
     }
+    var addonSubtitlePreparationJob by remember(outerPlaybackSessionId) { mutableStateOf<Job?>(null) }
+    var addonSubtitlePreparationCancelled by remember(outerPlaybackSessionId) { mutableStateOf<AtomicBoolean?>(null) }
+    fun cancelAddonSubtitlePreparation() {
+        addonSubtitlePreparationCancelled?.set(true)
+        addonSubtitlePreparationCancelled = null
+        addonSubtitlePreparationJob?.cancel()
+        addonSubtitlePreparationJob = null
+    }
+    val preparePlayerExit = remember { AtomicReference<(() -> Unit)?>(null) }
     fun exitPlayer() {
         if (playerExitRequested) return
+        cancelAddonSubtitlePreparation()
+        // Preserve/flush an owned receiver synchronously, before invalidating its original history gate.
+        preparePlayerExit.get()?.invoke()
         playerExitRequested = true
         // Restore synchronously as well as from DisposableEffect. This prevents the browse shell from
         // drawing one or more frames in player landscape while navigation is committing.
@@ -289,6 +313,10 @@ fun PlayerScreen(
                 },
             ),
         )
+    }
+    // Explicit user controls publish through the current room only; remote/automatic effects do not recurse.
+    val partyPublisher = remember(playbackSessionKey) {
+        java.util.concurrent.atomic.AtomicReference<((String, Long) -> Unit)?>(null)
     }
     // A successful inner replacement gets a fresh source terminal verdict while retaining the intent
     // above. Initial playback is harmless (the controller starts non-terminal); failed sources remain
@@ -363,6 +391,7 @@ fun PlayerScreen(
     }
     var subtitleDelaySeconds by remember(playbackSessionKey) { mutableStateOf(savedSubtitleDelay ?: 0.0) }
     val subtitleTiming = remember(playbackSessionKey) { SubtitleTimingSession(savedSubtitleDelay) }
+    var subtitlePoolRetry by remember(playbackSessionKey) { mutableStateOf(0L) }
     DisposableEffect(subtitleTiming) { onDispose { subtitleTiming.retire() } }
     // Capture BEFORE the original manager/UI/account/profile proof; never adopt a successor epoch.
     val originalOwnerCandidate = remember { PlaybackOwnerEpoch.capture() }
@@ -728,6 +757,9 @@ fun PlayerScreen(
     // wraps this screen). Deliberately AFTER the orientation/immersive effect so the connecting frame is
     // already landscape + edge-to-edge.
     val engine = builtEngine
+    DisposableEffect(playbackSessionKey, engine) {
+        onDispose { cancelAddonSubtitlePreparation() }
+    }
     // One deadline per physical attempt, spanning null -> built publication. Key collection by the
     // actual engine so a replacement cannot consume a retained settled value from its predecessor.
     val startupWindow = remember(engineHolder, subtitleProfileRevision) { StartupCoverWindow(SystemClock.elapsedRealtime()) }
@@ -883,9 +915,25 @@ fun PlayerScreen(
         engine.seekTo(positionMs)
     }
 
-    fun seekLocalBy(deltaMs: Long) {
-        invalidateAutoSkipPending(engine.state.value.positionMs)
+    fun userSeekLocalBy(deltaMs: Long) {
+        val state = engine.state.value
+        val boundedDelta = deltaMs.coerceIn(-86_400_000L, 86_400_000L)
+        val predicted = (state.positionMs.coerceIn(0, 86_400_000) + boundedDelta)
+            .coerceIn(0, state.durationMs.takeIf { it > 0L }?.coerceAtMost(86_400_000) ?: 86_400_000)
+        invalidateAutoSkipPending(state.positionMs)
         engine.seekBy(deltaMs)
+        partyPublisher.get()?.invoke("seek", predicted)
+    }
+    fun userSeekLocalTo(positionMs: Long) {
+        seekLocalTo(positionMs)
+        partyPublisher.get()?.invoke("seek", positionMs)
+    }
+    fun userSetPlaying(playing: Boolean) {
+        if (playing) playbackIntent.userPlay() else playbackIntent.userPause()
+        partyPublisher.get()?.invoke(if (playing) "play" else "pause", engine.state.value.positionMs)
+    }
+    fun userTogglePlayback() {
+        userSetPlaying(engine.state.value.isPaused || !playbackIntent.snapshot().shouldPlay)
     }
 
     // Settings can change while the player remains mounted (including profile sync/restore). Keep one
@@ -973,56 +1021,12 @@ fun PlayerScreen(
             stillWatchingPrompt = true
         }
     }
-    // GOOGLE CAST (the CAST lane, Android's AirPlay equivalent). Conceptually mirrors the Apple AirPlay
-    // handoff: while a receiver is connected the local engine YIELDS (pauses, so it stops decoding and
-    // consuming the source), the current stream (URL + subtitles + start position) plays on the receiver,
-    // and on disconnect local playback RESUMES where the receiver left off. Torrents are gated OUT of
-    // casting (loopback streaming-server URLs a receiver cannot reach), exactly as the router keeps them on
-    // libmpv. All cast machinery lives in com.vortx.android.cast; this host block is the minimal seam.
-    val castManager = rememberCastManager()
-    val castState by castManager.state.collectAsStateWithLifecycle()
-    var castChooserOpen by remember(playbackSessionKey) { mutableStateOf(false) }
-    val streamCastable = CastEligibility.isCastable(currentPlayable)
-    // Keep the manager aimed at the current stream with a LIVE position provider, so a session started from
-    // our chooser loads exactly where local playback is, and an in-player episode/source switch reloads the
-    // receiver. A non-castable stream clears it so nothing stale is ever cast.
-    LaunchedEffect(castManager, currentPlayable, streamCastable) {
-        castManager.setNowPlaying(if (streamCastable) currentPlayable else null) {
-            latestState.positionMs.coerceAtLeast(0L)
-        }
-    }
-    // Local playback yields to / resumes from the receiver. The [wasCasting] latch makes resume fire ONLY
-    // after an actual cast, so the initial (disconnected) composition never spuriously seeks or plays.
-    var wasCasting by remember(playbackSessionKey) { mutableStateOf(false) }
-    LaunchedEffect(castState.isConnected) {
-        if (castState.isConnected) {
-            wasCasting = true
-            invalidateAutoSkipPending(engine.state.value.positionMs)
-            playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
-        } else if (wasCasting) {
-            wasCasting = false
-            val resumeAt = castManager.lastKnownPositionMs
-            if (resumeAt > 0L) seekLocalTo(resumeAt)
-            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
-        }
-    }
-    // Record progress WHILE casting through the SAME per-profile onProgress path the local engine uses:
-    // casting must not bypass watch history. The local progress writer is dormant here (its engine is
-    // paused), so this is the only writer while connected, and it never runs for a trailer.
-    LaunchedEffect(castState.isConnected, currentPlayable.isTrailer) {
-        if (!castState.isConnected || currentPlayable.isTrailer) return@LaunchedEffect
-        while (isActive) {
-            val s = castManager.state.value
-            if (!s.isPaused && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) currentOnProgress(s.positionMs, s.durationMs)
-            delay(CAST_PROGRESS_WRITEBACK_MS)
-        }
-    }
-
     // Keying the resolver job by the exact authority cancels it when the outer playback session or request
     // changes. The token check below is the authoritative defense if a resolver ignores cancellation.
     val pendingSourceSwitch = sourceSwitchState.pendingSwitch
     LaunchedEffect(pendingSourceSwitch?.authority) {
         val pending = pendingSourceSwitch ?: return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         val resolver = currentOnSwitchSource
         resolveAndApplyPlayerSourceSwitch(
             coordinator = sourceSwitchCoordinator,
@@ -1044,6 +1048,7 @@ fun PlayerScreen(
     LaunchedEffect(outerPlaybackSessionId, episodeHandoffRequest?.sequence) {
         val request = episodeHandoffRequest ?: return@LaunchedEffect
         if (playerExitRequested) return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
             sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, request.episode, authority, request.automatic)
@@ -1258,6 +1263,144 @@ fun PlayerScreen(
         }
     }
 
+    // Every transport and history path uses the mounted source/episode owner, not receiver connectivity.
+    val castManager = rememberCastManager()
+    val castState by castManager.state.collectAsStateWithLifecycle()
+    val castOwner = remember(playbackSessionKey) { java.util.UUID.randomUUID().toString() }
+    val currentCastOwner by rememberUpdatedState(castOwner)
+    val castOwned = castState.isConnected && castState.owner == castOwner
+    val progressTimeline = remember(castOwner) {
+        PlayerProgressTimeline(castOwner,
+            admitted = { currentCastOwner == castOwner && withCurrentSubtitleOwnerState { true } },
+            valid = { pos, dur -> !runtimeMismatch && !knownAudioMismatch &&
+                canReportPlayerProgress(currentPlayable, pos, dur) },
+            emit = { currentOnProgress(it) })
+    }
+    var castChooserOpen by remember(playbackSessionKey) { mutableStateOf(false) }
+    val streamCastable = CastEligibility.isCastable(currentPlayable)
+    LaunchedEffect(castManager, castOwner, currentPlayable, streamCastable) {
+        castManager.setNowPlaying(owner = castOwner,
+            playable = if (streamCastable) currentPlayable else null,
+            positionProvider = { latestState.positionMs.coerceAtLeast(0L) },
+            isCurrent = { currentCastOwner == castOwner && withCurrentSubtitleOwnerState { true } },
+            timeline = { point, active, resume -> progressTimeline.remote(point, active, resume) })
+    }
+    DisposableEffect(castManager, castOwner, progressTimeline, playbackIntent) {
+        val beforeExit: () -> Unit = {
+            castManager.leavePlayer(castOwner)
+            progressTimeline.finish(latestState.positionMs, latestState.durationMs)
+            progressTimeline.close()
+        }
+        preparePlayerExit.set(beforeExit)
+        onDispose {
+            preparePlayerExit.compareAndSet(beforeExit, null)
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
+        }
+    }
+    var wasCasting by remember(castOwner) { mutableStateOf(false) }
+    LaunchedEffect(castOwned, castOwner, engine) {
+        if (castOwned) {
+            wasCasting = true
+            invalidateAutoSkipPending(engine.state.value.positionMs)
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
+        } else if (wasCasting) {
+            wasCasting = false
+            val resumeAt = castManager.takeResumePosition(castOwner)
+            if (resumeAt != null && withCurrentSubtitleOwnerState { true }) {
+                progressTimeline.beginLocalResume(engine, engine.state.value)
+                seekLocalTo(resumeAt)
+            }
+            playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
+        }
+    }
+
+    // Seek acceptance is a current-engine telemetry event, not a throttled history tick. The ticket
+    // captures the mounted generation and exact pre-seek state; stale/buffering/old-engine samples fail.
+    LaunchedEffect(progressTimeline, engine, castOwner) {
+        engine.state.collect { sample ->
+            val ticket = progressTimeline.localResumeTicket ?: return@collect
+            if (builtEngine !== engine || engineHolder.get() !== engine || currentCastOwner != castOwner) return@collect
+            progressTimeline.acknowledgeLocalResume(ticket, engine, castOwner, sample,
+                sample.positionMs, sample.durationMs, sample.isBuffering)
+        }
+    }
+
+    // One room is owned by the actual mounted engine/source and permanent account/profile lifetime.
+    // Android has no activeLoadToken: this uses the real engine identity + source session/revision.
+    val partyGeneration = remember(engine, playbackSessionKey, sourceSwitchState.revision) {
+        java.util.UUID.randomUUID().toString()
+    }
+    val partyVideoId = currentPlayable.playbackContext?.videoId ?: currentPlayable.watchPartyVideoId
+    val partyTitleToken = remember(partyVideoId) { partyVideoId?.let(WatchPartyWire::titleToken) }
+    val currentPartyOwner by rememberUpdatedState(newValue = {
+        val auth = subtitleSyncManager?.captureWatchPartyAuth()
+        if (auth == null || partyTitleToken == null || currentPlayable.isTrailer || currentPlayable.isLive ||
+            playerExitRequested || castOwned || sourceSwitchState.isSwitching || effectiveError ||
+            speed != 1.0f || engine.state.value.durationMs <= 0L || engine.state.value.hasEnded || engine.state.value.hasError ||
+            !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) ||
+            builtEngine !== engine || engineHolder.get() !== engine || !withCurrentSubtitleOwnerState { true }
+        ) null else WatchPartyOwnerStamp(partyGeneration, playbackSessionKey.outerSessionId, sourceSwitchState.revision,
+            partyTitleToken, auth.accountId, auth.profileId, auth.ownerEpoch)
+    })
+    val applyPartyControl by rememberUpdatedState<(WatchPartyWire.Control,
+        com.vortx.android.party.WatchPartyApplyPermit, com.vortx.android.party.WatchPartyClientPolicy) -> Boolean>(
+        newValue = { control, permit, policy ->
+            // Consume once as STATE under the existing real account/profile admission. Native calls
+            // remain outside owner monitors and retain the engine's original one-way liveness cell.
+            val captured = currentPartyOwner()
+            val consumed = captured != null && withCurrentSubtitleOwnerState {
+                policy.consume(permit, captured, SystemClock.elapsedRealtime())
+            }
+            consumed && currentPartyOwner() == captured && withCurrentSubtitleOwner {
+                val current = engine.state.value
+                if (current.hasEnded || current.hasError || control.mediaId != partyTitleToken) false else {
+                    val target = control.positionMs.coerceIn(0L,
+                        current.durationMs.takeIf { it > 0L } ?: 86_400_000L)
+                    if (control.action == "seek" || kotlin.math.abs(current.positionMs - target) > 1500L) seekLocalTo(target)
+                    when (control.action) {
+                        "play" -> playbackIntent.userPlay()
+                        "pause" -> playbackIntent.userPause()
+                    }
+                    true
+                }
+            }
+        },
+    )
+    val captureCurrentPartyLeaderControl by rememberUpdatedState(newValue = {
+        val current = currentPartyOwner()
+        val state = engine.state.value
+        if (current == null || state.durationMs <= 0L || state.hasEnded || state.hasError) null
+        else WatchPartyWire.Control(
+            if (state.isPaused || state.isBuffering || !playbackIntent.snapshot().shouldPlay) "pause" else "play",
+            current.titleToken, state.positionMs.coerceIn(0L, 86_400_000L))
+    })
+    val partySession = remember(engine, playbackSessionKey, sourceSwitchState.revision, subtitleSyncManager) {
+        subtitleSyncManager?.let { manager -> WatchPartyClientSession(manager,
+            currentOwner = { currentPartyOwner() },
+            apply = { control, permit, policy -> applyPartyControl(control, permit, policy) },
+            currentLeaderControl = { captureCurrentPartyLeaderControl() }) }
+    }
+    var partyPanelOpen by remember(partySession) { mutableStateOf(false) }
+    DisposableEffect(partySession, partyPublisher) {
+        val publish: (String, Long) -> Unit = { action, position -> partySession?.publish(action, position) }
+        partyPublisher.set(publish)
+        onDispose {
+            partyPublisher.compareAndSet(publish, null)
+            partySession?.close()
+        }
+    }
+    // Small leader snapshots reconcile a host's automatic skip without publishing source/end-of-file
+    // transitions or watched/next-episode mutations. Guests never echo received commands back.
+    LaunchedEffect(partySession, engine) {
+        while (true) {
+            delay(5000)
+            val state = engine.state.value
+            if (currentPartyOwner() != null && state.durationMs > 0L && !state.isBuffering && !state.hasEnded) {
+                partySession?.publish(if (state.isPaused || !playbackIntent.snapshot().shouldPlay) "pause" else "play", state.positionMs)
+            }
+        }
+    }
+
     // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
     // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
     // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
@@ -1268,9 +1411,7 @@ fun PlayerScreen(
     val pip = rememberPlayerPip(
         engine = engine,
         onToggleUserPlayback = {
-            playbackIntent.userToggle(
-                currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-            )
+            userTogglePlayback()
         },
         isActivelyPlaying = !playerState.isPaused && !playerState.hasEnded && !effectiveError,
         isPaused = playerState.isPaused,
@@ -1308,7 +1449,7 @@ fun PlayerScreen(
             !playerExitRequested &&
             !controlsLocked &&
             !pip.isInPip &&
-            !castState.isConnected &&
+            !castOwned &&
             !effectiveError &&
             !current.hasEnded &&
             AutoSkipCountdownPolicy.isCurrent(
@@ -1332,6 +1473,7 @@ fun PlayerScreen(
         AutoSkipCountdownPolicy.complete(next, segment)
         AutoSkipCountdownPolicy.invalidatePending(next, latestState.positionMs)
         engine.seekTo(target)
+        partyPublisher.get()?.invoke("seek", target)
         autoSkipCountdown = next
         autoSkipDecision = AutoSkipCountdownDecision.Idle
         skipPillFocusedCancel = false
@@ -1358,7 +1500,7 @@ fun PlayerScreen(
         engine = engine,
         playable = currentPlayable,
         speed = speed,
-        setUserPlaying = { playing -> if (playing) playbackIntent.userPlay() else playbackIntent.userPause() },
+        setUserPlaying = ::userSetPlaying,
     )
 
     // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
@@ -1420,17 +1562,28 @@ fun PlayerScreen(
     // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
     // it on the live engine. Each engine selects the exact requested file; the UI never guesses
     // identity from inventory count/order, which can change when unrelated sidecars finish.
-    var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
-    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
-    fun mountAddonSubtitle(sub: AddonSubtitle, original: PlayerSubtitleSelection) {
-        engine.addExternalSubtitle(sub.url, original)
+    val trackPreferences = remember(playbackSessionKey) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
     }
+    val matchAudioSub = remember(playbackSessionKey) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
+    }
+    val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
+    var addonSubtitles by remember(playbackSessionKey, engine) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    var addonLookupSettled by remember(playbackSessionKey, engine) { mutableStateOf(false) }
+    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
     // Shared by phone and TV: pool IO is owned by the exact source/account/profile lifetime.
     // Freeze the first real duration/release query rather than applying a duration-0 pool offset.
     val subtitlePoolScope = rememberCoroutineScope()
     val latestSubtitleEngine by rememberUpdatedState(engine)
     val poolSignedIn = subtitleSyncManager?.isSignedIn == true
+    val poolConsent = MoatConsent.contributeAndConsume(context)
+    // Observation may advance; every request below captures an immutable epoch before its first await.
+    var currentPoolEpoch by remember(playbackSessionKey, engine) { mutableStateOf(SourceIndexLifecycle.currentEpoch()) }
     val poolThin = playerState.subtitleTracks.size + addonSubtitles.size < 2
+    val needsAutomaticPool = !currentPlayable.isTrailer && !currentPlayable.isLive &&
+        TrackSelector.wantsExternalSubtitle(playerState.audioTracks, playerState.subtitleTracks,
+            trackPreferences, preferAddonSubtitles, matchAudioSub)
     val subtitlePoolQuery = remember(playbackSessionKey, playerState.durationMs > 0L) {
         val filename = runCatching { java.net.URI(currentPlayable.url).path?.substringAfterLast('/') }
             .getOrNull()?.takeIf { it.isNotBlank() }
@@ -1438,59 +1591,196 @@ fun PlayerScreen(
             currentPlayable.mediaRef?.year?.toString()).joinToString(" ")
         subtitlePoolPlaybackQuery(subtitleContentKey, playerState.durationMs, releaseName)
     }
-    var pooledSubtitles by remember(playbackSessionKey) {
+    var pooledSubtitles by remember(playbackSessionKey, engine) {
         mutableStateOf(emptyList<SubtitlePoolClient.PooledSubtitle>())
     }
+    var pooledPublicationEpoch by remember(playbackSessionKey, engine) { mutableStateOf<Long?>(null) }
     var poolLoadingId by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
     var poolLoadingSelection by remember(playbackSessionKey, engine) { mutableStateOf<PlayerSubtitleSelection?>(null) }
+    var automaticPoolRequest by remember(playbackSessionKey, engine) { mutableStateOf<Job?>(null) }
+    var poolLookupRequest by remember(playbackSessionKey, engine) { mutableStateOf<Job?>(null) }
+    DisposableEffect(playbackSessionKey, engine) {
+        onDispose { automaticPoolRequest?.cancel(); poolLookupRequest?.cancel() }
+    }
+    fun cancelAutomaticPoolSelection() {
+        automaticPoolRequest?.cancel()
+        poolLookupRequest?.cancel()
+    }
+    DisposableEffect(playbackSessionKey, engine, currentPoolEpoch) {
+        val observedEpoch = currentPoolEpoch
+        val registration = SourceIndexLifecycle.onEpochInvalidated(observedEpoch) {
+            subtitlePoolScope.launch {
+                // Retire old work only. A fresh effect still needs the original live playback owner.
+                if (currentSubtitleSessionKey == playbackSessionKey && latestSubtitleEngine === engine &&
+                    currentPoolEpoch == observedEpoch) {
+                    cancelAutomaticPoolSelection()
+                    pooledSubtitles = emptyList()
+                    pooledPublicationEpoch = null
+                    currentPoolEpoch = SourceIndexLifecycle.currentEpoch()
+                }
+            }
+        }
+        onDispose { registration.close() }
+    }
     fun admitCurrentSubtitleEngine(action: () -> Boolean): Boolean = withCurrentSubtitleOwner {
         latestSubtitleEngine === engine && action()
     }
-    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, poolSignedIn) {
+    fun admitCurrentPoolEngine(expectedEpoch: Long, action: () -> Boolean): Boolean =
+        SourceIndexLifecycle.currentEpoch() == expectedEpoch &&
+            subtitleSyncManager?.isSignedIn == true && MoatConsent.contributeAndConsume(context) &&
+            admitCurrentSubtitleEngine(action)
+    suspend fun awaitSubtitleMount(mount: Job?) {
+        if (mount == null) return
+        try { mount.join() }
+        finally { if (!currentCoroutineContext().isActive) mount.cancel() }
+    }
+    fun mountAddonSubtitle(sub: AddonSubtitle, original: PlayerSubtitleSelection,
+        permitsUse: () -> Boolean = { true }): Job? {
+        if (!permitsUse() || !withCurrentSubtitleOwner { engine.isSubtitleSelectionCurrent(original) }) return null
+        val timingAttempt = subtitleTiming.beginAlignment() ?: return null
+        cancelAddonSubtitlePreparation()
+        val installedAddon = sub.originalInstalledBase != null
+        val syntheticPoolLocal = sub.originalInstalledBase == null && sub.id.startsWith("pool:")
+        if (!installedAddon && !syntheticPoolLocal) {
+            subtitleTiming.finishAlignment(timingAttempt, aligned = false)
+            return null
+        }
+        val originalOwner = if (installedAddon) originalPlaybackOwner ?: run {
+            subtitleTiming.finishAlignment(timingAttempt, aligned = false)
+            return null
+        } else null
+        val preparationCancelled = AtomicBoolean(false)
+        val preparationPermitsUse: () -> Boolean = if (installedAddon) {
+            { originalOwner!!.isActive && engine.isSubtitlePreparationCurrent(original) }
+        } else {
+            permitsUse
+        }
+        val preparation = subtitlePoolScope.launch(start = CoroutineStart.LAZY) {
+            var aligned = false
+            try {
+                val admitMount: ((() -> Boolean) -> Boolean) = { action ->
+                    permitsUse() && admitCurrentSubtitleEngine(action)
+                }
+                if (!subtitleTiming.prepareAlignment(timingAttempt, admitMount) {
+                        if (!engine.setSubtitleDelay(0.0, original)) false else {
+                            subtitleDelaySeconds = 0.0
+                            true
+                        }
+                    }) return@launch
+                if (!permitsUse() || !engine.isSubtitleSelectionCurrent(original)) return@launch
+                val result = if (installedAddon) {
+                    if (!preparationPermitsUse()) return@launch
+                    val source = AddonSubtitleFileClient.fetch(
+                        sub,
+                        permitsUse = preparationPermitsUse,
+                        isCancelled = { preparationCancelled.get() },
+                    ) ?: return@launch
+                    currentCoroutineContext().ensureActive()
+                    if (preparationCancelled.get() || !preparationPermitsUse() ||
+                        !withCurrentSubtitleOwner {
+                            latestSubtitleEngine === engine && engine.isSubtitleSelectionCurrent(original)
+                        }) return@launch
+                    engine.selectAddonSubtitle(source, sub.lang, original)
+                } else {
+                    engine.selectExternalSubtitleAutomatically(sub.url, sub.lang, original)
+                }
+                currentCoroutineContext().ensureActive()
+                aligned = result == PlayerExternalSubtitleSelectionResult.ALIGNED &&
+                    !preparationCancelled.get() && preparationPermitsUse() &&
+                    withCurrentSubtitleOwner { latestSubtitleEngine === engine && engine.isSubtitleSelectionCurrent(original) }
+            } catch (cancelled: CancellationException) {
+                preparationCancelled.set(true)
+                throw cancelled
+            } catch (_: Exception) {
+                // Keep errors silent; a guarded installed-add-on fetch never falls back to its raw URL.
+            } finally {
+                // Retrying only releases the exact older hold. A newer selection keeps its own hold.
+                if (subtitleTiming.finishAlignment(timingAttempt, aligned) && !aligned &&
+                    !preparationCancelled.get() && preparationPermitsUse() &&
+                    withCurrentSubtitleOwner { true }) {
+                    subtitlePoolRetry += 1L
+                }
+                if (addonSubtitlePreparationCancelled === preparationCancelled) {
+                    addonSubtitlePreparationCancelled = null
+                    addonSubtitlePreparationJob = null
+                }
+            }
+        }
+        addonSubtitlePreparationCancelled = preparationCancelled
+        addonSubtitlePreparationJob = preparation
+        preparation.invokeOnCompletion { cause ->
+            if (cause is CancellationException) preparationCancelled.set(true)
+        }
+        preparation.start()
+        return preparation
+    }
+    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, poolThin, needsAutomaticPool,
+        poolSignedIn, poolConsent, currentPoolEpoch, subtitlePoolRetry) {
         val query = subtitlePoolQuery ?: return@LaunchedEffect
+        val readEpoch = currentPoolEpoch
         val original = engine.captureSubtitleSelection() ?: return@LaunchedEffect
         val syncEnabled = com.vortx.android.config.RemoteConfig.isFeatureOn("subtitleSync",
             com.vortx.android.config.RemoteConfigDefaults.FEATURE_SUBTITLE_SYNC)
-        if (!poolSignedIn || (!poolThin && !(engine.subtitleDelayAvailable && syncEnabled)) ||
-            !admitCurrentSubtitleEngine { true }) return@LaunchedEffect
-        val result = SubtitlePoolClient.fetchPooled(
-            contentKey = query.contentKey,
-            fingerprint = query.fingerprint,
-            isSignedIn = true,
-        )
-        currentCoroutineContext().ensureActive()
-        admitCurrentSubtitleEngine {
-            pooledSubtitles = if (poolThin) result.subs else emptyList()
-            true
-        }
-        // Offset and subtitle choices came from THIS captured query, not a mutable title lookup.
-        if (syncEnabled && engine.isSubtitleSelectionCurrent(original)) subtitleTiming.applyCommunityAccepted(result.offsetMs, engine.subtitleDelayAvailable,
-            ::admitCurrentSubtitleEngine) { seconds ->
-            if (!engine.setSubtitleDelay(seconds, original)) return@applyCommunityAccepted false
-            subtitleDelaySeconds = seconds
-            true
+        if (!poolSignedIn || !poolConsent ||
+            (!poolThin && !needsAutomaticPool && !(engine.subtitleDelayAvailable && syncEnabled)) ||
+            !admitCurrentPoolEngine(readEpoch) { true }) return@LaunchedEffect
+        val lookup = currentCoroutineContext()[Job] ?: return@LaunchedEffect
+        poolLookupRequest = lookup
+        try {
+            val result = SubtitlePoolClient.fetchPooled(
+                contentKey = query.contentKey,
+                fingerprint = query.fingerprint,
+                isSignedIn = true,
+                expectedEpoch = readEpoch,
+            )
+            currentCoroutineContext().ensureActive()
+            admitCurrentPoolEngine(readEpoch) {
+                pooledSubtitles = if (poolThin || needsAutomaticPool) result.subs else emptyList()
+                pooledPublicationEpoch = readEpoch
+                true
+            }
+            // Offset and subtitle choices came from THIS captured query, not a mutable title lookup.
+            if (syncEnabled && engine.isSubtitleSelectionCurrent(original)) subtitleTiming.applyCommunityAccepted(result.offsetMs, engine.subtitleDelayAvailable,
+                { action -> admitCurrentPoolEngine(readEpoch, action) }) { seconds ->
+                if (!engine.setSubtitleDelay(seconds, original)) return@applyCommunityAccepted false
+                subtitleDelaySeconds = seconds
+                true
+            }
+        } finally {
+            if (poolLookupRequest === lookup) poolLookupRequest = null
         }
     }
     fun selectPooledSubtitle(sub: SubtitlePoolClient.PooledSubtitle) {
-        if ((poolLoadingId != null && poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) ||
-            sub !in pooledSubtitles || !poolSignedIn ||
-            !admitCurrentSubtitleEngine { true }) return
+        val readEpoch = pooledPublicationEpoch ?: return
+        if (sub !in pooledSubtitles || !poolSignedIn ||
+            !admitCurrentPoolEngine(readEpoch) { true }) return
+        val replacingAutomatic = automaticPoolRequest != null
+        cancelAutomaticPoolSelection()
+        if (!replacingAutomatic && poolLoadingId != null &&
+            poolLoadingSelection?.let(engine::isSubtitleSelectionCurrent) == true) return
+        cancelAddonSubtitlePreparation()
         val original = engine.beginSubtitleSelection() ?: return
         showControls()
         trackSelectionPhases = trackSelectionPhases.holdSubtitle()
         poolLoadingId = sub.id
         poolLoadingSelection = original
         subtitlePoolScope.launch {
+            val job = currentCoroutineContext()[Job] ?: return@launch
+            val registration = SourceIndexLifecycle.onEpochInvalidated(readEpoch) { job.cancel() }
             try {
-                val local = SubtitlePoolClient.download(context, sub, isSignedIn = true)
+                val local = SubtitlePoolClient.download(context, sub, isSignedIn = true, expectedEpoch = readEpoch)
                 currentCoroutineContext().ensureActive()
-                admitCurrentSubtitleEngine {
+                var mount: Job? = null
+                admitCurrentPoolEngine(readEpoch) {
                     if (local != null && engine.isSubtitleSelectionCurrent(original)) {
-                        mountAddonSubtitle(AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), original)
+                        mount = mountAddonSubtitle(AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), original,
+                            permitsUse = { admitCurrentPoolEngine(readEpoch) { true } })
                     }
                     true
                 }
+                awaitSubtitleMount(mount)
             } finally {
+                registration.close()
                 // An older completion/cancellation must not clear a newer choice's loading UI.
                 if (poolLoadingSelection === original) {
                     poolLoadingId = null
@@ -1499,33 +1789,78 @@ fun PlayerScreen(
             }
         }
     }
-    LaunchedEffect(playbackSessionKey) {
-        if (currentPlayable.isTrailer) return@LaunchedEffect
-        val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
-        val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
-        val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
-        val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
-        if (sources.isEmpty()) return@LaunchedEffect
-        val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
-        addonSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
-            items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
-            enabled = store.subtitlesOnlyPreferred,
-            preferredLanguages = store.current.subtitleLanguages,
-            language = AddonSubtitle::lang,
-        )
+    fun selectAutomaticPooledSubtitle(sub: SubtitlePoolClient.PooledSubtitle, readEpoch: Long) {
+        if (automaticPoolRequest != null || !admitCurrentPoolEngine(readEpoch) { true }) return
+        val original = engine.captureSubtitleSelection() ?: return
+        trackSelectionPhases = trackSelectionPhases.recordPoolSelection()
+        poolLoadingId = sub.id
+        poolLoadingSelection = original
+        val request = subtitlePoolScope.launch(start = CoroutineStart.LAZY) {
+            val job = currentCoroutineContext()[Job] ?: return@launch
+            val registration = SourceIndexLifecycle.onEpochInvalidated(readEpoch) { job.cancel() }
+            try {
+                runAutomaticPooledSubtitleSelection(
+                    capture = { original },
+                    permits = { receipt ->
+                        trackSelectionPhases.subtitle != DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION &&
+                            admitCurrentPoolEngine(readEpoch) { engine.isSubtitleSelectionCurrent(receipt) }
+                    },
+                    download = { SubtitlePoolClient.download(context, sub, isSignedIn = true, expectedEpoch = readEpoch) },
+                    mount = { local, receipt ->
+                        awaitSubtitleMount(mountAddonSubtitle(
+                            AddonSubtitle("pool:${sub.id}", local, sub.lang, "Community"), receipt,
+                            permitsUse = { admitCurrentPoolEngine(readEpoch) { engine.isSubtitleSelectionCurrent(receipt) } }))
+                    },
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Tier-2 failure is silent and never retries as a fresh manual selection.
+            } finally {
+                registration.close()
+                if (automaticPoolRequest === job) automaticPoolRequest = null
+                if (poolLoadingSelection === original) {
+                    poolLoadingId = null
+                    poolLoadingSelection = null
+                }
+            }
+        }
+        automaticPoolRequest = request
+        request.start()
+    }
+    LaunchedEffect(playbackSessionKey, engine) {
+        addonLookupSettled = false
+        try {
+            if (currentPlayable.isTrailer) return@LaunchedEffect
+            val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
+            val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
+            val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+            val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
+            if (sources.isEmpty()) return@LaunchedEffect
+            val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
+            val found = TrackSelector.keepingPreferredSubtitleLanguages(
+                items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
+                enabled = store.subtitlesOnlyPreferred,
+                preferredLanguages = store.current.subtitleLanguages,
+                language = AddonSubtitle::lang,
+            )
+            currentCoroutineContext().ensureActive()
+            admitCurrentSubtitleEngine { addonSubtitles = found; true }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // A terminal lookup failure may use the pool, but canceled old work may not publish.
+        } finally {
+            currentCoroutineContext().ensureActive()
+            admitCurrentSubtitleEngine { addonLookupSettled = true; true }
+        }
     }
     // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
     // inventories can arrive independently, so each type gets one default decision once *its own*
     // selectable inventory appears. A viewer's manual or external subtitle pick holds that type until this
     // loaded engine is replaced; a late inventory must not clobber manual Off or a selected add-on track.
-    val trackPreferences = remember(playbackSessionKey) {
-        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
-    }
     // Read once per load alongside the preferences: when ON, the auto audio pick follows the subtitle chain
     // (Apple `matchAudioSub`). Separate from [trackPreferences] because it is not part of the value struct.
-    val matchAudioSub = remember(playbackSessionKey) {
-        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
-    }
     LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks, trackSelectionPhases) {
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
@@ -1572,12 +1907,12 @@ fun PlayerScreen(
         playbackIntent.setSourceTerminal(true)
         if (currentOnSwitchSource == null) return@LaunchedEffect
         val alternate = audioAlternates.next(sourceSwitchState.currentSource, sourceOptions) ?: return@LaunchedEffect
+        cancelAddonSubtitlePreparation()
         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
             sourceSwitchState = beginPlayerSourceSwitch(sourceSwitchState, alternate, authority, automatic = true)
         }
     }
 
-    val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
     LaunchedEffect(playbackSessionKey, engine, trackSelectionPhases, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
         if (addonSubtitles.isEmpty() || !trackSelectionPhases.mayAttemptAddon(latestState.subtitleTracks.isNotEmpty())) {
             return@LaunchedEffect
@@ -1594,6 +1929,24 @@ fun PlayerScreen(
         // this effect. The reservation prevents a second automatic overlay for the same loaded engine.
         trackSelectionPhases = trackSelectionPhases.recordAddonSelection()
         engine.captureSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
+    }
+
+    // Tier 2 follows settled native/add-on decisions. Reserve once, but do not key the
+    // running request to poolAttempted: its own reservation must not cancel its download.
+    LaunchedEffect(playbackSessionKey, engine, subtitlePoolQuery, pooledSubtitles, pooledPublicationEpoch,
+        addonLookupSettled, trackSelectionPhases.audio, trackSelectionPhases.subtitle,
+        poolSignedIn, poolConsent, currentPoolEpoch) {
+        if (!poolSignedIn || !poolConsent || currentPlayable.isTrailer || currentPlayable.isLive ||
+            !trackSelectionPhases.mayAttemptPool(latestState.subtitleTracks.isNotEmpty(), addonLookupSettled,
+                trackPreferences.subtitleLanguages.any { language -> addonSubtitles.any { TrackSelector.matches(it.lang, language) } }) ||
+            !TrackSelector.wantsExternalSubtitle(latestState.audioTracks, latestState.subtitleTracks,
+                trackPreferences, preferAddonSubtitles, matchAudioSub)) return@LaunchedEffect
+        val query = subtitlePoolQuery ?: return@LaunchedEffect
+        val readEpoch = pooledPublicationEpoch?.takeIf { it == currentPoolEpoch } ?: return@LaunchedEffect
+        val sub = trackPreferences.subtitleLanguages.asSequence().mapNotNull { language ->
+            pooledSubtitles.firstOrNull { it.contentKey == query.contentKey && TrackSelector.matches(it.lang, language) }
+        }.firstOrNull() ?: return@LaunchedEffect
+        selectAutomaticPooledSubtitle(sub, readEpoch)
     }
 
     // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
@@ -1640,7 +1993,7 @@ fun PlayerScreen(
         playerState.hasEnded,
         effectiveError,
         sourceSwitchState.isSwitching,
-        castState.isConnected,
+        castOwned,
         pip.isInPip,
         controlsLocked,
         playerExitRequested,
@@ -1656,7 +2009,7 @@ fun PlayerScreen(
             !latestState.hasEnded &&
             !effectiveError &&
             !sourceSwitchState.isSwitching &&
-            !castState.isConnected &&
+            !castOwned &&
             !pip.isInPip &&
             !controlsLocked &&
             !playerExitRequested
@@ -1701,7 +2054,7 @@ fun PlayerScreen(
                 currentPositionSec < activeSegment.end &&
                 !effectiveError &&
                 !sourceSwitchState.isSwitching &&
-                !castState.isConnected &&
+                !castOwned &&
                 !pip.isInPip &&
                 !controlsLocked &&
                 !playerExitRequested &&
@@ -1728,10 +2081,11 @@ fun PlayerScreen(
     // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
     //   1. KEY + FETCH  -- below, once the engine reports a real duration.
     //   2. CAPTURE      -- the wall-clock driver further down.
-    //   3. SERVE        -- [previewAt] handed to the chrome's scrubber.
+    //   3. SERVE        -- suspendable worker preview handed to the chrome's scrubber.
     // The session owns its own scope (it must outlive this composition to flush on exit), so it is only
     // remembered here, never scoped to the composition.
     val trickplay = remember(playbackSessionKey) { TrickplaySession(context) }
+    val trickplayPreviewRevision by trickplay.previewRevision.collectAsStateWithLifecycle()
 
     // KEY + FETCH. Gated on a real reported duration because the content key is
     // sha1(imdb:season:episode:durationBucket) -- keying on 0 would compute the WRONG key and index a
@@ -1865,14 +2219,14 @@ fun PlayerScreen(
     LaunchedEffect(engine) {
         while (true) {
             delay(PROGRESS_REPORT_MS)
-            val s = latestState
+            val s = engine.state.value
             if (!s.isPaused && !runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
-                currentOnProgress(s.positionMs, s.durationMs)
+                progressTimeline.local(s.positionMs, s.durationMs, buffering = s.isBuffering)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
                 // A LOCAL session never drives it: warming resolves through the host's detail ViewModel,
                 // which for a download play can belong to an earlier streamed title (AND-DL-01).
-                if (!isLocalSession && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
+                if (!isLocalSession && !castOwned && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1883,10 +2237,8 @@ fun PlayerScreen(
     // mark a 10-second junk file watched, so it is dropped entirely.
     DisposableEffect(engine) {
         onDispose {
-            val s = latestState
-            if (!runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
-                currentOnProgress(s.positionMs, s.durationMs)
-            }
+            val s = engine.state.value
+            progressTimeline.finish(s.positionMs, s.durationMs)
         }
     }
 
@@ -1964,29 +2316,27 @@ fun PlayerScreen(
                 when (event.key) {
                     Key.MediaPlayPause -> {
                         showControls()
-                        playbackIntent.userToggle(
-                            currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-                        )
+                        userTogglePlayback()
                         return@onKeyEvent true
                     }
                     Key.MediaPlay -> {
                         showControls()
-                        playbackIntent.userPlay()
+                        userSetPlaying(true)
                         return@onKeyEvent true
                     }
                     Key.MediaPause -> {
                         showControls()
-                        playbackIntent.userPause()
+                        userSetPlaying(false)
                         return@onKeyEvent true
                     }
                     Key.MediaFastForward -> {
                         showControls()
-                        seekLocalBy(seekStepMs)
+                        userSeekLocalBy(seekStepMs)
                         return@onKeyEvent true
                     }
                     Key.MediaRewind -> {
                         showControls()
-                        seekLocalBy(-seekStepMs)
+                        userSeekLocalBy(-seekStepMs)
                         return@onKeyEvent true
                     }
                     else -> Unit
@@ -2062,7 +2412,7 @@ fun PlayerScreen(
                     if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
                         val forward = event.key == Key.DirectionRight
                         val delta = if (forward) seekStepMs else -seekStepMs
-                        seekLocalBy(delta)
+                        userSeekLocalBy(delta)
                         // The pill shows the predicted target; the engine clamps the real seek to the file.
                         seekNudgeTargetMs = (latestState.positionMs + delta).coerceAtLeast(0L)
                         seekNudgeTick++
@@ -2115,7 +2465,7 @@ fun PlayerScreen(
                             onDoubleTap = { offset ->
                                 val forward = offset.x >= size.width / 2
                                 // The double-tap step follows the viewer's Skip step (Apple `stremiox.seekStep`).
-                                seekLocalBy(if (forward) seekStepMs else -seekStepMs)
+                                userSeekLocalBy(if (forward) seekStepMs else -seekStepMs)
                                 showControls()
                             },
                         )
@@ -2135,7 +2485,7 @@ fun PlayerScreen(
                         onVolumeFraction = { setPlayerVolume((it * 100.0)) },
                         onSeekCommit = { target ->
                             showControls()
-                            seekLocalTo(target)
+                            userSeekLocalTo(target)
                         },
                         onHud = { gestureHud = it },
                     )
@@ -2175,6 +2525,8 @@ fun PlayerScreen(
             subtitleDelayAvailable = engine.subtitleDelayAvailable,
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
+                cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 subtitleTiming.applyManualAccepted(adjustedPlayerDelay(subtitleDelaySeconds, delta),
                     engine.subtitleDelayAvailable, ::admitCurrentSubtitleEngine) manualDelay@{ seconds ->
@@ -2230,12 +2582,10 @@ fun PlayerScreen(
             onBack = ::exitPlayer,
             onTogglePause = {
                 showControls()
-                playbackIntent.userToggle(
-                    currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
-                )
+                userTogglePlayback()
             },
-            onSeek = { showControls(); seekLocalTo(it) },
-            onSeekBy = { showControls(); seekLocalBy(it) },
+            onSeek = { showControls(); userSeekLocalTo(it) },
+            onSeekBy = { showControls(); userSeekLocalBy(it) },
             onSelectAudio = {
                 showControls()
                 knownAudioMismatch = false
@@ -2243,6 +2593,7 @@ fun PlayerScreen(
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)
                     sourceSwitchState = sourceSwitchState.copy(pendingSwitch = null, errorMessage = null)
                 }
+                cancelAutomaticPoolSelection()
                 trackSelectionPhases = trackSelectionPhases.holdAudio()
                 engine.selectAudioTrack(it)
                 latestState.audioTracks.firstOrNull { track -> track.id == it }?.let { track ->
@@ -2252,6 +2603,8 @@ fun PlayerScreen(
                 }
             },
             onSelectSubtitle = {
+                cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.selectSubtitleTrack(it)
@@ -2267,7 +2620,10 @@ fun PlayerScreen(
                 // Persist under Apple's key so the pick survives this title and rides the cross-device blob.
                 com.vortx.android.player.extras.AspectRatioSetting.setCurrent(context, mode)
             },
-            onErrorRetry = currentOnError,
+            onErrorRetry = {
+                cancelAddonSubtitlePreparation()
+                currentOnError()
+            },
             sourceOptions = if (currentOnSwitchSource != null) sourceOptions else emptyList(),
             qualityOptions = if (currentOnSwitchSource != null) qualityOptions else emptyList(),
             episodeOptions = if (currentOnSwitchEpisode != null) episodeOptions else emptyList(),
@@ -2279,6 +2635,7 @@ fun PlayerScreen(
             onRetryEpisode = {
                 sourceSwitchState.failedEpisode?.let { failed ->
                     if (currentOnSwitchEpisode != null) {
+                        cancelAddonSubtitlePreparation()
                         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                         sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                             sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, failed, authority)
@@ -2292,6 +2649,7 @@ fun PlayerScreen(
                     resolver != null &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
+                    cancelAddonSubtitlePreparation()
                     val replacement = requestPlayerSourceSwitch(sourceSwitchState, source, sourceSwitchCoordinator)
                     if (replacement !== sourceSwitchState) {
                         sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
@@ -2308,6 +2666,7 @@ fun PlayerScreen(
                         currentRef.season == episode.season &&
                         currentRef.episode == episode.episode)
                 ) {
+                    cancelAddonSubtitlePreparation()
                     sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerEpisodeSwitch(
@@ -2329,16 +2688,17 @@ fun PlayerScreen(
             // current stream is castable (a direct/HLS/debrid URL, never a loopback torrent); the button
             // itself further self-hides when no receivers are on the network. Opening it shows the device
             // chooser. Withheld while locked or in PiP (the cluster is unreachable then anyway).
-            castButton = if (castManager.isEnabled && streamCastable) {
-                {
-                    CastButton(
-                        state = castState,
-                        emberAccent = emberAccent,
-                        onClick = { showControls(); castChooserOpen = true },
-                    )
+            castButton = {
+                Row {
+                    // Ships dark: the account service's party routes are not live yet. RemoteConfig turns it on.
+                    if (com.vortx.android.config.RemoteConfig.isFeatureOn("watchParty", false)) {
+                        WatchPartyButton(partySession, open = { showControls(); partyPanelOpen = true })
+                    }
+                    if (castManager.isEnabled && streamCastable) {
+                        CastButton(state = castState, emberAccent = emberAccent,
+                            onClick = { showControls(); castChooserOpen = true })
+                    }
                 }
-            } else {
-                null
             },
             onLock = {
                 controlsLocked = true
@@ -2348,6 +2708,8 @@ fun PlayerScreen(
             },
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
+                cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.beginSubtitleSelection()?.let { original -> mountAddonSubtitle(sub, original) }
@@ -2358,6 +2720,8 @@ fun PlayerScreen(
             primarySubtitleId = engine.primarySubtitleId,
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
+                cancelAutomaticPoolSelection()
+                cancelAddonSubtitlePreparation()
                 showControls()
                 trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 engine.setSecondarySubtitleTrack(id)
@@ -2385,6 +2749,7 @@ fun PlayerScreen(
                     mpvAvailable = MpvEngineFactory.isBundled,
                 )
                 if (effective != enginePreference) {
+                    cancelAddonSubtitlePreparation()
                     engineSwitchResumeMs[0] = latestState.positionMs.coerceAtLeast(0L)
                     enginePreference = effective
                 }
@@ -2413,11 +2778,10 @@ fun PlayerScreen(
             } else {
                 null
             },
-            // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
-            // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null
-            // until (or unless) this title has a community sheet, and the scrubber then simply shows no
-            // thumbnail, exactly as it does today.
-            scrubPreview = trickplay::previewAt,
+            // SERVE: bitmap work and bounded local disk fallback stay on the session's worker context.
+            // Revision also refreshes a stationary scrub when a sheet or local frame arrives.
+            scrubPreview = trickplay::loadPreviewAt,
+            scrubPreviewRevision = trickplayPreviewRevision,
             // TV-only chrome opt-ins (both default off on the phone host, leaving its chrome unchanged).
             shareLink = shareLink,
             isTvPlayer = isTvPlayer,
@@ -2434,7 +2798,7 @@ fun PlayerScreen(
         if (
             !controlsLocked &&
             !pip.isInPip &&
-            !castState.isConnected &&
+            !castOwned &&
             !effectiveError &&
             !playerState.hasEnded &&
             !sourceSwitchState.isSwitching &&
@@ -2544,11 +2908,17 @@ fun PlayerScreen(
         // The chooser is a dialog the cast button opens. The overlay takes over the surface while a receiver
         // is connected (the local video is paused underneath), naming the device and hosting the cast
         // transport (play/pause, +/-10s, seek, stop). Withheld in PiP, where the tiny window is video-only.
+        if (partyPanelOpen && partySession != null && !pip.isInPip) {
+            WatchPartyPanel(partySession, onDismiss = { partyPanelOpen = false })
+        }
         if (castManager.isEnabled) {
             if (castChooserOpen) {
-                CastRouteChooserSheet(onDismiss = { castChooserOpen = false })
+                CastRouteChooserSheet(
+                    onDismiss = { castChooserOpen = false },
+                    onRouteSelected = { deviceId, selected -> castManager.requestCast(deviceId, selected) },
+                )
             }
-            if (castState.isConnected && !pip.isInPip) {
+            if (castOwned && !pip.isInPip) {
                 CastOverlay(
                     state = castState,
                     emberAccent = emberAccent,

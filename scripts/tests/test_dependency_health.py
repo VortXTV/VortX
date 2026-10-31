@@ -287,6 +287,173 @@ class DependencyHealthTests(unittest.TestCase):
         self.assertEqual(report["unresolved_entries"], 1)
         self.assertFalse(report["complete"])
 
+    def pnpm_fixture_inventory(self, text, extra_files=None):
+        # Reuse the established fixture; only wrap the inventory call to prove it is read-only.
+        files = {"pnpm-lock.yaml": text, "retained-history.json": '{"cursor":"KEEP_ME"}'}
+        files.update(extra_files or {})
+        inventory = health.inventory
+        def read_only_inventory(config):
+            folder = Path(config["repositories"][0]["path"])
+            before = {str(p.relative_to(folder)): p.read_bytes()
+                      for p in folder.rglob("*") if p.is_file()}
+            result = inventory(config)
+            after = {str(p.relative_to(folder)): p.read_bytes()
+                     for p in folder.rglob("*") if p.is_file()}
+            self.assertEqual(after, before)
+            return result
+        with patch.object(health, "inventory", side_effect=read_only_inventory), \
+             patch.dict(health.os.environ, {}, clear=True), \
+             patch.object(health, "get") as fetch, \
+             patch.object(health, "releases") as release_fetch:
+            result = self.fixture_inventory(files)
+        fetch.assert_not_called()
+        release_fetch.assert_not_called()
+        return result
+
+    def pnpm_identities(self, result):
+        return {(row["name"], row["current"]) for row in result["entries"]}
+
+    def test_pnpm_existing_single_document_keeps_scoped_and_peer_suffix_versions(self):
+        text = """lockfileVersion: '9.0'
+packages:
+  example@1.2.3:
+    resolution: {integrity: sha512-placeholder}
+  '@scope/pkg@2.0.0(peer@1.0.0)': {}
+"""
+        result = self.pnpm_fixture_inventory(text)
+        self.assertEqual(self.pnpm_identities(result), {("example", "1.2.3"), ("@scope/pkg", "2.0.0")})
+        self.assertEqual(result["coverage_gaps"], [])
+        self.assertTrue(all(row["source"] == "pnpm-lock.yaml" and row["kind"] == "resolved-transitive"
+                            for row in result["entries"]))
+
+    def test_pnpm_manager_and_project_documents_are_both_inventoried_and_deduplicated(self):
+        text = """---
+lockfileVersion: '9.0'
+importers:
+  .:
+    packageManagerDependencies:
+      pnpm: {specifier: 12.15.0, version: 12.15.0}
+packages:
+  pnpm@12.15.0: {}
+  '@pnpm/exe.darwin-arm64@12.15.0': {}
+  shared@1.0.0: {}
+---
+lockfileVersion: '9.0'
+packages:
+  shared@1.0.0: {}
+  shared@2.0.0: {}
+  next@16.4.3: {}
+"""
+        result = self.pnpm_fixture_inventory(text)
+        self.assertEqual(self.pnpm_identities(result), {("pnpm", "12.15.0"),
+                         ("@pnpm/exe.darwin-arm64", "12.15.0"),
+                         ("shared", "1.0.0"), ("shared", "2.0.0"), ("next", "16.4.3")})
+        self.assertEqual(len(result["entries"]), 5)
+        self.assertEqual(result["coverage_gaps"], [])
+
+    def test_pnpm_private_identity_and_origin_filters_apply_in_every_document(self):
+        document = """packages:
+  visible@1.0.0: {}
+  nested-private@1.0.0: {}
+  '@vortx/private@1.0.0': {}
+  '@private/pkg@1.0.0': {}
+  external@1.0.0:
+    resolution: {tarball: 'https://private.invalid/DO_NOT_LEAK.tgz'}
+"""
+        result = self.pnpm_fixture_inventory("---\n" + document + "---\n" + document, {
+            "zzz/private/package.json": '{"name":"nested-private","private":true}',
+            ".npmrc": "@private:registry=https://private.invalid/\n//private.invalid/:_authToken=DO_NOT_LEAK\n",
+        })
+        self.assertEqual(self.pnpm_identities(result), {("visible", "1.0.0")})
+        self.assertEqual(len(result["entries"]), 1)
+        rendered = json.dumps(result)
+        for secret in ("nested-private", "@vortx/private", "@private/pkg", "external", "private.invalid", "DO_NOT_LEAK"):
+            self.assertNotIn(secret, rendered)
+        self.assertEqual(len(result["coverage_gaps"]), 8)
+
+    def test_pnpm_invalid_document_shapes_report_gaps_and_keep_later_valid_documents(self):
+        valid = "---\npackages:\n  example@1.0.0: {}\n"
+        for invalid in ("---\n", "---\n[]\n", "---\n{}\n", "---\npackages: []\n", "---\npackages: null\n"):
+            with self.subTest(invalid=invalid):
+                result = self.pnpm_fixture_inventory(invalid + valid)
+                self.assertEqual(self.pnpm_identities(result), {("example", "1.0.0")})
+                self.assertEqual(len(result["coverage_gaps"]), 1)
+                self.assertIn("pnpm document 1", result["coverage_gaps"][0]["reason"])
+
+    def test_pnpm_empty_lock_is_explicit_and_empty_package_mapping_remains_valid(self):
+        result = self.pnpm_fixture_inventory("")
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(result["coverage_gaps"], [{"source": "fixture/pnpm-lock.yaml",
+                         "reason": "pnpm lock contains no documents"}])
+        result = self.pnpm_fixture_inventory("packages: {}\n")
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(result["coverage_gaps"], [])
+
+    def test_pnpm_invalid_package_metadata_does_not_drop_later_rows(self):
+        text = """packages:
+  123: {}
+  missing_separator: {}
+  wrong_item@1.0.0: null
+  wrong_resolution@1.0.0:
+    resolution: []
+  wrong_tarball@1.0.0:
+    resolution: {tarball: [DO_NOT_LEAK]}
+  malformed_tarball@1.0.0:
+    resolution: {tarball: 'https://[DO_NOT_LEAK'}
+  visible@1.0.0: {}
+"""
+        result = self.pnpm_fixture_inventory(text)
+        self.assertEqual(self.pnpm_identities(result), {("visible", "1.0.0")})
+        self.assertEqual(len(result["coverage_gaps"]), 6)
+        self.assertNotIn("DO_NOT_LEAK", json.dumps(result))
+
+    def test_pnpm_malformed_later_yaml_keeps_prior_document_entries_and_redacts_error(self):
+        text = """---
+packages:
+  example@1.0.0: {}
+---
+packages:
+  secret@2.0.0: [DO_NOT_LEAK
+"""
+        result = self.pnpm_fixture_inventory(text)
+        self.assertEqual(self.pnpm_identities(result), {("example", "1.0.0")})
+        self.assertEqual(len(result["coverage_gaps"]), 1)
+        self.assertTrue(result["coverage_gaps"][0]["reason"].startswith("pnpm document 2 parse failed: "))
+        self.assertNotIn("DO_NOT_LEAK", json.dumps(result))
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_pnpm_malformed_first_yaml_becomes_one_bounded_gap(self):
+        result = self.pnpm_fixture_inventory("packages: [DO_NOT_LEAK\n")
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(len(result["coverage_gaps"]), 1)
+        self.assertTrue(result["coverage_gaps"][0]["reason"].startswith("pnpm document 1 parse failed: "))
+        self.assertNotIn("DO_NOT_LEAK", json.dumps(result))
+
+    def test_pnpm_excess_diagnostics_keep_count_and_valid_late_rows(self):
+        text = "---\n[]\n" * 40 + "---\npackages:\n  example@1.0.0: {}\n"
+        result = self.pnpm_fixture_inventory(text)
+        self.assertEqual(self.pnpm_identities(result), {("example", "1.0.0")})
+        self.assertEqual(len(result["coverage_gaps"]), 33)
+        self.assertIn({"source": "fixture/pnpm-lock.yaml",
+                       "reason": "Additional pnpm diagnostics suppressed: 8"}, result["coverage_gaps"])
+
+    def test_pnpm_inventory_gap_and_fetch_failure_retain_prior_release_cursor(self):
+        result = self.pnpm_fixture_inventory("---\npackages:\n  example@1.0.0: {}\n---\npackages: [DO_NOT_LEAK\n")
+        prior = {"releases": {"npm:example": {"versions": ["1.0.0"], "latest_stable": "1.0.0",
+                 "source": "https://registry.npmjs.org/example", "observed_at": "2026-10-25T00:00:00Z"}}}
+        before = json.loads(json.dumps(prior))
+        with patch.object(health, "releases", side_effect=ValueError("DO_NOT_LEAK")), \
+             patch.object(health, "get") as fetch:
+            report = health.compare(result, prior, 1)
+        fetch.assert_not_called()
+        self.assertEqual(prior, before)
+        self.assertEqual(report["releases"]["npm:example"], before["releases"]["npm:example"])
+        self.assertEqual(report["new_releases"], [])
+        self.assertFalse(report["complete"])
+        self.assertNotIn("DO_NOT_LEAK", json.dumps(report))
+
+
+
 class MavenMetadataSecurityTests(unittest.TestCase):
     name = "public.example:fixture"
     source = "https://repo.maven.apache.org/maven2/public/example/fixture/maven-metadata.xml"

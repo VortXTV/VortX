@@ -43,7 +43,7 @@
 	     a tunnel, not the LAN, so it does not trip this gate, which is why the Tailscale server already
 	     connected without it (issue #58). No effect for embedded-server users (loopback is exempt). -->
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>VortX connects to the streaming server you point it at, such as one you run at home on your local network or reach over Tailscale.</string>
+	<string>VortX discovers Google Cast devices on your Wi-Fi and connects to the streaming server you choose. When you cast a phone-hosted torrent, VortX shares only that video with the receiver while the app remains open.</string>
 	<!-- The app's own URL scheme. Infuse calls it back (x-success / x-error) with the position the
 	     viewer stopped at, so Continue Watching resumes there. $(VORTX_URL_SCHEME) is set per target in
 	     project.yml; InfuseReturnCoordinator and TopShelfSnapshot read VortXURLScheme back at runtime. -->
@@ -200,6 +200,8 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_vortx-engine._tcp</string>
+		<string>_googlecast._tcp</string>
+		<string>_CC1AD845._googlecast._tcp</string>
 	</array>
 </dict>
 </plist>

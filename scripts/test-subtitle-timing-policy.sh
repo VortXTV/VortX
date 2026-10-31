@@ -33,6 +33,8 @@ const path = require('node:path');
 const [out, sourceRef] = process.argv.slice(2);
 const sourcePath = 'app/SourcesShared/SubtitleEmbeddedExtractor.swift';
 const fixturePath = 'app/Tests/SubtitleTimingPolicyTests.swift';
+const preparationPath = 'app/SourcesShared/SubtitleReferencePreparation.swift';
+const queryPath = 'app/SourcesShared/SubtitleReferenceNativeQuery.swift';
 const sourceCommit = cp.execFileSync(
   'git', ['rev-parse', '--verify', `${sourceRef === 'current' ? 'HEAD' : sourceRef}^{commit}`],
   { encoding: 'utf8' }
@@ -100,9 +102,14 @@ function declaration(text, marker) {
 }
 
 const source = read(sourcePath);
+const preparation = read(preparationPath);
+const query = read(queryPath);
 const hasOutputMarker = '    static func timingPacketHasOutput(';
 const movTextMarker = '    static func timingPacketIsMovTextClear(';
-const missing = [hasOutputMarker, movTextMarker].filter(marker => count(source, marker) !== 1);
+const appendMarker = '    static func appendTimingCue(';
+const projectionMarker = '    nonisolated static func referenceTimings(';
+const missing = [hasOutputMarker, movTextMarker, appendMarker].filter(marker => count(source, marker) !== 1);
+if (count(preparation, projectionMarker) !== 1) missing.push(projectionMarker);
 
 // A real historical ref that predates these helpers is unsupported input. Do not
 // copy the current dirty source or manufacture a baseline that can turn absence
@@ -130,6 +137,28 @@ const fixture = read(fixturePath);
 const hasOutput = declaration(source, hasOutputMarker);
 const movTextClear = declaration(source, movTextMarker);
 const timingCue = declaration(source, '    private static func timingCue(');
+const collector = declaration(source, '    private static func collectTimingCues(');
+const appendCue = declaration(source, appendMarker);
+const window = declaration(source, '    struct TimingWindow:');
+const cue = declaration(source, '    struct TimingCue:');
+const failures = declaration(source, '    enum TimingWindowFailure:');
+const projection = declaration(preparation, projectionMarker);
+const queryTiming = declaration(query, '    struct Timing:');
+const queryWindows = ['    static let scoringWindowStartMs:', '    static let scoringWindowEndMs:',
+                      '    static let referenceWindowEndMs:'].map(marker => {
+  const at = once(query, marker);
+  return query.slice(at, query.indexOf('\n', at));
+}).join('\n');
+selections.referenceQueryWindows = sha256(queryWindows);
+if (count(collector, 'try appendTimingCue(cue, to: &cues)') !== 1 ||
+    collector.includes('cues.sorted') || collector.includes('cues.last != cue') ||
+    !collector.includes('return (cues, packets)')) {
+  throw new Error('Actual collector must use the complete-corpus helper once without deduplication or sorting');
+}
+const prepare = declaration(preparation, '    nonisolated static func prepare(');
+if (count(prepare, 'referenceTimings(from: result.cues, window: request.referenceWindow)') !== 1) {
+  throw new Error('Actual worker lost the genuine projection helper call');
+}
 
 for (const anchor of [
   'guard packetSize >= 0, bytesConsumed >= 0, bytesConsumed == packetSize else {',
@@ -160,7 +189,14 @@ if (predecoderAt < 0 || decoderAt < 0 || fullConsumptionAt < 0 ||
 
 const generated = fixture
   .replace('// @source:timingPacketHasOutput', hasOutput)
-  .replace('// @source:timingPacketIsMovTextClear', movTextClear);
+  .replace('// @source:timingPacketIsMovTextClear', movTextClear)
+  .replace('// @source:TimingWindowFailure', failures)
+  .replace('// @source:TimingWindow', window)
+  .replace('// @source:TimingCue', cue)
+  .replace('// @source:appendTimingCue', appendCue)
+  .replace('// @source:referenceQueryWindows', queryWindows)
+  .replace('// @source:referenceQueryTiming', queryTiming)
+  .replace('// @source:referenceTimings', projection);
 if (generated.includes('// @source:')) throw new Error('Unfilled actual-source fixture slot');
 fs.writeFileSync(path.join(out, 'ActualSourceTests.swift'), generated);
 fs.writeFileSync(path.join(out, 'source-manifest.json'), JSON.stringify({
@@ -172,7 +208,7 @@ fs.writeFileSync(path.join(out, 'source-manifest.json'), JSON.stringify({
   timing_cue_sha256: sha256(timingCue),
   generated_sha256: sha256(generated),
   policy_collaborators: 'AVCodecID is a scalar typealias and the two codec constants are distinct inert policy-only values; this is not genuine Libav enum ABI proof.',
-  extraction: 'Complete actual helper declarations are inserted byte-for-byte after balanced source selection. timingCue is source-checked only; no native decoder call is compiled or replaced.'
+  extraction: 'Complete actual policy/model declarations are inserted byte-for-byte after balanced source selection. timingCue, collectTimingCues and the real prepare helper call are source-checked only; no native decoder call or owner worker is compiled or replaced.'
 }, null, 2) + '\n');
 NODE
 

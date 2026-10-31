@@ -1,0 +1,235 @@
+--- a/stream/reference_source.h
++++ b/stream/reference_source.h
+@@ -68,3 +68,52 @@
+ bool stream_reference_lease_copy_initial_request(
+     const struct stream_reference_lease *lease,
+     char **url, struct AVDictionary **options);
++
++// Owned, native-only completed-response HEADER observation. This does not turn
++// the retained INITIAL_REQUEST_ONLY lease into current-request/reader authority.
++// In particular, post-response learned cookies are not the headers sent on wire.
++struct stream_reference_observation;
++struct stream_reference_observation_values {
++    char *etag;
++    char *location;
++    int64_t response_generation;
++    int64_t source_generation;
++    uint64_t source_epoch;
++};
++
++// OWNER-ONLY, while s and its AVIO are alive and no source I/O can intervene.
++// Reads public AVOptions and owns every returned string; performs no I/O. Require
++// a finite absolute mp_time_ns deadline >now and at most30s ahead. out must be
++// NULL; failure never replaces an existing owning output or affects playback.
++// Missing/empty metadata, old producers, zero/exhausted tokens, cancellation,
++// source changes and allocation failure all return unavailable.
++// This is intentionally not connected to a demux/public command or a reader.
++bool stream_reference_source_observe_response(
++    struct stream *s, int64_t deadline_ns,
++    struct stream_reference_observation **out);
++
++// OWNER-ONLY, under the same stream/AVIO ownership discipline. Requires the exact
++// retained source object/generation/epoch and the same current response token
++// AND pair. Certifies only this owner instant; later publication still needs its
++// original owner/load/track/request fences. No URL/ETag equality substitutes for
++// a token. This never opens, reads, seeks, refreshes or mutates the live source.
++bool stream_reference_source_revalidate_observation(
++    struct stream *s, const struct stream_reference_observation *observation);
++
++// A move-only observation may cross to a worker; keep it alive through every
++// use and release once. Cancellation checks only the retained original source
++// observer/epoch plus deadline, never current AVIO metadata. Owner revalidation
++// remains mandatory. Values are owned copies, NOT a current-request capability;
++// URLs/tokens/credentials must not be logged, persisted or sent through Swift.
++bool stream_reference_observation_cancelled(
++    const struct stream_reference_observation *observation);
++// copy_values requires out initialized to {0} (or cleared). Existing owned
++// strings are refused; failure leaves out unchanged. Clear successful owning
++// outputs with values_clear before reusing them. Values are not a capability.
++bool stream_reference_observation_copy_values(
++    const struct stream_reference_observation *observation,
++    struct stream_reference_observation_values *out);
++void stream_reference_observation_values_clear(
++    struct stream_reference_observation_values *values);
++void stream_reference_observation_release(
++    struct stream_reference_observation **observation);
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -27,6 +27,7 @@
+ #include "common/msg.h"
+ #include "common/av_common.h"
+ #include "misc/thread_tools.h"
++#include "osdep/timer.h"
+ #include "stream.h"
+ #include "network.h"
+ #include "options/m_config.h"
+@@ -330,6 +331,169 @@
+     return true;
+ }
+ 
++// These fields are owned and immutable after publication. No live stream,
++// AVIOContext, borrowed cancel, current cookie, or option pointer is retained.
++struct stream_reference_observation {
++    struct stream_reference_lease initial;
++    struct stream_reference_observation_values values;
++    int64_t deadline_ns;
++};
++
++#define REFERENCE_OBSERVATION_MAX_NS MP_TIME_S_TO_NS(30)
++#define REFERENCE_RESPONSE_ETAG_LIMIT 1024
++#define REFERENCE_RESPONSE_LOCATION_LIMIT 4095
++
++static bool reference_observation_deadline_valid(int64_t deadline_ns)
++{
++    int64_t now = mp_time_ns();
++    return deadline_ns > now &&
++        deadline_ns - now <= REFERENCE_OBSERVATION_MAX_NS;
++}
++
++void stream_reference_observation_values_clear(
++    struct stream_reference_observation_values *values)
++{
++    if (!values)
++        return;
++    av_free(values->etag);
++    av_free(values->location);
++    *values = (struct stream_reference_observation_values){0};
++}
++
++bool stream_reference_observation_cancelled(
++    const struct stream_reference_observation *observation)
++{
++    return !observation || mp_time_ns() >= observation->deadline_ns ||
++        stream_reference_lease_cancelled(&observation->initial);
++}
++
++void stream_reference_observation_release(
++    struct stream_reference_observation **handle)
++{
++    if (!handle)
++        return;
++    struct stream_reference_observation *observation = *handle;
++    *handle = NULL;
++    if (observation) {
++        stream_reference_observation_values_clear(&observation->values);
++        stream_reference_lease_release(&observation->initial);
++        av_free(observation);
++    }
++}
++
++// Actual owner only. AVOptions are not a cross-thread snapshot lock. The real
++// completed-header token distinguishes equal URL/ETag responses and context ABA.
++static bool reference_response_read_owner(
++    stream_t *s, struct stream_reference_observation_values *out)
++{
++    struct lavf_priv *p = s->priv;
++    uint8_t *etag = NULL, *location = NULL;
++    int64_t before = 0, after = 0;
++    bool ok = false;
++    const int search = AV_OPT_SEARCH_CHILDREN;
++    const int required = AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY;
++    if (!p || !p->avio)
++        return false;
++    const AVOption *token = av_opt_find(p->avio, "response_generation", NULL, 0, search);
++    const AVOption *tag = av_opt_find(p->avio, "response_etag", NULL, 0, search);
++    const AVOption *where = av_opt_find(p->avio, "response_location", NULL, 0, search);
++    if (!token || token->type != AV_OPT_TYPE_INT64 ||
++        (token->flags & required) != required ||
++        !tag || tag->type != AV_OPT_TYPE_STRING || (tag->flags & required) != required ||
++        !where || where->type != AV_OPT_TYPE_STRING || (where->flags & required) != required)
++        return false;
++    if (av_opt_get_int(p->avio, "response_generation", search, &before) < 0 || before <= 0 ||
++        av_opt_get(p->avio, "response_etag", search | AV_OPT_ALLOW_NULL, &etag) < 0 ||
++        !etag || !etag[0] ||
++        strnlen((char *)etag, REFERENCE_RESPONSE_ETAG_LIMIT + 1) > REFERENCE_RESPONSE_ETAG_LIMIT ||
++        av_opt_get(p->avio, "response_location", search | AV_OPT_ALLOW_NULL, &location) < 0 ||
++        !location || !location[0] ||
++        strnlen((char *)location, REFERENCE_RESPONSE_LOCATION_LIMIT + 1) > REFERENCE_RESPONSE_LOCATION_LIMIT ||
++        av_opt_get_int(p->avio, "response_generation", search, &after) < 0 || after != before)
++        goto done;
++    *out = (struct stream_reference_observation_values){
++        .etag = (char *)etag, .location = (char *)location,
++        .response_generation = before,
++    };
++    etag = location = NULL;
++    ok = true;
++done:
++    av_free(etag);
++    av_free(location);
++    return ok;
++}
++
++static bool reference_observation_matches_source(
++    stream_t *s, const struct stream_reference_observation *observation)
++{
++    return s && observation && s->info == &stream_info_ffmpeg &&
++        s->mode == STREAM_READ && s->seekable && s->seek_interruptible &&
++        s->original_source_backend == STREAM_REFERENCE_LAVF_HTTP_GET_INITIAL &&
++        s->reference_source == observation->initial.source &&
++        s->original_source_generation == observation->initial.source_generation &&
++        !mp_cancel_test(s->cancel) && !stream_io_interrupted(s) &&
++        !stream_reference_observation_cancelled(observation);
++}
++
++bool stream_reference_source_observe_response(
++    stream_t *s, int64_t deadline_ns, struct stream_reference_observation **out)
++{
++    if (!out || *out || !reference_observation_deadline_valid(deadline_ns))
++        return false;
++    struct stream_reference_lease initial = {0};
++    if (!stream_reference_source_acquire_initial_request(s, &initial))
++        return false;
++    struct stream_reference_observation *observation = av_mallocz(sizeof(*observation));
++    if (!observation) {
++        stream_reference_lease_release(&initial);
++        return false;
++    }
++    observation->initial = initial;
++    observation->deadline_ns = deadline_ns;
++    if (!reference_observation_matches_source(s, observation) ||
++        !reference_response_read_owner(s, &observation->values) ||
++        !reference_observation_matches_source(s, observation)) {
++        stream_reference_observation_release(&observation);
++        return false;
++    }
++    observation->values.source_generation = initial.source_generation;
++    observation->values.source_epoch = initial.epoch;
++    *out = observation;
++    return true;
++}
++
++bool stream_reference_source_revalidate_observation(
++    stream_t *s, const struct stream_reference_observation *observation)
++{
++    struct stream_reference_observation_values current = {0};
++    bool valid = reference_observation_matches_source(s, observation) &&
++        reference_response_read_owner(s, &current) &&
++        current.response_generation == observation->values.response_generation &&
++        !strcmp(current.etag, observation->values.etag) &&
++        !strcmp(current.location, observation->values.location) &&
++        reference_observation_matches_source(s, observation);
++    stream_reference_observation_values_clear(&current);
++    return valid;
++}
++
++bool stream_reference_observation_copy_values(
++    const struct stream_reference_observation *observation,
++    struct stream_reference_observation_values *out)
++{
++    if (!out || out->etag || out->location ||
++        stream_reference_observation_cancelled(observation))
++        return false;
++    struct stream_reference_observation_values copy = observation->values;
++    copy.etag = av_strdup(observation->values.etag);
++    copy.location = av_strdup(observation->values.location);
++    if (!copy.etag || !copy.location || stream_reference_observation_cancelled(observation)) {
++        stream_reference_observation_values_clear(&copy);
++        return false;
++    }
++    *out = copy;
++    return true;
++}
++
+ static int interrupt_cb(void *ctx);
+ 
+ static bool reopen_at(stream_t *s, int64_t offset)

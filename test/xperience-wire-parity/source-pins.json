@@ -1,0 +1,246 @@
+{
+  "schema": 4,
+  "reviewState": "ROOT_AND_INDEPENDENT_SOURCE_SECURITY_REVIEWED",
+  "repository": "VortXTV/VortX",
+  "ref": "refs/heads/beta-xperience-wire-parity-20261030",
+  "finalModel": {
+    "packet": "android-xperience-domain-source-v10",
+    "version": 10,
+    "reviewState": "SOURCE_SECURITY_REVIEWED",
+    "frozenReceiptSHA256": "ca44326867175558efd603d9d4218e27f7a9fd152b9d890797f967f8d4da3b1f",
+    "reviewReceiptSHA256": "94f3035314033c61800b41cc5c391e1b8b45459ea059afb48f3014823ed05133",
+    "domainSourceSHA256": "8314562070da19eb8011f5da625916671b9ebd912f1daa9156e0b7bce06c8aae"
+  },
+  "appleDomain": {
+    "path": "app/SourcesShared/XperienceCollections.swift",
+    "sha256": "91200e187919eab5bfade0a7b611a0e82f5194d99857bb99440b5546d8ff32da"
+  },
+  "appleJSON": {
+    "path": "app/SourcesShared/VortxResourceBridge.swift",
+    "sha256": "0d3f7301a39b74cddd9d5cd81fd630ff0c96147b9034659a04fda5f5ad5b29f0",
+    "start": "indirect enum VortxJSON: Codable, Equatable, Sendable {",
+    "endBefore": "\n\nstruct VortxResourceRequest: Codable, Equatable, Sendable {",
+    "spanSHA256": "3f1287e06138d05ee6e9ebaadeb5e55b8c6c70035f476535b1574f266ecb573b",
+    "actualImportPrefix": "import Foundation\n"
+  },
+  "androidJSON": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/engine/NativeOwnerHistoryAccount.kt",
+    "sha256": "4127844a42d38562a85789f4f532cc7ea0c9b0a92d2747f91d16839e584c86db",
+    "start": "internal object OHJson {",
+    "endBefore": "\n\n/** No authority is minted by this serializer. Every raw sibling survives unless explicitly owned. */",
+    "spanSHA256": "ea3dd444994b625f2aff82cc34623177a076e4ccdbd953b95b5c8c79e7d2a636",
+    "preambleSHA256": "ae749a041d75632ea97416ba1fb789e57d973b2b199215b0ce3bbc37d9a2b183"
+  },
+  "androidDomain": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceCollections.kt",
+    "sha256": "8314562070da19eb8011f5da625916671b9ebd912f1daa9156e0b7bce06c8aae"
+  },
+  "hostToolchain": {
+    "kotlinVersion": "2.4.21",
+    "requiredJDKMajors": [
+      17,
+      21
+    ],
+    "requiredJDKEnvironment": [
+      "JAVA_HOME_17_arm64",
+      "JAVA_HOME_21_arm64"
+    ],
+    "compileJDKMajor": 21,
+    "bytecodeTarget": 17,
+    "referenceImage": {
+      "source": "https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md",
+      "version": "20261013.0424.1",
+      "rootObservedContents": "Kotlin 2.4.21 and JDK17/JDK21 arm64 environment variables",
+      "provenanceLimit": "Reference image documentation only; actual installed versions and binary/jar hashes must be recorded by the hosted run"
+    },
+    "downloadOrInstallPermitted": false
+  },
+  "namespaceSource": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceImportNamespace.kt",
+    "sha256": "4858fb7ba8bfc0f8cdec92f00ff6eb56a2d5ec216d8546f11d4288a458a727cf"
+  },
+  "namespaceFixture": {
+    "path": "test/xperience-wire-parity/NamespacePublicApiFixture.kt",
+    "sha256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0"
+  },
+  "namespaceCheck": {
+    "packet": "android-xperience-store-source-v4",
+    "reviewState": "SOURCE_AND_FIXTURE_SECURITY_REVIEWED",
+    "frozenReceiptSHA256": "a99b62d44ac58580087563488c42ceec46aef67f986dabfcd1e5f99111bdc25f",
+    "namespaceReviewReceiptSHA256": "b27cac29c120995ba32625d569eec9b29d621aa07cc6cd823b7e2e4dfe944568",
+    "fixtureReviewReceiptSHA256": "b27cac29c120995ba32625d569eec9b29d621aa07cc6cd823b7e2e4dfe944568",
+    "namespaceSourceSHA256": "4858fb7ba8bfc0f8cdec92f00ff6eb56a2d5ec216d8546f11d4288a458a727cf",
+    "fixtureSourceSHA256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0",
+    "mainClass": "com.vortx.android.xperience.NamespacePublicApiFixture",
+    "caseIds": [
+      "read-replace-unknown-raw",
+      "semantic-full-register-stale",
+      "detached-observation-bytes",
+      "duplicate-precision-invalid-shortcut",
+      "small-depth-unknown-cas",
+      "exact-integer-unknown-conservation",
+      "actual-canonical-expansion-quota",
+      "concurrent-original-observations",
+      "tombstone-namespace-future-format"
+    ],
+    "assertionMinimum": 9,
+    "assertionMaximum": 128,
+    "maximumInputBytes": 16384
+  },
+  "appleBinding": {
+    "path": "app/SourcesShared/XperienceAddonBinding.swift",
+    "sha256": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f"
+  },
+  "androidBinding": {
+    "path": "android/app/src/main/kotlin/com/vortx/android/xperience/XperienceAddonBinding.kt",
+    "sha256": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268"
+  },
+  "swiftDocumentFixture": {
+    "path": "test/xperience-wire-parity/SwiftFixture.swift",
+    "sha256": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732"
+  },
+  "kotlinDocumentFixture": {
+    "path": "test/xperience-wire-parity/KotlinFixture.kt",
+    "sha256": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1"
+  },
+  "transportSwiftFixture": {
+    "path": "test/xperience-wire-parity/TransportFixture.swift",
+    "sha256": "1bdd3d8ca1a173da8cce530e592f0f1de8b562a6c74dfb3eadcdaf0cd245efc9"
+  },
+  "transportKotlinFixture": {
+    "path": "test/xperience-wire-parity/TransportFixture.kt",
+    "sha256": "978859d1e925fe649ae1d6df244a5bf9502e312c27a0868a4734809e0d3a463b"
+  },
+  "transportCorpus": {
+    "path": "test/xperience-wire-parity/transport-cases.json",
+    "sha256": "de132e69bd605de930fdbc552534b31216232463e4900de93e4646ec74c1e296"
+  },
+  "transportGuardTests": {
+    "path": "test/xperience-wire-parity/test_toolchain_layout.py",
+    "sha256": "5f629bc343d47a4df7a23776c9631a1e68b92bb31b207150a18483edef6c278d"
+  },
+  "transportCheck": {
+    "reviewState": "SOURCE_COLLECTORS_AND_GUARDS_SECURITY_REVIEWED",
+    "contractPacket": "xperience-transport-fingerprint-source-v1/final-v2",
+    "contractFreezeSHA256": "c74128bf02b58e2bd0a05c3d11a492d3fb693f2c585a7712891e014c2414b0ce",
+    "contractReviewReceiptSHA256": "317df0c90f7a3fd6f615ef59ab631b2280b2ef631564d8dc1980a1c05e4041b6",
+    "bindingSourceReviewReceiptSHA256": "08f6e784cc849045d59681872e2c9a08660658c1bf3b6b4faf10544d0604b6d2",
+    "collectorsPacket": "xperience-transport-collectors-source-v1",
+    "collectorsFreezeSHA256": "b43782eb22dfd061eebb007ae34caab55b8107733d3ead0473bdddc560d681c6",
+    "collectorsInventorySHA256": "e79afb6cc978f3fe0d0efa9f5e734c6e20f0194b08ebaf56f5b055f951d60806",
+    "collectorsReviewReceiptSHA256": "317df0c90f7a3fd6f615ef59ab631b2280b2ef631564d8dc1980a1c05e4041b6",
+    "collectorsReviewIdentitySHA256": "87f5ca3fe9757fba8be22f053201268f63531ad4020f90d30dde2870dbe013de",
+    "driverGuardReviewReceiptSHA256": "959fe05a4fffa2abe91283facd6169a0df42e8aaf6e871d1c572e355643afbca",
+    "corpusSHA256": "de132e69bd605de930fdbc552534b31216232463e4900de93e4646ec74c1e296",
+    "sourceSHA256s": {
+      "appleBinding": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f",
+      "androidBinding": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268",
+      "swiftDocumentFixture": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732",
+      "kotlinDocumentFixture": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1",
+      "transportSwiftFixture": "1bdd3d8ca1a173da8cce530e592f0f1de8b562a6c74dfb3eadcdaf0cd245efc9",
+      "transportKotlinFixture": "978859d1e925fe649ae1d6df244a5bf9502e312c27a0868a4734809e0d3a463b",
+      "transportCorpus": "de132e69bd605de930fdbc552534b31216232463e4900de93e4646ec74c1e296",
+      "transportGuardTests": "5f629bc343d47a4df7a23776c9631a1e68b92bb31b207150a18483edef6c278d"
+    },
+    "modeCounts": {
+      "LITERAL_CONTRACT_UNOBSERVED": 25,
+      "GUARD_REJECTION_UNOBSERVED": 11,
+      "PLATFORM_PARITY_PROBE_UNOBSERVED": 16
+    },
+    "cases": 52,
+    "relations": 6
+  },
+  "normalizationSwiftFixture": {
+    "path": "test/xperience-wire-parity/NormalizationRegressionFixture.swift",
+    "sha256": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd"
+  },
+  "normalizationKotlinFixture": {
+    "path": "test/xperience-wire-parity/NormalizationRegressionFixture.kt",
+    "sha256": "f6c1755df0833a80eee3b2febfa71df32d57dd6c3c3e9807580c80ac31e0a8ce"
+  },
+  "appleCatalogClient": {
+    "path": "app/SourcesShared/XperienceCatalogClient.swift",
+    "sha256": "333a0e787f535770b4731f6385b144d6f50b650aa5393b1bf5b285b915b41144"
+  },
+  "normalizationCheck": {
+    "reviewState": "SOURCE_AND_PORTABLE_REGRESSIONS_SECURITY_REVIEWED",
+    "sourcePacket": "xperience-transport-normalization-source-v2",
+    "sourceFreezeSHA256": "7b1c9bf03dd85557eb18a17a16f1d42806153eefef96c70ffbfcf5cd91bc174e",
+    "sourceInventorySHA256": "c1f0d651012f38d2d9c1ae7eb3ff620282beb940a9ece8adfc587d32c2448858",
+    "originSwiftSHA256": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd",
+    "originKotlinSHA256": "082662d8ec092e6d64256fa9a5af4f841c94a5ff81730f23bb567e5980cd3d22",
+    "sourceReviewReceiptSHA256": "08f6e784cc849045d59681872e2c9a08660658c1bf3b6b4faf10544d0604b6d2",
+    "sourceReviewIdentitySHA256": "924345d2f1ce4aa2d1628c9020e737f6525f604605ded1c44e2d0dceff50065a",
+    "portableHarnessReviewReceiptSHA256": "959fe05a4fffa2abe91283facd6169a0df42e8aaf6e871d1c572e355643afbca",
+    "sourceSHA256s": {
+      "appleBinding": "3cdcddcc7ce859bfef4e0f509e03f4a3c53ff9e70e865ac936c04fff3970bb5f",
+      "androidBinding": "973ade6aede460a3d75b077ef4d9d2d0d121c0f5525cc04e5c8fa99a0a7dd268",
+      "swiftDocumentFixture": "cdd3577bb4fb27ba30b9f8a174ac5705beae61376ccf0c6f49d050d1fdc7b732",
+      "kotlinDocumentFixture": "ec2c239992df2925fd3c431082fc6fd46b0afb4ea33e46fd32546d6e2a51a9c1",
+      "normalizationSwiftFixture": "e486dda617f826a8b0908df4d38c6246703b5a8fc0a79f6a342b45574a4cd5bd",
+      "normalizationKotlinFixture": "f6c1755df0833a80eee3b2febfa71df32d57dd6c3c3e9807580c80ac31e0a8ce",
+      "appleCatalogClient": "333a0e787f535770b4731f6385b144d6f50b650aa5393b1bf5b285b915b41144"
+    },
+    "rosters": {
+      "swift": {
+        "accepted": 15,
+        "rejected": 18,
+        "distinct": 7,
+        "longQueries": 2,
+        "unicodeExpansion": 1,
+        "capacity": 4,
+        "requestProjection": 2,
+        "oldHashRebind": 2,
+        "sourceGuards": 3
+      },
+      "kotlin": {
+        "accepted": 15,
+        "rejected": 19,
+        "distinct": 7,
+        "longQueries": 2,
+        "unicodeExpansion": 1,
+        "capacity": 4,
+        "oldHashRebind": 2,
+        "methods": 4
+      }
+    }
+  },
+  "namespaceEvolutionHistory": [
+    {
+      "previousCheck": {
+        "packet": "android-xperience-namespace-source-v2",
+        "reviewState": "SOURCE_AND_FIXTURE_SECURITY_REVIEWED",
+        "frozenReceiptSHA256": "7557ed3bcd91d4df83466bf6ee7cf7026e9776f1b0f48810f847e47a66ad3e3d",
+        "namespaceReviewReceiptSHA256": "982ebd3b0c2860283d50571eea24813ce4ce005eaa4f24370fd7a9ccb2343efe",
+        "fixtureReviewReceiptSHA256": "8984a58a6aef7116ef0756a0eac8fa1afb8fb51db85705e65892d16a5683c95d",
+        "namespaceSourceSHA256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061",
+        "fixtureSourceSHA256": "292bdd1b5b3c58e56e88aeedac2a85333a39e43c600716bdb5010a2b6cbafdc0",
+        "mainClass": "com.vortx.android.xperience.NamespacePublicApiFixture",
+        "caseIds": [
+          "read-replace-unknown-raw",
+          "semantic-full-register-stale",
+          "detached-observation-bytes",
+          "duplicate-precision-invalid-shortcut",
+          "small-depth-unknown-cas",
+          "exact-integer-unknown-conservation",
+          "actual-canonical-expansion-quota",
+          "concurrent-original-observations",
+          "tombstone-namespace-future-format"
+        ],
+        "assertionMinimum": 9,
+        "assertionMaximum": 128,
+        "maximumInputBytes": 16384
+      },
+      "previousSourceSHA256": "2d82e561eb8a24fbfd34856cf6dfc89ee1cdc59be24574fbf29088eab3b80061",
+      "previousActualProof": {
+        "sourceCommit": "61d2664cd56227e904410e1e996fc13ded26712d",
+        "runId": 41018806840,
+        "attempt": 1,
+        "scope": "historical pure-source proof for previous inputs only"
+      },
+      "currentReviewScope": "Additive isolated reader and byte-conserved legacy readAll/preflight; unchanged nine-case fixture source/API composition reviewed. No old assertion or guard changed.",
+      "currentExecution": "UNRUN for changed Namespace; strict compilation/parity and separate Store controls remain required",
+      "newStoreControls": "14 authored standalone controls, not part of the retained nine-case fixture or prior hosted result"
+    }
+  ]
+}

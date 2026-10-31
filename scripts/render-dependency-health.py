@@ -14,6 +14,13 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.I)
 _PUBLIC_MAPPING_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+&(),:/-]{0,159}$")
 _MAPPING_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
+def _archive_adapter():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dependency_archive_adapter", Path(__file__).with_name("dependency_archive_adapter.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 def cell(value):
     text = html.escape(str(value), quote=False).replace("\n", " ").replace("\r", " ")
@@ -34,6 +41,11 @@ def _safe_repository(value):
 
 def _safe_github_key(value):
     return value if isinstance(value, str) and _GITHUB_KEY.fullmatch(value) else "redacted"
+
+def _safe_native_observation(value):
+    if value in {"native-archive:ffmpeg", "native-archive:gmp", "native-archive:nettle", "native-archive:freetype"}:
+        return value
+    return _safe_github_key(value) if value.startswith("github:") else _safe_repository(value)
 
 
 def _safe_digest(value):
@@ -117,7 +129,7 @@ def _native_group_rows(native):
             "reason": reason or "none recorded",
             "lanes": ", ".join(sorted(set(lane_values))) or "none recorded",
             "observation": "; ".join(
-                _safe_repository(value) if not value.startswith("github:") else _safe_github_key(value)
+                _safe_native_observation(value)
                 for value in observation
             ) or "none recorded",
             "source": record.get("observation_source") if isinstance(record.get("observation_source"), str) else "none recorded",
@@ -190,7 +202,27 @@ def render(data):
         lines.append("| " + " | ".join(cell(value) for value in values) + " |")
     lines += ["", "## Every newly observed release", ""]
     for release in data.get("new_releases", []):
-        lines.append(f"- {cell(release['component'])}: {', '.join(cell(v) for v in release['new_versions'])}. Source: {cell(release['source'])}")
+        component = release.get("component", "")
+        source = release['source']
+        if isinstance(component, str) and component.startswith("native-archive:"):
+            archive = _archive_adapter()
+            group = component.removeprefix("native-archive:")
+            source = archive.SOURCES[group][0] if group in archive.SOURCES and source == archive.SOURCES[group][0] else "redacted"
+        lines.append(f"- {cell(component)}: {', '.join(cell(v) for v in release['new_versions'])}. Source: {cell(source)}")
+        if isinstance(component, str) and component.startswith("native-archive:"):
+            archive = _archive_adapter()
+            group = component.removeprefix("native-archive:")
+            urls = release.get("archive_urls", {})
+            if isinstance(urls, dict):
+                for version in release.get("new_versions", []):
+                    candidates = urls.get(version, [])
+                    if not isinstance(candidates, list): continue
+                    for url in candidates:
+                        if archive.archive_url(group, url):
+                            filename = url.rsplit("/", 1)[-1]
+                            if filename.startswith(group + "-" + str(version) + ".tar."):
+                                label = "stable" if re.fullmatch(r"\d+(?:\.\d+){0,2}", str(version)) else "prerelease or nonstandard"
+                                lines.append(f"  - {cell(version)} ({label}): {cell(url)}")
     if not data.get("new_releases"):
         lines.append("Initial baseline, or no new versions compared with the retained cursor; this does not mean all current versions are latest.")
     lines += ["", "## Every GitHub metadata observation change", ""]

@@ -70,7 +70,7 @@ struct XperienceCollectionsBrowserView: View {
     @StateObject private var model = XperienceCollectionsViewModel()
     @State private var pastedJSON = ""
     @State private var chooserTicket: XperienceFileImportTicket?
-    @State private var confirmReplacement = false
+    @State private var confirmReplacement: XperienceSaveConfirmation?
     @State private var loaded = false
 
     var body: some View {
@@ -82,7 +82,7 @@ struct XperienceCollectionsBrowserView: View {
                 supportNotice
                 inputCard
                 if let message = model.message { Text(message).foregroundStyle(Theme.Palette.textSecondary) }
-                if let document = model.preview { previewCard(document) }
+                if let document = model.preview, let identity = model.previewIdentity { previewCard(document, original: identity) }
                 savedImports
             }
             .padding(.horizontal, Theme.Space.screenInset)
@@ -95,12 +95,12 @@ struct XperienceCollectionsBrowserView: View {
             chooserTicket = nil
             loaded = false
             pastedJSON = ""
-            confirmReplacement = false
+            confirmReplacement = nil
             model.stop()
         }
         .onReceive(model.store.revisionEvents) { _ in
             model.retireIfStale()
-            if !model.isLive { pastedJSON = ""; chooserTicket = nil; confirmReplacement = false }
+            if !model.isLive { pastedJSON = ""; chooserTicket = nil; confirmReplacement = nil }
         }
         .navigationDestination(for: XperienceBrowserRoute.self) { route in
             if model.accepts(route.generation) { destination(route.page, generation: route.generation) }
@@ -111,10 +111,11 @@ struct XperienceCollectionsBrowserView: View {
                     #endif
             }
         }
-        .confirmationDialog("Replace this saved import?", isPresented: $confirmReplacement, titleVisibility: .visible) {
-            Button("Replace saved import", role: .destructive) { model.commitStaged() }
-            Button("Cancel", role: .cancel) { model.cancelStaged() }
-        } message: {
+        .confirmationDialog("Replace this saved import?", isPresented: confirmationPresented(for: confirmReplacement),
+                            titleVisibility: .visible, presenting: confirmReplacement) { original in
+            Button("Replace saved import", role: .destructive) { model.commitStaged(original) }
+            Button("Cancel", role: .cancel) { model.cancelStaged(original) }
+        } message: { _ in
             Text("Replaces only the selected import namespace in this profile. Other imports and add-ons keep their current data.")
         }
         #if os(iOS) || os(macOS)
@@ -125,6 +126,14 @@ struct XperienceCollectionsBrowserView: View {
             }
         }
         #endif
+    }
+
+    private func confirmationPresented(for original: XperienceSaveConfirmation?) -> Binding<Bool> {
+        Binding(get: { original != nil && confirmReplacement == original }, set: { showing in
+            // Dismissal can precede its button action. Do not cancel the model commit here;
+            // both action closures carry their own immutable confirmation instead.
+            if !showing && confirmReplacement == original { confirmReplacement = nil }
+        })
     }
 
     #if os(iOS) || os(macOS)
@@ -181,20 +190,22 @@ struct XperienceCollectionsBrowserView: View {
         }
     }
 
-    private func previewCard(_ document: XperienceCollections.Document) -> some View {
+    private func previewCard(_ document: XperienceCollections.Document, original: XperiencePresentationIdentity) -> some View {
         card {
             Text("Import preview").font(Theme.Typography.cardTitle)
             Text("\(document.collections.count) collections · \(document.collections.flatMap(\.folders).count) folders")
-            TextField("Import name", text: $model.label).autocorrectionDisabled(true)
+            TextField("Import name", text: Binding(
+                get: { model.previewIdentity == original ? model.label : "" },
+                set: { model.setLabel($0, original: original) })).autocorrectionDisabled(true)
             Text("Save destination").font(Theme.Typography.label)
             ScrollView(.horizontal) {
                 HStack {
-                    Button("Append as a new import") { model.destination = "append" }
+                    Button("Append as a new import") { model.setDestination("append", original: original) }
                         .buttonStyle(ChipButtonStyle(selected: model.destination == "append"))
                         .accessibilityAddTraits(model.destination == "append" ? .isSelected : [])
                         .accessibilityHint("Save as a separate import in this profile")
                     ForEach(model.namespaces, id: \.field) { namespace in
-                        Button("Replace \(namespace.label)") { model.destination = namespace.field }
+                        Button("Replace \(namespace.label)") { model.setDestination(namespace.field, original: original) }
                             .buttonStyle(ChipButtonStyle(selected: model.destination == namespace.field))
                             .accessibilityAddTraits(model.destination == namespace.field ? .isSelected : [])
                             .accessibilityHint("Select this import as the replacement destination; saving asks for confirmation")
@@ -215,12 +226,12 @@ struct XperienceCollectionsBrowserView: View {
                         ScrollView(.horizontal) {
                             HStack {
                                 ForEach(row.choices) { choice in
-                                    Button(choice.title) { model.chooseInstance(row: row.id, choice: choice.id) }
+                                    Button(choice.title) { model.chooseInstance(row: row.id, choice: choice.id, original: original) }
                                         .buttonStyle(ChipButtonStyle(selected: row.selection == choice.id))
                                         .accessibilityAddTraits(row.selection == choice.id ? .isSelected : [])
                                         .accessibilityHint("Use this installed instance for \(row.title)")
                                 }
-                                Button("Leave unavailable") { model.chooseInstance(row: row.id, choice: "unavailable") }
+                                Button("Leave unavailable") { model.chooseInstance(row: row.id, choice: "unavailable", original: original) }
                                     .buttonStyle(ChipButtonStyle(selected: row.selection == nil))
                                     .accessibilityAddTraits(row.selection == nil ? .isSelected : [])
                                     .accessibilityHint("Keep \(row.title) unavailable without discarding its layout")
@@ -240,7 +251,8 @@ struct XperienceCollectionsBrowserView: View {
             Text("Save first checks your VortX account backup and may merge account updates on this device. The import is confirmed after its local save; cloud upload is separate.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             Button {
-                if model.stageSave() { confirmReplacement = true }
+                guard model.previewIdentity == original else { return }
+                confirmReplacement = model.stageSave(original)
             } label: { Label(model.busy ? "Saving…" : "Save import", systemImage: "square.and.arrow.down") }
                 .buttonStyle(PrimaryActionStyle()).disabled(model.busy || !model.isLive)
         }
@@ -254,17 +266,19 @@ struct XperienceCollectionsBrowserView: View {
                 Button("Reload") { model.reload() }.buttonStyle(ChipButtonStyle()).disabled(model.busy)
             }
             if model.namespaces.isEmpty { Text("No saved collections are available.").foregroundStyle(Theme.Palette.textSecondary) }
-            ForEach(model.namespaces, id: \.field) { namespace in
-                VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                    Text(namespace.label).font(Theme.Typography.cardTitle)
-                    ForEach(XperiencePresentationPolicy.ordered(namespace.document.collections), id: \.id) { collection in
-                        Label(collection.title, systemImage: collection.pinToTop ? "pin.fill" : "folder")
-                            .padding(Theme.Space.sm).frame(maxWidth: .infinity, alignment: .leading)
+            if let original = model.savedIdentity {
+                ForEach(model.namespaces, id: \.field) { namespace in
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        Text(namespace.label).font(Theme.Typography.cardTitle)
+                        ForEach(XperiencePresentationPolicy.ordered(namespace.document.collections), id: \.id) { collection in
+                            Label(collection.title, systemImage: collection.pinToTop ? "pin.fill" : "folder")
+                                .padding(Theme.Space.sm).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        Button("Review sources or replace this import") { model.reviewSaved(namespace.field, original: original) }
+                            .buttonStyle(ChipButtonStyle()).disabled(model.busy)
                     }
-                    Button("Review sources or replace this import") { model.reviewSaved(namespace.field) }
-                        .buttonStyle(ChipButtonStyle()).disabled(model.busy)
+                    .xperienceFocusSection()
                 }
-                .xperienceFocusSection()
             }
         }
     }
@@ -417,7 +431,19 @@ private struct XperienceCatalogPage: View {
     @State private var message: String?
     @State private var loadTask: Task<Void, Never>?
     @State private var loadRequestID = UUID()
+    @State private var activeSelection: Selection?
     private struct Identity: Hashable { let type: String; let id: String }
+    private struct Selection: Hashable {
+        let namespace: String
+        let collectionID: String
+        let folderID: String
+        let sourceIndex: Int
+        let generation: UUID
+    }
+    private var selection: Selection {
+        .init(namespace: namespace, collectionID: collectionID, folderID: folderID,
+              sourceIndex: sourceIndex, generation: routeGeneration)
+    }
     var body: some View {
         ScrollView {
             if model.accepts(routeGeneration) {
@@ -449,7 +475,11 @@ private struct XperienceCatalogPage: View {
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onAppear { if items.isEmpty { startLoad(next: false) } }
+        .onAppear {
+            if activeSelection != selection { selectCatalog() }
+            else if items.isEmpty { startLoad(next: false) }
+        }
+        .onValueChange(of: selection) { _ in selectCatalog() }
         .onDisappear { cancelLoad() }
         .onValueChange(of: model.generation) { _ in
             if !model.accepts(routeGeneration) { cancelLoad(clear: true) }
@@ -459,33 +489,49 @@ private struct XperienceCatalogPage: View {
         }
     }
 
+    @MainActor private func selectCatalog() {
+        // SwiftUI may reuse this page's State for a different folder/source. Retire the old
+        // task and results before resolving ANY outcome of the new rendered selection.
+        cancelLoad(clear: true)
+        activeSelection = selection
+        startLoad(next: false)
+    }
+
     @MainActor private func startLoad(next: Bool) {
-        guard !busy, model.accepts(routeGeneration) else { return }
-        loadTask?.cancel()
+        let selected = selection
+        // A queued Retry/Load more action from an old page cannot cancel its successor.
+        guard activeSelection == selected else { return }
+        guard model.accepts(selected.generation) else { cancelLoad(clear: true); return }
+        if next && busy { return } // A duplicate action for this same current page is not a selection.
+        let skip = next ? offset : nil
+        cancelLoad(clear: !next)
+        activeSelection = selected
         let requestID = UUID()
         loadRequestID = requestID
         busy = true; message = nil
-        loadTask = Task { await load(next: next, requestID: requestID) }
+        loadTask = Task { await load(next: next, skip: skip, selection: selected, requestID: requestID) }
     }
 
     @MainActor private func cancelLoad(clear: Bool = false) {
         loadRequestID = UUID()
         loadTask?.cancel(); loadTask = nil
         busy = false
-        if clear { items = []; offset = 0; more = false; message = nil }
+        if clear { activeSelection = nil; items = []; offset = 0; more = false; message = nil }
     }
 
-    @MainActor private func load(next: Bool, requestID: UUID) async {
+    @MainActor private func load(next: Bool, skip: Int?, selection selected: Selection, requestID: UUID) async {
         defer {
             // A retired request must not clear the busy flag or owner of its successor.
             if loadRequestID == requestID { busy = false; loadTask = nil }
         }
-        guard !Task.isCancelled, loadRequestID == requestID, model.accepts(routeGeneration) else { return }
+        guard !Task.isCancelled, loadRequestID == requestID, activeSelection == selected,
+              model.accepts(selected.generation) else { return }
         do {
-            let request = try model.catalogRequest(namespace: namespace, collectionID: collectionID, folderID: folderID, index: sourceIndex)
-            let page = try await XperienceCatalogClient.load(source: request.source, candidate: request.candidate, skip: next ? offset : nil)
-            guard !Task.isCancelled, loadRequestID == requestID,
-                  model.accepts(request.generation), model.accepts(routeGeneration) else { return }
+            let request = try model.catalogRequest(namespace: selected.namespace, collectionID: selected.collectionID,
+                                                   folderID: selected.folderID, index: selected.sourceIndex)
+            let page = try await XperienceCatalogClient.load(source: request.source, candidate: request.candidate, skip: skip)
+            guard !Task.isCancelled, loadRequestID == requestID, activeSelection == selected,
+                  model.accepts(request.generation), model.accepts(selected.generation) else { return }
             if !next { items = []; offset = 0 }
             var seen = Set(items.map { Identity(type: $0.type, id: $0.id) })
             for item in page where seen.insert(.init(type: item.type, id: item.id)).inserted && items.count < XperienceCatalogClient.maximumItems { items.append(item) }
@@ -501,8 +547,8 @@ private struct XperienceCatalogPage: View {
         } catch is CancellationError {
             // Cancellation is an owned lifecycle transition, not a user-facing catalog error.
         } catch {
-            guard !Task.isCancelled, loadRequestID == requestID,
-                  model.accepts(routeGeneration) else { return }
+            guard !Task.isCancelled, loadRequestID == requestID, activeSelection == selected,
+                  model.accepts(selected.generation) else { return }
             message = (error as? XperienceCatalogClient.Failure)?.errorDescription
                 ?? "This catalog is unavailable. Return to the import preview and review its source mapping."
         }

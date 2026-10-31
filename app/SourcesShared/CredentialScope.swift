@@ -2625,6 +2625,16 @@ final class CredentialScopeRegistry: @unchecked Sendable {
         return scope == capture.scope && generation == capture.generation
     }
 
+    /// Fixed prepared-task admission only. Lock order: request -> load lifetime -> config -> lifecycle -> registry -> profile.
+    /// No arbitrary callback or actor wait is allowed while these authority locks are held.
+    func resumeContributionTask(_ task: URLSessionTask, ifCurrent capture: Capture,
+                                applicationEpoch: UUID) -> LegacyWatchOwnership.TaskAdmission {
+        lock.lock()
+        defer { lock.unlock() }
+        guard scope == capture.scope, generation == capture.generation else { return .stale }
+        return LegacyWatchOwnership.resumeApplicationTask(task, ifCurrent: applicationEpoch)
+    }
+
     func isMigrationEligible(_ capture: Capture) -> Bool {
         lock.lock()
         defer { lock.unlock() }

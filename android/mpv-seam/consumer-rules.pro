@@ -3,3 +3,6 @@
 # future R8 pass must not rename or remove them, or every mpv callback would die with a JNI
 # NoSuchMethodError. Mirrors upstream libmpv-android's own consumer rule.
 -keep class com.vortx.android.player.mpv.seam.MpvSeam { *; }
+
+# The bounded NODE value is constructed directly from JNI.
+-keep class com.vortx.android.player.mpv.seam.MpvReferenceNode { *; }

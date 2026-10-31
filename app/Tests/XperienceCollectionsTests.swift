@@ -82,6 +82,42 @@ enum XperienceCollectionsTests {
         }
         let unsigned = try XperienceCollections.parse(fixture(extra: #","future":18446744073709551615"#))
         expect(unsigned.raw.array?[0]["future"] == .unsigned(UInt64.max), "UInt64 maximum remains exact")
+        let exactIntegralTokens: [(String, VortxJSON)] = [
+            ("-9223372036854775808.0", .integer(Int64.min)),
+            ("-9223372036854775808e0", .integer(Int64.min)),
+            ("9223372036854775807.0", .integer(Int64.max)),
+            ("18446744073709551615.0", .unsigned(UInt64.max)),
+            ("18446744073709551615e0", .unsigned(UInt64.max)),
+            ("9223372036854775808.0", .unsigned(9_223_372_036_854_775_808)),
+            ("9007199254740993.0", .integer(9_007_199_254_740_993)),
+            ("9007199254740993e0", .integer(9_007_199_254_740_993)),
+            ("1e7", .integer(10_000_000)), ("-0.0", .integer(0)),
+        ]
+        for (token, expected) in exactIntegralTokens {
+            let scalar = try XperienceCollections.parseCompleteRaw(Data(token.utf8))
+            expect(scalar == expected, "owned exact Int64/UInt64 selection: " + token)
+            let imported = try XperienceCollections.parse(fixture(extra: ",\"future\":" + token))
+            expect(imported.raw.array?[0]["future"] == expected, "unknown integral value retained exactly: " + token)
+            let encodedScalar = try XperienceCollections.canonicalData(scalar)
+            let expectedScalar = try XperienceCollections.canonicalData(expected)
+            expect(encodedScalar == expectedScalar, "exact integral canonical scalar: " + token)
+        }
+        for malformed in ["01", "-01", "1.", "1e", "1e+", "1e-", "--1", "+1", "0x10", "1.0.0", "-", "-.1"] {
+            rejects(.invalidJSON, "complete number grammar before owned admission: " + malformed) {
+                _ = try XperienceCollections.parseCompleteRaw(Data(malformed.utf8))
+            }
+            rejects(.invalidJSON, "nested unknown number grammar: " + malformed) {
+                _ = try XperienceCollections.parse(fixture(extra: ",\"future\":" + malformed))
+            }
+        }
+        rejects(.invalidJSON, "finite Double decode failure keeps invalid JSON category") {
+            _ = try XperienceCollections.parse(fixture(extra: #","future":1.7976931348623159e308"#))
+        }
+        for token in ["0.99999999999999999", "1.0000000000000001", "1e100001", "18446744073709551617"] {
+            rejects(.unpreservableNumber, "normalized raw lossless guard remains mandatory: " + token) {
+                _ = try XperienceCollections.parse(fixture(extra: ",\"future\":" + token))
+            }
+        }
         let collection = document.raw.array![0]
         rejects(.duplicateCollection, "duplicate collection IDs fail the whole import") {
             _ = try XperienceCollections.project(.array([collection, collection]))

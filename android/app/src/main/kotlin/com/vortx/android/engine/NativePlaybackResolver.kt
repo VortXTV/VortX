@@ -72,6 +72,8 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
     override suspend fun resolve(source: StreamSource, episode: Episode?, isCurrent: () -> Boolean,
         playbackIsCurrent: () -> Boolean): Playable {
         if (!isCurrent()) throw CancellationException("Playback owner changed")
+        // Capture the user choice before debrid/network work. Never adopt a newer server after I/O.
+        val selectedServer = if (source.isTorrent) StreamingServerSelectionStore.instance(context).capture() else null
         val direct = nativeDirectPlayable(source)
         val playable = when {
             direct != null -> direct
@@ -97,9 +99,14 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
                     val fallbackFileIdx = checkNotNull(nativeTorrentFallbackFileIndex(target.fileIdx, episode != null)) {
                         "This source could not be resolved for the selected episode. Choose another source or check your debrid account."
                     }
-                    val base = if (VortxServer.streamingEnabled(context)) VortxServer.startIfNeeded(context) else null
-                    checkNotNull(base) { "Native torrent server is unavailable; configure debrid or install a server-enabled artifact" }
-                    Playable("$base/${target.infoHash.lowercase()}/${fallbackFileIdx}", source.title, viaStreamingServer = true, isTorrent = true)
+                    if (selectedServer != null) {
+                        resolveSelectedStreamingServerTorrent(selectedServer, target.infoHash, fallbackFileIdx,
+                            source.title, isCurrent, playbackIsCurrent)
+                    } else {
+                        val base = if (VortxServer.streamingEnabled(context)) VortxServer.startIfNeeded(context) else null
+                        checkNotNull(base) { "Native torrent server is unavailable; configure debrid or choose a streaming server in Playback settings" }
+                        Playable("$base/${target.infoHash.lowercase()}/${fallbackFileIdx}", source.title, viaStreamingServer = true, isTorrent = true)
+                    }
                 }
             }
             else -> throw UnsupportedOperationException("This native source type cannot be resolved")
