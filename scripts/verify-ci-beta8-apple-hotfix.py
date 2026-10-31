@@ -35,8 +35,9 @@ SUMS = "SHA256SUMS.txt"
 TAG = "v0.5.6-beta.9"
 # The immutable candidate is built first; the public release tag is created only after acceptance.
 # candidate.1 failed the live ABI gate (harness file list); candidates 2 and 3 failed the CI compiler's
-# concurrency and type-check limits (Xcode 26). candidate.4 is the accepted build source.
-BUILD_TAG = "v0.5.6-beta.9-candidate.4"
+# concurrency and type-check limits (Xcode 26); candidate.4 predates AetherEngine. candidate.5 is the
+# accepted build source.
+BUILD_TAG = "v0.5.6-beta.9-candidate.5"
 VERSION = "0.5.6"
 BUILD = "281"
 ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
