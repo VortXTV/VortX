@@ -491,7 +491,7 @@ internal fun XperienceAction(label: String, tv: Boolean, enabled: Boolean = true
         colors = ClickableSurfaceDefaults.colors(containerColor = VortXTheme.colors.surface1, contentColor = VortXTheme.colors.textPrimary,
             focusedContainerColor = VortXTheme.colors.accent, focusedContentColor = VortXTheme.colors.onAccent),
         scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f),
-        border = ClickableSurfaceDefaults.border(focusedBorder = Border(BorderStroke(2.dp, VortXTheme.colors.accentBright), VortXShapes.control))) {
+        border = ClickableSurfaceDefaults.border(focusedBorder = Border(BorderStroke(2.dp, VortXTheme.colors.accentBright), shape = VortXShapes.control))) {
         Column(Modifier.padding(16.dp)) {
             Text(label, style = VortXTheme.type.body, color = if (focused) VortXTheme.colors.onAccent else VortXTheme.colors.textPrimary,
                 maxLines = 2, overflow = TextOverflow.Ellipsis)

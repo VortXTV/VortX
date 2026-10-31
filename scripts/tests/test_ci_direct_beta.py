@@ -24,8 +24,7 @@ class HostedDirectBetaContract(unittest.TestCase):
         self.assertEqual(MODULE.expected_engine("v0.5.6-beta.6"), "a3169f338f3f05da4ad3adb39a1e557c3ddcac33")
         self.assertEqual(MODULE.expected_engine("v0.5.6-beta.2"), "af29b22e4c45740a1f5b6cb415b81f8430f55b9f")
         self.assertEqual(MODULE.expected_engine("v0.5.6-beta.7"), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
-        self.assertEqual(MODULE.expected_engine("v0.5.6-beta.8"), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
-        for tag in ("v0.5.6-beta.1", "v0.5.6-beta.9", "v0.5.7-beta.1", "main", "", None):
+        for tag in ("v0.5.6-beta.1", "v0.5.6-beta.8", "v0.5.7-beta.1", "main", "", None):
             with self.subTest(tag=tag), self.assertRaises(ValueError):
                 MODULE.expected_engine(tag)
 
@@ -191,7 +190,7 @@ class NativeBeta7Contract(unittest.TestCase):
             with self.subTest(gradle=gradle), self.assertRaises(ValueError):
                 MODULE.source_versions(project, gradle, "0.5.6", self.tag)
         with self.assertRaises(ValueError):
-            MODULE.source_versions(project, self.gradle(), "0.5.6", "v0.5.6-beta.9")
+            MODULE.source_versions(project, self.gradle(), "0.5.6", "v0.5.6-beta.8")
 
     def test_historical_six_pair_and_job_contracts_remain_required(self):
         project = self.project(self.native_targets + ("HistoricalLegacyTarget",))

@@ -110,7 +110,7 @@ class NativeXperienceCatalogSourceTest {
                     .put("groups", JSONArray().put(JSONObject().put("addonId", addon.getString("id")).put("status", "ready")
                         .put("content", JSONObject().put("metas", JSONArray()
                             .put(JSONObject().put("id", "tt1").put("type", "movie").put("name", "A"))
-                            .put(JSONObject().put("id", "tt2").put("type", "movie").put("name", "B"))))).toString()
+                            .put(JSONObject().put("id", "tt2").put("type", "movie").put("name", "B")))))).toString()
             }
         }
         val session = VortxNativeSession.open(scope, "Owner", bindings, store, transport)

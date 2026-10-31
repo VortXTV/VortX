@@ -1293,6 +1293,7 @@ internal class NativeAccountCoordinator(
             pendingImport = null
             publish(account, session, active)
             mounted.get()?.takeIf { it.account == account }?.clearRead()
+            true
         } catch (failure: Throwable) {
             if (failure is NativeOwnerHistoryCoordinator.Uncertain) uncertainHistoryAccounts.add(account.id)
             candidate?.let { owned -> runCatching { retireUnpublished(account, owned) }.onFailure { failure.addSuppressed(it) } }
