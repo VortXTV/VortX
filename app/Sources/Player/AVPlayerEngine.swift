@@ -4414,10 +4414,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               owns(originalItem, loadToken: originalLoad) else { completion(.superseded); return nil }
         retireSubtitleAlignment(cause: .successor)
         externalSubtitleRequestRevision &+= 1
+        var permitsUse: @Sendable () -> Bool = { true }
+        if let localSource { permitsUse = localSource.permitsUse }
         let request = AutomaticSubtitleRequest(generation: subtitleAlignmentGeneration,
             requestRevision: externalSubtitleRequestRevision, item: originalItem, load: originalLoad,
             itemGeneration: itemGeneration, mountIdentity: playbackMountIdentity, owner: owner,
-            permitsUse: localSource?.permitsUse ?? { true })
+            permitsUse: permitsUse)
         automaticSubtitleRequest = request
         // Capture while the real native row is selected. Our subsequent raw mount is expected to
         // deselect it. Off, HLS/remux, protected/nonlocal and unsupported text stay ordinary selection.

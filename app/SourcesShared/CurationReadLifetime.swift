@@ -8,8 +8,8 @@ import Combine
     private(set) var artworkLifetime = CurationArtworkLifetime(active: false)
     private(set) var profileID: UUID?
     private var authority: CurationReadAuthority?
-    private var originalImportRegisters: [String: VortxJSON] = [:]
-    private var pinnedImportRegisters: [String: VortxJSON] = [:]
+    private var originalImportRegisters: [String: VortxRawHostRegister] = [:]
+    private var pinnedImportRegisters: [String: VortxRawHostRegister] = [:]
     private let captureAuthority: @MainActor () throws -> CurationReadAuthority
     private let retireCaches: @MainActor (UUID) -> Void
     private var subscriptions = Set<AnyCancellable>()

@@ -1143,7 +1143,9 @@ struct TVPlayerView: View {
         .id(firstFrameCoverMedia)
     }
 
-    var body: some View {
+    /// The player surface and its lifecycle observers. The rest of the modifier chain continues in
+    /// `body`; splitting the chain keeps each half within the type checker's limits.
+    private var playerSceneWithLifecycle: some View {
         ZStack(alignment: .bottom) {
             Color.black.ignoresSafeArea()
 
@@ -1377,6 +1379,12 @@ struct TVPlayerView: View {
             // advance clears hasStartedPlaying, which is exactly what this one requires).
             revalidateMountOnForeground(suspendedFor: suspended, playHeadAtSuspension: playHead)
         }
+    }
+
+    /// Watch Party and idle-timer observers on top of the player scene. Kept apart from `body` so
+    /// each part of the modifier chain stays within the type checker's limits.
+    private var playerSceneWithSessionObservers: some View {
+        playerSceneWithLifecycle
         // Sources keep arriving after playback starts (add-ons answer at their own pace), and the Sources /
         // Quality buttons must appear when they do. `streamsEpoch` bumps ONLY when the engine's ready-stream
         // set actually changed, so this is the exact, cheap edge the cached counts need: no per-body-pass walk,
@@ -1406,6 +1414,10 @@ struct TVPlayerView: View {
         .onChange(of: reconnecting) { _, active in if active { invalidateWatchParty() } }
         .onChange(of: playbackDeadlineClock.isPaused) { refreshPlaybackIdleTimer() }
         .onChange(of: loadFailed) { if loadFailed { invalidateWatchParty() }; refreshPlaybackIdleTimer() }
+    }
+
+    var body: some View {
+        playerSceneWithSessionObservers
         .onChange(of: curDebridRef?.nativeUsenetLease) { oldLease, newLease in
             // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
             if oldLease != newLease { oldLease?.close() }
@@ -1436,61 +1448,7 @@ struct TVPlayerView: View {
             episodeInventoryUnavailable = false
             hydrateDirectResumeSeriesInventory()
         }
-        .onDisappear {
-            invalidateWatchParty()
-            embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
-            embeddedContributionTask?.cancel(); embeddedContributionTask = nil
-            invalidateSubtitleAlignmentPresentation()
-            TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
-            cancelEmptySourceRecovery()
-            let integrityOwner = exitAcceptedLoadToken ?? coordinator.player?.activeLoadToken
-            let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: integrityOwner)
-            core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
-            LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
-            invalidateNextEpisodePreparation(reason: "player view disappeared")
-            invalidateLocalTrickplayCapture()
-            cancelAssetSanityObservationDeadline()
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); clearPostFrameResumeSeekWatchdog(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
-            cancelTerminalFinalityRefresh()
-            cancelDirectResumeInventoryRefresh()
-            invalidateEpisodeResolution()
-            // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
-            // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
-            // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
-            if assetSanityAccepted {
-                scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
-            }
-            NowPlayingCenter.clear()   // #157: drop the system Now Playing card + its transport targets on close
-            if terminalRewindGate.permitsExitProgressFlush {
-                saveProgress(
-                    at: currentTime, thenSyncEngine: true, acceptedOwner: integrityOwner
-                )   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
-            }
-            // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
-            // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
-            // the viewer actually was. saveProgress(at:) just above already cleared the floor if playback passed it.
-            // Attribution gate (binge-desync fix): only write to the engine Player when it is loaded for the
-            // episode curMeta names. After a binge advance whose engine re-point could not be confirmed, this
-            // skips the wrong-episode flush; the correct-identity account write (saveProgress above) still lands.
-            if terminalRewindGate.permitsExitProgressFlush,
-               assetSanityAccepted, !isCurrentLiveStream,
-               enginePlayerVideoId == curMeta?.videoId,
-               suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
-                core.reportProgress(timeSeconds: currentTime, durationSeconds: duration,
-                                    target: playbackMutationTarget)   // flush final position (never for live)
-            }
-            exitAcceptedLoadToken = nil
-            // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
-            // path that mints a fresh PlaybackRequest id rebuilds the player → onDisappear → would
-            // destroy an engine that's about to be reused. (In-player source picks go through switchStream
-            // in place and never rebuild, but tearing the engine down on every disappear is still wrong.)
-            // Teardown happens only on genuine exits (see leavePlayback()), which onClose routes through.
-            // App-backgrounding is deliberately NOT a teardown trigger: tvOS suspends the app AND the
-            // embedded server together, the same player stays mounted, and returning to .active resumes
-            // on the same engine - closing it on .background would kill background-resume without
-            // preventing any leak (an app the system kills while suspended takes the server, and every
-            // engine with it, down too). In-session leaks are covered by the switch / advance / exit paths.
-        }
+        .onDisappear { handlePlayerDisappear() }
     }
 
     // MARK: - Video surface (engine-routed under the same chrome)
@@ -1957,6 +1915,73 @@ struct TVPlayerView: View {
         handleProperty(MPVProperty.timePos,
                        PlayerTimePositionEvent(seconds: assetSanityDeferredStartPosition, loadToken: loadToken),
                        loadToken: loadToken)
+    }
+
+    /// Player teardown on disappear. Kept out of the view's modifier chain so the type checker
+    /// checks it on its own instead of as part of one very large expression.
+    private func handlePlayerDisappear() {
+        invalidateWatchParty()
+        embeddedContributionLoad?.retire(); embeddedContributionLoad = nil
+        embeddedContributionTask?.cancel(); embeddedContributionTask = nil
+        invalidateSubtitleAlignmentPresentation()
+        TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
+        cancelEmptySourceRecovery()
+        let integrityOwner = exitAcceptedLoadToken ?? coordinator.player?.activeLoadToken
+        let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: integrityOwner)
+        core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
+        LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
+        invalidateNextEpisodePreparation(reason: "player view disappeared")
+        invalidateLocalTrickplayCapture()
+        cancelAssetSanityObservationDeadline()
+        hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); clearPostFrameResumeSeekWatchdog(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
+        cancelTerminalFinalityRefresh()
+        cancelDirectResumeInventoryRefresh()
+        invalidateEpisodeResolution()
+        // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
+        // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
+        // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
+        if assetSanityAccepted {
+            scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
+        }
+        NowPlayingCenter.clear()   // #157: drop the system Now Playing card + its transport targets on close
+        flushExitProgress(integrityOwner: integrityOwner, assetSanityAccepted: assetSanityAccepted)
+        exitAcceptedLoadToken = nil
+        // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
+        // path that mints a fresh PlaybackRequest id rebuilds the player → onDisappear → would
+        // destroy an engine that's about to be reused. (In-player source picks go through switchStream
+        // in place and never rebuild, but tearing the engine down on every disappear is still wrong.)
+        // Teardown happens only on genuine exits (see leavePlayback()), which onClose routes through.
+        // App-backgrounding is deliberately NOT a teardown trigger: tvOS suspends the app AND the
+        // embedded server together, the same player stays mounted, and returning to .active resumes
+        // on the same engine - closing it on .background would kill background-resume without
+        // preventing any leak (an app the system kills while suspended takes the server, and every
+        // engine with it, down too). In-session leaks are covered by the switch / advance / exit paths.
+    }
+
+    /// The exit progress flush, kept out of the large onDisappear closure so the type checker
+    /// checks it on its own.
+    private func flushExitProgress(integrityOwner: PlayerLoadToken?, assetSanityAccepted: Bool) {
+        if terminalRewindGate.permitsExitProgressFlush {
+            saveProgress(
+                at: currentTime, thenSyncEngine: true, acceptedOwner: integrityOwner
+            )   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
+        }
+        // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
+        // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
+        // the viewer actually was. saveProgress(at:) just above already cleared the floor if playback passed it.
+        // Attribution gate (binge-desync fix): only write to the engine Player when it is loaded for the
+        // episode curMeta names. After a binge advance whose engine re-point could not be confirmed, this
+        // skips the wrong-episode flush; the correct-identity account write (saveProgress above) still lands.
+        let position: Double = currentTime
+        var clearsResumeFloor = true
+        if let floor: Double = suppressedResumeFloor { clearsResumeFloor = position >= floor }
+        let playingVideoID: String? = curMeta?.videoId
+        let engineOwnsEpisode: Bool = enginePlayerVideoId == playingVideoID
+        if terminalRewindGate.permitsExitProgressFlush,
+           assetSanityAccepted, !isCurrentLiveStream, engineOwnsEpisode, clearsResumeFloor {
+            core.reportProgress(timeSeconds: currentTime, durationSeconds: duration,
+                                target: playbackMutationTarget)   // flush final position (never for live)
+        }
     }
 
     private func handleRejectedEpisodicAsset(loadToken: PlayerLoadToken) {

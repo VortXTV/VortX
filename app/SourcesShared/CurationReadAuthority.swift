@@ -17,9 +17,9 @@ enum CurationReadContextDelivery {
 /// against this production owner without a live account, native install or credential-store write.
 @MainActor struct CurationReadAuthority {
     let profileID: UUID
-    let importRegisters: [String: VortxJSON]
+    let importRegisters: [String: VortxRawHostRegister]
     let isCurrent: @MainActor () -> Bool
-    let currentImportRegisters: @MainActor () throws -> [String: VortxJSON]
+    let currentImportRegisters: @MainActor () throws -> [String: VortxRawHostRegister]
     let retire: @MainActor () -> Void
 
     static func capture() throws -> Self {
@@ -56,8 +56,8 @@ enum CurationReadContextDelivery {
 /// Select only registers from the original snapshot. Full raw evidence includes the binding map,
 /// deletion value and register metadata, not only the imported collection-document fingerprint.
 enum CurationImportReadEvidence {
-    static func binding(fingerprints: [String: String], original: [String: VortxJSON],
-                        retaining pinned: [String: VortxJSON]) throws -> [String: VortxJSON] {
+    static func binding(fingerprints: [String: String], original: [String: VortxRawHostRegister],
+                        retaining pinned: [String: VortxRawHostRegister]) throws -> [String: VortxRawHostRegister] {
         var result = pinned
         for (importID, fingerprint) in fingerprints {
             guard let namespace = UUID(uuidString: importID), namespace.uuidString.lowercased() == importID else {
@@ -67,7 +67,7 @@ enum CurationImportReadEvidence {
             guard let register = original[field] else { throw CurationFailure.staleContext }
             let saved = try XperienceSavedNamespace.read(field: field, register: register)
             guard saved.document.fingerprint == fingerprint else { throw CurationFailure.staleRevision }
-            if let previous = result[field], !VortxNativeHostFieldEvidence.json(previous, register) {
+            if let previous = result[field], !VortxRawHostRegister.same(previous, register) {
                 throw CurationFailure.staleRevision
             }
             result[field] = register
@@ -75,9 +75,9 @@ enum CurationImportReadEvidence {
         return result
     }
 
-    static func matches(pinned: [String: VortxJSON], current: [String: VortxJSON]) -> Bool {
+    static func matches(pinned: [String: VortxRawHostRegister], current: [String: VortxRawHostRegister]) -> Bool {
         pinned.allSatisfy { field, original in
-            VortxNativeHostFieldEvidence.json(original, current[field])
+            VortxRawHostRegister.same(original, current[field])
         }
     }
 }

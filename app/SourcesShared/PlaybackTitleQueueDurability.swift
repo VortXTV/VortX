@@ -589,7 +589,7 @@ final class PlaybackTitleQueueDurability {
             try withDirectory { directory in
                 let lock = try acquireLock(key, in: directory)
                 defer {
-                    while Darwin.flock(lock.fd, LOCK_UN) != 0 && errno == EINTR {}
+                    while systemFileLock(lock.fd, LOCK_UN) != 0 && errno == EINTR {}
                     _ = Darwin.close(lock.fd)
                 }
                 try verifyDirectory(directory)
@@ -694,7 +694,7 @@ final class PlaybackTitleQueueDurability {
 
             var result: Int32
             repeat {
-                result = Darwin.flock(fd, LOCK_EX | LOCK_NB)
+                result = systemFileLock(fd, LOCK_EX | LOCK_NB)
             } while result != 0 && errno == EINTR
             guard result == 0 else {
                 if errno == EWOULDBLOCK || errno == EAGAIN {
@@ -708,7 +708,7 @@ final class PlaybackTitleQueueDurability {
                 try sync(fd, failure: .unavailableDirectory)
                 try sync(directory.queueFD, failure: .unavailableDirectory)
             } catch {
-                while Darwin.flock(fd, LOCK_UN) != 0 && errno == EINTR {}
+                while systemFileLock(fd, LOCK_UN) != 0 && errno == EINTR {}
                 throw error
             }
             keepOpen = true
@@ -1040,3 +1040,8 @@ final class PlaybackTitleQueueDurability {
     }
 
 }
+
+/// libc flock(2). Current SDKs resolve `Darwin.flock` to the `struct flock` record even with a
+/// contextual function type, so bind the C symbol directly.
+@_silgen_name("flock")
+private func systemFileLock(_ descriptor: Int32, _ operation: Int32) -> Int32
