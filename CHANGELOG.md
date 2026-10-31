@@ -11,7 +11,7 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.5.6 beta 9 - Accounts that always open, Cast and saved playlists
 
-Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 beta 7 packages while its account-sync changes finish testing. This beta brings the Apple apps everything since beta 7 (the beta 8 number was not published): accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists and Library genre filters, plus the fixes below.
+Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 beta 7 packages while its account-sync changes finish testing. This beta brings the Apple apps everything since beta 7 (the beta 8 number was not published): accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists and Library genre filters, a new AetherEngine player to try on Apple TV, plus the fixes below.
 
 ### Fixed
 
@@ -32,6 +32,7 @@ Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 bet
 - **Add-on subtitles in the built-in players.** Subtitles from your installed subtitle add-ons load in the built-in players, with automatic timing alignment where the video allows it.
 - **Saved playlists.** Create named playlists in your profile, saved with your account, and play them later. Each profile's playback queue is also kept between launches.
 - **Library genre filters.**
+- **AetherEngine player on Apple TV, to try.** A second player for VortX and VortX Lite that uses Apple TV's own video decoding and display. Choose it under **Settings > Playback > Player engine**, or for a single source from its player menu. Auto stays the default. If AetherEngine cannot play a source, VortX Player takes over on the same source from the same moment. Picture-based (PGS) subtitles are not drawn with it yet.
 
 Watch Party is built into this beta but stays switched off until its account service is ready.
 

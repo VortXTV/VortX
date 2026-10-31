@@ -7,8 +7,9 @@
 # to launch with "Library not loaded". The list is the dependency closure of VortXAetherKit
 # (otool -L); keep it in step with the outputFiles of the build phases in app/project.yml.
 #
-# Like Xcode's own embed step, headers and modules are dropped. Unsigned builds keep the vendor's
-# ad-hoc signatures for the sideload signer to replace; signed builds re-sign with the app's identity.
+# Like Xcode's own embed step, headers and modules are dropped. Signed builds re-sign with the app's
+# identity; unsigned builds drop the vendor's _CodeSignature folder, as Xcode's embed does for the MPVKit
+# frameworks, because a release IPA must carry no signature folders for the sideload signer to replace.
 set -euo pipefail
 
 frameworks=(AetherLibavcodec AetherLibavfilter AetherLibavformat AetherLibavutil AetherLibdav1d
@@ -24,5 +25,7 @@ for name in "${frameworks[@]}"; do
   if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
     codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --preserve-metadata=identifier \
       "${destination}/${name}.framework"
+  else
+    rm -rf "${destination}/${name}.framework/_CodeSignature"
   fi
 done

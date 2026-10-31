@@ -489,6 +489,12 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # License texts for AetherEngine and its FFmpeg (AetherLib*), LibDovi and SMBClient, which ship inside
+      # this app. Their licenses require distributing these texts with the binaries; folder reference so
+      # they land under `licenses/aether-engine/` in the bundle.
+      - path: Resources/licenses
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -678,6 +684,12 @@ targets:
       # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
       - path: Resources/jsproviders
         optional: true
+        type: folder
+        buildPhase: resources
+      # License texts for AetherEngine and its FFmpeg (AetherLib*), LibDovi and SMBClient, which ship inside
+      # this app. Their licenses require distributing these texts with the binaries; folder reference so
+      # they land under `licenses/aether-engine/` in the bundle.
+      - path: Resources/licenses
         type: folder
         buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
