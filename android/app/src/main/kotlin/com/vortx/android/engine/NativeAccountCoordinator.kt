@@ -1771,13 +1771,19 @@ internal class NativeAccountCoordinator(
                 mounted.get() === current && body()
             }
         } }
-        return current.session.withCompleteAccountExportRead(current.readIdentity() != null) { read ->
+        // A cloud copy with no native register yet (an older or imported account, or one never synced
+        // natively) has no native source to conserve or retain a read for. Its first native upload takes
+        // the caller's legacy bootstrap merge (owned-field replacement over the original GET bytes), as
+        // before the generic composer existed; the composer needs a source `nativeSync` for its scope.
+        val legacySource = NativeOwnerHistoryAccount(originalRaw).raw("nativeSync") == null
+        return current.session.withCompleteAccountExportRead(current.readIdentity() != null || legacySource) { read ->
             var result: Result<T>? = null
             check(originalAdmission {
                 result = runCatching {
                     val exported = exportDocument(current, read)
                     val mount = NativeAccountMountToken(current, current.session.updates.value)
                     if (exported.rawAccount != null) action(exported, mount, null, null, currency) // Separate typed path.
+                    else if (legacySource) action(exported, mount, null, null, currency) // Legacy bootstrap merge.
                     else {
                         val retained = checkNotNull(current.readIdentity()) { "Authenticated generic read unavailable" }
                         check(retained.sameObservation(source)) { "Original authenticated upload read changed" }
