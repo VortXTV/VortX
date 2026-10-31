@@ -156,7 +156,7 @@ class NativeAccountSyncTest {
             assertEquals(doc.getString("settings"), result.getString("settings")); assertEquals(2, gateway.applied)
             assertTrue(gateway.appliedReads.isNotEmpty())
             val captured = gateway.appliedReads.first()
-            assertEquals(SessionOwnerSnapshot.Account(account.id, 0L), captured.account)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH), captured.account)
             assertEquals(100L, captured.baseRevision)
             assertTrue(captured.operationGeneration >= 0L)
             assertArrayEquals(doc.toString().toByteArray(Charsets.UTF_8), captured.raw)
