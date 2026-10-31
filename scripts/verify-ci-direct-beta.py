@@ -33,6 +33,8 @@ SUMS = "SHA256SUMS.txt"
 ENGINE = "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"
 NATIVE_BETA7_TAG = "v0.5.6-beta.7"
 NATIVE_BETA7_ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
+# Beta 8 is built by the same reviewed native-only workflows from the same engine pin.
+NATIVE_TAGS = (NATIVE_BETA7_TAG, "v0.5.6-beta.8")
 HISTORICAL_BETA2_ENGINE = "af29b22e4c45740a1f5b6cb415b81f8430f55b9f"
 STREMIO = "31c66611822043e089f5819ad232a5df93975873"
 BUNDLETOOL_SHA = "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
@@ -248,7 +250,7 @@ def tag_version(tag):
 
 def expected_engine(tag):
     # Exact reviewed tag interpretation, never a caller-supplied/fallback engine pin.
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         return NATIVE_BETA7_ENGINE
     if tag == "v0.5.6-beta.2":
         return HISTORICAL_BETA2_ENGINE
@@ -308,10 +310,10 @@ def source_versions(project, gradle, version, tag):
     require(tag_version(tag) == version, "source version differs from the exact beta tag")
     versions = re.findall(r'^\s*MARKETING_VERSION:\s*"?([0-9.]+)"?\s*$', project, re.M)
     builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
-    expected_pairs = 5 if tag == NATIVE_BETA7_TAG else 6
+    expected_pairs = 5 if tag in NATIVE_TAGS else 6
     require(len(versions) == len(builds) == expected_pairs and set(versions) == {version} and len(set(builds)) == 1,
             "Apple target version/build pairs must agree with the exact beta contract")
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         sections = project.split("\ntargets:\n")
         require(len(sections) == 2, "native beta7 requires the actual project target section")
         targets = sections[1].split("\nschemes:\n", 1)[0]
@@ -338,7 +340,7 @@ def job_contract(lane, tag):
         "Upload the immutable feed handoff", "Constrain legacy comparison to artifact-only builds",
         "Constrain Full tvOS test mode to artifact-only builds", "Package Full tvOS test IPA",
     )
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         required = NATIVE_BETA7_APPLE_STEPS if lane == "apple" else NATIVE_BETA7_ANDROID_STEPS
         if lane == "apple":
             skipped = tuple("Reject removed legacy comparison builds"
@@ -569,7 +571,7 @@ def validate_android_evidence(lines, pointer, tag, source, version, build):
         ("workflow run attempt", str(pointer["attempt"])),
         ("Android versionCode", build), ("Android versionName", version),
     ]
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         require(not any(line.startswith("legacy Stremio source commit") for line in lines),
                 "native beta7 evidence must not record a legacy engine source")
     else:

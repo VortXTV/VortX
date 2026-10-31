@@ -7,6 +7,7 @@ import Foundation
 enum WhatsNew {
     static let version = "0.5.6"
     static let highlights: [String] = [
+        "Beta 8: accounts open even when one saved value is unreadable, sign-ins refresh themselves, Google Cast on iPhone, iPad and Android, add-on subtitles in the built-in players, and saved playlists.",
         "A faster start: VortX opens your account from this device straight away and catches up with the cloud right after.",
         "Much less background uploading while you watch, and Top Shelf that follows Continue Watching after re-signing.",
         "Mac playback resumes properly after a pause, Skip Intro and Skip Credits stay visible above the controls, and the controls are translucent.",
