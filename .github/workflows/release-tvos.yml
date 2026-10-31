@@ -829,7 +829,9 @@ jobs:
       # A device Release product cannot be installed into CoreSimulator. Build the same current
       # source as a Release simulator product and require it to remain alive after first launch.
       - name: Smoke-test tvOS launch in a simulator (fail closed)
-        timeout-minutes: 20
+        # AetherEngine adds two Swift packages and its FFmpeg to this cold simulator build; 20 minutes was
+        # spent on package resolution plus compilation before the launch could run.
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           BUNDLE_ID="com.stremiox.tv"
