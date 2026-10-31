@@ -10285,13 +10285,19 @@ struct PlayerScreen: View {
         subtitlePoolRequests.invalidate()
         subtitleLoadingURL = sub.url
         refreshAddonSubtitleRows()
+        // Assigned, not a ternary: Xcode 26 infers `automatic ? nil : { ... }` as a non-isolated closure and
+        // rejects its conversion to the main-actor parameter.
+        var failure: (@MainActor () -> Void)?
+        if !automatic {
+            failure = {
+                self.subtitleAlignmentNotice = PlayerExternalSubtitleSelectionResult.failed.failureMessage
+                self.subtitleLoadFailed = true
+            }
+        }
         startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
             loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
             videoID: video, credential: credential, applicationEpoch: applicationEpoch,
-            failure: automatic ? nil : {
-                self.subtitleAlignmentNotice = PlayerExternalSubtitleSelectionResult.failed.failureMessage
-                self.subtitleLoadFailed = true
-            }) { source, cancellation in
+            failure: failure) { source, cancellation in
                 let request = player.selectLocalExternalSubtitleAutomatically(source,
                     title: sub.displayTitle, lang: sub.lang, owner: owner,
                     expectedLoad: load, expectedRevision: revision) { result in

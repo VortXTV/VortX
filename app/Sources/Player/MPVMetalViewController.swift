@@ -4946,8 +4946,10 @@ final class MPVMetalViewController: PlatformViewController {
         localSource: PlayerLocalSubtitleSource?,
         completion: @escaping (PlayerExternalSubtitleSelectionResult) -> Void
     ) -> UInt64? {
-        let original = beginOriginalSubtitleAlignment(context: context, load: load,
-            permitsUse: localSource?.permitsUse ?? { true })
+        // Typed before use: Xcode 26 infers a bare `?? { true }` as non-Sendable and rejects the conversion.
+        var permitsUse: @Sendable () -> Bool = { true }
+        if let localSource { permitsUse = localSource.permitsUse }
+        let original = beginOriginalSubtitleAlignment(context: context, load: load, permitsUse: permitsUse)
         let finish = MPVMainCompletion(completion, subtitleLifetime: original.lifetime)
         DispatchQueue.global(qos: .utility).async { [weak self, context] in
             let consume: @Sendable (AutomaticSubtitleSnapshot?) -> Void = { [weak self, context] value in

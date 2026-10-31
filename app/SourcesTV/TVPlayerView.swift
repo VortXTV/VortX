@@ -8593,12 +8593,18 @@ struct TVPlayerView: View {
         if !automatic { suppressRapidBufferingRecovery(reason: "user external subtitle") }
         subtitleLoadingURL = sub.url
         refreshAddonSubtitleRows()
+        // Assigned, not a ternary: Xcode 26 infers `automatic ? nil : { ... }` as a non-isolated closure and
+        // rejects its conversion to the main-actor parameter.
+        var failure: (@MainActor () -> Void)?
+        if !automatic {
+            failure = {
+                self.showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
+            }
+        }
         startAddonSubtitlePreparation(sub, presentation: presentation, player: player, load: load,
             loadLifetime: loadLifetime, revision: revision, target: target, owner: owner,
             videoID: video, credential: credential, applicationEpoch: applicationEpoch,
-            failure: automatic ? nil : {
-                self.showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
-            }) { source, cancellation in
+            failure: failure) { source, cancellation in
                 let request = player.selectLocalExternalSubtitleAutomatically(source,
                     title: sub.displayTitle, lang: sub.lang, owner: owner,
                     expectedLoad: load, expectedRevision: revision) { result in
