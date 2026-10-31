@@ -79,6 +79,11 @@ extension FixtureTask where Success == Never, Failure == Never {
 
     init(historicallyApplied: Bool = false) { hasAppliedAccountDoc = historicallyApplied }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
+    /// The session the account service turned away; mirrors VortXSyncManager.accountReconnectRequired.
+    var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        accountReconnectFailureCapture == capture && isCurrent(capture)
+    }
     func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { pending.contains(capture) }
     func ensureNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool {
         ensureStarts[capture, default: 0] += 1
