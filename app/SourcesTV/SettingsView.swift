@@ -615,7 +615,7 @@ struct SettingsView: View {
             }
             Text(diskCacheFooter)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
+            choiceRow(String(localized: "Player engine"), PlayerEngineRouter.offeredOverrides.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Dolby Vision for MKV (Beta)"), [("0", "Off"), ("1", "On")],

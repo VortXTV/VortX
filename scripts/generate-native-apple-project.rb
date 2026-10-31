@@ -33,7 +33,8 @@ abort 'MPVKit Package.swift is missing' unless File.file?(File.join(mpvkit, 'Pac
 spec = YAML.safe_load(File.read(File.join(app, 'project.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
 NativeAppleSwift6Policy.validate!(spec)
 native_targets = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
-retained_targets = native_targets + ['VortXTopShelf']
+# VortXAetherKit is the tvOS AetherEngine player framework, embedded in VortXTV (see project.yml).
+retained_targets = native_targets + ['VortXTopShelf', 'VortXAetherKit']
 abort 'native release target roster changed; review the generator' unless (retained_targets - spec.fetch('targets').keys).empty?
 spec['targets'].select! { |name, _| retained_targets.include?(name) }
 spec.fetch('schemes').select! { |name, _| native_targets.include?(name) }

@@ -1453,11 +1453,39 @@ struct TVPlayerView: View {
 
     // MARK: - Video surface (engine-routed under the same chrome)
 
+    /// The viewer chose AetherEngine for this playback, in Settings or the per-source menu.
+    private var useAetherEngine: Bool {
+        #if VORTX_AETHER_ENGINE
+        if forceMPV || avToMPVHandoff != nil || avToMPVHandoffBlocked || !PlayerEngineRouter.aetherEngineAvailable {
+            return false
+        }
+        return (initialEnginePreference ?? PlayerEngineRouter.currentOverride) == .aether
+        #else
+        return false
+        #endif
+    }
+
+    /// AetherEngine gets the same playback inputs as the libmpv surface; it plays loopback and remote HTTP alike.
+    @ViewBuilder private var aetherSurface: some View {
+        #if VORTX_AETHER_ENGINE
+        AetherEngineView(coordinator: coordinator)
+            .play(mpvSurfacePlayback.url, headers: mpvSurfacePlayback.headers,
+                  audioSidecar: mpvSurfacePlayback.audioSidecar, isDolbyVision: mpvSurfacePlayback.isDolbyVision)
+            .live(mpvSurfacePlayback.live)
+            .initiallyPaused(enginePauseForSurface(engine: .libmpv))
+            .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
+            .ignoresSafeArea()
+        #else
+        Color.black.ignoresSafeArea()
+        #endif
+    }
+
     /// Whether to mount the AVFoundation engine instead of libmpv for this stream (#76). The decision comes
     /// from `engineLatch` (seeded ONCE in onAppear); the 1-2 pre-onAppear renders fall through the nil latch
     /// to the same computed value, so the seed cannot swap the mounted surface. The demote lane
     /// (`avEngineFailed`) stays OUTSIDE the latch so an AVPlayer failure still falls back to libmpv in place.
     private var useAVPlayerEngine: Bool {
+        if useAetherEngine { return false }
         if forceMPV || avEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
         if let forced = manualEngineAVPlayer { return forced }
         if initialEnginePreference == .mpv { return false }
@@ -1581,6 +1609,8 @@ struct TVPlayerView: View {
     @ViewBuilder private var playerSurface: some View {
         if avToMPVHandoff != nil || avToMPVHandoffBlocked {
             Color.black.ignoresSafeArea()
+        } else if useAetherEngine {
+            aetherSurface
         } else if useAVPlayerEngine {
             if let resumeOrigin = initialAVResumeOrigin {
                 AVPlayerEngineView(coordinator: coordinator)

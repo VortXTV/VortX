@@ -4787,6 +4787,9 @@ struct CoreStreamList: View {
         switch launchEnginePreference {
         case .mpv: return "VortX Player"
         case .avfoundation: return "AVPlayer when compatible"
+        #if VORTX_AETHER_ENGINE
+        case .aether: return "AetherEngine"
+        #endif
         case .auto, .none: return "Player"
         }
     }
@@ -4849,6 +4852,13 @@ struct CoreStreamList: View {
                 play(stream, enginePreference: .avfoundation, sourceOrigin: origin)
             }
         }
+        #if VORTX_AETHER_ENGINE
+        if !stream.isYouTubeTrailer, PlayerEngineRouter.aetherEngineAvailable {
+            Button("AetherEngine (testing)") {
+                play(stream, enginePreference: .aether, sourceOrigin: origin)
+            }
+        }
+        #endif
         if let url = playableURL(for: stream),
            SourcePlayerChoicePolicy.canHandOffExternally(
                url: url,

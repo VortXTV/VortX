@@ -24,19 +24,47 @@ enum PlayerEngineRouter {
     /// remote URL (advanced / testing).
     enum Override: String, CaseIterable {
         case auto, mpv, avfoundation
+        #if VORTX_AETHER_ENGINE
+        /// AetherEngine, offered to everyone on Apple TV for testing. Only the Apple TV apps (VortX and VortX Lite) link it.
+        case aether
+        #endif
         var label: String {
             switch self {
             case .auto:         return "Auto"
             case .mpv:          return "Always libmpv"
             case .avfoundation: return "Prefer AVPlayer (HLS / DV)"
+            #if VORTX_AETHER_ENGINE
+            case .aether:       return "AetherEngine (testing)"
+            #endif
             }
         }
     }
 
     static let overrideKey = "stremiox.playerEngine"
     static var currentOverride: Override {
-        Override(rawValue: UserDefaults.standard.string(forKey: overrideKey) ?? "") ?? .auto
+        let saved = Override(rawValue: UserDefaults.standard.string(forKey: overrideKey) ?? "") ?? .auto
+        #if VORTX_AETHER_ENGINE
+        if saved == .aether && !aetherEngineAvailable { return .auto }
+        #endif
+        return saved
     }
+
+    /// The choices Settings offers: every engine this build links that the fleet has not switched off.
+    static var offeredOverrides: [Override] {
+        #if VORTX_AETHER_ENGINE
+        return Override.allCases.filter { $0 != .aether || aetherEngineAvailable }
+        #else
+        return Override.allCases
+        #endif
+    }
+
+    #if VORTX_AETHER_ENGINE
+    /// RemoteConfig `features.aetherEngine`, the emergency kill switch for the AetherEngine choice. Baked ON;
+    /// when the fleet turns it OFF the choice disappears and a saved pick plays on Auto.
+    static var aetherEngineAvailable: Bool {
+        RemoteConfig.snapshot.isFeatureOn("aetherEngine", default: RemoteConfigDefaults.featureAetherEngine)
+    }
+    #endif
 
     /// Opt-in flag for the DV-for-MKV in-process streaming remux (Phase 1). OFF by default: when disabled, DV
     /// in an MKV stays on libmpv (tone-mapped HDR10) exactly as before. When enabled, a Dolby Vision MKV from
@@ -155,6 +183,12 @@ enum PlayerEngineRouter {
         // function runs per render, so the guardrail message for that case (DiagnosticsLog + one-shot
         // in-player notice) lives in the chrome at play start (TVPlayerView.onAppear), not here.
         switch override {
+        #if VORTX_AETHER_ENGINE
+        // The AetherEngine surface is chosen by the tvOS chrome before routing; behind it, routing must
+        // never pick AVPlayer, so it reads as libmpv here.
+        case .aether:
+            return .mpv
+        #endif
         case .mpv:
             return .mpv
         case .avfoundation:

@@ -72,7 +72,7 @@ NativeAppleSwift6Policy::ROSTERS.fetch('native').each do |target|
   end
 end
 generated_fixture = { 'rootObject' => 'project', 'objects' => objects }
-abort 'generated policy omits target configurations' unless NativeAppleSwift6Policy.validate_generated!(generated_fixture, 'native').length == 10
+abort 'generated policy omits target configurations' unless NativeAppleSwift6Policy.validate_generated!(generated_fixture, 'native').length == 12
 policy_checks += 1
 mutations = {
   'target Swift 5' => ->(pbx) { pbx['objects']['VortXMac-Release']['buildSettings']['SWIFT_VERSION'] = '5.0' },
@@ -139,10 +139,11 @@ begin
   NativeAppleSwift6Policy.validate!(spec)
   abort 'native generator changed shared Swift policy' unless spec.fetch('settings') == project_spec.fetch('settings')
   policy_checks += 1
-  expected = %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf]
+  apps = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
+  expected = apps + %w[VortXTopShelf VortXAetherKit]
   abort 'unexpected native target roster' unless spec.fetch('targets').keys.sort == expected.sort
-  abort 'web/diagnostic scheme survived native generation' unless spec.fetch('schemes').keys.sort == (expected - ['VortXTopShelf']).sort
-  expected[0...-1].each do |name|
+  abort 'web/diagnostic scheme survived native generation' unless spec.fetch('schemes').keys.sort == apps.sort
+  apps.each do |name|
     target = spec.fetch('targets').fetch(name)
     settings = target.fetch('settings').fetch('base')
     conditions = settings.fetch('SWIFT_ACTIVE_COMPILATION_CONDITIONS', '').split

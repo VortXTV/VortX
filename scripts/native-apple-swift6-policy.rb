@@ -9,8 +9,8 @@ module NativeAppleSwift6Policy
     'SWIFT_TREAT_WARNINGS_AS_ERRORS' => 'YES'
   }.freeze
   ROSTERS = {
-    'native' => %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf],
-    'main' => %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf CinemaUISmokeRenderer],
+    'native' => %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf VortXAetherKit],
+    'main' => %w[VortXiOSNative VortXMac VortXTV VortXTVLite VortXTopShelf VortXAetherKit CinemaUISmokeRenderer],
     'mac-smoke' => %w[CinemaUISmokeRenderer],
     'ios-smoke' => %w[CinemaUISmokeIOSRenderer]
   }.each_value(&:freeze).freeze

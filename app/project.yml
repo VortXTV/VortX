@@ -121,6 +121,13 @@ options:
     - zh-Hant
     - zu
 packages:
+  # AetherEngine (LGPL-3.0 with an App Store exception): FFmpeg demux, VideoToolbox decode and the system
+  # player for Dolby Vision / Atmos. Its FFmpeg ships as AetherLib* dynamic frameworks. It is linked ONLY into
+  # the VortXAetherKit framework below, never into an app executable: MPVKit's FFmpeg is static, and a static
+  # FFmpeg in the same link would answer the engine's av* calls (AetherEngine docs/api.md, "One FFmpeg").
+  AetherEngine:
+    url: https://github.com/superuser404notfound/AetherEngine
+    exactVersion: "7.53.0"
   GoogleCast:
     url: https://github.com/googlecast/google-cast-ios-sdk
     exactVersion: "4.8.6"
@@ -489,6 +496,9 @@ targets:
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
+      # The AetherEngine player lane (see VortXAetherKit). Embedded with its AetherLib* frameworks.
+      - target: VortXAetherKit
+        embed: true
       # The VortX engine ABI, SERVER-INCLUSIVE tvos-arm64 / tvos-arm64-simulator slices (kernel +
       # vortx_server_start/port/base_url/stop). Linked, not embedded, exactly like VortXiOSNative's iOS
       # slices; drives the in-process streaming server (SourcesShared/VortxNativeServer.swift).
@@ -504,6 +514,21 @@ targets:
       # VortX is the focused app on the Home screen.
       - target: VortXTopShelf
         embed: true
+    postBuildScripts:
+      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
+      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
+        name: Embed AetherEngine FFmpeg frameworks
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
     settings:
       base:
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
@@ -513,7 +538,7 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
         # The linked tvOS VortxEngine slices are SERVER-INCLUSIVE, so this target compiles the REAL
         # VortxNativeServer body (see the VortXiOSNative note).
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "281"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
@@ -570,6 +595,32 @@ targets:
         # Substituted into the extension's plist so its deep links carry the SAME scheme the host app
         # registers. Keep in step with VortXTV's VORTX_URL_SCHEME above.
         VORTX_URL_SCHEME: vortx
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+  # AetherEngine player lane for Apple TV. A dynamic framework so the engine's FFmpeg references resolve
+  # against its own AetherLib* frameworks at this framework's link, not against the app's static MPVKit
+  # FFmpeg. The app talks only to the plain-typed VortXAetherPlayer API in SourcesAetherKit.
+  VortXAetherKit:
+    type: framework
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: SourcesAetherKit
+    dependencies:
+      - package: AetherEngine
+        product: AetherEngine
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.aetherkit
+        # Library evolution keeps the internal AetherEngine import out of clients: without it the app's
+        # compile still loads AetherEngine's AetherLib* FFmpeg modules, which collide with MPVKit's.
+        BUILD_LIBRARY_FOR_DISTRIBUTION: "YES"
+        MARKETING_VERSION: "0.5.6"
+        CURRENT_PROJECT_VERSION: "281"
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_VERSION: "6.0"
+        DEFINES_MODULE: "YES"
+        SKIP_INSTALL: "YES"
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
   # Lite/debrid-only tvOS build. It compiles no streaming server (VORTX_NO_EMBEDDED_SERVER),
@@ -640,13 +691,31 @@ targets:
       - framework: Vendor/VortxEngine.xcframework
         embed: false
       - sdk: AVKit.framework
+      # The AetherEngine player lane, the same as VortXTV. A framework needs no extra provisioning.
+      - target: VortXAetherKit
+        embed: true
+    postBuildScripts:
+      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
+      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
+        name: Embed AetherEngine FFmpeg frameworks
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
     settings:
       base:
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "281"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
