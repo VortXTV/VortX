@@ -143,6 +143,19 @@ class Beta8AppleHotfixControls(unittest.TestCase):
         with self.assertRaises(ValueError): V.sdk_cache_proof(selected, [line.replace(V.ENGINE, "b" * 40) for line in hit])
         with self.assertRaises(ValueError): V.sdk_cache_proof(selected, missed)
 
+    def test_sdk_proof_ignores_a_neighbouring_cache_logged_in_the_same_second(self):
+        # Beta 10 candidate.1: "Cache cargo" ended in the second "Cache vortx-ffi xcframework" started, so its
+        # restore line fell inside the SDK step's whole-second window.
+        selected = steps(); key = "vortx-ffi-resource-host-v1-macOS-26.0-" + V.ENGINE + "-" + "a" * 64
+        cargo = "cargo-macOS-" + "c" * 64
+        missed = timed(selected[V.SDK_CACHE], ["Cache restored from key: " + cargo, "Cache not found for input keys: " + key])
+        self.assertEqual(V.sdk_cache_proof(selected, missed)["restore"], "miss-built-and-save-step-succeeded")
+        wrong_engine = timed(selected[V.SDK_CACHE], ["Cache restored from key: " + cargo,
+            "Cache not found for input keys: " + key.replace(V.ENGINE, "b" * 40)])
+        with self.assertRaises(ValueError): V.sdk_cache_proof(selected, wrong_engine)
+        sdk_restore_on_miss = timed(selected[V.SDK_CACHE], ["Cache restored from key: " + key, "Cache not found for input keys: " + key])
+        with self.assertRaises(ValueError): V.sdk_cache_proof(selected, sdk_restore_on_miss)
+
     def test_archive_requires_original_digest_exact_flat_roster(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); archive = root / "artifact.zip"

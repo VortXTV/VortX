@@ -34,8 +34,9 @@ SUMS = "SHA256SUMS.txt"
 # this contract rejected (six Apple version pairs once VortXAetherKit joined); neither is published.
 # The same Apple scope, with AetherEngine, ships as beta 10.
 TAG = "v0.5.6-beta.10"
-# Beta 10 candidate.1 is the accepted build source (the Beta 9 candidates are superseded).
-BUILD_TAG = "v0.5.6-beta.10-candidate.1"
+# Beta 10 candidate.1 was rejected here (a neighbouring cargo cache line was read as an SDK restore);
+# candidate.2 is the accepted build source.
+BUILD_TAG = "v0.5.6-beta.10-candidate.2"
 VERSION = "0.5.6"
 BUILD = "281"
 ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
@@ -424,9 +425,14 @@ def sdk_cache_proof(steps, lines):
             "native SDK restore step did not succeed")
     bodies = step_log_bodies(lines, steps[SDK_CACHE])
     key_pattern = r"vortx-ffi-resource-host-v1-macOS-[A-Za-z0-9._-]{1,200}-" + ENGINE + r"-[0-9a-f]{64}"
-    missed = [body.removeprefix("Cache not found for input keys: ") for body in bodies if body.startswith("Cache not found for input keys: ")]
-    hit = [body.removeprefix("Cache hit for: ") for body in bodies if body.startswith("Cache hit for: ")]
-    restored = [body.removeprefix("Cache restored from key: ") for body in bodies if body.startswith("Cache restored from key: ")]
+    # API step times have whole-second precision, so a neighbouring cache step (cargo) can log within this
+    # step's window. Only this SDK component's own keys are evidence; a wrong-engine SDK key still fails below.
+    def sdk_values(marker):
+        values = [body.removeprefix(marker) for body in bodies if body.startswith(marker)]
+        return [value for value in values if value.startswith("vortx-ffi-resource-host-v1-")]
+    missed = sdk_values("Cache not found for input keys: ")
+    hit = sdk_values("Cache hit for: ")
+    restored = sdk_values("Cache restored from key: ")
     if hit:
         require(len(hit) == 1 and re.fullmatch(key_pattern, hit[0]) and restored == hit and not missed and
                 steps[SDK_BUILD]["conclusion"] == steps[SDK_SAVE]["conclusion"] == "skipped",
