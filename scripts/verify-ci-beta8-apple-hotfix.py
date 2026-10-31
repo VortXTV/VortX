@@ -30,9 +30,11 @@ REPO = "VortXTV/VortX"
 MARKER = "<!-- vortx-distribution: hosted-direct-beta -->"
 PROVENANCE = "VortX-Hosted-Direct-Beta-Provenance.json"
 SUMS = "SHA256SUMS.txt"
-TAG = "v0.5.6-beta.8"
+# The v0.5.6-beta.8 tag points at a source whose Android did not compile; it is never published.
+# The same Apple hotfix scope ships as beta 9.
+TAG = "v0.5.6-beta.9"
 # The immutable candidate is built first; the public release tag is created only after acceptance.
-BUILD_TAG = "v0.5.6-beta.8-candidate.1"
+BUILD_TAG = "v0.5.6-beta.9-candidate.1"
 VERSION = "0.5.6"
 BUILD = "281"
 ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
@@ -215,7 +217,7 @@ def public_download(tag, name, destination, size, expected_sha):
 
 
 def tag_version(tag):
-    require(tag == TAG, "only the exact reviewed Beta 8 Apple hotfix is eligible")
+    require(tag == TAG, "only the exact reviewed Beta 9 Apple release is eligible")
     return VERSION
 
 

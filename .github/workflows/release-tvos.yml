@@ -2376,13 +2376,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Set up JDK 21 for read-only Android package verification
-        if: github.event.release.tag_name != 'v0.5.6-beta.8'
+        if: github.event.release.tag_name != 'v0.5.6-beta.9'
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "21"
       - name: Set up Android package inspection tools
-        if: github.event.release.tag_name != 'v0.5.6-beta.8'
+        if: github.event.release.tag_name != 'v0.5.6-beta.9'
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           packages: "platform-tools platforms;android-36 build-tools;36.0.0"
@@ -2396,12 +2396,12 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = VortXTV/VortX
           WORK_DIR="$(mktemp -d "$RUNNER_TEMP/vortx-hosted-beta.XXXXXX")"
-          if [[ "$EVENT_TAG" == v0.5.6-beta.8 ]]; then
+          if [[ "$EVENT_TAG" == v0.5.6-beta.9 ]]; then
             # This public, body-digest-bound manifest supplies original numeric build pointers.
             # The successor then reauthenticates all CI, native, package and public-byte evidence.
             curl --fail --location --proto '=https' --proto-redir '=https' \
               --connect-timeout 10 --max-time 90 --max-filesize 1048576 \
-              "https://github.com/VortXTV/VortX/releases/download/v0.5.6-beta.8/VortX-Hosted-Direct-Beta-Provenance.json" \
+              "https://github.com/VortXTV/VortX/releases/download/v0.5.6-beta.9/VortX-Hosted-Direct-Beta-Provenance.json" \
               --output "$WORK_DIR/provenance.json"
             python3 - "$GITHUB_EVENT_PATH" "$WORK_DIR/provenance.json" "$GITHUB_SHA" > "$WORK_DIR/apple-pointer.txt" <<'PY'
           import hashlib, json, pathlib, re, sys
@@ -2411,7 +2411,7 @@ jobs:
           event = json.loads(pathlib.Path(event_path).read_bytes())
           release = event['release']
           assert event['action'] == 'published' and event['repository']['full_name'] == 'VortXTV/VortX'
-          assert release['tag_name'] == 'v0.5.6-beta.8' and release['target_commitish'] == source
+          assert release['tag_name'] == 'v0.5.6-beta.9' and release['target_commitish'] == source
           assert release['draft'] is False and release['prerelease'] is True
           bindings = [line for line in release['body'].splitlines() if 'vortx-ci-provenance-sha256:' in line]
           assert len(bindings) == 1

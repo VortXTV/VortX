@@ -9,32 +9,29 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 - **Imported Stremio titles in Library ([#267](https://github.com/VortXTV/VortX/issues/267)).** Apple apps now display the native engine’s combined Library view, including imported saved titles and eligible watched history. Continue Watching, detail membership, filters and search use the same accepted snapshot. Removed titles stay removed, and movies and series with the same ID keep their own resume state. A connected account also has an explicit **Refresh Stremio import** action, including after relaunch.
 - **Less work blocking Android sign-in ([#277](https://github.com/VortXTV/VortX/issues/277)).** Initial profile reads and recovery run in the background; the screen applies only a result that still belongs to the current account and profile. Dependent For You reloads are asynchronous, stale retries are bounded, and failed recovery retains pending saved changes. The reported customer crash still needs confirmation on the affected device.
 
-## 0.5.6 beta 8 - Accounts that always open, Cast and saved playlists
+## 0.5.6 beta 9 - Accounts that always open, Cast and saved playlists
 
-Build **281** across Apple and Android. This beta brings together everything since beta 7: accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone, iPad and Android, add-on subtitles in the built-in players, saved playlists and Library genre filters, plus the fixes below.
+Build **281** for Apple TV, iPhone, iPad and Mac. Android stays on the 0.5.6 beta 7 packages while its account-sync changes finish testing. This beta brings the Apple apps everything since beta 7 (the beta 8 number was not published): accounts that keep opening when one saved value is unreadable, sign-ins that refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists and Library genre filters, plus the fixes below.
 
 ### Fixed
 
 - **Accounts open even when one saved value is unreadable ([#262](https://github.com/VortXTV/VortX/issues/262), [#263](https://github.com/VortXTV/VortX/issues/263), [#265](https://github.com/VortXTV/VortX/issues/265)).** One saved setting or name the app could not read stopped the whole account from loading, so profiles never appeared. Titles and add-on names that start with tags such as `[RD] [4K]` or `[TB⚡]` are now read as text. If a single device setting still cannot be read, the account opens without it, and a name that cannot be read shows as "Untitled". The original stays in your account's cloud copy, and the diagnostic log notes what was set aside.
-- **Sign-ins no longer run out.** VortX accounts now refresh their sign-in while you use them, and the Apple apps keep the refreshed one. If the account service does turn a session away, Library and profiles show a way to sign in again instead of loading forever.
+- **Sign-ins no longer run out.** VortX accounts now refresh their sign-in while you use them, and the apps keep the refreshed one. If the account service does turn a session away, Library and profiles show a way to sign in again instead of loading forever.
 - **Your Stremio library in the Library tab ([#267](https://github.com/VortXTV/VortX/issues/267)).** Titles imported from Stremio show in the owner profile's Library instead of only the titles played in VortX.
 - **Connecting Trakt ([#271](https://github.com/VortXTV/VortX/issues/271)).** Connecting could fail with "Could not reach the VortX Trakt service" when the service sent a compressed reply. The app now accepts it.
 - **Tapping a movie on iPhone ([#279](https://github.com/VortXTV/VortX/issues/279)).** Some titles closed the app before their page appeared. The detail page now builds its information without running out of room.
-- **Android after signing in.** Account setup after signing in ran on the screen's own thread, so the app could freeze and close. It now runs in the background.
 - **Installed add-ons stay visible.** An add-on you had removed and installed again could stay hidden by its old removal record.
 - **Imported collections.** One add-on with a broken catalog no longer hides the valid collections imported from the others.
 - **Saved seek previews** show again instead of being replaced by a blank preview from memory.
-- **Several configurations of one add-on on Android** keep their own source sections, as on Apple.
-- **A crash while handling a background notification** on Apple is fixed.
+- **A crash while handling a background notification** is fixed.
 - **Diagnostic logs leave out add-on settings.** Add-on addresses in exported logs no longer include the part of the address where add-ons keep debrid keys and sign-in tokens.
 
 ### New
 
-- **Google Cast on iPhone, iPad and Android.** Send what you are watching to a Cast device and take it back. Android can also cast torrents through a streaming server you choose, and eligible self-hosted sources.
-- **Add-on subtitles in the built-in players.** Subtitles from your installed subtitle add-ons load in the built-in players on Apple and Android, with automatic timing alignment where the video allows it. Android can also fall back to community subtitles, only with your consent.
-- **Saved playlists.** Create named playlists in your profile, saved with your account, and play them later, on Apple and on Android phone and TV. Apple also keeps each profile's playback queue between launches.
-- **Library genre filters** on Apple and Android.
-- **Collections on Android.** Browse and import Xperience collections on phone and TV, and edit your collections there.
+- **Google Cast on iPhone and iPad.** Send what you are watching to a Cast device and take it back.
+- **Add-on subtitles in the built-in players.** Subtitles from your installed subtitle add-ons load in the built-in players, with automatic timing alignment where the video allows it.
+- **Saved playlists.** Create named playlists in your profile, saved with your account, and play them later. Each profile's playback queue is also kept between launches.
+- **Library genre filters.**
 
 Watch Party is built into this beta but stays switched off until its account service is ready.
 
