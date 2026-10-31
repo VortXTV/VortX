@@ -589,6 +589,8 @@ struct TVPlayerView: View {
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
+    /// AetherEngine failed for this playback and handed the source to libmpv (`demoteAetherToMPV`). One way.
+    @State private var aetherEngineFailed = false
     /// The engine routing decision, LATCHED once per playback (seeded in onAppear), mirroring
     /// PlayerScreen.engineLatch. `useAVPlayerEngine` is read by `playerSurface` on every SwiftUI body pass
     /// (4-9x/sec during playback), and re-running the full route each render (regex + UserDefaults +
@@ -1456,7 +1458,8 @@ struct TVPlayerView: View {
     /// The viewer chose AetherEngine for this playback, in Settings or the per-source menu.
     private var useAetherEngine: Bool {
         #if VORTX_AETHER_ENGINE
-        if forceMPV || avToMPVHandoff != nil || avToMPVHandoffBlocked || !PlayerEngineRouter.aetherEngineAvailable {
+        if forceMPV || aetherEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked
+            || !PlayerEngineRouter.aetherEngineAvailable {
             return false
         }
         return (initialEnginePreference ?? PlayerEngineRouter.currentOverride) == .aether
@@ -1646,6 +1649,15 @@ struct TVPlayerView: View {
     /// equivalent for: audio sync (setAudioDelay), audio output mode, and the hardware-decoding toggle).
     /// External add-on subtitles and trickplay frame capture DO work on AVPlayer, so those rows stay shown.
     private var isAVPlayerActive: Bool { coordinator.player is AVPlayerEngineController }
+
+    /// Whether the mounted engine is AetherEngine, whose failures hand the source to libmpv (`demoteAetherToMPV`).
+    private var isAetherEngineActive: Bool {
+        #if VORTX_AETHER_ENGINE
+        return coordinator.player is AetherEngineController
+        #else
+        return false
+        #endif
+    }
 
     // MARK: - Property handling (shared by both engines via the MPVProperty event bus)
 
@@ -2689,7 +2701,13 @@ struct TVPlayerView: View {
                     return
                 }
                 if demoteAVPlayerToMPV() { return }
+                if demoteAetherToMPV(reason: failureMessage) { return }
                 handleLoadFailure((data as? String) ?? "")
+            } else if isAetherEngineActive {
+                // A mid-play AetherEngine failure replays the same source on libmpv at the play head.
+                let midPlayAetherFailureMessage = (data as? String) ?? "-"
+                if demoteAetherToMPV(reason: midPlayAetherFailureMessage) { return }
+                if !isCurrentLiveStream { handleMidPlayFailure(midPlayAetherFailureMessage, loadToken: loadToken) }
             } else if isAVPlayerActive {
                 // #76 residual: a MID-PLAY AVPlayer failure. The audio-over-black watchdog is the canonical
                 // emitter here (native DV that plays Atmos over a black screen: the audio clock advances
@@ -6746,6 +6764,8 @@ struct TVPlayerView: View {
             }
             return
         }
+        // AetherEngine never started this source: give the same source to libmpv before any retry or hop.
+        if demoteAetherToMPV(reason: "start timeout") { return }
         // Honor an explicit user pick: retry the SAME source in place instead of hopping to a different,
         // possibly lower-quality, source. Once the grace is spent, surface a clear error, not a silent drop.
         if currentPickWasExplicit {
@@ -7109,6 +7129,86 @@ struct TVPlayerView: View {
             if abs(playSpeed - 1.0) > 0.01 { coordinator.player?.setSpeed(playSpeed) }
         }
         withAnimation { showOptions = false }
+    }
+
+    /// AetherEngine could not open or keep playing this source: replay the SAME source on libmpv in place,
+    /// carrying the position, instead of hopping to another source. One way for the rest of this playback,
+    /// like the AVPlayer demote, so a failure cannot bounce between engines. Mirrors
+    /// `performPlayerEngineSwitch(toAVPlayer: false)`: the old engine is fully down before the surface swaps,
+    /// and the one-shot latches, watchdog and speed re-arm for the fresh libmpv mount. Returns false when
+    /// AetherEngine is not the mounted engine, so the caller runs its ordinary failure path.
+    @discardableResult
+    private func demoteAetherToMPV(reason: String) -> Bool {
+        #if VORTX_AETHER_ENGINE
+        guard coordinator.player is AetherEngineController, !aetherEngineFailed else { return false }
+        if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
+        resetRapidBufferingRecovery(reason: "AetherEngine fallback")
+        let desiredPaused = playbackDeadlineClock.isPaused
+        captureRecoverySelections()
+        queueIncomingTransportIntent(paused: desiredPaused)
+        DiagnosticsLog.log("player", "AetherEngine fallback -> libmpv (same source, carry position) class=\(safeFailureClass(reason))")
+        resumeRetryGeneration &+= 1
+        let reissueEpisodeGeneration = episodeSwitchGeneration
+        let reissueSourceGeneration = sourceSwitchGeneration
+        let reissueMediaGeneration = resumeRetryGeneration
+        let reissuePendingVideoID = pendingAdvance?.meta.videoId
+        if let retiringOwner = coordinator.player?.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: retiringOwner, context: resumeSurfaceContext(engine: .libmpv))
+        }
+        libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil
+        clearPostFrameResumeSeekWatchdog()
+        let reconcileResume: Double? = recoveryResumeTarget()
+        let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
+        demotedEngineLoadToken = coordinator.player?.activeLoadToken
+        prepareResumeSurfaceTransfer(engine: .libmpv, origin: reconcileResume ?? 0)
+        coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        clearCachedAudioOutputTruth()
+        engineSurfaceURLOverride = curURL ?? url
+        engineSurfaceHeadersOverride = curHeaders
+        engineSurfaceUsesActiveTuple = true
+        avSurfaceResumeOrigin = reconcileResume
+        aetherEngineFailed = true           // useAetherEngine now reads false: playerSurface mounts libmpv
+        engineSwitchedAt = Date()           // grace window swallows a stale event from the outgoing engine
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false; appliedResume = false
+        appliedAutoTracks = false; loadErrorMsg = ""
+        firstFrameRenderedAt = nil
+        invalidateSubtitlePresentationForReplacement()
+        subtitleLoadingURL = nil
+        addedSubURLs = []; addedPooledIDs = []
+        inFlightSeekTarget = nil
+        pendingLibmpvResumeSeek = nil
+        resumeSeconds = reconcileResume
+        resumeIsMidPlayRecovery = carriedPlayHead
+        startLoadTimeout()
+        showEngineNote(String(localized: "AetherEngine couldn't play this source, so VortX Player took over."))
+        // A pending episode needs an explicit issued load to rebind its pending-token transaction to the new
+        // controller; ordinary replacements already mount the active tuple.
+        if let cu = curURL, pendingAdvance?.issued == true {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard aetherEngineFailed, !Task.isCancelled, curURL == cu,
+                      reissueEpisodeGeneration == episodeSwitchGeneration,
+                      reissueSourceGeneration == sourceSwitchGeneration,
+                      reissueMediaGeneration == resumeRetryGeneration,
+                      reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
+                appliedResume = false; pendingLibmpvResumeSeek = nil
+                loadIntoPlayer(cu, headers: curHeaders, live: curIsLive,
+                               resumeOrigin: reconcileResume, preservingAbandonedResume: true)
+            }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard aetherEngineFailed, !Task.isCancelled,
+                  reissueEpisodeGeneration == episodeSwitchGeneration,
+                  reissueSourceGeneration == sourceSwitchGeneration,
+                  reissueMediaGeneration == resumeRetryGeneration,
+                  reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
+            if abs(playSpeed - 1.0) > 0.01 { coordinator.player?.setSpeed(playSpeed) }
+        }
+        return true
+        #else
+        return false
+        #endif
     }
 
     /// Show a brief player toast and auto-clear it. Used to surface the AVPlayer->libmpv fallback reason.
