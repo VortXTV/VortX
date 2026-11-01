@@ -12,8 +12,8 @@ const pairing = readFileSync('app/SourcesShared/AddonPairingProtocol.swift', 'ut
 assert(pairing.includes('static let maxManifestURLBytes = 2048'), 'test URL cap matches production');
 assert(guard.includes('context: .manifest, access: .addon(origin: url)'), 'install/preview use selected endpoint');
 assert(guard.includes('access: AccessScope = .publicNetwork'), 'public resource requests remain strict');
-assert(guard.includes('await validate(current, access: access)') &&
-       guard.includes('await validate(finalURL, access: access)'), 'redirect/final scope retained');
+assert(guard.includes('await validate(current, access: access, context: context)') &&
+       guard.includes('await validate(finalURL, access: access, context: context)'), 'redirect/final scope retained');
 assert(guard.includes('session.bytes(for: request)') && guard.includes('canAcceptBody(currentBytes:'), 'bounded transport retained');
 assert(guard.includes('forHTTPHeaderField: "User-Agent"'), 'CDN-compatible UA retained for health');
 assert(health.includes('access: .addon(origin: url), timeout: timeout') &&
