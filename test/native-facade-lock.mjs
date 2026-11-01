@@ -56,7 +56,9 @@ assert.match(sourceEvent, /self\.sourceID = producer\.sourceID/);
 assert(!sourceEvent.includes('@unchecked'), 'source carrier must add no unchecked conformance');
 assert.match(initializer, /sourceChangedDelivery = \{ \[weak self\] fields, receipt in\s*guard let self else \{ return nil \}\s*let event = SourceEvent\(producer: self, kind: \.changed\(legacyFields: fields, receipt: receipt\)\)/);
 assert.match(initializer, /sourceAcceptedDelivery = \{ \[weak self\] progressOnly in\s*guard let self else \{ return nil \}\s*let event = SourceEvent\(producer: self, kind: progressOnly \? \.progressAccepted : \.mutationAccepted\)/);
-assert.equal((initializer.match(/return \{ sourceEvent\(event\) \}/g) ?? []).length, 2, 'both builders return retained original envelopes without invoking the client');
+// 00acaaa6f added the host-carrier builder for playlist cloud receipts; it follows the same retained-envelope shape.
+assert.match(initializer, /sourceHostChangeDelivery = \{ \[weak self\] receipt in\s*guard let self else \{ return nil \}\s*let event = SourceEvent\(producer: self, kind: \.hostCarrierChanged\(receipt\)\)/);
+assert.equal((initializer.match(/return \{ sourceEvent\(event\) \}/g) ?? []).length, 3, 'all three builders return retained original envelopes without invoking the client');
 assert.match(source.fifo, /private let lock: any NSLocking & Sendable\b/);
 assert.match(source.fifo, /init\(lock: any NSLocking & Sendable\)/);
 const makeReceipt = declaration('facade', 'private func makeChangeReceipt(');
@@ -69,7 +71,7 @@ assert.match(stage, /private func stageChanged\(_ legacyFields: \[String\], rece
 assert.match(stage, /guard receipt != nil \|\| !legacyFields\.isEmpty else \{ return \}/);
 assert.match(stage, /let legacy = changed, owned = ownedChange/);
 assert.match(stage, /lock\.withLock \{\s*let legacy = changed, owned = ownedChange\s*let source = sourceChangedDelivery\?\(legacyFields, receipt\)/);
-assert.match(stage, /lock\.afterOutermostUnlock \{\s*source\?\(\)\s*if let receipt \{ owned\?\(receipt\) \}\s*if !legacyFields\.isEmpty \{ legacy\(legacyFields\) \}\s*\}/);
+assert.match(stage, /lock\.afterOutermostUnlock \{\s*source\?\(\)\s*hostSource\?\(\)\s*if let receipt \{ owned\?\(receipt\) \}\s*if !legacyFields\.isEmpty \{ legacy\(legacyFields\) \}\s*\}/);
 const ackStage = declaration('facade', 'private func stageAccepted(');
 assert.match(ackStage, /lock\.withLock \{\s*let source = sourceAcceptedDelivery\?\(progressOnly\)/);
 assert.match(ackStage, /lock\.afterOutermostUnlock \{\s*source\?\(\)\s*legacy\(\)\s*\}/);
@@ -131,6 +133,9 @@ const receiptSupport = [
   property('facade', 'private var accountEpoch = UUID()'),
   property('facade', 'private var watchlistProfileGeneration = UUID()'),
   property('facade', 'private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?'),
+  // The host-carrier receipt and builder (00acaaa6f) are staged by the same worker method under test.
+  declaration('facade', 'struct HostChangeReceipt: Equatable, Sendable {'),
+  property('facade', 'private var sourceHostChangeDelivery: (@Sendable (HostChangeReceipt) -> (@Sendable () -> Void)?)?'),
   property('facade', 'private let ownedChange: (@Sendable (ChangeReceipt) -> Void)?'),
 ].join('\n\n');
 const workerMethods = [
