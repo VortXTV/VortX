@@ -64,11 +64,6 @@
 #   3. <canonical-app>/../vortx-core/vortx-core (also from a registered app worktree)
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
-# Rust may already be on PATH without rustup's optional shell initializer.
-# A missing source file is fatal in the system Bash even with `|| true`.
-if [[ -f "$HOME/.cargo/env" ]]; then
-    source "$HOME/.cargo/env"
-fi
 REPO_ROOT="$(pwd)"
 
 MODE=server
@@ -106,6 +101,8 @@ if [ "$STAGED_MACOS" != 1 ] && { [ "$SEEN_OUT" = 1 ] || [ "$SEEN_PRELOCALIZE" = 
     exit 2
 fi
 
+# Rust may already be on PATH without rustup's optional shell initializer, and a missing source file is fatal
+# in the system Bash even with `|| true`. A staged macOS build never reads the developer's Rust environment.
 if [ "$STAGED_MACOS" != 1 ] && [[ -f "$HOME/.cargo/env" ]]; then source "$HOME/.cargo/env"; fi
 if [ "$STAGED_MACOS" = 1 ]; then
     [[ -n "${VORTX_ENGINE_DIR:-}" ]] || { echo "staged macOS FFI requires explicit VORTX_ENGINE_DIR" >&2; exit 2; }
