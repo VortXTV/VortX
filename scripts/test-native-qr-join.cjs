@@ -32,7 +32,9 @@ function method(text, marker) {
 }
 const declarations = {
   PRODUCTION_AUTH_CAPTURE: between(manager, '    private struct AuthOperationCapture: Sendable, Equatable {', '    private var credentialOwnerRetryTask:'),
-  PRODUCTION_AUTH_GENERATION: between(manager, '    private func currentCredentialOwnerIntent() -> AuthOperationCapture {', '    private func logCredentialOwnerAcquisitionDenied('),
+  // The auth-operation methods only: Watch Party's capture (d44b3ce61) follows them and is not under test here.
+  PRODUCTION_AUTH_GENERATION: between(manager, '    private func currentCredentialOwnerIntent() -> AuthOperationCapture {',
+    '    /// Capture and re-capture on the main actor around every party suspension.'),
   PRODUCTION_QR: between(manager, '    struct QrJoinSession {', '    /// HOLDER (a signed-in device, and the shared shape the web holder mirrors):')
 };
 let fixture = read(sources[3]);
