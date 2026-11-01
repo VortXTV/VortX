@@ -25,9 +25,9 @@ targets:
     sources:
       - SourcesiOS
       - path: SourcesShared
-        excludes: [".claude/**", "JSProviders/**"]
+        excludes: [".[!.]*/**", "JSProviders/**"]
       - path: Sources/Player
-        excludes: [".claude/**"]
+        excludes: [".[!.]*/**"]
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
