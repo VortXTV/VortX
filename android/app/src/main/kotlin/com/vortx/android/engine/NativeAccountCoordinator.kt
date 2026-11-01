@@ -1031,8 +1031,9 @@ internal class NativeAccountCoordinator(
     override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject =
         prepareEmptyAccount(account, isCurrent, null)
 
+    /** [sessionLifetime] is the lifetime of a session this recovery mounts; [isCurrent] fences the work. */
     private suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
-        onInstalled: ((Mounted) -> Unit)?): JSONObject {
+        onInstalled: ((Mounted) -> Unit)?, sessionLifetime: () -> Boolean = isCurrent): JSONObject {
         if (reopenCheckpoint(account, isCurrent, onInstalled)) {
             require(!session().hasOwnerHistory()) { "Existing owner-history backup disappeared" }
             val read = session().read()
@@ -1051,8 +1052,10 @@ internal class NativeAccountCoordinator(
             val retained = scope.validateSnapshot(snapshot)
             val baseline = retained.getJSONObject("hostDocument")
             require(baseline.optString("nativeAccountBootstrap") == "authenticated-empty-v1") { "Existing account backup disappeared" }
-            check(mutex.withLock { applyDocumentLocked(account, baseline, isCurrent, onInstalled = onInstalled) })
-            return prepareEmptyAccount(account, isCurrent, onInstalled)
+            check(mutex.withLock {
+                applyDocumentLocked(account, baseline, sessionLifetime, operationCurrent = isCurrent, onInstalled = onInstalled)
+            })
+            return prepareEmptyAccount(account, isCurrent, onInstalled, sessionLifetime)
         }
         checkpoints.verifyFreshAccount(scope)
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
@@ -1667,6 +1670,9 @@ internal class NativeAccountCoordinator(
         fun withAuthentication(body: () -> Boolean): Boolean = admission {
             active() && accountCurrent(account) && body()
         }
+        /** The original account admission without this upload's own activity: it still retires on
+         * sign-out or re-authentication, but not when the upload that captured it finishes. */
+        fun withOriginalAdmission(body: () -> Boolean): Boolean = admission { accountCurrent(account) && body() }
         override fun isCurrent() = withAuthentication { true }
     }
 
@@ -1710,7 +1716,9 @@ internal class NativeAccountCoordinator(
         } }
         // prepare may reopen a genuine bootstrap checkpoint. Only its publication CAS may name
         // that replacement; an unrelated same-account mount after an await is never adopted.
-        val document = prepareEmptyAccount(account, ::current) { next -> check(produced.compareAndSet(null, next)) }
+        // A recovered seed session outlives this upload (original admission); the upload fences the work.
+        val document = prepareEmptyAccount(account, ::current, { next -> check(produced.compareAndSet(null, next)) },
+            sessionLifetime = { origin.withOriginalAdmission { true } })
         if (!current()) return null
         val currency = captured.successor(produced.get() ?: captured.installation)
         return if (currency.withCurrentSession { current() } == true) document to currency else null
@@ -1727,7 +1735,10 @@ internal class NativeAccountCoordinator(
         val applied = mutex.withLock {
             require(!document.has(NativeOwnerHistoryAccount.ARCHIVE) && document.optJSONObject("nativeSync")?.optInt("schemaVersion") != 6)
             require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending"))
-            if (!current()) false else applyDocumentLocked(account, document, ::current,
+            // applyDocumentLocked's isCurrent is the mounted session's lifetime, which must outlive this
+            // upload: it lives under the original admission, while the upload fences only the commit.
+            if (!current()) false else applyDocumentLocked(account, document,
+                { captured.origin.withOriginalAdmission { true } }, operationCurrent = ::current,
                 onInstalled = { next -> check(produced.compareAndSet(null, next)) })
         }
         if (!applied || !current()) return null
@@ -1771,13 +1782,19 @@ internal class NativeAccountCoordinator(
                 mounted.get() === current && body()
             }
         } }
-        return current.session.withCompleteAccountExportRead(current.readIdentity() != null) { read ->
+        // A cloud copy with no native register yet (an older or imported account, or one never synced
+        // natively) has no native source to conserve or retain a read for. Its first native upload takes
+        // the caller's legacy bootstrap merge (owned-field replacement over the original GET bytes), as
+        // before the generic composer existed; the composer needs a source `nativeSync` for its scope.
+        val legacySource = NativeOwnerHistoryAccount(originalRaw).raw("nativeSync") == null
+        return current.session.withCompleteAccountExportRead(current.readIdentity() != null || legacySource) { read ->
             var result: Result<T>? = null
             check(originalAdmission {
                 result = runCatching {
                     val exported = exportDocument(current, read)
                     val mount = NativeAccountMountToken(current, current.session.updates.value)
                     if (exported.rawAccount != null) action(exported, mount, null, null, currency) // Separate typed path.
+                    else if (legacySource) action(exported, mount, null, null, currency) // Legacy bootstrap merge.
                     else {
                         val retained = checkNotNull(current.readIdentity()) { "Authenticated generic read unavailable" }
                         check(retained.sameObservation(source)) { "Original authenticated upload read changed" }

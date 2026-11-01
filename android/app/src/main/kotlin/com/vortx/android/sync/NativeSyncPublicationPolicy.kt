@@ -23,7 +23,11 @@ internal object NativeSyncPublicationPolicy {
         // Both are already verified by the native gateway. A missing/wrong scope must not be
         // repaired by guessing an account or treating a migration projection as native authority.
         if (incoming.optString("scope").isBlank() || incoming.optString("scope") != joined.nativeSync.optString("scope")) return false
-        return !same(incoming, joined.nativeSync) ||
+        // A generic source keeps fields this client cannot model (a newer writer's future native fields),
+        // which its export never carries. The engine's projection of that same source alone is the
+        // like-for-like baseline: only facts the join added beyond it need republishing.
+        val baseline = joined.genericSourceNativeProjection?.let { JSONObject(String(it, Charsets.UTF_8)) } ?: incoming
+        return !same(baseline, joined.nativeSync) ||
             (joined.hostPreferences != null && !same(remote.optJSONObject("nativeHostPreferences"), joined.hostPreferences))
     }
 

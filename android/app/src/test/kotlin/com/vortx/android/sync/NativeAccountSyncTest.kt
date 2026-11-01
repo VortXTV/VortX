@@ -156,7 +156,7 @@ class NativeAccountSyncTest {
             assertEquals(doc.getString("settings"), result.getString("settings")); assertEquals(2, gateway.applied)
             assertTrue(gateway.appliedReads.isNotEmpty())
             val captured = gateway.appliedReads.first()
-            assertEquals(SessionOwnerSnapshot.Account(account.id, 0L), captured.account)
+            assertEquals(SessionOwnerSnapshot.Account(account.id, INITIAL_SESSION_OWNER_EPOCH), captured.account)
             assertEquals(100L, captured.baseRevision)
             assertTrue(captured.operationGeneration >= 0L)
             assertArrayEquals(doc.toString().toByteArray(Charsets.UTF_8), captured.raw)
@@ -829,7 +829,13 @@ class NativeAccountSyncTest {
             assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(fixture.principal) == true)
             val local = fixture.disk.captureCheckpoint(fixture.runtime.session().scope).plaintext!!
             assertFalse(local.contains("fixture-pending"))
-            assertTrue(fixture.manager.syncUp())
+            // A pending edit is uploaded by its armed (debounced) pending job; an explicit syncUp defers
+            // to it, as for every pending edit. This fixture runs in real time, so wait for that upload.
+            assertFalse(fixture.manager.syncUp())
+            val deadline = System.nanoTime() + 20_000_000_000L
+            while (System.nanoTime() < deadline && fixture.runtime.playlistReceiptState(receiptOwner, ticket, ticket.fingerprint) !is
+                    com.vortx.android.engine.NativePlaylistCloudReceiptLedger.State.Saved) kotlinx.coroutines.delay(50)
+            assertTrue(fixture.putCount > 0)
             // nativeSyncUp freezes this edit before its fresh GET replaces retained raw identity.
             // The original receipt survives that merge; the original mutation target does not.
             assertNotSame(retained, coordinatorRead(fixture.runtime))

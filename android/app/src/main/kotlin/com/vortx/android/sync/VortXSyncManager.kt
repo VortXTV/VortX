@@ -2533,7 +2533,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             val originalRead = pulled as? SyncDocPull.Doc ?: return null
             val originalRaw = originalRead.raw
             val capturedRead = capturedAccountRead(lease, account, originalRead) ?: return null
-            val applied = try { gateway.applyRawDocument(account, capturedRead) { original.isCurrent() } }
+            // Lease-scoped like the pull path: this predicate is also the lifetime of any session the apply
+            // mounts, which must outlive this one upload. The upload's own authentication still fences
+            // the export and PUT below (withUploadExport, original currency).
+            val applied = try { gateway.applyRawDocument(account, capturedRead) { isSyncLeaseCurrent(lease) && nativeGateway === gateway } }
                 finally { capturedRead.retire() }
             if (!applied) return null
             if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals, original)) return null
