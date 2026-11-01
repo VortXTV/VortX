@@ -7,6 +7,7 @@ import Foundation
 enum WhatsNew {
     static let version = "0.5.6"
     static let highlights: [String] = [
+        "Beta 11: the AetherEngine player to try on iPhone, iPad and Mac, Android catches up with everything since beta 7, Trakt stays signed in on all your devices, and Trakt Continue Watching on the Apple TV Top Shelf.",
         "Beta 10: accounts open even when one saved value is unreadable, sign-ins refresh themselves, Google Cast on iPhone and iPad, add-on subtitles in the built-in players, saved playlists, and a new AetherEngine player to try on Apple TV.",
         "A faster start: VortX opens your account from this device straight away and catches up with the cloud right after.",
         "Much less background uploading while you watch, and Top Shelf that follows Continue Watching after re-signing.",

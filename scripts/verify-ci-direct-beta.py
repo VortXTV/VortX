@@ -33,6 +33,15 @@ SUMS = "SHA256SUMS.txt"
 ENGINE = "a3169f338f3f05da4ad3adb39a1e557c3ddcac33"
 NATIVE_BETA7_TAG = "v0.5.6-beta.7"
 NATIVE_BETA7_ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
+# Beta 11 follows the same reviewed native-only workflows and engine pin as beta 7, with the VortXAetherKit
+# framework as a sixth Apple version pair. Both lanes are built at the candidate tag, on the release tag's
+# exact commit; the protected release tag is pushed only after a full dry run of this checker passes against
+# those builds, so a contract miss can no longer burn the release number (beta 9).
+NATIVE_BETA11_TAG = "v0.5.6-beta.11"
+NATIVE_BETA11_BUILD_TAG = "v0.5.6-beta.11-candidate.1"
+NATIVE_TAGS = (NATIVE_BETA7_TAG, NATIVE_BETA11_TAG)
+NATIVE_TARGETS = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
+NATIVE_TAG_TARGETS = {NATIVE_BETA7_TAG: NATIVE_TARGETS, NATIVE_BETA11_TAG: NATIVE_TARGETS + ("VortXAetherKit",)}
 HISTORICAL_BETA2_ENGINE = "af29b22e4c45740a1f5b6cb415b81f8430f55b9f"
 STREMIO = "31c66611822043e089f5819ad232a5df93975873"
 BUNDLETOOL_SHA = "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
@@ -246,9 +255,14 @@ def tag_version(tag):
     return match[1]
 
 
+def build_tag(tag):
+    """The tag both CI lanes were dispatched at: the release tag itself, or beta 11's candidate tag."""
+    return NATIVE_BETA11_BUILD_TAG if tag == NATIVE_BETA11_TAG else tag
+
+
 def expected_engine(tag):
     # Exact reviewed tag interpretation, never a caller-supplied/fallback engine pin.
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         return NATIVE_BETA7_ENGINE
     if tag == "v0.5.6-beta.2":
         return HISTORICAL_BETA2_ENGINE
@@ -311,18 +325,18 @@ def source_versions(project, gradle, version, tag):
     expected_pairs = 5 if tag == NATIVE_BETA7_TAG else 6
     require(len(versions) == len(builds) == expected_pairs and set(versions) == {version} and len(set(builds)) == 1,
             "Apple target version/build pairs must agree with the exact beta contract")
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         sections = project.split("\ntargets:\n")
-        require(len(sections) == 2, "native beta7 requires the actual project target section")
+        require(len(sections) == 2, "native beta requires the actual project target section")
         targets = sections[1].split("\nschemes:\n", 1)[0]
         blocks = re.findall(r'^  ([A-Za-z_][A-Za-z0-9_]*):\n(.*?)(?=^  [A-Za-z_][A-Za-z0-9_]*:\n|\Z)',
                             targets, re.M | re.S)
-        for name in ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite"):
+        for name in NATIVE_TAG_TARGETS[tag]:
             selected = [body for target, body in blocks if target == name]
             require(len(selected) == 1 and
                     re.findall(r'^\s*MARKETING_VERSION:\s*"?([0-9.]+)"?\s*$', selected[0], re.M) == [version] and
                     re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', selected[0], re.M) == [builds[0]],
-                    "native beta7 target version/build differs: " + name)
+                    "native beta target version/build differs: " + name)
     require(re.findall(r'versionName = "([^"]+)"', gradle) == [version] and
             re.findall(r'^\s*versionCode = ([0-9]+)\s*$', gradle, re.M) == [builds[0]],
             "Android source version/build differs from Apple/tag")
@@ -338,7 +352,7 @@ def job_contract(lane, tag):
         "Upload the immutable feed handoff", "Constrain legacy comparison to artifact-only builds",
         "Constrain Full tvOS test mode to artifact-only builds", "Package Full tvOS test IPA",
     )
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         required = NATIVE_BETA7_APPLE_STEPS if lane == "apple" else NATIVE_BETA7_ANDROID_STEPS
         if lane == "apple":
             skipped = tuple("Reject removed legacy comparison builds"
@@ -383,6 +397,8 @@ def upload_proof(artifact, step, lines):
     matches = [[] for _ in expected]
     for line in lines:
         stamp, separator, body = line.rstrip("\r\n").partition(" ")
+        stamp = stamp[1:] if stamp.startswith("\ufeff") else stamp
+        require("\ufeff" not in stamp, "internal/repeated BOM in upload timestamp")
         if separator and body in expected:
             when = parse(stamp)
             require(start <= when < boundary, "upload proof falls outside its step")
@@ -428,7 +444,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
     require(repository.get("full_name") == head_repository.get("full_name") == REPO and
             head_repository.get("id") == repo_id and run.get("id") == run_id and
             run.get("run_attempt") == attempt and run.get("event") == "workflow_dispatch" and
-            run.get("head_sha") == source and run.get("head_branch") == tag and
+            run.get("head_sha") == source and run.get("head_branch") == build_tag(tag) and
             run.get("path") == workflow_meta.get("path") == f".github/workflows/{workflow}" and
             run.get("workflow_id") == workflow_meta.get("id") and
             run.get("status") == "completed" and run.get("conclusion") == "success",
@@ -451,7 +467,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
             0 < artifact["size_in_bytes"] <= MAX_ARCHIVE and
             re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", "")) and
             workflow_run.get("id") == run_id and workflow_run.get("head_sha") == source and
-            workflow_run.get("head_branch") == tag and workflow_run.get("repository_id") == repo_id and
+            workflow_run.get("head_branch") == build_tag(tag) and workflow_run.get("repository_id") == repo_id and
             workflow_run.get("head_repository_id") == repo_id, "artifact metadata is not the original run's output")
     log = work / f"{lane}.log"
     api_download(f"actions/jobs/{positive(job['id'])}/logs", log, 512 * 1024**2)
@@ -462,7 +478,7 @@ def authenticate_build(lane, pointer, tag, source, names, work):
     output = work / lane
     extract_exact(archive, artifact, names, output)
     public = {**pointer, "workflow": f".github/workflows/{workflow}", "workflowId": workflow_meta["id"],
-              "sourceCommit": source, "headBranch": tag, "event": "workflow_dispatch",
+              "sourceCommit": source, "headBranch": build_tag(tag), "event": "workflow_dispatch",
               "repositoryId": repo_id, "jobId": job["id"], "jobName": job_name,
               "requiredSuccessfulSteps": list(required), "artifactName": artifact_name,
               "artifactSha256": artifact["digest"][7:], "artifactSize": artifact["size_in_bytes"],
@@ -494,7 +510,7 @@ def file_matrix(tag, version):
 
 
 def validate_dispatch(receipt, pointer, tag, source):
-    expected = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": f"refs/tags/{tag}",
+    expected = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": f"refs/tags/{build_tag(tag)}",
                 "sourceCommit": source, "workflowCommit": source, "runId": pointer["runId"],
                 "attempt": pointer["attempt"], "inputs": APPLE_INPUTS}
     require(canonical(receipt) == canonical(expected), "original typed Apple dispatch inputs differ")
@@ -563,13 +579,13 @@ def inspect_apple(directory, pointer, tag, source, version, build, tools, helper
 def validate_android_evidence(lines, pointer, tag, source, version, build):
     engine = expected_engine(tag)
     expected = [
-        ("release tag", tag), ("release tag commit", source), ("source commit", source),
+        ("release tag", build_tag(tag)), ("release tag commit", source), ("source commit", source),
         ("native engine source commit", engine), ("native engine Cargo features", "jni,server,resource-host"),
         ("workflow run", f"https://github.com/{REPO}/actions/runs/{pointer['runId']}"),
         ("workflow run attempt", str(pointer["attempt"])),
         ("Android versionCode", build), ("Android versionName", version),
     ]
-    if tag == NATIVE_BETA7_TAG:
+    if tag in NATIVE_TAGS:
         require(not any(line.startswith("legacy Stremio source commit") for line in lines),
                 "native beta7 evidence must not record a legacy engine source")
     else:
@@ -630,6 +646,8 @@ def build_manifest(args, pointers, stable, helper, work):
     source = sha(args.source_commit, 40)
     build, tools = source_contract(args.repo_root, source, version, args.tag)
     check_tag(args.tag, source)
+    if build_tag(args.tag) != args.tag:
+        check_tag(build_tag(args.tag), source)
     apple_names, apple_matrix, android_names = file_matrix(args.tag, version)
     apple_dir, apple_run = authenticate_build("apple", pointers["apple"], args.tag, source, apple_matrix, work)
     android_dir, android_run = authenticate_build("android", pointers["android"], args.tag, source,

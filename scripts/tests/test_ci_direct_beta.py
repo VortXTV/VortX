@@ -166,13 +166,13 @@ class NativeBeta7Contract(unittest.TestCase):
             values.append(("legacy Stremio source commit (not packaged)", MODULE.STREMIO))
         return [label + ": " + value for label, value in values]
 
-    def test_current_native_project_uses_all_five_exact_versioned_targets(self):
+    def test_current_native_project_no_longer_satisfies_the_immutable_beta7_contract(self):
+        # Beta 7 shipped five Apple version pairs; the VortXAetherKit framework made the current project six.
         root = Path(__file__).resolve().parents[2]
         project = (root / "app/project.yml").read_text()
         gradle = (root / "android/app/build.gradle.kts").read_text()
-        builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
-        self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), builds[0])
-        self.assertEqual(len(builds), 5)
+        with self.assertRaises(ValueError):
+            MODULE.source_versions(project, gradle, "0.5.6", NativeBeta7Contract.tag)
 
     def test_native_project_refuses_missing_extra_misnamed_or_disagreeing_target_pairs(self):
         project = self.project()
@@ -314,12 +314,12 @@ class NativeBeta7Contract(unittest.TestCase):
                     upload.update(started_at="2026-10-26T01:00:00Z", completed_at="2026-10-26T01:00:02Z")
                     repository = {"id": 1, "full_name": MODULE.REPO}
                     run = {"id": 5, "run_attempt": 1, "event": "workflow_dispatch", "head_sha": self.source,
-                           "head_branch": tag, "path": ".github/workflows/" + workflow, "workflow_id": 7,
+                           "head_branch": MODULE.build_tag(tag), "path": ".github/workflows/" + workflow, "workflow_id": 7,
                            "status": "completed", "conclusion": "success", "repository": repository,
                            "head_repository": repository}
                     artifact = {"id": 8, "name": artifact_name, "expired": False, "size_in_bytes": len(data),
                                 "digest": "sha256:" + digest, "created_at": "2026-10-26T01:00:01Z",
-                                "workflow_run": {"id": 5, "head_sha": self.source, "head_branch": tag,
+                                "workflow_run": {"id": 5, "head_sha": self.source, "head_branch": MODULE.build_tag(tag),
                                                  "repository_id": 1, "head_repository_id": 1}}
                     metadata = {"actions/runs/5": run,
                                 "actions/workflows/" + workflow: {"id": 7, "path": ".github/workflows/" + workflow},
@@ -369,6 +369,61 @@ class NativeBeta7Contract(unittest.TestCase):
                                  ["verify-android-release-signing.sh", "verify-android-release-version.sh"])
                 for call in package_tools.call_args_list:
                     self.assertIs(call.kwargs["check"], True)
+
+
+class NativeBeta11Contract(NativeBeta7Contract):
+    """Every beta 7 native check, rerun under beta 11's tag, six Apple pairs and candidate build tag."""
+    tag = "v0.5.6-beta.11"
+    build_tag = "v0.5.6-beta.11-candidate.1"
+    native_targets = NativeBeta7Contract.native_targets + ("VortXAetherKit",)
+
+    def evidence(self, tag=None):
+        # The Android lane records the tag it was dispatched at, which for beta 11 is the candidate tag.
+        tag = tag or self.tag
+        lines = super().evidence(tag)
+        if tag == self.tag:
+            lines[0] = "release tag: " + self.build_tag
+        return lines
+
+    def test_current_native_project_no_longer_satisfies_the_immutable_beta7_contract(self):
+        pass  # Covered once by NativeBeta7Contract.
+
+    def test_historical_six_pair_and_job_contracts_remain_required(self):
+        pass  # Covered once by NativeBeta7Contract with the five beta 7 targets.
+
+    def test_current_native_project_uses_all_six_exact_versioned_targets(self):
+        root = Path(__file__).resolve().parents[2]
+        project = (root / "app/project.yml").read_text()
+        gradle = (root / "android/app/build.gradle.kts").read_text()
+        builds = re.findall(r'^\s*CURRENT_PROJECT_VERSION:\s*"?([0-9]+)"?\s*$', project, re.M)
+        self.assertEqual(MODULE.source_versions(project, gradle, "0.5.6", self.tag), builds[0])
+        self.assertEqual(len(builds), 6)
+
+    def test_builds_bind_to_the_candidate_tag_and_the_beta7_engine(self):
+        self.assertEqual(MODULE.build_tag(self.tag), self.build_tag)
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.6", "v0.5.6-beta.12"):
+            self.assertEqual(MODULE.build_tag(tag), tag)
+        self.assertEqual(MODULE.expected_engine(self.tag), MODULE.NATIVE_BETA7_ENGINE)
+        for tag in ("v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.12", self.build_tag):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.expected_engine(tag)
+        for lane in ("apple", "android"):
+            self.assertEqual(MODULE.job_contract(lane, self.tag), MODULE.job_contract(lane, NativeBeta7Contract.tag))
+
+    def test_dispatch_receipt_must_name_the_candidate_tag(self):
+        pointer = {"runId": 5, "attempt": 1}
+        receipt = {"schemaVersion": 1, "event": "workflow_dispatch", "ref": "refs/tags/" + self.build_tag,
+                   "sourceCommit": self.source, "workflowCommit": self.source, "runId": 5, "attempt": 1,
+                   "inputs": MODULE.APPLE_INPUTS}
+        MODULE.validate_dispatch(receipt, pointer, self.tag, self.source)
+        with self.assertRaises(ValueError):
+            MODULE.validate_dispatch({**receipt, "ref": "refs/tags/" + self.tag}, pointer, self.tag, self.source)
+
+    def test_android_evidence_from_the_release_tag_itself_is_refused(self):
+        evidence = self.evidence()
+        evidence[0] = "release tag: " + self.tag
+        with self.assertRaises(ValueError):
+            MODULE.validate_android_evidence(evidence, {"runId": 5, "attempt": 1}, self.tag, self.source, "0.5.6", "281")
 
 
 if __name__ == "__main__":
