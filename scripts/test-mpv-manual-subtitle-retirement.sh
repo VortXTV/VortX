@@ -84,6 +84,10 @@ if (supportsOwnedRetirement) stateMembers.push(
   '        var subtitleRendererRegistration: CredentialPublicationOutbox.SubtitleRendererRegistration?',
   '        var alignedSubtitle: MPVAlignedSubtitleRecord?'
 );
+// Subtitle contribution sharing (0a45fbd32) keeps its revocable load scope in the same native state.
+const contributionMember = '        var contributionLoad: SubtitlePoolClient.ContributionLoad?';
+const supportsContribution = fullState.includes(contributionMember + '\n');
+if (supportsContribution) stateMembers.push(contributionMember);
 const remoteCancellationMember = '        var subtitleRemoteCancellation: MPVRemoteReferenceCancellation?';
 if (fullState.includes(remoteCancellationMember + '\n')) stateMembers.push(remoteCancellationMember);
 for (const member of stateMembers) once(fullState, member + '\n');
@@ -91,8 +95,19 @@ const projectedNative = native.replace(fullState, '    struct State: Sendable {\
 for (const marker of ['let transaction = NSRecursiveLock()', 'OSAllocatedUnfairLock(initialState: State())', 'transaction.lock(); defer { transaction.unlock() }']) {
   if (!projectedNative.includes(marker)) throw new Error(`Missing real recursive native state boundary: ${marker}`);
 }
+// The actual contribution load and its retirement lifetime. Resuming an upload task is admission the
+// contribution tests cover; it is cut from the lifetime so the fixture needs no network or config types.
+let contributionModels = '';
+if (supportsContribution) {
+  const pool = read('app/SourcesShared/SubtitlePoolClient.swift');
+  const lifetime = declaration(pool, '    fileprivate final class ContributionLifetime: Sendable');
+  const resume = declaration(lifetime, '        fileprivate func resume(_ task: URLSessionTask');
+  contributionModels = 'enum SubtitlePoolClient {\n' + lifetime.replace(resume, '') + '\n' +
+    declaration(pool, '    struct ContributionLoad: Sendable') + '\n}';
+}
 const blocks = {
   models: declaration(core, 'struct PlayerLoadToken: Hashable, Sendable') + '\n' + declaration(core, 'struct PlayerLoadProvenanceState: Sendable'),
+  contributionModels,
   properties,
   native: projectedNative,
   accessors: [

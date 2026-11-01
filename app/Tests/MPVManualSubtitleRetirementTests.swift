@@ -5,6 +5,7 @@ import os
 
 // Filled by the maintained runner from the selected actual source, never a guard model.
 // @source:models
+// @source:contributionModels
 // @source:properties
 
 private final class NativePort: Sendable {
