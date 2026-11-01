@@ -152,7 +152,8 @@ require_literal "shared sync gate requires fresh XML" 'test ! -e app/build/test-
 require_literal "shared sync gate rejects native/source changes" 'cmp --silent "$VORTX_JNI_SOURCE_MANIFEST" "$VORTX_JNI_SOURCE_MANIFEST.current"' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate retains post-runtime library proof" 'postRuntimeLibrarySha256:$after' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate retains post-runtime private input digest" 'postRuntimeSourceInputsSha256:$inputs' "$NATIVE_SYNC_HOST_SCRIPT"
-require_literal "shared sync gate records 22 executed and 17 real JNI cases" 'executed:22,realJniCases:17,skipped:0,failures:0,errors:0' "$NATIVE_SYNC_HOST_SCRIPT"
-require_literal "shared sync gate never accepts native sync skips" 'Require real native BackupRevision14 plus NativeAccountSync8, zero skips/failures' "$REPO_ROOT/android/native-sync-hosted.init.gradle"
+require_literal "shared sync gate requires the exact named test roster" 'assert {case.attrib["name"] for case in cases} == expected[name]' "$NATIVE_SYNC_HOST_SCRIPT"
+require_literal "shared sync gate rejects skipped, failed or errored cases" 'assert all(int(suite.attrib[key]) == 0 for key in ("failures", "errors", "skipped"))' "$NATIVE_SYNC_HOST_SCRIPT"
+require_literal "shared sync gate never accepts native sync skips" 'result.skippedTestCount != 0L || result.failedTestCount != 0L' "$REPO_ROOT/android/native-sync-hosted.init.gradle"
 
 printf 'PASS: Android VortX engine release selection/package contract\n'
