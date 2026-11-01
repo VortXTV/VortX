@@ -25,7 +25,7 @@ enum PlayerEngineRouter {
     enum Override: String, CaseIterable {
         case auto, mpv, avfoundation
         #if VORTX_AETHER_ENGINE
-        /// AetherEngine, offered to everyone on Apple TV for testing. Only the Apple TV apps (VortX and VortX Lite) link it.
+        /// AetherEngine, offered to everyone for testing on a system it supports (iOS 18, tvOS 18, macOS 15).
         case aether
         #endif
         var label: String {
@@ -59,10 +59,12 @@ enum PlayerEngineRouter {
     }
 
     #if VORTX_AETHER_ENGINE
-    /// RemoteConfig `features.aetherEngine`, the emergency kill switch for the AetherEngine choice. Baked ON;
-    /// when the fleet turns it OFF the choice disappears and a saved pick plays on Auto.
+    /// Whether to offer AetherEngine: this system runs it (`AetherEngineLoader.isSupported`, which also retires
+    /// it after a failed load) and RemoteConfig `features.aetherEngine`, the emergency kill switch, is on. Baked
+    /// ON; when the fleet turns it OFF the choice disappears and a saved pick plays on Auto.
     static var aetherEngineAvailable: Bool {
-        RemoteConfig.snapshot.isFeatureOn("aetherEngine", default: RemoteConfigDefaults.featureAetherEngine)
+        AetherEngineLoader.isSupported
+            && RemoteConfig.snapshot.isFeatureOn("aetherEngine", default: RemoteConfigDefaults.featureAetherEngine)
     }
     #endif
 
@@ -184,7 +186,7 @@ enum PlayerEngineRouter {
         // in-player notice) lives in the chrome at play start (TVPlayerView.onAppear), not here.
         switch override {
         #if VORTX_AETHER_ENGINE
-        // The AetherEngine surface is chosen by the tvOS chrome before routing; behind it, routing must
+        // The AetherEngine surface is chosen by the player chrome before routing; behind it, routing must
         // never pick AVPlayer, so it reads as libmpv here.
         case .aether:
             return .mpv

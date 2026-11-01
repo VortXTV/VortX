@@ -211,6 +211,7 @@ targets:
         # OS-agnostic layer: engine bridge, models, account, ranking, themes
       # shared engine bridge, models, account, ranking, profiles, themes
       - Sources/Player # libmpv player core (shared with tvOS)
+      - SourcesAetherBridge # the runtime boundary to VortXAetherKit (AetherEngineLoader)
       - Sources/NodeServer.swift # embedded streaming server
       - Sources/PlayerScreen.swift # full native touch player (controls, tracks, resume), reused by the native UI
       - Sources/ShareSheet.swift # share sheet used by the player handoff
@@ -245,6 +246,12 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # License texts for AetherEngine and its FFmpeg (AetherLib*), LibDovi and SMBClient, which ship inside
+      # this app. Their licenses require distributing these texts with the binaries; folder reference so
+      # they land under `licenses/aether-engine/` in the bundle.
+      - path: Resources/licenses
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -258,6 +265,26 @@ targets:
       # non-vortx_* globals are localized so it link-coexists with Libdovi). Linked, not embedded.
       - framework: Vendor/VortxEngine.xcframework
         embed: false
+      # The AetherEngine player lane (see VortXAetherKit): embedded with its AetherLib* frameworks but never
+      # linked. AetherEngineLoader loads it at runtime only on iOS 18 or later, so this app's iOS 16 floor stays.
+      - target: VortXAetherKit
+        embed: true
+        link: false
+    postBuildScripts:
+      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
+      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
+        name: Embed AetherEngine FFmpeg frameworks
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
     settings:
       base:
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
@@ -270,7 +297,7 @@ targets:
         # vortx_server_start/port/base_url/stop). SourcesShared/VortxNativeServer.swift compiles its
         # real body under this condition and inert stubs elsewhere. Do NOT copy it to a target whose
         # slice is kernel-only (the script's --no-server fallback): it would fail at link.
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "281"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -340,6 +367,7 @@ targets:
       # includes MacNodeServer.swift (the child-process streaming server)
       - path: Sources/Player
         excludes: [".claude/**"]
+      - SourcesAetherBridge # the runtime boundary to VortXAetherKit (AetherEngineLoader)
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
@@ -371,6 +399,12 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # License texts for AetherEngine and its FFmpeg (AetherLib*), LibDovi and SMBClient, which ship inside
+      # this app. Their licenses require distributing these texts with the binaries; folder reference so
+      # they land under `licenses/aether-engine/` in the bundle.
+      - path: Resources/licenses
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -382,7 +416,26 @@ targets:
       # separate child process, so its slice needs no server feature.
       - framework: Vendor/VortxEngine.xcframework
         embed: false
+      # The AetherEngine player lane (see VortXAetherKit): embedded with its AetherLib* frameworks but never
+      # linked. AetherEngineLoader loads it at runtime only on macOS 15 or later, so this app's macOS 14 floor stays.
+      - target: VortXAetherKit
+        embed: true
+        link: false
     postBuildScripts:
+      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
+      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
+        name: Embed AetherEngine FFmpeg frameworks
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
       # Embed the streaming server. The binary is a gitignored, script-produced artifact
       # (app/Vendor/vortx-streaming-server, from ../scripts/build-mac-server.sh, which needs the
       # engine checkout like the ffi xcframework build). A build without it fails here rather than
@@ -406,6 +459,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_AETHER_ENGINE"
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "281"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -460,6 +514,7 @@ targets:
       # OS-agnostic layer: engine bridge, models, account, ranking, themes
       - path: Sources/Player
         excludes: [".claude/**"]
+      - SourcesAetherBridge # the runtime boundary to VortXAetherKit (AetherEngineLoader)
       - Sources/NodeServer.swift
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
@@ -502,9 +557,11 @@ targets:
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
-      # The AetherEngine player lane (see VortXAetherKit). Embedded with its AetherLib* frameworks.
+      # The AetherEngine player lane (see VortXAetherKit). Embedded with its AetherLib* frameworks, not linked:
+      # AetherEngineLoader loads it on first use, as on iPhone and Mac.
       - target: VortXAetherKit
         embed: true
+        link: false
       # The VortX engine ABI, SERVER-INCLUSIVE tvos-arm64 / tvos-arm64-simulator slices (kernel +
       # vortx_server_start/port/base_url/stop). Linked, not embedded, exactly like VortXiOSNative's iOS
       # slices; drives the in-process streaming server (SourcesShared/VortxNativeServer.swift).
@@ -603,23 +660,33 @@ targets:
         VORTX_URL_SCHEME: vortx
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
-  # AetherEngine player lane for Apple TV. A dynamic framework so the engine's FFmpeg references resolve
-  # against its own AetherLib* frameworks at this framework's link, not against the app's static MPVKit
-  # FFmpeg. The app talks only to the plain-typed VortXAetherPlayer API in SourcesAetherKit.
+  # AetherEngine player lane for every Apple app. A dynamic framework so the engine's FFmpeg references
+  # resolve against its own AetherLib* frameworks at this framework's link, not against the apps' static
+  # MPVKit FFmpeg. The apps embed it without linking it and reach it only through VortXAetherBridging
+  # (SourcesAetherBridge), loaded at runtime by AetherEngineLoader.
   VortXAetherKit:
     type: framework
-    platform: tvOS
-    deploymentTarget: "18.0"
+    platform: auto
+    supportedDestinations: [iOS, tvOS, macOS]
     sources:
       - path: SourcesAetherKit
+      - path: SourcesAetherBridge
     dependencies:
       - package: AetherEngine
         product: AetherEngine
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.aetherkit
-        # Library evolution keeps the internal AetherEngine import out of clients: without it the app's
-        # compile still loads AetherEngine's AetherLib* FFmpeg modules, which collide with MPVKit's.
+        # AetherEngine's own floors. The apps keep theirs (iOS 16, macOS 14): they load this framework at
+        # runtime only where it runs (AetherEngineLoader), so it never has to match them.
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TVOS_DEPLOYMENT_TARGET: "18.0"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        # A Mac app keeps its frameworks in Contents/Frameworks, next to this one, where the AetherLib*
+        # frameworks this links resolve; the default runpath is the iPhone and Apple TV layout.
+        "LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]": "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
+        # Library evolution keeps the internal AetherEngine import out of the framework's module interface,
+        # so nothing outside it ever loads AetherEngine's AetherLib* FFmpeg modules next to MPVKit's.
         BUILD_LIBRARY_FOR_DISTRIBUTION: "YES"
         MARKETING_VERSION: "0.5.6"
         CURRENT_PROJECT_VERSION: "281"
@@ -655,6 +722,7 @@ targets:
       # OS-agnostic layer: engine bridge, models, account, ranking, themes
       - path: Sources/Player
         excludes: [".claude/**"]
+      - SourcesAetherBridge # the runtime boundary to VortXAetherKit (AetherEngineLoader)
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
       # Same full font set as the Full build. Lite briefly dropped the CJK face, but libass's
@@ -706,6 +774,7 @@ targets:
       # The AetherEngine player lane, the same as VortXTV. A framework needs no extra provisioning.
       - target: VortXAetherKit
         embed: true
+        link: false
     postBuildScripts:
       # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
       - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'

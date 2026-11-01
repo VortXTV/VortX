@@ -196,7 +196,7 @@ enum RemoteConfigDefaults {
     static let featureCommunityTrickplay = true // CommunityTrickplay.isEnabled default
     static let featureCollectionsHub = true     // CollectionsHubModel.isAvailable
     static let featureSpoilerBlur = true        // vortx.spoilerBlur default (user setting wins)
-    static let featureAetherEngine = true       // AetherEngine player choice on Apple TV; remote OFF is the
+    static let featureAetherEngine = true       // AetherEngine player choice on every Apple app; remote OFF is the
                                                 // emergency kill switch (hides it, routes a saved pick to Auto)
     static let featureTorBoxSearch = true       // TorBox SEARCH-as-a-source master gate. Baked ON, so an
                                                 // unreachable RemoteConfig is behaviorally identical to today;
@@ -240,7 +240,7 @@ struct RemoteConfigData: Decodable {
         let refindSources: Bool?       // "Re-find sources" control master gate (baked ON; backend kill switch)
         let communityJSPlugins: Bool?  // JSProviderSource master gate (baked OFF; ships dark, remote ON enables)
         let watchParty: Bool?          // Watch Party entry points (baked OFF until its account-service routes are live)
-        let aetherEngine: Bool?        // AetherEngine player choice on Apple TV (baked ON; remote OFF is the kill switch)
+        let aetherEngine: Bool?        // AetherEngine player choice on every Apple app (baked ON; remote OFF is the kill switch)
         let skipVortxLayer: Bool?
         let aniSkip: Bool?
         let spoilerBlur: Bool?

@@ -1929,6 +1929,12 @@ struct PlayerScreen: View {
     @State private var srcProbeLoadStart = Date()
     #if os(iOS) || os(macOS)
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
+    /// AetherEngine failed for this playback and handed the source to libmpv (`demoteAetherToMPV`). One way.
+    @State private var aetherEngineFailed = false
+    /// Whether this playback mounts AetherEngine, LATCHED once at start like `engineLatch`, so a RemoteConfig
+    /// refresh or a failed engine load can't swap the surface mid-play. Only `demoteAetherToMPV` and a manual
+    /// engine pick leave it.
+    @State private var aetherLatch: Bool?
     /// Exact item observed by the surface-stall watchdog. An AVPlayer replacement advances this value, fencing
     /// a stale watchdog callback away from the new item.
     @State private var avStallWatchdogItemGeneration: UInt64?
@@ -2258,9 +2264,54 @@ struct PlayerScreen: View {
     /// override (Always libmpv / Prefer AVPlayer) still wins. On an AVPlayer load failure we fall back to libmpv
     /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
+        if useAetherEngine { return false }
         if avEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
         if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
         return engineLatch ?? routedToAVPlayer
+    }
+
+    /// The viewer chose AetherEngine for this playback, in Settings or the per-source menu. Latched at start
+    /// (`aetherLatch`); a failure demotes to libmpv and a manual engine pick moves to the picked engine.
+    private var useAetherEngine: Bool {
+        if aetherEngineFailed || manualEngineAVPlayer != nil || avToMPVHandoff != nil || avToMPVHandoffBlocked {
+            return false
+        }
+        return aetherLatch ?? routedToAether
+    }
+
+    /// The raw AetherEngine choice, consulted once to seed `aetherLatch`. Trailers and a yt-direct adaptive pair
+    /// (its separate audio needs libmpv) never take it.
+    private var routedToAether: Bool {
+        #if VORTX_AETHER_ENGINE
+        guard !isTrailer, audioSidecarURL == nil, PlayerEngineRouter.aetherEngineAvailable else { return false }
+        return (initialEnginePreference ?? PlayerEngineRouter.currentOverride) == .aether
+        #else
+        return false
+        #endif
+    }
+
+    /// Whether the mounted engine is AetherEngine, whose failures hand the source to libmpv (`demoteAetherToMPV`).
+    private var isAetherEngineActive: Bool {
+        #if VORTX_AETHER_ENGINE
+        return coordinator.player is AetherEngineController
+        #else
+        return false
+        #endif
+    }
+
+    /// AetherEngine gets the same playback inputs as the libmpv surface; it plays loopback and remote HTTP alike.
+    @ViewBuilder private var aetherSurface: some View {
+        #if VORTX_AETHER_ENGINE
+        AetherEngineView(coordinator: coordinator)
+            .play(mpvSurfacePlayback.url, headers: mpvSurfacePlayback.headers,
+                  audioSidecar: mpvSurfacePlayback.audioSidecar, isDolbyVision: mpvSurfacePlayback.isDolbyVision)
+            .live(mpvSurfacePlayback.live)
+            .initiallyPaused(enginePauseForSurface(engine: .libmpv))
+            .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
+            .ignoresSafeArea()
+        #else
+        mpvSurface
+        #endif
     }
 
     /// Whether AVPlayer can actually PLAY the ACTIVE stream, gating the "AVPlayer" row in the engine picker.
@@ -2379,6 +2430,8 @@ struct PlayerScreen: View {
         #if os(iOS) || os(macOS)
         if avToMPVHandoff != nil || avToMPVHandoffBlocked {
             Color.black.ignoresSafeArea()
+        } else if useAetherEngine {
+            aetherSurface
         } else if useAVPlayerEngine {
             AVPlayerEngineView(coordinator: coordinator)
                 // Pass the launching stream's Dolby Vision flag (same plumbing as mpvSurface and the tvOS
@@ -2674,6 +2727,7 @@ struct PlayerScreen: View {
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
             if engineLatch == nil { engineLatch = routedToAVPlayer }   // engine picked ONCE per playback
+            if aetherLatch == nil { aetherLatch = routedToAether }
             #endif
             // [src-probe] Load-start anchor + launch classification. `resume=Y` + `explicit=N` is the
             // Continue-Watching auto-pick path (the one that produces "Tried 5 sources, none worked");
@@ -3796,6 +3850,15 @@ struct PlayerScreen: View {
                 demoteAVPlayerToMPV(silent: !hasStartedPlaying)
                 return
             }
+            #if VORTX_AETHER_ENGINE
+            // ANY AetherEngine failure, pre-start or mid-play, replays the SAME source on libmpv at the play
+            // head. A provider link that expired is not an engine fault: re-mint it once first, as for AVPlayer,
+            // unless the engine never started on this device.
+            if let aether = coordinator.player as? AetherEngineController, !aetherEngineFailed {
+                if aether.player != nil, recoverCurrentNativeDebridLink(reason: "AetherEngine failure") { return }
+                if demoteAetherToMPV(reason: (data as? String) ?? "-") { return }
+            }
+            #endif
             // Stale error from the just-dismounted AVPlayer engine (a queued event can land after the swap):
             // swallow it so it never burns the fresh mpv load's retry budget or paints the error overlay.
             // W2-A item 3a (tvOS twin in TVPlayerView): `endFileError` is a SHARED channel - libmpv emits on it
@@ -5474,6 +5537,8 @@ struct PlayerScreen: View {
         // A no-frame timeout with no buffer progress can be an expired native-debrid transport URL. Refresh
         // that exact file once before retrying an explicit source or hopping an automatic pick.
         if recoverCurrentNativeDebridLink(reason: "start timeout") { return }
+        // AetherEngine never started this source: give the same source to libmpv before any retry or hop.
+        if demoteAetherToMPV(reason: "start timeout") { return }
         // Honor an explicit user pick: retry the SAME source in place (a longer grace) instead of hopping
         // to a different, possibly lower-quality, source. Once the grace is spent, surface a clear error
         // that points at the source list, not a silent quality drop.
@@ -6495,6 +6560,13 @@ struct PlayerScreen: View {
             close()
             return
         }
+        // AetherEngine -> VortX Player is the same in-place replay its failure path uses; AetherEngine ->
+        // AVPlayer takes the ordinary switch below (the manual pick retires the AetherEngine latch).
+        if !toAVPlayer, isAetherEngineActive {
+            demoteAetherToMPV(reason: "viewer picked VortX Player", notify: false)
+            close()
+            return
+        }
         guard toAVPlayer != isAVPlayerActive else { close(); return }
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         if (reconnecting || autoRetryTask != nil),
@@ -6584,6 +6656,82 @@ struct PlayerScreen: View {
             if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
         }
         close()   // dismiss the settings sheet so the video is visible during the swap
+    }
+
+    /// AetherEngine could not open or keep playing this source: replay the SAME source on libmpv in place,
+    /// carrying the position, instead of hopping to another source. One way for the rest of this playback,
+    /// like the AVPlayer demote, so a failure cannot bounce between engines. Mirrors
+    /// `switchPlayerEngine(toAVPlayer: false)` (and the tvOS twin in TVPlayerView): the old engine is fully down
+    /// before the surface swaps, and the one-shot latches, watchdog and speed re-arm for the fresh libmpv mount.
+    /// Returns false when AetherEngine is not the mounted engine, so the caller runs its ordinary failure path.
+    @discardableResult
+    private func demoteAetherToMPV(reason: String, notify: Bool = true) -> Bool {
+        #if VORTX_AETHER_ENGINE
+        guard isAetherEngineActive, !aetherEngineFailed else { return false }
+        srcProbe("AetherEngine -> libmpv (SAME url, carry position, NOT a hop) reason=\(reason)")
+        if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
+        resumeRetryGeneration &+= 1
+        if let retiringOwner = coordinator.player?.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: retiringOwner, context: resumeSurfaceContext(engine: .libmpv))
+        }
+        let reissueEpisodeGeneration = episodeSwitchGeneration
+        let reissueMediaGeneration = resumeRetryGeneration
+        let reissuePendingVideoID = pendingAdvance?.meta.videoId
+        let resume = retryResumeTarget()
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        pendingAudioReapply = captureSelectedAudioChoice()
+        // Engine of origin for the post-demote grace, captured before stop() clears it.
+        demotedEngineLoadToken = coordinator.player?.activeLoadToken
+        prepareResumeSurfaceTransfer(engine: .libmpv, origin: resume)
+        coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        clearCachedAudioOutputTruth()
+        engineSurfaceURLOverride = curURL ?? url
+        engineSurfaceHeadersOverride = curHeaders
+        engineSurfaceUsesActiveTuple = true
+        avSurfaceResumeOrigin = resume
+        aetherEngineFailed = true           // useAetherEngine now reads false: playerSurface mounts libmpv
+        avDemotedAt = Date()                // grace window swallows a stale event from the outgoing engine
+        appliedSize = false; appliedVolume = false; appliedAutoTracks = false
+        addedSubURLs = []; addedPooledIDs = []
+        invalidateSubtitlePresentationForReplacement()
+        subtitleLoadingURL = nil
+        hasStartedPlaying = false; isSeekable = true
+        buffering = true; loadFailed = false; loadErrorMsg = ""
+        firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil
+        cancelPostFrameResumeSeekWatchdog()
+        srcProbeLoadStart = Date()
+        startLoadTimeout()
+        if pendingResumeSurfaceTransfer == nil, retiredResumePersistenceFloor == nil { suppressedResumeFloor = nil }
+        if resume > 5 { nudgeResume(to: resume) }
+        if notify {
+            showEngineNotice(String(localized: "AetherEngine couldn't play this source, so VortX Player took over."))
+        }
+        // Ordinary replacements already mount the active tuple. Only a pending episode needs an explicit
+        // issued load to rebind its pending-token transaction to the newly constructed controller.
+        if let cu = curURL, pendingAdvance?.issued == true {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard aetherEngineFailed, !Task.isCancelled, curURL == cu,
+                      reissueEpisodeGeneration == episodeSwitchGeneration,
+                      reissueMediaGeneration == resumeRetryGeneration,
+                      reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
+                loadIntoPlayer(cu, headers: curHeaders, live: isLive, resumeOrigin: resume,
+                               preservingAbandonedResume: true)
+            }
+        }
+        // Re-apply speed once the libmpv controller is mounted (next render).
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard aetherEngineFailed, !Task.isCancelled,
+                  reissueEpisodeGeneration == episodeSwitchGeneration,
+                  reissueMediaGeneration == resumeRetryGeneration,
+                  reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
+            if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
+        }
+        return true
+        #else
+        return false
+        #endif
     }
 
     /// AVPlayer-only START watchdog (see `avStartWatchdogSeconds`). If AVFoundation is the active engine and no
@@ -11295,9 +11443,9 @@ struct PlayerScreen: View {
             #if os(iOS) || os(macOS)
             // Player engine picker (P3, #76): only when AVPlayer is a real option for this stream (DV / HLS /
             // debrid; never torrents or a yt-direct sidecar pair). Flips libmpv <-> AVPlayer mid-title.
-            if canUseAVPlayerEngine {
-                rows.append(Row(label: "Player engine",
-                                detail: isAVPlayerActive ? "AVPlayer  ›" : "VortX Player  ›") { openPanel(.engine) })
+            if canUseAVPlayerEngine || isAetherEngineActive {
+                let engineName = isAetherEngineActive ? "AetherEngine" : (isAVPlayerActive ? "AVPlayer" : "VortX Player")
+                rows.append(Row(label: "Player engine", detail: "\(engineName)  ›") { openPanel(.engine) })
             }
             #endif
             // Skip-segment submit (G): a discoverable overflow entry to the in-player editor, pre-filled with
@@ -11317,9 +11465,14 @@ struct PlayerScreen: View {
             // Player Engine picker (P3, #76): flip libmpv <-> AVPlayer mid-title. The AVPlayer row appears only
             // when it is a valid engine for this stream (canUseAVPlayerEngine).
             let onAV = isAVPlayerActive
-            var rs: [Row] = [Row(label: "VortX Player", detail: "all formats, styled subtitles", selected: !onAV) {
+            let onAether = isAetherEngineActive
+            var rs: [Row] = [Row(label: "VortX Player", detail: "all formats, styled subtitles", selected: !onAV && !onAether) {
                 switchPlayerEngine(toAVPlayer: false)
             }]
+            if onAether {
+                // Shown while it plays so the viewer can see it; switching back into it starts a new playback.
+                rs.append(Row(label: "AetherEngine", detail: "testing", selected: true) { close() })
+            }
             if canUseAVPlayerEngine {
                 rs.append(Row(label: "AVPlayer", detail: "Dolby Vision, HLS", selected: onAV) {
                     switchPlayerEngine(toAVPlayer: true)

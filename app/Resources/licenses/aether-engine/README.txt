@@ -1,4 +1,4 @@
-AetherEngine and the libraries it ships with in VortX for Apple TV
+AetherEngine and the libraries it ships with in VortX for Apple TV, iPhone, iPad and Mac
 
 AetherEngine 7.53.0 (Vincent Herbst), LGPL-3.0 with an App Store / DRM exception:
   AetherEngine-LICENSE.txt, which refers to the GNU GPL in GPL-3.0.txt.

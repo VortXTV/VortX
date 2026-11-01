@@ -904,7 +904,7 @@ struct iOSSettingsView: View {
             }
             #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
-                ForEach(PlayerEngineRouter.Override.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                ForEach(PlayerEngineRouter.offeredOverrides, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(.caption).foregroundStyle(.secondary)

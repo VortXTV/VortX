@@ -591,6 +591,9 @@ struct TVPlayerView: View {
     @State private var avEngineFailed = false
     /// AetherEngine failed for this playback and handed the source to libmpv (`demoteAetherToMPV`). One way.
     @State private var aetherEngineFailed = false
+    /// Whether this playback mounts AetherEngine, LATCHED once at start like `engineLatch`, so a RemoteConfig
+    /// refresh or a failed engine load can't swap the surface mid-play; only `demoteAetherToMPV` leaves it.
+    @State private var aetherLatch: Bool?
     /// The engine routing decision, LATCHED once per playback (seeded in onAppear), mirroring
     /// PlayerScreen.engineLatch. `useAVPlayerEngine` is read by `playerSurface` on every SwiftUI body pass
     /// (4-9x/sec during playback), and re-running the full route each render (regex + UserDefaults +
@@ -1274,6 +1277,7 @@ struct TVPlayerView: View {
             // rebuilds the whole view via `.id(req.id)` and reseeds. In-place switchStream deliberately
             // keeps the launch route, and the demote lane (avEngineFailed) stays outside the latch.
             if engineLatch == nil { engineLatch = routedToAVPlayer }
+            if aetherLatch == nil { aetherLatch = routedToAether }
             // Guardrail (message-only): an "Always libmpv" engine override short-circuits the router BEFORE
             // the DV rules, silently disabling the true-DV remux lane; a DV title then tone-maps to HDR10
             // with no clue why. Say so once, in the log AND on screen, so the setting is discoverable.
@@ -1457,11 +1461,14 @@ struct TVPlayerView: View {
 
     /// The viewer chose AetherEngine for this playback, in Settings or the per-source menu.
     private var useAetherEngine: Bool {
+        if forceMPV || aetherEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
+        return aetherLatch ?? routedToAether
+    }
+
+    /// The raw AetherEngine choice, consulted once to seed `aetherLatch`.
+    private var routedToAether: Bool {
         #if VORTX_AETHER_ENGINE
-        if forceMPV || aetherEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked
-            || !PlayerEngineRouter.aetherEngineAvailable {
-            return false
-        }
+        guard PlayerEngineRouter.aetherEngineAvailable else { return false }
         return (initialEnginePreference ?? PlayerEngineRouter.currentOverride) == .aether
         #else
         return false

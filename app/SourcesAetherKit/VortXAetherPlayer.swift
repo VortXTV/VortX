@@ -1,14 +1,18 @@
 import AVFoundation
 import Combine
 import Foundation
+#if os(macOS)
+import AppKit
+#else
 import UIKit
-// Internal: apps importing VortXAetherKit must not load AetherEngine or its AetherLib* FFmpeg headers,
-// which would collide with MPVKit's FFmpeg headers in the same compile.
+#endif
+// Internal: AetherEngine and its AetherLib* FFmpeg headers stay inside this framework, apart from the apps'
+// MPVKit FFmpeg headers.
 internal import AetherEngine
 
 // The only file that imports AetherEngine. This framework is where the engine is linked, so its FFmpeg
-// references resolve to the AetherLib* frameworks here instead of the app's static MPVKit FFmpeg. The app
-// sees plain types only and never imports AetherEngine itself.
+// references resolve to the AetherLib* frameworks here instead of the app's static MPVKit FFmpeg. The apps
+// reach it only through `VortXAetherBridgePlayer` (VortXAetherBridging.swift), loaded at runtime.
 
 /// One audio or subtitle track, in plain values.
 public struct VortXAetherTrack: Sendable, Equatable {
@@ -30,7 +34,7 @@ public enum VortXAetherState: Sendable, Equatable {
 @MainActor
 public final class VortXAetherPlayer {
     /// The view the engine presents into. Host it full screen; the engine swaps its layer per session.
-    public let view: UIView
+    public let view: VortXAetherBridgeView
 
     public var onState: ((VortXAetherState) -> Void)?
     /// Playback clock, the scrubber axis.

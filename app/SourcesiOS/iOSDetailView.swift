@@ -2886,6 +2886,9 @@ struct iOSDetailView: View {
         switch launchEnginePreference {
         case .mpv: return "VortX Player"
         case .avfoundation: return "AVPlayer when compatible"
+        #if VORTX_AETHER_ENGINE
+        case .aether: return "AetherEngine"
+        #endif
         case .auto, .none: return "Player"
         }
     }
@@ -2895,6 +2898,11 @@ struct iOSDetailView: View {
             Button("Auto") { launchEnginePreference = nil }
             Button("VortX Player") { launchEnginePreference = .mpv }
             Button("AVPlayer when compatible") { launchEnginePreference = .avfoundation }
+            #if VORTX_AETHER_ENGINE
+            if PlayerEngineRouter.aetherEngineAvailable {
+                Button("AetherEngine (testing)") { launchEnginePreference = .aether }
+            }
+            #endif
         } label: {
             Label(launchPlayerLabel, systemImage: "play.rectangle")
         }
@@ -7861,6 +7869,11 @@ struct iOSSourceList: View {
                 Button("Auto") { onLaunchEnginePreferenceChange(nil) }
                 Button("VortX Player") { onLaunchEnginePreferenceChange(.mpv) }
                 Button("AVPlayer when compatible") { onLaunchEnginePreferenceChange(.avfoundation) }
+                #if VORTX_AETHER_ENGINE
+                if PlayerEngineRouter.aetherEngineAvailable {
+                    Button("AetherEngine (testing)") { onLaunchEnginePreferenceChange(.aether) }
+                }
+                #endif
             } label: {
                 Label(launchPlayerLabel, systemImage: "play.rectangle")
             }
@@ -7874,6 +7887,9 @@ struct iOSSourceList: View {
         switch launchEnginePreference {
         case .mpv: return "VortX Player"
         case .avfoundation: return "AVPlayer when compatible"
+        #if VORTX_AETHER_ENGINE
+        case .aether: return "AetherEngine"
+        #endif
         case .auto, .none: return "Player"
         }
     }

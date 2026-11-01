@@ -1,20 +1,23 @@
 #if VORTX_AETHER_ENGINE
-import AVFoundation
+import Foundation
+#if os(iOS)
 import UIKit
-import VortXAetherKit
+#endif
 
 /// The AetherEngine lane behind the shared `PlayerEngine` contract. Property changes reach the chrome with
 /// the same keys the libmpv controller emits, so `handleProperty()` runs unchanged against this engine.
-/// AetherEngine itself lives in VortXAetherKit; this file only sees its plain-typed wrapper.
+/// AetherEngine itself lives in VortXAetherKit, loaded at runtime; this file only sees `VortXAetherBridging`.
 @MainActor
 final class AetherEngineController: NSObject, PlayerEngine {
-    let player: VortXAetherPlayer
+    /// Nil when the engine could not start on this device; the first load then reports `startError`, which the
+    /// chrome answers by handing the source to libmpv.
+    let player: (any VortXAetherBridging)?
+    private let startError: String?
     weak var playDelegate: MPVPlayerDelegate?
     /// Text cues drawn above the picture. Bitmap subtitles are not drawn by this lane yet.
     let subtitleOverlay = SubtitleOverlayView()
 
     private(set) var activeLoadToken: PlayerLoadToken?
-    private var loadTask: Task<Void, Never>?
     private var resumeOriginSeconds = 0.0
     private var speed = 1.0
     private var subtitleDelay = 0.0
@@ -35,8 +38,14 @@ final class AetherEngineController: NSObject, PlayerEngine {
     var isFullPlayerPresentation = false
     private(set) var videoSizeMode = "fit"
 
-    init(player: VortXAetherPlayer) {
-        self.player = player
+    override init() {
+        do {
+            player = try AetherEngineLoader.makePlayer()
+            startError = nil
+        } catch {
+            player = nil
+            startError = error.localizedDescription
+        }
         super.init()
         wire()
     }
@@ -47,38 +56,38 @@ final class AetherEngineController: NSObject, PlayerEngine {
     }
 
     private func wire() {
-        player.onState = { [weak self] state in
+        guard let player else { return }
+        player.onState = { [weak self] (state: VortXAetherBridgeState, message: String?) in
             guard let self else { return }
             isSeeking = state == .seeking
             switch state {
             case .playing: emitPause(false)
             case .paused: emitPause(true)
             case .ended: emit(MPVProperty.endFileEof, nil)
-            case .failed(let message): emit(MPVProperty.endFileError, message)
+            case .failed: emit(MPVProperty.endFileError, message ?? "AetherEngine stopped")
             case .idle, .loading, .seeking: break
-            @unknown default: break
             }
         }
         player.onFirstFrame = { [weak self] in self?.hasFirstFrame = true }
-        player.onTime = { [weak self] seconds in
+        player.onTime = { [weak self] (seconds: Double) in
             guard let self, let token = activeLoadToken, seconds.isFinite else { return }
             playDelegate?.propertyChange(propertyName: MPVProperty.timePos,
                 data: PlayerTimePositionEvent(seconds: seconds, loadToken: token,
                                               positionSettled: hasFirstFrame && !isSeeking),
                 loadToken: token)
         }
-        player.onDuration = { [weak self] seconds in
+        player.onDuration = { [weak self] (seconds: Double) in
             guard let self, seconds.isFinite, seconds > 0 else { return }
             emit(MPVProperty.duration, seconds)
-            emit(MPVProperty.seekable, player.canSeek)
+            emit(MPVProperty.seekable, self.player?.canSeek ?? false)
         }
-        player.onBuffering = { [weak self] buffering in self?.emit(MPVProperty.pausedForCache, buffering) }
-        player.onBufferedPosition = { [weak self] seconds in
+        player.onBuffering = { [weak self] (buffering: Bool) in self?.emit(MPVProperty.pausedForCache, buffering) }
+        player.onBufferedPosition = { [weak self] (seconds: Double) in
             guard seconds.isFinite else { return }
             self?.emit(MPVProperty.demuxerCacheTime, seconds)
         }
         player.onTracksChanged = { [weak self] in self?.emit(MPVProperty.trackList, nil) }
-        player.onSubtitleText = { [weak self] text in self?.subtitleOverlay.setText(text) }
+        player.onSubtitleText = { [weak self] (text: String?) in self?.subtitleOverlay.setText(text) }
     }
 
     private func emitPause(_ paused: Bool) {
@@ -93,37 +102,45 @@ final class AetherEngineController: NSObject, PlayerEngine {
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
         let token = loadToken ?? PlayerLoadToken()
-        loadTask?.cancel()
+        player?.cancelLoad()
         activeLoadToken = token
         lastPaused = nil
         hasFirstFrame = false
         isSeeking = false
         subtitleOverlay.setText(nil)
+        guard let player else {
+            // Reported on the next turn, after the surface finishes mounting, like any engine's own failure.
+            let reason = startError ?? "AetherEngine could not start"
+            Task { @MainActor [weak self] in
+                guard let self, activeLoadToken == token else { return }
+                emit(MPVProperty.endFileError, reason)
+            }
+            return token
+        }
         guard audioSidecar == nil else {
             // A separate audio URL needs libmpv; report it so the chrome's failure handling can move on.
             emit(MPVProperty.endFileError, String(localized: "AetherEngine can't play a source with separate audio. Choose VortX Player for this source."))
             return token
         }
-        let start = resumeOriginSeconds > 0 ? resumeOriginSeconds : nil
+        let start = resumeOriginSeconds > 0 ? NSNumber(value: resumeOriginSeconds) : nil
         let autoplay = !holdsNextLoadPaused
         holdsNextLoadPaused = false
-        loadTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await player.load(url: url, headers: headers, startPosition: start, autoplay: autoplay)
-                guard activeLoadToken == token, !Task.isCancelled else { return }
-                player.setRate(speed)
-            } catch is CancellationError {
-            } catch {
-                guard activeLoadToken == token else { return }
-                emit(MPVProperty.endFileError, error.localizedDescription)
+        player.load(url: url, headers: headers, startPosition: start, autoplay: autoplay) { [weak self] (error: NSError?) in
+            guard let self, activeLoadToken == token else { return }
+            guard let error else {
+                self.player?.setRate(speed)
+                return
             }
+            if error.domain == VortXAetherBridgeErrorDomain, error.code == VortXAetherBridgeErrorCode.cancelled.rawValue {
+                return
+            }
+            emit(MPVProperty.endFileError, error.localizedDescription)
         }
         return token
     }
 
     func invalidateLoadToken() {
-        loadTask?.cancel()
+        player?.cancelLoad()
         activeLoadToken = nil
     }
 
@@ -131,22 +148,21 @@ final class AetherEngineController: NSObject, PlayerEngine {
         resumeOriginSeconds = seconds.isFinite ? max(0, seconds) : 0
     }
 
-    func play() { player.play() }
-    func pause() { player.pause() }
-    func togglePause() { lastPaused == true ? player.play() : player.pause() }
+    func play() { player?.play() }
+    func pause() { player?.pause() }
+    func togglePause() { lastPaused == true ? player?.play() : player?.pause() }
     func seek(to seconds: Double) {
         guard seconds.isFinite else { return }
-        Task { await player.seek(to: max(0, seconds)) }
+        player?.seek(to: max(0, seconds), completion: nil)
     }
-    func seek(by seconds: Double) { seek(to: player.currentTime + seconds) }
+    func seek(by seconds: Double) { seek(to: (player?.currentTime ?? 0) + seconds) }
     func setSpeed(_ speed: Double) {
         self.speed = speed
-        player.setRate(speed)
+        player?.setRate(speed)
         emit(MPVProperty.speed, speed)
     }
     func stop() {
-        loadTask?.cancel()
-        player.stop()
+        player?.stop()
         activeLoadToken = nil
         hasFirstFrame = false
         sidecarRevision &+= 1
@@ -158,18 +174,47 @@ final class AetherEngineController: NSObject, PlayerEngine {
 
     // MARK: Tracks and subtitles
 
+    /// One engine track, read from the bridge's plain dictionary.
+    private struct Track {
+        let id: Int
+        let title: String
+        let language: String
+        let codec: String
+        let channels: Int
+        let isForced: Bool
+
+        init?(_ values: [String: Any]) {
+            guard let id = values[VortXAetherBridgeTrackKey.id] as? Int else { return nil }
+            self.id = id
+            title = values[VortXAetherBridgeTrackKey.title] as? String ?? ""
+            language = values[VortXAetherBridgeTrackKey.language] as? String ?? ""
+            codec = values[VortXAetherBridgeTrackKey.codec] as? String ?? ""
+            channels = values[VortXAetherBridgeTrackKey.channels] as? Int ?? 0
+            isForced = values[VortXAetherBridgeTrackKey.isForced] as? Bool ?? false
+        }
+
+        var displayTitle: String {
+            if !title.isEmpty { return title }
+            if !language.isEmpty { return language }
+            return codec.uppercased()
+        }
+    }
+
+    private var audioTracks: [Track] { (player?.audioTracks ?? []).compactMap(Track.init) }
+    private var subtitleTracks: [Track] { (player?.subtitleTracks ?? []).compactMap(Track.init) }
+
     func tracks(ofType type: String) -> [MPVTrack] {
         switch type {
         case "audio":
-            let active = player.activeAudioTrackID
-            return player.audioTracks.map { track in
-                MPVTrack(id: track.id, type: "audio", title: Self.title(track), lang: track.language,
+            let active = player?.activeAudioTrackID?.intValue
+            return audioTracks.map { track in
+                MPVTrack(id: track.id, type: "audio", title: track.displayTitle, lang: track.language,
                          selected: track.id == active, forced: track.isForced)
             }
         case "sub":
-            let active = player.activeSubtitleTrackID
-            return player.subtitleTracks.map { track in
-                MPVTrack(id: track.id, type: "sub", title: Self.title(track), lang: track.language,
+            let active = player?.activeSubtitleTrackID?.intValue
+            return subtitleTracks.map { track in
+                MPVTrack(id: track.id, type: "sub", title: track.displayTitle, lang: track.language,
                          selected: track.id == active, forced: track.isForced)
             }
         default:
@@ -177,15 +222,9 @@ final class AetherEngineController: NSObject, PlayerEngine {
         }
     }
 
-    private static func title(_ track: VortXAetherTrack) -> String {
-        if !track.title.isEmpty { return track.title }
-        if !track.language.isEmpty { return track.language }
-        return track.codec.uppercased()
-    }
-
-    func setAudioTrack(_ id: Int) { player.selectAudioTrack(id: id) }
+    func setAudioTrack(_ id: Int) { player?.selectAudioTrack(id: id) }
     func setSubtitleTrack(_ id: Int) {
-        if id < 0 { player.clearSubtitle() } else { player.selectSubtitleTrack(id: id) }
+        if id < 0 { player?.clearSubtitle() } else { player?.selectSubtitleTrack(id: id) }
     }
     /// Add-on subtitles download through the shared pinned transport, like the other lanes: HTTPS only, the
     /// connected address vetted, no redirects, size-capped. The engine opens only the local copy, never the
@@ -194,7 +233,7 @@ final class AetherEngineController: NSObject, PlayerEngine {
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
         sidecarRevision &+= 1
         let revision = sidecarRevision
-        guard let remote = URL(string: url), let token = activeLoadToken else { completion?(false); return }
+        guard let remote = URL(string: url), let token = activeLoadToken, player != nil else { completion?(false); return }
         let finish: @MainActor @Sendable (Bool) -> Void = { ok in completion?(ok) }
         SubtitleFileFetcher.fetch(remote, timeout: timeout) { [weak self] data in
             let file = data.flatMap { Self.writeSidecar($0, remote: remote) }
@@ -205,7 +244,7 @@ final class AetherEngineController: NSObject, PlayerEngine {
                     return
                 }
                 self.replaceSidecarFile(with: file)
-                self.player.selectSidecarSubtitle(url: file, headers: nil)
+                self.player?.selectSidecarSubtitle(url: file, headers: nil)
                 finish(true)
             }
         }
@@ -234,25 +273,27 @@ final class AetherEngineController: NSObject, PlayerEngine {
     }
     func setSubDelay(_ seconds: Double) {
         subtitleDelay = seconds
-        player.setSubtitleDelay(seconds)
+        player?.setSubtitleDelay(seconds)
     }
-    func setAudioDelay(_ seconds: Double) { player.setAudioDelay(seconds) }
+    func setAudioDelay(_ seconds: Double) { player?.setAudioDelay(seconds) }
     func applySubtitleStyle() { subtitleOverlay.applyStyle() }
     func currentSubDelaySeconds() -> Double { subtitleDelay }
 
     // MARK: Facts and diagnostics
 
-    func mediaDurationSeconds() -> Double { player.duration }
+    func mediaDurationSeconds() -> Double { player?.duration ?? 0 }
     func chapters() -> [MPVChapter] { [] }
     func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int) {
-        let audio = player.audioTracks.first { $0.id == player.activeAudioTrackID }
+        let active = player?.activeAudioTrackID?.intValue
+        let audio = audioTracks.first { $0.id == active }
         return (0, 0, audio?.codec ?? "", audio?.channels ?? 0)
     }
     func playbackStats() -> [(String, String)] {
+        guard let player else { return [("Engine", "AetherEngine (not started)")] }
         var rows: [(String, String)] = [("Engine", "AetherEngine"), ("Route", player.videoRoute),
                                         ("Video", player.videoFormat), ("Source video", player.sourceVideoFormat),
                                         ("Audio delivery", player.audioDelivery)]
-        if let profile = player.sourceDolbyVisionProfile { rows.append(("Dolby Vision profile", String(profile))) }
+        if let profile = player.sourceDolbyVisionProfile { rows.append(("Dolby Vision profile", profile.stringValue)) }
         if let decoder = player.videoDecoder { rows.append(("Video decoder", decoder)) }
         if let decoder = player.audioDecoder { rows.append(("Audio decoder", decoder)) }
         return rows
@@ -263,16 +304,26 @@ final class AetherEngineController: NSObject, PlayerEngine {
     func setAudioOutputMode(_ mode: AudioOutputMode) {}
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) { completion(nil) }
-    var hdrAvailable: Bool { player.videoFormat != "sdr" }
-    var playbackPositionSeconds: Double { player.currentTime }
+    var hdrAvailable: Bool { (player?.videoFormat ?? "sdr") != "sdr" }
+    var playbackPositionSeconds: Double { player?.currentTime ?? 0 }
 
     func setVolume(_ volume0to100: Double) {
         userVolume = min(max(volume0to100, 0), 100)
-        player.volume = isMuted ? 0 : userVolume / 100
+        player?.volume = isMuted ? 0 : userVolume / 100
     }
     func setMuted(_ muted: Bool) {
         isMuted = muted
-        player.volume = muted ? 0 : userVolume / 100
+        player?.volume = muted ? 0 : userVolume / 100
     }
+
+    #if os(iOS)
+    /// Force the player into landscape (or back to portrait) for viewers who keep auto-rotation off, the same
+    /// scene geometry request the libmpv lane makes.
+    func setOrientation(landscape: Bool) {
+        guard let window = subtitleOverlay.window, let scene = window.windowScene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: landscape ? .landscapeRight : .portrait))
+        window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+    #endif
 }
 #endif
