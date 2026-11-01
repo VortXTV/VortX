@@ -20,7 +20,7 @@ POINTER = {"runId": 11, "attempt": 2, "artifactId": 33}
 BASE = datetime(2026, 10, 30, tzinfo=timezone.utc)
 
 
-def project(build="281"):
+def project(build="282"):
     return "name: Controlled\ntargets:\n" + "".join(
         f"  {name}:\n    settings:\n      MARKETING_VERSION: 0.5.6\n      CURRENT_PROJECT_VERSION: {build}\n"
         for name in ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXAetherKit", "VortXTVLite")) + "schemes:\n"
@@ -49,14 +49,14 @@ class Beta8AppleHotfixControls(unittest.TestCase):
     def test_exact_release_version_build_and_native_only(self):
         self.assertEqual(V.tag_version(V.TAG), "0.5.6")
         self.assertEqual(V.expected_engine(V.TAG), "2ea2e0f27dd2e53b7b28228435ca35a70f92831f")
-        self.assertEqual(V.source_versions(project(), "0.5.6", V.TAG), "281")
-        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.11", "v0.5.6", V.BUILD_TAG, V.TAG + " "):
+        self.assertEqual(V.source_versions(project(), "0.5.6", V.TAG), "282")
+        for tag in ("v0.5.6-beta.7", "v0.5.6-beta.8", "v0.5.6-beta.9", "v0.5.6-beta.10", "v0.5.6-beta.12", "v0.5.6", V.BUILD_TAG, V.TAG + " "):
             with self.assertRaises(ValueError): V.expected_engine(tag)
-        with self.assertRaises(ValueError): V.source_versions(project("280"), "0.5.6", V.TAG)
+        with self.assertRaises(ValueError): V.source_versions(project("281"), "0.5.6", V.TAG)
 
     def test_each_real_target_pair_required(self):
         for malformed in (project().replace("VortXTopShelf:", "OtherExtension:"),
-                          project().replace("CURRENT_PROJECT_VERSION: 281", "CURRENT_PROJECT_VERSION: 282", 1),
+                          project().replace("CURRENT_PROJECT_VERSION: 282", "CURRENT_PROJECT_VERSION: 283", 1),
                           project().replace("MARKETING_VERSION: 0.5.6", "MARKETING_VERSION: 0.5.7", 1)):
             with self.assertRaises(ValueError): V.source_versions(malformed, "0.5.6", V.TAG)
 
