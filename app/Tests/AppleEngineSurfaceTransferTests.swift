@@ -92,8 +92,9 @@ private enum AppleEngineSurfaceTransferTests {
         precondition(tvHandler.contains("recoveryPauseOwner = loadToken"),
                      "a parked TV replacement must use the existing no-first-frame resume path")
         precondition(tvHandler.contains("bindIncomingTransportIntent(to: loadToken)"))
-        let tvPause = tv.components(separatedBy: "private func viewerPause() {")[1]
-            .components(separatedBy: "private func viewerPlay()")[0]
+        // Watch Party added `shareWithParty:`; the pause body is the same whatever the signature carries.
+        let tvPause = tv.components(separatedBy: "private func viewerPause(")[1]
+            .components(separatedBy: "private func viewerPlay(")[0]
         precondition(!tvPause.contains("guard coordinator.player != nil"))
         print("PASS engine surface transport intent, teardown input, owner/context fencing and caller wiring")
     }
