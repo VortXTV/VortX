@@ -64,7 +64,8 @@ enum ProfilePickerLayoutTests {
         precondition(!picker.contains("Reconnect the owner's Stremio account"))
         precondition(picker.contains("if !nativeSync.isSignedIn"))
         precondition(picker.contains("Button(\"Sign in\") { deferredSelection.cancel(); accountHelpNeeded = true }"))
-        precondition(picker.contains(".disabled(!nativeSync.isSignedIn)"))
+        precondition(picker.contains(".disabled(!nativeSync.isSignedIn || nativeSync.accountReconnectRequired)"),
+                     "Signed-out and reconnect-required pickers keep every profile tile disabled")
         precondition(picker.contains("isPhone: profilePickerIsPhone"))
         precondition(picker.contains("isTV: profilePickerIsTV"))
         precondition(picker.contains(".frame(maxWidth: layout.contentMaxWidth)"))
