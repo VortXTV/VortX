@@ -3521,7 +3521,13 @@ struct CoreStreamList: View {
         sourceList.setContext(
             metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin,
             auxiliaryTarget: auxiliaryTarget,
-            mediaServerTarget: mediaServerTarget
+            mediaServerTarget: mediaServerTarget,
+            titleMatch: meta.map { meta in
+                // An episode page matches its episode; a movie, live or franchise page matches the title alone.
+                episodeStreamId == nil
+                    ? SourceTitleMatch.Target(title: meta.name)
+                    : SourceTitleMatch.Target(title: meta.name, season: meta.season, episode: meta.episode)
+            }
         )
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best

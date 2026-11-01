@@ -1336,6 +1336,15 @@ struct iOSSettingsView: View {
                 Text("30 GB").tag(30.0)
                 Text("50 GB").tag(50.0)
             }
+            // Title match (#172): hide sources whose release name does not match the title being opened.
+            Picker("Title match", selection: $sourcePrefs.titleMatchThreshold) {
+                Text("Off").tag(0)
+                Text("50%").tag(50)
+                Text("70%").tag(70)
+                Text("90%").tag(90)
+            }
+            Text("Hides sources whose file name matches the title or episode you opened less than this. Sources without a file name are kept, and a title never loses every source.")
+                .font(.footnote).foregroundStyle(.secondary)
             // Compact source rows (#117): display-only, hides the raw release-name line under each source
             // so a row reads as "2160p · Remux · DV · 12.4 GB" from the parsed badges + tags.
             Toggle("Compact source rows", isOn: $compactStreamLabels).tint(Theme.Palette.accent)

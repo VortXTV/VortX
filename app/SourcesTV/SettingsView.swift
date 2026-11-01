@@ -1222,6 +1222,12 @@ struct SettingsView: View {
                       selection: $sourcePrefs.maxFileSizeGB)
             Text("Hides sources larger than the cap (e.g. 1080p but not a 20 GB file). Sources with no stated size are kept.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Title match"),
+                      [("0", String(localized: "Off")), ("50", "50%"), ("70", "70%"), ("90", "90%")],
+                      selection: Binding(get: { String(sourcePrefs.titleMatchThreshold) },
+                                         set: { sourcePrefs.titleMatchThreshold = Int($0) ?? 0 }))
+            Text("Hides sources whose file name matches the title or episode you opened less than this. Sources without a file name are kept, and a title never loses every source.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             // Instant sources / Hide dead torrents / HDR only / Hide AV1 / Preferred audio only / Hide unknown
             // quality moved to the Smart source selection chip panel above (Cached / Dead swarms / HDR-DV /

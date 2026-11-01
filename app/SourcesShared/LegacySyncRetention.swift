@@ -14,7 +14,7 @@ enum LegacySyncRetention {
         .object(Set(keys.split(separator: " ").map(String.init)), children)
     }
 
-    private static let playback = object("audioLang subtitleLang forcedPolicy forced subFont subSize subColor subBackground subSizeScale subBrightness sourceTypeOrder useAddonOrder safetyMode instantOnly hideDeadTorrents hdrOnly excludeAV1 excludeKeywords includeKeywords keywordsAreRegex maxResolution maxFileSizeGB minResolution hideUnknownResolution preferredAudioOnly preferKeywords avoidBehavior autoPickBest")
+    private static let playback = object("audioLang subtitleLang forcedPolicy forced subFont subSize subColor subBackground subSizeScale subBrightness sourceTypeOrder useAddonOrder safetyMode instantOnly hideDeadTorrents hdrOnly excludeAV1 excludeKeywords includeKeywords keywordsAreRegex maxResolution maxFileSizeGB titleMatchThreshold minResolution hideUnknownResolution preferredAudioOnly preferKeywords avoidBehavior autoPickBest")
     private static let discovery = object("hiddenCatalogs catalogOrder hiddenHubCategories regionOverrideCaptured regionOverride filtersCaptured filtersData selectedProviders providerOrder tabVisibilityCaptured hideLiveTab hideDiscoverTab hideLibraryTab hideSearchTab showCollectionsHome showCollectionsDiscover continueWatchingSource continueWatchingWindow")
     private static let ranking = object("addonOrder sourceTypeOrder useAddonOrder")
     private static let addonPreferences = object("disabledAddonURLsOverride rankingOverride", ["rankingOverride": ranking])

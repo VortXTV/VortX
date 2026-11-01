@@ -3389,9 +3389,16 @@ struct iOSDetailView: View {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: rememberedQuality, pin: sourcePin,
             auxiliaryTarget: auxiliaryTarget,
-            mediaServerTarget: mediaServerTarget
+            mediaServerTarget: mediaServerTarget,
+            titleMatch: movieTitleMatch
         )
         return (sourceList.groups, sourceList.best)
+    }
+
+    /// The opened movie for the optional title-match filter; a series or live page has no single release.
+    private var movieTitleMatch: SourceTitleMatch.Target? {
+        guard effectiveType == "movie", let meta else { return nil }
+        return SourceTitleMatch.Target(title: meta.name, year: SourceTitleMatch.year(from: meta.releaseInfo))
     }
 
     /// The ranked groups for the LIVE source set. rankedGroups ignores continuity, so the group order
@@ -6677,7 +6684,8 @@ struct iOSEpisodeStreams: View {
         sourceList.setContext(
             metaId: meta.id, streamId: shownVideo.id, continuity: rememberedQuality, pin: sourcePin,
             auxiliaryTarget: episodeTarget,
-            mediaServerTarget: mediaServerTarget
+            mediaServerTarget: mediaServerTarget,
+            titleMatch: SourceTitleMatch.Target(title: meta.name, season: auxiliarySeason, episode: auxiliaryEpisode)
         )
         return sourceList.groups
     }

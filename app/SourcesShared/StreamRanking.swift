@@ -1064,6 +1064,22 @@ enum StreamRanking {
         }
     }
 
+    /// The optional title-match filter (#172): hide streams whose release name matches `target` below
+    /// `threshold` percent. A stream naming no release always stays, and so does every stream when the filter
+    /// would leave none, so a strict setting can never make a title look like it has no sources.
+    static func titleMatched(_ groups: [CoreStreamSourceGroup], target: SourceTitleMatch.Target?,
+                             threshold: Int) -> [CoreStreamSourceGroup] {
+        guard threshold > 0, let target else { return groups }
+        let kept = groups.compactMap { group -> CoreStreamSourceGroup? in
+            let streams = group.streams.filter {
+                SourceTitleMatch.passes(texts: [$0.behaviorHints?.filename, $0.description, $0.name],
+                                        target: target, threshold: threshold)
+            }
+            return streams.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
+        }
+        return kept.isEmpty ? groups : kept
+    }
+
     static func applyUserFilters(_ groups: [CoreStreamSourceGroup], debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
         let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
         let prefs = SourcePreferences.reading
