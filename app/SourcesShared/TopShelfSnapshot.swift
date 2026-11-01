@@ -43,12 +43,26 @@ enum TopShelfSnapshot {
     /// Continue Watching row the Home screen already shows. Nil means the feature is off, never an error.
     static let appGroupID: String? = resolveAppGroupID(bundle: .main)
 
-    enum AppGroupSource: String, Sendable { case canonical, signer, none }
+    /// `dedicated` is a signer's copy of VortX's own group; `signer` is a signer group other apps can share.
+    enum AppGroupSource: String, Sendable { case canonical, dedicated, signer, none }
 
-    /// Which kind of group this copy uses, for diagnostics; the identifier itself is not logged.
+    /// Which kind of group this copy uses; the identifier itself is not logged. Trakt and SIMKL rows go only
+    /// to a group no other app shares (`TopShelfSnapshotWriter.publishCurrent`).
     static var appGroupSource: AppGroupSource {
         guard let appGroupID else { return .none }
-        return appGroupID == canonicalAppGroupID ? .canonical : .signer
+        if appGroupID == canonicalAppGroupID { return .canonical }
+        return isDedicatedSignerGroup(appGroupID) ? .dedicated : .signer
+    }
+
+    /// AltStore and SideStore give each app its own copy of every group it declares, named after it
+    /// (`group.com.stremiox.tv.<team>`), and only an app that declares VortX's group receives that copy. A
+    /// signing service's generic group (a FlareStore log shows `group.<hex>.1`) can be granted to every app it
+    /// signs, so it does not count.
+    static func isDedicatedSignerGroup(_ id: String) -> Bool {
+        let prefix = canonicalAppGroupID + "."
+        guard id.hasPrefix(prefix) else { return false }
+        let suffix = id.dropFirst(prefix.count)
+        return !suffix.isEmpty && suffix.allSatisfy { $0.isLetter || $0.isNumber }
     }
 
     static func resolveAppGroupID(bundle: Bundle) -> String? {

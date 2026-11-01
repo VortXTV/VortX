@@ -560,6 +560,21 @@ check(TopShelfSnapshot.selectAppGroup(granted: ["group.*", "com.example.notagrou
 check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonicalGroup) { _ in false } == nil,
       "no granted container leaves the feature off")
 
+section("only a group no other app shares carries Trakt and SIMKL rows")
+
+check(TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + ".ABCDE12345"),
+      "an AltStore or SideStore copy of VortX's own group is VortX's")
+check(!TopShelfSnapshot.isDedicatedSignerGroup(signerGroup),
+      "a signing service's generic group can be shared, so it is not dedicated")
+check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + "."),
+      "an empty team suffix is not a copy of the group")
+check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + ".team.extra"),
+      "a longer name under VortX's group is not a signer copy")
+check(!TopShelfSnapshot.isDedicatedSignerGroup("group.com.stremiox.tvx.ABCDE12345"),
+      "a lookalike group name is not VortX's")
+check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup),
+      "the canonical group itself is reported as canonical, not as a signer copy")
+
 let profilePlist = """
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

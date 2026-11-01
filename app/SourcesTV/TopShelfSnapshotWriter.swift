@@ -115,8 +115,9 @@ enum TopShelfSnapshotWriter {
         guard snapshot.intent.isCurrent() else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
-        // A signing service's group can be shared by other apps it signs for this viewer. Trakt and SIMKL
-        // history, and Trakt's warmed artwork, never go there: such a queue leaves the static shelf image.
+        // A signing service's generic group can be shared by other apps it signs for this viewer. Trakt and
+        // SIMKL history, and Trakt's warmed artwork, never go there: such a queue leaves the static shelf
+        // image. VortX's own group, and a signer's copy of it (`.dedicated`), carry them like local rows (#229).
         guard selection.source == .local || TopShelfSnapshot.appGroupSource != .signer else {
             cancelWarm(clearArtwork: true); publish([]); return
         }
