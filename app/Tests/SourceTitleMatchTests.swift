@@ -72,6 +72,17 @@ enum SourceTitleMatchTests {
         check(SourceTitleMatch.thresholds == [0, 50, 70, 90], "the setting offers off, 50, 70 and 90 percent")
         check(SourceTitleMatch.normalized("  Léon: The Professional (1994) ") == "leon the professional 1994",
               "normalisation folds accents and collapses punctuation")
+        check(SourceTitleMatch.admittedThreshold(70) == 70 && SourceTitleMatch.admittedThreshold(65) == nil
+              && SourceTitleMatch.admittedThreshold(nil) == nil,
+              "only an offered threshold is admitted from storage or sync")
+
+        print("release year")
+        check(SourceTitleMatch.year(from: "2021") == 2021, "a plain year")
+        check(SourceTitleMatch.year(from: "2019-2023") == 2019, "the first year of a range")
+        check(SourceTitleMatch.year(from: "2019–") == 2019, "an open range")
+        check(SourceTitleMatch.year(from: "123456") == nil, "a longer number is not a year")
+        check(SourceTitleMatch.year(from: "1850") == nil && SourceTitleMatch.year(from: nil) == nil,
+              "an implausible or absent year is none")
 
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }

@@ -107,6 +107,7 @@ final class SourcePreferences: ObservableObject {
     nonisolated static let hideUnknownResKey     = "stremiox.streaming.hideUnknownResolution"
     nonisolated static let preferredAudioKey     = "stremiox.streaming.preferredAudioOnly"
     nonisolated static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
+    nonisolated static let titleMatchThresholdKey = "stremiox.streaming.titleMatchThreshold"
     nonisolated static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
     nonisolated static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
     nonisolated static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
@@ -150,6 +151,7 @@ final class SourcePreferences: ObservableObject {
     nonisolated static let defaultKeywordsAreRegex      = false
     nonisolated static let defaultMaxResolution         = 0
     nonisolated static let defaultMaxFileSizeGB         = 0.0
+    nonisolated static let defaultTitleMatchThreshold   = 0
     nonisolated static let defaultMinResolution         = 0
     nonisolated static let defaultHideUnknownResolution = false
     nonisolated static let defaultPreferredAudioOnly    = false
@@ -279,6 +281,12 @@ final class SourcePreferences: ObservableObject {
     @Published var maxFileSizeGB: Double {
         didSet { publishReadingSnapshot(); UserDefaults.standard.set(maxFileSizeGB, forKey: Self.maxFileSizeKey) }
     }
+    /// Hide sources whose release name matches the opened title below this percent (0 = off, else one of
+    /// `SourceTitleMatch.thresholds`; #172). Applied where a screen assembles its source list for a known title
+    /// (`StreamRanking.titleMatched`): a stream naming no release, and a list the threshold would empty, stay.
+    @Published var titleMatchThreshold: Int {
+        didSet { UserDefaults.standard.set(titleMatchThreshold, forKey: Self.titleMatchThresholdKey) }
+    }
     /// Show only HDR / Dolby Vision sources. Off by default (aggressive, hides most SDR releases).
     @Published var hdrOnly: Bool {
         didSet { publishReadingSnapshot(); UserDefaults.standard.set(hdrOnly, forKey: Self.hdrOnlyKey) }
@@ -337,6 +345,7 @@ final class SourcePreferences: ObservableObject {
          hideUnknownResolution ? "1" : "0",
          preferredAudioOnly ? "1" : "0",
          String(maxFileSizeGB),
+         String(titleMatchThreshold),
          hdrOnly ? "1" : "0",
          excludeAV1 ? "1" : "0",
          // Smart Source Selection (Lane A): the Prefer words and the Avoid behavior both change RANK order,
@@ -391,6 +400,7 @@ final class SourcePreferences: ObservableObject {
         hideUnknownResolution = UserDefaults.standard.bool(forKey: Self.hideUnknownResKey)
         preferredAudioOnly = UserDefaults.standard.bool(forKey: Self.preferredAudioKey)
         maxFileSizeGB   = UserDefaults.standard.double(forKey: Self.maxFileSizeKey)
+        titleMatchThreshold = UserDefaults.standard.integer(forKey: Self.titleMatchThresholdKey)
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
         defaultSourceSort = UserDefaults.standard.string(forKey: Self.defaultSortKey) ?? "best"
@@ -457,6 +467,8 @@ final class SourcePreferences: ObservableObject {
         if preferredAudioOnly != prefAudio { preferredAudioOnly = prefAudio }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
+        let titleMatch = d.integer(forKey: Self.titleMatchThresholdKey)
+        if titleMatchThreshold != titleMatch { titleMatchThreshold = titleMatch }
         // Smart Source Selection (Lane A). Per-profile now (folded into PlaybackPrefs): a profile switch
         // rewrites these flat keys via applyPlayback, so this guarded re-read re-syncs the singleton's
         // in-memory @Published values on a switch, exactly like the filters above (and also picks up a

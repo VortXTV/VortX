@@ -8,7 +8,7 @@ import Foundation
 /// release marker (year, episode tag, resolution or video extension). A stream that names no release, such as
 /// "Debridio 1080p", scores nil and is always kept.
 enum SourceTitleMatch {
-    struct Target: Equatable, Sendable {
+    struct Target: Hashable, Sendable {
         let title: String
         let year: Int?
         let season: Int?
@@ -24,6 +24,26 @@ enum SourceTitleMatch {
 
     /// Thresholds the setting offers, in percent; 0 is off.
     static let thresholds = [0, 50, 70, 90]
+
+    /// The first plausible release year in catalog text such as "2021" or "2019-2023", for a movie target.
+    static func year(from releaseInfo: String?) -> Int? {
+        guard let releaseInfo else { return nil }
+        var digits = ""
+        for character in releaseInfo + " " {
+            if character.isASCII, character.isNumber {
+                digits.append(character)
+                continue
+            }
+            if digits.count == 4, let year = Int(digits), (1900...2099).contains(year) { return year }
+            digits = ""
+        }
+        return nil
+    }
+
+    /// A synced or stored threshold the setting offers, else nil (an unknown value never filters).
+    static func admittedThreshold(_ value: Int?) -> Int? {
+        value.flatMap { thresholds.contains($0) ? $0 : nil }
+    }
 
     /// 0...100, or nil when none of the texts names a release to compare. The best-scoring release wins.
     static func score(texts: [String?], target: Target) -> Int? {

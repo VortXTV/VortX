@@ -133,6 +133,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         current.isKids = ProfileStore.activeIsKids()
         current.directLinksOnly = PlaybackSettings.directLinksOnly
         current.disabledAddons = ProfileStore.activeDisabledAddons()
+        current.titleMatchThreshold = SourcePreferences.shared.titleMatchThreshold
         return current
     }
 
@@ -155,6 +156,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         hasher.combine(ctx.isKids)
         hasher.combine(ctx.directLinksOnly)
         hasher.combine(ctx.disabledAddons)
+        hasher.combine(ctx.titleMatch)
+        hasher.combine(ctx.titleMatchThreshold)
         hasher.combine(cachedHashes)
         hasher.combine(tombstones)
         // A pick made in the player changes the rank without changing any epoch, so it has to be in the
@@ -193,6 +196,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         var isKids = false           // Kids content guard state (read inside applyUserFilters)
         var directLinksOnly = false  // drop torrent sources entirely
         var disabledAddons: Set<String> = []   // per-profile disabled add-on bases
+        var titleMatch: SourceTitleMatch.Target?   // the opened title, for the optional title-match filter (#172)
+        var titleMatchThreshold = 0  // SourcePreferences.titleMatchThreshold; 0 = off
     }
 
     // MARK: Internals
@@ -322,7 +327,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         continuity: String?,
         pin: ResolvedPin?,
         auxiliaryTarget: SourceIndexIdentity.TargetResolution,
-        mediaServerTarget: SourceIndexIdentity.MediaServerTarget?
+        mediaServerTarget: SourceIndexIdentity.MediaServerTarget?,
+        titleMatch: SourceTitleMatch.Target? = nil
     ) {
         var next = Context()
         next.metaId = metaId
@@ -336,6 +342,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.isKids = ProfileStore.activeIsKids()
         next.directLinksOnly = PlaybackSettings.directLinksOnly
         next.disabledAddons = ProfileStore.activeDisabledAddons()
+        next.titleMatch = titleMatch
+        next.titleMatchThreshold = SourcePreferences.shared.titleMatchThreshold
         guard next != context else { return }
         let identityChanged = next.metaId != context.metaId || next.streamId != context.streamId
             || next.auxiliaryTarget != context.auxiliaryTarget
@@ -538,6 +546,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                     return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
                 }
             }
+            assembled = StreamRanking.titleMatched(assembled, target: ctx.titleMatch, threshold: ctx.titleMatchThreshold)
             let (ranked, rankedBest, rankedTiers, rankedResOpts) =
                 StreamRanking.capturedPresentation(assembled, preferences: workerPreferences,
                     continuity: ctx.continuity, pin: ctx.pin, sticky: sticky,
