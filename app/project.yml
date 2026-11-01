@@ -422,20 +422,6 @@ targets:
         embed: true
         link: false
     postBuildScripts:
-      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
-      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
-        name: Embed AetherEngine FFmpeg frameworks
-        basedOnDependencyAnalysis: false
-        outputFiles:
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
-          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
       # Embed the streaming server. The binary is a gitignored, script-produced artifact
       # (app/Vendor/vortx-streaming-server, from ../scripts/build-mac-server.sh, which needs the
       # engine checkout like the ffi xcframework build). A build without it fails here rather than
@@ -453,6 +439,20 @@ targets:
           - "$(SRCROOT)/Vendor/vortx-streaming-server"
         outputFiles:
           - "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/vortx-streaming-server"
+      # AetherEngine's FFmpeg frameworks; see the script for why the app embeds them itself.
+      - script: '"${SRCROOT}/../scripts/embed-aether-frameworks.sh"'
+        name: Embed AetherEngine FFmpeg frameworks
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavcodec.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavfilter.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavformat.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibavutil.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibdav1d.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswresample.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibswscale.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzimg.framework"
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/AetherLibzvbi.framework"
     settings:
       base:
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
