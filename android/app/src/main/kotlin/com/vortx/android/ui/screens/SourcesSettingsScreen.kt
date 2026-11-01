@@ -207,6 +207,13 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     selectedId = formatSizeId(ui.maxFileSizeGB),
                     onSelect = { id -> mutate { maxFileSizeGB = id.toDouble() } },
                 )
+                // Title match (#172): sources without a file name are kept, and a title never loses every source.
+                PickerRow(
+                    label = "Title match",
+                    options = titleMatchOptions,
+                    selectedId = ui.titleMatchThreshold.toString(),
+                    onSelect = { id -> mutate { titleMatchThreshold = id.toInt() } },
+                )
                 // HDR only / Hide AV1 / Hide unlabelled resolutions moved to the Smart source selection chips
                 // above (HDR / DV, AV1, Stated quality). They write the same store keys.
             }
@@ -328,6 +335,7 @@ internal data class SourcesPrefsUi(
     val maxResolution: Int,
     val minResolution: Int,
     val maxFileSizeGB: Double,
+    val titleMatchThreshold: Int,
     val compactStreamLabels: Boolean,
 )
 
@@ -350,6 +358,7 @@ private fun readPrefs(store: SourcePreferencesStore) = SourcesPrefsUi(
     maxResolution = store.maxResolution,
     minResolution = store.minResolution,
     maxFileSizeGB = store.maxFileSizeGB,
+    titleMatchThreshold = store.titleMatchThreshold,
     compactStreamLabels = store.compactStreamLabels,
 )
 
@@ -385,6 +394,13 @@ private val minResolutionOptions: List<Pair<String, String>> = listOf(
 /// Size ids are plain GB doubles; `0` is the no-cap sentinel (StreamRanking.kt:613 gates on `> 0`). The 4 GB
 /// and 15 GB entries are the Data Saver and Balanced preset values (SourcePreferences.kt:313-316) so the
 /// preset a viewer taps shows up as a selected chip here rather than as an unexplained custom value.
+private val titleMatchOptions: List<Pair<String, String>> = listOf(
+    "0" to "Off",
+    "50" to "50%",
+    "70" to "70%",
+    "90" to "90%",
+)
+
 private val fileSizeOptions: List<Pair<String, String>> = listOf(
     "0.0" to "No cap",
     "4.0" to "4 GB",

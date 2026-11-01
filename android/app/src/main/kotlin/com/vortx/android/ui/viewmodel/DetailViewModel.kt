@@ -22,6 +22,7 @@ import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaRef
+import com.vortx.android.engine.SourceTitleMatch
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
@@ -1465,7 +1466,21 @@ class DetailViewModel(
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
             contentId = contentId,
+            titleMatch = titleMatchTarget(episodeId),
+            titleMatchThreshold = sourcePrefs.titleMatchThreshold,
         )
+
+    /// The opened movie or episode for the optional title-match filter; a channel or TV page has no single release.
+    private fun titleMatchTarget(episodeId: String?): SourceTitleMatch.Target? {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return null
+        return when (detail.type) {
+            MediaType.MOVIE -> SourceTitleMatch.Target(detail.name, year = SourceTitleMatch.year(detail.releaseInfo))
+            MediaType.SERIES -> detail.videos.firstOrNull { it.id == episodeId }
+                ?.let { SourceTitleMatch.Target(detail.name, season = it.season, episode = it.episode) }
+                ?: SourceTitleMatch.Target(detail.name)
+            else -> null
+        }
+    }
 
     private fun playbackSourcePreferences() = sourcePrefs.snapshot(
         playbackAudioPreference.languages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),

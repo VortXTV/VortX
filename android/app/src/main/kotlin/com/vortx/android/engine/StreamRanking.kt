@@ -699,6 +699,22 @@ object StreamRanking {
     /// Drop streams that fail the user filters, and any group left empty. Always strips non-video
     /// diagnostic pseudo-streams first (unconditional on Apple too). No-op filtering when nothing is set
     /// (and not a Kids profile). Mirrors Apple `applyUserFilters`.
+    /**
+     * The optional title-match filter (#172): hide streams whose release name matches [target] below [threshold]
+     * percent. A stream naming no release always stays, and so does every stream when the filter would leave none,
+     * so a strict setting never makes a title look like it has no sources. Mirrors Apple `titleMatched`.
+     */
+    fun titleMatched(groups: List<StreamGroup>, target: SourceTitleMatch.Target?, threshold: Int): List<StreamGroup> {
+        if (threshold <= 0 || target == null) return groups
+        val kept = groups.mapNotNull { group ->
+            val streams = group.streams.filter {
+                SourceTitleMatch.passes(listOf(it.filename, it.description, it.title), target, threshold)
+            }
+            if (streams.isEmpty()) null else group.copy(streams = streams)
+        }
+        return kept.ifEmpty { groups }
+    }
+
     fun applyUserFilters(
         groups: List<StreamGroup>,
         prefs: SourcePrefsSnapshot = installedReading,

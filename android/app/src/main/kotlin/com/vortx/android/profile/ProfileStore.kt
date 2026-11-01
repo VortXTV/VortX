@@ -730,6 +730,7 @@ class ProfileStore private constructor(context: Context) {
             includeKeywords = prefs.getString(SourcePreferencesStore.INCLUDE_KEY, ""),
             keywordsAreRegex = prefs.getBoolean(SourcePreferencesStore.REGEX_KEY, false),
             maxResolution = prefs.getInt(SourcePreferencesStore.MAX_RESOLUTION_KEY, 0),
+            titleMatchThreshold = prefs.getInt(SourcePreferencesStore.TITLE_MATCH_THRESHOLD_KEY, 0),
             maxFileSizeGB = prefs.getFloat(SourcePreferencesStore.MAX_FILE_SIZE_KEY, 0f).toDouble(),
             minResolution = prefs.getInt(SourcePreferencesStore.MIN_RESOLUTION_KEY, 0),
             hideUnknownResolution = prefs.getBoolean(SourcePreferencesStore.HIDE_UNKNOWN_RES_KEY, false),
@@ -780,6 +781,7 @@ class ProfileStore private constructor(context: Context) {
         applyString(e, SourcePreferencesStore.INCLUDE_KEY, p?.includeKeywords, "", resetUnset)
         applyBool(e, SourcePreferencesStore.REGEX_KEY, p?.keywordsAreRegex, false, resetUnset)
         applyInt(e, SourcePreferencesStore.MAX_RESOLUTION_KEY, p?.maxResolution, 0, resetUnset)
+        applyInt(e, SourcePreferencesStore.TITLE_MATCH_THRESHOLD_KEY, p?.titleMatchThreshold, 0, resetUnset)
         applyFloat(e, SourcePreferencesStore.MAX_FILE_SIZE_KEY, p?.maxFileSizeGB, 0.0, resetUnset)
         applyInt(e, SourcePreferencesStore.MIN_RESOLUTION_KEY, p?.minResolution, 0, resetUnset)
         applyBool(e, SourcePreferencesStore.HIDE_UNKNOWN_RES_KEY, p?.hideUnknownResolution, false, resetUnset)
