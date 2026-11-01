@@ -9,8 +9,9 @@ import { test } from 'node:test';
 const workflow = readFileSync(new URL('../../.github/workflows/release-tvos.yml', import.meta.url), 'utf8');
 const source = '844782d29a93ae51991bfadc639d50bc3619d40b', code = 'a'.repeat(40), tag = 'v0.5.0-beta.1';
 const normalNative = '2ea2e0f27dd2e53b7b28228435ca35a70f92831f';
-// Desktop is outside the seven mobile/Apple release assets; adoption remains a separate gate.
-const desktopNative = '0c30f4782aee544a2b7e33169ad60d03630d4097';
+// Desktop is outside the seven mobile/Apple release assets; adoption remains a separate gate. f08bb89b9 adopted
+// vortx-core 7b79b45d6 (archive and constant-time dependency updates) for Desktop alone.
+const desktopNative = '7b79b45d62dd06716661ff196a845e76330a140f';
 const historicalNative = '0c201563c6aa54eeb0545b55ad01582c0c3bcae3';
 const beta1RecordedNative = '7e3e68be5bf2b11c65d158c1823be94bd1608d1b';
 const playerDigest = '737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1'; // immutable historical checkout only
@@ -291,7 +292,10 @@ function assertNativeWiring(text = workflow, android = androidWorkflows) {
 
 function assertDesktopNativeSource(manifest, lock) {
   const repository = 'https://github.com/VortXTV/vortx-core';
-  const expected = ['librqbit', 'vortx-archive', 'vortx-nntp', 'vortx-nzb', 'vortx-streaming-server'];
+  // librqbit-dualstack-sockets and librqbit-upnp are vendored inside vortx-core from 7b79b45d6 on and resolve
+  // from the same pin.
+  const expected = ['librqbit', 'librqbit-dualstack-sockets', 'librqbit-upnp', 'vortx-archive', 'vortx-nntp', 'vortx-nzb',
+    'vortx-streaming-server'];
   assert.match(desktopNative, /^[0-9a-f]{40}$/, 'Desktop engine source must be a full immutable SHA');
   const dependencies = manifest.match(/^vortx-streaming-server = .+\r?$/gm) ?? [];
   assert.equal(dependencies.length, 1, 'Desktop must declare one engine dependency');
@@ -313,7 +317,7 @@ function assertDesktopNativeSource(manifest, lock) {
     observed.push(name);
   }
   assert.deepEqual(observed.sort(), [...expected].sort(),
-    'Desktop engine lock roster must contain exactly the five reviewed packages');
+    'Desktop engine lock roster must contain exactly the seven reviewed packages');
 }
 
 test('Desktop manifest and all engine lock records retain their separately reviewed source', () => {
@@ -327,7 +331,8 @@ test('Desktop engine source invariant rejects actual pure pin and lock mutations
   const manifest = '[dependencies]\nvortx-streaming-server = { git = "' + repository + '", rev = "' + desktopNative + '" }\n';
   const record = name => '[[package]]\nname = "' + name + '"\nversion = "0.0.1"\nsource = "git+' +
     repository + '?rev=' + desktopNative + '#' + desktopNative + '"\n\n';
-  const blocks = ['librqbit', 'vortx-archive', 'vortx-nntp', 'vortx-nzb', 'vortx-streaming-server'].map(record);
+  const blocks = ['librqbit', 'librqbit-dualstack-sockets', 'librqbit-upnp', 'vortx-archive', 'vortx-nntp', 'vortx-nzb',
+    'vortx-streaming-server'].map(record);
   const lock = 'version = 4\n\n' + blocks.join('');
   const oldPin = '39bc4e7e6d34be71e3bb6d4f6407f49a182b89b9';
   const sourceLine = 'source = "git+' + repository + '?rev=' + desktopNative + '#' + desktopNative + '"';
