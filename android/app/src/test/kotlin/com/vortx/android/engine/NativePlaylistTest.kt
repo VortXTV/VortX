@@ -130,6 +130,23 @@ class NativePlaylistTest {
         assertEquals(NativePlaylist.Projection.Unsupported, NativePlaylist.projection(field, bad))
     }
 
+    @Test fun `first playlist register on a profile without host DTO leaves the projection unchanged`() {
+        val profileID = "00000000-0000-0000-0000-00000000A11C"
+        val scope = VortxAccountScope("account.fixture", profileID)
+        val roster = JSONObject().put(profileID, JSONObject().put("deleted", false).put("name", "Owner"))
+        // The playlist route creates the profile bucket for its register. A ledger-only bucket is
+        // not a generic DTO edit, so the Session must not observe a profile preference change.
+        val local = NativeHostPreferences.recordProfileFields(scope, NativeHostPreferences.local(scope), profileID,
+            JSONObject().put(field, NativePlaylist.encodedValue(doc)))
+        assertTrue(local.getJSONObject("document").getJSONObject("profiles").has(profileID))
+        assertEquals("{}", NativeHostPreferences.projectProfiles(local, JSONObject(), roster).toString())
+        // A generic attribute in the same bucket still materializes the profile DTO.
+        val generic = NativeHostPreferences.recordProfileFields(scope, local, profileID, JSONObject().put("avatar", "🍿"))
+        val projected = NativeHostPreferences.projectProfiles(generic, JSONObject(), roster).getJSONObject(profileID)
+        assertEquals("🍿", projected.getString("avatar"))
+        assertFalse(projected.has(field))
+    }
+
     @Test fun `generic profile projection and edits leave dedicated playlist register unchanged`() {
         val profileID = "00000000-0000-0000-0000-00000000A11C"
         val scope = VortxAccountScope("account.fixture", profileID)
