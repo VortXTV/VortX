@@ -245,6 +245,10 @@ actor TraktAuth {
     /// SIBLING device rotated and pushed, instead of signing this device out. A seam (not a direct import)
     /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
     private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
+    /// Waits between synced-token lookups after an invalid_grant, while a sibling's rotated set may still be
+    /// uploading (`recoverAfterRefreshFailure`).
+    private let siblingRotationRetryDelays: [Duration]
+    static let defaultSiblingRotationRetryDelays: [Duration] = [.seconds(3), .seconds(6), .seconds(12)]
 
     init(
         sessionConfiguration: URLSessionConfiguration = TraktAuth.defaultSessionConfiguration(),
@@ -252,7 +256,8 @@ actor TraktAuth {
         configuration: TraktAuthConfiguration = .production,
         oauthRequestSigner: (@Sendable (URLRequest, Data) -> URLRequest?)? = nil,
         refreshJoinObserver: (@Sendable () -> Void)? = nil,
-        sessionWriteDrainObserver: (@Sendable () -> Void)? = nil
+        sessionWriteDrainObserver: (@Sendable () -> Void)? = nil,
+        siblingRotationRetryDelays: [Duration] = TraktAuth.defaultSiblingRotationRetryDelays
     ) {
         sessionConfiguration.httpShouldSetCookies = false
         sessionConfiguration.httpCookieAcceptPolicy = .never
@@ -266,6 +271,7 @@ actor TraktAuth {
         self.oauthRequestSigner = oauthRequestSigner
         self.refreshJoinObserver = refreshJoinObserver
         self.sessionWriteDrainObserver = sessionWriteDrainObserver
+        self.siblingRotationRetryDelays = siblingRotationRetryDelays
     }
 
     /// Wire the cross-device synced-token lookup used by invalid-grant recovery (T-2). Called once
@@ -1275,7 +1281,22 @@ actor TraktAuth {
         // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
         // synced refresh token different from the one we spent is that sibling's fresher set; adopt it into
         // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
-        let synced = await syncedTokenProvider?()
+        // Devices sharing one token set reach its refresh window together. The winner publishes its rotated
+        // set within seconds, but this device can pull before that upload lands, so look again over a short
+        // bounded window before concluding nothing fresher exists (#187).
+        var synced = await syncedTokenProvider?()
+        if syncedTokenProvider != nil {
+            for delay in siblingRotationRetryDelays {
+                if let synced, synced.refresh != deadRefreshToken { break }
+                do { try await Task.sleep(for: delay) } catch { return nil }
+                guard CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return nil }
+                if let local = currentToken(ownerNamespace: capture.namespace), local.refreshToken != deadRefreshToken {
+                    return local
+                }
+                synced = await syncedTokenProvider?()
+            }
+        }
         guard !Task.isCancelled else { return nil }
         if let synced,
            !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
