@@ -1,7 +1,26 @@
 import Foundation
 
 private enum CredentialScopeRegistry {
-    struct Capture: Equatable { let generation: Int }
+    struct Capture: Equatable {
+        let generation: Int
+        var namespace: String { "fixture" }
+    }
+}
+
+/// Playlist receipt collaborators of the production candidate freeze. These checks register no playlist
+/// edit, so the real ledger stays empty and the freeze takes its no-receipt path; neither stub is reached.
+@MainActor private final class CoreBridge {
+    static let shared = CoreBridge()
+    func nativePlaylistReceiptOwnerIsCurrent(_ owner: NativePlaylistReceiptOwner) -> Bool { false }
+}
+
+private actor NativePlaylistCloudReceiptProjectionWorker {
+    static let shared = NativePlaylistCloudReceiptProjectionWorker()
+    enum Failure: Error { case unexpected }
+    func candidateProjection(plaintext: Data, owner: NativePlaylistReceiptOwner,
+                             fields: [String], edits: [String: UUID]) throws -> NativePlaylistCandidateProjection {
+        throw Failure.unexpected
+    }
 }
 
 @MainActor private final class FixtureAuthority {
@@ -22,6 +41,7 @@ private enum CredentialScopeRegistry {
 @MainActor private final class UploadHarness {
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case upgradeRequired; case error }
     private let credentialAuthority = FixtureAuthority()
+    private var nativePlaylistReceiptLedger = NativePlaylistCloudReceiptLedger()
     let relay: BackupRelay
     var sent: [Int] = []
     var witnesses: [Int?] = []
