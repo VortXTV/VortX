@@ -34,7 +34,7 @@ internal object NativeHostPreferences {
     // Dedicated raw import records never become profile DTO attributes or generic DTO edits.
     private const val rawImportPrefix = "xperience.import."
     private const val playbackDecimals = "subSizeScale maxFileSizeGB"
-    private const val playbackIntegers = "maxResolution minResolution"
+    private const val playbackIntegers = "maxResolution minResolution titleMatchThreshold"
     private const val discoveryIntegerArrays = "selectedProviders providerOrder"
     internal enum class NumericValueKind { SCALAR, INTEGER_ARRAY }
 

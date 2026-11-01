@@ -1,5 +1,7 @@
 package com.vortx.android.profile
 
+import com.vortx.android.engine.SourceTitleMatchThreshold
+
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -251,6 +253,7 @@ data class PlaybackPrefs(
     val includeKeywords: String? = null,
     val keywordsAreRegex: Boolean? = null,
     val maxResolution: Int? = null,          // 0 = no cap, else 720 / 1080 / 4000 (4K)
+    val titleMatchThreshold: Int? = null,    // 0 = off, else 50 / 70 / 90 percent (#172)
     val maxFileSizeGB: Double? = null,       // 0 = no cap
     val minResolution: Int? = null,          // 0 = no floor, else 720 / 1080 / 2160 (#117)
     val hideUnknownResolution: Boolean? = null,
@@ -282,6 +285,7 @@ data class PlaybackPrefs(
             p.includeKeywords?.let { put("includeKeywords", it) }
             p.keywordsAreRegex?.let { put("keywordsAreRegex", it) }
             p.maxResolution?.let { put("maxResolution", it) }
+            p.titleMatchThreshold?.let { put("titleMatchThreshold", it) }
             p.maxFileSizeGB?.let { put("maxFileSizeGB", it) }
             p.minResolution?.let { put("minResolution", it) }
             p.hideUnknownResolution?.let { put("hideUnknownResolution", it) }
@@ -312,6 +316,7 @@ data class PlaybackPrefs(
             includeKeywords = o.optStringOrNull("includeKeywords"),
             keywordsAreRegex = o.optBooleanOrNull("keywordsAreRegex"),
             maxResolution = o.optIntOrNull("maxResolution"),
+            titleMatchThreshold = SourceTitleMatchThreshold.admitted(o.optIntOrNull("titleMatchThreshold")),
             maxFileSizeGB = o.optDoubleOrNull("maxFileSizeGB"),
             minResolution = o.optIntOrNull("minResolution"),
             hideUnknownResolution = o.optBooleanOrNull("hideUnknownResolution"),
