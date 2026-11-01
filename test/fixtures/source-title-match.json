@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "scores": [
+    {"case": "movie release with its title and year", "title": "Dune", "year": 2021, "texts": ["Dune.2021.2160p.WEB-DL.DDP5.1.Atmos.mkv"], "expected": 100},
+    {"case": "a sequel with another year is a weak match", "title": "Dune", "year": 2021, "texts": ["Dune.Part.Two.2024.1080p.BluRay.mkv"], "expected": 30},
+    {"case": "a different film does not match", "title": "Arrival", "year": 2016, "texts": ["Interstellar.2014.1080p.BluRay.x264.mkv"], "expected": 0},
+    {"case": "a bare add-on label names no release", "title": "Dune", "year": 2021, "texts": ["Debridio 1080p"], "expected": null},
+    {"case": "size and seed lines name no release", "title": "Dune", "year": 2021, "texts": ["Size 4.2 GB, Seeds 120"], "expected": null},
+    {"case": "the right episode", "title": "The Bear", "season": 2, "episode": 3, "texts": ["The.Bear.S02E03.1080p.WEB.h264.mkv"], "expected": 100},
+    {"case": "another episode of the right show", "title": "The Bear", "season": 2, "episode": 3, "texts": ["The.Bear.S02E04.1080p.WEB.h264.mkv"], "expected": 0},
+    {"case": "a pack of the right season", "title": "The Bear", "season": 2, "episode": 3, "texts": ["The.Bear.S02.COMPLETE.1080p.WEB"], "expected": 100},
+    {"case": "a pack of another season", "title": "The Bear", "season": 2, "episode": 3, "texts": ["The.Bear.S01.COMPLETE.1080p.WEB"], "expected": 0},
+    {"case": "season-by-episode numbering", "title": "The Bear", "season": 2, "episode": 3, "texts": ["the bear 2x03 720p hdtv"], "expected": 100},
+    {"case": "a multi-episode file covering the episode", "title": "Severance", "season": 1, "episode": 2, "texts": ["Severance.S01E01E02.2160p.mkv"], "expected": 100},
+    {"case": "accents fold", "title": "Amélie", "year": 2001, "texts": ["Amelie.2001.1080p.BluRay.mkv"], "expected": 100},
+    {"case": "an ampersand reads as and", "title": "Law & Order", "season": 1, "episode": 1, "texts": ["Law.and.Order.S01E01.480p.mkv"], "expected": 100},
+    {"case": "the best release among several texts wins", "title": "Arrival", "year": 2016, "texts": ["Torrentio\n4k", "Arrival 2016 2160p UHD BluRay\nSeeds 40"], "expected": 100},
+    {"case": "a partly matching title scores between", "title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "texts": ["The.Lord.of.the.Rings.2001.1080p.mkv"], "expected": 67}
+  ],
+  "passes": [
+    {"case": "off keeps everything", "title": "Arrival", "year": 2016, "texts": ["Interstellar.2014.1080p.mkv"], "threshold": 0, "expected": true},
+    {"case": "below the threshold is hidden", "title": "Dune", "year": 2021, "texts": ["Dune.Part.Two.2024.1080p.BluRay.mkv"], "threshold": 50, "expected": false},
+    {"case": "at the threshold is kept", "title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "texts": ["The.Lord.of.the.Rings.2001.1080p.mkv"], "threshold": 50, "expected": true},
+    {"case": "a stream naming no release is always kept", "title": "Dune", "year": 2021, "texts": ["Debridio 1080p"], "threshold": 90, "expected": true}
+  ]
+}
