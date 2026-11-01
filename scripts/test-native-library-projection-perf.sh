@@ -77,6 +77,10 @@ assert.equal(presentationFields.length, 1, 'unique actual presentation field dec
 const sourceChangedHook = current.split('\n').filter(line => line.trim()
   === 'private var sourceChangedDelivery: (@Sendable ([String], ChangeReceipt?) -> (@Sendable () -> Void)?)?');
 assert.equal(sourceChangedHook.length, 1, 'unique exact production generic source-delivery property');
+// The host-carrier receipt and builder (00acaaa6f) are staged by the same stageChanged under test.
+const sourceHostChangeHook = current.split('\n').filter(line => line.trim()
+  === 'private var sourceHostChangeDelivery: (@Sendable (HostChangeReceipt) -> (@Sendable () -> Void)?)?');
+assert.equal(sourceHostChangeHook.length, 1, 'unique exact production host-carrier source-delivery property');
 const combined = (genreFacts + '\n' + fixture)
   .replace('// PRODUCTION_EXACT_JSON', pureExact)
   .replace('// PRODUCTION_OWNER_LIBRARY', member(publication, 'struct Presentation: Sendable {'))
@@ -86,8 +90,9 @@ const combined = (genreFacts + '\n' + fixture)
   .replace('// PRODUCTION_ERROR', member(runtime, 'enum VortxNativeError:'))
   .replace('// PRODUCTION_PREVIOUSLY_WATCHED', member(watched, 'enum VortxNativePreviouslyWatched {'))
   .replace('// BASELINE_PREVIOUSLY_WATCHED', member(oldWatched, 'enum VortxNativePreviouslyWatched {').replaceAll('VortxNativePreviouslyWatched', 'BaselinePreviouslyWatched'))
-  .replace('// PRODUCTION_CHANGE_RECEIPT', member(current, 'struct ChangeReceipt: Sendable {'))
-  .replace('// PRODUCTION_SOURCE_CHANGED_DELIVERY', sourceChangedHook[0])
+  .replace('// PRODUCTION_CHANGE_RECEIPT', member(current, 'struct ChangeReceipt: Sendable {') + '\n' +
+    member(current, 'struct HostChangeReceipt: Equatable, Sendable {'))
+  .replace('// PRODUCTION_SOURCE_CHANGED_DELIVERY', sourceChangedHook[0] + '\n' + sourceHostChangeHook[0])
   .replace('// PRODUCTION_CURRENT_PUBLICATION', [member(current, 'private func makeChangeReceipt('),
     member(current, 'private func stageChanged('), member(current, 'private func publish(')].join('\n'))
   .replace('// PRODUCTION_CURRENT_MANAGEMENT', managementHelpers)
