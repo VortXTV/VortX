@@ -562,18 +562,29 @@ check(TopShelfSnapshot.selectAppGroup(granted: [signerGroup], canonical: canonic
 
 section("only a group no other app shares carries Trakt and SIMKL rows")
 
-check(TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + ".ABCDE12345"),
-      "an AltStore or SideStore copy of VortX's own group is VortX's")
-check(!TopShelfSnapshot.isDedicatedSignerGroup(signerGroup),
-      "a signing service's generic group can be shared, so it is not dedicated")
-check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + "."),
-      "an empty team suffix is not a copy of the group")
-check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup + ".team.extra"),
-      "a longer name under VortX's group is not a signer copy")
-check(!TopShelfSnapshot.isDedicatedSignerGroup("group.com.stremiox.tvx.ABCDE12345"),
-      "a lookalike group name is not VortX's")
-check(!TopShelfSnapshot.isDedicatedSignerGroup(canonicalGroup),
-      "the canonical group itself is reported as canonical, not as a signer copy")
+let team = "ABCDE12345"
+let teamCopy = canonicalGroup + "." + team
+func dedicated(_ id: String, recorded: [String]? = nil, teams: [String] = [team]) -> Bool {
+    TopShelfSnapshot.isDedicatedSignerGroup(id, recordedGroups: recorded ?? [id], teamIdentifiers: teams)
+}
+check(dedicated(teamCopy), "an AltStore or SideStore copy of VortX's group under this copy's team is VortX's")
+check(!dedicated(teamCopy, recorded: []), "a copy the signer did not record for this bundle is not trusted")
+check(!dedicated(teamCopy, teams: ["ZZZZZ99999"]), "a copy named for another team is not this copy's group")
+check(!dedicated(teamCopy, teams: []), "no provisioned team leaves the group shared")
+check(!dedicated(signerGroup), "a signing service's generic group can be shared, so it is not dedicated")
+check(!dedicated(canonicalGroup + "."), "an empty team suffix is not a copy of the group")
+check(!dedicated(canonicalGroup + ".team.extra", teams: ["team.extra"]), "a longer name under VortX's group is not a signer copy")
+check(!dedicated(canonicalGroup + ".abcde12345", teams: ["abcde12345"]), "a team identifier is upper-case ASCII")
+check(!dedicated(canonicalGroup + ".ＡＢＣ123", teams: ["ＡＢＣ123"]), "non-ASCII letters are not a team identifier")
+check(!dedicated("group.com.stremiox.tvx." + team), "a lookalike group name is not VortX's")
+check(!dedicated(canonicalGroup), "the canonical group itself is reported as canonical, not as a signer copy")
+let teamProfile = Data(("noise<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>TeamIdentifier</key><array><string>" + team
+    + "</string></array><key>Entitlements</key><dict><key>com.apple.developer.team-identifier</key><string>" + team
+    + "</string></dict></dict></plist>tail").utf8)
+check(TopShelfSnapshot.provisionedTeamIdentifiers(profile: teamProfile).contains(team),
+      "the signing team is read from the profile inside its signed envelope")
+check(TopShelfSnapshot.provisionedTeamIdentifiers(profile: Data("not a profile".utf8)).isEmpty,
+      "an unreadable profile names no team")
 
 let profilePlist = """
 <?xml version="1.0" encoding="UTF-8"?>

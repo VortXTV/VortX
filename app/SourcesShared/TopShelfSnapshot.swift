@@ -51,18 +51,29 @@ enum TopShelfSnapshot {
     static var appGroupSource: AppGroupSource {
         guard let appGroupID else { return .none }
         if appGroupID == canonicalAppGroupID { return .canonical }
-        return isDedicatedSignerGroup(appGroupID) ? .dedicated : .signer
+        return isDedicatedSignerGroup(appGroupID, bundle: .main) ? .dedicated : .signer
     }
 
-    /// AltStore and SideStore give each app its own copy of every group it declares, named after it
-    /// (`group.com.stremiox.tv.<team>`), and only an app that declares VortX's group receives that copy. A
-    /// signing service's generic group (a FlareStore log shows `group.<hex>.1`) can be granted to every app it
-    /// signs, so it does not count.
-    static func isDedicatedSignerGroup(_ id: String) -> Bool {
+    static func isDedicatedSignerGroup(_ id: String, bundle: Bundle) -> Bool {
+        let profile = bundle.url(forResource: "embedded", withExtension: "mobileprovision")
+            .flatMap { try? Data(contentsOf: $0, options: .mappedIfSafe) }
+        return isDedicatedSignerGroup(id,
+            recordedGroups: bundle.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] ?? [],
+            teamIdentifiers: profile.map(provisionedTeamIdentifiers) ?? [])
+    }
+
+    /// AltStore and SideStore give each app its own copy of every group it declares, named after it and the
+    /// signing team (`group.com.stremiox.tv.<team>`), and record it in the bundle's `ALTAppGroups`. Such a copy
+    /// is VortX's only when all of that holds for this signed bundle: the group is recorded there, and its suffix
+    /// is exactly this copy's team identifier (ASCII letters and digits). Anything else, including a signing
+    /// service's generic group (a FlareStore log shows `group.<hex>.1`) that other apps it signs can share,
+    /// stays a shared signer group.
+    static func isDedicatedSignerGroup(_ id: String, recordedGroups: [String], teamIdentifiers: [String]) -> Bool {
         let prefix = canonicalAppGroupID + "."
-        guard id.hasPrefix(prefix) else { return false }
-        let suffix = id.dropFirst(prefix.count)
-        return !suffix.isEmpty && suffix.allSatisfy { $0.isLetter || $0.isNumber }
+        guard id.hasPrefix(prefix), recordedGroups.contains(id) else { return false }
+        let suffix = String(id.dropFirst(prefix.count))
+        let isTeamIdentifier = !suffix.isEmpty && suffix.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) }
+        return isTeamIdentifier && teamIdentifiers.contains(suffix)
     }
 
     static func resolveAppGroupID(bundle: Bundle) -> String? {
@@ -101,6 +112,20 @@ enum TopShelfSnapshot {
                   from: profile.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any],
               let entitlements = plist["Entitlements"] as? [String: Any] else { return [] }
         return entitlements["com.apple.security.application-groups"] as? [String] ?? []
+    }
+
+    /// The signing team of a provisioning profile, from its `TeamIdentifier` list and its entitlements.
+    static func provisionedTeamIdentifiers(profile: Data) -> [String] {
+        guard let start = profile.range(of: Data("<?xml".utf8)),
+              let end = profile.range(of: Data("</plist>".utf8), in: start.lowerBound..<profile.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: profile.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any]
+        else { return [] }
+        var teams = plist["TeamIdentifier"] as? [String] ?? []
+        if let team = (plist["Entitlements"] as? [String: Any])?["com.apple.developer.team-identifier"] as? String {
+            teams.append(team)
+        }
+        return teams
     }
 
     /// True for the Top Shelf extension itself and for an app that embeds one.
