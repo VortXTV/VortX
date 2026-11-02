@@ -54,6 +54,7 @@ on:
       - "scripts/test-account-file-access.sh"
       - "scripts/test-profile-picker-account.sh"
       - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
       - "scripts/run-account-file-restore-manager.py"
@@ -160,6 +161,7 @@ on:
       - "scripts/test-account-file-access.sh"
       - "scripts/test-profile-picker-account.sh"
       - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
       - "scripts/run-account-file-restore-manager.py"
@@ -347,6 +349,8 @@ jobs:
       - run: bash scripts/test-profile-picker-account.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-picker-tools.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools-transfer.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
