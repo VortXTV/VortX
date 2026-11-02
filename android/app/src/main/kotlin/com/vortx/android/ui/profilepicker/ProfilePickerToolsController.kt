@@ -30,7 +30,9 @@ internal data class PickerToolsState(
     val message: String? = null,
 ) { val busy: Boolean get() = phase != PickerToolsPhase.IDLE }
 internal enum class PickerToolsPhase { IDLE, DOWNLOADING, AWAITING_DESTINATION, SAVING, SHARING_DIAGNOSTICS, CANCELLING }
+@ConsistentCopyVisibility
 internal data class PickerToolsAttachment internal constructor(val routeId: String, val attachmentId: String)
+@ConsistentCopyVisibility
 internal data class PickerToolsDestinationRequest internal constructor(val routeId: String, val operationId: String)
 
 /** Captured when Tools renders, never acquired by a queued action at click time. */
@@ -319,7 +321,7 @@ internal class ProfilePickerToolsController(
                 requireCurrent(original)
                 val ready = preparer.prepare(checkNotNull(raw)) { current(original) }
                 prepared = ready
-                raw?.fill(0); raw = null
+                raw.fill(0); raw = null
                 requireCurrent(original)
                 phase(original, PickerToolsPhase.AWAITING_DESTINATION, original.request)
                 when (val destination = original.destination.await()) {
