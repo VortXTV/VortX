@@ -169,6 +169,28 @@ struct NativePreferenceIntentStore {
         self.fileURL = directoryURL.appendingPathComponent("preference-intents-\(digest).bin", isDirectory: false)
     }
 
+    /// Existing-only file restore admission. Presence, including an unreadable/symlink file,
+    /// is pending native state. Other accounts' committed files do not block this account.
+    enum FileRestoreRefusal: Error { case pending, unverifiable }
+    func requireFileRestoreAbsence() throws {
+        var directoryInfo = stat()
+        if lstat(directoryURL.path, &directoryInfo) != 0 {
+            guard errno == ENOENT else { throw FileRestoreRefusal.unverifiable }
+            return
+        }
+        guard directoryInfo.st_mode & S_IFMT == S_IFDIR, directoryInfo.st_uid == geteuid(),
+              directoryInfo.st_mode & mode_t(0o022) == 0 else { throw FileRestoreRefusal.unverifiable }
+        var info = stat()
+        if lstat(fileURL.path, &info) == 0 { throw FileRestoreRefusal.pending }
+        guard errno == ENOENT else { throw FileRestoreRefusal.unverifiable }
+        do {
+            let digest = fileURL.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "preference-intents-", with: "")
+            let names = try FileManager.default.contentsOfDirectory(atPath: directoryURL.path)
+            guard !names.contains(where: { $0.contains(digest) || $0.hasPrefix(".intent-") }) else {
+                throw FileRestoreRefusal.unverifiable
+            }
+        } catch { throw FileRestoreRefusal.unverifiable }
+    }
     func prepare(authority: Authority, group: Group, base: Snapshot, desired: VortxJSON,
                  projectionStamps: [String: Double] = [:], requiresResolution: Bool = false) throws -> Intent {
         try validate(authority: authority)

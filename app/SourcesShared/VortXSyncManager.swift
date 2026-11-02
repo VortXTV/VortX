@@ -234,6 +234,7 @@ final class VortXSyncManager: ObservableObject {
         return dirtySettings[key] == nil || retained[key] != dirtySettings[key]
     }
     private func nativePreferenceStore(capture: CredentialScopeRegistry.Capture) throws -> NativePreferenceIntentStore {
+        guard !accountFileRestoreBusy else { throw VortxNativeError.unavailable }
         guard isSignedIn, isCurrent(capture), case .account = capture.scope,
               let key = dataKey, key.count == 32 else { throw VortxNativeError.superseded }
         let root = try VortxNativeStorage.root()
@@ -546,6 +547,7 @@ final class VortXSyncManager: ObservableObject {
         }
     }
     func prepareNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture) -> [String: VortxNativeProviderCredentials.Register]? {
+        guard !accountFileRestoreBusy else { return nil }
         guard isCurrent(capture) else { return nil }
         guard case .account = capture.scope else { return [:] }
         do {
@@ -556,6 +558,7 @@ final class VortXSyncManager: ObservableObject {
         } catch { return nil }
     }
     func finishNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
+        guard !accountFileRestoreBusy else { return false }
         if events.isEmpty { return isCurrent(capture) }
         do {
             var state = try nativeProviderState(capture: capture)
@@ -633,6 +636,7 @@ final class VortXSyncManager: ObservableObject {
     }
     func noteNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture,
                                     expectedRevision: [String: String]? = nil, suppressImportedApply: Bool = true) -> Bool {
+        guard !accountFileRestoreBusy else { return false }
         guard isCurrent(capture) else { return false }
         guard (!suppressImportedApply || !isApplyingRemote), case .account = capture.scope else { return true }
         do {
@@ -1600,6 +1604,7 @@ final class VortXSyncManager: ObservableObject {
 
     func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                                  userInitiated: Bool = false) async -> Bool {
+        guard !accountFileRestoreBusy else { return false }
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard userInitiated || !accountReconnectRequired(for: capture) else { return false }
         let selectedProfile = ProfileStore.shared.activeID
@@ -1627,7 +1632,7 @@ final class VortXSyncManager: ObservableObject {
         let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeAddonEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; retireNativeWatchedPendingProjection(); nativeWatchedMigrationPending = []
         nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
         let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
-        guard isCurrent(capture), nativeCheckpointGeneration == generation else {
+        guard !accountFileRestoreBusy, isCurrent(capture), nativeCheckpointGeneration == generation else {
             DiagnosticsLog.log("native-profiles", "restore result=not_started reason=superseded")
             return false
         }
@@ -3510,6 +3515,7 @@ final class VortXSyncManager: ObservableObject {
     /// original account capture/key remain current. No native mount/profile selection is required.
     /// Normal fenced session renewal on the GET remains enabled; no backup is uploaded or applied.
     func prepareAccountBackupRepair(_ selectedFile: Data) async throws -> VortxAccountFileRepairService.Preview {
+        guard !accountFileRestoreBusy else { throw VortxAccountFileRepairService.Failure.busy }
         typealias Service = VortxAccountFileRepairService
         guard selectedFile.count <= VortxAccountBackupFile.maximumFileBytes else {
             throw Service.Failure.conversion(.tooLarge)
@@ -3605,6 +3611,209 @@ final class VortXSyncManager: ObservableObject {
 
     private func retireAccountFileRepairForOwnerTransition() {
         if let operation = accountFileRepairOperation { cancelAccountBackupRepair(operation.id) }
+    }
+
+    // MARK: - Dedicated encrypted account file restore
+
+    private struct AccountFileRestoreOperation {
+        let id: UUID
+        let input: VortxAccountFileRepairService.Input
+        let fence: VortxAccountFileRepairService.Fence
+    }
+    private var accountFileRestoreOperation: AccountFileRestoreOperation?
+    private var accountFileRestoreBusy: Bool { accountFileRestoreOperation != nil }
+
+    private func captureAccountFileRestore() throws -> AccountFileRestoreOperation {
+        guard accountFileRestoreOperation == nil, accountFileRepairOperation == nil else { throw VortxAccountFileRestoreFailure.busy }
+        let capture = credentialAuthority.capture()
+        guard isSignedIn, credentialAuthority.isMigrationEligible(capture), let account,
+              let key = dataKey, key.count == 32, let token, !token.isEmpty,
+              CredentialScope(canonicalRemoteAccountID: account.id) == capture.scope else {
+            throw VortxAccountFileRestoreFailure.accountChanged
+        }
+        return .init(id: UUID(), input: .init(accountID: account.id, capture: capture, dataKey: key,
+            requiresVersionBoundHead: Self.sawDocV2(account.id)), fence: .init(capture: capture))
+    }
+    private func requireAccountFileRestore(_ operation: AccountFileRestoreOperation) throws {
+        guard accountFileRestoreOperation?.id == operation.id, isSignedIn,
+              isCurrent(operation.input.capture), credentialAuthority.isMigrationEligible(operation.input.capture),
+              account?.id == operation.input.accountID, dataKey == operation.input.dataKey else {
+            throw VortxAccountFileRestoreFailure.accountChanged
+        }
+        try operation.fence.check()
+    }
+    private func requireIdleLegacyFileRestore(_ operation: AccountFileRestoreOperation) throws {
+        try requireAccountFileRestore(operation)
+        let capture = operation.input.capture
+        guard !CoreBridge.shared.hasNativeSession else { throw VortxAccountFileRestoreFailure.busy }
+        guard activeSyncUp?.capture != capture, activeSyncDown?.capture != capture,
+              nativeCheckpointCapture != capture, restoreTaskCapture != capture,
+              providerLegacyMigrationCapture != capture else { throw VortxAccountFileRestoreFailure.busy }
+        guard !nativeDurablePushPending,
+              !(pendingSyncCapture == capture && nativePushQueue.hasPendingPush), dirtySettings.isEmpty,
+              pendingAddonOrderIntent == nil, pendingDebridApply?.capture != capture,
+              pendingProviderApply?.capture != capture else { throw VortxAccountFileRestoreFailure.pendingLocalChanges }
+        // Do NOT call nativeProviderState here: its legacy failure branch may repair storage.
+        guard case .missing = Keychain.confirmedString("vortx.native.providerState." + capture.namespace) else {
+            throw VortxAccountFileRestoreFailure.currentNativeState
+        }
+    }
+    private func readAccountFileRestoreHead(_ operation: AccountFileRestoreOperation) async throws -> Data {
+        try requireAccountFileRestore(operation)
+        var bytes: Data?
+        let (code, _) = await request("GET", "/v1/backup", auth: true,
+            credentialCapture: operation.input.capture, receiveBackupData: { bytes = $0 })
+        try requireAccountFileRestore(operation)
+        if code == 404 { throw VortxAccountFileRestoreFailure.noCloudBackup }
+        guard code == 200, let bytes else { throw VortxAccountFileRestoreFailure.unavailable }
+        return bytes
+    }
+    /// The caller presents explicit file replacement confirmation before invoking this action.
+    /// Original legacy and source-retaining repaired files are admitted; existing native destination
+    /// state is not replaced. Result reports transport/readback only, never native local adoption.
+    func restoreAccountBackupFile(_ selectedFile: Data) async -> VortxAccountFileRestoreResult {
+        let operation: AccountFileRestoreOperation
+        do { operation = try captureAccountFileRestore() }
+        catch { return .notSubmitted((error as? VortxAccountFileRestoreFailure) ?? .accountChanged) }
+        accountFileRestoreOperation = operation
+        defer {
+            operation.fence.revoke()
+            if accountFileRestoreOperation?.id == operation.id { accountFileRestoreOperation = nil }
+        }
+        return await withTaskCancellationHandler(operation: {
+            var retained: VortxAccountFileRestore.Intent?
+            var attempted = false
+            var accepted = false
+            var readingRecovery = false
+            do {
+                guard selectedFile.count <= VortxAccountBackupFile.maximumFileBytes else { throw VortxAccountFileRestoreFailure.unsupportedFile }
+                try requireIdleLegacyFileRestore(operation)
+                readingRecovery = true
+                let previous = try await VortxAccountFileRestoreJournal.shared.unresolved(
+                    account: operation.input.accountID, key: operation.input.dataKey)
+                readingRecovery = false
+                if let previous {
+                    try requireAccountFileRestore(operation)
+                    return .deliveryUnconfirmed(previous) // Earlier operation: never submit selected file over it.
+                }
+                let response = try await readAccountFileRestoreHead(operation)
+                let prepared = try await VortxAccountFileRestoreWorker.shared.prepare(file: selectedFile,
+                    response: response, input: operation.input, fence: operation.fence)
+                try requireIdleLegacyFileRestore(operation)
+                await Task.yield()
+                try await VortxAccountFileRestoreWorker.shared.requireLocalAbsence(scope: prepared.scope, key: operation.input.dataKey)
+                try requireIdleLegacyFileRestore(operation)
+                let freshResponse = try await readAccountFileRestoreHead(operation)
+                let fresh = try VortxAccountFileRestore.head(freshResponse)
+                guard fresh.version == prepared.baseRevision, fresh.document == prepared.headDocument,
+                      fresh.version >= lastSyncedVersion else { throw VortxAccountFileRestoreFailure.staleHead }
+                guard (!fresh.usesVersionBoundEncryption && !Self.sawDocV2(operation.input.accountID)) || Self.writeSyncDocV2,
+                      let revision = SyncDocumentRevisionPolicy.next(after: fresh.version),
+                      let sealed = VortXSyncCrypto.sealDocument(dataKey: operation.input.dataKey,
+                        plaintext: prepared.plaintext, accountId: operation.input.accountID,
+                        version: revision, writeV2: Self.writeSyncDocV2) else {
+                    throw VortxAccountFileRestoreFailure.revisionUnavailable
+                }
+                let intent = VortxAccountFileRestore.Intent(format: "vortx-account-file-restore-intent-v1",
+                    sourceKind: "user_selected_file", operationID: operation.id, accountID: operation.input.accountID,
+                    ownerProfileID: prepared.scope.ownerProfileID, selectedFile: prepared.selectedFile,
+                    candidateFile: prepared.candidateFile, replacedHeadResponse: freshResponse,
+                    plaintextSHA256: VortxAccountFileRestore.digest(prepared.plaintext),
+                    baseRevision: fresh.version, revision: revision, submittedDocument: sealed)
+                readingRecovery = true
+                try await VortxAccountFileRestoreJournal.shared.retain(intent, key: operation.input.dataKey, fence: operation.fence)
+                retained = intent
+                readingRecovery = false
+                try await VortxAccountFileRestoreWorker.shared.requireLocalAbsence(scope: prepared.scope, key: operation.input.dataKey)
+                try requireIdleLegacyFileRestore(operation)
+                // After this point an absent/lost verdict means possible delivery. There is exactly one PUT.
+                attempted = true
+                let verdict = await putAccountFileRestore(intent, operation: operation)
+                try requireAccountFileRestore(operation)
+                if verdict == false {
+                    await recordFileRestore(.conflict, intent: intent, operation: operation)
+                    return .conflict(operation.id)
+                }
+                accepted = verdict == true
+                if accepted { await recordFileRestore(.uploadAccepted, intent: intent, operation: operation) }
+                // Actual authenticated GET, never a file-labelled VersionedPull or a fabricated source observation.
+                let readback = try await readAccountFileRestoreHead(operation)
+                if VortxAccountFileRestore.confirms(readback, intent: intent, key: operation.input.dataKey) {
+                    await recordFileRestore(.serverConfirmed, intent: intent, operation: operation)
+                    return .serverConfirmed(operation.id, revision: intent.revision)
+                }
+                return accepted ? .uploadAccepted(operation.id) : .deliveryUnconfirmed(operation.id)
+            } catch {
+                if attempted { return accepted ? .uploadAccepted(operation.id) : .deliveryUnconfirmed(operation.id) }
+                if let retained { await recordFileRestore(.notSubmitted, intent: retained, operation: operation) }
+                if error is CancellationError { return .notSubmitted(.cancelled) }
+                if readingRecovery { return .notSubmitted(.recoveryUnavailable) }
+                if let failure = error as? VortxAccountFileRestoreFailure { return .notSubmitted(failure) }
+                if let failure = error as? VortxAccountFileRepairService.Failure {
+                    switch failure {
+                    case .accountChanged: return .notSubmitted(.accountChanged)
+                    case .busy: return .notSubmitted(.busy)
+                    case .unavailable, .ownerUnavailable: return .notSubmitted(.unavailable)
+                    case .currentAccountUnsupported: return .notSubmitted(.modernAccount)
+                    default: return .notSubmitted(.unsupportedFile)
+                    }
+                }
+                return .notSubmitted(.unsupportedFile)
+            }
+        }, onCancel: { operation.fence.revoke() })
+    }
+    /// No native ACK/floor/settings/session-success side effects. Existing transport restrictions
+    /// and normal same-account token-renewal fences are retained, but verdict parsing uses raw bytes.
+    private func putAccountFileRestore(_ intent: VortxAccountFileRestore.Intent,
+                                       operation: AccountFileRestoreOperation) async -> Bool? {
+        do {
+            try requireIdleLegacyFileRestore(operation)
+            guard let sentToken = token, let url = URL(string: base + "/v1/backup") else { return nil }
+            var request = URLRequest(url: url)
+            request.httpMethod = "PUT"
+            request.setValue("Bearer " + sentToken, forHTTPHeaderField: "authorization")
+            request.setValue("application/json", forHTTPHeaderField: "content-type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["document": intent.submittedDocument,
+                "version": intent.revision, "baseRevision": intent.baseRevision])
+            let response = try await AuthenticatedHTTPTransport.shared.send(request,
+                allowedHosts: ["api.vortx.tv"], maxResponseBytes: AuthenticatedHTTPTransport.controlResponseLimit)
+            try requireAccountFileRestore(operation)
+            if (200..<300).contains(response.statusCode) {
+                storeSessionRenewal(response.sessionRenewal, sentToken: sentToken, capture: operation.input.capture)
+            }
+            return VortxAccountFileRestore.acceptedVerdict(status: response.statusCode, body: response.data)
+        } catch { return nil }
+    }
+    private func recordFileRestore(_ verdict: VortxAccountFileRestore.Verdict,
+                                   intent: VortxAccountFileRestore.Intent, operation: AccountFileRestoreOperation) async {
+        // An operation's own journal may record known no-send/transport facts after UI cancellation.
+        // This does not readopt an account or write any checkpoint/provider/key/sync receipt.
+        try? await VortxAccountFileRestoreJournal.shared.record(.init(operationID: intent.operationID,
+            verdict: verdict, revision: intent.revision), account: intent.accountID, key: operation.input.dataKey)
+    }
+    /// Read-only verification of a retained operation. Never resubmits or generates a new revision.
+    func verifyAccountBackupFileRestore(_ operationID: UUID) async -> VortxAccountFileRestoreResult {
+        let operation: AccountFileRestoreOperation
+        do { operation = try captureAccountFileRestore() }
+        catch { return .notSubmitted((error as? VortxAccountFileRestoreFailure) ?? .accountChanged) }
+        accountFileRestoreOperation = operation
+        defer {
+            operation.fence.revoke()
+            if accountFileRestoreOperation?.id == operation.id { accountFileRestoreOperation = nil }
+        }
+        return await withTaskCancellationHandler(operation: {
+            do {
+                let intent = try await VortxAccountFileRestoreJournal.shared.load(account: operation.input.accountID,
+                    id: operationID, key: operation.input.dataKey)
+                try requireAccountFileRestore(operation)
+                let response = try await readAccountFileRestoreHead(operation)
+                if VortxAccountFileRestore.confirms(response, intent: intent, key: operation.input.dataKey) {
+                    await recordFileRestore(.serverConfirmed, intent: intent, operation: operation)
+                    return .serverConfirmed(operationID, revision: intent.revision)
+                }
+                return .deliveryUnconfirmed(operationID)
+            } catch { return .deliveryUnconfirmed(operationID) }
+        }, onCancel: { operation.fence.revoke() })
     }
 
     /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and
@@ -3801,7 +4010,7 @@ final class VortXSyncManager: ObservableObject {
                                sourceIsCurrent: () -> Bool = { true }) async -> PushOutcome {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedAccountID = account?.id ?? ""
-        guard isCurrent(capture), !accountReconnectRequired(for: capture), sourceIsCurrent(), !Task.isCancelled,
+        guard !accountFileRestoreBusy, isCurrent(capture), !accountReconnectRequired(for: capture), sourceIsCurrent(), !Task.isCancelled,
               SyncDocumentRevisionPolicy.next(after: baseRevision) == version,
               !hasPendingAccountDocApply(for: capture), let capturedDataKey = dataKey,
               let pt = plaintextData ?? (try? JSONSerialization.data(withJSONObject: obj)),
@@ -4314,6 +4523,7 @@ final class VortXSyncManager: ObservableObject {
     /// happens when an unattended push decides on the user's behalf.
     @discardableResult
     func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
+        guard !accountFileRestoreBusy else { return false }
         let capture = credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture), !accountReconnectRequired(for: capture),
               backupUploadFailure != .upgradeRequired else { return false }
@@ -4354,6 +4564,7 @@ final class VortXSyncManager: ObservableObject {
             return false
         }
         let operationID = UUID()
+        guard !accountFileRestoreBusy else { return false }
         activeSyncUp = (operationID, capture)
         defer { finishSyncUp(operationID) }
         // An already-restored account may have lost its resident native session. A queued
@@ -4591,6 +4802,7 @@ final class VortXSyncManager: ObservableObject {
     /// and "Keep this device" in the conflict prompt remains the explicit, user-chosen way through.
     @discardableResult
     func restoreAccountDocIfNeeded(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
+        guard !accountFileRestoreBusy else { return false }
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture), !accountReconnectRequired(for: capture) else { return false }
         // Single-flight: adopt(), startRealtime(), and any blocked syncUp can all arrive at once. Assigning
@@ -4709,6 +4921,7 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncDown(force: Bool = false, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                   reportOutcome: ((ConflictResolutionOutcome) -> Void)? = nil, routineReceive: Bool = false) async -> Bool {
+        guard !accountFileRestoreBusy else { reportOutcome?(.pending); return false }
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedDataKey = dataKey
         var outcome: ConflictResolutionOutcome = .failed

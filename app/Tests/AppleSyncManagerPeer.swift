@@ -128,6 +128,8 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
 }
 
 @MainActor private final class ManagerHarness {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     static var shared: ManagerHarness!
     struct Command: Decodable {
         let mode: String; let directory: String; let baseURL: String; let actor: String

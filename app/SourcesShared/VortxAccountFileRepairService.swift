@@ -97,7 +97,7 @@ enum VortxAccountFileRepairService {
 
     /// Called only on the dedicated worker actor below. It performs no I/O.
     static func prepare(file: Data, authenticatedHeadResponse: Data, input: Input,
-                        fence: Fence, abi: any VortxRuntimeABI) throws -> Output {
+                        fence: Fence, abi: any VortxRuntimeABI, permitValidatedReimport: Bool = false) throws -> Output {
         try fence.check()
         guard file.count <= VortxAccountBackupFile.maximumFileBytes,
               authenticatedHeadResponse.count <= AuthenticatedHTTPTransport.snapshotResponseLimit else {
@@ -133,7 +133,15 @@ enum VortxAccountFileRepairService {
         do {
             let raw = try Exact.Object(file)
             if raw[VortxAccountBackupRepair.repairKey] != nil {
-                try validateReimport(file, context: context, fence: fence, abi: abi)
+                let admitted = try validateReimport(file, context: context, fence: fence, abi: abi)
+                if permitValidatedReimport {
+                    try VortxAccountFileRestore.admitCandidate(file: file, input: input, owner: owner, fence: fence, abi: abi)
+                    try fence.check()
+                    return Output(file: file, fileSHA256: digest(file), sourceSHA256: admitted.sourceSHA256,
+                        ownerWitnessSHA256: context.ownerReceiptSHA256, headVersion: head.version,
+                        headWasVersionBound: head.usesVersionBoundEncryption,
+                        profileCount: admitted.profileCount, nativeSchema: admitted.nativeSchema)
+                }
                 // A compatible native candidate may contain further native history. Never
                 // discard it by regenerating a file from the original, or call the metadata
                 // proof that the candidate is exclusively a pristine cold conversion.
@@ -142,6 +150,7 @@ enum VortxAccountFileRepairService {
             let candidate = try VortxAccountBackupRepair.convert(file, context: context,
                 abi: abi, isCurrent: { fence.isActive() })
             try fence.check()
+            try VortxAccountFileRestore.admitCandidate(file: candidate.file, input: input, owner: owner, fence: fence, abi: abi)
             return Output(file: candidate.file, fileSHA256: digest(candidate.file),
                 sourceSHA256: candidate.sourceSHA256, ownerWitnessSHA256: context.ownerReceiptSHA256,
                 headVersion: head.version, headWasVersionBound: head.usesVersionBoundEncryption,
@@ -157,7 +166,7 @@ enum VortxAccountFileRepairService {
     /// This validates preserved source bytes and complete generic native compatibility, not
     /// historical provenance or an exclusive conversion-only native state. No output is minted.
     private static func validateReimport(_ file: Data, context: VortxAccountBackupRepair.Context,
-                                        fence: Fence, abi: any VortxRuntimeABI) throws {
+                                        fence: Fence, abi: any VortxRuntimeABI) throws -> (sourceSHA256: String, profileCount: Int, nativeSchema: Int) {
         try fence.check()
         let inspection = try VortxAccountBackupFile.inspect(file)
         let envelope = try Exact.Object(file)
@@ -222,6 +231,7 @@ enum VortxAccountFileRepairService {
         guard outcome == .accepted else { throw Failure.repairedCopyChanged }
         _ = try OwnerHistoryAccountExport(completeAccountPlaintext: plaintext).validatedPlaintext(writeV2: true)
         try fence.check()
+        return (digest(original), regenerated.profileCount, schema)
     }
 
     static func digest(_ bytes: Data) -> String {

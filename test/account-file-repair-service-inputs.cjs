@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const { recipe, extract } = require('./account-backup-repair-inputs.cjs');
 const { extractDeclaration } = require('./xperience-harness-inputs.cjs');
+const { addAdmission } = require('./account-file-restore-inputs.cjs');
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 function compose(root, directory) {
   root = fs.realpathSync(root); directory = fs.realpathSync(directory);
@@ -41,7 +42,7 @@ function compose(root, directory) {
     {literal: pieces[0]},
     {source:'app/SourcesShared/VortXSyncManager.swift', kind:'between',
       start:'    // MARK: - File-only account repair\n',
-      end:'    /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and\n'},
+      end:'    // MARK: - Dedicated encrypted account file restore\n'},
     {literal: pieces[1]}
   ]});
   const managerBytes = fs.readFileSync(path.join(root, 'app/SourcesShared/VortXSyncManager.swift'));
@@ -50,7 +51,9 @@ function compose(root, directory) {
     'guard let capture = credentialAuthority.tryBind(scope) else { return nil }\n        retireAccountFileRepairForOwnerTransition()',
     'guard let capture = credentialAuthority.tryBind(scope, certifying: certifying) else { return nil }\n        retireAccountFileRepairForOwnerTransition()'
   ]) assert(managerSource.includes(needle), 'owner transition retirement hook missing');
+  addAdmission(recipe);
   const manifest = extract(root, directory);
+  manifest.sourceHashes['test/account-file-restore-inputs.cjs'] = hash(fs.readFileSync(path.join(root,'test/account-file-restore-inputs.cjs')));
   manifest.sourceHashes[seamPath] = hash(seamBytes);
   manifest.sourceHashes['test/account-file-repair-service-inputs.cjs'] = hash(fs.readFileSync(__filename));
   // Keep an exact source receipt for the production worker even though this boundary fixture

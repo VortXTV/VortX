@@ -48,6 +48,8 @@ private enum NativeForegroundSyncPolicy {
 /* PRODUCTION_PULL_POLICY */
 
 @MainActor private final class VortXSyncManager {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     static var shared = VortXSyncManager()
     let credentialAuthority = Authority()
     var dataKey: Data? = Data([1])

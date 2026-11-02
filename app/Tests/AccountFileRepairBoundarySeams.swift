@@ -14,6 +14,7 @@ final class VortXSyncManager {
     var responseCode = 200
     var afterGET: (@MainActor () -> Void)?
     var afterWorker: (@MainActor () -> Void)?
+    private var accountFileRestoreBusy = false
     var getCount = 0
     static var fixtureSawV2 = false
     init(accountID: String, key: Data, response: Data) {
@@ -70,4 +71,5 @@ actor VortxAccountFileRepairWorker {
 /// is substituted inside a successful native conversion; manager HTTP is the explicit seam above.
 enum AuthenticatedHTTPTransport {
     static let snapshotResponseLimit = 8 * 1024 * 1024
+    static let controlResponseLimit = 64 * 1024
 }

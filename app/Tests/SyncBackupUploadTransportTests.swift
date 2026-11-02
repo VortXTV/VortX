@@ -19,6 +19,8 @@ private enum VortXSyncCrypto {
     }
 }
 @MainActor private final class UploadHarness {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     struct Account { let id = "synthetic-account" }
     let credentialAuthority = Authority()
     var account: Account? = Account()

@@ -207,6 +207,8 @@ struct SIMKLContinueWatchingShadow {
 }
 
 @MainActor final class VortXSyncManager {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     static var shared: VortXSyncManager!
     struct Account { let id: String }
     let directory: URL; let baseURL: URL

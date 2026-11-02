@@ -1535,6 +1535,9 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         check(try indexedA.authenticatedCheckpoint(scope: scope) == before)
         try indexedA.rememberAuthenticatedScope(scope)
         check(try indexedB.authenticatedCheckpoint(scope: scopeB) == nil)
+        try indexedB.requireFileRestoreAbsence(scope: scopeB)
+        do { try indexedA.requireFileRestoreAbsence(scope: scope); fatalError("file restore ignored current account state") }
+        catch VortxEncryptedCheckpointStore.FileRestoreRefusal.currentNativeState {}
         // A preparation probe must carry the installation proof, just like the opener.
         // Without it, another account's healthy indexed history cannot prove B is absent.
         let unindexedPreparationProbe = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: keyB)
@@ -1571,6 +1574,8 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let pairedBytes = try Data(contentsOf: pairedLocator)
         try FileManager.default.removeItem(at: pairedLocator)
         do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("v2 inventory without paired v1 locator admitted absence") } catch {}
+        do { try indexedC.requireFileRestoreAbsence(scope: scopeC); fatalError("file restore accepted incomplete foreign inventory locator") }
+        catch VortxEncryptedCheckpointStore.FileRestoreRefusal.unverifiable {}
         try Data("altered-account-locator".utf8).write(to: pairedLocator)
         do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("corrupt paired v1 locator admitted absence") } catch {}
         try pairedBytes.write(to: pairedLocator)
@@ -1593,6 +1598,18 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let stateDigest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
         let indexedStateA = indexedDirectory.appendingPathComponent("native-state-v1-\(stateDigest).sealed")
         let validIndexedState = try Data(contentsOf: indexedStateA)
+        try FileManager.default.removeItem(at: indexedStateA)
+        do { try indexedC.requireFileRestoreAbsence(scope: scopeC); fatalError("file restore accepted missing foreign indexed state") }
+        catch VortxEncryptedCheckpointStore.FileRestoreRefusal.unverifiable {}
+        try validIndexedState.write(to: indexedStateA)
+        let absentRestoreDirectory = directory.deletingLastPathComponent().appendingPathComponent("file-restore-absent")
+        let absentRestoreStore = try VortxEncryptedCheckpointStore(directory: absentRestoreDirectory, key: keyB)
+        try absentRestoreStore.requireFileRestoreAbsence(scope: scopeC)
+        let danglingRestoreDirectory = directory.deletingLastPathComponent().appendingPathComponent("file-restore-dangling")
+        try FileManager.default.createSymbolicLink(at: danglingRestoreDirectory, withDestinationURL: absentRestoreDirectory)
+        let danglingRestoreStore = try VortxEncryptedCheckpointStore(directory: danglingRestoreDirectory, key: keyB)
+        do { try danglingRestoreStore.requireFileRestoreAbsence(scope: scopeC); fatalError("file restore accepted dangling inventory directory") }
+        catch VortxEncryptedCheckpointStore.FileRestoreRefusal.unverifiable {}
         let prefix = Data("vortx-native-indexed-ciphertext-v2\n".utf8)
         var corrupted = try JSONSerialization.jsonObject(with: validIndexedState.dropFirst(prefix.count)) as! [String: Any]
         var ciphertext = Data(base64Encoded: corrupted["ciphertext"] as! String)!

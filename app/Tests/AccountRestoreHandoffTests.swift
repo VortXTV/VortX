@@ -51,6 +51,8 @@ extension FixtureTask where Success == Never, Failure == Never {
 }
 
 @MainActor final class RestoreManagerFixture {
+    // These existing fixtures do not run a concurrent account-file restore.
+    var accountFileRestoreBusy = false
     typealias Task<Success: Sendable, Failure: Error> = FixtureTask<Success, Failure>
     let credentialAuthority = CredentialScopeRegistry()
     var isSignedIn = true

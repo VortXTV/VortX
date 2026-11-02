@@ -33,6 +33,7 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 } > "$native_oauth_dir/Discovery.swift"
 {
     printf '%s\n' 'import Foundation' '@MainActor final class VortXSyncManager {' 'static let shared = VortXSyncManager()'
+    printf '%s\n' 'var accountFileRestoreBusy = false // No concurrent account-file restore in this OAuth journal fixture.'
     printf '%s\n' 'func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { CredentialScopeRegistry.shared.isCurrent(capture) }'
     printf '%s\n' 'var testActorLookupHook: (() -> Void)?' 'var testPreparedHook: (() -> Void)?' 'func nativeHostActor(capture: CredentialScopeRegistry.Capture) throws -> String { let hook = testActorLookupHook; testActorLookupHook = nil; hook?(); return "00000000-0000-0000-0000-000000000001" }' 'func requestSyncSoon() {}'
     sed -n '/^    private func nativeProviderState(/,/^    \/\/\/ Called only after/{ /^    \/\/\/ Called only after/!p; }' app/SourcesShared/VortXSyncManager.swift | sed '/^[[:space:]]*return events$/i\
