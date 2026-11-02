@@ -119,8 +119,16 @@ enum AutoSkipCountdownWiringContractTests {
         check(playerNowPlaying.contains("seekBy: { delta in") &&
               playerNowPlaying.contains("AutoSkipCountdownPolicy.invalidatePending"),
               "iOS system transport seeks invalidate countdowns")
-        check(tvNowPlaying.contains("seekBy: { delta in") &&
-              tvNowPlaying.contains("AutoSkipCountdownPolicy.invalidatePending"),
+        // tvOS routes system transport through the same user-seek choke points as the remote, so each of
+        // them must retire the pending countdown before its first early return.
+        let invalidatesBeforeReturning = { (body: String) -> Bool in
+            guard let invalidate = body.range(of: "AutoSkipCountdownPolicy.invalidatePending"),
+                  let firstReturn = body.range(of: "return") else { return false }
+            return invalidate.lowerBound < firstReturn.lowerBound
+        }
+        check(tvNowPlaying.contains("seekBy: { delta in seek(delta) }") &&
+              tvNowPlaying.contains("seekTo: { position in issueSeek(to: position, reason: \"system-seek\") }") &&
+              invalidatesBeforeReturning(tvRelativeSeek) && invalidatesBeforeReturning(tvIssueSeek),
               "tvOS system transport seeks invalidate countdowns")
 
         let tvRemote = section(tv, from: "private func handlePress(_ type:", to: "// MARK: -")

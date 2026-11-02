@@ -17,6 +17,7 @@ if [[ ${1:-} == --baseline-ref ]]; then
 fi
 # Compile the production retry method and candidate type with a deterministic relay; only
 # transport/account collaborators are substituted. The base and retry policy are not mirrored.
+# The real candidate freeze runs too, against the real (empty) playlist receipt ledger.
 cp app/Tests/SyncDerivedDocumentRevisionTests.swift "$revision_test_dir/Combined.swift"
 {
     printf '\n%s\n' 'extension UploadHarness {'
@@ -26,9 +27,15 @@ cp app/Tests/SyncDerivedDocumentRevisionTests.swift "$revision_test_dir/Combined
         sed -n '/^    private struct DerivedSyncDoc {/,/^    }/p' "$source_file"
     fi
     sed -n '/^    private func pushDerivedDoc(/,/^    }/p' "$source_file"
+    sed -n '/^    private func freezePlaylistAckCandidate(/,/^    }/p' "$source_file"
+    printf '%s\n' '}'
+    # The receipt ledger's only playlist dependency, read from production rather than restated.
+    printf '%s\n' 'enum VortxNativePlaylist {'
+    grep -m1 '^    static let v1Prefix = ' app/SourcesShared/VortxNativePlaylist.swift
     printf '%s\n' '}'
 } >> "$revision_test_dir/Combined.swift"
 xcrun swiftc "${swift_flags[@]}" app/SourcesShared/SyncDocumentRevisionPolicy.swift \
+    app/SourcesShared/NativePlaylistCloudReceiptLedger.swift app/SourcesShared/OwnerHistoryExactJSON.swift \
     "$revision_test_dir/Combined.swift" -o "$revision_test_dir/revisions"
 shasum -a 256 "$source_file" app/SourcesShared/SyncDocumentRevisionPolicy.swift
 "$revision_test_dir/revisions"

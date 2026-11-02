@@ -383,8 +383,12 @@ enum MPVSeekSettlementPolicyTests {
                   "\(path) owner-scoped failed target wins over earlier persistence floors on Retry")
             check(surface.contains("viewerPlay()   // release only the accepted replacement from terminal parking"),
                   "\(path) explicit Retry releases terminal pause only after new-owner admission")
+            // The terminal gate precedes every property's handling; Cast's receiver ownership may return before it.
             let handler = surface.range(of: "private func handleProperty(")!
-            check(surface[handler.lowerBound...].prefix(350).contains("!loadFailed"),
+            let handlerBody = surface[handler.lowerBound...]
+            let terminalGate = handlerBody.range(of: "guard !loadFailed else { return }")
+            let firstHandling = handlerBody.range(of: "if let loadToken, let transfer = engineSurfaceTransfer")
+            check(terminalGate != nil && firstHandling != nil && terminalGate!.lowerBound < firstHandling!.lowerBound,
                   "\(path) late parked-source property cannot resurrect terminal UI")
         }
         print("MPV seek settlement policy: PASS")

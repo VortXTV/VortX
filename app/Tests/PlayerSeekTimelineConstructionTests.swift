@@ -28,6 +28,7 @@ enum ProbePanel: String { case speed, subtitles, audio, video, quality, sources,
 final class ProbeEffects {
     var events: [String] = []
     var seeks: [Double] = []
+    var partyControls: [String] = []
     var activeLoadToken: UUID? = UUID()
     func seek(to time: Double) { seeks.append(time) }
 }
@@ -47,6 +48,14 @@ final class ProbeWatchedDwell { private(set) var resets = 0; func reset() { rese
 struct CoreStream {}
 struct CoreStreamSourceGroup { var streams: [CoreStream] = [] }
 struct PlayerLoadToken: Equatable {}
+
+/// Watch Party ships dark: these probes join no party and the remote flag keeps its default (off), so the
+/// control bar must omit the Watch Party button exactly as a production build does.
+enum RemoteConfig {
+    struct Snapshot { func isFeatureOn(_ key: String, default fallback: Bool) -> Bool { fallback } }
+    static let snapshot = Snapshot()
+}
+struct WatchPartyApplyContext {}
 
 /// Signature stand-in for StreamRanking (StreamRanking.swift is app-bound).
 enum StreamRanking {
@@ -117,6 +126,11 @@ struct PlayerScreen {
     func scheduleHide() { effects.events.append("hide") }
     func openPanel(_ panel: ProbePanel) { effects.events.append(panel.rawValue) }
     func grabFrame() { effects.events.append("grab") }
+    var currentWatchPartyContext: WatchPartyApplyContext? = nil
+    func beginWatchParty() { effects.events.append("watchParty") }
+    func publishWatchPartyControl(_ action: String, position: Double) {
+        effects.partyControls.append("\(action):\(position)")
+    }
     func viewerPlay() { effects.events.append("play") }
     func viewerPause() { effects.events.append("pause") }
     func restartFromBeginning() { effects.events.append("restart") }
@@ -382,6 +396,7 @@ enum PlayerBottomBarConstructionProbe {
         precondition(!screen.scrubbing && screen.currentTime == 75)
         precondition(screen.effects.seeks == [75])
         precondition(screen.effects.events == ["scrub", "report:75.0", "hide"])
+        precondition(screen.effects.partyControls == ["seek:75.0"], "a committed scrub is shared with a party")
         precondition(screen.scrubThumbnails.clears == 1)
         track.onHoverPreviewChanged(nil)
         precondition(screen.hoverPreviewTime == nil && screen.scrubThumbnails.clears == 2)

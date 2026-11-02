@@ -100,7 +100,9 @@ test("toolbar and editor do not expose repeated opaque button or editor-section 
     assert(source.includes("action: @escaping () -> Void) -> PlayerControlButton"));
     const toolbar = source.slice(source.indexOf("private struct PlayerTransportToolbar:"),
         source.indexOf("private struct PlayerLiveIndicator:"));
-    assert.equal((toolbar.match(/: PlayerControlButton/g) || []).length, 10);
+    // Ten fixed and optional controls plus the dark-shipped Watch Party slot (d44b3ce61), all nominal.
+    assert.equal((toolbar.match(/: PlayerControlButton/g) || []).length, 11);
+    assert(toolbar.includes("let watchParty: PlayerControlButton?"), "Watch Party stays an optional nominal control");
     const editor = source.slice(source.indexOf("private struct PlayerSkipEditorLayout:"),
         source.indexOf("private struct PlayerBottomBarLayout:"));
     assert.equal((editor.match(/let \w+: \(\) -> AnyView/g) || []).length, 3);

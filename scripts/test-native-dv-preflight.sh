@@ -10,7 +10,11 @@ else
   cp app/Sources/Player/AVPlayerEngine.swift "$preflight_test_dir/engine.swift"
 fi
 {
-  printf '%s\n' 'import Foundation' 'enum DVPlaybackPolicy {'
+  printf '%s\n' 'import Foundation' 'import AVFoundation'
+  if grep -Fq 'enum AVSubtitleRequestRetirementCause' "$preflight_test_dir/engine.swift" app/Sources/Player/*.swift 2>/dev/null; then
+    printf '%s\n' 'enum AVSubtitleRequestRetirementCause { case successor, ownerRevoked, uncertainNativeCommit }'
+  fi
+  printf '%s\n' 'enum DVPlaybackPolicy {'
   sed -n '/    enum NativePreAttachOutcome:/,/    \/\/ MARK: - HLS start position/p' \
     app/Sources/Player/DVPlaybackPolicy.swift | sed '$d'
   printf '%s\n' '}' '@MainActor extension PreflightFixtureEngine {'
@@ -27,6 +31,21 @@ fi
     }
     sed -n '/    private func retireSubtitleAlignment() {/,/^    }/p' "$preflight_test_dir/engine.swift" \
       | sed 's/private func /func /'
+  elif grep -Fq '    private func retireSubtitleAlignment(revealRequestedFile: Bool = true,' "$preflight_test_dir/engine.swift"; then
+    # The owned-alignment retirement (0a45fbd32) now resolves request and publication state this fixture does not
+    # model; its own tests cover that. Here it keeps the counter retirement the preflight sequence depends on.
+    printf '%s\n' \
+      '    func retireSubtitleAlignment(revealRequestedFile: Bool = true, cause: AVSubtitleRequestRetirementCause? = nil) {' \
+      '        subtitleAlignmentGeneration &+= 1' \
+      '    }'
+  fi
+  # Subtitle contribution sharing (0a45fbd32) retires and publishes a contribution object the fixture does not
+  # model; its own tests cover it. The item replacement itself is the actual production method.
+  if grep -Fq '    private func retireSubtitleContributionLoad() {' "$preflight_test_dir/engine.swift"; then
+    printf '%s\n' '    func retireSubtitleContributionLoad() {}' \
+      '    func publishSubtitleContributionLoad(for token: PlayerLoadToken) {}'
+    sed -n '/    private func replaceContributionPlayerItem(with replacement: AVPlayerItem?) {/,/^    }/p' \
+      "$preflight_test_dir/engine.swift" | sed 's/private func /func /'
   fi
   sed -n '/    func invalidateLoadToken() {/,/^    }/p' "$preflight_test_dir/engine.swift" \
     | sed '/^[[:space:]]*#if os(tvOS)/d; /^[[:space:]]*#endif/d'

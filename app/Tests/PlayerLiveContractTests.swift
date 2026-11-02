@@ -3365,6 +3365,10 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func retryFreshHDRItemOnHealthyMount(",
             to: "private func refreshPendingIntentTransport()")
+        let contributionItemReplacement = sourceSection(
+            engine,
+            from: "private func replaceContributionPlayerItem(with replacement: AVPlayerItem?) {",
+            to: "private func publishSubtitleContributionLoad(")
         let playerScreenAVDemote = sourceSection(
             playerScreen,
             from: "private func demoteAVPlayerToMPV(silent: Bool)",
@@ -3381,6 +3385,10 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "NowPlayingCenter.wireCommands(",
             to: "refreshNowPlaying(at:")
+        let tvPlayerIssueSeek = sourceSection(
+            tvPlayer,
+            from: "private func issueSeek(to target: Double, reason: String) {",
+            to: "private func seek(_ delta: Double) {")
         let playerScreenChapterRows = sourceSection(
             playerScreen,
             from: "case .chapters:\n            let chs =",
@@ -4158,10 +4166,11 @@ enum PlayerLiveContractTests {
                 "cancelPendingResumeForUserSeek()",
                 "coordinator.player?.seek(to: position)",
               ])
-                  && sourceContainsInOrder(tvPlayerNowPlaying, [
-                    "seekTo: { position in",
+                  && tvPlayerNowPlaying?.contains(
+                    "seekTo: { position in issueSeek(to: position, reason: \"system-seek\") }") == true
+                  && sourceContainsInOrder(tvPlayerIssueSeek, [
                     "cancelPendingLibmpvResumeForUserSeek()",
-                    "coordinator.player?.seek(to: position)",
+                    "coordinator.player?.seek(to: target)",
                   ])
                   && playerScreenDemotionUsesNewestEngineTarget
                   && tvPlayerDemotionUsesNewestEngineTarget)
@@ -4371,14 +4380,14 @@ enum PlayerLiveContractTests {
                     "subtitleSelectionRevision &+= 1",
                     "let revision = subtitleSelectionRevision",
                     "let generation = itemGeneration",
-                    "setExternalSubtitleActive(false)",
+                    "setExternalSubtitleActive(false, preservingAutomaticRequest: original)",
                     "item.select(requested, in: group)",
                     "refreshSelectionTracks(for: item)",
                     "self.subtitleSelectionRevision == revision",
                     "selectionContextIsCurrent(",
                     "item.currentMediaSelection.selectedMediaOption(in: group) == requested",
                     "self.externalSubtitleSettlement.consumeIfNativeDeselected(",
-                    "self.setExternalSubtitleActive(true)",
+                    "self.setExternalSubtitleActive(true, preservingAutomaticRequest: original)",
                     "self.refreshSelectionTracks(for: item)",
                   ]))
         check("wiring: the ticked-row identity includes the external subtitle",
@@ -4743,7 +4752,8 @@ enum PlayerLiveContractTests {
                   "finish(true)",
               ])
                   && externalSubtitleLoad?.contains("self.externalSubActive = true") == false
-                  && nativeSubtitleSelection?.contains("setExternalSubtitleActive(false)") == true)
+                  && nativeSubtitleSelection?.contains(
+                    "setExternalSubtitleActive(false, preservingAutomaticRequest: original)") == true)
         check("wiring: AVPlayer status clears stale cache state when playback resumes",
               sourceContainsInOrder(avTimeControl, [
                   "let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate",
@@ -4951,9 +4961,13 @@ enum PlayerLiveContractTests {
         check("wiring: HDR item replacement settles server admission before raw intent restoration",
               sourceContainsInOrder(hdrFallbackRetry, [
                 "invalidateSeekRequests()",
-                "player.replaceCurrentItem(with: freshItem)",
+                "replaceContributionPlayerItem(with: freshItem)",
                 "observe(freshItem, loadToken: loadToken)",
               ])
+                  && sourceContainsInOrder(contributionItemReplacement, [
+                    "retireSubtitleContributionLoad()",
+                    "player.replaceCurrentItem(with: replacement)",
+                  ])
                   && sourceContainsInOrder(groupLoad, [
                     "let restore = replacementReady",
                     "applyCommittedTransport()",

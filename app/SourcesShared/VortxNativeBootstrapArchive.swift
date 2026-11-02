@@ -193,6 +193,7 @@ enum VortxNativeBootstrapArchive {
         case settingsDomain, profileRosterData, profileRoster, profileRosterItem, profileName, profileAvatar
         case seriesChoiceData, seriesChoices, seriesChoice, seriesAddonName
         case legacyHost, legacyVortx, legacyLibraryRows, legacyLibraryRow, libraryName
+        case legacyAddonRows, legacyAddonSummaryRow
     }
     /// The plain label a loaded copy shows in place of display text that fails every display rule.
     static let replacedDisplayText = "Untitled"
@@ -297,6 +298,15 @@ enum VortxNativeBootstrapArchive {
               let manifest = object["manifest"] as? [String: Any] else { return false }
         return ["id", "name", "version"].allSatisfy { (manifest[$0] as? String)?.isEmpty == false }
     }
+    private static func isLegacyAddonSummaryRow(_ object: [String: Any]) -> Bool {
+        // Historical dashboard summaries contain only a URL/name pair. They have display
+        // semantics only in the account's exact add-on arrays, never in arbitrary objects.
+        // A present manifest must qualify through the complete descriptor predicate instead.
+        guard object["manifest"] == nil, object["name"] is String,
+              let transport = object["transportUrl"] as? String, let url = URLComponents(string: transport),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host?.isEmpty == false else { return false }
+        return true
+    }
     private static func hasLiteralDisplayLabel(_ text: String) -> Bool {
         // A public manifest label such as [4K], [Community] or {Public} is not a broken JSON
         // document. Admit only a short balanced label with no key/value, quoting or nested syntax.
@@ -399,15 +409,24 @@ enum VortxNativeBootstrapArchive {
                         context = .profileName
                     } else if textContext == .legacyLibraryRow, object[key] is String, key == "name" {
                         context = .libraryName
+                    } else if textContext == .legacyAddonSummaryRow, object[key] is String, key == "name" {
+                        context = .addonDisplayText
                     } else if textContext == .legacyHost, key == "vortx", object[key] is [String: Any] {
                         context = .legacyVortx
                     } else if (textContext == .legacyHost || textContext == .legacyVortx),
                               key == "library", object[key] is [Any] {
                         context = .legacyLibraryRows
+                    } else if (textContext == .legacyHost || textContext == .legacyVortx),
+                              key == "addons", object[key] is [Any] {
+                        context = .legacyAddonRows
                     } else if textContext == .profileRosterItem, object[key] is String, key == "avatar" {
                         context = .profileAvatar
                     } else {
+                        // vortxSummary also lifts manifest.name onto the descriptor itself.
+                        // The importer retains that sibling in typed material/native registers,
+                        // so complete descriptors keep this role wherever they are inspected.
                         context = key == "manifest" && addonDescriptor ? .addonManifest
+                            : addonDescriptor && key == "name" && object[key] is String ? .addonDisplayText
                             : textContext == .addonManifest && ["name", "description"].contains(key) && object[key] is String ? .addonDisplayText : .ordinary
                     }
                     guard holding, textContext == .settingsDomain, key != "stremiox.profiles" else {
@@ -443,6 +462,8 @@ enum VortxNativeBootstrapArchive {
                     context = .profileRosterItem
                 } else if textContext == .legacyLibraryRows && ($0.element as? [String: Any]).map(isLegacyLibraryRow) == true {
                     context = .legacyLibraryRow
+                } else if textContext == .legacyAddonRows && ($0.element as? [String: Any]).map(isLegacyAddonSummaryRow) == true {
+                    context = .legacyAddonSummaryRow
                 } else {
                     context = .ordinary
                 }
