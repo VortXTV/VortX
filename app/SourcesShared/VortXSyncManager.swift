@@ -2630,6 +2630,7 @@ final class VortXSyncManager: ObservableObject {
         // A busy publication boundary is a hard composition failure. Do not let any dependent store, source
         // index, or session field observe a partial owner transition; the caller leaves all of them untouched.
         guard let capture = credentialAuthority.tryBind(scope) else { return nil }
+        retireAccountFileRepairForOwnerTransition()
         nativeProfileEditConflicts = []
         nativeAddonEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
@@ -2660,6 +2661,7 @@ final class VortXSyncManager: ObservableObject {
         certifying: @MainActor () -> CredentialMutationResult
     ) -> CredentialScopeRegistry.Capture? {
         guard let capture = credentialAuthority.tryBind(scope, certifying: certifying) else { return nil }
+        retireAccountFileRepairForOwnerTransition()
         nativeProfileEditConflicts = []
         nativeAddonEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
@@ -3490,6 +3492,119 @@ final class VortXSyncManager: ObservableObject {
             throw VortxAccountBackupFile.Failure.damaged
         }
         return try VortxAccountBackupFile.encodeServerResponse(responseBytes, username: capturedAccount.username)
+    }
+
+    // MARK: - File-only account repair
+
+    private struct AccountFileRepairOperation {
+        let id: UUID
+        let input: VortxAccountFileRepairService.Input
+        let fence: VortxAccountFileRepairService.Fence
+        var preparing = true
+        var output: VortxAccountFileRepairService.Output?
+        var expiry: Task<Void, Never>?
+    }
+    private var accountFileRepairOperation: AccountFileRepairOperation?
+
+    /// Returns a metadata-only preview. Its UUID can release one encrypted export while the
+    /// original account capture/key remain current. No native mount/profile selection is required.
+    /// Normal fenced session renewal on the GET remains enabled; no backup is uploaded or applied.
+    func prepareAccountBackupRepair(_ selectedFile: Data) async throws -> VortxAccountFileRepairService.Preview {
+        typealias Service = VortxAccountFileRepairService
+        guard selectedFile.count <= VortxAccountBackupFile.maximumFileBytes else {
+            throw Service.Failure.conversion(.tooLarge)
+        }
+        if let old = accountFileRepairOperation, !old.preparing, !old.fence.isActive() {
+            retireAccountFileRepair(old.id)
+        }
+        guard accountFileRepairOperation == nil else { throw Service.Failure.busy }
+        let capture = credentialAuthority.capture()
+        guard isSignedIn, isCurrent(capture), credentialAuthority.isMigrationEligible(capture),
+              let capturedAccount = account, let key = dataKey, key.count == 32,
+              let bearer = token, !bearer.isEmpty,
+              CredentialScope(canonicalRemoteAccountID: capturedAccount.id) == capture.scope else {
+            throw Service.Failure.accountChanged
+        }
+        let input = Service.Input(accountID: capturedAccount.id, capture: capture, dataKey: key,
+                                  requiresVersionBoundHead: Self.sawDocV2(capturedAccount.id))
+        let id = UUID(), fence = Service.Fence(capture: capture)
+        accountFileRepairOperation = .init(id: id, input: input, fence: fence)
+        accountFileRepairOperation?.expiry = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: Service.lifetimeNanoseconds) }
+            catch { return }
+            self?.cancelAccountBackupRepair(id)
+        }
+        var prepared = false
+        defer { if !prepared { retireAccountFileRepair(id) } }
+        return try await withTaskCancellationHandler(operation: {
+            try requireAccountFileRepair(id)
+            var rawResponse: Data?
+            // This is the actual current authenticated transport read, not a file-derived
+            // owner/source witness. The transport retains its existing renewal/write fences.
+            let (code, _) = await request("GET", "/v1/backup", auth: true, credentialCapture: capture,
+                                         receiveBackupData: { rawResponse = $0 })
+            try requireAccountFileRepair(id)
+            if code == 404 { throw Service.Failure.ownerUnavailable }
+            guard code == 200, let rawResponse else { throw Service.Failure.unavailable }
+            let output = try await VortxAccountFileRepairWorker.shared.prepare(file: selectedFile,
+                authenticatedHeadResponse: rawResponse, input: input, fence: fence)
+            try requireAccountFileRepair(id)
+            guard !Self.sawDocV2(input.accountID) || output.headWasVersionBound else {
+                throw Service.Failure.ownerUnavailable
+            }
+            accountFileRepairOperation?.preparing = false
+            accountFileRepairOperation?.output = output
+            prepared = true
+            return Service.Preview(id: id, profileCount: output.profileCount,
+                                   nativeSchema: output.nativeSchema, fileBytes: output.file.count)
+        }, onCancel: { fence.revoke() })
+    }
+
+    /// Returns encrypted export bytes once. UI must use a NEW user-chosen destination and
+    /// report saved only after the document exporter confirms it. This is not file-save proof.
+    func takeAccountBackupRepairExport(_ id: UUID) throws -> Data {
+        try requireAccountFileRepair(id)
+        guard let operation = accountFileRepairOperation, !operation.preparing,
+              let output = operation.output else { throw VortxAccountFileRepairService.Failure.busy }
+        guard !Self.sawDocV2(operation.input.accountID) || output.headWasVersionBound else {
+            retireAccountFileRepair(id)
+            throw VortxAccountFileRepairService.Failure.ownerUnavailable
+        }
+        // Output is immutable Data held only by this exact operation; no UI-supplied file/hash.
+        let bytes = output.file
+        retireAccountFileRepair(id)
+        return bytes
+    }
+
+    /// Dismissal while preparation is running cancels the caller's Task. Once a preview is
+    /// available, cancellation names its exact UUID; stale view cleanup cannot cancel a successor.
+    func cancelAccountBackupRepair(_ id: UUID) {
+        guard let operation = accountFileRepairOperation, operation.id == id else { return }
+        operation.fence.revoke()
+        // Keep the one-operation slot until the actual HTTP/ABI task returns. A cancelled
+        // synchronous ABI call may still be unwinding; do not allow an unbounded replacement queue.
+        if !operation.preparing { retireAccountFileRepair(id) }
+    }
+
+    private func requireAccountFileRepair(_ id: UUID) throws {
+        guard let operation = accountFileRepairOperation, operation.id == id,
+              isSignedIn, isCurrent(operation.input.capture),
+              credentialAuthority.isMigrationEligible(operation.input.capture),
+              account?.id == operation.input.accountID, dataKey == operation.input.dataKey else {
+            throw VortxAccountFileRepairService.Failure.accountChanged
+        }
+        try operation.fence.check()
+    }
+
+    private func retireAccountFileRepair(_ id: UUID) {
+        guard let operation = accountFileRepairOperation, operation.id == id else { return }
+        operation.fence.revoke()
+        operation.expiry?.cancel()
+        accountFileRepairOperation = nil
+    }
+
+    private func retireAccountFileRepairForOwnerTransition() {
+        if let operation = accountFileRepairOperation { cancelAccountBackupRepair(operation.id) }
     }
 
     /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and
