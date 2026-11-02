@@ -64,6 +64,9 @@ internal class FailClosedCredentialStore(
 
     fun set(values: Map<String, String?>): Boolean = state.write(values)
 
+    fun replaceConfirmed(expected: Map<String, String?>, updates: Map<String, String?>): Boolean =
+        state.replaceConfirmed(expected, updates)
+
     fun setAndPurgeLegacy(values: Map<String, String?>): Boolean =
         writeThenPurgeLegacy(
             write = { state.write(values) },
@@ -236,6 +239,33 @@ internal class FailClosedCredentialState(
             poisonBackend(IllegalStateException("Encrypted credential commit was rejected"))
             ConditionalCredentialWrite.REJECTED
         }
+    }
+
+    /** Exact confirmed tuple CAS. A rejected/ambiguous commit or readback poisons this process's
+     * backend, so its mutated SharedPreferences cache can never certify a replacement credential. */
+    @Synchronized
+    fun replaceConfirmed(expected: Map<String, String?>, updates: Map<String, String?>): Boolean {
+        if (expected.isEmpty() || updates.isEmpty() || !expected.keys.containsAll(updates.keys)) return false
+        val persistent = backend ?: reopenPersistentBackend() ?: return false
+        val before = try { expected.keys.associateWith(persistent::string) }
+            catch (error: Exception) { disableBackend(error); return false }
+        before.forEach(::rememberConfirmed)
+        if (before != expected) return false
+        val replacement = before + updates
+        val stored = try { persistent.write(updates) }
+            catch (error: Exception) { poisonBackend(error); return false }
+        if (!stored) {
+            poisonBackend(IllegalStateException("Encrypted credential compare-and-set rejected"))
+            return false
+        }
+        val after = try { expected.keys.associateWith(persistent::string) }
+            catch (error: Exception) { poisonBackend(error); return false }
+        if (after != replacement) {
+            poisonBackend(IllegalStateException("Encrypted credential readback mismatch"))
+            return false
+        }
+        after.forEach(::rememberConfirmed)
+        return true
     }
 
     @Synchronized

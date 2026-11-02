@@ -375,7 +375,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         MoatToken.appContext = applicationContext
         MoatToken.sessionProvider = {
             syncManager?.currentSession()?.let { session ->
-                MoatToken.SessionCredential(bearer = session.token, accountId = session.account.id)
+                MoatToken.SessionCredential(bearer = session.currentBearer, accountId = session.account.id)
             }
         }
         // Compatibility hook for the closed legacy API. The typed path uses its captured account admission.

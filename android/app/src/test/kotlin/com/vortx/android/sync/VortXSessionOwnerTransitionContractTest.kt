@@ -108,7 +108,7 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("fun clear(ownerEpoch: Long): Boolean")
             .substringBefore("private companion object")
 
-        assertTrue(persist.contains("KEY_TOKEN to s.token"))
+        assertTrue(persist.contains("KEY_TOKEN to s.currentBearer"))
         assertTrue(persist.contains("KEY_ACCOUNT to acct.toString()"))
         assertTrue(persist.contains("KEY_DATA_KEY to VortXCrypto.b64(s.dataKey)"))
         assertTrue(persist.contains("KEY_OWNER_EPOCH to ownerEpoch.toString()"))

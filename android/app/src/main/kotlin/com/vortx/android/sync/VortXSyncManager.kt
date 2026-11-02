@@ -532,7 +532,11 @@ internal class SyncSessionLease(
     val accountId: String,
     val token: String,
     dataKey: ByteArray,
+    private val transportBearer: () -> String = { token },
 ) {
+    /** Bound to the original Session; callers retain their existing owner/epoch admission. */
+    fun currentBearer(): String = transportBearer()
+
     private val immutableDataKey = dataKey.copyOf()
 
     fun dataKeyCopy(): ByteArray = immutableDataKey.copyOf()
@@ -546,7 +550,7 @@ internal fun sessionTruthMatches(
     right: VortXSyncManager.Session?,
 ): Boolean {
     if (left == null || right == null) return left == null && right == null
-    return left.token == right.token &&
+    return left.currentBearer == right.currentBearer &&
         left.account == right.account &&
         left.dataKey.contentEquals(right.dataKey)
 }
@@ -927,6 +931,16 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     /** A live signed-in session: bearer token + account + the decrypted 32-byte data key. */
     data class Session(val token: String, val account: Account, val dataKey: ByteArray) {
+        // token remains the immutable owner/lease identity for this process. Only confirmed
+        // same-session renewal advances the network carrier; no Session/epoch is replaced.
+        @Volatile internal var currentBearer: String = token
+            private set
+        internal fun publishConfirmedRenewal(expected: String, candidate: String): Boolean {
+            if (currentBearer != expected) return false
+            currentBearer = candidate
+            return true
+        }
+        override fun toString(): String = "Session(redacted)"
         override fun equals(other: Any?): Boolean =
             other is Session && token == other.token && account == other.account && dataKey.contentEquals(other.dataKey)
         override fun hashCode(): Int = 31 * (31 * token.hashCode() + account.hashCode()) + dataKey.contentHashCode()
@@ -1365,6 +1379,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 val selected = profileStore?.active ?: return@serialized null
                 WatchPartyAuthSnapshot.capture(
                     bearer = current.token,
+                    currentBearer = { current.currentBearer },
                     accountId = current.account.id,
                     profileId = selected.id,
                     authGeneration = authGeneration,
@@ -1416,7 +1431,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 com.vortx.android.player.PlaybackOwnerEpoch.transition {
                     sessionState.restore(persisted, persistedOwnerEpoch)
                 }
-            } else sessionState.restore(persisted, persistedOwnerEpoch)
+            } // Equal confirmed truth retains the ORIGINAL Session and immutable lease token.
             bindLibraryAccount(persisted?.account?.id)
             AddonTombstones.activateAccount(persisted?.account?.id)
             AddonPrefsStore.activateAccount(persisted?.account?.id)
@@ -1515,6 +1530,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     accountId = current.account.id,
                     token = current.token,
                     dataKey = current.dataKey,
+                    transportBearer = { current.currentBearer },
                 )
             }
         }
@@ -3607,6 +3623,63 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return adoption
     }
 
+    private class SessionRenewalCapture(
+        val owner: Session, val operationGeneration: Long, val ownerEpoch: Long,
+        val sentToken: String, val dataKey: ByteArray,
+    )
+
+    private fun captureSessionRenewal(bearer: String?, permit: SessionOperationCoordinator.OutboundCallPermit): SessionRenewalCapture? =
+        operations.snapshot { generation -> sessionState.serialized {
+            val owner = sessionState.value ?: return@serialized null
+            if (permit.owner != SessionOperationCoordinator.OutboundCallOwner.SESSION || !permit.isCurrent() ||
+                bearer != owner.token || _sessionUiState.value != SessionUiState.SignedIn(owner.account) ||
+                _account.value != owner.account || owner.dataKey.size != 32) return@serialized null
+            SessionRenewalCapture(owner, generation, sessionState.ownerEpoch, owner.currentBearer, owner.dataKey.copyOf())
+        } }
+
+    private fun storeSessionRenewal(candidate: String?, captured: SessionRenewalCapture?,
+                                    permit: SessionOperationCoordinator.OutboundCallPermit,
+                                    method: String, path: String, status: Int, ifNoneMatch: String?,
+                                    etag: String?, emptyBody: Boolean) {
+        if (captured == null || !SessionRenewalPolicy.eligibleResponse(method, path, status, ifNoneMatch, etag, emptyBody) ||
+            !SessionRenewalPolicy.accepts(candidate, captured.sentToken, captured.owner.account.id,
+                sessionRenewalNowTestSeam?.invoke() ?: System.currentTimeMillis())) return
+        operations.mutateIfCurrent(captured.operationGeneration) { sessionState.serialized {
+            val owner = sessionState.value ?: return@serialized
+            if (!permit.isCurrent() || owner !== captured.owner || sessionState.ownerEpoch != captured.ownerEpoch ||
+                owner.currentBearer != captured.sentToken || !owner.dataKey.contentEquals(captured.dataKey) ||
+                _sessionUiState.value != SessionUiState.SignedIn(owner.account) || _account.value != owner.account) return@serialized
+            val next = candidate ?: return@serialized
+            val saved = sessionRenewalPersistTestSeam?.invoke(owner, captured.sentToken, captured.ownerEpoch, next)
+                ?: store.renew(owner, captured.sentToken, captured.ownerEpoch, next)
+            if (saved && permit.isCurrent() && sessionState.value === owner &&
+                sessionState.ownerEpoch == captured.ownerEpoch && owner.dataKey.contentEquals(captured.dataKey)) {
+                owner.publishConfirmedRenewal(captured.sentToken, next)
+            }
+        } }
+    }
+
+    // Synthetic response and persistence boundaries for actual manager renewal regression tests.
+    // Production still uses the real URL connection and exact encrypted tuple CAS above.
+    internal data class SessionRenewalTestResponse(val status: Int, val body: JSONObject? = null,
+        val renewal: String? = null, val etag: String? = null, val emptyBody: Boolean = true,
+        val rawBody: ByteArray? = null)
+    @Volatile private var sessionRenewalNowTestSeam: (() -> Long)? = null
+    @Volatile private var sessionRenewalPersistTestSeam: ((Session, String, Long, String) -> Boolean)? = null
+    @Volatile private var sessionRenewalTransportTestSeam: (suspend (String, String, String?) -> SessionRenewalTestResponse)? = null
+    internal fun installSessionRenewalTestSeam(now: () -> Long,
+        persist: (Session, String, Long, String) -> Boolean,
+        transport: suspend (String, String, String?) -> SessionRenewalTestResponse) {
+        sessionRenewalNowTestSeam = now; sessionRenewalPersistTestSeam = persist
+        sessionRenewalTransportTestSeam = transport
+    }
+    internal suspend fun requestSessionRenewalForTest(method: String = "GET", path: String = "/v1/backup",
+        ifNoneMatch: String? = null, authPermit: Boolean = false): Pair<Int, JSONObject?> {
+        val lease = captureSyncLease() ?: return 0 to null
+        val permit = if (authPermit) operations.beginAuth().acquireCallPermit() else acquireSyncCallPermit(lease)
+        return request(method, path, null, lease.token, permit ?: return 0 to null, ifNoneMatch)
+    }
+
     // MARK: - HTTP (tiny JSON-over-HttpURLConnection helper, same shape as IntegrationsHttp)
 
     /**
@@ -3625,6 +3698,28 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         candidateCurrent: () -> Boolean = { true },
         accountFileDownload: AccountFileDownload? = null,
     ): Pair<Int, JSONObject?> {
+        val renewalCapture = captureSessionRenewal(bearerToken, callPermit)
+        val effectiveBearer = renewalCapture?.sentToken ?: bearerToken
+        sessionRenewalTransportTestSeam?.let { transport ->
+            try {
+                if (!callPermit.isCurrent() || !candidateCurrent()) return 0 to null
+                val response = transport(method, path, effectiveBearer)
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!callPermit.isCurrent() || !candidateCurrent()) return 0 to null
+                receiveETag?.invoke(response.etag)
+                storeSessionRenewal(response.renewal, renewalCapture, callPermit, method, path,
+                    response.status, ifNoneMatch, response.etag, response.emptyBody)
+                if (accountFileDownload != null) {
+                    check(method == "GET" && path == "/v1/backup" && body == null && ifNoneMatch == null &&
+                        bearerToken == accountFileDownload.lease.token)
+                    if (!isAccountFileDownloadCurrent(accountFileDownload)) return 0 to null
+                    if (response.status == 200 && response.rawBody != null) accountFileDownload.response =
+                        response.rawBody.inputStream().use(AccountBackupFile::readBoundedResponse)
+                    return response.status to null
+                }
+                return response.status to response.body
+            } finally { callPermit.close() }
+        }
         if (accountFileDownload != null) {
             check(method == "GET" && path == "/v1/backup" && body == null && ifNoneMatch == null &&
                 bearerToken == accountFileDownload.lease.token)
@@ -3632,7 +3727,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 return try {
                     if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) 0 to null
                     else {
-                        val (status, raw) = transport(method, path, bearerToken)
+                        val (status, raw) = transport(method, path, effectiveBearer)
                         if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) 0 to null
                         else {
                             if (status == 200 && raw != null) accountFileDownload.response =
@@ -3646,7 +3741,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         conditionalRequestTestSeam?.let { testTransport ->
             if (!callPermit.isCurrent() || !candidateCurrent()) { callPermit.close(); return 0 to null }
             return try {
-                val (status, json, etag) = testTransport(method, path, body, bearerToken, ifNoneMatch)
+                val (status, json, etag) = testTransport(method, path, body, effectiveBearer, ifNoneMatch)
                 receiveETag?.invoke(etag)
                 status to json
             } finally { callPermit.close() }
@@ -3654,7 +3749,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         requestTestSeam?.let { testTransport ->
             if (!callPermit.isCurrent() || !candidateCurrent()) { callPermit.close(); return 0 to null }
             return try {
-                testTransport(method, path, body, bearerToken)
+                testTransport(method, path, body, effectiveBearer)
             } finally {
                 callPermit.close()
             }
@@ -3678,7 +3773,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         useCaches = false
                         // The session bearer for the backup/sync endpoints. `api.vortx.tv` is the account-authed
                         // host and is deliberately NOT edge-signed (excluded from VortXEdgeAuth's gate).
-                        bearerToken?.let { setRequestProperty("authorization", "Bearer $it") }
+                        // Never follow a response to another origin with a stored bearer.
+                        if (renewalCapture != null) instanceFollowRedirects = false
+                        effectiveBearer?.let { setRequestProperty("authorization", "Bearer $it") }
                         if (method == "GET" && path == "/v1/backup") ifNoneMatch?.let { setRequestProperty("If-None-Match", it) }
                         if (bodyBytes != null) {
                             doOutput = true
@@ -3693,7 +3790,18 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     }
                     if (!callPermit.isCurrent()) return@withContext 0 to null
                     val status = opened.responseCode
-                    receiveETag?.invoke(opened.getHeaderField("ETag"))
+                    val responseETag = opened.getHeaderField("ETag")
+                    receiveETag?.invoke(responseETag)
+                    val emptyNotModified = status != 304 || opened.inputStream.use { it.read() == -1 }
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (!callPermit.isCurrent() || !candidateCurrent()) return@withContext 0 to null
+                    if (opened.url.protocol == "https" && opened.url.host == "api.vortx.tv" &&
+                        opened.url.port in setOf(-1, 443) && opened.url.file == path) {
+                        val renewals = opened.headerFields.entries.filter { it.key?.equals("X-VortX-Session", true) == true }
+                            .flatMap { it.value.orEmpty() }
+                        storeSessionRenewal(renewals.singleOrNull(), renewalCapture, callPermit,
+                            method, path, status, ifNoneMatch, responseETag, emptyNotModified)
+                    }
                     if (accountFileDownload != null) {
                         if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) return@withContext 0 to null
                         if (status != 200) return@withContext status to null
@@ -3702,7 +3810,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         accountFileDownload.response = raw
                         return@withContext status to null
                     }
-                    if (status == 304) return@withContext 304 to null
+                    if (status == 304) return@withContext if (emptyNotModified) 304 to null else 0 to null
                     val stream = if (status in 200..399) opened.inputStream else opened.errorStream
                     val text = try { stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty() }
                         catch (error: IOException) {
@@ -3746,13 +3854,17 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             }
             return store.set(
                 mapOf(
-                    KEY_TOKEN to s.token,
+                    KEY_TOKEN to s.currentBearer,
                     KEY_ACCOUNT to acct.toString(),
                     KEY_DATA_KEY to VortXCrypto.b64(s.dataKey),
                     KEY_OWNER_EPOCH to ownerEpoch.toString(),
                 ),
             )
         }
+
+        fun renew(expected: Session, sentToken: String, ownerEpoch: Long, candidate: String): Boolean =
+            SessionRenewalPolicy.persistConfirmed(candidate, sentToken, expected, ownerEpoch,
+                store.confirmedSnapshot(*SessionRenewalPolicy.tupleKeys), store::replaceConfirmed)
 
         fun load(): SessionLoad {
             val snapshot = store.confirmedSnapshot(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY, KEY_OWNER_EPOCH)

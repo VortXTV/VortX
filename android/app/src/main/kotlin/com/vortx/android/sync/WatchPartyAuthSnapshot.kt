@@ -8,14 +8,18 @@ import java.util.UUID
  * It deliberately contains neither the account data key nor add-on/provider credentials.
  */
 internal class WatchPartyAuthSnapshot private constructor(
-    val bearer: String,
+    private val authorityBearer: String,
     val accountId: String,
     val profileId: String,
     val authGeneration: Long,
     val sessionGeneration: Long,
     val ownerEpoch: Long,
     internal val ownerToken: PlaybackOwnerToken,
+    private val currentBearer: () -> String,
 ) {
+    /** Network carrier bound to the ORIGINAL session, never a replacement account lookup. */
+    val bearer: String get() = currentBearer()
+
     /** A retired account/profile lifetime cannot revive after an A-to-B-to-A transition. */
     internal fun sameAuthorityAs(other: WatchPartyAuthSnapshot): Boolean =
         ownerToken === other.ownerToken &&
@@ -24,7 +28,7 @@ internal class WatchPartyAuthSnapshot private constructor(
             ownerEpoch == other.ownerEpoch &&
             accountId == other.accountId &&
             profileId == other.profileId &&
-            bearer == other.bearer &&
+            authorityBearer == other.authorityBearer &&
             ownerToken.isActive && other.ownerToken.isActive
 
     override fun toString(): String = "WatchPartyAuthSnapshot(redacted)"
@@ -39,6 +43,7 @@ internal class WatchPartyAuthSnapshot private constructor(
             sessionGeneration: Long,
             ownerEpoch: Long,
             ownerToken: PlaybackOwnerToken,
+            currentBearer: (() -> String)? = null,
         ): WatchPartyAuthSnapshot? {
             val canonicalAccount = runCatching { UUID.fromString(accountId).toString() }.getOrNull()
             if (canonicalAccount != accountId || bearer.isBlank() || bearer.any(Char::isWhitespace) ||
@@ -46,7 +51,7 @@ internal class WatchPartyAuthSnapshot private constructor(
                 authGeneration < 0L || sessionGeneration < 0L || ownerEpoch < 1L || !ownerToken.isActive
             ) return null
             return WatchPartyAuthSnapshot(
-                bearer, accountId, profileId, authGeneration, sessionGeneration, ownerEpoch, ownerToken,
+                bearer, accountId, profileId, authGeneration, sessionGeneration, ownerEpoch, ownerToken, currentBearer ?: { bearer },
             )
         }
     }

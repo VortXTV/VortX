@@ -103,7 +103,7 @@ internal class VortXSyncRealtime(
     private fun connectLocked(expected: Channel): Boolean {
         return try {
             val request = Request.Builder().url(wssUrl)
-                .header("authorization", "Bearer " + expected.lease.token).build()
+                .header("authorization", "Bearer " + expected.lease.currentBearer()).build()
             val listener = object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) = handleMessage(expected, webSocket, text)
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) = handleMessage(expected, webSocket, bytes.utf8())
