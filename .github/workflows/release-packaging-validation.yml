@@ -140,6 +140,10 @@ jobs:
           --tests com.vortx.android.playlists.SavedPlaylistStoreTest
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
+          --tests com.vortx.android.sync.AccountBackupFileTest
+          --tests com.vortx.android.sync.SessionRenewalPolicyTest
+          --tests com.vortx.android.sync.SessionRenewalManagerTest
+          --tests com.vortx.android.profile.ProfileSelectionWiringTest
           --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
           --tests com.vortx.android.diagnostics.DiagnosticShareOperationTest
           --tests com.vortx.android.engine.NativeRetirementDispatchTest
