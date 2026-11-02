@@ -25,7 +25,7 @@ enum PlayerEngineRouter {
     enum Override: String, CaseIterable {
         case auto, mpv, avfoundation
         #if VORTX_AETHER_ENGINE
-        /// AetherEngine, offered to everyone for testing on a system it supports (iOS 18, tvOS 18, macOS 15).
+        /// AetherEngine, offered on a system it supports (iOS 18, tvOS 18, macOS 15).
         case aether
         #endif
         var label: String {
@@ -34,7 +34,7 @@ enum PlayerEngineRouter {
             case .mpv:          return "Always libmpv"
             case .avfoundation: return "Prefer AVPlayer (HLS / DV)"
             #if VORTX_AETHER_ENGINE
-            case .aether:       return "AetherEngine (testing)"
+            case .aether:       return "AetherEngine"
             #endif
             }
         }

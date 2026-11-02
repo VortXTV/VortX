@@ -77,7 +77,7 @@ VortX does not include a movie or television subscription. Add-ons and services 
 
 ### A player with room to adjust
 
-- Native playback with libmpv and Apple's AVPlayer paths on Apple, and MPV/Media3 variants on Android.
+- Apple playback with libmpv, AVPlayer and AetherEngine on supported systems; MPV/Media3 variants on Android. AetherEngine is available on macOS 15+, iOS 18+ and tvOS 18+.
 - Audio and subtitle selection, language preferences, subtitle styling/sync, playback speed and aspect controls.
 - Intro and credit skipping when timings or chapters are available, episode navigation and next-episode preparation.
 - Resume, source switching, playback information, seek previews and supported external-player handoffs.
@@ -151,7 +151,7 @@ Report security vulnerabilities through [private vulnerability reporting](https:
 
 ## Development and documentation
 
-Apple uses Swift/SwiftUI, native Rust engine interfaces, libmpv/MPVKit and AVPlayer. Android uses Kotlin/Jetpack Compose with native engine integration. The [browser client](webapp/README.md) has a different playback capability boundary from the native apps.
+Apple uses Swift/SwiftUI, native Rust engine interfaces, libmpv/MPVKit, AVPlayer and AetherEngine. AetherEngine is isolated in its own framework so its FFmpeg libraries remain separate from the libmpv stack. Android uses Kotlin/Jetpack Compose with native engine integration. The [browser client](webapp/README.md) has a different playback capability boundary from the native apps.
 
 - [Documentation index](docs/README.md)
 - [Installation](docs/INSTALLING.md) and [help / diagnostics](docs/SUPPORT.md)

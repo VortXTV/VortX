@@ -472,6 +472,19 @@ struct TVPlayerView: View {
     @State private var addonSubtitlePreparationTask: Task<Void, Never>?
     @State private var subtitlePresentationEpoch = UUID()
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
+    private struct AddonSubtitleFetchOwner: Equatable {
+        let player: ObjectIdentifier
+        let load: PlayerLoadToken
+        let target: PlaybackMutationTarget
+        let credential: CredentialScopeRegistry.Capture
+        let applicationEpoch: UUID
+        let query: SubtitleAddonService.QueryIdentity
+    }
+    @State private var addonSubsOwner: AddonSubtitleFetchOwner?
+    @State private var addonSubsLoadLifetime: SubtitlePoolClient.ContributionLoad?
+    @State private var addonSubsRequests = SubtitleAddonService.DiscoveryState()
+    @State private var addonSubsResolution = SubtitleAddonService.ResolutionState()
+
     // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
     // the preferred language chain but an add-on does). Reset wherever appliedAutoTracks resets, so a source
     // hop / episode switch / reload re-evaluates cleanly; latched after one attempt so a failed or declined
@@ -5383,9 +5396,9 @@ struct TVPlayerView: View {
         refreshTracks()
         refreshSourceOptionCounts()
         scheduleHide()   // loop won't hide while showOptions; this just keeps the deadline fresh
-        // Late add-on subtitle recovery: if the start-of-playback fetch raced an empty add-on collection,
-        // retry now. Key-latched inside (no-op once a real fetch ran); the async result refreshes the rows.
-        if kind == .subtitles { fetchAddonSubtitles() }
+        // Explicit opening retries only failed installed sources; successful (including empty) and
+        // in-flight source/key receipts remain latched. Newly installed sources join independently.
+        if kind == .subtitles { fetchAddonSubtitles(retryFailures: true) }
         panelRows = stabilizedOptionRows(optionRows, for: kind)
         // Single-choice panels open on the current selection; the mixed settings panel opens
         // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
@@ -8411,50 +8424,84 @@ struct TVPlayerView: View {
 
     /// Pull external subtitles for the playing title from the account's subtitle add-ons,
     /// once per episode. Movies query by their id; episodes by id:season:episode.
-    private func fetchAddonSubtitles() {
-        guard let m = curMeta else { return }
-        // Subtitle add-ons come from the ENGINE's installed set (`core.addons`, the source of truth since VortX
-        // went account-primary), unioned with the legacy Stremio collection (`account.addons`) as a fallback.
-        // Reading account.addons alone showed NO add-on subtitles on a VortX-primary device (#148). Both load
-        // async, so latching an empty union here would hide add-on subtitles for the whole session: bail before
-        // touching the key so a later call (playback start / panel open) fetches once the add-ons have arrived.
+    private func fetchAddonSubtitles(retryFailures: Bool = false) {
+        guard !leftPlayback, let m = curMeta, let player = coordinator.player, let load = player.activeLoadToken,
+              let applicationEpoch = LegacyWatchOwnership.captureApplicationEpoch() else { return }
+        let target = playbackMutationTarget
+        let credential = CredentialScopeRegistry.shared.capture()
+        guard target.stillOwnsCurrentContext(core: core) else { return }
+        // Some engines expose an additional native-mount lifetime; their retired same-token mount
+        // must not publish. Engines without that optional capability still use their real load token.
+        let loadLifetime = player.captureSubtitleContributionLoad(for: load)
+        let owner = AddonSubtitleFetchOwner(player: ObjectIdentifier(player), load: load, target: target,
+            credential: credential, applicationEpoch: applicationEpoch,
+            query: .init(type: m.type, libraryID: m.libraryId, videoID: m.videoId))
+        if addonSubsOwner != owner || addonSubsLoadLifetime?.isCurrent == false {
+            addonSubsOwner = owner; addonSubsLoadLifetime = loadLifetime
+            addonSubsRequests.reset(); addonSubsKey = ""
+            addonSubsResolution.reset(); addonSubsResolveTried = false
+            addonSubs = []; addedSubURLs = []
+            refreshAddonSubtitleRows()
+        }
         let sources = SubtitleAddonService.installedSources(engine: core.addons, account: account.addons)
-        guard !sources.isEmpty else { return }
-        // A hub / TMDB-catalog play carries a `tmdb:` library id that OpenSubtitles-class add-ons cannot answer,
-        // so the raw id returns nothing and add-on subtitles never appear. Resolve tmdb -> tt ONCE (the same
-        // persistent trickplay resolver), then re-enter with the tt id. A failed resolve falls through to the
-        // raw-id path below exactly once (= today's behavior); addonSubsResolveTried keeps it loop-proof.
+        guard !sources.isEmpty else {
+            addonSubsRequests.updateSources([]); addonSubs = []
+            refreshAddonSubtitleRows()
+            return
+        }
+        guard addonSubsResolution.pending == nil else { return }
         if m.libraryId.lowercased().hasPrefix("tmdb:"),
            CommunityTrickplay.cachedIMDbID(for: m.libraryId) == nil,
            !addonSubsResolveTried {
             addonSubsResolveTried = true
+            guard let request = addonSubsResolution.begin(query: owner.query) else { return }
             Task { @MainActor in
                 _ = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil)
-                fetchAddonSubtitles()      // cache hit now, or raw-id fallback below exactly once
-                fetchPooledSubtitles()     // re-key the pooled path under the resolved identity (see communityContentKey)
+                guard !Task.isCancelled, !leftPlayback, addonSubsOwner == owner, addonSubsResolution.pending == request,
+                      player === coordinator.player, player.activeLoadToken == load,
+                      loadLifetime?.isCurrent != false, target.stillOwnsCurrentContext(core: core),
+                      curMeta?.type == m.type, curMeta?.videoId == m.videoId, curMeta?.libraryId == m.libraryId,
+                      CredentialScopeRegistry.shared.isCurrent(credential),
+                      LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch) else { return }
+                guard addonSubsResolution.finish(request, currentQuery: owner.query) else { return }
+                fetchAddonSubtitles(retryFailures: retryFailures)
+                fetchPooledSubtitles()
             }
             return
         }
-        // Rewrite the tmdb: prefix of the query id to the resolved tt id when we have one; all other ids pass
-        // through unchanged. "tmdb:456:1:2" -> "tt789:1:2".
         let effectiveVideoId = SubtitleRequestMetadata.effectiveVideoID(
             libraryID: m.libraryId, videoID: m.videoId,
             cachedIMDbID: CommunityTrickplay.cachedIMDbID(for: m.libraryId))
         let metadata = currentStream?.behaviorHints?.subtitleMetadata ?? .init()
         let key = metadata.resourcePath(type: m.type, videoID: effectiveVideoId)
-        guard key != addonSubsKey else { return }
-        addonSubsKey = key
-        addonSubs = []
-        addedSubURLs = []
+        if addonSubsKey != key {
+            addonSubsKey = key; addonSubsRequests.reset()
+            addonSubs = []; addedSubURLs = []
+        }
+        let request = addonSubsRequests.begin(key: key, sources: sources, retryFailures: retryFailures)
+        addonSubs = addonSubsRequests.subtitles
+        refreshAddonSubtitleRows()
+        guard let request else { return }
         Task { @MainActor in
-            let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId,
-                                                       metadata: metadata)
-            guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
-            addonSubs = subs
-            if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
-            // The add-on list can land AFTER autoSelectTracks already ran (and left subs off because the
-            // container had no chain match): re-evaluate the add-on fallback now that candidates exist.
+            let outcome = await SubtitleAddonService.fetchOutcome(sources: request.sources, type: m.type,
+                videoId: effectiveVideoId, metadata: metadata)
+            guard !Task.isCancelled, !leftPlayback, addonSubsOwner == owner, addonSubsKey == key,
+                  player === coordinator.player, player.activeLoadToken == load,
+                  loadLifetime?.isCurrent != false, target.stillOwnsCurrentContext(core: core),
+                  curMeta?.type == m.type, curMeta?.videoId == m.videoId, curMeta?.libraryId == m.libraryId,
+                  (currentStream?.behaviorHints?.subtitleMetadata ?? .init()) == metadata,
+                  CredentialScopeRegistry.shared.isCurrent(credential),
+                  LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch) else { return }
+            let currentSources = SubtitleAddonService.installedSources(engine: core.addons, account: account.addons)
+            addonSubsRequests.updateSources(currentSources)
+            guard addonSubsRequests.finish(request, outcome: outcome) else { return }
+            addonSubs = addonSubsRequests.subtitles
+            VXProbe.log("subs", "add-on subtitles listed count=\(addonSubs.count) sources=\(currentSources.count) failed_sources=\(addonSubsRequests.failedSourceCount)")
+            refreshAddonSubtitleRows()
             autoSelectAddonSubtitleIfNeeded()
+            // A roster that completed while this request ran may introduce a NEW source. Ordinary
+            // reconciliation never retries failed sources and stops once all current sources are known.
+            fetchAddonSubtitles()
         }
     }
 

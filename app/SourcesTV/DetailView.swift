@@ -4861,7 +4861,7 @@ struct CoreStreamList: View {
         }
         #if VORTX_AETHER_ENGINE
         if !stream.isYouTubeTrailer, PlayerEngineRouter.aetherEngineAvailable {
-            Button("AetherEngine (testing)") {
+            Button("AetherEngine") {
                 play(stream, enginePreference: .aether, sourceOrigin: origin)
             }
         }

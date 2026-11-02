@@ -34,9 +34,25 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
         let exact = "https://127.0.0.1/subtitles/series/tt123:1:9/videoHash=0123456789abcdef&videoSize=6750000000&filename=Episode%209%20%26%20%231%2F%25%3F.mkv.json"
         let matchesFile = request.url?.absoluteString == exact
         let host = request.url?.host ?? ""
-        let hasMetadata = request.url?.path.contains("/filename=") ?? false
+        let encodedPath = request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath
+        } ?? ""
+        let resourceComponent = encodedPath.split(separator: "/").last ?? ""
+        // Metadata extras share one final route component. Hash/size precede filename when
+        // present; inspect the encoded component so an escaped filename slash cannot split it.
+        let hasMetadata = ["videoHash=", "videoSize=", "filename="].contains {
+            resourceComponent.hasPrefix($0)
+        }
+        if host == "127.0.0.22" {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
         let body: String
-        if host == "127.0.0.16" {
+        if host == "127.0.0.21" {
+            body = "{invalid-json"
+        } else if host == "127.0.0.24" {
+            body = #"{"error":"fixture-unavailable"}"#
+        } else if host == "127.0.0.16" {
             body = #"{"subtitles":[{"url":"../captions/en.srt"},{"url":"//127.0.0.99/foreign.srt"},{"url":"file:///private/invalid.srt"},{"url":"bad.srt#fragment"}]}"#
         } else if host == "127.0.0.20" {
             body = "{\"subtitles\":[" + (0..<1_024).map { "{\"url\":\"part-\($0).srt\"}" }.joined(separator: ",") + "]}"
@@ -133,6 +149,21 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
             sources: [.init(baseUrl: "https://127.0.0.5", name: "Empty")], type: "series", videoId: "tt123:1:9",
             metadata: .init(filename: "other-file.mkv"), testURLProtocolClasses: fixtures)
         precondition(emptySuccess.isEmpty, "empty 200 must not retry the legacy route")
+        let nonemptyLegacyForEmptySource = await SubtitleAddonService.fetch(
+            sources: [.init(baseUrl: "https://127.0.0.5", name: "Empty")], type: "series", videoId: "tt123:1:9",
+            testURLProtocolClasses: fixtures)
+        precondition(nonemptyLegacyForEmptySource.count == 1
+                     && nonemptyLegacyForEmptySource[0].url == "https://cdn.invalid/legacy.srt",
+                     "Empty metadata success must retain a nonempty legacy-route negative control")
+        for requestMetadata in [SubtitleRequestMetadata(videoHash: "0123456789abcdef"),
+                         SubtitleRequestMetadata(videoSize: 6_750_000_000), metadata] {
+            let emptyOutcome = await SubtitleAddonService.fetchOutcome(
+                sources: [.init(baseUrl: "https://127.0.0.5", name: "Empty")], type: "series", videoId: "tt123:1:9",
+                metadata: requestMetadata, testURLProtocolClasses: fixtures)
+            precondition(emptyOutcome.sources.count == 1 && emptyOutcome.subtitles.isEmpty)
+            if case .success(let rows) = emptyOutcome.sources[0].status { precondition(rows.isEmpty) }
+            else { preconditionFailure("Valid empty hash/size/full-metadata response became a failure") }
+        }
         let sameOriginRedirect = await SubtitleAddonService.fetch(
             sources: [.init(baseUrl: "https://127.0.0.11", name: "Redirect")], type: "series", videoId: "tt123:1:9",
             metadata: .init(filename: "other-file.mkv"), testURLProtocolClasses: fixtures)
@@ -194,6 +225,130 @@ private final class SubtitleFixture: URLProtocol, @unchecked Sendable {
         precondition(duplicateSources.count == 1 && duplicateSources[0].addonName == "First"
                      && duplicateSources[0].installedBaseURL.host == "127.0.0.13",
                      "first source keeps dedup winner and its original provenance")
+        let outcomeSources = [
+            SubtitleAddonSource(baseUrl: "https://127.0.0.1/", name: "Success"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.5/", name: "Empty success"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.21/", name: "Malformed response"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.22/", name: "Transport failure"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.24/", name: "Invalid response shape"),
+        ]
+        let outcome = await SubtitleAddonService.fetchOutcome(sources: outcomeSources, type: "series", videoId: "tt123:1:9",
+            metadata: metadata, testURLProtocolClasses: fixtures)
+        precondition(outcome.sources.count == 5 && outcome.subtitles.count == 2)
+        if case .success(let empty) = outcome.sources[1].status { precondition(empty.isEmpty) }
+        else { preconditionFailure("Successful empty list became a retryable failure") }
+        for index in 2..<outcome.sources.count {
+            if case .failed = outcome.sources[index].status {} else { preconditionFailure("Failure became empty success") }
+        }
+        verifyDiscoveryState(outcome: outcome)
+        verifyResolutionState()
+        verifyDiscoveryCallerContracts()
         print("PASS bounded guarded subtitle-index fixture contracts")
     }
+    private static func verifyDiscoveryState(outcome: SubtitleAddonService.FetchOutcome) {
+        let sources = outcome.sources.map(\.source)
+        var state = SubtitleAddonService.DiscoveryState()
+        let first = state.begin(key: "title-file", sources: sources, retryFailures: false)!
+        precondition(state.begin(key: "title-file", sources: sources, retryFailures: true) == nil,
+            "Panel reopen duplicated an in-flight batch")
+        var renamed = sources
+        renamed[0] = SubtitleAddonSource(baseUrl: sources[0].baseUrl, name: "Updated display name")
+        precondition(state.begin(key: "title-file", sources: renamed, retryFailures: true) == nil,
+            "Display-name change duplicated an installed endpoint in flight")
+        precondition(state.finish(first, outcome: outcome))
+        precondition(outcome.failedSourceCount == 3 && state.failedSourceCount == 3)
+        let successful = state.subtitles
+        precondition(state.begin(key: "title-file", sources: sources, retryFailures: false) == nil,
+            "Ordinary reconciliation retried failures")
+        let retry = state.begin(key: "title-file", sources: sources, retryFailures: true)!
+        precondition(retry.sources == Array(sources.dropFirst(2)), "Retry must exclude success AND empty success")
+        precondition(state.subtitles == successful, "Retry erased a successful source's candidates")
+        precondition(state.begin(key: "title-file", sources: sources, retryFailures: true) == nil)
+        precondition(state.finish(retry, outcome: .init(sources: retry.sources.map { .init(source: $0, status: .success([])) })))
+        precondition(state.begin(key: "title-file", sources: sources, retryFailures: true) == nil)
+        state.updateSources(Array(sources.dropFirst()))
+        precondition(state.subtitles.isEmpty, "Removed source remained visible")
+        precondition(state.begin(key: "title-file", sources: sources, retryFailures: false) == nil)
+        precondition(state.subtitles == successful)
+        let configSources = [
+            SubtitleAddonSource(baseUrl: "https://127.0.0.30/Config/A?token=Upper", name: "Same label"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.30/Config/a?token=Upper", name: "Same label"),
+            SubtitleAddonSource(baseUrl: "https://127.0.0.30/Config/A?token=upper", name: "Same label"),
+        ]
+        var configured = SubtitleAddonService.DiscoveryState()
+        precondition(configured.begin(key: "same-title", sources: configSources, retryFailures: false)?.sources == configSources,
+            "Case-sensitive path or complete configuration query was lost from endpoint identity")
+        let added = SubtitleAddonSource(baseUrl: "https://127.0.0.23/", name: "Late installation")
+        let late = state.begin(key: "title-file", sources: sources + [added], retryFailures: false)!
+        precondition(late.sources == [added] && state.subtitles == successful)
+        state.updateSources(sources) // Removal hides rows but must not duplicate in-flight work on re-add.
+        precondition(state.begin(key: "title-file", sources: sources + [added], retryFailures: true) == nil)
+        let next = state.begin(key: "next-title-file", sources: sources, retryFailures: false)!
+        precondition(!state.finish(late, outcome: .init(sources: [.init(source: added, status: .success(successful))])),
+            "Prior title/resource completion crossed generation")
+        state.reset() // Caller resets on account/profile/player/load generation change.
+        precondition(!state.finish(next, outcome: outcome), "Retired owner completion republished candidates")
+    }
+
+    private static func verifyResolutionState() {
+        let old = SubtitleAddonService.QueryIdentity(type: "movie", libraryID: "tmdb:1", videoID: "tmdb:1")
+        let next = SubtitleAddonService.QueryIdentity(type: "series", libraryID: "tmdb:2", videoID: "tmdb:2:1:1")
+        precondition(old != next)
+        var state = SubtitleAddonService.ResolutionState()
+        let first = state.begin(query: old)!
+        precondition(state.begin(query: old) == nil, "Duplicate media resolver admitted")
+        state.reset() // The real caller's query-aware owner resets BEFORE its pending resolver guard.
+        let second = state.begin(query: next)!
+        precondition(!state.finish(first, currentQuery: next), "Stale resolver published another media query")
+        precondition(state.pending == second, "Stale resolver cleared the next media's pending request")
+        precondition(state.finish(second, currentQuery: next))
+        let third = state.begin(query: old)!
+        precondition(!state.finish(third, currentQuery: next) && state.pending == nil,
+            "Exact old request mismatch left a permanent resolver latch")
+    }
+
+    private static func verifyDiscoveryCallerContracts() {
+        for relative in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
+            let source = try! String(contentsOfFile: relative, encoding: .utf8)
+            let start = source.range(of: "    private func fetchAddonSubtitles(retryFailures:")!.lowerBound
+            let end = source.range(of: "    /// Auto-load an ADD-ON subtitle", range: start..<source.endIndex)!.lowerBound
+            let caller = String(source[start..<end])
+            let ownerStart = source.range(of: "    private struct AddonSubtitleFetchOwner:")!.lowerBound
+            let ownerEnd = source.range(of: "    @State private var addonSubsOwner", range: ownerStart..<source.endIndex)!.lowerBound
+            let owner = String(source[ownerStart..<ownerEnd])
+            precondition(owner.contains("let query: SubtitleAddonService.QueryIdentity"), "Resolver owner lost media identity")
+            precondition(caller.contains("query: .init(type: m.type, libraryID: m.libraryId, videoID: m.videoId)"))
+            let reset = caller.range(of: "addonSubsResolution.reset()")!.lowerBound
+            let pending = caller.range(of: "guard addonSubsResolution.pending == nil")!.lowerBound
+            precondition(reset < pending, "New media must retire old resolver before checking its latch")
+            precondition(caller.contains("addonSubsResolution.pending == request"))
+            precondition(caller.contains("addonSubsResolution.finish(request, currentQuery: owner.query)"))
+            let fetch = caller.range(of: "let outcome = await SubtitleAddonService.fetchOutcome")!.lowerBound
+            let completion = String(caller[fetch...])
+            precondition(discoveryPublicationIsFenced(completion), "Missing subtitle discovery publication fence")
+            for fence in discoveryPublicationFences {
+                precondition(!discoveryPublicationIsFenced(completion.replacingOccurrences(of: fence, with: "true")),
+                    "Missing discovery fence was accepted by the contract")
+            }
+            precondition(!completion.contains("addedSubURLs = []"), "Retry completion cleared already loaded URLs")
+            precondition(source.contains("fetchAddonSubtitles(retryFailures: true)"), "Explicit panel retry missing")
+            precondition(caller.contains("fetchAddonSubtitles()"), "New installed source reconciliation missing")
+        }
+    }
+
+    private static let discoveryPublicationFences = [
+        "!Task.isCancelled", "addonSubsOwner == owner", "addonSubsKey == key", "player === coordinator.player",
+        "player.activeLoadToken == load", "target.stillOwnsCurrentContext(core: core)",
+        "loadLifetime?.isCurrent != false", "CredentialScopeRegistry.shared.isCurrent(credential)",
+        "LegacyWatchOwnership.applicationEpochIsCurrent(applicationEpoch)", "curMeta?.type == m.type",
+        "curMeta?.videoId == m.videoId", "curMeta?.libraryId == m.libraryId", "subtitleMetadata ?? .init()) == metadata",
+    ]
+    private static func discoveryPublicationIsFenced(_ completion: String) -> Bool {
+        guard let finish = completion.range(of: "addonSubsRequests.finish(request, outcome: outcome)")?.lowerBound,
+              let publication = completion.range(of: "addonSubs = addonSubsRequests.subtitles")?.lowerBound,
+              finish < publication else { return false }
+        let admission = String(completion[..<finish])
+        return discoveryPublicationFences.allSatisfy { admission.contains($0) }
+    }
+
 }

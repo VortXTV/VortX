@@ -2900,7 +2900,7 @@ struct iOSDetailView: View {
             Button("AVPlayer when compatible") { launchEnginePreference = .avfoundation }
             #if VORTX_AETHER_ENGINE
             if PlayerEngineRouter.aetherEngineAvailable {
-                Button("AetherEngine (testing)") { launchEnginePreference = .aether }
+                Button("AetherEngine") { launchEnginePreference = .aether }
             }
             #endif
         } label: {
@@ -7879,7 +7879,7 @@ struct iOSSourceList: View {
                 Button("AVPlayer when compatible") { onLaunchEnginePreferenceChange(.avfoundation) }
                 #if VORTX_AETHER_ENGINE
                 if PlayerEngineRouter.aetherEngineAvailable {
-                    Button("AetherEngine (testing)") { onLaunchEnginePreferenceChange(.aether) }
+                    Button("AetherEngine") { onLaunchEnginePreferenceChange(.aether) }
                 }
                 #endif
             } label: {
