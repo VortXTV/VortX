@@ -9361,8 +9361,7 @@ struct TVPlayerView: View {
                     subtitleAlignmentPresentation = nil
                     subtitleLoadingURL = nil
                     if reportFailure, current {
-                        subtitleAlignmentNotice = PlayerExternalSubtitleSelectionResult.failed.failureMessage
-                        subtitleLoadFailed = true
+                        showEngineNote(PlayerExternalSubtitleSelectionResult.failed.failureMessage ?? String(localized: "Subtitle failed to load"))
                     }
                     if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                 }
@@ -9391,8 +9390,7 @@ struct TVPlayerView: View {
                         applyCurrentSubtitleDelayIfReady(force: false)
                     }
                 } else if reportFailure, case .failed = result {
-                    subtitleAlignmentNotice = result.failureMessage
-                    subtitleLoadFailed = true
+                    showEngineNote(result.failureMessage ?? String(localized: "Subtitle failed to load"))
                 }
                 if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
             }
