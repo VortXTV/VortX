@@ -4838,16 +4838,24 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "private func demoteAVPlayerToMPV() -> Bool",
             to: "/// SwiftUI construction has no synchronous completion callback")
+        // The entry point now accepts the Aether choice and delegates the ordinary switch.
+        // Keep its transport assertion inside the actual switch body, not a later fallback.
+        let tvEngineSwitchEntry = sourceSection(
+            tvPlayer,
+            from: "private func switchPlayerEngine(toAVPlayer:",
+            to: "/// User-invoked mid-title engine swap (P3, #76).")
         let tvEngineSwitch = sourceSection(
             tvPlayer,
-            from: "private func switchPlayerEngine(toAVPlayer: Bool)",
-            to: "/// Show a brief player toast")
+            from: "private func performPlayerEngineSwitch(",
+            to: "/// AetherEngine could not open or keep playing")
         check("wiring: paused AV demotion and both manual engine directions carry a token-fenced transport intent",
               sourceContainsInOrder(tvDemote, [
                 "let desiredPaused = playbackDeadlineClock.isPaused",
                 "captureRecoverySelections()",
                 "queueIncomingTransportIntent(paused: desiredPaused)",
               ])
+                  && tvEngineSwitchEntry?.contains(
+                    "performPlayerEngineSwitch(toAVPlayer: toAVPlayer, toAether: toAether)") == true
                   && sourceContainsInOrder(tvEngineSwitch, [
                     "let desiredPaused = playbackDeadlineClock.isPaused",
                     "captureRecoverySelections()",

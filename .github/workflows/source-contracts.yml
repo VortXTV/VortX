@@ -224,8 +224,8 @@ jobs:
     # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
     # runner generation as Apple packaging instead of the older default SDK.
     runs-on: macos-26-intel
-    # Keep the full serial Swift fixture roster on the Intel host.
-    timeout-minutes: 20
+    # The serial Intel roster takes over 20 minutes; retain time for every final check.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure ripgrep is available
