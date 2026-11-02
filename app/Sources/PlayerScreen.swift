@@ -9162,7 +9162,7 @@ struct PlayerScreen: View {
         }
         let session = playbackSessionID, sourceGeneration = sourceSwitchGeneration
         let episodeGeneration = episodeSwitchGeneration, target = playbackMutationTarget
-        let isCurrent = {
+        let isCurrent: @MainActor @Sendable () -> Bool = {
             !playbackExited && coordinator.player?.activeLoadToken == loadToken
                 && playbackSessionID == session && sourceSwitchGeneration == sourceGeneration
                 && episodeSwitchGeneration == episodeGeneration && (curURL ?? url) == sourceURL

@@ -458,7 +458,7 @@ jobs:
             [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
             exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
             file "$executable_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
-            if [ -n "$arch" ]; then xcrun lipo -verify_arch "$arch" "$executable_dir/$exe"; fi
+            if [ -n "$arch" ]; then xcrun lipo "$executable_dir/$exe" -verify_arch "$arch"; fi
             # Capture first: grep -q can close the pipe early and make nm fail with SIGPIPE under pipefail.
             local defined_symbols undefined_symbols
             defined_symbols="$(nm -gU "$executable_dir/$exe")"
@@ -481,7 +481,7 @@ jobs:
             if [ -d "$products_dir/Contents/Frameworks" ]; then framework_root="$products_dir/Contents/Frameworks"; fi
             local aether="$framework_root/VortXAetherKit.framework/VortXAetherKit"
             [ -f "$aether" ] || { echo "::error::$scheme is missing its real Aether framework"; exit 1; }
-            if [ -n "$arch" ]; then xcrun lipo -verify_arch "$arch" "$aether"; fi
+            if [ -n "$arch" ]; then xcrun lipo "$aether" -verify_arch "$arch"; fi
             local aether_undefined aether_dependencies
             aether_undefined="$(nm -u "$aether")"
             if grep -Eq '[[:space:]]_dovi_' <<< "$aether_undefined"; then
@@ -491,8 +491,11 @@ jobs:
             grep -Fq '@rpath/AetherLibavcodec.framework/' <<< "$aether_dependencies" \
               || { echo "::error::$scheme Aether lost its isolated dynamic FFmpeg dependency"; exit 1; }
             if [ "$scheme" = VortXTVLite ]; then
-              if [ "$arch" = x86_64 ]; then xcrun lipo -verify_arch x86_64 "$aether";
-              else xcrun lipo -verify_arch arm64 x86_64 "$aether"; fi
+              if [ "$arch" = x86_64 ]; then xcrun lipo "$aether" -verify_arch x86_64;
+              else
+                xcrun lipo "$aether" -verify_arch arm64
+                xcrun lipo "$aether" -verify_arch x86_64
+              fi
             fi
             local framework framework_binary built_arch
             for framework in AetherLibavcodec AetherLibavfilter AetherLibavformat AetherLibavutil AetherLibdav1d AetherLibswresample AetherLibswscale AetherLibzimg AetherLibzvbi; do
@@ -500,7 +503,7 @@ jobs:
               [ -f "$framework_binary" ] \
                 || { echo "::error::$scheme is missing the $framework binary"; exit 1; }
               for built_arch in $(xcrun lipo -archs "$aether"); do
-                xcrun lipo -verify_arch "$built_arch" "$framework_binary"
+                xcrun lipo "$framework_binary" -verify_arch "$built_arch"
               done
             done
             local evidence="$RUNNER_TEMP/aether-link-evidence/$scheme-${arch:-default}"
