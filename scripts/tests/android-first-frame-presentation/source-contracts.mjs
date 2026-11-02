@@ -163,7 +163,9 @@ contract('media3-actual-render-event-not-ready', f => {
 
 contract('mpv-release-and-waiting-load-retire-under-same-gate', f => {
   const release = block(f.mpv, 'override fun release()');
-  const releaseGate = block(release, 'synchronized(subtitleGenerationGate)');
+  // release also collects retired files under this monitor after native destruction.
+  // Select its standalone retirement block; keep requiring one exact anchor in that method.
+  const releaseGate = block(release, '\n        synchronized(subtitleGenerationGate)');
   const load = block(f.mpv, 'override fun load(playable: Playable)');
   const loadGate = block(load, 'val (loadGeneration, initialSubtitleSelection) = synchronized(subtitleGenerationGate)');
   return has(f.mpv, 'private val subtitleSelections = SubtitleSelectionAuthority()') &&
@@ -176,7 +178,7 @@ contract('mpv-release-and-waiting-load-retire-under-same-gate', f => {
       'metadataLoadIdentity.begin(generation)', 'startupEvidence = PlaybackStartupEvidence.AWAITING',
       'generation to original') &&
     !release.slice(0, release.indexOf('synchronized(subtitleGenerationGate)')).includes('compareAndSet');
-}, [['mpv', 'override fun release() {\n        synchronized(subtitleGenerationGate)', 'override fun release() {\n        synchronized(unrelatedGate)'],
+}, [['mpv', 'override fun release() {\n        var retireAlignment: (() -> Unit)? = null\n        synchronized(subtitleGenerationGate)', 'override fun release() {\n        var retireAlignment: (() -> Unit)? = null\n        synchronized(unrelatedGate)'],
     ['mpv', 'val (loadGeneration, initialSubtitleSelection) = synchronized(subtitleGenerationGate) {\n            if (released.get() || originalPlaybackOwner?.isActive != true) return', 'val (loadGeneration, initialSubtitleSelection) = synchronized(subtitleGenerationGate) {\n            REMOVED_INNER_RELEASE_RECHECK'],
     ['mpv', 'val (loadGeneration, initialSubtitleSelection) = synchronized(subtitleGenerationGate) {\n            if (released.get() || originalPlaybackOwner?.isActive != true) return', 'val (loadGeneration, initialSubtitleSelection) = synchronized(subtitleGenerationGate) {\n            if (released.get()) return'],
     ['mpv', 'val original = subtitleSelections.beginSource(generation) ?: return', 'val original = subtitleSelections.capture() ?: return'],
