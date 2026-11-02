@@ -34,11 +34,11 @@ final class ProfileMutationPresentation: ObservableObject {
         }
     }
 
-    func cancel() {
+    func cancel(preservingFailure: Bool = false) {
         generation = nil
         task?.cancel()
         task = nil
         isRunning = false
-        errorMessage = nil
+        if !preservingFailure { errorMessage = nil }
     }
 }

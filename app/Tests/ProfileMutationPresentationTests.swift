@@ -45,6 +45,8 @@ enum ProfileMutationPresentationTests {
         first.finish(false)
         await settle { !presentation.isRunning }
         precondition(!duplicateStarted && dismissals == 0 && presentation.errorMessage == "Save failed")
+        presentation.cancel(preservingFailure: true)
+        precondition(!presentation.isRunning && presentation.errorMessage == "Save failed")
         presentation.cancel()
         precondition(presentation.errorMessage == nil)
 

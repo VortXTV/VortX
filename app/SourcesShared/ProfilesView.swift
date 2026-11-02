@@ -146,9 +146,6 @@ struct ProfilePickerView: View {
                                 Text("Sign in to your VortX account to load your profiles.")
                                     .font(.callout).foregroundStyle(.white)
                                     .multilineTextAlignment(.center)
-                                Button("Sign in") { deferredSelection.cancel(); accountHelpNeeded = true }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(theme.accent)
                             }
                             if profileAction.isRunning {
                                 ProgressView(profileActionStatus).tint(Theme.Palette.accent).foregroundStyle(.white)
@@ -191,17 +188,30 @@ struct ProfilePickerView: View {
                     .accessibilityHidden(pinTarget != nil)
                     // Outside the disabled picker: a stuck profile/restore must not block its own log.
                     .safeAreaInset(edge: .bottom) {
-                        if exportAllowedBeforeProfile {
-                            diagnosticRecoveryButton
-                                .padding(.horizontal, 24)
-                                .padding(.vertical, 12)
-                                // The full-width focus section bridges every centered profile row
-                                // to the footer, including tiles away from the middle of the screen.
-                                .frame(maxWidth: .infinity)
-                                .profileFocusSection()
-                                .disabled(pinTarget != nil)
-                                .accessibilityHidden(pinTarget != nil)
+                        VStack(spacing: Theme.Space.md) {
+                            ProfilePickerAccountControls(
+                                onSignIn: {
+                                    deferredSelection.cancel()
+                                    accountHelpNeeded = true
+                                },
+                                beforeConfirmedSignOut: {
+                                    deferredSelection.cancel()
+                                    profileAction.cancel(preservingFailure: true)
+                                    pinTarget = nil; pinCredential = nil; pinIsForEditing = false
+                                    signInCredential = nil; signInProfileID = nil
+                                    signInNeeded = false; accountHelpNeeded = false
+                                })
+                            if exportAllowedBeforeProfile {
+                                diagnosticRecoveryButton
+                            }
                         }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        // Outside the disabled grid, including when profile opening fails.
+                        .frame(maxWidth: .infinity)
+                        .profileFocusSection()
+                        .disabled(pinTarget != nil)
+                        .accessibilityHidden(pinTarget != nil)
                     }
                 }
             }
@@ -265,6 +275,7 @@ struct ProfilePickerView: View {
         .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
         .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
+            profileAction.cancel()
             deferredSelection.cancel()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
