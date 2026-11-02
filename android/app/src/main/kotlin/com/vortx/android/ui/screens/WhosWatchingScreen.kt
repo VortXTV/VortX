@@ -24,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -55,6 +56,7 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.profile.captureProfileSelection
 import com.vortx.android.ui.profilepicker.ProfilePickerCinematicBackdrop
 import com.vortx.android.ui.profilepicker.ProfilePickerLayoutPolicy
+import com.vortx.android.ui.profilepicker.ProfilePickerAccountControl
 import com.vortx.android.ui.profilepicker.rememberProfilePickerLifecycleActive
 import com.vortx.android.ui.profilepicker.rememberProfilePickerMovie
 import com.vortx.android.ui.theme.VortXAccents
@@ -78,6 +80,7 @@ import kotlinx.coroutines.CancellationException
 fun WhosWatchingScreen(
     onDone: () -> Unit,
     onSelected: (ProfileSelectionRequest) -> Unit,
+    accountControl: ProfilePickerAccountControl?,
     modifier: Modifier = Modifier,
 ) {
     val store = ProfileStore.sharedOrNull()
@@ -329,6 +332,9 @@ fun WhosWatchingScreen(
                 )
             }
             if (!layout.isPhone) Spacer(Modifier.weight(1f))
+            accountControl?.let { control ->
+                TextButton(onClick = { if (pinTarget == null && editorRequest == null) control.onClick() }, modifier = Modifier.testTag("profile-picker-account")) { Text(control.label) }
+            }
             // Protected rosters keep export behind the existing profile PIN/selection route.
             if (pinTarget == null && roster.none { it.hasPin }) DiagnosticLogAction(mayShare = {
                 pinTarget == null && store.profiles.none { it.hasPin }

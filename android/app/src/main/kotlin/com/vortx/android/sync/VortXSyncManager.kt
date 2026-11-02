@@ -317,6 +317,8 @@ internal class SessionOperationCoordinator {
     private var authGeneration = 0L
     @Volatile
     private var sessionGeneration = 0L
+    private val _accountRevision = MutableStateFlow(0L)
+    val accountRevision: StateFlow<Long> = _accountRevision.asStateFlow()
     private val activeCalls: MutableSet<OutboundCallPermit> =
         Collections.newSetFromMap(IdentityHashMap())
 
@@ -339,12 +341,36 @@ internal class SessionOperationCoordinator {
                     authGeneration = nextGeneration(authGeneration)
                     sessionGeneration = nextGeneration(sessionGeneration)
                     cancellations = retireCallsLocked { true }
-                    mutation()
+                    try { mutation() } finally { _accountRevision.value = sessionGeneration }
                 }
             } finally {
                 cancelCalls(cancellations)
             }
         }
+    }
+
+    /** Guard BEFORE retiring playback/auth/session work; stale confirmation changes no authority.
+     * Cancellation callbacks still run after releasing the operations monitor, as in invalidate. */
+    fun <T> invalidateIfAuthorityCurrent(
+        expectedAuth: Long,
+        expectedSession: Long,
+        validate: () -> Boolean,
+        mutation: () -> T,
+    ): SessionMutationResult<T> {
+        var cancellations = emptyList<() -> Unit>()
+        return try {
+            synchronized(lock) {
+                if (authGeneration != expectedAuth || sessionGeneration != expectedSession || !validate()) {
+                    SessionMutationResult.Stale
+                } else com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                    authGeneration = nextGeneration(authGeneration)
+                    sessionGeneration = nextGeneration(sessionGeneration)
+                    cancellations = retireCallsLocked { true }
+                    try { SessionMutationResult.Applied(mutation()) }
+                    finally { _accountRevision.value = sessionGeneration }
+                }
+            }
+        } finally { cancelCalls(cancellations) }
     }
 
     fun <T> snapshot(read: (Long) -> T): T = synchronized(lock) {
@@ -418,6 +444,7 @@ internal class SessionOperationCoordinator {
                                     it.owner == OutboundCallOwner.SESSION
                                 }
                                 onCommitted()
+                                _accountRevision.value = sessionGeneration
                             }
                             SessionMutationResult.Applied(committed)
                         }
@@ -1075,11 +1102,13 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private val addonPrefs = AddonPrefsStore(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
+    @Volatile private var sessionClearTestSeam: ((Long) -> Boolean)? = null
+    internal fun installSessionClearTestSeam(clear: (Long) -> Boolean) { sessionClearTestSeam = clear }
     private val sessionState = DurableSessionState(
         initialValue = (initialSessionLoad as? SessionLoad.Available)?.session,
         initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial(),
         persist = store::persist,
-        clear = store::clear,
+        clear = { epoch -> sessionClearTestSeam?.invoke(epoch) ?: store.clear(epoch) },
         ownerTransition = { mutation -> mutation() },
     )
     private val operations = SessionOperationCoordinator()
@@ -1568,7 +1597,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * verifiers + wrapped keys. On success adopts the session and returns the one-time recovery code (the
      * UI must show it once and tell the user to store it offline). Mirrors Apple `register`.
      */
-    suspend fun register(email: String, username: String, password: String): RegisterResult {
+    suspend fun register(email: String, username: String, password: String, completion: PickerAuthCompletion? = null): RegisterResult {
         val operation = beginAuthOperation()
         val kdfSalt = VortXCrypto.randomBytes(16)
         val iters = VortXCrypto.DEFAULT_ITERS
@@ -1619,7 +1648,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 val token = json?.optString("token").takeUnless { it.isNullOrEmpty() }
                 val acct = json?.optJSONObject("account")
                 if (code == 200 && token != null && acct != null) {
-                    return when (adopt(operation, token, acct, dataKey)) {
+                    return when (adopt(operation, token, acct, dataKey, completion)) {
                         SessionAdoption.ADOPTED -> RegisterResult(AuthResult.Ok, recoveryCode)
                         SessionAdoption.STALE -> RegisterResult.superseded(recoveryCode)
                         SessionAdoption.STORAGE_FAILURE -> RegisterResult.secureStorageFailure(recoveryCode)
@@ -1644,7 +1673,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * + iterations; the master key is derived locally and only the auth verifier crosses the wire. On
      * success the password-wrapped data key is unwrapped on-device. Mirrors Apple `signIn`.
      */
-    suspend fun signIn(login: String, password: String, totp: String? = null): AuthResult {
+    suspend fun signIn(login: String, password: String, totp: String? = null, completion: PickerAuthCompletion? = null): AuthResult {
         val operation = beginAuthOperation()
         val preloginPermit = operation.acquireCallPermit()
             ?: return AuthResult.Failed(AUTH_SUPERSEDED)
@@ -1685,7 +1714,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             val wrappedPw = json?.optString("wrappedKeyPassword").takeUnless { it.isNullOrEmpty() }
             val dataKey = wrappedPw?.let { VortXCrypto.open(masterKey, it) }
             if (code == 200 && token != null && acct != null && dataKey != null) {
-                return when (adopt(operation, token, acct, dataKey)) {
+                return when (adopt(operation, token, acct, dataKey, completion)) {
                     SessionAdoption.ADOPTED -> AuthResult.Ok
                     SessionAdoption.STALE -> AuthResult.Failed(AUTH_SUPERSEDED)
                     SessionAdoption.STORAGE_FAILURE -> AuthResult.Failed(SESSION_STORAGE_FAILURE)
@@ -1721,7 +1750,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     /** Poll once, adopting only after the approved payload decrypts to a valid 32-byte data key. */
-    suspend fun qrPoll(session: QrJoinSession): QrJoinResult {
+    suspend fun qrPoll(session: QrJoinSession, completion: PickerAuthCompletion? = null): QrJoinResult {
         val statusPermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
         val encodedID = URLEncoder.encode(session.pairingID, Charsets.UTF_8.name())
         val (status, json) = request(
@@ -1754,7 +1783,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (!session.operation.isCurrent()) return QrJoinResult.Failed
         val account = meJson?.optJSONObject("account")
         if (meStatus != 200 || account == null) return QrJoinResult.Failed
-        return when (adopt(session.operation, token.orEmpty(), account, dataKey)) {
+        return when (adopt(session.operation, token.orEmpty(), account, dataKey, completion)) {
             SessionAdoption.ADOPTED -> QrJoinResult.SignedIn(account.optString("email"))
             SessionAdoption.STALE,
             SessionAdoption.STORAGE_FAILURE,
@@ -1767,7 +1796,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * with the recovery key, then re-derive a new master key from the SAME kdf salt the account already uses
      * (so the recovery key stays valid afterwards) and re-wrap the data key under it. Mirrors Apple `recover`.
      */
-    suspend fun recover(email: String, recoveryCode: String, newPassword: String): AuthResult {
+    suspend fun recover(email: String, recoveryCode: String, newPassword: String, completion: PickerAuthCompletion? = null): AuthResult {
         val operation = beginAuthOperation()
         val trimmed = recoveryCode.trim()
         val startPermit = operation.acquireCallPermit()
@@ -1814,7 +1843,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 val token = json?.optString("token").takeUnless { it.isNullOrEmpty() }
                 val acct = json?.optJSONObject("account")
                 if (code == 200 && token != null && acct != null) {
-                    return when (adopt(operation, token, acct, dataKey)) {
+                    return when (adopt(operation, token, acct, dataKey, completion)) {
                         SessionAdoption.ADOPTED -> AuthResult.Ok
                         SessionAdoption.STALE -> AuthResult.Failed(AUTH_SUPERSEDED)
                         SessionAdoption.STORAGE_FAILURE -> AuthResult.Failed(SESSION_STORAGE_FAILURE)
@@ -1829,10 +1858,69 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
     }
 
+    internal val pickerAccountRevision: StateFlow<Long> get() = operations.accountRevision
+    /** Read-only completion lifetime, not sign-out/write authority. Unavailable persistence must not
+     * erase an unsaved recovery code while the same original live owner is retained. */
+    internal fun capturePickerCompletionOwner(): PickerAccountSnapshot =
+        operations.snapshotAuthority { auth, generation -> sessionState.serialized {
+            PickerAccountSnapshot(this, auth, generation, sessionState.ownerEpoch, sessionState.value, sessionState.value?.account)
+        } }
+    internal fun isPickerCompletionOwnerCurrent(expected: PickerAccountSnapshot): Boolean = operations.snapshot {
+        sessionState.serialized { expected.matchesOwner(this, sessionState.ownerEpoch, sessionState.value) }
+    }
+    internal fun publishIfPickerCompletionOwnerCurrent(expected: PickerAccountSnapshot, publication: () -> Unit): Boolean =
+        operations.snapshot {
+            if (!isPickerCompletionOwnerCurrent(expected)) false else { publication(); true }
+        }
+
+    /** Account controls do not require a selected profile or a healthy native mount. */
+    internal fun capturePickerAccountSnapshot(): PickerAccountSnapshot? =
+        operations.snapshotAuthority { auth, sessionGeneration -> sessionState.serialized {
+            val current = sessionState.value
+            val published = _sessionUiState.value
+            if (published == SessionUiState.UnknownOrUnavailable ||
+                (current == null && published != SessionUiState.SignedOut) ||
+                (current != null && (published !is SessionUiState.SignedIn || published.account != current.account)) ||
+                _account.value != current?.account) return@serialized null
+            PickerAccountSnapshot(this, auth, sessionGeneration, sessionState.ownerEpoch, current, current?.account)
+        } }
+
+    private fun pickerAccountMatches(expected: PickerAccountSnapshot): Boolean = sessionState.serialized {
+        expected.matchesOwner(this, sessionState.ownerEpoch, sessionState.value) && _account.value == expected.account &&
+            when (val state = _sessionUiState.value) {
+                is SessionUiState.SignedIn -> state.account == expected.account
+                SessionUiState.SignedOut -> expected.account == null
+                SessionUiState.UnknownOrUnavailable -> false
+            }
+    }
+
+    internal fun isPickerAccountCurrent(expected: PickerAccountSnapshot): Boolean =
+        operations.snapshotAuthority { auth, sessionGeneration ->
+            expected.matchesAuthority(this, auth, sessionGeneration) && pickerAccountMatches(expected)
+        }
+
+    internal fun signOut(expected: PickerAccountSnapshot): PickerSignOutResult {
+        if (expected.account == null) return PickerSignOutResult.STALE
+        var admitted = false
+        val cleared = signOutUsing { mutation ->
+            when (val result = expected.invalidate(operations, this,
+                validate = { pickerAccountMatches(expected) }, mutation = mutation)) {
+                SessionMutationResult.Stale -> false
+                is SessionMutationResult.Applied -> { admitted = true; result.value }
+            }
+        }
+        return if (!admitted) PickerSignOutResult.STALE else if (cleared) PickerSignOutResult.SIGNED_OUT
+            else PickerSignOutResult.STORAGE_UNAVAILABLE
+    }
+
     /** Sign out only after the encrypted session clear succeeds. */
     fun signOut(): Boolean {
+        return signOutUsing { mutation -> operations.invalidate { mutation() } }
+    }
+
+    private fun signOutUsing(invalidate: (() -> Boolean) -> Boolean): Boolean {
         var retained: RetainedSessionWork? = null
-        val cleared = operations.invalidate {
+        val cleared = invalidate {
             retained = operations.snapshot { operationGeneration ->
                 sessionState.serialized {
                     sessionState.value?.let { current ->
@@ -3343,8 +3431,14 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * with data returns [SignInReconcile.HAS_ACCOUNT_DATA] (the UI asks which side to keep); an unreachable
      * doc returns [SignInReconcile.UNREACHABLE] and pushes NOTHING (a blip is never treated as a fresh account).
      */
-    suspend fun reconcileAfterSignIn(): SignInReconcile {
-        val lease = captureSyncLease() ?: return SignInReconcile.UNREACHABLE
+    suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())
+    internal suspend fun reconcileAfterSignIn(owner: PickerAccountSnapshot): SignInReconcile =
+        reconcileAfterSignIn(captureCompletionLease(owner))
+    private fun captureCompletionLease(owner: PickerAccountSnapshot): SyncSessionLease? = operations.snapshot {
+        if (!isPickerCompletionOwnerCurrent(owner)) null else captureSyncLease()
+    }
+    private suspend fun reconcileAfterSignIn(captured: SyncSessionLease?): SignInReconcile {
+        val lease = captured ?: return SignInReconcile.UNREACHABLE
         val probe = accountHasSyncData(lease)
         if (!isSyncLeaseCurrent(lease)) return SignInReconcile.UNREACHABLE
         return when (probe) {
@@ -3361,8 +3455,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     /** Conflict resolution: adopt the account's roster (forced). Still UNIONs, so no local-only profile is lost. */
-    suspend fun useAccountData(): Boolean {
-        val lease = captureSyncLease() ?: return false
+    suspend fun useAccountData(): Boolean = useAccountData(captureSyncLease())
+    internal suspend fun useAccountData(owner: PickerAccountSnapshot): Boolean = useAccountData(captureCompletionLease(owner))
+    private suspend fun useAccountData(captured: SyncSessionLease?): Boolean {
+        val lease = captured ?: return false
         val received = syncDown(lease, force = true)
         return received && isSyncLeaseCurrent(lease)
     }
@@ -3376,8 +3472,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     /** Explicit Keep device choice only. Sync now, automatic empty seeding, and Merge both never grant. */
-    suspend fun importThisDeviceLibraryAndPush(): Boolean {
-        val lease = captureSyncLease() ?: return false
+    suspend fun importThisDeviceLibraryAndPush(): Boolean = importThisDeviceLibraryAndPush(captureSyncLease())
+    internal suspend fun importThisDeviceLibraryAndPush(owner: PickerAccountSnapshot): Boolean = importThisDeviceLibraryAndPush(captureCompletionLease(owner))
+    private suspend fun importThisDeviceLibraryAndPush(captured: SyncSessionLease?): Boolean {
+        val lease = captured ?: return false
         val gateway = libraryGateway ?: return false
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
@@ -3403,8 +3501,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     /** "Sync now" recommended path: union both ways so EVERY profile from both sides survives, then push. */
-    suspend fun mergeBoth(): Boolean {
-        val lease = captureSyncLease() ?: return false
+    suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease())
+    internal suspend fun mergeBoth(owner: PickerAccountSnapshot): Boolean = mergeBoth(captureCompletionLease(owner))
+    private suspend fun mergeBoth(captured: SyncSessionLease?): Boolean {
+        val lease = captured ?: return false
         if (retryPendingPushBeforePull(lease)) return false
         val received = syncDown(lease, force = true)
         // Native receive reports admission/publication success. A later push cannot settle a failed
@@ -3429,6 +3529,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         token: String,
         acct: JSONObject,
         dataKey: ByteArray,
+        completion: PickerAuthCompletion? = null,
     ): SessionAdoption {
         val account = Account(
             id = acct.optString("id"),
@@ -3448,6 +3549,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     AddonPrefsStore.activateAccount(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
+                    completion?.record(capturePickerCompletionOwner())
                 }
             }
         ) {

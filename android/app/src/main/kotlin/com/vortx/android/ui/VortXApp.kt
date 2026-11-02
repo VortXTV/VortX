@@ -117,6 +117,9 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
+import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
+import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
+import com.vortx.android.ui.profilepicker.currentPickerDiagnosticExportAllowed
 import com.vortx.android.ui.profilepicker.ProfileSelectionOrigin
 import com.vortx.android.ui.profilepicker.ProfileSelectionPresentation
 import com.vortx.android.ui.randompick.RandomTitlePlayRequest
@@ -730,6 +733,9 @@ fun VortXApp(
 
         // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
         // watching" before any content renders. It self-dismisses when the store has nothing to pick.
+        val pickerAccountModel = rememberPickerAccountModel(syncManager)
+        val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf(false) })
         var profileSelection by remember { mutableStateOf<ProfileSelectionPresentation?>(null) }
         profileSelection?.let { presentation ->
             val request = presentation.request
@@ -741,11 +747,17 @@ fun VortXApp(
                 onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
-        if (showWhosWatching) {
-            WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
-                profileSelection = ProfileSelectionPresentation(it,
-                    if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
-            })
+        if (showWhosWatching || pickerAccountOpen) {
+            ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
+                accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
+                    com.vortx.android.ui.screens.VortXAccountScreen(model, onBack = closeAccount,
+                        onSignOutRequest = requestSignOut, diagnosticAdmission = diagnosticAdmission, dismissalNotice = notice)
+                }) { control ->
+                WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                    profileSelection = ProfileSelectionPresentation(it,
+                        if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
+                }, accountControl = control)
+            }
             return@VortXTheme
         }
 

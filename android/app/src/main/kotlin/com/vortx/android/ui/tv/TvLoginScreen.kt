@@ -91,3 +91,23 @@ private fun TvSignInSectionHeader(title: String, subtitle: String) {
         Text(subtitle, style = VortXTheme.type.label.copy(color = colors.textSecondary))
     }
 }
+
+/** Main-picker account entry does not expose Stremio/profile credential management. */
+@Composable
+internal fun TvPickerVortXAccountScreen(
+    model: VortXAccountViewModel,
+    onBack: () -> Unit,
+    onSignOutRequest: () -> Unit,
+    diagnosticAdmission: () -> Boolean,
+    dismissalNotice: String?,
+) {
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(TvDimens.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg)) {
+        TvBackupBackButton(onClick = onBack)
+        Text("VortX Account", style = VortXTheme.type.sectionTitle)
+        dismissalNotice?.let { Text(it, style = VortXTheme.type.label) }
+        VortXAccountContent(model, onSignOutRequest = onSignOutRequest)
+        if (diagnosticAdmission()) com.vortx.android.ui.screens.DiagnosticLogAction(mayShare = diagnosticAdmission)
+    }
+}

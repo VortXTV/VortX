@@ -64,7 +64,8 @@ import com.vortx.android.ui.viewmodel.VortXQrJoinState
 /// side?"), whose three answers map 1:1 onto the manager's merge/pull/push reconcile seams.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, modifier: Modifier = Modifier,
+    onSignOutRequest: (() -> Unit)? = null, diagnosticAdmission: (() -> Boolean)? = null, dismissalNotice: String? = null) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -77,14 +78,13 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
             )
         },
     ) { padding ->
-        VortXAccountContent(
-            viewModel = viewModel,
-            modifier = modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(VortXTheme.spacing.edge),
-        )
+        Column(modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(VortXTheme.spacing.edge)) {
+            dismissalNotice?.let { Text(it, style = VortXTheme.type.label) }
+            VortXAccountContent(viewModel, onSignOutRequest = onSignOutRequest)
+            diagnosticAdmission?.let { admission ->
+                if (admission()) DiagnosticLogAction(mayShare = admission)
+            }
+        }
     }
 }
 
@@ -93,7 +93,7 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
 /// owns the scroll and padding. Renders exactly one of: the one-time recovery code, the session-unavailable
 /// retry, the signed-out auth card (with the QR joiner), the reconcile question, or the signed-in card.
 @Composable
-fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = Modifier) {
+fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = Modifier, onSignOutRequest: (() -> Unit)? = null) {
     val sessionUiState by viewModel.sessionUiState.collectAsStateWithLifecycle()
     val recoveryCode by viewModel.recoveryCode.collectAsStateWithLifecycle()
     val showReconcile by viewModel.showReconcile.collectAsStateWithLifecycle()
@@ -108,7 +108,7 @@ fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = M
             RecoveryCodeCard(
                 code = code,
                 warning = (formState as? VortXAccountFormState.Error)?.message,
-                onSaved = viewModel::dismissRecoveryCode,
+                onSaved = { viewModel.dismissRecoveryCode(code) },
             )
         } else {
             when (val session = sessionUiState) {
@@ -117,9 +117,9 @@ fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = M
                 VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel)
                 is VortXSyncManager.SessionUiState.SignedIn -> {
                     if (showReconcile) {
-                        ReconcileCard(viewModel)
+                        ReconcileCard(viewModel, onSignOutRequest ?: viewModel::signOut)
                     } else {
-                        SignedInCard(session.account, viewModel)
+                        SignedInCard(session.account, viewModel, onSignOutRequest ?: viewModel::signOut)
                     }
                 }
             }
@@ -188,7 +188,7 @@ private fun RecoveryCodeCard(code: String, warning: String?, onSaved: () -> Unit
 /// The sign-in reconcile question. Nothing syncs until one of the three answers is chosen, so the
 /// account doc can never be pre-empted by an automatic pull or push (#145 restore-before-push).
 @Composable
-private fun ReconcileCard(viewModel: VortXAccountViewModel) {
+private fun ReconcileCard(viewModel: VortXAccountViewModel, onSignOut: () -> Unit) {
     val colors = VortXTheme.colors
     val syncing by viewModel.syncing.collectAsStateWithLifecycle()
     val syncNotice by viewModel.syncNotice.collectAsStateWithLifecycle()
@@ -211,13 +211,13 @@ private fun ReconcileCard(viewModel: VortXAccountViewModel) {
             TextAction("Use my account's data", onClick = viewModel::reconcileUseAccount, enabled = !syncing)
             TextAction("Keep this device's data", onClick = viewModel::reconcileKeepDevice, enabled = !syncing)
             syncNotice?.let { Text(it, style = VortXTheme.type.label.copy(color = colors.danger)) }
-            TextAction("Sign Out", onClick = viewModel::signOut, danger = true, enabled = !syncing)
+            TextAction("Sign Out", onClick = onSignOut, danger = true, enabled = !syncing)
         }
     }
 }
 
 @Composable
-private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAccountViewModel) {
+private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAccountViewModel, onSignOut: () -> Unit) {
     val colors = VortXTheme.colors
     val syncing by viewModel.syncing.collectAsStateWithLifecycle()
     val syncNotice by viewModel.syncNotice.collectAsStateWithLifecycle()
@@ -251,7 +251,7 @@ private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAcco
                 loading = syncing,
                 modifier = Modifier.fillMaxWidth(),
             )
-            TextAction("Sign Out", onClick = viewModel::signOut, danger = true)
+            TextAction("Sign Out", onClick = onSignOut, danger = true)
         }
     }
 }

@@ -275,6 +275,136 @@ class AndroidRealtimeSyncTest {
         }
     }
 
+    @Test fun pickerBackWaitsForUnresolvedManualAuthRequestWithoutDiscardingIt() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val response = CompletableDeferred<Unit>()
+            f.manager.installSyncTestSeam(checkNotNull(f.manager.currentSession()), 10, transport = { _, path, _, _ ->
+                check(path == "/v1/auth/prelogin"); response.await(); 500 to null
+            })
+            model.openPickerPresentation()
+            model.onLoginChange("fixture@example.invalid"); model.onPasswordChange("fixture password")
+            model.submit(); runCurrent()
+            assertEquals(VortXAccountFormState.Submitting, model.formState.value)
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.pickerPresentationOpen.value)
+            response.complete(Unit); runCurrent()
+            assertTrue(model.requestClosePickerPresentation())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun oldRegistrationReceiptCannotAttachItsRecoveryCodeToAReplacementSession() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val original = f.manager.capturePickerCompletionOwner()
+            val replacement = VortXSyncManager.Session("replacement", account, key)
+            f.manager.replaceSyncSessionTestSeam(replacement)
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "old fixture code"), original, original)
+            assertNull(model.recoveryCode.value); assertFalse(model.showReconcile.value)
+            assertSame(replacement, f.manager.currentSession())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun registrationBackBeforeRecoveryAcknowledgementKeepsOriginalCodeAndReconcile() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            f.cloud.put("vortx", JSONObject()) // Actual post-auth probe returns the pending account-data choice.
+            model.openPickerPresentation()
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
+                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            assertTrue(model.showReconcile.value)
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.pickerPresentationOpen.value)
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            model.dismissRecoveryCode("fixture recovery code")
+            assertNull(model.recoveryCode.value)
+            assertFalse(model.requestClosePickerPresentation()) // The separate unresolved reconcile still blocks.
+            model.reconcileUseAccount(); runCurrent()
+            assertFalse(model.showReconcile.value)
+            assertTrue(model.requestClosePickerPresentation())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun signInBackBeforeAccountChoiceKeepsPendingChoiceAndReplacementClearsIt() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            model.openPickerPresentation()
+            model.finishPostAuth { model.requireAccountReconcile() }
+            assertFalse(model.requestClosePickerPresentation())
+            assertTrue(model.showReconcile.value)
+            f.manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("fixture replacement", account, key))
+            runCurrent()
+            assertFalse(model.showReconcile.value); assertNull(model.recoveryCode.value)
+            assertFalse(model.pickerPresentationOpen.value)
+            model.openPickerPresentation()
+            assertFalse(model.hasPendingPickerCompletion())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun failedSecureClearRetainsUnacknowledgedRecoveryAndResumesItsPresentation() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            f.cloud.put("vortx", JSONObject())
+            model.openPickerPresentation()
+            model.completeRegistration(VortXSyncManager.RegisterResult(VortXSyncManager.AuthResult.Ok, "fixture recovery code"),
+                f.manager.capturePickerCompletionOwner(), f.manager.capturePickerCompletionOwner())
+            val saved = f.manager.currentSession()
+            f.manager.installSessionClearTestSeam { false }
+            val captured = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val result = model.signOut(captured) { model.retirePickerPresentationForSignOut() }
+            model.resumePickerCompletionIfCurrent(); runCurrent()
+            assertEquals(PickerSignOutResult.STORAGE_UNAVAILABLE, result)
+            assertSame(saved, f.manager.currentSession())
+            assertEquals("fixture recovery code", model.recoveryCode.value)
+            assertTrue(model.showReconcile.value); assertTrue(model.pickerPresentationOpen.value)
+            f.manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("different", account.copy(id = "00000000-0000-0000-0000-000000000999"), key))
+            runCurrent()
+            assertNull(model.recoveryCode.value); assertFalse(model.showReconcile.value)
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun pickerSignOutRechecksActualManagerAfterUiRetirementChangesItsAccount() = test {
+        val f = Fixture(testScheduler)
+        val model = VortXAccountViewModel(f.manager)
+        try {
+            val original = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val replacement = VortXSyncManager.Session("fixture-replacement", account, key)
+            var retired = false
+            val result = model.signOut(original) {
+                retired = true
+                f.manager.replaceSyncSessionTestSeam(replacement)
+            }
+            assertTrue(retired)
+            assertEquals(PickerSignOutResult.STALE, result)
+            assertSame(replacement, f.manager.currentSession())
+        } finally { model.viewModelScope.cancel(); f.close() }
+    }
+
+    @Test fun pickerSignOutCaptureRejectsSameAccountReplacementAndExpiredOperation() = test {
+        val f = Fixture(testScheduler)
+        try {
+            val first = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            assertTrue(f.manager.isPickerAccountCurrent(first))
+            val replacement = VortXSyncManager.Session("fixture-replacement", account, key)
+            f.manager.replaceSyncSessionTestSeam(replacement)
+            assertFalse(f.manager.isPickerAccountCurrent(first))
+            assertEquals(PickerSignOutResult.STALE, f.manager.signOut(first))
+            assertSame(replacement, f.manager.currentSession())
+            val second = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            f.manager.expireSyncOperationTestSeam()
+            assertFalse(f.manager.isPickerAccountCurrent(second))
+            assertEquals(PickerSignOutResult.STALE, f.manager.signOut(second))
+            assertSame(replacement, f.manager.currentSession())
+            assertEquals("PickerAccountSnapshot", first.toString())
+        } finally { f.close() }
+    }
+
     @Test fun synchronousSocketStartupFailureRetainsSessionWorkerPollingAndRetry() = test {
         val f = Fixture(testScheduler)
         var attempts = 0
@@ -859,10 +989,7 @@ class AndroidRealtimeSyncTest {
     }
 
     private fun pendingReconcile(manager: VortXSyncManager): VortXAccountViewModel = VortXAccountViewModel(manager).also { model ->
-        // Set only the already-visible choice state; transport, crypto, manager and VM action are real.
-        val field = VortXAccountViewModel::class.java.getDeclaredField("_showReconcile").apply { isAccessible = true }
-        @Suppress("UNCHECKED_CAST")
-        (field.get(model) as MutableStateFlow<Boolean>).value = true
+        model.requireAccountReconcile()
     }
 
     @Test fun `failed reconcile choices remain visible and actionable until confirmed retry`() = test {

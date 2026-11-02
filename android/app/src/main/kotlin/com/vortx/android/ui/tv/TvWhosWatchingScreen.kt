@@ -46,6 +46,7 @@ import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.profilepicker.ProfilePickerCinematicBackdrop
 import com.vortx.android.ui.profilepicker.ProfilePickerLayoutPolicy
+import com.vortx.android.ui.profilepicker.ProfilePickerAccountControl
 import com.vortx.android.ui.profilepicker.rememberProfilePickerLifecycleActive
 import com.vortx.android.ui.profilepicker.rememberProfilePickerMovie
 import com.vortx.android.ui.theme.VortXAccents
@@ -76,6 +77,7 @@ import kotlinx.coroutines.CancellationException
 fun TvWhosWatching(
     onDone: () -> Unit,
     onSelected: (ProfileSelectionRequest) -> Unit,
+    accountControl: ProfilePickerAccountControl?,
     modifier: Modifier = Modifier,
 ) {
     val (gateway, loading) = rememberTvProfileGateway()
@@ -95,13 +97,14 @@ fun TvWhosWatching(
         LaunchedEffect(Unit) { onDone() }
         return
     }
-    TvProfilePicker(gateway, onDone, onSelected, modifier)
+    TvProfilePicker(gateway, onDone, accountControl, onSelected, modifier)
 }
 
 @Composable
 internal fun TvProfilePicker(
     gateway: TvProfileGateway,
     onDone: () -> Unit,
+    accountControl: ProfilePickerAccountControl?,
     onSelected: (ProfileSelectionRequest) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -299,6 +302,9 @@ internal fun TvProfilePicker(
                 }
             }
             pickerError?.let { Text(it, style = VortXTheme.type.label.copy(color = Color.White), textAlign = TextAlign.Center) }
+            accountControl?.let { control ->
+                TvProfileButton(control.label, modifier = Modifier.width(300.dp).testTag("profile-picker-account"), onClick = { if (pinTarget == null && managementRequest == null) control.onClick() })
+            }
         }
 
         pinTarget?.let { pending ->

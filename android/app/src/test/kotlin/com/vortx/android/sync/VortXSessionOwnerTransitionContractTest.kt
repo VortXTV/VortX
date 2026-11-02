@@ -52,6 +52,8 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
         assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
         assertTrue(adopt.contains("sessionState.replace(s) {"))
+        assertTrue(adopt.contains("completion?.record(capturePickerCompletionOwner())"))
+        assertTrue(adopt.indexOf("sessionState.replace(s) {") < adopt.indexOf("completion?.record("))
         assertTrue(adopt.contains("armPendingSync(it, recordEdit = false)"))
         assertFalse(adopt.contains("sessionState.serialized"))
     }
@@ -126,13 +128,13 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("private fun beginAuthOperation()")
             .substringBefore("private fun cancelSessionWork()")
         val register = source
-            .substringAfter("suspend fun register(email: String, username: String, password: String)")
+            .substringAfter("suspend fun register(email: String, username: String, password: String, completion: PickerAuthCompletion? = null)")
             .substringBefore("/**\n     * Sign in with email-or-username")
         val signIn = source
-            .substringAfter("suspend fun signIn(login: String, password: String, totp: String? = null)")
+            .substringAfter("suspend fun signIn(login: String, password: String, totp: String? = null, completion: PickerAuthCompletion? = null)")
             .substringBefore("/**\n     * Forgot-password recovery")
         val recover = source
-            .substringAfter("suspend fun recover(email: String, recoveryCode: String, newPassword: String)")
+            .substringAfter("suspend fun recover(email: String, recoveryCode: String, newPassword: String, completion: PickerAuthCompletion? = null)")
             .substringBefore("/** Sign out only after")
         val transport = source
             .substringAfter("private suspend fun request(")
@@ -143,7 +145,7 @@ class VortXSessionOwnerTransitionContractTest {
         listOf(register, signIn, recover).forEach { flow ->
             assertTrue(flow.indexOf("val operation = beginAuthOperation()") in 0 until flow.indexOf("request("))
             assertResponseFenceAfterEveryRequest(flow)
-            assertTrue(flow.contains("adopt(operation, token, acct, dataKey)"))
+            assertTrue(flow.contains("adopt(operation, token, acct, dataKey, completion)"))
         }
         assertMutatingAuthFence(
             register,
@@ -335,10 +337,17 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("suspend fun mergeBoth(): Boolean")
             .substringBefore("// MARK: - Session adoption + persistence")
 
-        assertTrue(reconcile.contains("val lease = captureSyncLease()"))
+        assertTrue(source.contains("suspend fun reconcileAfterSignIn(): SignInReconcile = reconcileAfterSignIn(captureSyncLease())"))
+        assertTrue(reconcile.contains("reconcileAfterSignIn(captureCompletionLease(owner))"))
+        assertTrue(reconcile.contains("val lease = captured ?: return SignInReconcile.UNREACHABLE"))
+        val completionCapture = reconcile.substringAfter("private fun captureCompletionLease(").substringBefore("private suspend fun reconcileAfterSignIn(")
+        assertTrue(completionCapture.contains("operations.snapshot"))
+        assertTrue(completionCapture.contains("if (!isPickerCompletionOwnerCurrent(owner)) null else captureSyncLease()"))
         assertTrue(reconcile.contains("accountHasSyncData(lease)"))
         assertTrue(reconcile.contains("syncUp(lease)"))
-        assertTrue(mergeBoth.contains("val lease = captureSyncLease()"))
+        assertTrue(source.contains("suspend fun mergeBoth(): Boolean = mergeBoth(captureSyncLease())"))
+        assertTrue(mergeBoth.contains("mergeBoth(captureCompletionLease(owner))"))
+        assertTrue(mergeBoth.contains("val lease = captured ?: return false"))
         assertTrue(mergeBoth.contains("syncDown(lease, force = true)"))
         assertTrue(mergeBoth.contains("syncUp(lease)"))
         assertEquals(1, mergeBoth.windowed("captureSyncLease".length).count { it == "captureSyncLease" })
