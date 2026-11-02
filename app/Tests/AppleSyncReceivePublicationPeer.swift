@@ -20,17 +20,18 @@ final class UserDefaults: @unchecked Sendable {
     func removeObject(forKey key: String) { set(nil, forKey: key) }
 }
 final class CredentialScopeRegistry: @unchecked Sendable {
-    enum Scope: Hashable, Sendable { case account, signedOutDevice }
+    typealias Scope = CredentialScope
     struct Capture: Hashable, Sendable {
         let generation: UInt64
         var namespace: String { "synthetic.receive-publication" }
-        var scope: Scope { .account }
+        var scope: Scope { .account(UUID(uuidString: AppleSyncReceivePublicationPeer.account)!) }
     }
     static let shared = CredentialScopeRegistry()
     private let lock = NSLock()
     private var generation: UInt64 = 1
     func capture() -> Capture { lock.withLock { .init(generation: generation) } }
     func isCurrent(_ capture: Capture) -> Bool { self.capture() == capture }
+    func isMigrationEligible(_ capture: Capture) -> Bool { isCurrent(capture) } // Explicit established fixture account.
     func retire() { lock.withLock { generation &+= 1 } }
 }
 typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
@@ -92,6 +93,7 @@ final class CoreBridge: @unchecked Sendable {
     var nativeProfileBaseline: [UserProfile] = []
     var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+    var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
     var usesNativeProfileState = true
     var continueWatching: [CoreCWItem] = []
     var library: CoreLibrary?

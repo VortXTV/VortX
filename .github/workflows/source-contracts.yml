@@ -57,6 +57,9 @@ on:
       - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/run-account-file-local-adoption.py"
+      - "test/account-file-local-adoption-inputs.cjs"
       - "scripts/run-account-file-restore-manager.py"
       - "test/account-file-restore-manager-inputs.cjs"
       - "scripts/test-account-authentication-lifecycle.sh"
@@ -164,6 +167,9 @@ on:
       - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/run-account-file-local-adoption.py"
+      - "test/account-file-local-adoption-inputs.cjs"
       - "scripts/run-account-file-restore-manager.py"
       - "test/account-file-restore-manager-inputs.cjs"
       - "scripts/test-account-authentication-lifecycle.sh"
@@ -355,6 +361,8 @@ jobs:
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-file-restore-manager.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-file-local-adoption.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

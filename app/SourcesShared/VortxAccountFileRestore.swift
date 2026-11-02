@@ -36,6 +36,16 @@ enum VortxAccountFileRestoreResult: Sendable {
     // None of these cases claims a native checkpoint, provider apply, or profile mount.
 }
 
+/// Transport confirmation and historical local adoption are distinct facts.
+enum VortxAccountFileRestoreStatus: Sendable {
+    case available([VortxAccountFileRestore.OperationStatus])
+    case accountChanged, recoveryUnavailable
+}
+enum VortxAccountFileRestoreLocalResult: Sendable {
+    case localAdoptionRecorded(UUID, revision: Int)
+    case pending(UUID, reason: VortxAccountFileRestore.LocalPendingReason), accountChanged, recoveryUnavailable
+}
+
 enum VortxAccountFileRestore {
     typealias Exact = OwnerHistoryExactJSON
     struct Prepared: Sendable {
@@ -66,6 +76,36 @@ enum VortxAccountFileRestore {
         let operationID: UUID
         let verdict: Verdict
         let revision: Int
+    }
+    enum LocalState: String, Sendable {
+        case notSubmitted, conflict, deliveryUnconfirmed, uploadAccepted, serverConfirmed, localAdoptionRecorded
+        var unresolved: Bool { self != .notSubmitted && self != .conflict && self != .localAdoptionRecorded }
+    }
+    enum LocalPendingReason: Equatable, Sendable { case receivePending, legacyProviderSettlementUnavailable }
+    struct OperationStatus: Sendable, Equatable {
+        let operationID: UUID
+        let revision: Int
+        let state: LocalState
+        var pendingReason: LocalPendingReason = .receivePending
+    }
+    /// Source presence is intentionally conservative: these legacy stores have no durable apply
+    /// receipt yet. Never strip these keys or pretend awaiting their Void methods proves success.
+    static func hasUnacknowledgedProviderCarrier(_ plaintext: Data) -> Bool {
+        guard let raw = try? OwnerHistoryExactJSON.Object(plaintext) else { return true }
+        guard let keys = raw["apiKeys"] else { return false }
+        guard let fields = try? OwnerHistoryExactJSON.Object(keys) else { return true }
+        return fields["vortx.mediaServers"] != nil || fields["vortx.iptv"] != nil
+    }
+    /// Historical record only; never a replay, native checkpoint or current-session capability.
+    struct LocalAdoption: Codable, Sendable {
+        let format: String
+        let operationID: UUID
+        let accountID: String
+        let scope: VortxAccountScope
+        let revision: Int
+        let plaintextSHA256: String
+        let sealedIntentSHA256: String
+        let observation: UUID
     }
     static func digest(_ data: Data) -> String { VortxAccountFileRepairService.digest(data) }
     static func head(_ response: Data) throws -> VortxAccountBackupFile.Inspection {

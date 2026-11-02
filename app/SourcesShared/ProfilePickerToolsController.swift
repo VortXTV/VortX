@@ -10,6 +10,21 @@ struct ProfilePickerToolsRestoreAction {
         case notSubmitted(String), conflict
         case deliveryUnconfirmed(UUID), uploadAccepted(UUID), serverConfirmed(UUID)
     }
+    enum LocalOutcome: Sendable {
+        case loaded(UUID), pending(UUID), providerSettlementUnavailable(UUID), accountChanged, recoveryUnavailable
+    }
+    struct Retained: Sendable {
+        enum State: Equatable, Sendable { case needsVerification, serverConfirmed, loaded }
+        let operationID: UUID
+        let state: State
+        var providerSettlementUnavailable = false
+    }
+    enum StoredStatus: Sendable {
+        case available([Retained]), accountChanged, recoveryUnavailable
+    }
+    /// Both continuations are required. A file-only adapter cannot expose a no-op Finish button.
+    let status: @MainActor () async -> StoredStatus
+    let finish: @MainActor (UUID) async -> LocalOutcome
     let submit: @MainActor (Data) async -> Outcome
     /// Explicit verification is read-only; it never repeats the confirmed upload.
     let verify: @MainActor (UUID) async -> Outcome
@@ -28,7 +43,7 @@ final class ProfilePickerToolsController: ObservableObject {
     struct Saved: Sendable { let filename: String; let bytes: Int; let sha256: String }
     struct Repair: Identifiable, Sendable { let id: UUID; let profiles: Int; let bytes: Int }
     enum CopyKind: Sendable { case accountBackup, repairedAccount }
-    enum Action: Equatable, Sendable { case download, repair, restore }
+    enum Action: Equatable, Sendable { case download, repair, restore, restoreStatus, finishRestore }
     enum PickerPurpose: Equatable, Sendable { case input, destination }
     struct Picker: Identifiable, Sendable {
         let id: UUID
@@ -38,7 +53,7 @@ final class ProfilePickerToolsController: ObservableObject {
     }
     enum Stage: Equatable {
         case idle, choosingInput, reading, downloading, preparing
-        case reviewRepair, confirmRestore, choosingDestination, saving, restoring, draining
+        case reviewRepair, confirmRestore, choosingDestination, saving, restoring, checkingRestore, finishingRestore, draining
     }
     struct Status: Equatable {
         var stage: Stage = .idle
@@ -73,6 +88,7 @@ final class ProfilePickerToolsController: ObservableObject {
     private var pendingRestoreAction: ProfilePickerToolsRestoreAction?
     private var pendingRestoreIsCurrent: (@MainActor (Owner) -> Bool)?
     @Published private(set) var canVerifyRestore = false
+    @Published private(set) var canFinishRestore = false
 
     @MainActor private final class Operation {
         let id = UUID()
@@ -100,19 +116,23 @@ final class ProfilePickerToolsController: ObservableObject {
         self.services = services
         if let owner = pendingRestoreOwner, !services.isCurrent(owner) {
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
-            restoreNeedsVerification = false; canVerifyRestore = false
+            restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
         }
         if operation != nil {
             status = Status(stage: .draining,
                 message: "Finishing the previous cancelled file operation. New file actions will be available when it returns.")
-        } else if status.stage != .idle { status = Status() }
+        } else {
+            if status.stage != .idle { status = Status() }
+            discoverRestore(route: id)
+        }
     }
 
     var accountActionsAvailable: Bool { services?.owner() != nil }
     var canRestore: Bool { accountActionsAvailable && !isBusy && !restoreNeedsVerification }
 
     func begin(_ action: Action, route id: UUID) {
-        guard routeID == id, operation == nil, task == nil, let services,
+        guard [.download, .repair, .restore].contains(action),
+              routeID == id, operation == nil, task == nil, let services,
               let owner = services.owner(), services.isCurrent(owner),
               action != .restore || !restoreNeedsVerification else { return }
         let captured = Operation(routeID: id, owner: owner, action: action, services: services)
@@ -224,12 +244,89 @@ final class ProfilePickerToolsController: ObservableObject {
         }
     }
 
+    /// Restart discovery uses the same retained task/owner/route slot as every other Tools action.
+    private func discoverRestore(route id: UUID) {
+        guard !Task.isCancelled, routeID == id, operation == nil, task == nil, let services,
+              let owner = services.owner(), services.isCurrent(owner) else { return }
+        let captured = Operation(routeID: id, owner: owner, action: .restoreStatus, services: services)
+        operation = captured; isBusy = true
+        start(captured, stage: .checkingRestore) { [self] in
+            let discovered = await captured.services.restore.status()
+            try require(captured)
+            switch discovered {
+            case .available(let records):
+                if let pending = records.first(where: { $0.state != .loaded }) {
+                    pendingRestoreOwner = captured.owner; pendingRestoreID = pending.operationID
+                    pendingRestoreAction = captured.services.restore; pendingRestoreIsCurrent = captured.services.isCurrent
+                    restoreNeedsVerification = true
+                    canVerifyRestore = pending.state == .needsVerification
+                    canFinishRestore = pending.state == .serverConfirmed
+                    finish(captured, message: pending.providerSettlementUnavailable ? Self.providerSettlementMessage : canFinishRestore
+                        ? "The restored backup is confirmed on the server. Use Finish loading backup to receive it on this device."
+                        : "A previous restore is retained. Verify the stored backup before continuing; do not upload it again.")
+                } else if let loaded = records.first(where: { $0.state == .loaded && (pendingRestoreID == nil || $0.operationID == pendingRestoreID) }) {
+                    reportLocalRestore(.loaded(loaded.operationID), originalID: loaded.operationID, operation: captured)
+                } else {
+                    // An authenticated empty inventory cannot erase another in-memory operation.
+                    if pendingRestoreID == nil {
+                        restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
+                    }
+                    finish(captured, message: pendingRestoreID == nil ? "Backup tools are ready." : Self.pendingRestoreMessage)
+                }
+            case .accountChanged: throw Refusal.stale
+            case .recoveryUnavailable:
+                restoreNeedsVerification = true; canVerifyRestore = false; canFinishRestore = false
+                finish(captured, message: "The retained restore could not be verified. Its recovery files have been kept. Reopen Tools after account recovery is available.")
+            }
+        }
+    }
+
+    func finishRestore(route id: UUID) {
+        guard routeID == id, operation == nil, task == nil, let services,
+              let owner = pendingRestoreOwner, services.isCurrent(owner),
+              let originalID = pendingRestoreID, let action = pendingRestoreAction, canFinishRestore else { return }
+        let captured = Operation(routeID: id, owner: owner, action: .finishRestore, services: services)
+        operation = captured; isBusy = true
+        start(captured, stage: .finishingRestore) { [self] in
+            let result = await action.finish(originalID)
+            try require(captured)
+            reportLocalRestore(result, originalID: originalID, operation: captured)
+        }
+    }
+
+    private static let providerSettlementMessage = "This backup includes media-server or IPTV data whose complete local recovery cannot yet be verified by this version. Its encrypted recovery copy remains pending and has been kept. Normal profile recovery can continue; this tool will not report the whole backup as loaded."
+    private static let pendingRestoreMessage = "The backup has not yet been confirmed as loaded on this device. Local changes or account work may still be pending, or the stored backup may have changed. The original encrypted recovery copy is retained. This action does not upload it again."
+    private func reportLocalRestore(_ result: ProfilePickerToolsRestoreAction.LocalOutcome,
+                                    originalID: UUID, operation captured: Operation) {
+        guard isCurrent(captured) else { return }
+        switch result {
+        case .loaded(let id) where id == originalID:
+            guard pendingRestoreID == nil || (pendingRestoreID == id && pendingRestoreOwner == captured.owner) else {
+                finish(captured, message: Self.pendingRestoreMessage)
+                return
+            }
+            pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
+            restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
+            finish(captured, message: "The restored backup was loaded on this device. Its encrypted recovery copy has been kept. Opening the current profile may still be in progress.")
+        case .pending(let id) where id == originalID:
+            finish(captured, message: Self.pendingRestoreMessage)
+        case .providerSettlementUnavailable(let id) where id == originalID:
+            finish(captured, message: Self.providerSettlementMessage)
+        case .accountChanged:
+            finish(captured, message: "The account changed before loading could be confirmed. Reopen Tools for the current account.")
+        case .recoveryUnavailable:
+            finish(captured, message: "Local completion could not be verified. The encrypted recovery copy has been kept; no restore was uploaded again.")
+        default:
+            finish(captured, message: Self.pendingRestoreMessage)
+        }
+    }
+
     private func retainRestoreOutcome(_ outcome: ProfilePickerToolsRestoreAction.Outcome, operation captured: Operation) {
         guard captured.services.isCurrent(captured.owner) else { return }
         let id: UUID
         switch outcome {
-        case .deliveryUnconfirmed(let value), .uploadAccepted(let value): id = value; canVerifyRestore = true
-        case .serverConfirmed(let value): id = value; canVerifyRestore = false
+        case .deliveryUnconfirmed(let value), .uploadAccepted(let value): id = value; canVerifyRestore = true; canFinishRestore = false
+        case .serverConfirmed(let value): id = value; canVerifyRestore = false; canFinishRestore = true
         case .notSubmitted, .conflict: return
         }
         pendingRestoreOwner = captured.owner; pendingRestoreID = id
@@ -251,7 +348,7 @@ final class ProfilePickerToolsController: ObservableObject {
         case .uploadAccepted:
             message = "The server accepted the backup upload. Verification and local profile recovery are still pending. Verify restore before continuing."
         case .serverConfirmed:
-            message = "The restored backup is confirmed on the server. Local profiles have not been loaded yet. Close Tools and select a profile to continue recovery. If sign-in is required, use Sign in on the profile picker."
+            message = "The restored backup is confirmed on the server. Use Finish loading backup to receive it on this device. This does not upload the file again."
         }
         finish(captured, message: message)
     }
@@ -284,9 +381,12 @@ final class ProfilePickerToolsController: ObservableObject {
         if let captured = operation, !captured.services.isCurrent(captured.owner) { cancel(operationID: captured.id) }
         if let owner = pendingRestoreOwner, pendingRestoreIsCurrent?(owner) != true {
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
-            restoreNeedsVerification = false; canVerifyRestore = false
+            restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
         }
-        if task == nil { status = Status() }
+        if task == nil {
+            status = Status()
+            if let id = routeID { discoverRestore(route: id) }
+        }
     }
 
     private func isCurrent(_ captured: Operation) -> Bool {
@@ -327,6 +427,15 @@ final class ProfilePickerToolsController: ObservableObject {
         if captured.cancelled || routeID != captured.routeID || !captured.services.isCurrent(captured.owner) {
             if let id = captured.repairID { captured.services.cancelRepair(id) }
             operation = nil; isBusy = false; picker = nil; status = Status()
+            if let currentRoute = routeID,
+               currentRoute != captured.routeID || !captured.services.isCurrent(captured.owner) {
+                // returned() still runs inside the retired, possibly cancelled worker. Discovery
+                // must claim its slot from a fresh task, never inherit that task's cancellation.
+                Task { @MainActor [weak self] in
+                    guard let self, self.routeID == currentRoute else { return }
+                    self.discoverRestore(route: currentRoute)
+                }
+            }
         } else if captured.completed {
             operation = nil; isBusy = false
         }

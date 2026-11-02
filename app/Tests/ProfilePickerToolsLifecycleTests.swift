@@ -41,6 +41,11 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
     var saveGate: Gate<Model.Saved>?
     var restoreGate: Gate<ProfilePickerToolsRestoreAction.Outcome>?
     var verifyGate: Gate<ProfilePickerToolsRestoreAction.Outcome>?
+    var statusGate: Gate<ProfilePickerToolsRestoreAction.StoredStatus>?
+    var finishGate: Gate<ProfilePickerToolsRestoreAction.LocalOutcome>?
+    var retained: [ProfilePickerToolsRestoreAction.Retained] = []
+    var finishedIDs: [UUID] = []
+    var discoveries = 0
     var downloads = 0, reads = 0, preparations = 0, takes = 0, saves = 0, restores = 0, verifies = 0
     var cancelledRepairs: [UUID] = []
     var verifiedIDs: [UUID] = []
@@ -61,7 +66,15 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }, takeRepair: { id in
             precondition(id == self.repairID)
             self.takes += 1; return Self.data
-        }, cancelRepair: { self.cancelledRepairs.append($0) }, restore: .init(submit: { _ in
+        }, cancelRepair: { self.cancelledRepairs.append($0) }, restore: .init(status: {
+            self.discoveries += 1
+            if let gate = self.statusGate { return await gate.value() }
+            return .available(self.retained)
+        }, finish: { id in
+            self.finishedIDs.append(id)
+            if let gate = self.finishGate { return await gate.value() }
+            return .pending(id)
+        }, submit: { _ in
             self.restores += 1
             if let gate = self.restoreGate { return await gate.value() }
             return .notSubmitted("Fixture refused before upload")
@@ -82,6 +95,11 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         return .init(filename: "fixture-new-copy.json", bytes: bytes.count, sha256: digest)
     }
     func present() -> UUID { let id = UUID(); model.present(id, services: services()); return id }
+    func presentReady() async -> UUID {
+        let id = present()
+        await ProfilePickerToolsLifecycleTests.settle { !self.model.isBusy }
+        return id
+    }
     func choose(_ request: Model.Picker) {
         model.picked(request, result: .success([URL(fileURLWithPath: request.purpose == .input ? "/fixture/selected.json" : "/fixture/folder")]))
     }
@@ -102,14 +120,14 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
     static func main() async throws {
         do {
             let h = Harness(), route = UUID()
-            h.model.present(route, services: h.services()); h.model.begin(.repair, route: route)
+            h.model.present(route, services: h.services()); await settle { !h.model.isBusy }; h.model.begin(.repair, route: route)
             let oldPicker = h.model.picker!
             h.model.cancel(); h.choose(oldPicker)
             check(h.reads == 0 && !h.model.isBusy, "cancelled input picker cannot start a late provider read")
         }
         do {
             let h = Harness(); let gate = Gate<ProfilePickerToolsController.Selected>(); h.readGate = gate
-            let route = h.present(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
+            let route = await h.presentReady(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
             await gate.waitForStart(); h.model.cancel()
             let next = h.present(); h.model.begin(.download, route: next)
             check(h.model.isBusy && h.reads == 1 && h.downloads == 0,
@@ -124,7 +142,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<ProfilePickerToolsController.Repair>(); h.repairGate = gate
-            let route = h.present(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
+            let route = await h.presentReady(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
             await gate.waitForStart(); h.model.dismiss(route)
             gate.finish(.init(id: h.repairID, profiles: 3, bytes: Harness.data.count))
             await settle { !h.model.isBusy }
@@ -133,13 +151,13 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<Data>(); h.downloadGate = gate
-            let route = h.present(); h.model.begin(.download, route: route)
+            let route = await h.presentReady(); h.model.begin(.download, route: route)
             await gate.waitForStart(); h.owner = nil; h.model.credentialDidChange()
             gate.finish(Harness.data); await settle { !h.model.isBusy }
             check(h.model.picker == nil && h.saves == 0, "credential replacement denies late download before destination or save")
         }
         do {
-            let h = Harness(); let route = h.present(); h.model.begin(.download, route: route)
+            let h = Harness(); let route = await h.presentReady(); h.model.begin(.download, route: route)
             await settle { h.model.picker != nil }; let firstFolder = h.model.picker!
             h.model.cancel(); h.model.begin(.download, route: route)
             await settle { h.model.picker != nil }; let currentFolder = h.model.picker!
@@ -152,7 +170,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<ProfilePickerToolsController.Saved>(); h.saveGate = gate
-            let route = h.present(); h.model.begin(.download, route: route)
+            let route = await h.presentReady(); h.model.begin(.download, route: route)
             await settle { h.model.picker != nil }; h.choose(h.model.picker!)
             await gate.waitForStart(); h.model.cancel()
             check(h.model.isBusy && h.model.status.stage == .draining,
@@ -163,7 +181,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<ProfilePickerToolsController.Saved>(); h.saveGate = gate
-            let route = h.present(); h.model.begin(.download, route: route)
+            let route = await h.presentReady(); h.model.begin(.download, route: route)
             await settle { h.model.picker != nil }; h.choose(h.model.picker!)
             await gate.waitForStart()
             gate.finish(.init(filename: "unverified.json", bytes: Harness.data.count, sha256: "wrong-digest"))
@@ -172,7 +190,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
                   "mismatched provider receipt cannot publish a verified saved copy")
         }
         do {
-            let h = Harness(); let route = h.present(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
+            let h = Harness(); let route = await h.presentReady(); h.model.begin(.repair, route: route); h.choose(h.model.picker!)
             await settle { h.model.status.stage == .reviewRepair }
             h.model.present(route, services: h.services())
             check(h.model.status.stage == .reviewRepair, "system picker return does not reset an existing presentation")
@@ -183,7 +201,7 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<ProfilePickerToolsRestoreAction.Outcome>(); h.restoreGate = gate
-            let route = h.present(); h.model.begin(.restore, route: route); h.choose(h.model.picker!)
+            let route = await h.presentReady(); h.model.begin(.restore, route: route); h.choose(h.model.picker!)
             await settle { h.model.status.stage == .confirmRestore }
             check(h.restores == 0, "selected immutable bytes never upload before explicit restore confirmation")
             h.model.confirmRestore(route: route); h.model.confirmRestore(route: route)
@@ -198,12 +216,12 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
         }
         do {
             let h = Harness(), gate = Gate<ProfilePickerToolsRestoreAction.Outcome>(); h.restoreGate = gate
-            let route = h.present(); h.model.begin(.restore, route: route); h.choose(h.model.picker!)
+            let route = await h.presentReady(); h.model.begin(.restore, route: route); h.choose(h.model.picker!)
             await settle { h.model.status.stage == .confirmRestore }
             h.model.confirmRestore(route: route); await gate.waitForStart(); h.model.dismiss(route)
             let original = UUID(); gate.finish(.deliveryUnconfirmed(original)); await settle { !h.model.isBusy }
             h.model.credentialDidChange() // A closed presentation is not a credential replacement.
-            let next = h.present()
+            let next = await h.presentReady()
             check(h.model.restoreNeedsVerification && !h.model.canRestore,
                   "cancel after possible send retains original-account delivery uncertainty across reopening")
             h.model.verifyRestore(route: next); await settle { !h.model.isBusy }
@@ -211,10 +229,10 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
                   "late delivery state permits original GET verification without repeating upload")
         }
         do {
-            let h = Harness(); let old = h.present()
+            let h = Harness(); let old = await h.presentReady()
             var lease: ProfilePickerToolsLease? = .init(routeID: old, controller: h.model)
             check(lease?.routeID == old, "presentation lease records its original route")
-            let current = h.present(); h.model.begin(.download, route: current)
+            let current = await h.presentReady(); h.model.begin(.download, route: current)
             lease = nil; await settle { h.model.picker != nil }
             check(h.model.picker?.routeID == current, "old presentation teardown cannot cancel a newer Tools route")
             h.model.cancel()
@@ -232,6 +250,66 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
             check(!grant.permitsExport, "credential ABA cannot revive a prior diagnostic grant")
             let denied = ProfilePickerToolsDiagnosticGrant(allowed: false, credential: authority.capture(), admission: { true })
             check(!denied.permitsExport, "captured refusal cannot become a diagnostic grant after navigation")
+        }
+        do {
+            let h = Harness(), original = UUID()
+            h.retained = [.init(operationID: original, state: .serverConfirmed)]
+            let route = await h.presentReady()
+            check(h.model.canFinishRestore && !h.model.canRestore && h.model.restoreNeedsVerification,
+                  "restart status exposes real Finish after server confirmation")
+            h.model.finishRestore(route: route); await settle { !h.model.isBusy }
+            check(h.finishedIDs == [original] && h.restores == 0 && h.verifies == 0 && h.model.restoreNeedsVerification,
+                  "Finish passes retained UUID only and pending does not unlock another restore")
+            let gate = Gate<ProfilePickerToolsRestoreAction.LocalOutcome>(); h.finishGate = gate
+            h.model.finishRestore(route: route); await gate.waitForStart()
+            gate.finish(.loaded(original)); await settle { !h.model.isBusy }
+            check(!h.model.restoreNeedsVerification && h.model.canRestore && h.model.status.message?.contains("was loaded on this device") == true,
+                  "typed completion of same operation clears pending UI only after true finish return")
+        }
+        do {
+            let h = Harness(), original = UUID(), gate = Gate<ProfilePickerToolsRestoreAction.LocalOutcome>()
+            h.retained = [.init(operationID: original, state: .serverConfirmed)]; h.finishGate = gate
+            let route = await h.presentReady()
+            h.model.finishRestore(route: route); await gate.waitForStart(); h.model.cancel()
+            let next = h.present(); h.model.begin(.download, route: next)
+            check(h.model.isBusy && h.downloads == 0, "cancelled noncooperative Finish retains sole slot across route replacement")
+            gate.finish(.loaded(original)); await settle { !h.model.isBusy }
+            check(h.model.restoreNeedsVerification && h.model.status.message?.contains("was loaded") != true,
+                  "late historical completion cannot publish into replacement route")
+        }
+        do {
+            let h = Harness(), original = UUID(), gate = Gate<ProfilePickerToolsRestoreAction.LocalOutcome>()
+            h.retained = [.init(operationID: original, state: .serverConfirmed)]; h.finishGate = gate
+            let route = await h.presentReady()
+            h.model.finishRestore(route: route); await gate.waitForStart()
+            gate.finish(.loaded(UUID())); await settle { !h.model.isBusy }
+            check(h.model.restoreNeedsVerification && !h.model.canRestore, "another operation's loaded result cannot clear this retained operation")
+        }
+        do {
+            let h = Harness(), original = UUID(), gate = Gate<ProfilePickerToolsRestoreAction.StoredStatus>()
+            h.statusGate = gate
+            let route = h.present(); await gate.waitForStart(); h.model.dismiss(route)
+            h.statusGate = nil; let next = h.present(); h.model.begin(.restore, route: next)
+            check(h.model.isBusy && h.restores == 0, "status discovery owns the same noncooperative task slot as restore")
+            gate.finish(.available([.init(operationID: original, state: .serverConfirmed)]))
+            await settle { !h.model.isBusy && h.discoveries == 2 }
+            check(!h.model.canFinishRestore && h.discoveries == 2, "retired discovery cannot publish old operation and successor discovers afresh")
+        }
+        do {
+            let h = Harness(), original = UUID(), gate = Gate<ProfilePickerToolsRestoreAction.LocalOutcome>()
+            h.retained = [.init(operationID: original, state: .serverConfirmed)]; h.finishGate = gate
+            let route = await h.presentReady()
+            h.model.finishRestore(route: route); await gate.waitForStart()
+            h.owner = nil; h.model.credentialDidChange(); gate.finish(.loaded(original)); await settle { !h.model.isBusy }
+            check(!h.model.restoreNeedsVerification && h.model.status.message?.contains("was loaded") != true,
+                  "replacement owner never sees prior account's completion publication")
+        }
+        do {
+            let h = Harness(), original = UUID()
+            h.retained = [.init(operationID: original, state: .serverConfirmed, providerSettlementUnavailable: true)]
+            _ = await h.presentReady()
+            check(h.model.restoreNeedsVerification && h.model.status.message?.contains("cannot yet be verified") == true,
+                  "interim provider restriction remains explicit pending history without false loaded copy")
         }
         print("\(checks) actual Tools controller/access checks passed")
     }

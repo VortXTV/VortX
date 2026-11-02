@@ -155,7 +155,7 @@ struct ProfilePickerToolsView: View {
                     .accessibilityIdentifier("profile-tools-result")
             }
             switch controller.status.stage {
-            case .reading, .downloading, .preparing, .saving, .restoring, .draining:
+            case .reading, .downloading, .preparing, .saving, .restoring, .checkingRestore, .finishingRestore, .draining:
                 ProgressView(progressLabel).tint(Theme.Palette.accent)
             case .reviewRepair:
                 Button("Save repaired copy") { controller.saveRepair(route: route.id) }
@@ -176,6 +176,12 @@ struct ProfilePickerToolsView: View {
                     .accessibilityIdentifier("profile-tools-verify-restore")
                     .accessibilityHint("Checks the stored backup without uploading the selected file again.")
             }
+            if controller.canFinishRestore, !controller.isBusy {
+                Button("Finish loading backup") { controller.finishRestore(route: route.id) }
+                    .buttonStyle(ChipButtonStyle())
+                    .accessibilityIdentifier("profile-tools-finish-loading-backup")
+                    .accessibilityHint("Receives the stored backup through normal account recovery without uploading the file again.")
+            }
             if controller.isBusy {
                 Button("Cancel file action", role: .cancel) { controller.cancel() }
                     .buttonStyle(ChipButtonStyle())
@@ -190,7 +196,9 @@ struct ProfilePickerToolsView: View {
         case .downloading: "Downloading account backup…"
         case .preparing: "Preparing backup copy…"
         case .saving: "Saving and checking the new copy…"
-        case .restoring: "Submitting the confirmed restore…"
+        case .restoring: "Submitting or verifying the confirmed restore…"
+        case .checkingRestore: "Checking retained restore status…"
+        case .finishingRestore: "Loading the restored backup…"
         default: "Waiting for the previous operation to finish…"
         }
     }

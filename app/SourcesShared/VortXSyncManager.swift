@@ -3613,6 +3613,118 @@ final class VortXSyncManager: ObservableObject {
         if let operation = accountFileRepairOperation { cancelAccountBackupRepair(operation.id) }
     }
 
+    // MARK: - Historical completion of a selected-file restore
+
+    /// Only the full receive success boundary below can construct this value. It is intentionally
+    /// not Codable and has no memberwise initializer accessible to UI, journal or selected-file code.
+    struct CompletedFileRestoreReceive: Sendable {
+        let accountID: String
+        let capture: CredentialScopeRegistry.Capture
+        let dataKey: Data
+        let revision: Int
+        let plaintextSHA256: String
+        let observation: UUID
+        let target: PlaybackMutationTarget
+        let scope: VortxAccountScope
+        fileprivate init(accountID: String, capture: CredentialScopeRegistry.Capture, dataKey: Data,
+                         revision: Int, plaintextSHA256: String, observation: UUID,
+                         target: PlaybackMutationTarget, scope: VortxAccountScope) {
+            self.accountID = accountID; self.capture = capture; self.dataKey = dataKey
+            self.revision = revision; self.plaintextSHA256 = plaintextSHA256
+            self.observation = observation; self.target = target; self.scope = scope
+        }
+    }
+
+    /// Called synchronously only after the real generic native+host commit, provider settlement,
+    /// ordinary receive bookkeeping and publication. No pending-push test: a causal republish is
+    /// still pending and does not undo the source that was genuinely received.
+    private func completedFileRestoreReceive(_ received: VersionedPull, accountID: String?,
+        capture: CredentialScopeRegistry.Capture, key: Data?, target: PlaybackMutationTarget?) -> CompletedFileRestoreReceive? {
+        guard case .doc(_, let revision, let plaintext, let observation?) = received,
+              let raw = try? OwnerHistoryExactJSON.Object(plaintext),
+              let native = raw["nativeSync"], let carrier = try? OwnerHistoryExactJSON.Object(native),
+              let schemaBytes = carrier["schemaVersion"],
+              let schema = try? JSONDecoder().decode(Int.self, from: schemaBytes), (1...5).contains(schema) else { return nil }
+        // These legacy credential carriers currently have no acknowledged durable apply: media
+        // servers run in an unstructured Task, and IPTV applies best-effort without readback. Their
+        // normal receive remains unchanged, but it cannot retire exact-file recovery in this unit.
+        guard !VortxAccountFileRestore.hasUnacknowledgedProviderCarrier(plaintext) else { return nil }
+        let plaintextSHA256 = VortxAccountFileRestore.digest(plaintext)
+        guard let accountID, let key, key.count == 32, isSignedIn, account?.id == accountID,
+              CredentialScope(canonicalRemoteAccountID: accountID) == capture.scope,
+              isCurrent(capture), credentialAuthority.isMigrationEligible(capture), dataKey == key,
+              !Task.isCancelled, !hasPendingAccountDocApply(for: capture),
+              !CoreBridge.shared.hasOwnerHistorySession, let target,
+              case .native(let binding?) = target, binding.accountGeneration != nil,
+              binding.credential == capture, binding.profileID == ProfileStore.shared.activeID,
+              CoreBridge.shared.nativePlaybackTargetIsCurrent(target),
+              CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: binding.profileID),
+              let registry = CoreBridge.shared.nativeRegistryBinding,
+              registry.profileID == binding.profileID.uuidString, registry.scope.account == capture.namespace,
+              UUID(uuidString: registry.scope.ownerProfileID) != nil else { return nil }
+        // Hash the ORIGINAL authenticated HTTP plaintext, never the mutated/projected document.
+        // This synchronous MainActor work has no suspension between the final guards and mint.
+        return CompletedFileRestoreReceive(accountID: accountID, capture: capture, dataKey: key,
+            revision: revision, plaintextSHA256: plaintextSHA256,
+            observation: observation, target: target, scope: registry.scope)
+    }
+
+    private struct FileRestoreStatusOwner {
+        let accountID: String
+        let capture: CredentialScopeRegistry.Capture
+        let key: Data
+    }
+    private func fileRestoreStatusOwner() -> FileRestoreStatusOwner? {
+        let capture = credentialAuthority.capture()
+        guard isSignedIn, credentialAuthority.isMigrationEligible(capture), let account,
+              CredentialScope(canonicalRemoteAccountID: account.id) == capture.scope,
+              let key = dataKey, key.count == 32, !Task.isCancelled else { return nil }
+        return .init(accountID: account.id, capture: capture, key: key)
+    }
+    private func fileRestoreStatusOwnerIsCurrent(_ owner: FileRestoreStatusOwner) -> Bool {
+        !Task.isCancelled && isSignedIn && account?.id == owner.accountID && dataKey == owner.key
+            && isCurrent(owner.capture) && credentialAuthority.isMigrationEligible(owner.capture)
+    }
+    /// Existing-only local discovery. Never creates a key, directory, file or native state.
+    func accountBackupFileRestoreStatus() async -> VortxAccountFileRestoreStatus {
+        guard let owner = fileRestoreStatusOwner() else { return .accountChanged }
+        do {
+            let records = try await VortxAccountFileRestoreJournal.shared.status(account: owner.accountID, key: owner.key)
+            guard fileRestoreStatusOwnerIsCurrent(owner) else { return .accountChanged }
+            return .available(records)
+        } catch {
+            return fileRestoreStatusOwnerIsCurrent(owner) ? .recoveryUnavailable : .accountChanged
+        }
+    }
+    /// Continue the ORIGINAL retained operation with a normal GET/receive. No selected bytes or PUT.
+    /// The dedicated restore lock must stay free: syncDown owns its existing receive slot instead.
+    func finishAccountBackupFileRestore(_ operationID: UUID) async -> VortxAccountFileRestoreLocalResult {
+        guard let owner = fileRestoreStatusOwner() else { return .accountChanged }
+        do {
+            let records = try await VortxAccountFileRestoreJournal.shared.status(account: owner.accountID, key: owner.key)
+            guard fileRestoreStatusOwnerIsCurrent(owner) else { return .accountChanged }
+            guard let original = records.first(where: { $0.operationID == operationID }) else { return .recoveryUnavailable }
+            if original.state == .localAdoptionRecorded { return .localAdoptionRecorded(operationID, revision: original.revision) }
+            if original.pendingReason == .legacyProviderSettlementUnavailable {
+                return .pending(operationID, reason: .legacyProviderSettlementUnavailable)
+            }
+            guard original.state.unresolved, !accountFileRestoreBusy, accountFileRepairOperation == nil,
+                  activeSyncUp?.capture != owner.capture, activeSyncDown?.capture != owner.capture else { return .pending(operationID, reason: .receivePending) }
+            // Invalidate ONLY the process-local conditional-GET optimization. Existing pending-edit,
+            // initial-restore and older-version policies remain in the actual normal receive method.
+            nativeReceiveReceipt = nil
+            _ = await syncDown(force: false, credentialCapture: owner.capture, routineReceive: true)
+            guard fileRestoreStatusOwnerIsCurrent(owner) else { return .accountChanged }
+            let readback = try await VortxAccountFileRestoreJournal.shared.status(account: owner.accountID, key: owner.key)
+            guard fileRestoreStatusOwnerIsCurrent(owner) else { return .accountChanged }
+            guard let completed = readback.first(where: { $0.operationID == operationID }),
+                  completed.revision == original.revision, completed.state == .localAdoptionRecorded else { return .pending(operationID, reason: .receivePending) }
+            return .localAdoptionRecorded(operationID, revision: completed.revision)
+        } catch {
+            return fileRestoreStatusOwnerIsCurrent(owner) ? .recoveryUnavailable : .accountChanged
+        }
+    }
+
     // MARK: - Dedicated encrypted account file restore
 
     private struct AccountFileRestoreOperation {
@@ -4924,6 +5036,7 @@ final class VortXSyncManager: ObservableObject {
         guard !accountFileRestoreBusy else { reportOutcome?(.pending); return false }
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let capturedDataKey = dataKey
+        let capturedFileRestoreAccountID = account?.id
         var outcome: ConflictResolutionOutcome = .failed
         defer { reportOutcome?(isCurrent(capture) && dataKey == capturedDataKey && !Task.isCancelled ? outcome : .failed) }
         guard isSignedIn, isCurrent(capture), backupUploadFailure != .upgradeRequired else { return false }
@@ -5398,6 +5511,18 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return false }
         CoreBridge.shared.rebuildContinueWatching()
         rememberCompletedNativeReceive(version: pulled.version, capture: capture, target: nativeCommittedTarget)
+        if let completed = completedFileRestoreReceive(received, accountID: capturedFileRestoreAccountID,
+            capture: capture, key: capturedDataKey, target: nativeCommittedTarget) {
+            // Mint is the linearization point. A late cancellation/account change can only finish
+            // this original historical fact; this await does not mutate native/provider state or
+            // publish completion into a replacement UI. Persistence failure leaves recovery pending.
+            _ = try? await VortxAccountFileRestoreJournal.shared.recordLocalAdoption(completed)
+            // The added persistence await may outlive this session. Keep its historical record,
+            // but do not report a completed receive to a replacement profile/session/owner.
+            guard isSignedIn, isCurrent(capture), credentialAuthority.isMigrationEligible(capture),
+                  account?.id == completed.accountID, dataKey == completed.dataKey, !Task.isCancelled,
+                  !hasPendingAccountDocApply(for: capture), CoreBridge.shared.nativePlaybackTargetIsCurrent(completed.target) else { return restored }
+        }
         outcome = .completed
         return restored
     }

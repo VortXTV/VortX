@@ -3,10 +3,35 @@ import Foundation
 
 extension ProfilePickerToolsRestoreAction {
     /// This adapter requires the separately reviewed dedicated account-file restore service.
-    /// No settings import, sync-document alias, automatic replay or local-adoption claim exists here.
+    /// Transport verification and durable historical local completion have separate typed results.
     static var live: Self {
         let sync = VortXSyncManager.shared
-        return .init(submit: { data in
+        return .init(status: {
+            switch await sync.accountBackupFileRestoreStatus() {
+            case .available(let records):
+                return .available(records.compactMap { record in
+                    let state: Retained.State
+                    switch record.state {
+                    case .notSubmitted, .conflict: return nil
+                    case .deliveryUnconfirmed, .uploadAccepted: state = .needsVerification
+                    case .serverConfirmed: state = .serverConfirmed
+                    case .localAdoptionRecorded: state = .loaded
+                    }
+                    return Retained(operationID: record.operationID, state: state,
+                        providerSettlementUnavailable: record.pendingReason == .legacyProviderSettlementUnavailable)
+                })
+            case .accountChanged: return .accountChanged
+            case .recoveryUnavailable: return .recoveryUnavailable
+            }
+        }, finish: { originalOperation in
+            switch await sync.finishAccountBackupFileRestore(originalOperation) {
+            case .localAdoptionRecorded(let id, revision: _): return .loaded(id)
+            case .pending(let id, let reason):
+                return reason == .legacyProviderSettlementUnavailable ? .providerSettlementUnavailable(id) : .pending(id)
+            case .accountChanged: return .accountChanged
+            case .recoveryUnavailable: return .recoveryUnavailable
+            }
+        }, submit: { data in
             map(await sync.restoreAccountBackupFile(data))
         }, verify: { originalOperation in
             map(await sync.verifyAccountBackupFileRestore(originalOperation))

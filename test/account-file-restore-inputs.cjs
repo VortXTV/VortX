@@ -46,6 +46,15 @@ function compose(root,directory) {
       start:'    static let controlResponseLimit = ',end:'\n    private let protocolClasses:'},
     {literal:'}\n'}]});
   addAdmission(recipe);
+  // The journal accepts a concrete manager-minted evidence type. This existing C ABI suite does
+  // not mint it; add its exact declaration rather than an alternate constructible protocol/model.
+  recipe.outputs.push({name:'ActualLocalAdoptionEvidence.swift',parts:[{literal:'import Foundation\n'},
+    {literal:'enum PlaybackMutationOwnershipPolicy {\n'},
+    {source:'app/SourcesShared/PlaybackMutationOwnershipPolicy.swift',kind:'declaration',header:'    enum Target: Hashable, Sendable {'},
+    {source:'app/SourcesShared/PlaybackMutationOwnershipPolicy.swift',kind:'declaration',header:'    struct NativeBinding: Hashable, Sendable {'},
+    {literal:'}\ntypealias PlaybackMutationTarget=PlaybackMutationOwnershipPolicy.Target\nenum VortXSyncManager {\n'},
+    {source:'app/SourcesShared/VortXSyncManager.swift',kind:'declaration',header:'    struct CompletedFileRestoreReceive: Sendable {'},
+    {literal:'}\n'}]});
   const manifest=extract(root,directory);
   for(const relative of ['test/account-file-restore-inputs.cjs','app/SourcesShared/VortXSyncManager.swift',
     'app/SourcesShared/NativePreferenceIntentStore.swift']) manifest.sourceHashes[relative]=hash(fs.readFileSync(path.join(root,relative)));

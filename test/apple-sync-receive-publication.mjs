@@ -61,6 +61,7 @@ if (process.argv[2] === '--extract') {
     source('app/SourcesShared/CatalogPreferences.swift'), source('app/SourcesShared/HomeRailPreferences.swift')]);
   const managerMethods = ['    private static func sawDocV2(', '    private static func markSawDocV2(',
     '    private func conditionalReceiveVersion(', '    private func rememberCompletedNativeReceive(',
+    '    private func completedFileRestoreReceive(',
     '    private func openSyncDocument(', '    private static func decodeDecryptedSyncDocument(', '    private static func documentVersion(',
     '    private func pullDocVersionedResult(', '    private func pullDocVersionedRetrying(',
     '    private func pushSyncDocAt(', '    private func commitNativePulledDocument(', '    private func applyNativeGlobals(',
@@ -93,10 +94,24 @@ if (process.argv[2] === '--extract') {
   const observation = xperienceInputs.observationProperty(manager.text);
   if (observation) receipts.push({ path: manager.path, marker: 'exact Xperience observation property',
     sourceSHA256: sha256(manager.text), sliceSHA256: sha256(observation) });
+  const restoreValues = await source('app/SourcesShared/VortxAccountFileRestore.swift');
+  receipts.push({path:restoreValues.path,marker:'declared local completion helper input',sourceSHA256:sha256(restoreValues.text)});
+  const repairValues = await source('app/SourcesShared/VortxAccountFileRepairService.swift');
+  const credentialValues = await source('app/SourcesShared/CredentialScope.swift');
+  receipts.push({path:credentialValues.path,marker:'declared canonical account scope input',sourceSHA256:sha256(credentialValues.text)});
+  combined += '\n' + xperienceInputs.extractDeclaration(credentialValues.text, 'enum CredentialScope: Equatable, Hashable, Sendable {')
+    + '\nenum VortxAccountFileRestore {\n'
+    + member(restoreValues, '    static func hasUnacknowledgedProviderCarrier(')
+    + member(restoreValues, '    static func digest(') + '\n}\nenum VortxAccountFileRepairService {\n'
+    + member(repairValues, '    static func digest(') + '\n}\n';
+  // This existing publication lane has no file intents; it observes the new call without
+  // inventing journal success. The dedicated local-adoption suite executes the actual journal.
+  combined += '\nactor VortxAccountFileRestoreJournal { static let shared=VortxAccountFileRestoreJournal()\n'
+    + 'func recordLocalAdoption(_ completed: VortXSyncManager.CompletedFileRestoreReceive) -> [UUID] { [] }\n}\n';
   combined += '\nextension VortXSyncManager {\n'
     + observation + '\n'
     + conversionMembers.join('\n') + '\n'
-    + ['    private struct NativeReceiveReceipt {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
+    + ['    struct CompletedFileRestoreReceive: Sendable {', '    private struct NativeReceiveReceipt {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
       '    private enum ProviderApplyService:', '    private enum ProviderApplyValue:', '    private struct PendingProviderApply:']
       .map(marker => member(manager, marker)).join('\n')
     + '\n' + managerMethods.map(marker => member(manager, marker)).join('\n')

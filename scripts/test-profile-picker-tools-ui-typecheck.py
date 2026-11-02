@@ -38,6 +38,13 @@ RECIPE = [
     ('app/SourcesShared/VortXSyncManager.swift', '    func cancelAccountBackupRepair(_ id: UUID) {', 'header', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    func restoreAccountBackupFile(_ selectedFile: Data) async -> VortxAccountFileRestoreResult {', 'header', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    func verifyAccountBackupFileRestore(_ operationID: UUID) async -> VortxAccountFileRestoreResult {', 'header', 'manager'),
+    ('app/SourcesShared/VortXSyncManager.swift', '    func accountBackupFileRestoreStatus() async -> VortxAccountFileRestoreStatus {', 'header', 'manager'),
+    ('app/SourcesShared/VortXSyncManager.swift', '    func finishAccountBackupFileRestore(_ operationID: UUID) async -> VortxAccountFileRestoreLocalResult {', 'header', 'manager'),
+    ('app/SourcesShared/VortxAccountFileRestore.swift', 'enum VortxAccountFileRestoreStatus: Sendable {', 'declaration', ''),
+    ('app/SourcesShared/VortxAccountFileRestore.swift', 'enum VortxAccountFileRestoreLocalResult: Sendable {', 'declaration', ''),
+    ('app/SourcesShared/VortxAccountFileRestore.swift', '    enum LocalState: String, Sendable {', 'declaration', 'restore'),
+    ('app/SourcesShared/VortxAccountFileRestore.swift', '    enum LocalPendingReason: Equatable, Sendable {', 'declaration', 'restore'),
+    ('app/SourcesShared/VortxAccountFileRestore.swift', '    struct OperationStatus: Sendable, Equatable {', 'declaration', 'restore'),
     ('app/SourcesShared/VortxAccountBackupRepair.swift', '    enum Failure: String, Error, Sendable {', 'declaration', 'converter'),
     ('app/SourcesShared/VortxAccountFileRepairService.swift', '    enum Failure: Error, Sendable, LocalizedError {', 'declaration', 'repair'),
     ('app/SourcesShared/VortxAccountFileRepairService.swift', '    struct Preview: Identifiable, Sendable {', 'declaration', 'repair'),
@@ -69,7 +76,7 @@ for(const [file,anchor,kind,group] of recipe){
 }
 const wrap={registry:'final class CredentialScopeRegistry: @unchecked Sendable {\n    static let shared = CredentialScopeRegistry()\n',
  manager:'@MainActor final class VortXSyncManager: ObservableObject {\n',converter:'enum VortxAccountBackupRepair {\n',
- repair:'enum VortxAccountFileRepairService {\n',diagnostic:'enum VXDiagExport {\n'};
+ repair:'enum VortxAccountFileRepairService {\n',restore:'enum VortxAccountFileRestore {\n',diagnostic:'enum VXDiagExport {\n'};
 let generated='import SwiftUI\nimport Foundation\n\n';
 for(const [group,parts] of groups)generated+=(group?wrap[group]:'')+parts.join('\n\n')+'\n'+(group?'}\n':'');
 fs.writeFileSync(output,generated,{flag:'wx'});
