@@ -2496,8 +2496,13 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     val stamps = linkedMapOf<String, Double>()
                     dirty.keys().forEach { field -> stamps[field] = dirty.getDouble(field).also { require(it.isFinite() && it >= 0) } }
                     val unstamped = SettingsDirtyKeys.changedSyncableKeys(settingsShadow, values) { SettingsBackup.isSyncable(it) }
-                    val fields = (stamps.keys + unstamped).filter { it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS }
-                    require(fields.all { !settingsPrefs.contains(it) || values.containsKey(it) }) { "Pending global setting cannot be exported" }
+                    val fields = (stamps.keys + unstamped).filter {
+                        it in SettingsBackup.SYNCABLE_SETTING_TYPES && it !in NATIVE_PROFILE_SETTING_KEYS &&
+                            (!settingsPrefs.contains(it) || values.containsKey(it))
+                    }
+                    // A present value with an unsupported local type is not a deletion. Leave its
+                    // exact dirty stamp pending while independently exportable native edits upload;
+                    // only the fields actually included below can receive a settings acknowledgement.
                     val changes = JSONObject().also { target -> fields.forEach { field ->
                         target.put(field, values[field]?.let(JSONObject::wrap) ?: JSONObject.NULL)
                     } }

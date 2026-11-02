@@ -295,7 +295,7 @@ jobs:
 
   apple-shell-packaging:
     name: Apple tvOS/iOS/macOS shell packaging (secretless)
-    runs-on: macos-26
+    runs-on: macos-26-intel
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -451,6 +451,7 @@ jobs:
             [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
             exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
             file "$executable_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
+            if [ -n "$arch" ]; then xcrun lipo -verify_arch "$arch" "$executable_dir/$exe"; fi
             # Capture first: grep -q can close the pipe early and make nm fail with SIGPIPE under pipefail.
             local defined_symbols undefined_symbols
             defined_symbols="$(nm -gU "$executable_dir/$exe")"
@@ -473,6 +474,7 @@ jobs:
             if [ -d "$products_dir/Contents/Frameworks" ]; then framework_root="$products_dir/Contents/Frameworks"; fi
             local aether="$framework_root/VortXAetherKit.framework/VortXAetherKit"
             [ -f "$aether" ] || { echo "::error::$scheme is missing its real Aether framework"; exit 1; }
+            if [ -n "$arch" ]; then xcrun lipo -verify_arch "$arch" "$aether"; fi
             local aether_undefined aether_dependencies
             aether_undefined="$(nm -u "$aether")"
             if grep -Eq '[[:space:]]_dovi_' <<< "$aether_undefined"; then
@@ -546,7 +548,7 @@ jobs:
           build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     in-process arm64
           build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" native x86_64
           build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    in-process
-          build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    daemon
+          build_shell VortXMac      'generic/platform=macOS'          com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    daemon arm64
           [ "$shell_failures" -eq 0 ] || { echo "::error::$shell_failures shell checks failed"; exit 1; }
 
       - name: Retain the real simulator provider and its complete verification receipts

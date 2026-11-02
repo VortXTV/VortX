@@ -29,6 +29,8 @@ on:
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/embed-aether-frameworks.sh"
+      - "scripts/tests/test_embed_aether_permissions.py"
       - "scripts/build-aether-dovi-tv-simulator.sh"
       - "scripts/aether-dovi-provider.py"
       - "scripts/verify-aether-dovi-processed.py"
@@ -123,6 +125,8 @@ on:
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/embed-aether-frameworks.sh"
+      - "scripts/tests/test_embed_aether_permissions.py"
       - "scripts/build-aether-dovi-tv-simulator.sh"
       - "scripts/aether-dovi-provider.py"
       - "scripts/verify-aether-dovi-processed.py"
@@ -217,7 +221,7 @@ jobs:
     if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
     # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
     # runner generation as Apple packaging instead of the older default SDK.
-    runs-on: macos-26
+    runs-on: macos-26-intel
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -345,6 +349,8 @@ jobs:
       - run: bash scripts/test-ranking-cache-concurrency.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-binge-language-continuity.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/tests/test_embed_aether_permissions.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-aether-playback-boundary.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
