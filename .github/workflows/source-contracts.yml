@@ -50,6 +50,7 @@ on:
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-native-bootstrap-archive.sh"
+      - "scripts/test-account-backup-file.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -147,6 +148,7 @@ on:
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-native-bootstrap-archive.sh"
+      - "scripts/test-account-backup-file.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -321,6 +323,8 @@ jobs:
       - run: bash scripts/test-sync-derived-document-revisions.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-native-bootstrap-archive.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-backup-file.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-roster-propagation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

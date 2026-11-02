@@ -3152,9 +3152,14 @@ final class VortXSyncManager: ObservableObject {
         bearer: String? = nil,
         credentialCapture: CredentialScopeRegistry.Capture? = nil,
         ifNoneMatch: Int? = nil,
+        receiveBackupData: ((Data) -> Void)? = nil,
         receiveETag: ((String?) -> Void)? = nil
     ) async -> (Int, [String: Any]?) {
         if let credentialCapture, !isCurrent(credentialCapture) { return (0, nil) }
+        if receiveBackupData != nil {
+            guard method == "GET", path == "/v1/backup", auth, bearer == nil,
+                  let credentialCapture, isCurrent(credentialCapture) else { return (0, nil) }
+        }
         let sentStoredToken = auth && bearer == nil ? token : nil
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
@@ -3196,6 +3201,10 @@ final class VortXSyncManager: ObservableObject {
                auth, bearer == nil, !path.hasPrefix("/v1/auth/"), !path.hasPrefix("/v1/qr/"),
                let sentStoredToken, let credentialCapture {
                 storeSessionRenewal(response.sessionRenewal, sentToken: sentStoredToken, capture: credentialCapture)
+            }
+            if response.statusCode == 200, let receiveBackupData,
+               let credentialCapture, isCurrent(credentialCapture) {
+                receiveBackupData(response.data)
             }
             let json = (try? AuthenticatedHTTPTransport.jsonObject(from: response.data)) as? [String: Any]
             return (response.statusCode, json)
@@ -3447,6 +3456,28 @@ final class VortXSyncManager: ObservableObject {
         // Validate original numeric lexemes, duplicate keys and Unicode before Foundation can
         // round/drop them. Those values later become authenticated per-profile overlay witnesses.
         return try VortxProfileOverlayWitness.decodeObject(json: plaintext)
+    }
+
+    /// Download the full encrypted account file even when profile migration cannot mount.
+    /// This read never claims a native restore/checkpoint receipt or updates a sync floor.
+    func downloadAccountBackupFile() async throws -> Data {
+        let capture = credentialAuthority.capture()
+        guard isSignedIn, isCurrent(capture), case .account = capture.scope,
+              let capturedAccount = account,
+              let expectedScope = CredentialScope(canonicalRemoteAccountID: capturedAccount.id),
+              expectedScope == capture.scope else { throw VortxAccountBackupFile.Failure.sessionChanged }
+        var responseBytes: Data?
+        let (code, _) = await request("GET", "/v1/backup", auth: true, credentialCapture: capture,
+                                      receiveBackupData: { responseBytes = $0 })
+        guard isCurrent(capture), isSignedIn, account?.id == capturedAccount.id else {
+            throw VortxAccountBackupFile.Failure.sessionChanged
+        }
+        if code == 404 { throw VortxAccountBackupFile.Failure.noBackup }
+        guard code == 200 else { throw VortxAccountBackupFile.Failure.unavailable }
+        guard let responseBytes else {
+            throw VortxAccountBackupFile.Failure.damaged
+        }
+        return try VortxAccountBackupFile.encodeServerResponse(responseBytes, username: capturedAccount.username)
     }
 
     /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and
