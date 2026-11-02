@@ -677,6 +677,89 @@ jobs:
             VORTX_FFI_LIBRARY="$PWD/vortx-core/target/aarch64-apple-darwin/release/libvortx_ffi.dylib" \
             bash scripts/test-native-cutover-live-abi.sh
 
+      # BEGIN protected account backup ABI gates
+      # Historical recovery may omit this feature, but a recovery containing either
+      # production file must pass both tests just like the normal source.
+      - name: Verify account backup repair and file service against the packaged SDK
+        id: account_backup_abi
+        timeout-minutes: 15
+        env:
+          RECOVERY_SOURCE: ${{ inputs.recovery_source_commit }}
+          RECOVERY_OUTCOME: ${{ steps.recovery.outcome }}
+          ADMITTED_SOURCE: ${{ steps.recovery.outputs.source_sha }}
+          EXPECTED_NATIVE_REVISION: ${{ steps.native_source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def requires_gates(recovery, outcome, admitted, source, actual, present):
+              if not re.fullmatch(r'[0-9a-f]{40}', source) or actual != source:
+                  raise ValueError('Source identity mismatch')
+              if not recovery:
+                  return True
+              if outcome != 'success' or recovery != source or admitted != source:
+                  raise ValueError('Recovery source was not admitted')
+              return present
+
+          root = Path.cwd()
+          source = os.environ['BUILD_SOURCE_SHA']
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          paths = ('app/SourcesShared/VortxAccountBackupRepair.swift',
+                   'app/SourcesShared/VortxAccountFileRepairService.swift')
+          present = {name: ((root / name).exists() or (root / name).is_symlink() or
+                           subprocess.run(['git', 'cat-file', '-e', 'HEAD:' + name],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+                     for name in paths}
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'account-backup-abi-evidence'
+          evidence.mkdir(exist_ok=True)
+          required = requires_gates(os.environ['RECOVERY_SOURCE'], os.environ['RECOVERY_OUTCOME'],
+                                    os.environ['ADMITTED_SOURCE'], source, actual, any(present.values()))
+          record = {'schemaVersion': 1, 'sourceCommit': source, 'featureFilesPresent': present,
+                    'required': required,
+                    'reason': 'feature_gates_required' if required else 'admitted_historical_source_without_feature'}
+          (evidence / 'eligibility.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+          if not required:
+              print('Account backup gates: admitted historical source contains neither feature file')
+              raise SystemExit(0)
+          # Missing scripts are failures; no optional invocation or fallback is allowed.
+          raise SystemExit(subprocess.run(['python3', 'scripts/run-protected-account-backup-abi.py']).returncode)
+          PYCODE
+
+      - name: Record account backup ABI gate outcome
+        if: ${{ always() && steps.account_backup_abi.outcome != 'skipped' }}
+        env:
+          ACCOUNT_BACKUP_ABI_OUTCOME: ${{ steps.account_backup_abi.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import json
+          import os
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'account-backup-abi-evidence'
+          evidence.mkdir(exist_ok=True)
+          record = {'schemaVersion': 1, 'stepOutcome': os.environ['ACCOUNT_BACKUP_ABI_OUTCOME'],
+                    'sourceCommit': os.environ['BUILD_SOURCE_SHA'], 'workflowCommit': os.environ['GITHUB_SHA'],
+                    'runID': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT']}
+          (evidence / 'workflow-step.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+          PYCODE
+
+      # Separate evidence only. Never add raw logs or generated sources to public
+      # artifacts, and never expand the immutable app/feed/release asset lists.
+      - name: Retain account backup ABI evidence
+        if: ${{ always() && steps.account_backup_abi.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-account-backup-abi-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/account-backup-abi-evidence/*.json
+          if-no-files-found: error
+          retention-days: 14
+      # END protected account backup ABI gates
+
       # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
       # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
       # fetches the subtitle fonts. Beta 9's release run failed without this: SwiftPM reported "does not contain a
