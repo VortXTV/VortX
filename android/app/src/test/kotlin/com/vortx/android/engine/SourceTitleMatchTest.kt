@@ -2,6 +2,9 @@ package com.vortx.android.engine
 
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.profile.PlaybackPrefs
+import com.vortx.android.sources.SourcePrefsSnapshot
+import com.vortx.android.sync.VortXSyncDoc
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -66,6 +69,62 @@ class SourceTitleMatchTest {
         assertEquals(null, SourceTitleMatchThreshold.admitted(65))
         assertEquals(2019, SourceTitleMatch.year("2019-2023"))
         assertEquals(null, SourceTitleMatch.year("123456"))
+    }
+
+    @Test
+    fun `fallback runs after ordinary source admission and never restores denied rows`() {
+        val target = SourceTitleMatch.Target("The Bear", season = 2, episode = 3)
+        val matchingDenied = stream("matching-denied", filename = "The.Bear.S02E03.2160p.mkv")
+        val mismatchAllowed = stream("mismatch-allowed", filename = "Severance.S02E03.1080p.mkv")
+        val unnamedAllowed = stream("unnamed", title = "Debridio 1080p")
+        fun assembled(streams: List<StreamSource>, threshold: Int) = SourceListModel.assemble(
+            raw = listOf(StreamGroup("Fixture", streams)), torboxStreams = emptyList(),
+            singularityStreams = emptyList(), communityJsGroups = emptyList(), mediaServerGroups = emptyList(),
+            ctx = SourceListModel.Context(prefs = SourcePrefsSnapshot.DEFAULT.copy(excludeTerms = listOf("2160p")),
+                titleMatch = target, titleMatchThreshold = threshold),
+        ).groups.flatMap { it.streams }.map { it.id }
+        assertEquals(listOf("mismatch-allowed"), assembled(listOf(matchingDenied, mismatchAllowed), 70))
+        assertEquals(emptyList<String>(), assembled(listOf(matchingDenied), 70))
+        assertEquals(listOf("unnamed"), assembled(listOf(matchingDenied, mismatchAllowed, unnamedAllowed), 70))
+        assertEquals(listOf("mismatch-allowed"), assembled(listOf(matchingDenied, mismatchAllowed), 0))
+    }
+
+    @Test
+    fun `shared immediate and prepared display policy uses the captured target and all admission guards`() {
+        val directNext = stream("next", filename = "The.Bear.S02E04.1080p.mkv").copy(url = "https://fixture.invalid/next")
+        val directMounted = stream("mounted", filename = "The.Bear.S02E03.1080p.mkv").copy(url = "https://fixture.invalid/mounted")
+        val deniedNext = stream("denied-next", filename = "The.Bear.S02E04.2160p.mkv").copy(url = "https://fixture.invalid/denied")
+        val rawNext = stream("raw-next", filename = "The.Bear.S02E04.1080p.mkv")
+            .copy(isTorrent = true, infoHash = "a".repeat(40))
+        val unknown = stream("unknown", title = "Debridio 1080p").copy(url = "https://fixture.invalid/unknown")
+        val context = SourceListModel.Context(
+            prefs = SourcePrefsSnapshot.DEFAULT.copy(excludeTerms = listOf("2160p")), directLinksOnly = true,
+            titleMatch = SourceTitleMatch.Target("The Bear", season = 2, episode = 4), titleMatchThreshold = 70,
+        )
+        fun shown(streams: List<StreamSource>, ctx: SourceListModel.Context = context) =
+            SourceListModel.displayGroups(listOf(StreamGroup("Fixture", streams)), ctx)
+                .flatMap { it.streams }.map { it.id }
+        assertEquals(listOf("next", "unknown"), shown(listOf(directMounted, deniedNext, rawNext, directNext, unknown)))
+        assertEquals(listOf("mounted"), shown(listOf(directMounted, deniedNext, rawNext)))
+        assertEquals(emptyList<String>(), shown(listOf(deniedNext, rawNext)))
+        assertEquals(listOf("mounted", "next", "unknown"),
+            shown(listOf(directMounted, deniedNext, rawNext, directNext, unknown), context.copy(titleMatch = null)))
+    }
+
+    @Test
+    fun `raw sync and profile thresholds do not coerce fractions strings booleans or overflow`() {
+        for (unknown in listOf<Any>(true, false, 70.5, "70", 65, 4294967366L)) {
+            val objectValue = JSONObject().put("titleMatchThreshold", unknown)
+            assertEquals(null, SourceTitleMatchThreshold.admitted(unknown))
+            assertEquals(null, PlaybackPrefs.decode(objectValue).titleMatchThreshold)
+            assertEquals(null, VortXSyncDoc.playbackFromSummary(objectValue).titleMatchThreshold)
+        }
+        for (offered in listOf<Any>(0, 50, 70L, 90.0)) {
+            val objectValue = JSONObject().put("titleMatchThreshold", offered)
+            val expected = (offered as Number).toInt()
+            assertEquals(expected, PlaybackPrefs.decode(objectValue).titleMatchThreshold)
+            assertEquals(expected, VortXSyncDoc.playbackFromSummary(objectValue).titleMatchThreshold)
+        }
     }
 
     private fun stream(id: String, filename: String? = null, title: String = id) =

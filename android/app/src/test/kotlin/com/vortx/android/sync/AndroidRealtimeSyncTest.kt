@@ -57,7 +57,13 @@ class AndroidRealtimeSyncTest {
         var host: JSONObject? = null
         var applyGate: CompletableDeferred<Unit>? = null
         var applyEntered: CompletableDeferred<Unit>? = null
-        override fun retire() {}
+        var provideUploadComposer = true
+        private var appliedRead: NativeAccountReadCapture? = null
+        private var appliedRaw: ByteArray? = null
+        override fun retire() {
+            appliedRead = null; appliedRaw?.fill(0); appliedRaw = null
+            mount = Any()
+        }
         override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
             object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
         private fun currency(original: NativeAccountUploadCurrency.Origin): NativeAccountUploadCurrency {
@@ -82,13 +88,46 @@ class AndroidRealtimeSyncTest {
             originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
             action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
             val currency = currency(original)
-            val exported = exportDocument(account) ?: return null
-            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, currentMountToken(account), null, null, currency) }
+            return currency.withCurrentSession {
+                if (!isCurrent()) return@withCurrentSession null
+                check(account == source.account && appliedRead?.sameObservation(source) == true) {
+                    "Original synthetic upload read changed"
+                }
+                check(appliedRaw?.contentEquals(originalRaw) == true) { "Synthetic upload bytes changed" }
+                val exported = exportDocument(account) ?: return@withCurrentSession null
+                var active = true
+                // This test collaborator has synthetic facts, not a JNI checkpoint. Explicitly issue
+                // its synchronous composer after the actual manager GET/apply; do not label a DTO
+                // rawAccount or relax the production generic-source conservation guard.
+                val compose: ((JSONObject) -> ByteArray)? = if (!provideUploadComposer) null else { providers ->
+                    check(active && isCurrent() && currency.isCurrent()) { "Synthetic upload export expired" }
+                    val replacements = linkedMapOf("nativeSync" to exported.nativeSync.toString().toByteArray(Charsets.UTF_8))
+                    exported.hostPreferences?.let { replacements["nativeHostPreferences"] = it.toString().toByteArray(Charsets.UTF_8) }
+                    for (field in listOf("nativeProviderCredentials", "apiKeys")) {
+                        providers.optJSONObject(field)?.let { replacements[field] = it.toString().toByteArray(Charsets.UTF_8) }
+                    }
+                    com.vortx.android.engine.NativeOwnerHistoryAccount(originalRaw)
+                        .replacingOwned(replacements).validateBudget(writeV2 = true)
+                }
+                try { action(exported, currentMountToken(account), compose, null, currency) }
+                finally { active = false }
+            }
         }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) =
             if (reopenFails || !provideMountToken) null else NativeAccountMountToken(mount, mountRevision)
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
             reopens++; check(isCurrent()); reopenError?.let { throw it }; if (reopenFails) error("checkpoint unavailable"); return true
+        }
+        override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, captured: NativeAccountReadCapture,
+            isCurrent: () -> Boolean): Boolean {
+            val raw = captured.copyRawForApply(account)
+            var retained = false
+            try {
+                if (!super<NativeAccountGateway>.applyRawDocument(account, captured, isCurrent) || !isCurrent()) return false
+                appliedRaw?.fill(0); appliedRaw = raw; appliedRead = captured
+                retained = true
+                return true
+            } finally { if (!retained) raw.fill(0) }
         }
         override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean {
             applied++; applyEntered?.complete(Unit); applyGate?.await()
@@ -214,7 +253,7 @@ class AndroidRealtimeSyncTest {
             check(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
             check(manager.currentSession() == null)
         }
-        suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); NativeProviderAccess.unbindForTest() }
+        suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); gateway.retire(); NativeProviderAccess.unbindForTest() }
     }
 
     private fun test(block: suspend TestScope.() -> Unit) = runTest {
@@ -549,6 +588,49 @@ class AndroidRealtimeSyncTest {
             assertTrue(f.routinePull()); assertNull(f.validators.last())
             assertTrue(f.routinePull()); assertNull(f.validators.last())
         } finally { f.close() }
+    }
+
+    @Test fun `generic fixture without issued composer cannot PUT or acknowledge pending edits`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.gateway.provideUploadComposer = false
+            f.settingsDirty(JSONObject().put("vortx.player.matchFrameRate", 120.0))
+            val retainedCloud = f.cloud.toString()
+            f.edit("retained-local")
+            runCurrent(); advanceTimeBy(2_501); runCurrent()
+            assertTrue(f.gateway.exports > 0)
+            assertEquals(0, f.puts); assertTrue(f.dirty()); assertEquals(10L, f.manager.lastAppliedVersion())
+            assertEquals(120.0, f.settingsDirty().getDouble("vortx.player.matchFrameRate"), 0.0)
+            assertEquals(retainedCloud, f.cloud.toString())
+            assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("retained-local"))
+        } finally { f.close() }
+    }
+
+    @Test fun `synthetic upload composer requires the exact applied observation bytes and scope`() = test {
+        val gateway = Gateway()
+        val principal = SessionOwnerSnapshot.Account(account.id, 1)
+        val raw = document().toString().toByteArray(Charsets.UTF_8)
+        fun read() = NativeAccountReadCapture.fromAuthenticatedPull(principal, 1, account.id, 1, 10, raw)
+        val first = read(); val other = read()
+        val original = gateway.captureUploadOrigin(principal) { true }
+        var escaped: ((JSONObject) -> ByteArray)? = null
+        try {
+            assertTrue(gateway.applyRawDocument(principal, first) { true })
+            assertTrue(runCatching { gateway.withUploadExport(principal, other, raw, original, { true }) {
+                _, _, _, _, _ -> fail("Unapplied observation admitted")
+            } }.exceptionOrNull() is IllegalStateException)
+            assertTrue(runCatching { gateway.withUploadExport(principal, first, raw + byteArrayOf(32), original, { true }) {
+                _, _, _, _, _ -> fail("Different source bytes admitted")
+            } }.exceptionOrNull() is IllegalStateException)
+            gateway.withUploadExport(principal, first, raw, original, { true }) { _, _, compose, _, _ ->
+                val composer = requireNotNull(compose)
+                escaped = composer
+                val candidate = composer(JSONObject())
+                try { assertEquals("preserved", JSONObject(String(candidate, Charsets.UTF_8)).getString("foreign")) }
+                finally { candidate.fill(0) }
+            }
+            assertTrue(runCatching { requireNotNull(escaped)(JSONObject()) }.exceptionOrNull() is IllegalStateException)
+        } finally { first.retire(); other.retire(); gateway.retire(); raw.fill(0) }
     }
 
     @Test fun `continuous progress does not postpone upload and PUT edit survives exact ACK`() = test {

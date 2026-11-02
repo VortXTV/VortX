@@ -546,11 +546,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                     return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
                 }
             }
-            assembled = StreamRanking.titleMatched(assembled, target: ctx.titleMatch, threshold: ctx.titleMatchThreshold)
             let (ranked, rankedBest, rankedTiers, rankedResOpts) =
                 StreamRanking.capturedPresentation(assembled, preferences: workerPreferences,
                     continuity: ctx.continuity, pin: ctx.pin, sticky: sticky,
-                    providerPenalty: providerPenalty, debridCachedHashes: cachedHashes)
+                    providerPenalty: providerPenalty, debridCachedHashes: cachedHashes,
+                    titleMatch: ctx.titleMatch, titleMatchThreshold: ctx.titleMatchThreshold)
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
             let quickFilterIndex = SourceQuickFilterPolicy.Index(groups: ranked, previous: previousQuickFilterIndex,
                 reportedTags: StreamRanking.flavorTags)

@@ -1164,16 +1164,17 @@ enum StreamRanking {
                                      continuity hint: String?, pin: ResolvedPin?,
                                      sticky: (addon: String?, bingeGroup: String?)?,
                                      providerPenalty: (@Sendable (String) -> Bool)?,
-                                     debridCachedHashes: Set<String>)
+                                     debridCachedHashes: Set<String>,
+                                     titleMatch: SourceTitleMatch.Target? = nil, titleMatchThreshold: Int = 0)
         -> ([CoreStreamSourceGroup], CoreStream?, [String], [(label: String, stream: CoreStream)]) {
         let prefs = preferences.source
         let audio = canonicalAudioLanguagePreference(preferences.audioLanguages)
         let scorePreferences = ScorePreferences(prefs)
-        let groups: [CoreStreamSourceGroup]
+        let admitted: [CoreStreamSourceGroup]
         let playableInput = stripNonVideo(input)
-        if prefs.noFiltersActive && !preferences.isKids { groups = playableInput }
+        if prefs.noFiltersActive && !preferences.isKids { admitted = playableInput }
         else {
-            groups = playableInput.compactMap { group in
+            admitted = playableInput.compactMap { group in
                 let kept = group.streams.filter {
                     passesUserFilters($0, debridCachedHashes: debridCachedHashes,
                         preferences: prefs, preferredAudioLanguages: Set(audio), kids: preferences.isKids)
@@ -1181,6 +1182,8 @@ enum StreamRanking {
                 return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)
             }
         }
+        // The optional fallback can restore only rows admitted by all ordinary/parental filters.
+        let groups = titleMatched(admitted, target: titleMatch, threshold: titleMatchThreshold)
         let ranked: [CoreStreamSourceGroup]
         if prefs.useAddonOrder { ranked = groups }
         else {

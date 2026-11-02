@@ -76,6 +76,12 @@ enum SourceTitleMatchTests {
               && SourceTitleMatch.admittedThreshold(nil) == nil,
               "only an offered threshold is admitted from storage or sync")
 
+        for unknown in [true, false, 70.5, "70", NSNumber(value: Double.infinity), 65, 4294967366 as Int64] as [Any] {
+            check(SourceTitleMatch.admittedThreshold(unknown) == nil, "unoffered or coerced raw threshold is ignored: \(unknown)")
+        }
+        check(SourceTitleMatch.admittedThreshold(NSNumber(value: 70.0)) == 70,
+              "an exact integral JSON number remains an offered threshold")
+
         print("release year")
         check(SourceTitleMatch.year(from: "2021") == 2021, "a plain year")
         check(SourceTitleMatch.year(from: "2019-2023") == 2019, "the first year of a range")

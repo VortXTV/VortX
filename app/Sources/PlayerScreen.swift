@@ -11348,12 +11348,16 @@ struct PlayerScreen: View {
             if audioDelay != 0 { rs.append(Row(label: String(localized: "Reset sync")) { adjustAudioDelay(-audioDelay) }) }
             // Output mode, mirrored from Settings so it's reachable mid-playback (the "no passthrough
             // in the player" report). Applies live; mpv re-opens the audio output on the change.
-            let mode = AudioOutputMode.current
-            rs.append(Row(label: String(localized: "Output"), isHeader: true))
-            for m in AudioOutputMode.allCases {
-                rs.append(Row(label: m.label, selected: m == mode) {
-                    coordinator.player?.setAudioOutputMode(m)
-                })
+            if coordinator.player is MPVMetalViewController {
+                let mode = AudioOutputMode.current
+                rs.append(Row(label: String(localized: "Output"), isHeader: true))
+                for m in AudioOutputMode.allCases {
+                    rs.append(Row(label: m.label, selected: m == mode) {
+                        coordinator.player?.setAudioOutputMode(m)
+                    })
+                }
+            } else {
+                rs.append(Row(label: String(localized: "Audio output is managed by the system"), isHeader: true))
             }
             rs.append(contentsOf: audioPresetRows)
             return rs
@@ -11427,7 +11431,7 @@ struct PlayerScreen: View {
             }
             // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
             // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
-            if !isAVPlayerActive {
+            if coordinator.player is MPVMetalViewController {
                 let hw = coordinator.player?.hardwareDecoding ?? true
                 let hardwareDetail = (coordinator.player as? MPVMetalViewController)?
                     .hardwareDecoderSettingDetail ?? "recommended"

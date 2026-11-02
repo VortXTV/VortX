@@ -321,8 +321,7 @@ class SourceListModel(
                 ),
             )
 
-            assembled = directLinkDisplayGroups(assembled, ctx.directLinksOnly)
-            assembled = StreamRanking.titleMatched(assembled, ctx.titleMatch, ctx.titleMatchThreshold)
+            assembled = displayGroups(assembled, ctx)
 
             // Install the frozen snapshot so tiers()/resolutionOptions() (which read the installed reading) and
             // the explicit-prefs rankedGroups()/best() all rank against the SAME frozen copy, never a live
@@ -348,6 +347,14 @@ class SourceListModel(
                 requestGeneration = ctx.requestGeneration,
                 streamId = ctx.streamId,
             )
+        }
+
+        /** One captured display policy for coalesced, immediate and prepared-source paths. */
+        fun displayGroups(groups: List<StreamGroup>, ctx: Context): List<StreamGroup> {
+            val direct = directLinkDisplayGroups(groups, ctx.directLinksOnly)
+            val admitted = StreamRanking.applyUserFilters(direct, ctx.prefs)
+            // Fallback can restore only ordinarily admitted rows, never parental/diagnostic denials.
+            return StreamRanking.titleMatched(admitted, ctx.titleMatch, ctx.titleMatchThreshold)
         }
 
         /**

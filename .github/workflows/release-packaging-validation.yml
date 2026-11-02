@@ -135,6 +135,9 @@ jobs:
           ./gradlew :app:testPlayDebugUnitTest
           -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
           --tests com.vortx.android.sync.AndroidRealtimeSyncTest
+          --tests com.vortx.android.engine.SourceTitleMatchTest
+          --tests com.vortx.android.engine.NativePlaylistTest
+          --tests com.vortx.android.playlists.SavedPlaylistStoreTest
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
           --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
@@ -376,6 +379,44 @@ jobs:
           xcodegen generate --spec .native-ci-project.yml
           ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
+      # LibDovi 2.1.0 ships the real arm64 tvOS simulator provider but omits Intel.
+      # Build only that missing slice from its exact underlying 3.4.0 source, preserving
+      # the other upstream bytes. All original universal/explicit-x86 shell gates remain.
+      - name: Resolve Aether packages into this job's owned directory
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies -project app/VortX.xcodeproj -scheme VortXTVLite \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/aether-packages"
+          test "$(git -C "$RUNNER_TEMP/aether-packages/checkouts/AetherEngine" rev-parse HEAD)" = 4a82484b256deb70a2ae80d6923707d1fe54c6e7
+          test "$(git -C "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" rev-parse HEAD)" = 0d7cce1d6836a30d13a3a2326e50a153af53f014
+
+      - name: Acquire the exact public libdovi source
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/aether-dovi-source"
+          git -C "$RUNNER_TEMP/aether-dovi-source" remote add origin https://github.com/quietvoid/dovi_tool.git
+          git -C "$RUNNER_TEMP/aether-dovi-source" fetch --depth=1 origin d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
+          git -C "$RUNNER_TEMP/aether-dovi-source" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/aether-dovi-source" rev-parse HEAD)" = d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
+
+      - name: Prepare the pinned Rust and cargo-c tools on the hosted runner
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-07-19 --profile minimal --component rust-src
+          cargo +nightly-2026-07-19 install cargo-c --version '0.10.26+cargo-0.100.0' --locked \
+            --jobs 1 --root "$RUNNER_TEMP/aether-cargo-c"
+          echo "$RUNNER_TEMP/aether-cargo-c/bin" >> "$GITHUB_PATH"
+
+      - name: Build and admit the real Intel tvOS simulator provider
+        run: |
+          set -euo pipefail
+          bash scripts/build-aether-dovi-tv-simulator.sh \
+            "$RUNNER_TEMP/aether-dovi-source" "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
+            "$RUNNER_TEMP/aether-dovi-provider" "$RUNNER_TEMP"
+          python3 scripts/aether-dovi-provider.py extend \
+            --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
+            --provider "$RUNNER_TEMP/aether-dovi-provider" --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP"
+
       # Real compile/link/package per platform shell. Signing is disabled outright (no identity,
       # none needed for simulator or unsigned macOS builds). Each produced .app must carry the
       # expected bundle ID and a Mach-O executable whose engine symbols are RESOLVED (defined in
@@ -390,8 +431,10 @@ jobs:
             # Keep code in the executable checked below, not Xcode's Debug preview trampoline/dylib pair.
             xcodebuild -project app/VortX.xcodeproj -scheme "$scheme" \
               -destination "$destination" \
+              -clonedSourcePackagesDirPath "$RUNNER_TEMP/aether-packages" \
+              -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
               -derivedDataPath "$dd" \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ENABLE_DEBUG_DYLIB=NO ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ENABLE_DEBUG_DYLIB=NO LD_GENERATE_MAP_FILE=YES ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
               build
             echo '::endgroup::'
             local products_dir
@@ -426,7 +469,64 @@ jobs:
             if grep -Eq '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; then
               echo "::error::$scheme binary still has unresolved engine symbols"; grep -E '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; exit 1
             fi
-            echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved"
+            local framework_root="$products_dir/Frameworks"
+            if [ -d "$products_dir/Contents/Frameworks" ]; then framework_root="$products_dir/Contents/Frameworks"; fi
+            local aether="$framework_root/VortXAetherKit.framework/VortXAetherKit"
+            [ -f "$aether" ] || { echo "::error::$scheme is missing its real Aether framework"; exit 1; }
+            local aether_undefined aether_dependencies
+            aether_undefined="$(nm -u "$aether")"
+            if grep -Eq '[[:space:]]_dovi_' <<< "$aether_undefined"; then
+              echo "::error::$scheme Aether retains unresolved Dolby Vision provider calls"; exit 1
+            fi
+            aether_dependencies="$(otool -L "$aether")"
+            grep -Fq '@rpath/AetherLibavcodec.framework/' <<< "$aether_dependencies" \
+              || { echo "::error::$scheme Aether lost its isolated dynamic FFmpeg dependency"; exit 1; }
+            if [ "$scheme" = VortXTVLite ]; then
+              if [ "$arch" = x86_64 ]; then xcrun lipo -verify_arch x86_64 "$aether";
+              else xcrun lipo -verify_arch arm64 x86_64 "$aether"; fi
+            fi
+            local framework framework_binary built_arch
+            for framework in AetherLibavcodec AetherLibavfilter AetherLibavformat AetherLibavutil AetherLibdav1d AetherLibswresample AetherLibswscale AetherLibzimg AetherLibzvbi; do
+              framework_binary="$framework_root/$framework.framework/$framework"
+              [ -f "$framework_binary" ] \
+                || { echo "::error::$scheme is missing the $framework binary"; exit 1; }
+              for built_arch in $(xcrun lipo -archs "$aether"); do
+                xcrun lipo -verify_arch "$built_arch" "$framework_binary"
+              done
+            done
+            local evidence="$RUNNER_TEMP/aether-link-evidence/$scheme-${arch:-default}"
+            mkdir -p "$evidence"
+            cp "$aether" "$evidence/VortXAetherKit"
+            printf '%s\n' "$aether_dependencies" > "$evidence/dynamic-dependencies.txt"
+            local link_map map_count=0
+            while IFS= read -r link_map; do
+              grep -Fq 'libdovi.a' "$link_map" \
+                || { echo "::error::Aether link map lacks its admitted Dovi provider"; exit 1; }
+              if grep -Eq 'MPVKit-DVFEL/|Libmpv\.xcframework/|Libavcodec\.xcframework/' "$link_map"; then
+                echo "::error::Aether link map includes the other player native stack"; exit 1
+              fi
+              cp "$link_map" "$evidence/$(basename "$link_map")"
+              map_count=$((map_count + 1))
+            done < <(find "$dd" -type f -name 'VortXAetherKit-LinkMap-*.txt')
+            [ "$map_count" -gt 0 ] || { echo "::error::Aether link map missing"; exit 1; }
+            local processed processed_count=0 dovi_platform
+            case "$destination" in
+              *tvOS*) dovi_platform=tvos-simulator ;;
+              *iOS*) dovi_platform=ios-simulator ;;
+              *) dovi_platform=macos ;;
+            esac
+            while IFS= read -r processed; do
+              python3 scripts/verify-aether-dovi-processed.py --processed "$processed" \
+                --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" \
+                --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP" \
+                --platform "$dovi_platform" --output "$evidence/processed-$processed_count-admission.json"
+              cp "$processed" "$evidence/$(basename "$(dirname "$processed")")-libdovi.a"
+              processed_count=$((processed_count + 1))
+            done < <(find "$dd/Build/Products" -type f -name libdovi.a)
+            [ "$processed_count" -gt 0 ] || { echo "::error::Processed Dovi library missing"; exit 1; }
+            python3 scripts/aether-dovi-provider.py verify-installed \
+              --package "$RUNNER_TEMP/aether-packages/checkouts/LibDovi" --work "$RUNNER_TEMP/aether-dovi-extension" --owned-root "$RUNNER_TEMP"
+            echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved; Aether provider resolved and dynamic FFmpeg embedded"
           }
           # Keep every original gate fail-fast within its isolated shell, but collect all
           # platform failures before the job fails. A Lite error must not hide an iOS/Mac error.
@@ -448,3 +548,21 @@ jobs:
           build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    in-process
           build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    daemon
           [ "$shell_failures" -eq 0 ] || { echo "::error::$shell_failures shell checks failed"; exit 1; }
+
+      - name: Retain the real simulator provider and its complete verification receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Aether-Intel-tvOS-simulator-provider
+          path: |
+            ${{ runner.temp }}/aether-dovi-provider/install
+            ${{ runner.temp }}/aether-dovi-provider/*.json
+            ${{ runner.temp }}/aether-dovi-provider/*.txt
+            ${{ runner.temp }}/aether-dovi-provider/*.log
+            ${{ runner.temp }}/aether-dovi-provider/probe.c
+            ${{ runner.temp }}/aether-dovi-provider/probe.o
+            ${{ runner.temp }}/aether-dovi-provider/probe.dylib
+            ${{ runner.temp }}/aether-dovi-extension/extension-receipt.json
+            ${{ runner.temp }}/aether-link-evidence
+            app/VortX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          if-no-files-found: warn

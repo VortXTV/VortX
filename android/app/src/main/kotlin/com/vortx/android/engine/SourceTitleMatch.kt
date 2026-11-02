@@ -1,6 +1,7 @@
 package com.vortx.android.engine
 
 import java.text.Normalizer
+import java.math.BigDecimal
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -37,7 +38,7 @@ object SourceTitleMatch {
 
     /** True when the stream should stay listed at [threshold] percent. */
     fun passes(texts: List<String?>, target: Target, threshold: Int): Boolean {
-        if (threshold <= 0) return true
+        if (threshold !in thresholds || threshold <= 0) return true
         val score = score(texts, target) ?: return true
         return score >= threshold
     }
@@ -55,7 +56,11 @@ object SourceTitleMatch {
     }
 
     private fun releaseScore(line: String, wanted: List<String>, target: Target): Int? {
-        val words = tokens(normalized(line))
+        // Preserve explicit episode ranges before punctuation becomes token separators.
+        // S01E01-E03 (or S01E01-03) covers episodes 1..3, not only episode 1.
+        val ranged = Regex("(?i)(s[0-9]+e[0-9]+)-e?([0-9]+)(?![0-9])")
+            .replace(line, "${'$'}1e${'$'}2")
+        val words = tokens(normalized(ranged))
         if (words.size < 2) return null
         val markers = words.indices.mapNotNull { index ->
             marker(words[index], words.getOrNull(index + 1))?.let { index to it }
@@ -165,5 +170,9 @@ object SourceTitleMatch {
 
 /** A stored or synced threshold the setting offers, else null (an unknown value never filters). */
 object SourceTitleMatchThreshold {
-    fun admitted(value: Int?): Int? = value?.takeIf { it in SourceTitleMatch.thresholds }
+    fun admitted(value: Any?): Int? {
+        if (value !is Number) return null
+        val integer = runCatching { BigDecimal(value.toString()).intValueExact() }.getOrNull() ?: return null
+        return integer.takeIf { it in SourceTitleMatch.thresholds }
+    }
 }

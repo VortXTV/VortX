@@ -1326,7 +1326,7 @@ final class ProfileStore: ObservableObject {
             keywordsAreRegex: d["keywordsAreRegex"] as? Bool ?? base?.keywordsAreRegex,
             maxResolution: gatedMaxResolution(d["maxResolution"] as? Int) ?? base?.maxResolution,
             maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB,
-            titleMatchThreshold: SourceTitleMatch.admittedThreshold(d["titleMatchThreshold"] as? Int) ?? base?.titleMatchThreshold,
+            titleMatchThreshold: SourceTitleMatch.admittedThreshold(d["titleMatchThreshold"]) ?? base?.titleMatchThreshold,
             minResolution: gatedMinResolution(d["minResolution"] as? Int) ?? base?.minResolution,
             hideUnknownResolution: d["hideUnknownResolution"] as? Bool ?? base?.hideUnknownResolution,
             preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly,

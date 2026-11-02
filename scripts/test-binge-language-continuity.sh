@@ -21,6 +21,7 @@ nice -n 15 xcrun swiftc -j 1 -num-threads 1 -whole-module-optimization -parse-as
   app/Sources/Player/AudioLanguagePolicy.swift \
   app/SourcesShared/RankingMemo.swift \
   app/SourcesShared/StreamRanking.swift \
+  app/SourcesShared/SourceTitleMatch.swift \
   app/Tests/BingeSourceMemoryRaceContractTests.swift -o "$binge_test_dir/ranking"
 "$binge_test_dir/ranking"
 nice -n 15 xcrun swiftc -frontend -parse -num-threads 1 \

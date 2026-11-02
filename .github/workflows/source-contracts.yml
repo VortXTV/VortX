@@ -27,6 +27,13 @@ on:
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-source-title-match.sh"
+      - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/build-aether-dovi-tv-simulator.sh"
+      - "scripts/aether-dovi-provider.py"
+      - "scripts/verify-aether-dovi-processed.py"
+      - "scripts/tests/test_aether_dovi_provider.py"
+      - "test/fixtures/source-title-match.json"
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
@@ -51,6 +58,7 @@ on:
       - "scripts/test-addon-stream-publication.sh"
       - "scripts/test-native-preference-acknowledgement.sh"
       - "scripts/test-binge-language-continuity.sh"
+      - "scripts/test-ranking-cache-concurrency.sh"
       - "test/mpv-bounded-child.mjs"
       - "test/cw-worker-currentness.mjs"
       - "test/cw-profile-fixture.cjs"
@@ -113,6 +121,13 @@ on:
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-source-title-match.sh"
+      - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/build-aether-dovi-tv-simulator.sh"
+      - "scripts/aether-dovi-provider.py"
+      - "scripts/verify-aether-dovi-processed.py"
+      - "scripts/tests/test_aether_dovi_provider.py"
+      - "test/fixtures/source-title-match.json"
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
@@ -137,6 +152,7 @@ on:
       - "scripts/test-addon-stream-publication.sh"
       - "scripts/test-native-preference-acknowledgement.sh"
       - "scripts/test-binge-language-continuity.sh"
+      - "scripts/test-ranking-cache-concurrency.sh"
       - "test/mpv-bounded-child.mjs"
       - "test/cw-worker-currentness.mjs"
       - "test/cw-profile-fixture.cjs"
@@ -243,6 +259,8 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_builder_startup.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/tests/test_aether_dovi_provider.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_apple_package.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_release_native_snapshot_argv.py
@@ -321,6 +339,14 @@ jobs:
       - run: bash scripts/test-native-preference-acknowledgement.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-apple-parity-contracts.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-source-title-match.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-ranking-cache-concurrency.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-binge-language-continuity.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-aether-playback-boundary.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node test/native-callback-generation.mjs
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

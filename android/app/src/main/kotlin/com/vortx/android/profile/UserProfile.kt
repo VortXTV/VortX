@@ -316,7 +316,7 @@ data class PlaybackPrefs(
             includeKeywords = o.optStringOrNull("includeKeywords"),
             keywordsAreRegex = o.optBooleanOrNull("keywordsAreRegex"),
             maxResolution = o.optIntOrNull("maxResolution"),
-            titleMatchThreshold = SourceTitleMatchThreshold.admitted(o.optIntOrNull("titleMatchThreshold")),
+            titleMatchThreshold = SourceTitleMatchThreshold.admitted(o.opt("titleMatchThreshold")),
             maxFileSizeGB = o.optDoubleOrNull("maxFileSizeGB"),
             minResolution = o.optIntOrNull("minResolution"),
             hideUnknownResolution = o.optBooleanOrNull("hideUnknownResolution"),

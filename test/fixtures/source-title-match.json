@@ -12,12 +12,17 @@
     {"case": "a pack of another season", "title": "The Bear", "season": 2, "episode": 3, "texts": ["The.Bear.S01.COMPLETE.1080p.WEB"], "expected": 0},
     {"case": "season-by-episode numbering", "title": "The Bear", "season": 2, "episode": 3, "texts": ["the bear 2x03 720p hdtv"], "expected": 100},
     {"case": "a multi-episode file covering the episode", "title": "Severance", "season": 1, "episode": 2, "texts": ["Severance.S01E01E02.2160p.mkv"], "expected": 100},
+    {"case": "hyphenated episode range includes an interior episode", "title": "Severance", "season": 1, "episode": 2, "texts": ["Severance.S01E01-E03.2160p.mkv"], "expected": 100},
+    {"case": "hyphenated episode range includes its last episode", "title": "Severance", "season": 1, "episode": 3, "texts": ["Severance.S01E01-E03.2160p.mkv"], "expected": 100},
+    {"case": "hyphenated episode range excludes another episode", "title": "Severance", "season": 1, "episode": 4, "texts": ["Severance.S01E01-E03.2160p.mkv"], "expected": 0},
+    {"case": "episode range without repeated e includes an interior episode", "title": "Severance", "season": 1, "episode": 2, "texts": ["Severance.S01E01-03.2160p.mkv"], "expected": 100},
     {"case": "accents fold", "title": "Amélie", "year": 2001, "texts": ["Amelie.2001.1080p.BluRay.mkv"], "expected": 100},
     {"case": "an ampersand reads as and", "title": "Law & Order", "season": 1, "episode": 1, "texts": ["Law.and.Order.S01E01.480p.mkv"], "expected": 100},
     {"case": "the best release among several texts wins", "title": "Arrival", "year": 2016, "texts": ["Torrentio\n4k", "Arrival 2016 2160p UHD BluRay\nSeeds 40"], "expected": 100},
     {"case": "a partly matching title scores between", "title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "texts": ["The.Lord.of.the.Rings.2001.1080p.mkv"], "expected": 67}
   ],
   "passes": [
+    {"case": "an unsupported threshold keeps everything", "title": "Arrival", "year": 2016, "texts": ["Interstellar.2014.1080p.mkv"], "threshold": 65, "expected": true},
     {"case": "off keeps everything", "title": "Arrival", "year": 2016, "texts": ["Interstellar.2014.1080p.mkv"], "threshold": 0, "expected": true},
     {"case": "below the threshold is hidden", "title": "Dune", "year": 2021, "texts": ["Dune.Part.Two.2024.1080p.BluRay.mkv"], "threshold": 50, "expected": false},
     {"case": "at the threshold is kept", "title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "texts": ["The.Lord.of.the.Rings.2001.1080p.mkv"], "threshold": 50, "expected": true},

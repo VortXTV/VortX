@@ -9,6 +9,7 @@ ranking_phase=source-conservation
 ranking_inputs=(
   "$ranking_root/app/SourcesShared/RankingMemo.swift"
   "$ranking_root/app/SourcesShared/StreamRanking.swift"
+  "$ranking_root/app/SourcesShared/SourceTitleMatch.swift"
   "$ranking_root/app/SourcesShared/SourcePreferences.swift"
   "$ranking_root/app/SourcesShared/SourcePin.swift"
   "$ranking_root/app/SourcesShared/CoreModels.swift"
@@ -61,6 +62,7 @@ ranking_phase=strict-swift6-compile
   "$ranking_out/Fixtures.swift" \
   "$ranking_root/app/SourcesShared/RankingMemo.swift" \
   "$ranking_root/app/SourcesShared/StreamRanking.swift" \
+  "$ranking_root/app/SourcesShared/SourceTitleMatch.swift" \
   "$ranking_root/app/SourcesShared/UsenetStreamValidation.swift" \
   "$ranking_root/app/SourcesShared/SourceSettlementPolicy.swift" \
   "$ranking_root/app/Sources/Player/AudioLanguagePolicy.swift" \

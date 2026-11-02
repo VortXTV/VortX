@@ -514,9 +514,7 @@ object VortXSyncDoc {
         includeKeywords = p.optStringOrNull("includeKeywords"),
         keywordsAreRegex = if (p.has("keywordsAreRegex")) p.optBoolean("keywordsAreRegex") else null,
         maxResolution = if (p.has("maxResolution")) p.optInt("maxResolution") else null,
-        titleMatchThreshold = if (p.has("titleMatchThreshold")) {
-            com.vortx.android.engine.SourceTitleMatchThreshold.admitted(p.optInt("titleMatchThreshold"))
-        } else null,
+        titleMatchThreshold = com.vortx.android.engine.SourceTitleMatchThreshold.admitted(p.opt("titleMatchThreshold")),
         maxFileSizeGB = if (p.has("maxFileSizeGB")) p.optDouble("maxFileSizeGB") else null,
         minResolution = if (p.has("minResolution")) p.optInt("minResolution") else null,
         hideUnknownResolution = if (p.has("hideUnknownResolution")) p.optBoolean("hideUnknownResolution") else null,

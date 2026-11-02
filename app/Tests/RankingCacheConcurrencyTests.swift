@@ -44,6 +44,25 @@ private func require(_ condition: @autoclosure () -> Bool, _ name: String) {
     static func main() async throws {
         let base = try stream(#"{"url":"https://fixture.invalid/movie","name":"Film 2026 1080p WEB English"}"#)
         let plain = prefs(), preferred = prefs(prefer: ["web"])
+        let matchingDenied = try stream(#"{"url":"https://fixture.invalid/denied","name":"The.Bear.S02E03.2160p.mkv"}"#)
+        let mismatchAllowed = try stream(#"{"url":"https://fixture.invalid/allowed","name":"Severance.S02E03.1080p.mkv"}"#)
+        let unnamedAllowed = try stream(#"{"url":"https://fixture.invalid/unnamed","name":"Debridio 1080p"}"#)
+        let titleTarget = SourceTitleMatch.Target(title: "The Bear", season: 2, episode: 3)
+        let admission = StreamRanking.WorkerPreferences(source: prefs(avoid: ["2160p"]), audioLanguages: [], isKids: false)
+        func presented(_ streams: [CoreStream], threshold: Int = 70) -> [CoreStream] {
+            let groups = [CoreStreamSourceGroup(id: "fixture", addon: "Fixture", streams: streams)]
+            return StreamRanking.capturedPresentation(groups, preferences: admission,
+                continuity: nil, pin: nil, sticky: nil, providerPenalty: nil, debridCachedHashes: [],
+                titleMatch: titleTarget, titleMatchThreshold: threshold).0.flatMap(\.streams)
+        }
+        require(presented([matchingDenied, mismatchAllowed]).map(\.url) == [mismatchAllowed.url],
+                "actual captured ranker restores the ordinarily admitted mismatch when only matching rows are denied")
+        require(presented([matchingDenied]).isEmpty,
+                "title fallback never restores a row excluded by ordinary admission")
+        require(presented([matchingDenied, mismatchAllowed, unnamedAllowed]).map(\.url) == [unnamedAllowed.url],
+                "unknown release remains while denied matching and judged mismatching rows stay excluded")
+        require(presented([matchingDenied, mismatchAllowed], threshold: 0).map(\.url) == [mismatchAllowed.url],
+                "off preserves ordinary source admission")
         let baseline = score(base, plain)
         // Task.detached does not inherit the caller's task locals. Install the captured
         // snapshot inside its synchronous scope, then verify nested and final restoration.

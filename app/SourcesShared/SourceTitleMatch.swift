@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 /// How well a stream's release name matches the title being opened, for the optional title-match source
 /// filter (#172). Pure and stateless so it compiles on every target and in standalone tests; the Android twin
@@ -41,8 +42,11 @@ enum SourceTitleMatch {
     }
 
     /// A synced or stored threshold the setting offers, else nil (an unknown value never filters).
-    static func admittedThreshold(_ value: Int?) -> Int? {
-        value.flatMap { thresholds.contains($0) ? $0 : nil }
+    static func admittedThreshold(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, let integer = Int(exactly: number.doubleValue),
+              thresholds.contains(integer) else { return nil }
+        return integer
     }
 
     /// 0...100, or nil when none of the texts names a release to compare. The best-scoring release wins.
@@ -58,7 +62,8 @@ enum SourceTitleMatch {
 
     /// True when the stream should stay listed at `threshold` percent.
     static func passes(texts: [String?], target: Target, threshold: Int) -> Bool {
-        guard threshold > 0, let score = score(texts: texts, target: target) else { return true }
+        guard admittedThreshold(threshold) != nil, threshold > 0,
+              let score = score(texts: texts, target: target) else { return true }
         return score >= threshold
     }
 
@@ -77,7 +82,11 @@ enum SourceTitleMatch {
     }
 
     private static func releaseScore(_ line: String, wanted: [String], target: Target) -> Int? {
-        let words = tokens(normalized(line))
+        // Keep an explicit episode range together before punctuation becomes token separators.
+        // S01E01-E03 (or S01E01-03) covers episodes 1...3, not only episode 1.
+        let ranged = line.replacingOccurrences(of: #"(?i)(s[0-9]+e[0-9]+)-e?([0-9]+)(?![0-9])"#,
+                                               with: "$1e$2", options: .regularExpression)
+        let words = tokens(normalized(ranged))
         guard words.count >= 2 else { return nil }
         let markers = words.indices.compactMap { index in
             marker(words[index], next: index + 1 < words.count ? words[index + 1] : nil).map { (index, $0) }

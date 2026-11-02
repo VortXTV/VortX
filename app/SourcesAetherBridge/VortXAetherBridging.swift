@@ -71,7 +71,7 @@ public protocol VortXAetherBridging: NSObjectProtocol {
     /// Opens a source. `startPosition` nil starts at the beginning; `autoplay` false holds the session paused
     /// until `play()`. The completion runs once, with nil on success, or an error in
     /// `VortXAetherBridgeErrorDomain` (`cancelled` when a newer load, `cancelLoad()` or `stop()` replaced it).
-    func load(url: URL, headers: [String: String]?, startPosition: NSNumber?, autoplay: Bool,
+    func load(url: URL, headers: [String: String]?, live: Bool, startPosition: NSNumber?, autoplay: Bool,
               completion: @escaping (NSError?) -> Void)
     func cancelLoad()
     func play()
@@ -79,6 +79,7 @@ public protocol VortXAetherBridging: NSObjectProtocol {
     func stop()
     func seek(to seconds: Double, completion: (() -> Void)?)
     func setRate(_ rate: Double)
+    func setVideoSize(_ mode: String)
     /// Seconds; positive presents audio later than video. The engine clamps to +/-2 s.
     func setAudioDelay(_ seconds: Double)
     /// 0...1.
@@ -87,6 +88,11 @@ public protocol VortXAetherBridging: NSObjectProtocol {
     var currentTime: Double { get }
     var duration: Double { get }
     var canSeek: Bool { get }
+    /// Physical seek lifetime, which can outlast the optimistic transport state.
+    var isSeeking: Bool { get }
+    /// Settlement of the last onTime snapshot. False for an optimistic, stalled or
+    /// superseded seek even after isSeeking falls; true only with display evidence.
+    var positionIsSettled: Bool { get }
     var bufferedPosition: Double { get }
 
     /// Tracks as dictionaries keyed by `VortXAetherBridgeTrackKey`.
@@ -101,6 +107,14 @@ public protocol VortXAetherBridging: NSObjectProtocol {
     /// Seconds; positive shows cues later.
     func setSubtitleDelay(_ seconds: Double)
 
+    /// Observed stream dimensions and nominal frame rate; zero/nil when unmeasured.
+    var videoWidth: Int { get }
+    var videoHeight: Int { get }
+    var videoFrameRate: NSNumber? { get }
+    /// Stable presentation value: sdr, pq, hlg, dolbyVision or unknown.
+    var videoDynamicRange: String { get }
+    /// Container chapter dictionaries: title (String), start (Double), on the seek axis.
+    var mediaChapters: [[String: Any]] { get }
     var videoFormat: String { get }
     var sourceVideoFormat: String { get }
     var sourceDolbyVisionProfile: NSNumber? { get }

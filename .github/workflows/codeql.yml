@@ -96,6 +96,9 @@ jobs:
           ./gradlew :app:testPlayDebugUnitTest
           -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
           --tests com.vortx.android.sync.AndroidRealtimeSyncTest
+          --tests com.vortx.android.engine.SourceTitleMatchTest
+          --tests com.vortx.android.engine.NativePlaylistTest
+          --tests com.vortx.android.playlists.SavedPlaylistStoreTest
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
           --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest

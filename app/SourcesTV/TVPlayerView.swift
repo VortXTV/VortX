@@ -1461,7 +1461,8 @@ struct TVPlayerView: View {
 
     /// The viewer chose AetherEngine for this playback, in Settings or the per-source menu.
     private var useAetherEngine: Bool {
-        if forceMPV || aetherEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
+        if forceMPV || aetherEngineFailed || manualEngineAVPlayer != nil
+            || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
         return aetherLatch ?? routedToAether
     }
 
@@ -3534,12 +3535,16 @@ struct TVPlayerView: View {
             if audioDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustAudioDelay(-audioDelay) }) }
             // Output mode, mirrored from Settings so it is reachable mid-playback (iOS parity: the iOS
             // player ships the same section). Applies live; mpv re-opens the audio output on the change.
-            let mode = AudioOutputMode.current
-            rows.append(OptionRow(label: String(localized: "Output"), isHeader: true))
-            for m in AudioOutputMode.allCases {
-                rows.append(OptionRow(label: m.label, isSelected: m == mode) {
-                    coordinator.player?.setAudioOutputMode(m)
-                })
+            if coordinator.player is MPVMetalViewController {
+                let mode = AudioOutputMode.current
+                rows.append(OptionRow(label: String(localized: "Output"), isHeader: true))
+                for m in AudioOutputMode.allCases {
+                    rows.append(OptionRow(label: m.label, isSelected: m == mode) {
+                        coordinator.player?.setAudioOutputMode(m)
+                    })
+                }
+            } else {
+                rows.append(OptionRow(label: String(localized: "Audio output is managed by the system"), isHeader: true))
             }
             rows.append(contentsOf: audioPresetRows)
             return rows
@@ -4189,7 +4194,7 @@ struct TVPlayerView: View {
         }
         // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
         // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
-        if !isAVPlayerActive {
+        if coordinator.player is MPVMetalViewController {
             rows.append(OptionRow(label: "Decoder", isHeader: true))
             let hw = coordinator.player?.hardwareDecoding ?? true
             let hardwareDetail = (coordinator.player as? MPVMetalViewController)?
@@ -4204,10 +4209,11 @@ struct TVPlayerView: View {
         // Player engine picker (P3, #76): reachable only when AVPlayer is a real option for this stream (DV /
         // HLS / debrid; never torrents or a yt-direct sidecar pair). Lets the viewer flip libmpv <-> AVPlayer
         // mid-title for true Dolby Vision (AVPlayer) or wider format / libass subtitle support (libmpv).
-        if canUseAVPlayerEngine {
+        if canUseAVPlayerEngine || isAetherEngineActive {
+            let engineName = isAetherEngineActive ? "AetherEngine" : (isAVPlayerActive ? "AVPlayer" : "VortX Player")
             rows.append(OptionRow(label: "Playback", isHeader: true))
             rows.append(OptionRow(label: "Player engine",
-                                  detail: isAVPlayerActive ? "AVPlayer  ·  ›" : "VortX Player  ·  ›") {
+                                  detail: "\(engineName)  ·  ›") {
                 openPanel(.engine)
             })
         }
@@ -4237,10 +4243,16 @@ struct TVPlayerView: View {
     /// only when it is a valid engine for this stream (guarded by the caller via `canUseAVPlayerEngine`).
     private func engineRows() -> [OptionRow] {
         let onAV = isAVPlayerActive
+        let onAether = isAetherEngineActive
         var rows: [OptionRow] = []
-        rows.append(OptionRow(label: "VortX Player  ·  all formats, styled subtitles", isSelected: !onAV) {
+        rows.append(OptionRow(label: "VortX Player  ·  all formats, styled subtitles", isSelected: !onAV && !onAether) {
             switchPlayerEngine(toAVPlayer: false)
         })
+        if onAether {
+            rows.append(OptionRow(label: "AetherEngine  ·  testing", isSelected: true) {
+                withAnimation { showOptions = false }
+            })
+        }
         if canUseAVPlayerEngine {
             rows.append(OptionRow(label: "AVPlayer  ·  Dolby Vision, HLS", isSelected: onAV) {
                 switchPlayerEngine(toAVPlayer: true)
@@ -7020,7 +7032,9 @@ struct TVPlayerView: View {
             withAnimation { showOptions = false }
             return
         }
-        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        guard toAVPlayer != isAVPlayerActive || isAetherEngineActive else {
+            withAnimation { showOptions = false }; return
+        }
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         let needsFreshNativeDebridLink = reconnecting || autoRetryTask != nil
         if needsFreshNativeDebridLink,
@@ -7042,8 +7056,15 @@ struct TVPlayerView: View {
         toAVPlayer: Bool,
         preservingNativeDebridRecoveryGeneration: Bool = false
     ) {
-        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        guard toAVPlayer != isAVPlayerActive || isAetherEngineActive else {
+            withAnimation { showOptions = false }; return
+        }
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
+        if !toAVPlayer, isAetherEngineActive {
+            _ = demoteAetherToMPV(reason: "viewer picked VortX Player", notify: false)
+            withAnimation { showOptions = false }
+            return
+        }
         if !toAVPlayer, coordinator.player is AVPlayerEngineController {
             _ = demoteAVPlayerToMPV()
             withAnimation { showOptions = false }
@@ -7145,7 +7166,7 @@ struct TVPlayerView: View {
     /// and the one-shot latches, watchdog and speed re-arm for the fresh libmpv mount. Returns false when
     /// AetherEngine is not the mounted engine, so the caller runs its ordinary failure path.
     @discardableResult
-    private func demoteAetherToMPV(reason: String) -> Bool {
+    private func demoteAetherToMPV(reason: String, notify: Bool = true) -> Bool {
         #if VORTX_AETHER_ENGINE
         guard coordinator.player is AetherEngineController, !aetherEngineFailed else { return false }
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
@@ -7187,7 +7208,9 @@ struct TVPlayerView: View {
         resumeSeconds = reconcileResume
         resumeIsMidPlayRecovery = carriedPlayHead
         startLoadTimeout()
-        showEngineNote(String(localized: "AetherEngine couldn't play this source, so VortX Player took over."))
+        if notify {
+            showEngineNote(String(localized: "AetherEngine couldn't play this source, so VortX Player took over."))
+        }
         // A pending episode needs an explicit issued load to rebind its pending-token transaction to the new
         // controller; ordinary replacements already mount the active tuple.
         if let cu = curURL, pendingAdvance?.issued == true {

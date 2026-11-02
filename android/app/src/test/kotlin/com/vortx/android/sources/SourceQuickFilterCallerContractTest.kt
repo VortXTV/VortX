@@ -27,7 +27,7 @@ class SourceQuickFilterCallerContractTest {
         assertTrue(fold.contains("val hits = debrid.cacheCheck(hashes, owner)"))
         val mark = fold.indexOf("com.vortx.android.sources.markAccountConfirmedCache(")
         val firstFence = fold.indexOf("return@launch", fold.indexOf("val hits ="))
-        val publication = fold.indexOf("sourceModel.setRawGroups(decorated)")
+        val publication = fold.indexOf("sourceModel.setRawGroups(sourcePublicationBridge.recordDecoration(request, decorated))")
         assertTrue(firstFence in 0 until mark && publication > mark)
         listOf(
             "episodeId != _selectedEpisodeId.value", "episodeId == _selectedEpisodeId.value",
@@ -51,6 +51,34 @@ class SourceQuickFilterCallerContractTest {
         // Exact original text/id cache-decoration mechanism stays intact (29494785 / a5e677c2).
         val decoration = between(vm, "    private fun decorateCached(", "    /// The effective per-title")
         assertEquals("229e4fbbca9b5948dece948dbc5a0740ffac35fd487c9f8aeb5f62c33fa5623a", sha256(decoration))
+    }
+
+    @Test fun `cache publication source contract rejects bridge bypass and every final fence removal`() {
+        val vm = read(main + "ui/viewmodel/DetailViewModel.kt")
+        val fold = between(vm, "    private fun runCacheCheck(", "    /// Fold a \"cached\" marker")
+        assertTrue(cachePublicationIsFenced(fold))
+        val publication = "sourceModel.setRawGroups(sourcePublicationBridge.recordDecoration(request, decorated))"
+        assertFalse(cachePublicationIsFenced(fold.replace(publication, "sourceModel.setRawGroups(decorated)")))
+        finalCachePublicationFences.forEach { fence ->
+            assertTrue("Negative control must change production source: $fence", fold.contains(fence))
+            assertFalse("Missing final fence was accepted: $fence", cachePublicationIsFenced(fold.replace(fence, "true")))
+        }
+    }
+
+    private val finalCachePublicationFences = listOf(
+        "decorated !== raw", "episodeId == _selectedEpisodeId.value",
+        "sourceRequestFence.accepts(request, sourceSticky.currentProfileId())",
+        "cacheCheckGate.isCurrent(cacheGeneration)", "debridKeys.isCurrent(owner)",
+        "debridKeys.currentCredentialRevision() == credentialRevision",
+        "DebridKeys.credentialRevision.value == cacheDisplayRevision",
+    )
+
+    private fun cachePublicationIsFenced(fold: String): Boolean {
+        val mark = fold.indexOf("com.vortx.android.sources.markAccountConfirmedCache(")
+        val publication = fold.indexOf("sourceModel.setRawGroups(sourcePublicationBridge.recordDecoration(request, decorated))")
+        if (mark < 0 || publication <= mark) return false
+        val finalGuard = fold.substring(mark, publication)
+        return finalCachePublicationFences.all(finalGuard::contains)
     }
 
     @Test fun `transient evidence cannot come from provider import saved state or a ranker heuristic`() {

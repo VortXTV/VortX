@@ -28,7 +28,7 @@ final class AetherEngineController: NSObject, PlayerEngine {
     /// engine's clock can sit on a resume or seek target before any frame, and the chrome treats a settled
     /// position above zero as "playback started", which retires its no-frame watchdogs.
     private var hasFirstFrame = false
-    private var isSeeking = false
+    private var lastSeekable: Bool?
     /// One-shot: the next load mounts paused (the surface was asked to start paused).
     var holdsNextLoadPaused = false
     /// The local copy of the selected add-on subtitle, and the request allowed to replace it.
@@ -59,7 +59,6 @@ final class AetherEngineController: NSObject, PlayerEngine {
         guard let player else { return }
         player.onState = { [weak self] (state: VortXAetherBridgeState, message: String?) in
             guard let self else { return }
-            isSeeking = state == .seeking
             switch state {
             case .playing: emitPause(false)
             case .paused: emitPause(true)
@@ -71,15 +70,16 @@ final class AetherEngineController: NSObject, PlayerEngine {
         player.onFirstFrame = { [weak self] in self?.hasFirstFrame = true }
         player.onTime = { [weak self] (seconds: Double) in
             guard let self, let token = activeLoadToken, seconds.isFinite else { return }
+            emitSeekability()
             playDelegate?.propertyChange(propertyName: MPVProperty.timePos,
                 data: PlayerTimePositionEvent(seconds: seconds, loadToken: token,
-                                              positionSettled: hasFirstFrame && !isSeeking),
+                                              positionSettled: hasFirstFrame && self.player?.positionIsSettled == true),
                 loadToken: token)
         }
         player.onDuration = { [weak self] (seconds: Double) in
             guard let self, seconds.isFinite, seconds > 0 else { return }
             emit(MPVProperty.duration, seconds)
-            emit(MPVProperty.seekable, self.player?.canSeek ?? false)
+            emitSeekability()
         }
         player.onBuffering = { [weak self] (buffering: Bool) in self?.emit(MPVProperty.pausedForCache, buffering) }
         player.onBufferedPosition = { [weak self] (seconds: Double) in
@@ -87,7 +87,18 @@ final class AetherEngineController: NSObject, PlayerEngine {
             self?.emit(MPVProperty.demuxerCacheTime, seconds)
         }
         player.onTracksChanged = { [weak self] in self?.emit(MPVProperty.trackList, nil) }
-        player.onSubtitleText = { [weak self] (text: String?) in self?.subtitleOverlay.setText(text) }
+        player.onSubtitleText = { [weak self] (text: String?) in
+            guard let self, activeLoadToken != nil else { return }
+            subtitleOverlay.setText(text)
+        }
+    }
+
+    private func emitSeekability() {
+        guard activeLoadToken != nil else { return }
+        let seekable = player?.canSeek ?? false
+        guard seekable != lastSeekable else { return }
+        lastSeekable = seekable
+        emit(MPVProperty.seekable, seekable)
     }
 
     private func emitPause(_ paused: Bool) {
@@ -102,11 +113,19 @@ final class AetherEngineController: NSObject, PlayerEngine {
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
         let token = loadToken ?? PlayerLoadToken()
+        // Configuration belongs to this issue, including an issue that cannot start.
+        let start = resumeOriginSeconds > 0 ? NSNumber(value: resumeOriginSeconds) : nil
+        resumeOriginSeconds = 0
+        let autoplay = !holdsNextLoadPaused
+        holdsNextLoadPaused = false
+        // A retry may retain its logical token, but never an older subtitle request.
+        activeLoadToken = nil
+        sidecarRevision &+= 1
         player?.cancelLoad()
         activeLoadToken = token
         lastPaused = nil
         hasFirstFrame = false
-        isSeeking = false
+        lastSeekable = nil
         subtitleOverlay.setText(nil)
         guard let player else {
             // Reported on the next turn, after the surface finishes mounting, like any engine's own failure.
@@ -122,12 +141,10 @@ final class AetherEngineController: NSObject, PlayerEngine {
             emit(MPVProperty.endFileError, String(localized: "AetherEngine can't play a source with separate audio. Choose VortX Player for this source."))
             return token
         }
-        let start = resumeOriginSeconds > 0 ? NSNumber(value: resumeOriginSeconds) : nil
-        let autoplay = !holdsNextLoadPaused
-        holdsNextLoadPaused = false
-        player.load(url: url, headers: headers, startPosition: start, autoplay: autoplay) { [weak self] (error: NSError?) in
+        player.load(url: url, headers: headers, live: live, startPosition: start, autoplay: autoplay) { [weak self] (error: NSError?) in
             guard let self, activeLoadToken == token else { return }
             guard let error else {
+                emitSeekability()
                 self.player?.setRate(speed)
                 return
             }
@@ -140,8 +157,10 @@ final class AetherEngineController: NSObject, PlayerEngine {
     }
 
     func invalidateLoadToken() {
-        player?.cancelLoad()
         activeLoadToken = nil
+        sidecarRevision &+= 1
+        player?.cancelLoad()
+        subtitleOverlay.setText(nil)
     }
 
     func configureResumeOrigin(seconds: Double) {
@@ -162,15 +181,22 @@ final class AetherEngineController: NSObject, PlayerEngine {
         emit(MPVProperty.speed, speed)
     }
     func stop() {
-        player?.stop()
+        // Retire callback authority before synchronous engine teardown can publish.
         activeLoadToken = nil
-        hasFirstFrame = false
         sidecarRevision &+= 1
+        player?.stop()
+        hasFirstFrame = false
+        resumeOriginSeconds = 0
+        holdsNextLoadPaused = false
         replaceSidecarFile(with: nil)
         subtitleOverlay.setText(nil)
     }
 
-    func setVideoSize(_ mode: String) { videoSizeMode = mode }
+    func setVideoSize(_ mode: String) {
+        videoSizeMode = mode
+        UserDefaults.standard.set(mode, forKey: "stremiox.videoSize")
+        player?.setVideoSize(mode)
+    }
 
     // MARK: Tracks and subtitles
 
@@ -224,6 +250,8 @@ final class AetherEngineController: NSObject, PlayerEngine {
 
     func setAudioTrack(_ id: Int) { player?.selectAudioTrack(id: id) }
     func setSubtitleTrack(_ id: Int) {
+        // A manual Off/embedded pick supersedes any still-downloading add-on file.
+        sidecarRevision &+= 1
         if id < 0 { player?.clearSubtitle() } else { player?.selectSubtitleTrack(id: id) }
     }
     /// Add-on subtitles download through the shared pinned transport, like the other lanes: HTTPS only, the
@@ -281,12 +309,41 @@ final class AetherEngineController: NSObject, PlayerEngine {
 
     // MARK: Facts and diagnostics
 
-    func mediaDurationSeconds() -> Double { player?.duration ?? 0 }
-    func chapters() -> [MPVChapter] { [] }
+    func mediaDurationSeconds() -> Double { activeLoadToken == nil ? 0 : (player?.duration ?? 0) }
+    func chapters() -> [MPVChapter] {
+        guard activeLoadToken != nil else { return [] }
+        return (player?.mediaChapters ?? []).compactMap { values in
+            guard let start = values["start"] as? Double, start.isFinite, start >= 0 else { return nil }
+            return MPVChapter(title: values["title"] as? String ?? "", start: start)
+        }
+    }
+    func containerFrameRate() -> Double {
+        guard activeLoadToken != nil, let fps = player?.videoFrameRate?.doubleValue,
+              fps.isFinite, fps > 0 else { return 0 }
+        return fps
+    }
     func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int) {
+        guard activeLoadToken != nil else { return (0, 0, "", 0) }
         let active = player?.activeAudioTrackID?.intValue
         let audio = audioTracks.first { $0.id == active }
-        return (0, 0, audio?.codec ?? "", audio?.channels ?? 0)
+        return (player?.videoWidth ?? 0, player?.videoHeight ?? 0, audio?.codec ?? "", audio?.channels ?? 0)
+    }
+    func playbackMetadataFacts() -> PlaybackMetadataFacts {
+        guard activeLoadToken != nil, let player else { return PlaybackMetadataFacts() }
+        var facts = PlaybackMetadataFacts()
+        facts.width = max(0, player.videoWidth)
+        facts.height = max(0, player.videoHeight)
+        facts.dynamicRange = PlaybackMetadataFacts.DynamicRange(rawValue: player.videoDynamicRange) ?? .unknown
+        let selectedBefore = player.activeAudioTrackID?.intValue
+        let audio = audioTracks.first { $0.id == selectedBefore }
+        if let audio, PlaybackMetadataFacts.audioSelectionMatches(selectedRowID: audio.id,
+            beforeID: selectedBefore, afterID: player.activeAudioTrackID?.intValue) {
+            facts.audioSelected = true
+            facts.audioLanguage = audio.language
+            facts.audioCodec = audio.codec
+            facts.audioChannels = audio.channels
+        }
+        return facts
     }
     func playbackStats() -> [(String, String)] {
         guard let player else { return [("Engine", "AetherEngine (not started)")] }
@@ -304,7 +361,10 @@ final class AetherEngineController: NSObject, PlayerEngine {
     func setAudioOutputMode(_ mode: AudioOutputMode) {}
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) { completion(nil) }
-    var hdrAvailable: Bool { (player?.videoFormat ?? "sdr") != "sdr" }
+    var hdrAvailable: Bool {
+        guard activeLoadToken != nil, let player else { return false }
+        return ["pq", "hlg", "dolbyVision"].contains(player.videoDynamicRange)
+    }
     var playbackPositionSeconds: Double { player?.currentTime ?? 0 }
 
     func setVolume(_ volume0to100: Double) {

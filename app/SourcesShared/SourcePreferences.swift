@@ -400,7 +400,8 @@ final class SourcePreferences: ObservableObject {
         hideUnknownResolution = UserDefaults.standard.bool(forKey: Self.hideUnknownResKey)
         preferredAudioOnly = UserDefaults.standard.bool(forKey: Self.preferredAudioKey)
         maxFileSizeGB   = UserDefaults.standard.double(forKey: Self.maxFileSizeKey)
-        titleMatchThreshold = UserDefaults.standard.integer(forKey: Self.titleMatchThresholdKey)
+        titleMatchThreshold = SourceTitleMatch.admittedThreshold(
+            UserDefaults.standard.object(forKey: Self.titleMatchThresholdKey)) ?? Self.defaultTitleMatchThreshold
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
         defaultSourceSort = UserDefaults.standard.string(forKey: Self.defaultSortKey) ?? "best"
@@ -467,7 +468,8 @@ final class SourcePreferences: ObservableObject {
         if preferredAudioOnly != prefAudio { preferredAudioOnly = prefAudio }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
-        let titleMatch = d.integer(forKey: Self.titleMatchThresholdKey)
+        let titleMatch = SourceTitleMatch.admittedThreshold(d.object(forKey: Self.titleMatchThresholdKey))
+            ?? Self.defaultTitleMatchThreshold
         if titleMatchThreshold != titleMatch { titleMatchThreshold = titleMatch }
         // Smart Source Selection (Lane A). Per-profile now (folded into PlaybackPrefs): a profile switch
         // rewrites these flat keys via applyPlayback, so this guarded re-read re-syncs the singleton's
