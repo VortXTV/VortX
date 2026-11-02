@@ -42,6 +42,41 @@ class ProfileSelectionWiringTest {
         assertTrue(surface.contains("handoff.signIn(request, email, password)"))
     }
 
+    @Test fun `tools wraps only main picker while account and native selection guards remain separate`() {
+        for (path in listOf("ui/VortXApp.kt", "ui/tv/TvApp.kt")) {
+            val host = source(path)
+            assertTrue(host.contains("val pickerToolsModel = rememberPickerToolsModel(syncManager)"))
+            assertTrue(host.contains("ProfilePickerToolsHost(pickerToolsModel, isTv ="))
+            assertTrue(host.contains("diagnosticAdmission = ::currentPickerDiagnosticExportAllowed"))
+            assertTrue(host.contains("pickerToolsState.open"))
+        }
+        val tools = source("ui/profilepicker/ProfilePickerToolsHost.kt")
+        assertTrue(tools.contains("diagnosticAdmission: () -> Boolean"))
+        assertTrue(tools.contains("model.destinationReturned(originalRequest, tree)"))
+        assertTrue(tools.contains("key(request.routeId, request.operationId)"))
+        assertTrue(tools.contains("BackHandler(enabled = state.open"))
+        assertTrue(tools.contains("entryFocus.requestFocus()"))
+        assertTrue(tools.contains("remember(model, state.routeGeneration) { controller.attachPicker() }"))
+        assertTrue(tools.contains("remember(model, attachment, state.presentationId) { controller.renderedActions(attachment) }"))
+        assertTrue(tools.contains("onDownload = { actionGrant?.let(controller::download) }"))
+        val controller = source("ui/profilepicker/ProfilePickerToolsController.kt")
+        val download = controller.substringAfter("fun download(expected: PickerToolsActionGrant)").substringBefore("fun claimDestinationLaunch")
+        assertFalse(download.contains("accounts.capture()"))
+        assertTrue(controller.contains("route.original?.let(accounts::isCurrent)"))
+
+        assertFalse(tools.contains("onSelected"))
+        assertFalse(tools.contains("CreateDocument"))
+        val model = source("ui/viewmodel/ProfilePickerToolsViewModel.kt")
+        assertTrue(model.contains("manager.capturePickerAccountSnapshot()"))
+        assertTrue(model.contains("manager.isPickerAccountCurrent(original)"))
+        assertTrue(model.contains("manager.downloadAccountBackupFile(original)"))
+        assertTrue(model.contains("shareDiagnosticLog(applicationContext, mayShare = admission)"))
+        assertFalse(source("ui/screens/WhosWatchingScreen.kt").contains("DiagnosticLogAction("))
+        // The existing account form and settings diagnostics retain their independently legitimate uses.
+        assertTrue(source("ui/screens/VortXAccountScreen.kt").contains("DiagnosticLogAction("))
+        assertTrue(source("ui/screens/DiagnosticsSettingsScreen.kt").contains("shareDiagnosticLog(context)"))
+    }
+
     @Test fun `settings selections preserve typed result to the same host`() {
         assertTrue(source("ui/VortXApp.kt").contains("ProfileSelectionPresentation(it, ProfileSelectionOrigin.PROFILE_MANAGEMENT)"))
         assertTrue(source("ui/VortXApp.kt").contains("onReturnToProfiles = { showProfiles = true }"))

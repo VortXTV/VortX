@@ -120,6 +120,8 @@ import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
 import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
 import com.vortx.android.ui.profilepicker.currentPickerDiagnosticExportAllowed
+import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
+import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
 import com.vortx.android.ui.profilepicker.ProfileSelectionOrigin
 import com.vortx.android.ui.profilepicker.ProfileSelectionPresentation
 import com.vortx.android.ui.randompick.RandomTitlePlayRequest
@@ -734,6 +736,8 @@ fun VortXApp(
         // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
         // watching" before any content renders. It self-dismisses when the store has nothing to pick.
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
+        val pickerToolsModel = rememberPickerToolsModel(syncManager)
+        val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
         val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(false) })
         var profileSelection by remember { mutableStateOf<ProfileSelectionPresentation?>(null) }
@@ -747,16 +751,19 @@ fun VortXApp(
                 onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
-        if (showWhosWatching || pickerAccountOpen) {
+        if (showWhosWatching || pickerAccountOpen || pickerToolsState.open) {
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
                     com.vortx.android.ui.screens.VortXAccountScreen(model, onBack = closeAccount,
                         onSignOutRequest = requestSignOut, diagnosticAdmission = diagnosticAdmission, dismissalNotice = notice)
                 }) { control ->
-                WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
-                    profileSelection = ProfileSelectionPresentation(it,
-                        if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
-                }, accountControl = control)
+                ProfilePickerToolsHost(pickerToolsModel, isTv = false,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed) {
+                    WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                        profileSelection = ProfileSelectionPresentation(it,
+                            if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
+                    }, accountControl = control)
+                }
             }
             return@VortXTheme
         }

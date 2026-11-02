@@ -319,6 +319,11 @@ internal class SessionOperationCoordinator {
     private var sessionGeneration = 0L
     private val _accountRevision = MutableStateFlow(0L)
     val accountRevision: StateFlow<Long> = _accountRevision.asStateFlow()
+    private val _pickerAuthorityRevision = MutableStateFlow(0L)
+    val pickerAuthorityRevision: StateFlow<Long> = _pickerAuthorityRevision.asStateFlow()
+    private fun notifyPickerAuthorityChangedLocked() {
+        _pickerAuthorityRevision.value = nextGeneration(_pickerAuthorityRevision.value)
+    }
     private val activeCalls: MutableSet<OutboundCallPermit> =
         Collections.newSetFromMap(IdentityHashMap())
 
@@ -326,6 +331,7 @@ internal class SessionOperationCoordinator {
         var cancellations = emptyList<() -> Unit>()
         val operation = synchronized(lock) {
             authGeneration = nextGeneration(authGeneration)
+            notifyPickerAuthorityChangedLocked()
             cancellations = retireCallsLocked { it.owner == OutboundCallOwner.AUTH }
             AuthOperation(authGeneration)
         }
@@ -341,7 +347,7 @@ internal class SessionOperationCoordinator {
                     authGeneration = nextGeneration(authGeneration)
                     sessionGeneration = nextGeneration(sessionGeneration)
                     cancellations = retireCallsLocked { true }
-                    try { mutation() } finally { _accountRevision.value = sessionGeneration }
+                    try { mutation() } finally { _accountRevision.value = sessionGeneration; notifyPickerAuthorityChangedLocked() }
                 }
             } finally {
                 cancelCalls(cancellations)
@@ -367,7 +373,7 @@ internal class SessionOperationCoordinator {
                     sessionGeneration = nextGeneration(sessionGeneration)
                     cancellations = retireCallsLocked { true }
                     try { SessionMutationResult.Applied(mutation()) }
-                    finally { _accountRevision.value = sessionGeneration }
+                    finally { _accountRevision.value = sessionGeneration; notifyPickerAuthorityChangedLocked() }
                 }
             }
         } finally { cancelCalls(cancellations) }
@@ -445,6 +451,7 @@ internal class SessionOperationCoordinator {
                                 }
                                 onCommitted()
                                 _accountRevision.value = sessionGeneration
+                                notifyPickerAuthorityChangedLocked()
                             }
                             SessionMutationResult.Applied(committed)
                         }
@@ -1875,6 +1882,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     internal val pickerAccountRevision: StateFlow<Long> get() = operations.accountRevision
+    /** Ephemeral Tools cancellation, including auth start; it does not mutate session/owner epochs. */
+    internal val pickerAuthorityRevision: StateFlow<Long> get() = operations.pickerAuthorityRevision
     /** Read-only completion lifetime, not sign-out/write authority. Unavailable persistence must not
      * erase an unsaved recovery code while the same original live owner is retained. */
     internal fun capturePickerCompletionOwner(): PickerAccountSnapshot =
@@ -2183,26 +2192,34 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return plaintext
     }
 
-    private class AccountFileDownload(val lease: SyncSessionLease, val owner: Session) {
+    private class AccountFileDownload(val lease: SyncSessionLease, val owner: Session, val pickerOwner: PickerAccountSnapshot?) {
         var response: ByteArray? = null
     }
-    private fun captureAccountFileDownload(): AccountFileDownload? = operations.snapshot {
+    private fun captureAccountFileDownload(pickerOwner: PickerAccountSnapshot?): AccountFileDownload? = operations.snapshot {
+        if (pickerOwner != null && !isPickerAccountCurrent(pickerOwner)) return@snapshot null
         if (sessionOwnerSnapshot() !is SessionOwnerSnapshot.Account) return@snapshot null
         sessionState.serialized {
             val owner = sessionState.value ?: return@serialized null
             val lease = captureSyncLease() ?: return@serialized null
-            AccountFileDownload(lease, owner)
+            AccountFileDownload(lease, owner, pickerOwner)
         }
     }
     private fun isAccountFileDownloadCurrent(capture: AccountFileDownload): Boolean = operations.snapshot {
+        (capture.pickerOwner?.let(::isPickerAccountCurrent) ?: true) &&
         isSyncLeaseCurrent(capture.lease) && sessionState.serialized {
             sessionState.value === capture.owner && _sessionUiState.value is SessionUiState.SignedIn
         }
     }
 
     /** Full encrypted account export; independent of profile/native readiness and sync side effects. */
-    suspend fun downloadAccountBackupFile(): ByteArray {
-        val capture = captureAccountFileDownload()
+    suspend fun downloadAccountBackupFile(): ByteArray = downloadAccountBackupFileOwned(null)
+
+    /** Picker exports cannot recapture another Session between the UI check and owned raw GET. */
+    internal suspend fun downloadAccountBackupFile(expected: PickerAccountSnapshot): ByteArray =
+        downloadAccountBackupFileOwned(expected)
+
+    private suspend fun downloadAccountBackupFileOwned(expected: PickerAccountSnapshot?): ByteArray {
+        val capture = captureAccountFileDownload(expected)
             ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
         val permit = acquireSyncCallPermit(capture.lease)
             ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)

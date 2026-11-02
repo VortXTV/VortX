@@ -335,10 +335,6 @@ fun WhosWatchingScreen(
             accountControl?.let { control ->
                 TextButton(onClick = { if (pinTarget == null && editorRequest == null) control.onClick() }, modifier = Modifier.testTag("profile-picker-account")) { Text(control.label) }
             }
-            // Protected rosters keep export behind the existing profile PIN/selection route.
-            if (pinTarget == null && roster.none { it.hasPin }) DiagnosticLogAction(mayShare = {
-                pinTarget == null && store.profiles.none { it.hasPin }
-            })
         }
 
         pinTarget?.let { target ->

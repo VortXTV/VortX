@@ -31,6 +31,13 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
+    <!-- Permit accurate SAF capability discovery under Android 11+ package visibility. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT_TREE" />
+        </intent>
+    </queries>
+
     <application
         android:name=".VortXApplication"
         android:allowBackup="true"

@@ -57,6 +57,8 @@ import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
 import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
 import com.vortx.android.ui.profilepicker.currentPickerDiagnosticExportAllowed
+import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
+import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.update.UpdatePromptHost
@@ -112,6 +114,8 @@ fun TvApp(
         // skip it by construction, because ProfileStore.needsPicker is false in both cases.
         var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
+        val pickerToolsModel = rememberPickerToolsModel(syncManager)
+        val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
         val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(false) })
         var profileSelection by remember { mutableStateOf<ProfileSelectionRequest?>(null) }
@@ -122,13 +126,16 @@ fun TvApp(
                 onChooseAgain = { profileSelection = null; showPicker = true })
             return@VortXTheme
         }
-        if (showPicker || pickerAccountOpen) {
+        if (showPicker || pickerAccountOpen || pickerToolsState.open) {
             // The picker owns Back, its nested editor and exact native selection admission.
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
                     TvPickerVortXAccountScreen(model, closeAccount, onSignOutRequest = requestSignOut, diagnosticAdmission = diagnosticAdmission, dismissalNotice = notice)
                 }) { control ->
-                TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
+                ProfilePickerToolsHost(pickerToolsModel, isTv = true,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed) {
+                    TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
+                }
             }
             return@VortXTheme
         }
