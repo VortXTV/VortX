@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import Foundation
 
@@ -16,8 +17,24 @@ public struct TrackInfo: Equatable {
 }
 public struct ChapterInfo: Equatable { public var name: String; public var startSeconds: Double }
 public struct SubtitleRun { public var text: String }
-public enum SubtitleBody { case text(String), richText([SubtitleRun]), image }
-public struct SubtitleCue { public var startTime: Double; public var endTime: Double; public var body: SubtitleBody }
+public struct SubtitleImage: @unchecked Sendable {
+    public let cgImage: CGImage; public let position: CGRect; public let canvasSize: CGSize
+    public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero) {
+        self.cgImage = cgImage; self.position = position; self.canvasSize = canvasSize
+    }
+}
+public enum SubtitleBody { case text(String), richText([SubtitleRun]), image(SubtitleImage) }
+public struct SubtitleCue {
+    public var id: Int; public var startTime: Double; public var endTime: Double; public var body: SubtitleBody
+    public init(id: Int, startTime: Double, endTime: Double, body: SubtitleBody) {
+        self.id = id; self.startTime = startTime; self.endTime = endTime; self.body = body
+    }
+}
+public struct ExternalSubtitleTrack {
+    public let url: URL
+    public init(url: URL, name: String?, language: String?, httpHeaders: [String:String]) { self.url = url }
+}
+@MainActor public final class PreparedExternalSubtitle { public func discard() {} }
 public struct SeekEvent {
     public enum Origin: Equatable { case programmatic, nativeScrub, deferred }
     public enum Rejection: Equatable { case noActiveSession, liveWithoutDVR, sourceNotSeekable }
@@ -47,6 +64,8 @@ public final class AetherPlayerView: NSView {}
     @Published public var activeSubtitleTrackIndex: Int?
     @Published public var mediaChapters: [ChapterInfo] = []
     @Published public var subtitleCues: [SubtitleCue] = []
+    @Published public var secondarySubtitleCues: [SubtitleCue] = []
+    @Published public var isSecondarySubtitleActive = false
     public var isSeeking = false
     public var canSeek = true
     public var currentTime: Double { clock.currentTime }
@@ -54,6 +73,9 @@ public final class AetherPlayerView: NSView {}
     public var bufferedPosition: Double { clock.bufferedPosition }
     public var videoGravity = VideoGravity.resizeAspect
     public var volume: Float = 1
+    public var softwareDisplaySize: CGSize?
+    public var nativePlayerLayer: AVPlayerLayer?
+    public var sourceVideoPixelAspectRatio = 1.0
     public var sourceVideoWidth: Int32 = 1920, sourceVideoHeight: Int32 = 1080
     public var sourceVideoFrameRate: Double? = 24
     public var videoFormat = VideoFormat.sdr, sourceVideoFormat = VideoFormat.sdr
@@ -75,13 +97,21 @@ public final class AetherPlayerView: NSView {}
         state = .idle; hasFirstFrameReadyForDisplay = false; isSeeking = false
         clock.currentTime = 0; clock.sourceTime = 0; duration = 0
         audioTracks = []; subtitleTracks = []; activeAudioTrackIndex = nil; activeSubtitleTrackIndex = nil
-        mediaChapters = []; subtitleCues = []
+        mediaChapters = []; subtitleCues = []; secondarySubtitleCues = []; isSecondarySubtitleActive = false
     }
     public func seek(to seconds: Double) async {}
     public func setRate(_ rate: Float) {}
     public func setAudioDelay(_ seconds: Double) {}
     public func selectAudioTrack(index: Int) { activeAudioTrackIndex = index }
     public func selectSubtitleTrack(index: Int) { activeSubtitleTrackIndex = index }
-    public func clearSubtitle() { subtitleCues = [] }
+    public func clearSubtitle() { subtitleCues = []; activeSubtitleTrackIndex = nil }
+    public func removeExternalSubtitleTrack(id: Int) {
+        subtitleTracks.removeAll { $0.id == id }
+        if activeSubtitleTrackIndex == id { clearSubtitle() }
+    }
+    public func clearSecondarySubtitle() { secondarySubtitleCues = []; isSecondarySubtitleActive = false }
+    public func selectSecondarySubtitleTrack(index: Int) { isSecondarySubtitleActive = true }
+    public func prepareExternalSubtitle(_ track: ExternalSubtitleTrack) async throws -> PreparedExternalSubtitle { .init() }
+    public func commitExternalSubtitle(_ prepared: PreparedExternalSubtitle, secondary: Bool = false) throws -> TrackInfo { .init(id: 100000, name: "Prepared") }
     public func selectSidecarSubtitle(url: URL, httpHeaders: [String:String]?) {}
 }

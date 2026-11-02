@@ -16,6 +16,7 @@ struct PlayerTimePositionEvent {
 }
 struct MPVTrack {
     let id: Int; let type: String; let title: String; let lang: String; let selected: Bool; let forced: Bool
+    var unavailableReason: String? = nil
 }
 struct MPVChapter { let title: String; let start: Double }
 enum AudioOutputMode { case automatic }
@@ -115,6 +116,20 @@ enum VortXAetherState { case idle, loading, playing, paused, seeking, ended, fai
     func selectAudioTrack(id: Int) {}
     func selectSubtitleTrack(id: Int) {}
     func clearSubtitle() {}
+    var activeSecondarySubtitleTrackID: Int?
+    func selectSecondarySubtitleTrack(id: Int) { activeSecondarySubtitleTrackID = id }
+    func clearSecondarySubtitle() { activeSecondarySubtitleTrackID = nil }
+    func removeExternalSubtitleTrack(id: Int) {}
+    var localCommits: [URL] = []
+    func selectLocalSubtitle(url: URL, title: String, lang: String, secondary: Bool,
+        permitsPreparation: @MainActor () -> Bool, permitsCommit: @MainActor () -> Bool, committedTrack: @MainActor (Int) -> Void, finishedCommit: @MainActor () -> Void) async throws {
+        guard permitsPreparation() else { throw CancellationError() }
+        await Task.yield()
+        guard !Task.isCancelled, permitsCommit() else { throw CancellationError() }
+        defer { finishedCommit() }
+        localCommits.append(url)
+        committedTrack(100000 + localCommits.count)
+    }
     func selectSidecarSubtitle(url: URL, headers: [String: String]?) {}
     func setSubtitleDelay(_ seconds: Double) {}
     var videoWidth = 0, videoHeight = 0
@@ -211,6 +226,18 @@ enum VortXAetherState { case idle, loading, playing, paused, seeking, ended, fai
             check(queued.results.isEmpty && fake.loads == [sourceA, sourceA],
                   "cancelled queued load cannot enter or stop a later session")
             controller.stop()
+        }
+        do {
+            let (controller, _, fake, _) = try fresh()
+            _ = await issue(controller, fake, sourceA).value()
+            fake.onSubtitleText?("Embedded English")
+            check(controller.subtitleOverlay.text == "Embedded English",
+                  "active embedded text crosses complete runtime bridge into shared styled overlay")
+            controller.setSubtitleTrack(-1)
+            fake.onSubtitleText?(nil)
+            check(controller.subtitleOverlay.text == nil, "Off clears shared embedded text overlay")
+            controller.stop(); fake.onSubtitleText?("retired subtitle")
+            check(controller.subtitleOverlay.text == nil, "retired native text callback cannot redraw a later surface")
         }
         print("\(checks) callback-isolation checks passed against complete maintained controller and bridge")
     }

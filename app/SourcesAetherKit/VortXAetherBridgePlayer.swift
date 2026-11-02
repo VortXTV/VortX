@@ -12,6 +12,8 @@ import UIKit
 public final class VortXAetherBridgePlayer: NSObject, VortXAetherBridging {
     private let player: VortXAetherPlayer
     private var loadTask: Task<Void, Never>?
+    private var subtitleTask: Task<Void, Never>?
+    private var subtitleGeneration: UInt64 = 0
     private var loadGeneration = 0
     /// Opens only when this generation actually enters its engine load. Cancelling a
     /// completed load Task does not retire the session that Task already opened.
@@ -106,6 +108,7 @@ public final class VortXAetherBridgePlayer: NSObject, VortXAetherBridging {
     /// Retires the physical session synchronously, including one whose load already
     /// completed. No callback may cross the gap before a replacement load enters.
     public func cancelLoad() {
+        cancelSubtitlePreparation()
         loadGeneration &+= 1
         let hadEnteredSession = acceptsCallbacks
         acceptsCallbacks = false
@@ -148,8 +151,57 @@ public final class VortXAetherBridgePlayer: NSObject, VortXAetherBridging {
     public var activeAudioTrackID: NSNumber? { acceptsCallbacks ? (player.activeAudioTrackID.map { NSNumber(value: $0) }) : nil }
     public var activeSubtitleTrackID: NSNumber? { acceptsCallbacks ? (player.activeSubtitleTrackID.map { NSNumber(value: $0) }) : nil }
     public func selectAudioTrack(id: Int) { player.selectAudioTrack(id: id) }
-    public func selectSubtitleTrack(id: Int) { player.selectSubtitleTrack(id: id) }
-    public func clearSubtitle() { player.clearSubtitle() }
+    public func selectSubtitleTrack(id: Int) {
+        cancelSubtitlePreparation()
+        player.selectSubtitleTrack(id: id)
+    }
+    public func clearSubtitle() {
+        cancelSubtitlePreparation()
+        player.clearSubtitle()
+    }
+    public var activeSecondarySubtitleTrackID: NSNumber? {
+        acceptsCallbacks ? player.activeSecondarySubtitleTrackID.map { NSNumber(value: $0) } : nil
+    }
+    public func selectSecondarySubtitleTrack(id: Int) {
+        cancelSubtitlePreparation()
+        player.selectSecondarySubtitleTrack(id: id)
+    }
+    public func clearSecondarySubtitle() {
+        cancelSubtitlePreparation()
+        player.clearSecondarySubtitle()
+    }
+    public func removeExternalSubtitleTrack(id: Int) { player.removeExternalSubtitleTrack(id: id) }
+    public func cancelSubtitlePreparation() {
+        subtitleGeneration &+= 1
+        subtitleTask?.cancel()
+        subtitleTask = nil
+    }
+    public func selectLocalSubtitle(url: URL, title: String, lang: String, secondary: Bool,
+        permitsPreparation: @escaping @MainActor () -> Bool, permitsCommit: @escaping @MainActor () -> Bool, committedTrack: @escaping @MainActor (Int) -> Void, finishedCommit: @escaping @MainActor () -> Void, completion: @escaping (Bool) -> Void) {
+        cancelSubtitlePreparation()
+        let generation = subtitleGeneration, load = loadGeneration
+        guard acceptsCallbacks, url.isFileURL, permitsPreparation() else { completion(false); return }
+        subtitleTask = Task { @MainActor [weak self] in
+            guard let self else { completion(false); return }
+            do {
+                try await player.selectLocalSubtitle(url: url, title: title, lang: lang, secondary: secondary,
+                    permitsPreparation: {
+                        !Task.isCancelled && self.acceptsCallbacks && self.loadGeneration == load
+                            && self.subtitleGeneration == generation && permitsPreparation()
+                    }, permitsCommit: {
+                    !Task.isCancelled && self.acceptsCallbacks && self.loadGeneration == load
+                        && self.subtitleGeneration == generation && permitsCommit()
+                }, committedTrack: committedTrack, finishedCommit: finishedCommit)
+                guard !Task.isCancelled, acceptsCallbacks, loadGeneration == load,
+                      subtitleGeneration == generation else { completion(false); return }
+                subtitleTask = nil
+                completion(true)
+            } catch {
+                if subtitleGeneration == generation { subtitleTask = nil }
+                completion(false)
+            }
+        }
+    }
     public func selectSidecarSubtitle(url: URL, headers: [String: String]?) {
         player.selectSidecarSubtitle(url: url, headers: headers)
     }

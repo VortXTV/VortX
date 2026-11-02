@@ -174,6 +174,12 @@ protocol PlayerEngine: AnyObject {
     /// this before a remux mount is constructed; engines without a remux-origin path use the no-op default.
     /// The value is one-shot so an unrelated later title can never inherit an earlier resume point.
     func configureResumeOrigin(seconds: Double)
+    /// Request ownership only: this active load already received the exact source-time origin.
+    /// This does not prove that a frame landed or authorize saving progress.
+    func ownsLoadResumeOrigin(seconds: Double) -> Bool
+    /// Admit progress from a decoder-owned settled sample when its clock can publish targets.
+    /// Engines with the historical progress contract retain the requested value by default.
+    func admittedProgressPosition(_ requested: Double, owner: PlayerLoadToken?) -> Double?
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE `loadFile`. The AVPlayer lane
     /// (true DV) uses it to switch the Apple TV into Dolby Vision mode before the item attaches; the libmpv
     /// lane renders DV as a tone-mapped PQ base layer, so it requests only HDR10 (a decoded-pixel pipeline
@@ -204,6 +210,10 @@ protocol PlayerEngine: AnyObject {
     func audioAndSubtitleTracks() -> (audio: [MPVTrack], subtitles: [MPVTrack])
     func setAudioTrack(_ id: Int)
     func setSubtitleTrack(_ id: Int)
+    var supportsSecondarySubtitles: Bool { get }
+    var primarySubtitleID: Int { get }
+    var secondarySubtitleID: Int { get }
+    func setSecondarySubtitleTrack(_ id: Int)
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?)
     var automaticSubtitleAlignmentAvailable: Bool { get }
@@ -291,12 +301,17 @@ extension PlayerEngine {
 
     func seekForResume(to seconds: Double) { seek(to: seconds) }
 
-    /// libmpv already receives its resume as an ordinary post-load seek. Only the AVPlayer remux lane needs a
-    /// pre-mount origin, so other engines intentionally ignore this one-shot configuration call.
+    /// libmpv receives its resume as an ordinary post-load seek. Origin-aware engines override this.
     func configureResumeOrigin(seconds: Double) {}
+    func ownsLoadResumeOrigin(seconds: Double) -> Bool { false }
+    func admittedProgressPosition(_ requested: Double, owner: PlayerLoadToken?) -> Double? { requested }
 
     /// libmpv is the established full-capability path. The AVPlayer conformer overrides this with its
     /// current-track external-overlay state, so adding the capability does not widen every concrete engine.
+    var supportsSecondarySubtitles: Bool { self is MPVMetalViewController }
+    var primarySubtitleID: Int { (self as? MPVMetalViewController)?.primarySubtitleID ?? -1 }
+    var secondarySubtitleID: Int { (self as? MPVMetalViewController)?.secondarySubtitleID ?? -1 }
+    func setSecondarySubtitleTrack(_ id: Int) { (self as? MPVMetalViewController)?.setSecondarySubtitleTrack(id) }
     var subtitleDelayAvailable: Bool { true }
 
     /// Unsupported conformers must not accidentally grant automatic-alignment authority with a fixed zero.

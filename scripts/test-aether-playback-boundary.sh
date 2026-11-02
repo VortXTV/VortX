@@ -10,6 +10,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -n
   app/SourcesAetherBridge/VortXAetherBridging.swift \
   app/Sources/Player/PlaybackMetadataFacts.swift \
   app/Sources/Player/AetherEngine/AetherEngineController.swift \
+  app/Tests/AetherSubtitleControllerFixtures.swift \
   app/Tests/AetherEngineControllerBehaviorTests.swift -o "$build_dir/controller-behavior"
 "$build_dir/controller-behavior"
 swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
@@ -22,6 +23,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -n
   app/SourcesAetherBridge/VortXAetherBridging.swift \
   app/Sources/Player/PlaybackMetadataFacts.swift \
   app/Sources/Player/AetherEngine/AetherEngineController.swift \
+  app/Tests/AetherSubtitleControllerFixtures.swift \
   app/SourcesAetherKit/VortXAetherBridgePlayer.swift \
   app/Tests/AetherLoadCallbackIsolationTests.swift -o "$build_dir/callback-isolation"
 "$build_dir/callback-isolation"

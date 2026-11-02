@@ -1590,6 +1590,12 @@ struct PlayerScreen: View {
     @State private var bufferedTime = 0.0   // buffered-ahead edge (seconds) for the YouTube-style grey scrubber band
     /// This screen's identity in FullscreenPlaybackGate, so a repeated onAppear counts it once.
     @State private var playbackGateToken = UUID()
+    @State private var pendingAetherSeekProgressOwner: PlayerLoadToken?
+    @State private var aetherProgressOwner: PlayerLoadToken?
+    /// Only the existing receiver progress callback can mint this receipt. Its original
+    /// source/account/load currency is rechecked before a Cast exit retires the manager.
+    @State private var acceptedCastProgress: (owner: PlayerLoadToken, position: Double,
+                                             duration: Double, isCurrent: @MainActor () -> Bool)?
     @State private var lastReported = -1.0     // last whole-second progress pushed to stremio-core
     @State private var isPaused = false
     @State private var speed = 1.0
@@ -2303,6 +2309,25 @@ struct PlayerScreen: View {
         #endif
     }
 
+    /// The active source can be offered to the bundled runtime without a separate audio URL.
+    private var canUseAetherEngine: Bool {
+        #if VORTX_AETHER_ENGINE
+        return !isTrailer && ((curURL ?? url) != url || audioSidecarURL == nil)
+            && PlayerEngineRouter.aetherEngineAvailable
+        #else
+        return false
+        #endif
+    }
+
+    /// Recovery still carries a binary AVPlayer/libmpv intent. Aether stays visible while
+    /// that transaction finishes, and can be selected once the current source is owned.
+    private var aetherEngineSwitchReady: Bool {
+        canUseAetherEngine && coordinator.player?.activeLoadToken != nil
+            && pendingAdvance == nil && supersededAdvance == nil && !hasUncommittedIssuedMedia
+            && !nativeDebridFreshLinkRecovery.freshLinkInFlight && !reconnecting && autoRetryTask == nil
+            && avToMPVHandoff == nil && !avToMPVHandoffBlocked
+    }
+
     /// Whether the mounted engine is AetherEngine, whose failures hand the source to libmpv (`demoteAetherToMPV`).
     private var isAetherEngineActive: Bool {
         #if VORTX_AETHER_ENGINE
@@ -2319,6 +2344,7 @@ struct PlayerScreen: View {
             .play(mpvSurfacePlayback.url, headers: mpvSurfacePlayback.headers,
                   audioSidecar: mpvSurfacePlayback.audioSidecar, isDolbyVision: mpvSurfacePlayback.isDolbyVision)
             .live(mpvSurfacePlayback.live)
+            .resumeOrigin(mpvSurfacePlayback.live ? 0 : (avSurfaceResumeOrigin ?? resumeSeconds))
             .initiallyPaused(enginePauseForSurface(engine: .libmpv))
             .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
@@ -3298,6 +3324,17 @@ struct PlayerScreen: View {
         // A late first-frame/EOF event cannot resurrect a terminal attempt. A deliberate retry or
         // accepted replacement reopens callbacks; the existing load-token gates still fence old events.
         guard !loadFailed else { return }
+        if isAetherEngineActive, let loadToken, loadToken == coordinator.player?.activeLoadToken {
+            aetherProgressOwner = loadToken
+        }
+        // Aether's optimistic seek clock is not rendered progress or EOF evidence.
+        // Its wrapper publishes a new owned sample when the physical position settles.
+        if isAetherEngineActive, name == MPVProperty.timePos,
+           let event = data as? PlayerTimePositionEvent,
+           event.loadToken == coordinator.player?.activeLoadToken, !event.transportSettled {
+            watchedDwell.reset()
+            return
+        }
         if let loadToken, let transfer = engineSurfaceTransfer,
            transfer.accepts(observedOwner: loadToken, activeOwner: coordinator.player?.activeLoadToken,
                             currentContext: resumeSurfaceContext(engine: isAVPlayerActive ? .avPlayer : .libmpv)) {
@@ -3628,9 +3665,10 @@ struct PlayerScreen: View {
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
                     // bogus offset (or drop a fake Continue-Watching entry).
                     if assetSanityAccepted, !effectivelyLive,
-                       duration > 0, d - lastReported >= 20 {   // push progress ~every 20s, the tvOS cadence
+                       duration > 0, d - lastReported >= 20 || pendingAetherSeekProgressOwner == event.loadToken {   // push progress ~every 20s, the tvOS cadence
                         // Each report is a full native-engine transaction (state hydrate + validation), so a
                         // 5 s cadence kept a core busy during playback. Pause, seek and exit still report at once.
+                        pendingAetherSeekProgressOwner = nil
                         lastReported = d
                         reportProgress(d)
                     }
@@ -3680,13 +3718,21 @@ struct PlayerScreen: View {
                 if !appliedInitialResume, d > 0 {
                     appliedInitialResume = true
                     let initialResume = assetSanityAttempt.owner.map { $0 == loadToken } == true ? assetSanityRequestedResume : resumeSeconds
+                    if initialResume.isFinite, initialResume >= d,
+                       coordinator.player?.ownsLoadResumeOrigin(seconds: initialResume) == true {
+                        coordinator.player?.seek(to: 0) // preserve the existing out-of-range fresh-start rule
+                    }
                     if initialResume.isFinite, initialResume > 0, initialResume < d {   // this exact load's requested origin
                         // A remux resume is fulfilled before mount by rebuilding from the configured source
                         // origin. Do not seek AVPlayer into a forward-only playlist after mount. Verify the
                         // achieved keyframe origin instead; only a genuinely unreachable request needs the
                         // progress floor and an unavailable notice.
-                        if let av = coordinator.player as? AVPlayerEngineController,
-                           let origin = av.achievedRemuxTimelineOriginSeconds {
+                        if coordinator.player?.ownsLoadResumeOrigin(seconds: initialResume) == true {
+                            // Aether consumed this origin before load. Protect the stored position until
+                            // settled playback reaches it; do not replace its start with a second seek.
+                            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, initialResume)
+                        } else if let av = coordinator.player as? AVPlayerEngineController,
+                                  let origin = av.achievedRemuxTimelineOriginSeconds {
                             let retainedFloor = DeferredResumeSeekReconciliationPolicy.floorAfterAutomaticResume(
                                 currentFloor: suppressedResumeFloor, abandonment: abandonedResumeRecovery,
                                 currentOwner: loadToken, proposedFloor: nil, retirement: retiredResumePersistenceFloor,
@@ -6549,6 +6595,125 @@ struct PlayerScreen: View {
         return nil
     }
 
+    /// Retire every AV remux producer before the Aether surface can open the same source.
+    /// Uses the same bounded receipt and black-surface barrier as the existing MPV handoff.
+    private func switchAVPlayerToAether() {
+        #if VORTX_AETHER_ENGINE
+        guard aetherEngineSwitchReady,
+              let retiring = coordinator.player as? AVPlayerEngineController,
+              let retiringOwner = retiring.activeLoadToken else { return }
+        adoptResumeSurfaceIfCurrent(loadToken: retiringOwner)
+        pendingAudioReapply = captureSelectedAudioChoice()
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        resumeRetryGeneration &+= 1
+        let handoff = AVToMPVHandoff(
+            url: curURL ?? url,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            resumeGeneration: resumeRetryGeneration
+        )
+        let resume = retryResumeTarget()
+        engineSurfaceTransfer = .init(retiringOwner: retiringOwner, context: resumeSurfaceContext(engine: .libmpv))
+        prepareResumeSurfaceTransfer(engine: .libmpv, origin: resume)
+        demotedEngineLoadToken = retiringOwner
+        invalidatePreparedEpisode(reason: "AV-to-Aether handoff")
+        directAVNoFrameRecovery = nil
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        loadTimeout?.cancel(); loadTimeout = nil
+        cancelPostFrameResumeSeekWatchdog()
+        let quiescence = retiring.stopForMPVFallback()
+        clearCachedAudioOutputTruth()
+        avToMPVHandoff = handoff
+        avToMPVHandoffTask?.cancel()
+        avToMPVHandoffTask = Task { @MainActor in
+            let quiescent = await quiescence.wait(timeout: .seconds(2))
+            guard !Task.isCancelled, pendingAdvance == nil, supersededAdvance == nil, !hasUncommittedIssuedMedia, !playbackExited,
+                  avToMPVHandoff == handoff,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url) else { return }
+            guard VortXRemuxHandoffPolicy.canMountMPV(routeStillCurrent: true, producerQuiescent: quiescent),
+                  canUseAetherEngine, !nativeDebridFreshLinkRecovery.freshLinkInFlight,
+                  !reconnecting, autoRetryTask == nil else {
+                avToMPVHandoff = nil
+                avToMPVHandoffBlocked = true
+                loadErrorMsg = "Playback could not switch safely. Try another source."
+                presentTerminalLoadFailure()
+                return
+            }
+            // Supply the active source and origin before releasing the black-surface barrier.
+            engineSurfaceURLOverride = handoff.url
+            engineSurfaceHeadersOverride = curHeaders
+            engineSurfaceUsesActiveTuple = true
+            avSurfaceResumeOrigin = resume
+            appliedSize = false; appliedVolume = false; appliedAutoTracks = false
+            isSeekable = true; loadFailed = false
+            srcProbeLoadStart = Date()
+            addedSubURLs = []; addedPooledIDs = []
+            invalidateSubtitlePresentationForReplacement()
+            subtitleLoadingURL = nil
+            hasStartedPlaying = false; buffering = true; loadErrorMsg = ""
+            firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil
+            bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
+            avDemotedAt = Date()
+            aetherLatch = true
+            aetherEngineFailed = false
+            engineLatch = false
+            manualEngineAVPlayer = nil
+            avEngineFailed = false
+            avToMPVHandoff = nil
+            let mounted = await awaitReplacementAetherMount(for: handoff)
+            guard !Task.isCancelled, pendingAdvance == nil, supersededAdvance == nil, !hasUncommittedIssuedMedia, !playbackExited, useAetherEngine,
+                  avToMPVHandoff == nil, !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url),
+                  let mounted, coordinator.player === mounted.controller,
+                  mounted.controller.activeLoadToken == mounted.token,
+                  mounted.token != retiringOwner else { return }
+            adoptResumeSurfaceIfCurrent(loadToken: mounted.token)
+            mounted.controller.setSpeed(speed)
+            startLoadTimeout()
+            // Aether consumes the captured origin at mount; no duplicate post-mount seek.
+        }
+        #endif
+    }
+
+    #if VORTX_AETHER_ENGINE
+    private func awaitReplacementAetherMount(
+        for handoff: AVToMPVHandoff
+    ) async -> (controller: AetherEngineController, token: PlayerLoadToken)? {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !Task.isCancelled, ContinuousClock.now < deadline {
+            guard !playbackExited, pendingAdvance == nil, supersededAdvance == nil, !hasUncommittedIssuedMedia, useAetherEngine,
+                  avToMPVHandoff == nil, !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url) else { return nil }
+            if let controller = coordinator.player as? AetherEngineController,
+               let token = controller.activeLoadToken {
+                return (controller, token)
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        // Cancellation can end the polling loop during its sleep. A stale task
+        // must not publish a timeout into a newer source, route or exited player.
+        guard !Task.isCancelled, pendingAdvance == nil, supersededAdvance == nil, !hasUncommittedIssuedMedia, !playbackExited, useAetherEngine,
+              avToMPVHandoff == nil, !avToMPVHandoffBlocked,
+              handoff.episodeGeneration == episodeSwitchGeneration,
+              handoff.sourceGeneration == sourceSwitchGeneration,
+              handoff.resumeGeneration == resumeRetryGeneration,
+              handoff.url == (curURL ?? url) else { return nil }
+        avToMPVHandoffBlocked = true
+        loadErrorMsg = "The replacement player did not start."
+        presentTerminalLoadFailure()
+        return nil
+    }
+    #endif
+
     /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
     /// user-driven switch: tears the live engine down synchronously (straddle invariant) BEFORE flipping the
     /// manual override so `playerSurface` re-renders the other engine on the SAME view, carries the live
@@ -6558,8 +6723,15 @@ struct PlayerScreen: View {
     /// design; matching is by lang/title). No-op when already on the requested engine.
     private func switchPlayerEngine(
         toAVPlayer: Bool,
-        preservingNativeDebridRecoveryGeneration: Bool = false
+        preservingNativeDebridRecoveryGeneration: Bool = false,
+        toAether: Bool = false
     ) {
+        guard avToMPVHandoff == nil, !avToMPVHandoffBlocked else { close(); return }
+        if toAether {
+            if isAetherEngineActive { close(); return }
+            // Recheck at activation: availability/source ownership may have changed since row creation.
+            guard !toAVPlayer, aetherEngineSwitchReady else { close(); return }
+        }
         if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
@@ -6575,12 +6747,12 @@ struct PlayerScreen: View {
         }
         // AetherEngine -> VortX Player is the same in-place replay its failure path uses; AetherEngine ->
         // AVPlayer takes the ordinary switch below (the manual pick retires the AetherEngine latch).
-        if !toAVPlayer, isAetherEngineActive {
+        if !toAVPlayer, !toAether, isAetherEngineActive {
             demoteAetherToMPV(reason: "viewer picked VortX Player", notify: false)
             close()
             return
         }
-        guard toAVPlayer != isAVPlayerActive else { close(); return }
+        guard toAether || toAVPlayer != isAVPlayerActive else { close(); return }
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         if (reconnecting || autoRetryTask != nil),
            recoverCurrentNativeDebridLink(reason: "engine switch", requestedEngine: toAVPlayer) {
@@ -6589,12 +6761,17 @@ struct PlayerScreen: View {
         }
         // Resolve a stale provider URL (or join its current refresh) BEFORE the physical AV→MPV handoff.
         // Otherwise the direct demotion bypasses fresh-link recovery and loads the same failed transport.
-        if !toAVPlayer, coordinator.player is AVPlayerEngineController {
+        if toAether, coordinator.player is AVPlayerEngineController {
+            switchAVPlayerToAether()
+            close()
+            return
+        }
+        if !toAVPlayer, !toAether, coordinator.player is AVPlayerEngineController {
             demoteAVPlayerToMPV(silent: true)
             close()
             return
         }
-        srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
+        srcProbe("user engine switch -> \(toAether ? "AetherEngine" : (toAVPlayer ? "AVPlayer" : "libmpv")) (mid-title, carry position)")
         if !preservingNativeDebridRecoveryGeneration { resumeRetryGeneration &+= 1 }
         if let retiringOwner = coordinator.player?.activeLoadToken {
             engineSurfaceTransfer = .init(retiringOwner: retiringOwner,
@@ -6624,7 +6801,13 @@ struct PlayerScreen: View {
         engineSurfaceHeadersOverride = curHeaders
         engineSurfaceUsesActiveTuple = true
         avSurfaceResumeOrigin = resume
-        manualEngineAVPlayer = toAVPlayer
+        aetherLatch = toAether
+        if toAether {
+            aetherEngineFailed = false
+            // An Aether failure must uncover libmpv, not the outgoing AV route.
+            engineLatch = false
+        }
+        manualEngineAVPlayer = toAether ? nil : toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
         avDemotedAt = Date()               // grace window swallows a stale event from the outgoing engine
         // Treat the new mount as a fresh load (mirrors demoteAVPlayerToMPV). The new engine loads no external
@@ -6643,15 +6826,15 @@ struct PlayerScreen: View {
         startLoadTimeout()
         if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
         if pendingResumeSurfaceTransfer == nil, retiredResumePersistenceFloor == nil { suppressedResumeFloor = nil }
-        // A remux target consumes `avSurfaceResumeOrigin` before its initial load. Native AVPlayer and libmpv
-        // still need their ordinary post-mount seek.
-        if resume > 5, !targetIsRemux { nudgeResume(to: resume) }
+        // Remux and Aether targets consume the origin before their initial load. Native AVPlayer and
+        // libmpv still need their ordinary post-mount seek.
+        if resume > 5, !targetIsRemux, !toAether { nudgeResume(to: resume) }
         // Ordinary replacements already mount the active tuple. Only a pending episode needs an explicit
         // issued load to rebind its pending-token transaction to the newly constructed controller.
         if let cu = curURL, pendingAdvance?.issued == true {
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
-                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled, curURL == cu,
+                guard (toAether ? useAetherEngine : (!useAetherEngine && manualEngineAVPlayer == toAVPlayer)), !Task.isCancelled, curURL == cu,
                       reissueEpisodeGeneration == episodeSwitchGeneration,
                       reissueMediaGeneration == resumeRetryGeneration,
                       reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
@@ -6662,7 +6845,7 @@ struct PlayerScreen: View {
         // Re-apply speed once the new engine's controller is mounted (next render).
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(700))
-            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled,
+            guard (toAether ? useAetherEngine : (!useAetherEngine && manualEngineAVPlayer == toAVPlayer)), !Task.isCancelled,
                   reissueEpisodeGeneration == episodeSwitchGeneration,
                   reissueMediaGeneration == resumeRetryGeneration,
                   reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
@@ -6949,6 +7132,12 @@ struct PlayerScreen: View {
         ) {
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
             lastReported = max(lastReported, suppressedResumeFloor ?? floor)
+        }
+        if coordinator.player?.ownsLoadResumeOrigin(seconds: ticket.targetSeconds) == true {
+            // In-place Aether loads already received this exact origin in loadIntoPlayer.
+            // Settlement, including a paused landing, still comes from the owned time event.
+            _ = deferredResumeAttempt.complete(ticket)
+            return
         }
         Task { @MainActor in
             for _ in 0..<DeferredResumePolicy.maximumPollCount {
@@ -8980,6 +9169,7 @@ struct PlayerScreen: View {
                 && playbackMutationTarget == target && target.stillOwnsCurrentContext(core: core)
                 && !hasUncommittedIssuedMedia && !persistenceBlockedForExit
         }
+        acceptedCastProgress = nil
         googleCast.cast(.init(owner: UUID(), url: sourceURL, title: curTitle,
             position: currentTime, duration: duration, paused: isPaused || playbackDeadlineClock.isPaused, torrent: curIsTorrent,
             selectedServer: selectedServer, nativeBase: nativeBase, isCurrent: isCurrent,
@@ -8993,6 +9183,7 @@ struct PlayerScreen: View {
                 hideTask?.cancel(); hideTask = nil
             }, progress: { position, remoteDuration in
                 guard isCurrent(), remoteDuration > 0 else { return }
+                acceptedCastProgress = (loadToken, position, remoteDuration, isCurrent)
                 currentTime = position; duration = remoteDuration
                 reportProgress(position, acceptedOwner: loadToken, castReceipt: true)
             }, returnLocal: { position, play in
@@ -9081,9 +9272,13 @@ struct PlayerScreen: View {
         // other save (the hosts no longer write the account from the closures).
         if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
            duration > 0 {
-            if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
-            lastReported = 0
-            saveAccountProgress(0)
+            if isAetherEngineActive {
+                pendingAetherSeekProgressOwner = coordinator.player?.activeLoadToken
+            } else {
+                if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
+                lastReported = 0
+                saveAccountProgress(0)
+            }
         }
         viewerPlay()   // restart is an explicit resume, including its recovery budget
         scheduleHide()
@@ -9153,9 +9348,13 @@ struct PlayerScreen: View {
                     // other save (the hosts no longer write the account from the closures).
                     if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
                        duration > 0 {
-                        if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
-                        lastReported = 0
-                        saveAccountProgress(0)
+                        if isAetherEngineActive {
+                            pendingAetherSeekProgressOwner = coordinator.player?.activeLoadToken
+                        } else {
+                            if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
+                            lastReported = 0
+                            saveAccountProgress(0)
+                        }
                     }
                     viewerPlay()   // restart is an explicit resume, including its recovery budget
                     scheduleHide()
@@ -10723,7 +10922,7 @@ struct PlayerScreen: View {
     /// `auto`: a background language-chain pick (autoSelectAddonSubtitleIfNeeded tier 2), which suppresses the
     /// subtitleLoadFailed alert on failure, matching the add-on auto path and tvOS (the user did not ask).
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
-        if auto { selectAutomaticPooledSubtitle(sub); return }
+        if auto || isAetherEngineActive { selectAutomaticPooledSubtitle(sub, reportFailure: !auto); return }
         invalidateSubtitleAlignmentPresentation()
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume,
@@ -10808,7 +11007,7 @@ struct PlayerScreen: View {
 
     /// Preferred-language pool selection preserves the exact pre-download decision. The pool
     /// supplies immutable authorized bytes; the engine captures its real reference before raw mounting.
-    private func selectAutomaticPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+    private func selectAutomaticPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, reportFailure: Bool = false) {
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume, VortXSyncManager.shared.isSignedIn,
               let player = coordinator.player, let load = player.activeLoadToken else { return }
@@ -10857,9 +11056,13 @@ struct PlayerScreen: View {
                 if subtitlePoolRequests.finishDownload(download) {
                     subtitleAlignmentPresentation = nil
                     subtitleLoadingURL = nil
+                    if reportFailure, current {
+                        subtitleAlignmentNotice = PlayerExternalSubtitleSelectionResult.failed.failureMessage
+                        subtitleLoadFailed = true
+                    }
                     if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
                 }
-                return // Automatic failure stays silent and never retries as an ordinary mount.
+                return // Manual current failures report once; automatic fallback and superseded requests stay quiet.
             }
             guard let external = subtitlePoolRequests.beginExternal(after: download) else { return }
             let request = player.selectLocalExternalSubtitleAutomatically(source,
@@ -10883,6 +11086,9 @@ struct PlayerScreen: View {
                     } else {
                         applyCurrentSubtitleDelayIfReady(force: false)
                     }
+                } else if reportFailure, case .failed = result {
+                    subtitleAlignmentNotice = result.failureMessage
+                    subtitleLoadFailed = true
                 }
                 if panelShowsSubtitleList, let p = panel { panelRows = rows(for: p) }
             }
@@ -11207,10 +11413,10 @@ struct PlayerScreen: View {
             // language row drills into `.subtitleLanguage`, which lists every sub in that language across
             // embedded + add-on + community sources, so a title with dozens of subs no longer forces one
             // long flat scroll.
-            let mpvEngine = coordinator.player as? MPVMetalViewController
-            let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
+            let subtitleEngine = coordinator.player
+            let secondaryID = subtitleEngine?.secondarySubtitleID ?? -1
             let dualActive = secondaryID >= 0
-            let primaryID = mpvEngine?.primarySubtitleID ?? -1
+            let primaryID = subtitleEngine?.primarySubtitleID ?? -1
             let primaryOff = aligned == nil && (dualActive
                 ? (primaryID < 0)
                 : subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable })
@@ -11226,11 +11432,11 @@ struct PlayerScreen: View {
             // the opt-in "only preferred languages" toggle is on, non-preferred languages are hidden
             // (unknown-language subs always kept so the list never empties).
             let availableAddon = TrackSelector.keepingPreferredSubtitleLanguages(
-                addonSubs.filter { !addedSubURLs.contains($0.url) }, language: { $0.lang })
+                addonSubs.filter { (!addedSubURLs.contains($0.url) || isAetherEngineActive) }, language: { $0.lang })
             // Community-pooled subtitles (P2): other users' extracted subs for this title. Same opt-in
             // preferred-language filter as the add-on rows above.
             let availablePooled = TrackSelector.keepingPreferredSubtitleLanguages(
-                pooledSubs.filter { !addedPooledIDs.contains($0.id) }, language: { $0.lang })
+                pooledSubs.filter { (!addedPooledIDs.contains($0.id) || isAetherEngineActive) }, language: { $0.lang })
             // Union of every language offered by ANY source, each with its total count.
             var languageCounts: [String: Int] = [:]
             for t in subtitleTracks { languageCounts[subtitleLanguageKey(t.lang), default: 0] += 1 }
@@ -11250,11 +11456,9 @@ struct PlayerScreen: View {
             if languageCounts.isEmpty {
                 rs.append(Row(label: String(localized: "No subtitles available"), isHeader: true))
             }
-            // Second subtitle (language-study dual tracks). libmpv renders two subtitle tracks at once, so this
-            // drill-in only appears on that engine and only when there are at least two tracks to choose a
-            // second from. On the AVPlayer engine there is no secondary-subtitle overlay, so the row is hidden
-            // and playback degrades gracefully to the single primary subtitle (see .secondarySubtitles below).
-            if mpvEngine != nil, subtitleTracks.count >= 2 {
+            // Both libmpv and Aether expose two genuine subtitle channels. Unsupported engines
+            // retain a single primary subtitle; no second-channel control is advertised for them.
+            if subtitleEngine?.supportsSecondarySubtitles == true, subtitleTracks.filter(\.isSelectable).count >= 2 {
                 let secondLabel: String = {
                     if let t = subtitleTracks.first(where: { $0.id == secondaryID }) {
                         return String(localized: "Second subtitle") + " · " + langName(t.lang.isEmpty ? "und" : t.lang)
@@ -11268,10 +11472,10 @@ struct PlayerScreen: View {
             // One language's complete sub list: embedded tracks first, then add-on, then community.
             let aligned = coordinator.player?.alignedExternalSubtitle
             let alignmentAvailable = coordinator.player?.automaticSubtitleAlignmentAvailable == true
-            let mpvEngine = coordinator.player as? MPVMetalViewController
-            let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
+            let subtitleEngine = coordinator.player
+            let secondaryID = subtitleEngine?.secondarySubtitleID ?? -1
             let dualActive = secondaryID >= 0
-            let primaryID = mpvEngine?.primarySubtitleID ?? -1
+            let primaryID = subtitleEngine?.primarySubtitleID ?? -1
             let primarySel: ((MPVTrack) -> Bool)? = dualActive ? { $0.id == primaryID } : nil
             var rs: [Row] = []
             let embedded = subtitleTracks.filter { subtitleLanguageKey($0.lang) == code }
@@ -11293,13 +11497,14 @@ struct PlayerScreen: View {
                 }
             }
             let languageAddon = TrackSelector.keepingPreferredSubtitleLanguages(
-                addonSubs.filter { !addedSubURLs.contains($0.url) && subtitleLanguageKey($0.lang) == code },
+                addonSubs.filter { (!addedSubURLs.contains($0.url) || isAetherEngineActive) && subtitleLanguageKey($0.lang) == code },
                 language: { $0.lang })
             if !languageAddon.isEmpty {
                 rs.append(Row(label: String(localized: "From add-ons"), isHeader: true))
                 for sub in languageAddon.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url
-                    rs.append(Row(label: sub.displayTitle, detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
+                    rs.append(Row(label: sub.displayTitle, detail: loading ? String(localized: "Loading…") : String(localized: "Add-on"),
+                        selected: selectedAetherExternalSubtitle?.url == sub.url) {
                         selectAddonSubtitle(sub)
                     })
                     if alignmentAvailable {
@@ -11312,13 +11517,14 @@ struct PlayerScreen: View {
                 }
             }
             let languagePooled = TrackSelector.keepingPreferredSubtitleLanguages(
-                pooledSubs.filter { !addedPooledIDs.contains($0.id) && subtitleLanguageKey($0.lang) == code },
+                pooledSubs.filter { (!addedPooledIDs.contains($0.id) || isAetherEngineActive) && subtitleLanguageKey($0.lang) == code },
                 language: { $0.lang })
             if !languagePooled.isEmpty {
                 rs.append(Row(label: String(localized: "Community"), isHeader: true))
                 for sub in languagePooled.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
-                    rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
+                    rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community"),
+                        selected: selectedAetherExternalSubtitle?.url == sub.url.absoluteString) {
                         invalidateSubtitleAlignmentPresentation()
                         userPickedSubtitle = true
                         selectPooledSubtitle(sub)
@@ -11327,23 +11533,21 @@ struct PlayerScreen: View {
             }
             return rs
         case .secondarySubtitles:
-            // Pick a SECOND subtitle track shown at the same time as the primary (top of frame vs. bottom), for
-            // language study. libmpv-only: driven through the concrete engine because `secondary-sid` has no
-            // AVPlayer equivalent. mpv refuses to show one track as both primary and secondary, so the current
-            // primary is excluded from the options. The checkmark keys off the engine's tracked secondary id.
-            let mpvEngine = coordinator.player as? MPVMetalViewController
-            let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
-            let primaryID = mpvEngine?.primarySubtitleID ?? -1
+            // The supported engine renders its second channel independently. Exclude the current
+            // primary and keep the original engine's selected secondary id for the checkmark.
+            let subtitleEngine = coordinator.player
+            let secondaryID = subtitleEngine?.secondarySubtitleID ?? -1
+            let primaryID = subtitleEngine?.primarySubtitleID ?? -1
             var rs: [Row] = [Row(label: String(localized: "Off"), selected: secondaryID < 0) {
                 VXProbe.log("subs", "secondary subtitle off")
                 invalidateSubtitleAlignmentPresentation()
-                mpvEngine?.setSecondarySubtitleTrack(-1)
+                subtitleEngine?.setSecondarySubtitleTrack(-1)
             }]
             let secondaryOptions = subtitleTracks.filter { primaryID < 0 || $0.id != primaryID }
             rs += groupedTrackRows(secondaryOptions, isSelected: { $0.id == secondaryID }) { id in
                 VXProbe.log("subs", "selected secondary subtitle track \(id)")
                 invalidateSubtitleAlignmentPresentation()
-                mpvEngine?.setSecondarySubtitleTrack(id)
+                subtitleEngine?.setSecondarySubtitleTrack(id)
             }
             return rs
         case .subtitleSettings:
@@ -11494,7 +11698,7 @@ struct PlayerScreen: View {
             #if os(iOS) || os(macOS)
             // Player engine picker (P3, #76): only when AVPlayer is a real option for this stream (DV / HLS /
             // debrid; never torrents or a yt-direct sidecar pair). Flips libmpv <-> AVPlayer mid-title.
-            if canUseAVPlayerEngine || isAetherEngineActive {
+            if canUseAVPlayerEngine || canUseAetherEngine || isAetherEngineActive {
                 let engineName = isAetherEngineActive ? "AetherEngine" : (isAVPlayerActive ? "AVPlayer" : "VortX Player")
                 rows.append(Row(label: "Player engine", detail: "\(engineName)  ›") { openPanel(.engine) })
             }
@@ -11520,9 +11724,13 @@ struct PlayerScreen: View {
             var rs: [Row] = [Row(label: "VortX Player", detail: "all formats, styled subtitles", selected: !onAV && !onAether) {
                 switchPlayerEngine(toAVPlayer: false)
             }]
-            if onAether {
-                // Shown while it plays so the viewer can see it; switching back into it starts a new playback.
-                rs.append(Row(label: "AetherEngine", detail: "testing", selected: true) { close() })
+            if onAether || canUseAetherEngine {
+                rs.append(Row(label: "AetherEngine", detail: onAether || aetherEngineSwitchReady ? "" :
+                    ((pendingAdvance != nil || supersededAdvance != nil || hasUncommittedIssuedMedia)
+                        ? "waiting for playback transition" : "waiting for source recovery"),
+                              selected: onAether, isEnabled: onAether || aetherEngineSwitchReady) {
+                    switchPlayerEngine(toAVPlayer: false, toAether: true)
+                })
             }
             if canUseAVPlayerEngine {
                 rs.append(Row(label: "AVPlayer", detail: "Dolby Vision, HLS", selected: onAV) {
@@ -11910,20 +12118,38 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         invalidateWatchPartyOwner()
         #if os(iOS) && !CINEMA_UI_SMOKE_RENDERER
-        if googleCast.state.owned {
-            currentTime = googleCast.state.position; duration = googleCast.state.duration
-        }
+        let exitingCastOwner = googleCast.state.owned
+        let castExitReceipt: (position: Double, duration: Double)? = exitingCastOwner
+            ? acceptedCastProgress.flatMap { receipt in
+                guard receipt.owner == coordinator.player?.activeLoadToken, receipt.isCurrent(),
+                      receipt.position.isFinite, receipt.position >= 0,
+                      receipt.duration.isFinite, receipt.duration > 0 else { return nil }
+                return (receipt.position, receipt.duration)
+            } : nil
+        if let receipt = castExitReceipt { currentTime = receipt.position; duration = receipt.duration }
+        acceptedCastProgress = nil
         googleCast.retire()
+        #else
+        let exitingCastOwner = false
+        let castExitReceipt: (position: Double, duration: Double)? = nil
         #endif
         invalidateSubtitlePresentationForReplacement()
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
         curDebridRef?.nativeUsenetLease?.close()
         // Preview time is temporary editor state, not the viewer's watch progress.
         // Restore it under the original owner before terminal/history/scrobble decisions.
+        let exitingAetherPreview = !exitingCastOwner && isAetherEngineActive && skipDBPreviewing
+            && skipDBPreviewOwner != nil && skipDBPreviewOwner == coordinator.player?.activeLoadToken
         if skipDBPreviewing { stopSkipDBPreview() }
         let exitLoadToken = coordinator.player?.activeLoadToken
         engineSurfaceTransfer = nil
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
+        // The just-issued preview return has not landed yet; its last decoder witness still
+        // describes temporary editor playback. Retain the previous durable resume on this exit.
+        let exitPosition = exitingAetherPreview ? nil : (exitingCastOwner ? castExitReceipt?.position
+            : admittedProgressPosition(currentTime, owner: exitLoadToken))
+        let exitStopPosition = exitingAetherPreview ? nil : (exitingCastOwner ? castExitReceipt?.position
+            : admittedStopPosition(currentTime, owner: exitLoadToken))
         cancelTerminalFinalityRefresh()
         cancelDirectResumeInventoryRefresh()
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer leaving immediately
@@ -11931,8 +12157,8 @@ struct PlayerScreen: View {
         // Dismissing/rewinding Continue Watching requires proven completion, not
         // a provisional duration or a scrub target that happens to exceed 90%.
         if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive,
-           markedWatched, duration.isFinite, duration > 0, currentTime.isFinite,
-           currentTime / duration >= 0.9, let m = curMeta {
+           markedWatched, duration.isFinite, duration > 0, let exitPosition, exitPosition.isFinite,
+           exitPosition / duration >= 0.9, let m = curMeta {
             if !m.usesSeriesLifecycle, terminalRewindGate.issueTerminalRewind() {
                 core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)
             }
@@ -11953,16 +12179,16 @@ struct PlayerScreen: View {
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
         }
         if terminalRewindGate.permitsExitProgressFlush,
-           assetSanityAccepted, !effectivelyLive, duration > 0 {
-            reportProgress(currentTime, acceptedOwner: exitLoadToken)
+           assetSanityAccepted, !effectivelyLive, duration > 0, let exitPosition {
+            reportProgress(exitPosition, acceptedOwner: exitLoadToken, castReceipt: exitingCastOwner)
         }
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
         // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
         if !persistenceBlockedForExit, assetSanityAccepted,
-           !effectivelyLive, let m = curMeta {
+           !effectivelyLive, let m = curMeta, let exitStopPosition {
             ScrobbleCoordinator.shared.playbackStopped(
-                m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration
+                m, position: exitStopPosition, duration: duration
             )
         }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
@@ -12186,6 +12412,22 @@ struct PlayerScreen: View {
     /// keeps the real resume point only in `suppressedResumeFloor`; without this the periodic saves and the
     /// exit flush would overwrite the account resume with the restarted-low position. The floor clears once
     /// the playhead passes it (the viewer caught up) or on the next source/episode load.
+    private func admittedStopPosition(_ requested: Double, owner: PlayerLoadToken?) -> Double? {
+        guard isAetherEngineActive || (owner != nil && owner == aetherProgressOwner) else {
+            return max(requested, suppressedResumeFloor ?? 0)
+        }
+        guard let position = admittedProgressPosition(requested, owner: owner),
+              suppressedResumeFloor.map({ position >= $0 }) ?? true else { return nil }
+        // A protected resume floor is not rendered progress and cannot imply a watched scrobble.
+        return position
+    }
+
+    private func admittedProgressPosition(_ requested: Double, owner: PlayerLoadToken?) -> Double? {
+        guard isAetherEngineActive || (owner != nil && owner == aetherProgressOwner) else { return requested }
+        guard isAetherEngineActive else { return nil }
+        return coordinator.player?.admittedProgressPosition(requested, owner: owner)
+    }
+
     private func reportProgress(
         _ position: Double,
         acceptedOwner: PlayerLoadToken? = nil,
@@ -12196,13 +12438,14 @@ struct PlayerScreen: View {
         #endif
         let integrityOwner = acceptedOwner ?? coordinator.player?.activeLoadToken
         guard assetSanityAttempt.isAccepted(owner: integrityOwner) else { return }
+        guard let position = (castReceipt ? Optional(position) : admittedProgressPosition(position, owner: integrityOwner)) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         if let floor = suppressedResumeFloor {
             if position < floor { return }
             suppressedResumeFloor = nil
         }
         if engineWritesOpen { onProgress(position, duration, playbackMutationTarget) }
-        saveAccountProgress(position, acceptedOwner: integrityOwner)
+        saveAccountProgress(position, acceptedOwner: integrityOwner, castReceipt: castReceipt)
     }
 
     /// Persist a user-initiated seek (skip buttons, macOS arrow keys, slider commit) to the presenter, which
@@ -12217,6 +12460,10 @@ struct PlayerScreen: View {
         guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard duration > 0 else { return }
+        if isAetherEngineActive {
+            pendingAetherSeekProgressOwner = coordinator.player?.activeLoadToken
+            return // the settled callback forces a save even for a backward seek
+        }
         if let floor = suppressedResumeFloor {
             if target < floor { return }
             suppressedResumeFloor = nil
@@ -12248,10 +12495,12 @@ struct PlayerScreen: View {
     /// (trailer / paste-a-link / web shell) is a no-op, exactly like the old host-side meta guards.
     private func saveAccountProgress(
         _ position: Double,
-        acceptedOwner: PlayerLoadToken? = nil
+        acceptedOwner: PlayerLoadToken? = nil,
+        castReceipt: Bool = false
     ) {
         let integrityOwner = acceptedOwner ?? coordinator.player?.activeLoadToken
         guard assetSanityAttempt.isAccepted(owner: integrityOwner) else { return }
+        guard let position = (castReceipt ? Optional(position) : admittedProgressPosition(position, owner: integrityOwner)) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard let m = curMeta else { return }
         let dur = duration
@@ -12262,7 +12511,18 @@ struct PlayerScreen: View {
     /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it
     /// (mandated check 8). Off when no track is selected; otherwise an add-on / pooled external sub (matched
     /// back by language against the added set) or an embedded track (by lang/title).
+    private var selectedAetherExternalSubtitle: (url: String, title: String, lang: String)? {
+        #if VORTX_AETHER_ENGINE
+        (coordinator.player as? AetherEngineController)?.currentExternalSubtitle
+        #else
+        nil
+        #endif
+    }
     private func captureSubtitleChoice() -> SubtitleChoice {
+        if let selected = selectedAetherExternalSubtitle {
+            if let pooled = pooledSubs.first(where: { $0.url.absoluteString == selected.url }) { return .pooled(id: pooled.id) }
+            return .external(url: selected.url, title: selected.title, lang: selected.lang)
+        }
         if let aligned = coordinator.player?.alignedExternalSubtitle {
             return .external(url: aligned.url, title: aligned.title, lang: aligned.lang)
         }
@@ -12302,6 +12562,11 @@ struct PlayerScreen: View {
             }
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
+            if isAetherEngineActive {
+                // Re-enter the real installed-source guarded-byte route, not the legacy URL adapter.
+                if let source = addonSubs.first(where: { $0.url == urlStr }) { selectAddonSubtitle(source) }
+                return
+            }
             guard let player = coordinator.player else { return }
             let subtitlePresentationID = subtitlePresentationEpoch
             let subtitleLoadToken = player.activeLoadToken

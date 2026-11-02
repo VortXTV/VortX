@@ -49,6 +49,20 @@ enum VortXAetherState { case idle, loading, playing, paused, seeking, ended, fai
     func selectAudioTrack(id: Int) {}
     func selectSubtitleTrack(id: Int) {}
     func clearSubtitle() {}
+    var activeSecondarySubtitleTrackID: Int?
+    func selectSecondarySubtitleTrack(id: Int) { activeSecondarySubtitleTrackID = id }
+    func clearSecondarySubtitle() { activeSecondarySubtitleTrackID = nil }
+    func removeExternalSubtitleTrack(id: Int) {}
+    var localCommits: [URL] = []
+    func selectLocalSubtitle(url: URL, title: String, lang: String, secondary: Bool,
+        permitsPreparation: @MainActor () -> Bool, permitsCommit: @MainActor () -> Bool, committedTrack: @MainActor (Int) -> Void, finishedCommit: @MainActor () -> Void) async throws {
+        guard permitsPreparation() else { throw CancellationError() }
+        await Task.yield()
+        guard !Task.isCancelled, permitsCommit() else { throw CancellationError() }
+        defer { finishedCommit() }
+        localCommits.append(url)
+        committedTrack(100000 + localCommits.count)
+    }
     func selectSidecarSubtitle(url: URL, headers: [String: String]?) {}
     func setSubtitleDelay(_ seconds: Double) {}
     var videoWidth = 0, videoHeight = 0
@@ -117,6 +131,26 @@ enum VortXAetherState { case idle, loading, playing, paused, seeking, ended, fai
             fake.finish(sourceA)
             check(await completionA.value() == VortXAetherBridgeErrorCode.cancelled.rawValue, "late predecessor success reports cancellation")
             check(completionA.results.count == 1 && completionB.results.count == 1, "both load generations finish exactly once")
+        }
+        do {
+            let bridge = try VortXAetherBridgePlayer.makePlayer(); let fake = VortXAetherPlayer.latest!
+            _ = await issue(bridge, sourceA).value()
+            let result = Receipt<Bool>()
+            bridge.selectLocalSubtitle(url: URL(fileURLWithPath: "/synthetic-local.srt"), title: "English", lang: "eng", secondary: false,
+                permitsPreparation: { true }, permitsCommit: { true }, committedTrack: { _ in }, finishedCommit: {}) { result.record($0) }
+            bridge.clearSubtitle()
+            check(!(await result.value()) && fake.localCommits.isEmpty,
+                  "Off retires a queued prepared subtitle before native commit")
+            let current = Receipt<Bool>()
+            bridge.selectLocalSubtitle(url: URL(fileURLWithPath: "/synthetic-local.srt"), title: "English", lang: "eng", secondary: false,
+                permitsPreparation: { true }, permitsCommit: { true }, committedTrack: { _ in }, finishedCommit: {}) { current.record($0) }
+            check(await current.value() && fake.localCommits.count == 1,
+                  "current local subtitle completes only after underlying preparation commits")
+            let denied = Receipt<Bool>()
+            bridge.selectLocalSubtitle(url: URL(fileURLWithPath: "/denied-local.srt"), title: "English", lang: "eng", secondary: false,
+                permitsPreparation: { true }, permitsCommit: { false }, committedTrack: { _ in }, finishedCommit: {}) { denied.record($0) }
+            check(!(await denied.value()) && fake.localCommits.count == 1,
+                  "revoked original caller permit cannot commit an already prepared subtitle")
         }
         print("\(checks) bridge ownership checks passed against complete maintained adapter")
     }

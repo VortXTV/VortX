@@ -103,6 +103,15 @@ public protocol VortXAetherBridging: NSObjectProtocol {
     func selectAudioTrack(id: Int)
     func selectSubtitleTrack(id: Int)
     func clearSubtitle()
+    var activeSecondarySubtitleTrackID: NSNumber? { get }
+    func selectSecondarySubtitleTrack(id: Int)
+    func clearSecondarySubtitle()
+    /// Decode a bounded local text file, then commit only while its original caller still permits use.
+    /// Success means native preparation and commit completed; no remote URL is opened by this API.
+    func selectLocalSubtitle(url: URL, title: String, lang: String, secondary: Bool,
+        permitsPreparation: @escaping @MainActor () -> Bool, permitsCommit: @escaping @MainActor () -> Bool, committedTrack: @escaping @MainActor (Int) -> Void, finishedCommit: @escaping @MainActor () -> Void, completion: @escaping (Bool) -> Void)
+    func cancelSubtitlePreparation()
+    func removeExternalSubtitleTrack(id: Int)
     func selectSidecarSubtitle(url: URL, headers: [String: String]?)
     /// Seconds; positive shows cues later.
     func setSubtitleDelay(_ seconds: Double)

@@ -29,6 +29,7 @@ on:
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/test-aether-engine-picker.sh"
       - "scripts/embed-aether-frameworks.sh"
       - "scripts/tests/test_embed_aether_permissions.py"
       - "scripts/build-aether-dovi-tv-simulator.sh"
@@ -125,6 +126,7 @@ on:
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/test-aether-engine-picker.sh"
       - "scripts/embed-aether-frameworks.sh"
       - "scripts/tests/test_embed_aether_permissions.py"
       - "scripts/build-aether-dovi-tv-simulator.sh"
@@ -222,7 +224,8 @@ jobs:
     # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
     # runner generation as Apple packaging instead of the older default SDK.
     runs-on: macos-26-intel
-    timeout-minutes: 10
+    # Keep the full serial Swift fixture roster on the Intel host.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure ripgrep is available
@@ -353,6 +356,8 @@ jobs:
       - run: python3 scripts/tests/test_embed_aether_permissions.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-aether-playback-boundary.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-aether-engine-picker.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node test/native-callback-generation.mjs
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

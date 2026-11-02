@@ -16,6 +16,7 @@ struct PlayerTimePositionEvent {
 }
 struct MPVTrack {
     let id: Int; let type: String; let title: String; let lang: String; let selected: Bool; let forced: Bool
+    var unavailableReason: String? = nil
 }
 struct MPVChapter { let title: String; let start: Double }
 enum AudioOutputMode { case automatic }
@@ -79,7 +80,11 @@ enum SubtitleFileFetcher {
     func stop() {
         if publishDuringStop { onTime?(999); onSubtitleText?("retiring cue") }
     }
-    func seek(to seconds: Double, completion: (() -> Void)?) { completion?() }
+    var holdsSeek = false
+    var seekCompletions: [() -> Void] = []
+    func seek(to seconds: Double, completion: (() -> Void)?) {
+        if holdsSeek, let completion { seekCompletions.append(completion) } else { completion?() }
+    }
     func setRate(_ rate: Double) {}
     var sizeModes: [String] = []
     func setVideoSize(_ mode: String) { sizeModes.append(mode) }
@@ -99,6 +104,25 @@ enum SubtitleFileFetcher {
     func selectAudioTrack(id: Int) {}
     func selectSubtitleTrack(id: Int) { selections.append(id); activeSubtitleTrackID = NSNumber(value: id) }
     func clearSubtitle() { selections.append(-1); activeSubtitleTrackID = nil; onSubtitleText?(nil) }
+    var activeSecondarySubtitleTrackID: NSNumber?
+    func selectSecondarySubtitleTrack(id: Int) { activeSecondarySubtitleTrackID = NSNumber(value: id) }
+    func clearSecondarySubtitle() { activeSecondarySubtitleTrackID = nil }
+    func cancelSubtitlePreparation() {}
+    var removedExternalIDs: [Int] = []
+    var onLocalCommit: (() -> Void)?
+    func removeExternalSubtitleTrack(id: Int) { removedExternalIDs.append(id) }
+    func selectLocalSubtitle(url: URL, title: String, lang: String, secondary: Bool,
+        permitsPreparation: @escaping @MainActor () -> Bool,
+        permitsCommit: @escaping @MainActor () -> Bool, committedTrack: @escaping @MainActor (Int) -> Void, finishedCommit: @escaping @MainActor () -> Void, completion: @escaping (Bool) -> Void) {
+        guard permitsPreparation(), permitsCommit() else { completion(false); return }
+        sidecars.append(url)
+        committedTrack(100000 + sidecars.count)
+        finishedCommit()
+        if secondary { activeSecondarySubtitleTrackID = NSNumber(value: 100000 + sidecars.count) }
+        else { activeSubtitleTrackID = NSNumber(value: 100000 + sidecars.count) }
+        completion(true)
+        onLocalCommit?()
+    }
     func selectSidecarSubtitle(url: URL, headers: [String: String]?) { sidecars.append(url) }
     func setSubtitleDelay(_ seconds: Double) {}
     var videoWidth = 0, videoHeight = 0
@@ -153,9 +177,69 @@ enum SubtitleFileFetcher {
             controller.configureResumeOrigin(seconds: 312)
             controller.holdsNextLoadPaused = true
             controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: nil)
+            check(controller.ownsLoadResumeOrigin(seconds: 312), "issued load owns its captured resume")
+            check(!controller.ownsLoadResumeOrigin(seconds: 313), "a different request must not be suppressed")
             controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: nil)
+            check(!controller.ownsLoadResumeOrigin(seconds: 312) && controller.ownsLoadResumeOrigin(seconds: 0),
+                  "unrelated load retires old resume ownership")
             check(fake.loads[1].start == 312 && !fake.loads[1].autoplay, "configured load receives resume and paused intent")
             check(fake.loads[2].start == nil && fake.loads[2].autoplay, "next unrelated load consumes neither old intent")
+        }
+        do {
+            let (controller, fake) = fresh()
+            controller.configureResumeOrigin(seconds: 150)
+            controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: nil)
+            controller.seek(to: 42)
+            check(!controller.ownsLoadResumeOrigin(seconds: 150), "explicit seek supersedes load resume")
+            controller.configureResumeOrigin(seconds: 150)
+            controller.loadFile(source, headers: nil, live: true, audioSidecar: nil, reusing: nil)
+            check(fake.loads.last?.start == nil && controller.ownsLoadResumeOrigin(seconds: 0),
+                  "live load never receives the VOD resume")
+            controller.invalidateLoadToken()
+            check(!controller.ownsLoadResumeOrigin(seconds: 0), "retired load cannot suppress resume")
+            controller.configureResumeOrigin(seconds: 250)
+            controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: nil)
+            controller.stop()
+            check(!controller.ownsLoadResumeOrigin(seconds: 250), "stop retires resume ownership")
+        }
+        do {
+            let (controller, fake) = fresh()
+            let owner = controller.activeLoadToken!
+            check(controller.admittedProgressPosition(500, owner: owner) == nil, "no pre-frame progress witness")
+            fake.onFirstFrame?(); fake.onTime?(100)
+            check(controller.admittedProgressPosition(500, owner: owner) == 100, "optimistic UI uses actual settled position")
+            fake.holdsSeek = true
+            controller.seek(to: 40)
+            fake.currentTime = 40; fake.onTime?(40)
+            check(controller.admittedProgressPosition(40, owner: owner) == 100,
+                  "queued seek cannot replace the settled witness before completion")
+            fake.isSeeking = true
+            fake.seekCompletions.removeFirst()()
+            for _ in 0..<5 { await Task.yield() }
+            check(controller.admittedProgressPosition(40, owner: owner) == 100,
+                  "completion without wrapper settlement cannot commit target")
+            fake.isSeeking = false; fake.onTime?(39.75)
+            check(controller.admittedProgressPosition(40, owner: owner) == 39.75,
+                  "settled rendered clock replaces witness, including backward seek")
+            controller.seek(to: 350)
+            controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: nil)
+            fake.seekCompletions.removeFirst()()
+            for _ in 0..<5 { await Task.yield() }
+            check(controller.admittedProgressPosition(350, owner: owner) == nil,
+                  "retired seek completion cannot supply old-owner progress")
+            check(controller.admittedProgressPosition(350, owner: controller.activeLoadToken) == nil,
+                  "replacement load requires its own settled sample")
+        }
+        do {
+            let (controller, fake) = fresh()
+            let exitOwner = controller.activeLoadToken!
+            fake.onFirstFrame?(); fake.onTime?(100)
+            // TV leavePlayback captures/flushed this receipt before invalidateLoadToken.
+            let exitPosition = controller.admittedProgressPosition(500, owner: exitOwner)
+            controller.invalidateLoadToken()
+            check(exitPosition == 100, "exit captures actual settled 100 instead of optimistic UI 500")
+            check(controller.admittedProgressPosition(500, owner: exitOwner) == nil,
+                  "onDisappear cannot acknowledge the retired exit a second time")
         }
         for id in [-1, 4] {
             let (controller, fake) = fresh(); let result = pending(controller)
@@ -239,6 +323,45 @@ enum SubtitleFileFetcher {
             check(controller.playbackMetadataFacts().pills.isEmpty, "retired metadata cannot describe a successor surface")
             check(controller.chapters().isEmpty && controller.mediaSummary().width == 0 && !controller.hdrAvailable,
                   "retired chapters, summary and HDR capabilities fail closed")
+        }
+        do {
+            let (controller, fake) = fresh()
+            let token = controller.activeLoadToken!, revision = controller.subtitleAlignmentRevision!
+            let original = controller.captureSubtitleContributionLoad(for: token)!
+            let bytes = PlayerLocalSubtitleSource(data: Data("guarded-local-cues".utf8), permitsUse: { true })
+            let result = Completion()
+            _ = controller.selectLocalExternalSubtitleAutomatically(bytes, title: "English", lang: "eng",
+                owner: nil, expectedLoad: token, expectedRevision: revision) {
+                if case .selectedWithoutAlignment = $0 { result.record(true) } else { result.record(false) }
+            }
+            check(await result.value() && fake.sidecars.count == 1,
+                  "shared local-byte picker route reaches actual Aether controller and completes after commit")
+            let oldID = fake.activeSubtitleTrackID!.intValue, oldFile = fake.sidecars[0]
+            let selectedAgain = Completion(); fake.onLocalCommit = { selectedAgain.record(true) }
+            controller.setSubtitleTrack(oldID)
+            check(await selectedAgain.value() && fake.sidecars.count == 2 && fake.removedExternalIDs.contains(oldID),
+                  "registered external reselect uses original guarded bytes and a fresh prepared commit")
+            check(!FileManager.default.fileExists(atPath: oldFile.path),
+                  "retirement unregisters the original native external id before deleting its authorized input")
+            let currentFile = fake.sidecars[1]
+            controller.loadFile(source, headers: nil, live: false, audioSidecar: nil, reusing: token)
+            check(!FileManager.default.fileExists(atPath: currentFile.path),
+                  "same-token physical load replacement clears all predecessor registered subtitle files")
+            check(!original.isCurrent && controller.captureSubtitleContributionLoad(for: token)!.isCurrent,
+                  "same logical token never revives a retired physical subtitle-load receipt")
+        }
+        for id in [-1, 4] {
+            let (controller, fake) = fresh()
+            let token = controller.activeLoadToken!, revision = controller.subtitleAlignmentRevision!
+            let bytes = PlayerLocalSubtitleSource(data: Data("guarded-local-cues".utf8), permitsUse: { true })
+            let result = Completion()
+            _ = controller.selectLocalExternalSubtitleAutomatically(bytes, title: "English", lang: "eng",
+                owner: nil, expectedLoad: token, expectedRevision: revision) {
+                if case .selectedWithoutAlignment = $0 { result.record(true) } else { result.record(false) }
+            }
+            controller.setSubtitleTrack(id)
+            check(!(await result.value()) && fake.sidecars.isEmpty,
+                  "Off or embedded selection before local preparation prevents any subsequent native commit")
         }
         print("\(checks) checks passed against the complete actual controller")
     }
