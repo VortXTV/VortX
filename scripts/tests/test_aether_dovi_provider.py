@@ -1,9 +1,12 @@
 """Synthetic rejection tests for the real-provider inspector; no compiler or network."""
 import importlib.util
 from pathlib import Path
+import shutil
+import stat
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("dovi_provider", ROOT / "scripts/aether-dovi-provider.py")
@@ -111,6 +114,122 @@ class ProviderInspectionTests(unittest.TestCase):
             link.symlink_to(root.parent, target_is_directory=True)
             with self.assertRaises(ValueError):
                 provider.owned(link / "escape", root)
+
+
+class StagingPermissionTests(unittest.TestCase):
+    def setUp(self):
+        (ROOT / "app/build").mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=ROOT / "app/build")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.work = self.root / "extension"
+        self.work.mkdir()
+
+    @staticmethod
+    def snapshot(root):
+        return {str(path.relative_to(root)): (
+            stat.S_IMODE(path.stat().st_mode),
+            provider.sha(path.read_bytes()) if path.is_file() else None)
+            for path in [root, *sorted(root.rglob("*"))]}
+
+    def test_readonly_copy_replaces_only_staged_archive_and_plist(self):
+        original = self.root / "original.xcframework"
+        old = original / provider.OLD
+        (old / "Headers").mkdir(parents=True)
+        (old / "libdovi.a").write_bytes(b"original arm archive")
+        (old / "Headers/dovi.h").write_bytes(b"original header")
+        (original / "Info.plist").write_bytes(b"original plist")
+        (original / "unknown.txt").write_bytes(b"unreviewed file retained")
+        (original / "other-slice").mkdir()
+        (original / "other-slice/library.a").write_bytes(b"unrelated archive")
+        for path in original.rglob("*"):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        original.chmod(0o555)
+        before = self.snapshot(original)
+        staged = self.work / "Dovi.xcframework"
+        shutil.copytree(original, staged)
+        with provider.writable_staged_directory(staged, self.work):
+            (staged / provider.OLD).rename(staged / provider.NEW)
+        archive = staged / provider.NEW / "libdovi.a"
+        old_inode = archive.stat().st_ino
+        provider.replace_staged_file(archive, b"combined real-provider placeholder", self.work)
+        provider.replace_staged_file(staged / "Info.plist", b"updated plist", self.work)
+        self.assertNotEqual(old_inode, archive.stat().st_ino)
+        self.assertEqual(b"combined real-provider placeholder", archive.read_bytes())
+        self.assertEqual(b"updated plist", (staged / "Info.plist").read_bytes())
+        self.assertEqual(before, self.snapshot(original))
+        actual = self.snapshot(staged)
+        self.assertEqual({name.replace(provider.OLD, provider.NEW, 1) for name in before}, set(actual))
+        for name, (mode, digest) in before.items():
+            moved = name.replace(provider.OLD, provider.NEW, 1)
+            self.assertEqual(mode, actual[moved][0], moved)
+            if name not in ("Info.plist", provider.OLD + "/libdovi.a"):
+                self.assertEqual(digest, actual[moved][1], moved)
+        self.assertEqual([], list(staged.rglob(".dovi-replace-*")))
+
+    def test_replacement_failure_restores_modes_and_leaves_original_and_unknown_files(self):
+        staged = self.work / "stage"
+        staged.mkdir()
+        target = staged / "libdovi.a"
+        target.write_bytes(b"original")
+        target.chmod(0o444)
+        (staged / "unknown").write_bytes(b"keep")
+        staged.chmod(0o555)
+        before = self.snapshot(staged)
+        with mock.patch.object(provider.os, "replace", side_effect=OSError("replacement refused")):
+            with self.assertRaisesRegex(OSError, "replacement refused"):
+                provider.replace_staged_file(target, b"replacement", self.work)
+        self.assertEqual(before, self.snapshot(staged))
+
+    def test_rename_failure_restores_readonly_staging_directory(self):
+        staged = self.work / "stage"
+        staged.mkdir()
+        staged.chmod(0o555)
+        with self.assertRaisesRegex(RuntimeError, "simulated rename failure"):
+            with provider.writable_staged_directory(staged, self.work):
+                raise RuntimeError("simulated rename failure")
+        self.assertEqual(0o555, stat.S_IMODE(staged.stat().st_mode))
+
+    def test_symlink_and_outside_targets_are_rejected_without_modification(self):
+        external = self.root / "external"
+        external.mkdir()
+        target = external / "libdovi.a"
+        target.write_bytes(b"original")
+        target.chmod(0o444)
+        external.chmod(0o555)
+        (self.work / "file-link").symlink_to(target)
+        (self.work / "directory-link").symlink_to(external, target_is_directory=True)
+        before = self.snapshot(external)
+        for path in (target, self.work / "file-link", self.work / "directory-link/libdovi.a"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                provider.replace_staged_file(path, b"bad", self.work)
+        for directory in (external, self.work / "directory-link", self.work):
+            with self.subTest(directory=directory), self.assertRaises(ValueError):
+                with provider.writable_staged_directory(directory, self.work):
+                    self.fail("unsafe directory admitted")
+        self.assertEqual(before, self.snapshot(external))
+
+    def test_nonregular_target_and_symlink_xcframework_root_are_rejected(self):
+        directory = self.work / "directory"
+        directory.mkdir()
+        with self.assertRaises(ValueError):
+            provider.replace_staged_file(directory, b"bad", self.work)
+        link = self.work / "root-link"
+        link.symlink_to(directory, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            provider.manifest(link)
+
+    def test_extension_rejects_work_inside_inputs_before_any_tool_or_mutation(self):
+        package = self.root / "package"
+        built_provider = self.root / "provider"
+        package.mkdir()
+        built_provider.mkdir()
+        for work in (package / "extension", built_provider / "extension"):
+            with self.subTest(work=work), mock.patch.object(provider, "run") as run:
+                with self.assertRaisesRegex(ValueError, "outside package and provider"):
+                    provider.extend(package, built_provider, work)
+                run.assert_not_called()
+                self.assertFalse(work.exists())
 
 
 if __name__ == "__main__":

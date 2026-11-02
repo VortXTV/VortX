@@ -4,6 +4,7 @@
 No toolchain/install/download behavior. Run only in the parent-authorized build lane.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -11,8 +12,10 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import struct
 import subprocess
+import tempfile
 
 PACKAGE = '0d7cce1d6836a30d13a3a2326e50a153af53f014'
 SOURCE = 'd1abe0e27ff2c7ab3339614d06db9f8a058af6b2'
@@ -56,6 +59,42 @@ def owned(path, root, *, fresh=False):
     need('/Library/Caches/' not in str(path) and '/.cache/' not in str(path), 'shared cache is never an owned package output')
     if fresh:
         need(not os.path.lexists(path), 'fresh output required: '+str(path))
+
+
+
+@contextmanager
+def writable_staged_directory(directory, work):
+    # copytree preserves upstream read-only modes. Change only this owned staging
+    # directory, and restore its exact mode even when replacement fails.
+    owned(directory, work)
+    need(directory.is_dir(), 'missing staging directory: '+str(directory))
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    try:
+        directory.chmod(mode | stat.S_IWUSR | stat.S_IXUSR)
+        yield
+    finally:
+        directory.chmod(mode)
+
+
+def replace_staged_file(path, body, work):
+    owned(path, work)
+    need(path.is_file(), 'missing staging file: '+str(path))
+    mode = stat.S_IMODE(path.stat().st_mode)
+    # A sibling rename replaces a read-only inode without opening it for writing.
+    # Keep its original mode, and never chmod or overwrite the source/cache inode.
+    with writable_staged_directory(path.parent, work):
+        descriptor, temporary = tempfile.mkstemp(prefix='.dovi-replace-', dir=path.parent)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(body)
+                stream.flush()
+                os.fchmod(stream.fileno(), mode)
+            owned(path, work)
+            os.replace(temporary, path)
+        finally:
+            if os.path.lexists(temporary):
+                temporary.unlink()
 
 
 def source_clean(source):
@@ -151,6 +190,7 @@ def archive(body, symbols, expected_sdk):
 
 
 def manifest(root):
+    need(root.is_dir() and not root.is_symlink(), 'unsafe XCFramework root')
     result = {}
     for path in sorted(root.rglob('*')):
         need(not path.is_symlink(), 'symlink in XCFramework')
@@ -202,7 +242,9 @@ def verify_provider(package, provider):
 
 
 def extend(package, provider, work):
-    need(not work.exists() and work.is_absolute(), 'fresh absolute extension work directory required')
+    need(not os.path.lexists(work) and work.is_absolute(), 'fresh absolute extension work directory required')
+    need(package not in work.parents and provider not in work.parents,
+         'extension work must be outside package and provider inputs')
     need(not run(['git', '-C', package, 'status', '--porcelain', '--untracked-files=all']), 'package must be pristine before extension')
     receipt = verify_provider(package, provider)
     xc = package/'Dovi.xcframework'
@@ -214,7 +256,8 @@ def extend(package, provider, work):
     shutil.copytree(xc, staged)
     old = staged/OLD
     new = staged/NEW
-    old.rename(new)
+    with writable_staged_directory(staged, work):
+        old.rename(new)
     combined = work/'combined.a'
     run(['xcrun', 'lipo', '-create', arm, provider/'install/lib/libdovi.a', '-output', combined])
     need(set(run(['xcrun', 'lipo', '-archs', combined]).split()) == {'arm64', 'x86_64'}, 'unexpected combined architectures')
@@ -222,13 +265,13 @@ def extend(package, provider, work):
         leaf = work/(arch+'.a')
         run(['xcrun', 'lipo', combined, '-thin', arch, '-output', leaf])
         need(sha(read(leaf)) == expected, 'combined archive changed input architecture bytes')
-    shutil.copyfile(combined, new/'libdovi.a')
+    replace_staged_file(new/'libdovi.a', read(combined), work)
     info = plistlib.loads(read(staged/'Info.plist'))
     selected = [row for row in info['AvailableLibraries'] if row['LibraryIdentifier'] == OLD]
     need(len(selected) == 1 and selected[0]['SupportedPlatform'] == 'tvos' and selected[0].get('SupportedPlatformVariant') == 'simulator' and selected[0]['SupportedArchitectures'] == ['arm64'], 'unexpected upstream slice row')
     selected[0]['LibraryIdentifier'] = NEW
     selected[0]['SupportedArchitectures'] = ['arm64', 'x86_64']
-    (staged/'Info.plist').write_bytes(plistlib.dumps(info))
+    replace_staged_file(staged/'Info.plist', plistlib.dumps(info), work)
     after = manifest(staged)
     expected_paths = {name.replace(OLD+'/', NEW+'/', 1) if name.startswith(OLD+'/') else name for name in before}
     need(set(after) == expected_paths, 'unreviewed XCFramework file set change')
