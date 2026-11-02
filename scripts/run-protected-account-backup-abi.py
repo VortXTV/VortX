@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run both maintained gates against the already verified packaged static SDK.
+"""Run all three maintained gates against the already verified packaged static SDK.
 
 Emit allowlisted metadata/hashes only. Never upload raw logs, headers, sources,
 compiled binaries or credentials. SDK provenance comes from preceding CI gates.
@@ -17,9 +17,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SPECS = (
     ('converter', 'scripts/test-account-backup-repair-live-abi.sh', 'account-backup-repair-abi.',
-     'ABI_COMPATIBILITY_PASS', 269),
+     'ABI_COMPATIBILITY_PASS', 269, 'backup-repair-abi'),
     ('service', 'scripts/test-account-file-repair-service-live-abi.sh', 'account-file-repair-service-abi.',
-     'SERVICE_BOUNDARY_ABI_PASS', 35),
+     'SERVICE_BOUNDARY_ABI_PASS', 35, 'backup-repair-abi'),
+    ('restore', 'scripts/test-account-file-restore-live-abi.sh', 'account-file-restore-abi.',
+     'RESTORE_ADMISSION_JOURNAL_ABI_PASS', 63, 'account-file-restore-abi'),
 )
 
 
@@ -97,7 +99,7 @@ def main():
         build.mkdir(exist_ok=True)
         private = Path(tempfile.mkdtemp(prefix='account-backup-abi-private.', dir=os.environ['RUNNER_TEMP']))
         passed = True
-        for label, entry, prefix, expected_status, minimum in SPECS:
+        for label, entry, prefix, expected_status, minimum, binary in SPECS:
             result = {'status': 'NOT_STARTED'}
             metadata['fixtures'][label] = result
             before = set(build.glob(prefix + '*'))
@@ -115,7 +117,7 @@ def main():
                 if directory.parent != build.resolve() or not directory.is_dir():
                     raise ValueError('fixture containment')
                 result['outputHashes'] = {}
-                for name in ['receipt.json', 'inputs.json', 'compiler.log', 'test.log', 'backup-repair-abi']:
+                for name in ['receipt.json', 'inputs.json', 'compiler.log', 'test.log', binary]:
                     path = directory / name
                     if path.is_file() and not path.is_symlink():
                         result['outputHashes'][name] = digest(path)
@@ -158,7 +160,7 @@ def main():
                     result['driverLogSHA256'] = digest(driver)
                 passed = False
             write(evidence / (label + '.json'), result)
-        # Both gates must still describe the same retained source bytes at exit.
+        # All gates must still describe the same retained source bytes at exit.
         for result in metadata['fixtures'].values():
             for key in ('sourceHashes', 'controlHashes', 'compiledInputHashes', 'metadataHashes'):
                 if key in result:
