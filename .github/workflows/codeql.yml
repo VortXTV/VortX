@@ -102,6 +102,7 @@ jobs:
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
           --tests com.vortx.android.sync.AccountBackupFileTest
+          --tests com.vortx.android.backup.accountfiles.AccountBackupDocumentsTest
           --tests com.vortx.android.sync.SessionRenewalPolicyTest
           --tests com.vortx.android.sync.SessionRenewalManagerTest
           --tests com.vortx.android.profile.ProfileSelectionWiringTest
