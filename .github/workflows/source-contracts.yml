@@ -53,6 +53,11 @@ on:
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-account-file-access.sh"
       - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-ui-typecheck.py"
+      - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/run-account-file-restore-manager.py"
+      - "test/account-file-restore-manager-inputs.cjs"
       - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
@@ -154,6 +159,11 @@ on:
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-account-file-access.sh"
       - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-profile-picker-tools.sh"
+      - "scripts/test-profile-picker-tools-ui-typecheck.py"
+      - "scripts/test-account-file-restore-manager.sh"
+      - "scripts/run-account-file-restore-manager.py"
+      - "test/account-file-restore-manager-inputs.cjs"
       - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
@@ -335,6 +345,12 @@ jobs:
       - run: bash scripts/test-account-file-access.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-picker-account.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-file-restore-manager.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

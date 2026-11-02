@@ -63,7 +63,10 @@ manifest={'sourceSHA256':{paths[key]:hashlib.sha256(text.encode()).hexdigest() f
 (out/'extraction.json').write_text(json.dumps(manifest,indent=2)+'\n')
 # Wiring assertions complement executable methods; they do not stand in for lifecycle checks.
 settings=sources['settings']; profiles=sources['profiles']; touch=sources['touch']
-assert settings.count('if diagnosticExportIsAllowed { DiagnosticLogExportButton() }')==2
+assert settings.count('if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }')==2
+assert 'diagnosticGrant: diagnosticGrant' in profiles
+assert 'accountHelpDiagnosticGrant = diagnosticGrant()' in profiles
+assert 'if let diagnosticGrant { return diagnosticGrant }' in settings
 assert settings.index('if let code = authentication.recoveryCodeForCurrentOwner') < settings.index('else if sync.isSignedIn')
 assert 'newRecoveryCode' not in settings
 assert 'diagnosticCredential.map { CredentialScopeRegistry.shared.isCurrent($0) }' in settings

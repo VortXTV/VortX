@@ -35,6 +35,10 @@ methods += "\n" + '    private func focusDiagnosticRecovery() {' + between(picke
   '    private func focusDiagnosticRecovery() {', "\n    }\n") + "\n    }\n"
 methods += "\n" + '    private func openAccountHelp() {' + between(picker,
   '    private func openAccountHelp() {', "\n    }\n") + "\n    }\n"
+for name in ['diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant', 'closeTools(_ id: UUID)', 'openTools()']
+  signature = "    private func #{name} {"
+  methods += "\n" + signature + between(picker, signature, "\n    }\n") + "\n    }\n"
+end
 methods += "\n" + '    private var exportAllowedBeforeProfile: Bool {' + between(picker,
   '    private var exportAllowedBeforeProfile: Bool {', "\n    }\n") + "\n    }\n"
 preparing = '    private var profilesArePreparing: Bool {' + between(picker,
@@ -49,6 +53,7 @@ add_action = between(picker,
 edit_start = picker.index('ProfilePickerActionTile(title: isEditing ? "Done" : "Edit"') or raise 'Missing Edit'
 edit_action = between(picker[edit_start..-1], 'nameTextSize: nameTextSize) {', "\n            }\n")
 recovery_action = between(picker, 'Button("Account settings") {', ' }')
+account_help_event = between(picker, '.onValueChange(of: accountHelpNeeded) { presented in', "\n        }\n")
 signin_event = between(picker, '.onValueChange(of: signInNeeded) { presented in', " }\n")
 
 replacements = {
@@ -60,7 +65,8 @@ replacements = {
   '/* ACTUAL_ADD_ACTION */' => add_action,
   '/* ACTUAL_EDIT_ACTION */' => edit_action,
   '/* ACTUAL_RECOVERY_ACTION */' => recovery_action,
-  '/* ACTUAL_SIGNIN_EVENT */' => signin_event
+  '/* ACTUAL_SIGNIN_EVENT */' => signin_event,
+  '/* ACTUAL_ACCOUNT_HELP_EVENT */' => account_help_event
 }
 replacements.each do |marker, value|
   raise "Missing unique marker #{marker}" unless template.scan(marker).length == 1
@@ -69,7 +75,8 @@ end
 raise 'Unresolved extraction marker' if template.include?('/* ACTUAL_')
 File.write(File.join(out, 'NativeProfilePickerRouting.generated.swift'), template)
 paths = [source_path, File.join(root, 'app/SourcesShared/NativeProfileActionPreparation.swift'),
-         File.join(root, 'app/SourcesShared/ProfileMutationPresentation.swift')]
+         File.join(root, 'app/SourcesShared/ProfileMutationPresentation.swift'),
+         File.join(root, 'app/SourcesShared/ProfilePickerToolsAccess.swift')]
 receipt = paths.map { |path| "#{Digest::SHA256.file(path).hexdigest}  #{path}" }.join("\n") + "\n"
 File.write(File.join(out, 'source-sha256.txt'), receipt)
 puts receipt
@@ -79,6 +86,7 @@ xcrun swiftc -parse-as-library -swift-version 6 -strict-concurrency=complete -wa
     -D VORTX_NATIVE_DATA_ENGINE \
     "$picker_repo_root/app/SourcesShared/NativeProfileActionPreparation.swift" \
     "$picker_repo_root/app/SourcesShared/ProfileMutationPresentation.swift" \
+    "$picker_repo_root/app/SourcesShared/ProfilePickerToolsAccess.swift" \
     "$picker_test_dir/NativeProfilePickerRouting.generated.swift" \
     -o "$picker_test_dir/profile-picker-routing" 2>&1 | tee "$picker_test_dir/compile.log"
 "$picker_test_dir/profile-picker-routing" 2>&1 | tee "$picker_test_dir/test.log"

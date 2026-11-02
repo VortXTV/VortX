@@ -12,7 +12,8 @@ const paths = [
   'app/SourcesShared/DiagnosticLogExportButton.swift', 'app/SourcesShared/VXDiagExport.swift',
   'app/SourcesShared/ProfilesView.swift', 'app/SourcesShared/SyncSettingsView.swift',
   'app/SourcesTV/LoginView.swift', 'app/SourcesiOS/iOSSignInView.swift',
-  'app/SourcesTV/BackupImportView.swift', 'app/SourcesTV/MoveSeedingNagTV.swift'
+  'app/SourcesTV/BackupImportView.swift', 'app/SourcesTV/MoveSeedingNagTV.swift',
+  'app/SourcesShared/ProfilePickerToolsView.swift'
 ];
 const sources = Object.fromEntries(await Promise.all(paths.map(async path => [path, await readFile(path, 'utf8')])));
 const entry = sources[paths[0]], backend = sources[paths[1]], picker = sources[paths[2]];
@@ -42,16 +43,18 @@ function member(source, signature) {
 }
 
 const inset = member(picker, '.safeAreaInset(edge: .bottom)');
-const recoveryButton = member(picker, '@ViewBuilder private var diagnosticRecoveryButton:');
-assert(inset.includes('diagnosticRecoveryButton') && !inset.includes('profileAction.isRunning'));
-assert((recoveryButton.match(/DiagnosticLogExportButton\(\)/g) ?? []).length === 2
+const recoveryButton = member(picker, '@ViewBuilder private var toolsButton:');
+const tools = sources['app/SourcesShared/ProfilePickerToolsView.swift'];
+assert(inset.includes('toolsButton') && !inset.includes('profileAction.isRunning'));
+assert(tools.includes('DiagnosticLogExportButton(grant: route.diagnostics)')
   && !recoveryButton.includes('profileAction.isRunning'));
 assert(inset.includes('.frame(maxWidth: .infinity)') && inset.includes('.profileFocusSection()'));
 assert(recoveryButton.includes('.focused($diagnosticFocused)') && recoveryButton.includes('focusDiagnosticRecovery()'));
 assert(picker.indexOf('.safeAreaInset(edge: .bottom)') > picker.indexOf('.disabled(pinTarget != nil || profileAction.isRunning)'));
 assert(inset.includes('.disabled(pinTarget != nil)') && inset.includes('.accessibilityHidden(pinTarget != nil)'));
 // A PIN-protected profile keeps the whole-device log behind a profile unlock, except when loading failed.
-assert(inset.includes('if exportAllowedBeforeProfile'));
+assert(member(picker, 'private func diagnosticGrant()').includes('exportAllowedBeforeProfile && pinTarget == nil'));
+assert(tools.includes('.disabled(!route.diagnostics.permitsExport)'));
 const gate = member(picker, 'private var exportAllowedBeforeProfile: Bool');
 assert(gate.includes('$0.pin != nil') && gate.includes('profileAction.errorMessage != nil') && gate.includes('accountRestoreState == .failed'));
 // The shared call site also compiles in Lite/legacy shells. A lexical member extraction alone
@@ -72,37 +75,44 @@ function requireSharedPickerMember(source, signature) {
 }
 requireSharedPickerMember(picker, 'private var exportAllowedBeforeProfile: Bool');
 requireSharedPickerMember(picker, '.safeAreaInset(edge: .bottom)');
-requireSharedPickerMember(picker, '@ViewBuilder private var diagnosticRecoveryButton:');
+requireSharedPickerMember(picker, '@ViewBuilder private var toolsButton:');
 const nativeOnlyGate = picker.replace('private var exportAllowedBeforeProfile: Bool',
   '#if VORTX_NATIVE_DATA_ENGINE\nprivate var exportAllowedBeforeProfile: Bool');
 assert.throws(() => requireSharedPickerMember(nativeOnlyGate, 'private var exportAllowedBeforeProfile: Bool'),
   /must exist in both native and Lite\/legacy shells/);
-for (const path of paths.slice(3)) assert(sources[path].includes('DiagnosticLogExportButton()'), `${path} missing export`);
+for (const path of paths.slice(4, 8)) assert(sources[path].includes('DiagnosticLogExportButton()'), `${path} missing export`);
+assert(sources[paths[3]].includes('DiagnosticLogExportButton(grant: exportGrant)'));
 for (const path of ['app/SourcesTV/LoginView.swift', 'app/SourcesTV/BackupImportView.swift']) {
   const scroll = member(sources[path], 'ScrollView');
   assert(scroll.includes('DiagnosticLogExportButton()'), `${path} export must remain reachable in a tall error layout`);
 }
-assert(member(sources[paths[3]], 'private func qrSignInSheet(').includes('DiagnosticLogExportButton()'));
+assert(member(sources[paths[3]], 'private func qrSignInSheet(').includes('DiagnosticLogExportButton(grant: exportGrant)'));
 const entryCode = entry.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
 for (const forbidden of ['Keychain', 'CoreBridge', 'StremioAccount', 'VortXSyncManager', 'UserDefaults', '@AppStorage', 'VXProbe.enabled', 'VXProbe.logFileURL', 'consumeLogSnapshot']) {
   assert(!entryCode.includes(forbidden), `export must not depend on ${forbidden}`);
 }
-assert(entry.includes('FileRepresentation(exportedContentType: .plainText)') && entry.includes('VXDiagExport.exportBody().write('));
-assert(entry.includes('ShareLink(item: PreProfileDiagnosticLogTransfer()'));
+assert(entry.includes('FileRepresentation(exportedContentType: .plainText)') && entry.includes('let bytes = VXDiagExport.exportBody()') && entry.includes('try bytes.write('));
+assert(entry.includes('ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant)'));
 assert(entry.includes('preview: SharePreview("VortX diagnostic log")'));
 assert(entry.includes('UUID().uuidString.lowercased()') && entry.includes('directory.appendingPathComponent("vortx-diag.log")'));
 assert(member(entry, '.onDisappear').includes('session.stop()'));
 assert(member(entry, '.onExitCommand').includes('dismiss()'));
-assert(member(entry, '.task(id: retry)').includes('await session.prepare()'));
-assert(member(backend, 'static func makeSession()').includes('VXDiagExport(presentationOwned: true)'));
-assert(backend.includes('static let shared = VXDiagExport()') && backend.includes('private init(presentationOwned: Bool = false)'));
+assert(member(entry, '.task(id: retry)').includes('await session.prepare(grant: grant)'));
+assert(member(backend, 'static func makeSession(').includes('VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization)'));
+assert(backend.includes('static let shared = VXDiagExport()') && backend.includes('private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil)'));
 console.log('PASS pre-profile availability, lazy sanitized sharing, PIN and owned-session source contracts');
 
 const extracts = {
   SESSION: '@MainActor\n' + member(entry, 'private final class DiagnosticLogExportSession:'),
   CANCELLATION: member(backend, 'private final class VXDiagExportStartCancellation:'),
   START: member(backend, 'func startAsync()'),
-  STOP: member(backend, 'func stopOwnedSession()')
+  STOP: member(backend, 'func stopOwnedSession()'),
+  DELIVERY_AUTHORIZATION: member(backend, 'private func authorizeDelivery('),
+  DELIVERY_OWNS: member(backend, 'private func ownsDelivery('),
+  DELIVERY_SERVE: member(backend, 'private func serve('),
+  DELIVERY_CHUNKS: member(backend, 'private func sendBodyChunks('),
+  DELIVERY_FINISH: member(backend, 'private func finishTransfer('),
+  DELIVERY_STOP: member(backend, 'func stopOwnedSession()')
 };
 let fixture = await readFile('app/Tests/PreProfileDiagnosticExportTests.swift', 'utf8');
 for (const [key, text] of Object.entries(extracts)) fixture = fixture.replace(`/* PRODUCTION_${key} */`, text);
@@ -121,7 +131,7 @@ function run(name, command, args) {
   });
 }
 const binary = join(output, 'controls');
-await run('compile-controls', 'xcrun', ['swiftc', '-j', '1', '-num-threads', '1', '-parse-as-library', '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors', swift, '-o', binary]);
+await run('compile-controls', 'xcrun', ['swiftc', '-j', '1', '-num-threads', '1', '-parse-as-library', '-swift-version', '6', '-strict-concurrency=complete', '-warnings-as-errors', 'app/SourcesShared/ProfilePickerToolsAccess.swift', 'app/SourcesShared/VXProbeRedaction.swift', 'app/SourcesShared/VXDiagExportPolicy.swift', swift, '-o', binary]);
 await run('controls', binary, []);
 for (const [name, tests, deps] of [
   ['channels', 'DiagnosticsChannelGateTests.swift', ['VXProbeRedaction.swift', 'VXDiagExportPolicy.swift']],
@@ -139,9 +149,9 @@ await writeFile(join(output, 'source-receipt.json'), JSON.stringify({
     'scripts/test-pre-profile-diagnostic-export.mjs', 'app/Tests/PreProfileDiagnosticExportTests.swift',
     'app/Tests/DiagnosticsChannelGateTests.swift', 'app/Tests/VXDiagTransferPolicyTests.swift',
     'app/Tests/VXProbeRedactionTests.swift', 'app/SourcesShared/VXProbeRedaction.swift',
-    'app/SourcesShared/VXDiagExportPolicy.swift'
+    'app/SourcesShared/VXDiagExportPolicy.swift', 'app/SourcesShared/ProfilePickerToolsAccess.swift'
   ].map(async path => [path, sha(await readFile(path, 'utf8'))]))),
   extracts: Object.fromEntries(Object.entries(extracts).map(([key, text]) => [key, sha(text)])),
-  methodTransformations: [], boundary: 'Exact lifecycle/startup methods; inert listener/image/observable collaborators and accelerated worker clock. Redaction/transfer are pure production policy. No account, Keychain, live cache, HTTP, UI runtime, app build or launch.'
+  methodTransformations: [], boundary: 'Exact lifecycle/startup and payload/header/deferred-chunk authorization methods; inert controlled network callbacks/image/observable collaborators and accelerated worker clock. Actual grant and pure production redaction/transfer policy. No account, Keychain, live cache, HTTP, UI runtime, app build or launch.'
 }, null, 2) + '\n');
 console.log(`Retained export checks: ${output}`);

@@ -153,6 +153,12 @@ let rules: [Rule] = [
         check: { files in
             var found: [String] = []
             if let export = files["app/SourcesShared/VXDiagExport.swift"] {
+                found += requiring(export, "authorizeDelivery(connection, claim: claim)",
+                                   why: "TV payload and deferred sends must consult the original delivery grant")
+                found += requiring(export, "guard deliveryAuthorization() else",
+                                   why: "delivery admission must precede payload/send release")
+                found += requiring(export, "deliveryRetirement.cancel()",
+                                   why: "owned retirement must revoke queued sends before deferred teardown")
                 found += requiring(export, "VXDiagExportPolicy.exportBody(",
                                    why: "must build its bytes through the export-time sanitiser")
                 found += forbidding(export, "(try? Data(contentsOf: VXProbe.logFileURL))",
@@ -179,8 +185,12 @@ let rules: [Rule] = [
                                    why: "pre-profile sharing must export a sanitised copy")
                 found += requiring(entry, "FileRepresentation(exportedContentType: .plainText)",
                                    why: "pre-profile sharing must prepare the file lazily")
-                found += requiring(entry, "ShareLink(item: PreProfileDiagnosticLogTransfer()",
-                                   why: "pre-profile sharing must use the sanitised transfer")
+                found += requiring(entry, "ShareLink(item: PreProfileDiagnosticLogTransfer(grant: grant)",
+                                   why: "pre-profile sharing must use the sanitised transfer and captured grant")
+                found += requiring(entry, "try await require(transfer.grant)",
+                                   why: "an async share must recheck its original diagnostic grant around staging")
+                found += requiring(entry, "try await grant.requireForExport()",
+                                   why: "staging must check live PIN/failure admission and original credentials")
                 found += requiring(entry, "preview: SharePreview(\"VortX diagnostic log\")",
                                    why: "pre-profile sharing must supply a SwiftUI preview")
                 found += forbidding(entry, "VXProbe.logFileURL",

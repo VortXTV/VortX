@@ -68,12 +68,20 @@ final class VXDiagExport: @unchecked Sendable {
         let logSnapshot: VXProbeLogSnapshot
     }
 
+    typealias DeliveryAuthorization = @MainActor @Sendable () -> Bool
     private let presentationOwned: Bool
-    private init(presentationOwned: Bool = false) { self.presentationOwned = presentationOwned }
+    private let deliveryAuthorization: DeliveryAuthorization?
+    private let deliveryRetirement = VXDiagExportStartCancellation()
+    private init(presentationOwned: Bool = false, deliveryAuthorization: DeliveryAuthorization? = nil) {
+        self.presentationOwned = presentationOwned
+        self.deliveryAuthorization = deliveryAuthorization
+    }
 
     /// A presentation owns this listener, rather than stopping an unrelated Settings export through
     /// the singleton. Each retry/presentation gets its own capability and teardown lifetime.
-    static func makeSession() -> VXDiagExport { VXDiagExport(presentationOwned: true) }
+    static func makeSession(deliveryAuthorization: DeliveryAuthorization? = nil) -> VXDiagExport {
+        VXDiagExport(presentationOwned: true, deliveryAuthorization: deliveryAuthorization)
+    }
 
     // MARK: - Public contract
 
@@ -150,6 +158,7 @@ final class VXDiagExport: @unchecked Sendable {
 
     /// Tear the listener down so the log is no longer served. Safe to call when not started.
     func stop() {
+        if presentationOwned { deliveryRetirement.cancel() }
         queue.sync { tearDownListener() }
     }
 
@@ -158,6 +167,8 @@ final class VXDiagExport: @unchecked Sendable {
     /// the post-await guard requests cleanup again if that start finishes after dismissal.
     func stopOwnedSession() {
         guard presentationOwned else { return }
+        // Revoke synchronously: queued payload/send admission cannot outrun deferred teardown.
+        deliveryRetirement.cancel()
         queue.async { self.tearDownListener() }
     }
 
@@ -298,65 +309,63 @@ final class VXDiagExport: @unchecked Sendable {
         }
     }
 
+    /// Authorize each payload/header/chunk release against this presentation's ORIGINAL grant.
+    /// Nil preserves the direct account-independent Settings path. Guarded releases run on MainActor:
+    /// admission and the synchronous payload collection/send happen in one turn, with no await between.
+    /// Already handed-off network bytes cannot be recalled; no later chunk is admitted after revocation.
+    private func authorizeDelivery(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim,
+        release: @escaping @Sendable () -> Void
+    ) {
+        let commit: @Sendable () -> Void = { [weak self] in
+            guard let self else { connection.cancel(); return }
+            guard self.ownsDelivery(connection, claim: claim) else {
+                self.finishTransfer(connection, claim: claim, success: false)
+                return
+            }
+            release()
+        }
+        guard let deliveryAuthorization else { commit(); return }
+        Task { @MainActor [weak self] in
+            guard let self else { connection.cancel(); return }
+            guard deliveryAuthorization() else {
+                self.finishTransfer(connection, claim: claim, success: false)
+                self.stopOwnedSession()
+                return
+            }
+            commit()
+        }
+    }
+
+    private func ownsDelivery(_ connection: NWConnection, claim: VXDiagExportPolicy.TransferClaim) -> Bool {
+        guard !deliveryRetirement.isCancelled else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return connections[ObjectIdentifier(connection)] === connection && transferGate.owns(claim)
+    }
+
     /// Write the current diagnostic log as a text/plain attachment, then close. Any read failure yields an
     /// empty body rather than an error so the phone still gets a (harmless) file.
     private func serve(
         _ connection: NWConnection,
         claim: VXDiagExportPolicy.TransferClaim
     ) {
-        let payload = Self.exportPayload()
-        let body = payload.body
-        let head = """
-        HTTP/1.1 200 OK\r
-        Content-Type: text/plain; charset=utf-8\r
-        Content-Disposition: attachment; filename="vortx-diag.log"\r
-        Content-Length: \(body.count)\r
-        Connection: close\r
-        \r
+        authorizeDelivery(connection, claim: claim) { [self] in
+            let payload = Self.exportPayload()
+            let body = payload.body
+            let head = """
+            HTTP/1.1 200 OK\r
+            Content-Type: text/plain; charset=utf-8\r
+            Content-Disposition: attachment; filename="vortx-diag.log"\r
+            Content-Length: \(body.count)\r
+            Connection: close\r
+            \r
 
-        """
-        NSLog("[diag] export: sending log (%d bytes)", body.count)
-        let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
-        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
-            if error != nil {
-                self.finishTransfer(
-                    connection, claim: claim, success: false
-                )
-                return
-            }
-            self.sendBodyChunks(
-                body,
-                ranges: ranges,
-                index: 0,
-                connection: connection,
-                claim: claim
-            )
-        })
-    }
-
-    private func sendBodyChunks(
-        _ body: Data,
-        ranges: [Range<Int>],
-        index: Int,
-        connection: NWConnection,
-        claim: VXDiagExportPolicy.TransferClaim
-    ) {
-        guard ranges.indices.contains(index) else {
-            finishTransfer(
-                connection, claim: claim, success: true
-            )
-            return
-        }
-        let chunk = body.subdata(in: ranges[index])
-        let isFinalChunk = index == ranges.index(before: ranges.endIndex)
-        connection.send(
-            content: chunk,
-            contentContext: isFinalChunk
-                ? NWConnection.ContentContext.finalMessage
-                : NWConnection.ContentContext.defaultMessage,
-            isComplete: true,
-            completion: .contentProcessed { [weak self] error in
+            """
+            NSLog("[diag] export: sending log (%d bytes)", body.count)
+            let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
+            connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if error != nil {
                     self.finishTransfer(
@@ -367,12 +376,54 @@ final class VXDiagExport: @unchecked Sendable {
                 self.sendBodyChunks(
                     body,
                     ranges: ranges,
-                    index: index + 1,
+                    index: 0,
                     connection: connection,
                     claim: claim
                 )
+            })
+        }
+    }
+
+    private func sendBodyChunks(
+        _ body: Data,
+        ranges: [Range<Int>],
+        index: Int,
+        connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        authorizeDelivery(connection, claim: claim) { [self] in
+            guard ranges.indices.contains(index) else {
+                finishTransfer(
+                    connection, claim: claim, success: true
+                )
+                return
             }
-        )
+            let chunk = body.subdata(in: ranges[index])
+            let isFinalChunk = index == ranges.index(before: ranges.endIndex)
+            connection.send(
+                content: chunk,
+                contentContext: isFinalChunk
+                    ? NWConnection.ContentContext.finalMessage
+                    : NWConnection.ContentContext.defaultMessage,
+                isComplete: true,
+                completion: .contentProcessed { [weak self] error in
+                    guard let self else { return }
+                    if error != nil {
+                        self.finishTransfer(
+                            connection, claim: claim, success: false
+                        )
+                        return
+                    }
+                    self.sendBodyChunks(
+                        body,
+                        ranges: ranges,
+                        index: index + 1,
+                        connection: connection,
+                        claim: claim
+                    )
+                }
+            )
+        }
     }
 
     private func finishTransfer(

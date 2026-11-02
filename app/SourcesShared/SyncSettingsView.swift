@@ -9,6 +9,7 @@ struct SyncSettingsView: View {
     /// An account form is not an unlocked profile.
     var allowsDiagnosticExport: Bool
     var diagnosticCredential: CredentialScopeRegistry.Capture?
+    var diagnosticGrant: ProfilePickerToolsDiagnosticGrant?
     /// Embedded sheets close after authentication and one-time-code acknowledgement.
     /// Account restore remains manager-owned. Ordinary Account settings leave this nil.
     var onSignedIn: (() -> Void)?
@@ -16,10 +17,12 @@ struct SyncSettingsView: View {
 
     init(allowsDiagnosticExport: Bool = true,
          diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
+         diagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil,
          onSignedIn: (() -> Void)? = nil,
          authentication: AccountAuthenticationPresentation? = nil) {
         self.allowsDiagnosticExport = allowsDiagnosticExport
         self.diagnosticCredential = diagnosticCredential
+        self.diagnosticGrant = diagnosticGrant
         self.onSignedIn = onSignedIn
         _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
     }
@@ -27,6 +30,16 @@ struct SyncSettingsView: View {
     private var working: Bool { authentication.working }
     private var diagnosticExportIsAllowed: Bool {
         allowsDiagnosticExport && (diagnosticCredential.map { CredentialScopeRegistry.shared.isCurrent($0) } ?? true)
+            && (exportGrant?.permitsExport ?? true)
+    }
+    private var exportGrant: ProfilePickerToolsDiagnosticGrant? {
+        if let diagnosticGrant { return diagnosticGrant }
+        guard let credential = diagnosticCredential else { return nil }
+        let sync = sync, store = ProfileStore.shared
+        return .init(allowed: allowsDiagnosticExport, credential: credential, admission: {
+            if sync.accountReconnectRequired || sync.accountRestoreState == .failed { return true }
+            return !store.profiles.contains { $0.pin != nil }
+        })
     }
 
     enum Mode: String, CaseIterable { case signIn = "Sign in", create = "Create", recover = "Recover" }
@@ -59,7 +72,7 @@ struct SyncSettingsView: View {
                 } else {
                     signedOut
                 }
-                if diagnosticExportIsAllowed { DiagnosticLogExportButton() }
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
                 // This screen is now VortX-account-only. The external sync providers (Trakt, SIMKL) moved
                 // to the Integrations screen (IntegrationsSettingsView), alongside the Stremio connect card,
                 // since they enrich VortX rather than belonging to the VortX account itself.
@@ -224,7 +237,7 @@ struct SyncSettingsView: View {
                     completeQR(attempt: attempt)
                 })
                     .frame(maxWidth: .infinity)
-                if diagnosticExportIsAllowed { DiagnosticLogExportButton() }
+                if diagnosticExportIsAllowed { DiagnosticLogExportButton(grant: exportGrant) }
             }
             .padding(Theme.Space.lg)
         }

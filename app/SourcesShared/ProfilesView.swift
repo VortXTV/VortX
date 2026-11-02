@@ -77,6 +77,8 @@ struct ProfilePickerView: View {
     @State private var accountHelpNeeded = false
     @State private var accountHelpAllowsDiagnostics = false
     @State private var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture?
+    @State private var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant?
+    @State private var toolsRoute: ProfilePickerToolsRoute?
     @StateObject private var profileAction = ProfileMutationPresentation()
     @StateObject private var accountAuthentication: AccountAuthenticationPresentation
     @StateObject private var artwork = ProfilePickerArtwork.shared
@@ -206,9 +208,7 @@ struct ProfilePickerView: View {
                                     signInCredential = nil; signInProfileID = nil
                                     signInNeeded = false; accountHelpNeeded = false
                                 })
-                            if exportAllowedBeforeProfile {
-                                diagnosticRecoveryButton
-                            }
+                            toolsButton
                         }
                         .padding(.horizontal, 24)
                         .padding(.vertical, 12)
@@ -243,8 +243,17 @@ struct ProfilePickerView: View {
         .profileCover(isPresented: $accountHelpNeeded) {
             ProfileAccountRecoveryView(allowsDiagnosticExport: accountHelpAllowsDiagnostics,
                                        diagnosticCredential: accountHelpDiagnosticCredential,
+                                       diagnosticGrant: accountHelpDiagnosticGrant,
                                        authentication: accountAuthentication)
                 .environmentObject(VortXSyncManager.shared)
+        }
+        .profileCover(item: $toolsRoute) { route in
+            #if os(tvOS)
+            ProfilePickerToolsView(route: route) { closeTools(route.id) }
+            #else
+            ProfilePickerToolsView(route: route,
+                services: .live(restore: .live)) { closeTools(route.id) }
+            #endif
         }
         .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
@@ -258,14 +267,15 @@ struct ProfilePickerView: View {
         }
         .onDisappear {
             artwork.stopRotation()
-            profileAction.cancel()
+            // A full-screen Tools child must retain only the failed-profile diagnostic exception.
+            profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded)
             deferredSelection.cancel()
             // A full-screen child can hide its presenter without removing its identity.
             if !signInNeeded { signInCredential = nil; signInProfileID = nil }
         }
         .onValueChange(of: nativeSync.accountRestoreState) { state in
             if state == .failed { deferredSelection.cancel(); focusDiagnosticRecovery() }
-            if state == .ready, !profileAction.isRunning { profileAction.cancel() }
+            if state == .ready, !profileAction.isRunning { profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded) }
             resumeDeferredSelection()
         }
         .onValueChange(of: nativeSync.nativeCheckpointStatus) { _ in resumeDeferredSelection() }
@@ -280,6 +290,14 @@ struct ProfilePickerView: View {
             if error != nil { focusDiagnosticRecovery() }
             resumeDeferredSelection()
         }
+        .onValueChange(of: accountHelpNeeded) { presented in
+            if !presented {
+                accountHelpAllowsDiagnostics = false
+                accountHelpDiagnosticCredential = nil
+                accountHelpDiagnosticGrant = nil
+                if toolsRoute == nil { profileAction.cancel() }
+            }
+        }
         .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
         .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
@@ -287,20 +305,54 @@ struct ProfilePickerView: View {
             deferredSelection.cancel()
             accountHelpAllowsDiagnostics = false
             accountHelpDiagnosticCredential = nil
+            accountHelpDiagnosticGrant = nil
+            if let route = toolsRoute { closeTools(route.id) }
+            #if os(iOS) || os(macOS)
+            ProfilePickerToolsController.shared.credentialDidChange()
+            #endif
             accountAuthentication.credentialDidChange()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
         }
     }
 
-    @ViewBuilder private var diagnosticRecoveryButton: some View {
-        #if os(tvOS)
-        DiagnosticLogExportButton()
+    @ViewBuilder private var toolsButton: some View {
+        Button { openTools() } label: { Label("Tools", systemImage: "wrench.and.screwdriver") }
+            .buttonStyle(ChipButtonStyle())
+            .accessibilityIdentifier("profile-picker-tools")
+            .accessibilityHint("Download, repair or restore a backup, or export diagnostic logs.")
+            #if os(tvOS)
             .focused($diagnosticFocused)
             .onAppear { focusDiagnosticRecovery() }
-        #else
-        DiagnosticLogExportButton()
+            #endif
+    }
+
+    private func diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant {
+        let permitted = exportAllowedBeforeProfile && pinTarget == nil
+        let credential = CredentialScopeRegistry.shared.capture()
+        let store = store, sync = nativeSync, action = profileAction
+        return .init(allowed: permitted, credential: credential, admission: {
+            if sync.accountReconnectRequired || action.errorMessage != nil || sync.accountRestoreState == .failed { return true }
+            return !store.profiles.contains { $0.pin != nil }
+        })
+    }
+
+    private func openTools() {
+        guard pinTarget == nil else { return }
+        let grant = diagnosticGrant()
+        deferredSelection.cancel()
+        profileAction.cancel(preservingFailure: true)
+        toolsRoute = .init(diagnostics: grant,
+            focusDiagnostics: nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed)
+    }
+
+    private func closeTools(_ id: UUID) {
+        guard toolsRoute?.id == id else { return }
+        #if os(iOS) || os(macOS)
+        ProfilePickerToolsController.shared.dismiss(id)
         #endif
+        toolsRoute = nil
+        profileAction.cancel()
     }
 
     private func openAccountHelp() {
@@ -309,6 +361,7 @@ struct ProfilePickerView: View {
         // picker refused. Freeze this route's grant before auth changes its roster.
         accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil
         accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()
+        accountHelpDiagnosticGrant = diagnosticGrant()
         accountHelpNeeded = true
     }
 
@@ -322,7 +375,7 @@ struct ProfilePickerView: View {
 
     private var artworkIsVisible: Bool {
         scenePhase == .active && pinTarget == nil && editorProfile == nil &&
-        !signInNeeded && !accountHelpNeeded && !profileAction.isRunning
+        !signInNeeded && !accountHelpNeeded && toolsRoute == nil && !profileAction.isRunning
     }
 
     private var artworkTaskKey: String {
@@ -1021,13 +1074,16 @@ struct ProfileAccountRecoveryView: View {
     @Environment(\.dismiss) private var dismiss
     var allowsDiagnosticExport = true
     var diagnosticCredential: CredentialScopeRegistry.Capture?
+    var diagnosticGrant: ProfilePickerToolsDiagnosticGrant?
     @StateObject private var authentication: AccountAuthenticationPresentation
 
     init(allowsDiagnosticExport: Bool = true,
          diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
+         diagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil,
          authentication: AccountAuthenticationPresentation? = nil) {
         self.allowsDiagnosticExport = allowsDiagnosticExport
         self.diagnosticCredential = diagnosticCredential
+        self.diagnosticGrant = diagnosticGrant
         _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
     }
 
@@ -1043,6 +1099,7 @@ struct ProfileAccountRecoveryView: View {
             .padding()
             SyncSettingsView(allowsDiagnosticExport: allowsDiagnosticExport,
                              diagnosticCredential: diagnosticCredential,
+                             diagnosticGrant: diagnosticGrant,
                              onSignedIn: { dismissIfAllowed() }, authentication: authentication)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())

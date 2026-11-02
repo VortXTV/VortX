@@ -24,7 +24,7 @@ struct UserProfile: Equatable {
 }
 
 @MainActor final class CredentialScopeRegistry {
-    struct Capture: Equatable { let generation: Int }
+    struct Capture: Equatable, Sendable { let generation: Int }
     static let shared = CredentialScopeRegistry()
     private var generation = 0
     func capture() -> Capture { .init(generation: generation) }
@@ -107,6 +107,14 @@ enum FakeScene { case active, background }
     var credentialChanges = 0
     func credentialDidChange() { credentialChanges += 1 }
 }
+/// Explicit controller collaborator for extracted picker retirement. Real Tools schedules have their own suite.
+@MainActor final class ProfilePickerToolsController {
+    static let shared = ProfilePickerToolsController()
+    var credentialChanges = 0
+    var dismissed: [UUID] = []
+    func credentialDidChange() { credentialChanges += 1 }
+    func dismiss(_ id: UUID) { dismissed.append(id) }
+}
 @MainActor struct PickerHarness {
     let store: FakeStore
     let core: FakeCore
@@ -130,6 +138,8 @@ enum FakeScene { case active, background }
     @Cell var accountHelpNeeded = false
     @Cell var accountHelpAllowsDiagnostics = false
     @Cell var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture? = nil
+    @Cell var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil
+    @Cell var toolsRoute: ProfilePickerToolsRoute? = nil
 
     init(_ profiles: [UserProfile]) {
         CredentialScopeRegistry.shared.change()
@@ -155,6 +165,9 @@ enum FakeScene { case active, background }
     func foreground() { scenePhase = .active; resumeDeferredSelection() }
     func dismissAuth() { signInNeeded = false; signInChanged(false) }
     func signInChanged(_ presented: Bool) { /* ACTUAL_SIGNIN_EVENT */
+    }
+    func dismissAccountHelp() { accountHelpNeeded = false; accountHelpChanged(false) }
+    func accountHelpChanged(_ presented: Bool) { /* ACTUAL_ACCOUNT_HELP_EVENT */
     }
     func credentialChanged() { /* ACTUAL_CREDENTIAL_EVENT */
     }
@@ -203,7 +216,13 @@ enum FakeScene { case active, background }
             h.recoverAccount()
             precondition(h.accountHelpNeeded && !h.accountHelpAllowsDiagnostics)
             precondition(h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
+            let refused = h.accountHelpDiagnosticGrant!
+            precondition(!refused.permitsExport)
+            h.toolsRoute = .init(diagnostics: refused, focusDiagnostics: false)
+            let retiredRoute = h.toolsRoute!.id
             CredentialScopeRegistry.shared.change(); h.credentialChanged()
+            precondition(!refused.permitsExport && h.toolsRoute == nil
+                         && ProfilePickerToolsController.shared.dismissed.contains(retiredRoute))
             precondition(!h.accountHelpAllowsDiagnostics && h.accountHelpDiagnosticCredential == nil
                          && h.accountAuthentication.credentialChanges == 1)
             h.stop(); passed += 1
@@ -215,6 +234,14 @@ enum FakeScene { case active, background }
             h.recoverAccount()
             precondition(h.accountHelpAllowsDiagnostics
                          && h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
+            let grant = h.accountHelpDiagnosticGrant!
+            precondition(grant.permitsExport)
+            h.disappear() // Full-screen Account help hides its presenter.
+            precondition(h.profileAction.errorMessage != nil && grant.permitsExport)
+            h.restoreChanged(.ready)
+            precondition(grant.permitsExport) // The nested QR inherits this same original grant.
+            h.dismissAccountHelp()
+            precondition(h.accountHelpDiagnosticGrant == nil && h.profileAction.errorMessage == nil && !grant.permitsExport)
             h.stop(); passed += 1
         }
         do {
