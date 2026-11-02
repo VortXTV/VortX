@@ -9,9 +9,9 @@ import SwiftUI
 struct iOSSignInView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
-    // The shared VortX account manager (the same singleton the app root injects). Observed here so the sheet
-    // can dismiss itself the moment a typed VortX sign-in flips isSignedIn; the QR joiner dismisses itself.
-    @ObservedObject private var vortxSync = VortXSyncManager.shared
+    // The typed route shares protection synchronously; only its confirmed completion
+    // may dismiss after one-time-code acknowledgement. QR owns its separate callback.
+    @StateObject private var vortxAuthentication = AccountAuthenticationPresentation()
     @Environment(\.dismiss) private var dismiss
 
     @State private var mode: Mode = .vortx
@@ -43,7 +43,8 @@ struct iOSSignInView: View {
                         // sign-in sheet stays dismissable on Mac.
                         #if os(macOS)
                         HStack {
-                            Button("Cancel") { dismiss() }
+                            Button("Cancel") { dismissIfAllowed() }
+                                .disabled(vortxAuthentication.blocksDismissal)
                                 .buttonStyle(.plain)
                                 .foregroundStyle(Theme.Palette.textSecondary)
                             Spacer()
@@ -66,15 +67,18 @@ struct iOSSignInView: View {
             #if os(iOS)
             .navigationTitle("")          // the wordmark IS the title
             .inlineNavigationTitle()
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismissIfAllowed() }
+                    .disabled(vortxAuthentication.blocksDismissal)
+            } }
             #endif
             // Typed VortX account path: the shared SyncSettingsView (sign in / create / recover), reused
             // AS-IS and pushed as its own screen so its ScrollView never nests inside this one. On success it
-            // flips VortXSyncManager.isSignedIn and the .onChange below closes the sheet. SyncSettingsView
+            // confirms authentication and code acknowledgement before closing the sheet. SyncSettingsView
             // reads VortXSyncManager from the environment, which this sheet already inherits (same as the
             // account / core objects it already uses).
             .navigationDestination(isPresented: $showVortXEmail) {
-                SyncSettingsView(onSignedIn: { dismiss() })
+                SyncSettingsView(onSignedIn: { dismissIfAllowed() }, authentication: vortxAuthentication)
             }
         }
         // Stremio success handler. One place seeds the engine with the freshly written authKey, then
@@ -92,19 +96,15 @@ struct iOSSignInView: View {
         .onValueChange(of: account.credentialBoundaryGeneration) { _ in
             handleStremioSignIn(signedIn: account.isSignedIn)
         }
-        // VortX typed-path success: SyncSettingsView signs the VortX account in and adopt() has already
-        // hydrated add-ons + library (the app-root onChange re-runs the degraded-engine check), so here we
-        // only close the sheet. Scoped to showVortXEmail so the QR joiner's own checkmark-then-dismiss is
-        // never preempted. .onChange fires only on a real transition, so an already-signed-in open (someone
-        // who opened this sheet just to add Stremio) never spuriously dismisses.
-        .onValueChange(of: vortxSync.isSignedIn) { signedIn in
-            if signedIn && showVortXEmail { dismiss() }
-        }
+        // Manager publication alone is not permission to lose a newly-created recovery code.
+        // The typed child invokes its callback only after the user acknowledges that code.
+        .interactiveDismissDisabled(vortxAuthentication.blocksDismissal)
     }
 
     @MainActor
     private func handleStremioSignIn(signedIn: Bool) {
-        guard signedIn, account.signInError == nil, !didHandleSignIn else { return }
+        guard !showVortXEmail, !vortxAuthentication.blocksDismissal,
+              signedIn, account.signInError == nil, !didHandleSignIn else { return }
         didHandleSignIn = true
         core.signedInWithLegacyAuthKey()
         // Await actual add-on hydration, not a fixed delay, before the never-zero import snapshot.
@@ -112,6 +112,11 @@ struct iOSSignInView: View {
             await core.awaitAddonsHydrated()
             await VortXSyncManager.shared.snapshotOwnedFromEngine()
         }
+        dismiss()
+    }
+
+    private func dismissIfAllowed() {
+        guard !vortxAuthentication.blocksDismissal else { return }
         dismiss()
     }
 
@@ -150,7 +155,10 @@ struct iOSSignInView: View {
         case .vortx:
             // The joiner runs VortXSyncManager.qrStart/qrPoll and dismisses this sheet itself on success
             // (its own checkmark-then-dismiss), exactly as on tvOS.
-            VortXAccountJoinerView(onSignedIn: { dismiss() })
+            VortXAccountJoinerView(onSignedIn: {
+                guard !showVortXEmail else { return }
+                dismissIfAllowed()
+            })
                 .frame(maxWidth: 460)
         case .stremioLink:
             LinkLoginView(account: account)

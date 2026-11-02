@@ -3216,7 +3216,8 @@ final class VortXSyncManager: ObservableObject {
         token: String,
         account acct: [String: Any],
         dataKey: Data,
-        expectedOperation: AuthOperationCapture? = nil
+        expectedOperation: AuthOperationCapture? = nil,
+        onAuthenticated: (@MainActor (VortXAuthenticationReceipt) -> Void)? = nil
     ) async -> Bool {
         let operation = expectedOperation ?? currentCredentialOwnerIntent()
         guard isCurrent(operation) else { return false }
@@ -3284,6 +3285,11 @@ final class VortXSyncManager: ObservableObject {
             guard self.isCurrent(adoptedCapture) else { return }
             await self.hydrateEngineFromOwnedAddons(credentialCapture: adoptedCapture)
         }
+        // Issue UI ownership before returning across the await boundary. A caller must
+        // never attach an old one-time code to whichever account happens to be current later.
+        guard operation.generation == authOperationGeneration,
+              isCurrent(adoptedCapture), self.account?.id == candidateAccount.id, isSignedIn else { return false }
+        onAuthenticated?(VortXAuthenticationReceipt(accountID: candidateAccount.id, credential: adoptedCapture))
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
         return true
@@ -3293,7 +3299,8 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - Flows
 
-    func register(email: String, username: String, password: String) async -> (result: AuthResult, recoveryCode: String?) {
+    func register(email: String, username: String, password: String,
+                  onAuthenticated: (@MainActor (VortXAuthenticationReceipt, String) -> Void)? = nil) async -> (result: AuthResult, recoveryCode: String?) {
         let operation = beginAuthOperation()
         guard let kdfSalt = VortXSecureEntropy.randomBytes(16),
               let dataKey = VortXSecureEntropy.randomBytes(32),
@@ -3324,7 +3331,8 @@ final class VortXSyncManager: ObservableObject {
         )
         guard isCurrent(operation) else { return (.failed("Sign-in was superseded."), nil) }
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            guard await adopt(token: token, account: acct, dataKey: dataKey, expectedOperation: operation) else {
+            guard await adopt(token: token, account: acct, dataKey: dataKey, expectedOperation: operation,
+                              onAuthenticated: { receipt in onAuthenticated?(receipt, recoveryCode) }) else {
                 return (.failed("Could not create the account."), nil)
             }
             return (.ok, recoveryCode)
@@ -3337,7 +3345,8 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signIn(login: String, password: String, totp: String? = nil,
-                requireCurrentAccount: Bool = false) async -> AuthResult {
+                requireCurrentAccount: Bool = false,
+                onAuthenticated: (@MainActor (VortXAuthenticationReceipt) -> Void)? = nil) async -> AuthResult {
         let reconnectCapture = requireCurrentAccount ? credentialAuthority.capture() : nil
         let reconnectAccountID = requireCurrentAccount ? account?.id : nil
         let reconnectDataKey = requireCurrentAccount ? dataKey : nil
@@ -3382,13 +3391,15 @@ final class VortXSyncManager: ObservableObject {
                 return .failed("That sign-in does not match the connected VortX account.")
             }
         }
-        guard await adopt(token: token, account: acct, dataKey: dk, expectedOperation: operation) else {
+        guard await adopt(token: token, account: acct, dataKey: dk, expectedOperation: operation,
+                          onAuthenticated: onAuthenticated) else {
             return .failed("Could not sign in.")
         }
         return .ok
     }
 
-    func recover(email: String, recoveryCode: String, newPassword: String) async -> AuthResult {
+    func recover(email: String, recoveryCode: String, newPassword: String,
+                 onAuthenticated: (@MainActor (VortXAuthenticationReceipt) -> Void)? = nil) async -> AuthResult {
         let operation = beginAuthOperation()
         let trimmed = recoveryCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let (_, start) = await request(
@@ -3419,7 +3430,8 @@ final class VortXSyncManager: ObservableObject {
         )
         guard isCurrent(operation) else { return .failed("Recovery was superseded.") }
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            guard await adopt(token: token, account: acct, dataKey: dk, expectedOperation: operation) else {
+            guard await adopt(token: token, account: acct, dataKey: dk, expectedOperation: operation,
+                              onAuthenticated: onAuthenticated) else {
                 return .failed("Recovery failed.")
             }
             return .ok

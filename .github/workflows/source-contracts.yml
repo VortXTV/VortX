@@ -52,6 +52,7 @@ on:
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -151,6 +152,7 @@ on:
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-profile-picker-account.sh"
+      - "scripts/test-account-authentication-lifecycle.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-profile-picker-public-seed.sh"
       - "test/android-profile-picker-startup.test.mjs"
@@ -329,6 +331,8 @@ jobs:
       - run: bash scripts/test-account-backup-file.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-picker-account.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-roster-propagation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

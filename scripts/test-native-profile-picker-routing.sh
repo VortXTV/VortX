@@ -33,6 +33,10 @@ methods = '    private func pick(_ profile: UserProfile) {' + between(picker,
   '    private func pick(_ profile: UserProfile) {', "\n}\n")
 methods += "\n" + '    private func focusDiagnosticRecovery() {' + between(picker,
   '    private func focusDiagnosticRecovery() {', "\n    }\n") + "\n    }\n"
+methods += "\n" + '    private func openAccountHelp() {' + between(picker,
+  '    private func openAccountHelp() {', "\n    }\n") + "\n    }\n"
+methods += "\n" + '    private var exportAllowedBeforeProfile: Bool {' + between(picker,
+  '    private var exportAllowedBeforeProfile: Bool {', "\n    }\n") + "\n    }\n"
 preparing = '    private var profilesArePreparing: Bool {' + between(picker,
   '    private var profilesArePreparing: Bool {', "\n    }\n") + "\n    }"
 restore_event = between(picker,
@@ -71,7 +75,7 @@ File.write(File.join(out, 'source-sha256.txt'), receipt)
 puts receipt
 RUBY
 
-xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+xcrun swiftc -parse-as-library -swift-version 6 -strict-concurrency=complete -warnings-as-errors -j 1 -num-threads 1 \
     -D VORTX_NATIVE_DATA_ENGINE \
     "$picker_repo_root/app/SourcesShared/NativeProfileActionPreparation.swift" \
     "$picker_repo_root/app/SourcesShared/ProfileMutationPresentation.swift" \

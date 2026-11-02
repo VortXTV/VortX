@@ -91,6 +91,7 @@ struct iOSRootView: View {
     @State private var homeBrowse = false
     @State private var homeHasDestination = false
     @StateObject private var quickViewPresenter = CinemaQuickViewPresenter()
+    @StateObject private var profileAuthentication = AccountAuthenticationPresentation()
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -164,7 +165,7 @@ struct iOSRootView: View {
     /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
     /// brand splash lives one level up in VortXiOSApp), so per the shared design it gates on needsPicker
     /// alone here rather than inventing a splash flag.
-    private var pickerOwed: Bool { profiles.needsPicker && !playbackGate.playerActive }
+    private var pickerOwed: Bool { profileAuthentication.blocksDismissal || (profiles.needsPicker && !playbackGate.playerActive) }
 
     /// The main shell is visible only once a profile has settled: while the picker is owed it is hidden
     /// behind brand canvas so no main-profile content (Continue Watching, Library) shows before a viewer is
@@ -193,7 +194,10 @@ struct iOSRootView: View {
     private var pickerPresented: Binding<Bool> {
         Binding(
             get: { pickerOwed },
-            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+            set: { presented in
+                guard !profileAuthentication.blocksDismissal else { return }
+                if !presented { profiles.pickedThisLaunch = true }
+            }
         )
     }
 
@@ -401,10 +405,10 @@ struct iOSRootView: View {
         // MacProfileCoverHost / MacRootProfileCoverOverlay) instead of a content-sized `.sheet` that
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
-        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication) }
         #else
         shellWithTabPreferenceRouting
-            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication) }
         #endif
     }
 

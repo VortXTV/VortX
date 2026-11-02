@@ -82,7 +82,7 @@ for (const path of ['app/SourcesTV/LoginView.swift', 'app/SourcesTV/BackupImport
   const scroll = member(sources[path], 'ScrollView');
   assert(scroll.includes('DiagnosticLogExportButton()'), `${path} export must remain reachable in a tall error layout`);
 }
-assert(member(sources[paths[3]], 'private var qrSignInSheet:').includes('DiagnosticLogExportButton()'));
+assert(member(sources[paths[3]], 'private func qrSignInSheet(').includes('DiagnosticLogExportButton()'));
 const entryCode = entry.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
 for (const forbidden of ['Keychain', 'CoreBridge', 'StremioAccount', 'VortXSyncManager', 'UserDefaults', '@AppStorage', 'VXProbe.enabled', 'VXProbe.logFileURL', 'consumeLogSnapshot']) {
   assert(!entryCode.includes(forbidden), `export must not depend on ${forbidden}`);

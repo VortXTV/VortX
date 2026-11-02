@@ -75,7 +75,10 @@ struct ProfilePickerView: View {
     @State private var isEditing = false
     @State private var signInNeeded = false
     @State private var accountHelpNeeded = false
+    @State private var accountHelpAllowsDiagnostics = false
+    @State private var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture?
     @StateObject private var profileAction = ProfileMutationPresentation()
+    @StateObject private var accountAuthentication: AccountAuthenticationPresentation
     @StateObject private var artwork = ProfilePickerArtwork.shared
     @ObservedObject private var nativeSync = VortXSyncManager.shared
     @State private var deferredSelection = NativeProfileActionPreparation.DeferredSelection<CredentialScopeRegistry.Capture>()
@@ -98,7 +101,10 @@ struct ProfilePickerView: View {
         return !store.profiles.contains { $0.pin != nil }
     }
 
-    init(core: CoreBridge = .shared) { self.core = core }
+    init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil) {
+        self.core = core
+        _accountAuthentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
+    }
 
     private var visibleProfileError: String? {
         if nativeSync.accountReconnectRequired {
@@ -170,7 +176,7 @@ struct ProfilePickerView: View {
                                     .padding(12)
                                     .background(.red.opacity(0.22), in: RoundedRectangle(cornerRadius: 16))
                                     .accessibilityIdentifier("profile-picker-error")
-                                Button("Account settings") { deferredSelection.cancel(); accountHelpNeeded = true }
+                                Button("Account settings") { openAccountHelp() }
                                     .buttonStyle(.bordered)
                                     .tint(.white)
                             }
@@ -191,8 +197,7 @@ struct ProfilePickerView: View {
                         VStack(spacing: Theme.Space.md) {
                             ProfilePickerAccountControls(
                                 onSignIn: {
-                                    deferredSelection.cancel()
-                                    accountHelpNeeded = true
+                                    openAccountHelp()
                                 },
                                 beforeConfirmedSignOut: {
                                     deferredSelection.cancel()
@@ -236,9 +241,12 @@ struct ProfilePickerView: View {
             #endif
         }
         .profileCover(isPresented: $accountHelpNeeded) {
-            ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
+            ProfileAccountRecoveryView(allowsDiagnosticExport: accountHelpAllowsDiagnostics,
+                                       diagnosticCredential: accountHelpDiagnosticCredential,
+                                       authentication: accountAuthentication)
+                .environmentObject(VortXSyncManager.shared)
         }
-        .interactiveDismissDisabled(profileAction.isRunning)
+        .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
             guard artworkIsVisible else {
                 artwork.stopRotation()
@@ -277,6 +285,9 @@ struct ProfilePickerView: View {
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             profileAction.cancel()
             deferredSelection.cancel()
+            accountHelpAllowsDiagnostics = false
+            accountHelpDiagnosticCredential = nil
+            accountAuthentication.credentialDidChange()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
         }
@@ -290,6 +301,15 @@ struct ProfilePickerView: View {
         #else
         DiagnosticLogExportButton()
         #endif
+    }
+
+    private func openAccountHelp() {
+        deferredSelection.cancel()
+        // Opening the account form must not grant device-wide log access that the
+        // picker refused. Freeze this route's grant before auth changes its roster.
+        accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil
+        accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()
+        accountHelpNeeded = true
     }
 
     private func focusDiagnosticRecovery() {
@@ -999,17 +1019,42 @@ private struct ProfilePickerButtonContent: View {
 /// A full-screen account form needs its own way back to the picker, including before sign-in.
 struct ProfileAccountRecoveryView: View {
     @Environment(\.dismiss) private var dismiss
+    var allowsDiagnosticExport = true
+    var diagnosticCredential: CredentialScopeRegistry.Capture?
+    @StateObject private var authentication: AccountAuthenticationPresentation
+
+    init(allowsDiagnosticExport: Bool = true,
+         diagnosticCredential: CredentialScopeRegistry.Capture? = nil,
+         authentication: AccountAuthenticationPresentation? = nil) {
+        self.allowsDiagnosticExport = allowsDiagnosticExport
+        self.diagnosticCredential = diagnosticCredential
+        _authentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text("VortX account").font(.title2.bold())
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.bordered)
+                Button("Done") { dismissIfAllowed() }
+                    .buttonStyle(.bordered)
+                    .disabled(authentication.blocksDismissal)
             }
             .padding()
-            SyncSettingsView(onSignedIn: { dismiss() })
+            SyncSettingsView(allowsDiagnosticExport: allowsDiagnosticExport,
+                             diagnosticCredential: diagnosticCredential,
+                             onSignedIn: { dismissIfAllowed() }, authentication: authentication)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .interactiveDismissDisabled(authentication.blocksDismissal)
+        #if os(tvOS)
+        .onExitCommand { dismissIfAllowed() }
+        #endif
+    }
+
+    private func dismissIfAllowed() {
+        guard !authentication.blocksDismissal else { return }
+        dismiss()
     }
 }
 

@@ -103,6 +103,10 @@ final class FakeArtwork { var stops = 0; func stopRotation() { stops += 1 } }
 enum FakeScene { case active, background }
 @MainActor final class Lifetime { var subscriptions = Set<AnyCancellable>(); var live = true }
 
+@MainActor final class FakeAuthentication {
+    var credentialChanges = 0
+    func credentialDidChange() { credentialChanges += 1 }
+}
 @MainActor struct PickerHarness {
     let store: FakeStore
     let core: FakeCore
@@ -111,6 +115,7 @@ enum FakeScene { case active, background }
     let theme = FakeTheme()
     let artwork = FakeArtwork()
     let profileAction = ProfileMutationPresentation()
+    let accountAuthentication = FakeAuthentication()
     let lifetime = Lifetime()
     @Cell var scenePhase = FakeScene.active
     @Cell var deferredSelection = NativeProfileActionPreparation.DeferredSelection<CredentialScopeRegistry.Capture>()
@@ -123,6 +128,8 @@ enum FakeScene { case active, background }
     @Cell var isEditing = false
     @Cell var signInNeeded = false
     @Cell var accountHelpNeeded = false
+    @Cell var accountHelpAllowsDiagnostics = false
+    @Cell var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture? = nil
 
     init(_ profiles: [UserProfile]) {
         CredentialScopeRegistry.shared.change()
@@ -191,6 +198,25 @@ enum FakeScene { case active, background }
     }
     @MainActor static func main() async {
         var passed = 0
+        do {
+            let (h, _, _) = fixture(pin: "synthetic-pin")
+            h.recoverAccount()
+            precondition(h.accountHelpNeeded && !h.accountHelpAllowsDiagnostics)
+            precondition(h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
+            CredentialScopeRegistry.shared.change(); h.credentialChanged()
+            precondition(!h.accountHelpAllowsDiagnostics && h.accountHelpDiagnosticCredential == nil
+                         && h.accountAuthentication.credentialChanges == 1)
+            h.stop(); passed += 1
+        }
+        do {
+            let (h, _, b) = fixture(pin: "synthetic-pin")
+            h.store.selectResult = false; h.tap(b)
+            await until("synthetic failed-open diagnostic admission") { h.profileAction.errorMessage != nil }
+            h.recoverAccount()
+            precondition(h.accountHelpAllowsDiagnostics
+                         && h.accountHelpDiagnosticCredential == CredentialScopeRegistry.shared.capture())
+            h.stop(); passed += 1
+        }
         do {
             let (h, a, _) = fixture()
             h.nativeSync.accountReconnectRequired = true
