@@ -405,6 +405,105 @@ class AndroidRealtimeSyncTest {
         } finally { f.close() }
     }
 
+    @Test fun fullEncryptedAccountDownloadWorksWithoutProfileOrNativeMountAndNeverDecryptsOrAcknowledges() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            var ordinaryRequests = 0; var downloads = 0
+            manager.installSyncTestSeam(original, 99, transport = { _, _, _, _ -> ordinaryRequests++; 500 to null })
+            manager.installSessionRestoreTestSeam(original)
+            // Valid framing but deliberately not decryptable under key: export must retain opaque ciphertext.
+            val ciphertext = "v2." + com.vortx.android.engine.OHJson.b64(ByteArray(28))
+            val raw = """{"document":"$ciphertext","version":42,"username":"untrusted response metadata","future":{"precise":9007199254740991.1}}""".toByteArray()
+            manager.installAccountFileTransportTestSeam { method, path, token ->
+                downloads++; assertEquals("GET", method); assertEquals("/v1/backup", path)
+                assertEquals(original.token, token); 200 to raw
+            }
+            val names = listOf("vortx_settings", "vortx_sync_state", "vortx_sync_dirty")
+            val before = names.associateWith { context.getSharedPreferences(it, 0).all.toMap() }
+            val file = manager.downloadAccountBackupFile()
+            val wrapper = com.vortx.android.engine.OHJson.Obj(file)
+            assertEquals(account.username, wrapper.text("username"))
+            assertEquals(ciphertext, wrapper.text("document")); assertEquals(42L, com.vortx.android.engine.OHJson.integer(wrapper.raw("version")))
+            assertEquals(1, downloads); assertEquals(0, ordinaryRequests)
+            assertEquals(99L, manager.lastAppliedVersion()) // Downloading a lower cloud revision changes no floor.
+            assertSame(original, manager.currentSession())
+            names.forEach { assertEquals(before[it], context.getSharedPreferences(it, 0).all) }
+        } finally { manager.cancelSyncTestWork() }
+    }
+
+    @Test fun fullEncryptedAccountDownloadRefusesSameValueSessionReplacementAndExpiredOriginalOperation() = test {
+        for (replace in listOf(true, false)) {
+            val context = MemoryContext()
+            val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+            val manager = VortXSyncManager(context, work)
+            val original = VortXSyncManager.Session("fixture original", account, key)
+            try {
+                manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+                manager.installSessionRestoreTestSeam(original)
+                val entered = CompletableDeferred<Unit>(); val reply = CompletableDeferred<Unit>()
+                manager.installAccountFileTransportTestSeam { _, _, _ ->
+                    entered.complete(Unit); reply.await()
+                    200 to """{"document":"v2.${com.vortx.android.engine.OHJson.b64(ByteArray(28))}","version":10}""".toByteArray()
+                }
+                val pending = async { runCatching { manager.downloadAccountBackupFile() } }
+                runCurrent(); entered.await()
+                if (replace) manager.replaceSyncSessionTestSeam(VortXSyncManager.Session(original.token, account, key.copyOf()))
+                else manager.expireSyncOperationTestSeam()
+                reply.complete(Unit); runCurrent()
+                val error = pending.await().exceptionOrNull()
+                assertTrue(error is AccountBackupFile.Failure)
+                assertEquals(AccountBackupFile.Reason.SESSION_CHANGED, (error as AccountBackupFile.Failure).reason)
+            } finally { manager.cancelSyncTestWork() }
+        }
+    }
+
+    @Test fun fullEncryptedAccountDownloadKeepsMissingTransportMalformedAndOversizedFailuresDistinct() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+            manager.installSessionRestoreTestSeam(original)
+            var status = 404; var raw: ByteArray? = null
+            manager.installAccountFileTransportTestSeam { _, _, _ -> status to raw }
+            suspend fun refused(reason: AccountBackupFile.Reason) {
+                val error = runCatching { manager.downloadAccountBackupFile() }.exceptionOrNull()
+                assertTrue(error is AccountBackupFile.Failure)
+                assertEquals(reason, (error as AccountBackupFile.Failure).reason)
+                assertSame(original, manager.currentSession()); assertEquals(10L, manager.lastAppliedVersion())
+            }
+            refused(AccountBackupFile.Reason.NO_BACKUP)
+            for (failure in listOf(0, 304, 401, 403, 500)) { status = failure; refused(AccountBackupFile.Reason.UNAVAILABLE) }
+            status = 200; refused(AccountBackupFile.Reason.DAMAGED)
+            raw = """{"document":"v2.${com.vortx.android.engine.OHJson.b64(ByteArray(28))}","version":9007199254740991.1}""".toByteArray()
+            refused(AccountBackupFile.Reason.DAMAGED)
+            raw = ByteArray(AccountBackupFile.MAXIMUM_RESPONSE_BYTES + 1) { 32 }
+            refused(AccountBackupFile.Reason.TOO_LARGE)
+        } finally { manager.cancelSyncTestWork() }
+    }
+
+    @Test fun fullEncryptedAccountDownloadDoesNotTreatUnavailableSessionAsSignedOutOrContactTransport() = test {
+        val context = MemoryContext()
+        val work = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val manager = VortXSyncManager(context, work)
+        val original = VortXSyncManager.Session("fixture original", account, key)
+        try {
+            manager.installSyncTestSeam(original, 10, transport = { _, _, _, _ -> error("Unexpected ordinary request") })
+            manager.installUnavailableSessionRestoreTestSeam()
+            var calls = 0
+            manager.installAccountFileTransportTestSeam { _, _, _ -> calls++; 404 to null }
+            val error = runCatching { manager.downloadAccountBackupFile() }.exceptionOrNull()
+            assertTrue(error is AccountBackupFile.Failure)
+            assertEquals(AccountBackupFile.Reason.SESSION_CHANGED, (error as AccountBackupFile.Failure).reason)
+            assertEquals(0, calls); assertSame(original, manager.currentSession())
+            assertEquals(VortXSyncManager.SessionUiState.UnknownOrUnavailable, manager.sessionUiState.value)
+        } finally { manager.cancelSyncTestWork() }
+    }
+
     @Test fun synchronousSocketStartupFailureRetainsSessionWorkerPollingAndRetry() = test {
         val f = Fixture(testScheduler)
         var attempts = 0

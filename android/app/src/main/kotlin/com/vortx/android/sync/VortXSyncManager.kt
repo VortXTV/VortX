@@ -2167,6 +2167,47 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return plaintext
     }
 
+    private class AccountFileDownload(val lease: SyncSessionLease, val owner: Session) {
+        var response: ByteArray? = null
+    }
+    private fun captureAccountFileDownload(): AccountFileDownload? = operations.snapshot {
+        if (sessionOwnerSnapshot() !is SessionOwnerSnapshot.Account) return@snapshot null
+        sessionState.serialized {
+            val owner = sessionState.value ?: return@serialized null
+            val lease = captureSyncLease() ?: return@serialized null
+            AccountFileDownload(lease, owner)
+        }
+    }
+    private fun isAccountFileDownloadCurrent(capture: AccountFileDownload): Boolean = operations.snapshot {
+        isSyncLeaseCurrent(capture.lease) && sessionState.serialized {
+            sessionState.value === capture.owner && _sessionUiState.value is SessionUiState.SignedIn
+        }
+    }
+
+    /** Full encrypted account export; independent of profile/native readiness and sync side effects. */
+    suspend fun downloadAccountBackupFile(): ByteArray {
+        val capture = captureAccountFileDownload()
+            ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+        val permit = acquireSyncCallPermit(capture.lease)
+            ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+        val (status, _) = request("GET", "/v1/backup", null, bearerToken = capture.lease.token,
+            callPermit = permit, candidateCurrent = { isAccountFileDownloadCurrent(capture) },
+            accountFileDownload = capture)
+        if (!isAccountFileDownloadCurrent(capture)) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+        if (status == 404) throw AccountBackupFile.Failure(AccountBackupFile.Reason.NO_BACKUP)
+        if (status != 200) throw AccountBackupFile.Failure(AccountBackupFile.Reason.UNAVAILABLE)
+        val response = capture.response ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.DAMAGED)
+        val file = AccountBackupFile.encodeServerResponse(response, capture.owner.account.username)
+        if (!isAccountFileDownloadCurrent(capture)) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+        return file
+    }
+
+    /** Raw-body collaborator is restricted to this owned download mode; normal sync/auth is unchanged. */
+    @Volatile private var accountFileTransportTestSeam: (suspend (String, String, String?) -> Pair<Int, ByteArray?>)? = null
+    internal fun installAccountFileTransportTestSeam(transport: suspend (String, String, String?) -> Pair<Int, ByteArray?>) {
+        accountFileTransportTestSeam = transport
+    }
+
     // ---- Tri-state pull (never conflate "no backup yet" with "the pull failed") ----
 
     /** Constructed only by this account's authenticated GET, never a poll/high-water/reject echo. */
@@ -3582,7 +3623,26 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         ifNoneMatch: String? = null,
         receiveETag: ((String?) -> Unit)? = null,
         candidateCurrent: () -> Boolean = { true },
+        accountFileDownload: AccountFileDownload? = null,
     ): Pair<Int, JSONObject?> {
+        if (accountFileDownload != null) {
+            check(method == "GET" && path == "/v1/backup" && body == null && ifNoneMatch == null &&
+                bearerToken == accountFileDownload.lease.token)
+            accountFileTransportTestSeam?.let { transport ->
+                return try {
+                    if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) 0 to null
+                    else {
+                        val (status, raw) = transport(method, path, bearerToken)
+                        if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) 0 to null
+                        else {
+                            if (status == 200 && raw != null) accountFileDownload.response =
+                                raw.inputStream().use(AccountBackupFile::readBoundedResponse)
+                            status to null
+                        }
+                    }
+                } finally { callPermit.close() }
+            }
+        }
         conditionalRequestTestSeam?.let { testTransport ->
             if (!callPermit.isCurrent() || !candidateCurrent()) { callPermit.close(); return 0 to null }
             return try {
@@ -3634,6 +3694,14 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     if (!callPermit.isCurrent()) return@withContext 0 to null
                     val status = opened.responseCode
                     receiveETag?.invoke(opened.getHeaderField("ETag"))
+                    if (accountFileDownload != null) {
+                        if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) return@withContext 0 to null
+                        if (status != 200) return@withContext status to null
+                        val raw = opened.inputStream.use(AccountBackupFile::readBoundedResponse)
+                        if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) return@withContext 0 to null
+                        accountFileDownload.response = raw
+                        return@withContext status to null
+                    }
                     if (status == 304) return@withContext 304 to null
                     val stream = if (status in 200..399) opened.inputStream else opened.errorStream
                     val text = try { stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty() }
