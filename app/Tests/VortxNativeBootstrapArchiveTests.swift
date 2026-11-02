@@ -122,6 +122,8 @@ import CryptoKit
         try archiveInspectionDiagnostics()
         do { try literalProfileDisplayFields() }
         catch { print("FAIL: producer-shaped literal profile text blocked account preparation: \(error)"); exit(1) }
+        do { try taggedAccountRosterNames() }
+        catch { print("FAIL: full legacy/native tagged roster names blocked strict archive admission: \(error)"); exit(1) }
         do { try literalAddonManifestLabels() }
         catch { print("FAIL: literal add-on manifest text blocked account preparation: \(error)"); exit(1) }
         do { try literalAddonSummaryNames() }
@@ -421,6 +423,170 @@ import CryptoKit
         }
     }
 
+    static func taggedAccountRosterNames() throws {
+        typealias Object = [String: Any]
+        let owner = "20000000-0000-0000-0000-000000000001"
+        let shared = "20000000-0000-0000-0000-000000000002"
+        let label = "[RD] Synthetic Owner"
+        let pin = "sha256:" + String(repeating: "a", count: 64)
+        func full(_ id: String, _ name: String) -> Object {
+            ["id": id, "name": name, "avatar": "🍿", "isOwner": id == owner,
+             "usesOwnAccount": false, "pin": pin, "isKids": id != owner, "familyEdit": id != owner,
+             "future": ["safe": "retained"]]
+        }
+        func native(_ id: String, _ name: String) -> Object {
+            ["id": id, "name": name, "owner": id == owner,
+             "account": id == owner ? ["kind": "local_only"] : ["kind": "shared", "value": owner],
+             "parental": ["kids": id != owner, "familyEdit": id != owner], "pin": pin,
+             "addons": "share_primary", "settings": ["oled": false, "textScale": 1000, "languages": [String](),
+                                                         "disabledAddons": [String]()],
+             "deleted": false, "rev": 1, "updatedAt": 2, "future": ["safe": "retained"]]
+        }
+        func material(_ name: String = "[RD] Synthetic Owner", _ child: String = "[Kids] Shared") -> Object {
+            ["schemaVersion": 1, "roster": [native(owner, name), native(shared, child)],
+             "rosterModifiedSeconds": NSNull(), "deletedProfileIds": [String](),
+             "addons": Object(), "libraries": Object(), "watches": Object(), "identityLinks": Object()]
+        }
+        func document(_ name: String = "[RD] Synthetic Owner", _ child: String = "[Kids] Shared") -> Object {
+            ["vortx": ["roster": [full(owner, name), full(shared, child)], "future": ["safe": true]],
+             "nativeSync": ["schemaVersion": 5, "scope": "fixture-account", "ownerProfileId": owner,
+                            "profiles": [owner: ["profile": native(owner, name), "fieldClocks": Object()],
+                                         shared: ["profile": native(shared, child), "fieldClocks": Object()]],
+                            "legacyImport": ["schemaVersion": 1, "fingerprint": String(repeating: "a", count: 64),
+                                             "baseline": material(name, child)]],
+             "future": ["exact": 125.375]]
+        }
+        func changed(_ value: Any, at path: [String], to replacement: Any) -> Any {
+            guard let first = path.first else { return replacement }
+            let rest = Array(path.dropFirst())
+            if var object = value as? Object {
+                object[first] = changed(object[first] ?? Object(), at: rest, to: replacement)
+                return object
+            }
+            var array = value as! [Any]
+            let index = Int(first)!
+            array[index] = changed(array[index], at: rest, to: replacement)
+            return array
+        }
+        func changedDocument(_ path: [String], _ value: Any, source: Object? = nil) -> Object {
+            changed(source ?? document(), at: path, to: value) as! Object
+        }
+        let names = [["vortx", "roster", "0", "name"],
+                     ["nativeSync", "profiles", owner, "profile", "name"],
+                     ["nativeSync", "profiles", shared, "profile", "name"],
+                     ["nativeSync", "legacyImport", "baseline", "roster", "0", "name"]]
+        // Synthetic structure checks are paired with the actual-kernel Repair→Restore fixture.
+        // The first document is the old full-roster failure, followed by both native copies.
+        for (name, child) in [(label, "[Kids] Shared"), ("[RD] [4K] Family", "[日本語] 家族"), ("{Family} Room", "[")] {
+            let source = document(name, child)
+            let original = try JSONSerialization.data(withJSONObject: source, options: [.prettyPrinted, .sortedKeys])
+            let before = original
+            var diagnostics: [String] = []
+            let cleaned = try VortxNativeBootstrapArchive.credentialFreeDocument(source,
+                diagnostics: { diagnostics.append($0) }, holdingUnreadableValues: false)
+            check(try diagnostics.isEmpty && data(JSONSerialization.jsonObject(with: cleaned)) == data(source))
+            let archive = try VortxNativeBootstrapArchive.encode(document: original)
+            try VortxNativeBootstrapArchive.validate(archive)
+            let envelope = try JSONSerialization.jsonObject(with: archive) as! Object
+            check((envelope["excludedCredentialPaths"] as! [String]).isEmpty)
+            check(try data(envelope["hostDocument"]!) == data(source))
+            let retained = try VortxNativeBootstrapArchive.encode(document: data([:]), authenticatedSourceArchive: archive)
+            try VortxNativeBootstrapArchive.validate(retained)
+            check(try data((JSONSerialization.jsonObject(with: retained) as! Object)["authenticatedSourceArchive"]!) == data(source))
+            let empty = try VortxNativeBootstrapArchive.encode(document: data([:]))
+            let replaced = try VortxNativeBootstrapArchive.replacingHostDocument(in: empty, with: original)
+            try VortxNativeBootstrapArchive.validate(replaced)
+            check(try original == before && data(source) == data(JSONSerialization.jsonObject(with: original)))
+        }
+        // The explicit typed material parameter has its own content-qualified entry,
+        // never an exemption for a same-named arbitrary host field.
+        for version in [1, 2] {
+            var typed = material(); typed["schemaVersion"] = version
+            let bytes = try data(typed)
+            let archive = try VortxNativeBootstrapArchive.encode(document: data([:]), material: bytes)
+            try VortxNativeBootstrapArchive.validate(archive)
+            check(try data((JSONSerialization.jsonObject(with: archive) as! Object)["legacyImportMaterial"]!) == bytes)
+        }
+        for schema in 1...5 {
+            let archive = try VortxNativeBootstrapArchive.encode(document: data(changedDocument(["nativeSync", "schemaVersion"], schema)))
+            try VortxNativeBootstrapArchive.validate(archive)
+        }
+        for bad in taggedDisplayCarrierControls() + ["[RD] {\"token\":\"fixture-hidden\"}", "[RD] bplist00broken"] {
+            for path in names { try strictOpaqueRefusal(changedDocument(path, bad)) }
+        }
+        let carrier = #"{"token":"fixture-hidden","keep":true}"#
+        let quoted = String(decoding: try JSONSerialization.data(withJSONObject: carrier, options: [.fragmentsAllowed]), as: UTF8.self)
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["password": "fixture-hidden", "keep": true], format: .binary, options: 0)
+        for encoded in [carrier, quoted, Data(carrier.utf8).base64EncodedString(), plist.base64EncodedString()] {
+            for path in names {
+                let source = changedDocument(path, encoded), before = try data(source)
+                let archive = try VortxNativeBootstrapArchive.encode(document: before)
+                let envelope = try JSONSerialization.jsonObject(with: archive) as! Object
+                check(!(envelope["excludedCredentialPaths"] as! [String]).isEmpty)
+                check(try data(source) == before)
+                do {
+                    try VortxNativeBootstrapArchive.validate(data(["schemaVersion": 1, "hostDocument": source,
+                                                                 "excludedCredentialPaths": [String]()]))
+                    preconditionFailure("A profile display role hid a structured credential")
+                } catch VortxNativeBootstrapArchive.Failure.ambiguousCredentialCarrier {}
+            }
+        }
+        let quotedLabel = String(decoding: try JSONSerialization.data(withJSONObject: label, options: [.fragmentsAllowed]), as: UTF8.self)
+        for encoded in [quotedLabel, Data(label.utf8).base64EncodedString(), Data("[".utf8).base64EncodedString()] {
+            for path in names { try strictOpaqueRefusal(changedDocument(path, encoded)) }
+        }
+        // One-hop role boundaries: unknown/sibling fields, wrong/missing shapes, and
+        // structured strings containing even a complete native document stay ordinary.
+        for source: Object in [["roster": [full(owner, label)]], ["future": ["vortx": ["roster": [full(owner, label)]]]],
+                               ["vortx": ["profiles": [full(owner, label)]]], ["future": document()],
+                               ["legacyImportMaterial": material()],
+                               ["nativeSync": String(decoding: try data(document()["nativeSync"]!), as: UTF8.self)],
+                               ["vortx": ["roster": String(decoding: try data([full(owner, label)]), as: UTF8.self)]]] {
+            try strictOpaqueRefusal(source)
+        }
+        let ordinary = ["future", "type", "pin"]
+        for key in ordinary {
+            try strictOpaqueRefusal(changedDocument(["vortx", "roster", "0", key], label))
+            try strictOpaqueRefusal(changedDocument(["nativeSync", "profiles", owner, "profile", key], label))
+            try strictOpaqueRefusal(changedDocument(["nativeSync", "legacyImport", "baseline", "roster", "0", key], label))
+        }
+        for path in [["nativeSync", "profiles", owner, "profile", "account", "kind"],
+                     ["nativeSync", "profiles", owner, "fieldClocks", "name"],
+                     ["nativeSync", "legacyImport", "future", "name"],
+                     ["nativeSync", "legacyImport", "baseline", "future", "name"],
+                     ["vortx", "future", "name"]] {
+            try strictOpaqueRefusal(changedDocument(path, label))
+        }
+        let invalidShapes: [([String], Any)] = [
+            (["vortx", "roster", "0", "id"], "not-a-uuid"),
+            (["vortx", "roster", "0", "avatar"], NSNull()),
+            (["nativeSync", "schemaVersion"], true), (["nativeSync", "schemaVersion"], 1.5),
+            (["nativeSync", "schemaVersion"], 6), (["nativeSync", "scope"], ""),
+            (["nativeSync", "scope"], NSNull()), (["nativeSync", "ownerProfileId"], shared),
+            (["nativeSync", "profiles", owner, "profile", "id"], shared),
+            (["nativeSync", "profiles", shared, "profile", "id"], owner),
+            (["nativeSync", "profiles", owner, "fieldClocks"], NSNull()),
+            (["nativeSync", "profiles", owner, "profile", "owner"], 1),
+            (["nativeSync", "profiles", owner, "profile", "parental", "kids"], 1),
+            (["nativeSync", "profiles", owner, "profile", "settings"], NSNull()),
+            (["nativeSync", "profiles", shared, "profile", "account", "value"], shared),
+            (["nativeSync", "legacyImport", "schemaVersion"], true),
+            (["nativeSync", "legacyImport", "fingerprint"], "not-a-fingerprint"),
+            (["nativeSync", "legacyImport", "baseline", "schemaVersion"], 3),
+            (["nativeSync", "legacyImport", "baseline", "schemaVersion"], 1.5),
+            (["nativeSync", "legacyImport", "baseline", "identityLinks"], NSNull()),
+            (["nativeSync", "legacyImport", "baseline", "roster", "0", "owner"], 1)]
+        for (path, value) in invalidShapes { try strictOpaqueRefusal(changedDocument(path, value)) }
+        // Raw duplicate fields must be rejected before Foundation chooses one value.
+        for members in [#""name":"[RD] Synthetic Owner","name":"{\"token\":\"fixture-hidden\"}""#,
+                        #""name":"{\"token\":\"fixture-hidden\"}","name":"[RD] Synthetic Owner""#] {
+            let bytes = Data(("{\"vortx\":{\"roster\":[{\"id\":\"" + owner + "\",\"avatar\":\"🍿\"," + members + "}]}}").utf8)
+            do { _ = try VortxNativeBootstrapArchive.encode(document: bytes); preconditionFailure("Duplicate profile name admitted") }
+            catch VortxNativeBootstrapArchive.Failure.malformed {}
+        }
+        print("PASS: full legacy and scoped native tagged roster names retain bytes while carrier/context controls remain strict")
+    }
+
     static func literalProfileDisplayFields() throws {
         // Uses the actual SettingsBackup.encode implementation extracted by the source-unit runner.
         // The roster Data has ProfileStore.persist's JSON-array shape. Its deliberately noncanonical
@@ -499,6 +665,9 @@ import CryptoKit
                           #"[true] {"token":"fixture-hidden"}"#, "[[Kids]]", "[Kids]no separator",
                           "[" + String(repeating: "x", count: 65) + "] Room", "bplist00broken"] {
             try refused(document(roster([row(name: malformed)])))
+        }
+        for carrier in taggedDisplayCarrierControls() {
+            try strictOpaqueRefusal(document(roster([row(name: carrier)])))
         }
         try refused(document(roster([row(avatar: label)]))) // Avatar is not a manifest/name label.
         try refused(document(roster([row(name: "Fixture", avatar: "[ ")])))
