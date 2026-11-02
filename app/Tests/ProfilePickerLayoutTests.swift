@@ -63,7 +63,22 @@ enum ProfilePickerLayoutTests {
         precondition(!picker.contains("nativeUnsupportedSettings"))
         precondition(!picker.contains("Reconnect the owner's Stremio account"))
         precondition(picker.contains("if !nativeSync.isSignedIn"))
-        precondition(picker.contains("Button(\"Sign in\") { deferredSelection.cancel(); accountHelpNeeded = true }"))
+        let controls = try String(contentsOfFile: "app/SourcesShared/ProfilePickerAccountControls.swift", encoding: .utf8)
+        precondition(accountAccessWiringHolds(picker: picker, controls: controls),
+                     "Separate Sign in/out must reach Account help outside the busy grid, retaining PIN and captured diagnostics")
+        let unsafePickers = [
+            picker.replacingOccurrences(of: "ProfilePickerAccountControls(", with: "RetiredAccountControls("),
+            picker.replacingOccurrences(of: "onSignIn: {\n                                    openAccountHelp()", with: "onSignIn: {\n                                    retiredAccountHelp()"),
+            picker.replacingOccurrences(of: "accountHelpNeeded = true", with: "accountHelpNeeded = false"),
+            picker.replacingOccurrences(of: "accountHelpDiagnosticGrant = diagnosticGrant()", with: "accountHelpDiagnosticGrant = nil"),
+            picker.replacingOccurrences(of: ".safeAreaInset(edge: .bottom)", with: ".retiredSafeAreaInset(edge: .bottom)"),
+        ]
+        for mutation in unsafePickers {
+            precondition(mutation != picker && !accountAccessWiringHolds(picker: mutation, controls: controls),
+                         "Disconnected or unfenced account controls must fail the source contract")
+        }
+        precondition(!accountAccessWiringHolds(picker: picker,
+            controls: controls.replacingOccurrences(of: "Button(sync.isSignedIn ? \"Sign out\" : \"Sign in\")", with: "RetiredButton()")))
         precondition(picker.contains(".disabled(!nativeSync.isSignedIn || nativeSync.accountReconnectRequired)"),
                      "Signed-out and reconnect-required pickers keep every profile tile disabled")
         precondition(picker.contains("isPhone: profilePickerIsPhone"))
@@ -124,5 +139,33 @@ enum ProfilePickerLayoutTests {
         precondition(artwork.components(separatedBy: "guard rotationToken == token, !Task.isCancelled else { return }").count - 1 >= 2,
                      "rotation rechecks generation after prewarm and each candidate load")
         print("PASS profile picker: phone/tablet/Mac/TV grid bounds, large text, scope-bound PIN, PIN-preserving Edit, public-only artwork and transient preparation status")
+    }
+
+    private static func accountAccessWiringHolds(picker: String, controls: String) -> Bool {
+        let inset = ".safeAreaInset(edge: .bottom)"
+        let access = "ProfilePickerAccountControls("
+        let start = "    private func openAccountHelp() {"
+        let end = "    private func focusDiagnosticRecovery() {"
+        guard picker.components(separatedBy: inset).count == 2,
+              picker.components(separatedBy: access).count == 2,
+              picker.components(separatedBy: start).count == 2,
+              picker.components(separatedBy: end).count == 2,
+              let grid = picker.range(of: ".disabled(pinTarget != nil || profileAction.isRunning)"),
+              let insetRange = picker.range(of: inset), let controlRange = picker.range(of: access),
+              grid.lowerBound < insetRange.lowerBound, insetRange.lowerBound < controlRange.lowerBound,
+              let helpStart = picker.range(of: start), let helpEnd = picker.range(of: end),
+              helpStart.upperBound < helpEnd.lowerBound else { return false }
+        let help = String(picker[helpStart.upperBound..<helpEnd.lowerBound])
+        let accountInset = String(picker[insetRange.upperBound..<helpStart.lowerBound])
+        return accountInset.contains("onSignIn: {\n                                    openAccountHelp()")
+            && accountInset.contains(".disabled(pinTarget != nil)")
+            && accountInset.contains(".accessibilityHidden(pinTarget != nil)")
+            && help.contains("deferredSelection.cancel()")
+            && help.contains("accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil")
+            && help.contains("accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()")
+            && help.contains("accountHelpDiagnosticGrant = diagnosticGrant()")
+            && help.contains("accountHelpNeeded = true")
+            && controls.contains("Button(sync.isSignedIn ? \"Sign out\" : \"Sign in\")")
+            && controls.contains("} else { onSignIn() }")
     }
 }
