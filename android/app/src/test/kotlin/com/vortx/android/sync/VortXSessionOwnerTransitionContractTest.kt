@@ -20,9 +20,7 @@ class VortXSessionOwnerTransitionContractTest {
         val resume = source
             .substringAfter("private fun resumeRetainedSessionWork(retained: RetainedSessionWork?)")
             .substringBefore("private fun captureSyncLease()")
-        val adopt = source
-            .substringAfter("private fun adopt(")
-            .substringBefore("// MARK: - HTTP")
+        val adopt = adoptionSource(source)
 
         assertTrue(setup.contains("initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial()"))
         // Native provider credentials own their account admission; durable session mutation remains
@@ -49,13 +47,7 @@ class VortXSessionOwnerTransitionContractTest {
             resume.indexOf("armPendingSync(it, recordEdit = false)") <
                 resume.indexOf("startRealtime()"),
         )
-        assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
-        assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
-        assertTrue(adopt.contains("sessionState.replace(s) {"))
-        assertTrue(adopt.contains("completion?.record(capturePickerCompletionOwner())"))
-        assertTrue(adopt.indexOf("sessionState.replace(s) {") < adopt.indexOf("completion?.record("))
-        assertTrue(adopt.contains("armPendingSync(it, recordEdit = false)"))
-        assertFalse(adopt.contains("sessionState.serialized"))
+        assertAdoptionContract(adopt)
     }
 
     @Test
@@ -351,6 +343,63 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(mergeBoth.contains("syncDown(lease, force = true)"))
         assertTrue(mergeBoth.contains("syncUp(lease)"))
         assertEquals(1, mergeBoth.windowed("captureSyncLease".length).count { it == "captureSyncLease" })
+    }
+
+    @Test
+    fun adoptionContractIgnoresSeparateRenewalHelpersAndRejectsUnsafeAdoptionMutations() {
+        val source = readSource()
+        val adopt = adoptionSource(source)
+        assertAdoptionContract(adopt)
+        val renewal = source.substringAfter("\n    private class SessionRenewalCapture(")
+            .substringBefore("// MARK: - HTTP")
+        assertTrue(renewal.contains("sessionState.serialized"))
+        assertFalse(adopt.contains("private class SessionRenewalCapture("))
+        val mutations = listOf(
+            adopt.replace("operation.commitSessionMutation(", "operation.retiredMutation("),
+            adopt.replace("onCommitted = ::cancelSessionWork", "onCommitted = {}"),
+            adopt.replace("sessionState.replace(s) {", "sessionState.retiredReplace(s) {"),
+            adopt.replace("completion?.record(capturePickerCompletionOwner())", "completion?.retiredRecord(capturePickerCompletionOwner())"),
+            adopt.replace("sessionState.replace(s) {", "completion?.record(capturePickerCompletionOwner())\n                sessionState.replace(s) {"),
+            adopt.replace("armPendingSync(it, recordEdit = false)", "retiredArm(it)"),
+            adopt.replace("val account = Account(", "sessionState.serialized {}\n        val account = Account("),
+        )
+        mutations.forEachIndexed { index, mutation ->
+            assertFalse("Mutation $index must change the actual adoption body", mutation == adopt)
+            var rejected = false
+            try { assertAdoptionContract(mutation) } catch (_: AssertionError) { rejected = true }
+            assertTrue("Unsafe adoption mutation $index was accepted", rejected)
+        }
+        listOf(
+            source.replace("\n    private fun adopt(", "\n    private fun renamedAdopt("),
+            source.replace("\n    private class SessionRenewalCapture(", "\n    private class RenamedRenewalCapture("),
+            source + "\n    private fun adopt(",
+            source + "\n    private class SessionRenewalCapture(",
+        ).forEach { malformed ->
+            var rejected = false
+            try { adoptionSource(malformed) } catch (_: IllegalArgumentException) { rejected = true }
+            assertTrue("Missing or ambiguous adoption boundary was accepted", rejected)
+        }
+    }
+
+    /** Fail closed on ambiguous declarations; renewal's tuple lock is not an adoption mutation. */
+    private fun adoptionSource(source: String): String {
+        val start = "\n    private fun adopt("
+        val end = "\n    private class SessionRenewalCapture("
+        val begin = source.indexOf(start)
+        val finish = source.indexOf(end)
+        require(begin >= 0 && source.indexOf(start, begin + start.length) < 0)
+        require(finish > begin && source.indexOf(end, finish + end.length) < 0)
+        return source.substring(begin, finish)
+    }
+
+    private fun assertAdoptionContract(adopt: String) {
+        assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
+        assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
+        assertTrue(adopt.contains("sessionState.replace(s) {"))
+        assertTrue(adopt.contains("completion?.record(capturePickerCompletionOwner())"))
+        assertTrue(adopt.indexOf("sessionState.replace(s) {") < adopt.indexOf("completion?.record("))
+        assertTrue(adopt.contains("armPendingSync(it, recordEdit = false)"))
+        assertFalse(adopt.contains("sessionState.serialized"))
     }
 
     private fun assertResponseFenceAfterEveryRequest(flow: String) {
