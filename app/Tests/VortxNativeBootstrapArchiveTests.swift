@@ -124,6 +124,8 @@ import CryptoKit
         catch { print("FAIL: producer-shaped literal profile text blocked account preparation: \(error)"); exit(1) }
         do { try literalAddonManifestLabels() }
         catch { print("FAIL: literal add-on manifest text blocked account preparation: \(error)"); exit(1) }
+        do { try literalAddonSummaryNames() }
+        catch { print("FAIL: producer-shaped add-on summary text blocked account preparation: \(error)"); exit(1) }
         do { try literalLegacyLibraryNames() }
         catch { print("FAIL: literal library title blocked account preparation: \(error)"); exit(1) }
         do { try literalSeriesSourceAddonNames() }
@@ -654,7 +656,7 @@ import CryptoKit
     }
 
     static func literalAddonManifestLabels() throws {
-        // #263's five masked path segments match /vortx/addons/0/manifest/name.
+        // Manifest display fields are one carrier; #263 also has a direct summary-name carrier.
         // Add-on display labels are text, not necessarily JSON just because they start with '['.
         // This is a synthetic reproduction, not a recovered customer value.
         typealias Object = [String: Any]
@@ -795,6 +797,146 @@ import CryptoKit
             preconditionFailure("Strict capture admitted a nested carrier")
         } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
         print("Issue #263: \(journeys) exact display-text carrier journeys, nested credential inspection and malformed/opaque rejection controls passed")
+    }
+
+    static func literalAddonSummaryNames() throws {
+        // Current #263 evidence names /vortx/addons/*/name. vortxSummary lifts the
+        // manifest name into this sibling; old saved rows have only transportUrl/name.
+        typealias Object = [String: Any]
+        let url = "https://addon.example/CaseSensitive?secret=fixture-only"
+        let owner = "00000000-0000-0000-0000-00000000A11C"
+        let sentinel: Object = ["future": ["key": "public-record", "fractionalClock": 1000.125]]
+        func row(_ name: Any, full: Bool, extra: Object = [:]) -> Object {
+            var item: Object = ["transportUrl": url, "name": name, "unknown": sentinel]
+            if full {
+                item["manifest"] = ["id": "fixture.community", "name": "Fixture", "version": "1.0.0"]
+                item["flags"] = ["official": false, "protected": false]
+            }
+            item.merge(extra) { _, new in new }
+            return item
+        }
+        func host(_ item: Object, vortx: Bool) -> Object {
+            let value: Object = ["addons": [item], "unknownHost": sentinel]
+            return vortx ? ["vortx": value, "other": sentinel] : value
+        }
+        func item(_ document: Object, vortx: Bool) -> Object {
+            let body = vortx ? document["vortx"] as! Object : document
+            return (body["addons"] as! [Object])[0]
+        }
+        func journey(_ source: Object, material: Object? = nil) throws {
+            let original = try data(source)
+            var messages: [String] = []
+            let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(source, diagnostics: { messages.append($0) })
+            check(messages.isEmpty)
+            check(try data(JSONSerialization.jsonObject(with: clean)) == original)
+            let strict = try VortxNativeBootstrapArchive.credentialFreeDocument(source, holdingUnreadableValues: false)
+            check(try data(JSONSerialization.jsonObject(with: strict)) == original)
+            let archive = try VortxNativeBootstrapArchive.encode(document: original, material: material.map { try data($0) })
+            try VortxNativeBootstrapArchive.validate(archive)
+            let root = try JSONSerialization.jsonObject(with: archive) as! Object
+            check(try data(root["hostDocument"]!) == original)
+            check((root["excludedCredentialPaths"] as! [String]).isEmpty)
+            if let material { check(try data(root["legacyImportMaterial"]!) == data(material)) }
+            let retained = try VortxNativeBootstrapArchive.encode(document: data([:]), authenticatedSourceArchive: archive)
+            try VortxNativeBootstrapArchive.validate(retained)
+            let retainedRoot = try JSONSerialization.jsonObject(with: retained) as! Object
+            check(try data(retainedRoot["authenticatedSourceArchive"]!) == original)
+            _ = try VortxNativeBootstrapArchive.replacingHostDocument(in: archive, with: original)
+            check(try data(source) == original)
+        }
+        let labels = ["[RD] [4K] Torrentio", "[TB⚡] Comet", "[日本語] アニメ", "{Public} Catalog", "[true]"]
+        for label in labels {
+            for full in [false, true] {
+                for vortx in [false, true] { try journey(host(row(label, full: full), vortx: vortx)) }
+            }
+            var produced = row(label, full: true)
+            produced["manifest"] = ["id": "fixture.community", "name": label, "version": "1.0.0"]
+            let items: Object = ["items": [produced], "order": [url], "intents": []]
+            // The legacy importer preserves the complete producer row in its material.
+            try journey(host(produced, vortx: true), material: ["schemaVersion": 1, "addons": [owner: items]])
+            try journey(["nativeSync": ["addons": [owner: ["records": [url: ["value": produced]]]]]])
+            try journey(["future": ["descriptor": produced]]) // Complete descriptor remains content-typed.
+        }
+        let label = labels[0]
+        // The summary-only exemption is exact-context, immediate-child and field-specific.
+        for source: Object in [
+            ["future": ["name": label]], ["future": row(label, full: false)],
+            ["future": host(row(label, full: false), vortx: true)],
+            host(row("Fixture", full: false, extra: ["future": ["name": label]]), vortx: true),
+            host(row("Fixture", full: true, extra: ["future": ["name": label]]), vortx: true),
+            host(["name": label], vortx: true),
+            host(["transportUrl": "file:///private/fixture", "name": label], vortx: true),
+            host(row(label, full: false, extra: ["manifest": ["name": "Fixture"]]), vortx: true),
+            host(row([label], full: false), vortx: true),
+            host(row(["name": label], full: true), vortx: true)
+        ] {
+            try strictOpaqueRefusal(source)
+            do {
+                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
+                preconditionFailure("Untyped summary display field acquired loading authority")
+            } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+        }
+        for full in [false, true] {
+            for text in ["[private:token]", #"{"token":"unfinished"#] + taggedDisplayCarrierControls() {
+                let source = host(row(text, full: full), vortx: true), before = try data(source)
+                var messages: [String] = []
+                let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(source, diagnostics: { messages.append($0) })
+                let loaded = item(try JSONSerialization.jsonObject(with: clean) as! Object, vortx: true)
+                var expected = row(text, full: full); expected["name"] = VortxNativeBootstrapArchive.replacedDisplayText
+                check(try data(loaded) == data(expected))
+                check(messages == ["archive_inspection result=replaced reason=display_text field=/vortx/addons/*/name carrier=plain_text_prefix"])
+                try VortxNativeBootstrapArchive.validate(VortxNativeBootstrapArchive.encode(document: clean))
+                try strictOpaqueRefusal(source)
+                do {
+                    _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source, holdingUnreadableValues: false)
+                    preconditionFailure("Strict capture replaced a summary-name carrier")
+                } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+                check(try data(source) == before)
+            }
+        }
+        // Complete JSON/base64/plist carriers are still inspected before display handling.
+        let secret = #"{"token":"fixture-hidden","keep":true}"#
+        let quotedSecret = String(decoding: try JSONSerialization.data(withJSONObject: secret, options: [.fragmentsAllowed]), as: UTF8.self)
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["password": "fixture-hidden", "keep": true], format: .binary, options: 0)
+        let encoded: [(String, (String) throws -> Object)] = [
+            (secret, { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! Object }),
+            (quotedSecret, { value in
+                let inner = try JSONSerialization.jsonObject(with: Data(value.utf8), options: [.fragmentsAllowed]) as! String
+                return try JSONSerialization.jsonObject(with: Data(inner.utf8)) as! Object
+            }),
+            (Data(secret.utf8).base64EncodedString(), { try JSONSerialization.jsonObject(with: Data(base64Encoded: $0)!) as! Object }),
+            (plist.base64EncodedString(), { try PropertyListSerialization.propertyList(from: Data(base64Encoded: $0)!, options: [], format: nil) as! Object })
+        ]
+        for full in [false, true] {
+            for (text, unwrap) in encoded {
+                let source = host(row(text, full: full, extra: ["password": "fixture-sibling"]), vortx: true)
+                let before = try data(source)
+                let clean = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
+                let loaded = item(try JSONSerialization.jsonObject(with: clean) as! Object, vortx: true)
+                let nested = try unwrap(loaded["name"] as! String)
+                check(nested["token"] == nil && nested["password"] == nil && nested["keep"] as? Bool == true)
+                check(loaded["password"] == nil && loaded["transportUrl"] as? String == url)
+                check(try data(loaded["unknown"]!) == data(sentinel))
+                try VortxNativeBootstrapArchive.validate(VortxNativeBootstrapArchive.encode(document: clean))
+                check(try data(source) == before)
+            }
+            let ambiguous = host(row(label, full: full, extra: ["futureSecretBox": "opaque"]), vortx: true)
+            do {
+                _ = try VortxNativeBootstrapArchive.credentialFreeDocument(ambiguous)
+                preconditionFailure("Summary display context bypassed an ambiguous credential sibling")
+            } catch VortxNativeBootstrapArchive.Failure.ambiguousCredentialCarrier {}
+            // A decoded container never inherits the outer display-name role.
+            let quotedLabel = String(decoding: try JSONSerialization.data(withJSONObject: label, options: [.fragmentsAllowed]), as: UTF8.self)
+            for text in [quotedLabel, Data(label.utf8).base64EncodedString()] {
+                let source = host(row(text, full: full), vortx: true)
+                try strictOpaqueRefusal(source)
+                do {
+                    _ = try VortxNativeBootstrapArchive.credentialFreeDocument(source)
+                    preconditionFailure("Encoded inner text inherited the summary-name display role")
+                } catch VortxNativeBootstrapArchive.Failure.opaquePreference {}
+            }
+        }
+        print("Issue #263: actual descriptor sibling and historical summary names, immutable sources, strict archive and credential controls passed")
     }
 
     static func literalLegacyLibraryNames() throws {
