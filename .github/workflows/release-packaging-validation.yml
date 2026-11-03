@@ -127,6 +127,9 @@ jobs:
           receipt_dir="$(mktemp -d "$PWD/android/app/build/first-frame-focused/receipt.XXXXXX")"
           node scripts/tests/android-first-frame-presentation/source-contracts.mjs "$PWD" "$receipt_dir"
 
+      - name: Check selected account-file input bounds
+        run: node test/android-account-file-kernel-bounds-contract.cjs
+
       # Preserve the bounded recovery filters and exercise the actual shared Media3 metadata
       # policies. JNI-gated cases still skip without the real private native runtime.
       - name: Test Android sync, account recovery and active-media metadata
@@ -141,6 +144,10 @@ jobs:
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
           --tests com.vortx.android.sync.AccountBackupFileTest
+          --tests com.vortx.android.sync.AccountFileLegacyAdmissionTest
+          --tests com.vortx.android.engine.DetachedAccountFileKernelTest
+          --tests com.vortx.android.sync.AccountFileProfileMaterialTest
+          --tests com.vortx.android.sync.AccountFileAddonURLTest.decodedHostAndUntouchedConfigurationFixTheReportedIdentityMismatch
           --tests com.vortx.android.backup.accountfiles.AccountBackupDocumentsTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsControllerTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsManagerTest

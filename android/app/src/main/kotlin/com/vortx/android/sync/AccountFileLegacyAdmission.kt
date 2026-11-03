@@ -43,9 +43,9 @@ internal object AccountFileLegacyAdmission {
         /** Only the fields consumed by LegacyMaterialAdapter become UserProfile inputs. The full
          * typed known record (including 64-bit Apple preferences) and raw bytes remain separate;
          * this projection is not a profile restore or a serializer for the original account.
-         * IMPORTANT: current Android LegacyMaterialAdapter does not yet project Apple's native
-         * ranking/addonPreferences inheritance. Full Repair must close that semantic gap before
-         * exporting a completed candidate; this foundation does not authorize an export. */
+         * File-only profile projection below supplies the compatible ranking and disabled-list
+         * inheritance from these exact records. This still is not full candidate/host admission
+         * or permission to export/restore an account file. */
         fun prepareMaterial(scope: VortxAccountScope): ByteArray {
             require(scope.ownerProfileID == ownerProfileID) { "Account file owner mismatch" }
             val profiles = known.map { AccountFileLegacyAdmission.materialProfile(it) }
@@ -57,7 +57,8 @@ internal object AccountFileLegacyAdmission {
             require(prepared.held.isEmpty()) { "Account file contains held source units" }
             require(prepared.pendingMembershipReceipts.length() == 0) { "Account file contains pending source evidence" }
             // This is newly produced typed material, never a reserialization of the source account.
-            return prepared.material.toString().toByteArray(Charsets.UTF_8).also { OHJson.Obj(it) }
+            val material = prepared.material.toString().toByteArray(Charsets.UTF_8)
+            return AccountFileProfileMaterial.project(material, known, ownerProfileID)
         }
 
         /** Add exactly one genuinely cold-produced native carrier; every original VALUE slice

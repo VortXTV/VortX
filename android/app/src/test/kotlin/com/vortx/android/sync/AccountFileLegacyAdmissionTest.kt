@@ -111,7 +111,7 @@ class AccountFileLegacyAdmissionTest {
             .set("discovery", OHJson.literal("""{"selectedProviders":[9223372036854775807],"filtersData":"e30="}"""))
         assertEquals(1, admit(full(OHJson.array(listOf(withApplePreferences.encoded())))).profileCount)
         refuses { admit(full(OHJson.array(listOf(withApplePreferences.copy().set("addonPreferences", OHJson.literal("{\"rankingOverride\":{}}")).encoded())))) }
-        val playback = OHJson.literal("""{"audioLang":"en","subtitleLang":"fr","forcedPolicy":"auto","subFont":"default","subSize":"100","subColor":"white","subBackground":"none","titleMatchThreshold":71,"maxResolution":9223372036854775807}""")
+        val playback = OHJson.literal("""{"audioLang":"en","subtitleLang":"fr","forcedPolicy":"auto","subFont":"default","subSize":"100","subColor":"white","subBackground":"none","titleMatchThreshold":71,"minResolution":9223372036854775807}""")
         // The UI decoder would normalize/narrow these. Material consumes only validated languages;
         // the complete known preferences and original bytes remain intact, with no fabricated default.
         val source = full(OHJson.array(listOf(OHJson.Obj(profile()).set("playback", playback).encoded())))

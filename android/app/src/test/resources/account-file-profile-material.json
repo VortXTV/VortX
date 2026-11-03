@@ -1,0 +1,1791 @@
+{
+  "owner": "00000000-0000-0000-0000-00000000A11C",
+  "child": "10000000-0000-0000-0000-000000000001",
+  "cases": [
+    {
+      "name": "apple_existing_profile_preferences",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "explicit_empty_override",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": []
+              },
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "legacy_child_override",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              },
+              "disabledAddons": [
+                " HTTPS://Example.COM/ChildCase/manifest.json?Cfg=AbC%2F "
+              ]
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/ChildCase/manifest.json?Cfg=AbC%2F"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "present_preferences_inherit_instead_of_old_override",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              },
+              "disabledAddons": [
+                "https://ignored.invalid/legacy"
+              ]
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "rank_avoid_does_not_hide",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam",
+                "avoidBehavior": "rank"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ]
+        }
+      }
+    },
+    {
+      "name": "regex_stays_only_in_raw_roster",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam",
+                "keywordsAreRegex": true
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5
+        }
+      }
+    },
+    {
+      "name": "absent_playback_has_no_ranking",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {}
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": []
+      }
+    },
+    {
+      "name": "resolution_0",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 0,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "resolution_480",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 480,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "480p",
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "resolution_720",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 720,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "720p",
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "resolution_1080",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 1080,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "1080p",
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "resolution_2160",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 2160,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "resolution_4000",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 0,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "int64_ui_fields_and_transport_order_are_preserved_not_cast",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "rankingOverride": {
+                  "sourceTypeOrder": [
+                    "debrid"
+                  ],
+                  "useAddonOrder": true,
+                  "addonOrder": [
+                    "https://example.invalid/transport"
+                  ]
+                }
+              },
+              "playback": {
+                "audioLang": "EN, ja, EN",
+                "subtitleLang": "de",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": "HDR, hdr, , Atmos",
+                "excludeKeywords": " Cam, Telecine ",
+                "minResolution": 9007199254740991,
+                "titleMatchThreshold": 9007199254740991
+              },
+              "discovery": {
+                "selectedProviders": [
+                  9007199254740991
+                ]
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "EN, ja, EN",
+          "de"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "hdr",
+            "hdr",
+            "atmos"
+          ],
+          "keyword_exclude": [
+            "cam",
+            "telecine"
+          ]
+        }
+      }
+    },
+    {
+      "name": "held_resolution_1440",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 1440,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "held_resolution_9223372036854775807",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 9223372036854775807,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "held_negative_file_size",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": -0.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "held_url_fragment",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "https://example.invalid/manifest.json#cfg"
+                ]
+              },
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "held_url_userinfo",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "https://name@example.invalid/manifest.json"
+                ]
+              },
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "held_url_scheme",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "file:///manifest.json"
+                ]
+              },
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": true
+    },
+    {
+      "name": "url_unicode_path_query_and_ascii_case",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  " HTTPS://Example.COM/café/manifest.json?Name=Crème Brûlée "
+                ]
+              },
+              "playback": {
+                "audioLang": "en, JA, en",
+                "subtitleLang": "hi",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": " Atmos, HDR ",
+                "excludeKeywords": "Cam"
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/caf%C3%A9/manifest.json?Name=Cr%C3%A8me%20Br%C3%BBl%C3%A9e"
+        ],
+        "languages": [
+          "en, JA, en",
+          "hi"
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "atmos",
+            "hdr"
+          ],
+          "keyword_exclude": [
+            "cam"
+          ]
+        }
+      }
+    },
+    {
+      "name": "unicode_canonical_duplicates_whitespace_and_sorted_audio",
+      "source": {
+        "vortx": {
+          "roster": [
+            {
+              "id": "00000000-0000-0000-0000-00000000A11C",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": true,
+              "usesOwnAccount": false,
+              "familyEdit": false,
+              "isKids": false,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {
+                "disabledAddonURLsOverride": [
+                  "HTTPS://Example.COM/OwnerCase/manifest.json"
+                ]
+              }
+            },
+            {
+              "id": "10000000-0000-0000-0000-000000000001",
+              "name": "[RD] Viewer",
+              "avatar": "🍿",
+              "accentID": "ember",
+              "oled": false,
+              "textScale": 1,
+              "isOwner": false,
+              "usesOwnAccount": false,
+              "familyEdit": true,
+              "isKids": true,
+              "pin": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "addonPreferences": {},
+              "playback": {
+                "audioLang": "ja, É, é, en",
+                "subtitleLang": " ",
+                "forcedPolicy": "auto",
+                "subFont": "system",
+                "subSize": "normal",
+                "subColor": "white",
+                "subBackground": "none",
+                "maxResolution": 4000,
+                "maxFileSizeGB": 12.5,
+                "sourceTypeOrder": [
+                  "debrid",
+                  "torrent"
+                ],
+                "includeKeywords": "é, é, é",
+                "excludeKeywords": " CAM, cam "
+              }
+            }
+          ],
+          "rosterModified": 1720000000.25
+        },
+        "future": {
+          "text": "unchanged",
+          "number": 123
+        }
+      },
+      "expectReject": false,
+      "expectedChildSettings": {
+        "disabledAddons": [
+          "https://example.com/OwnerCase/manifest.json"
+        ],
+        "languages": [
+          "ja, É, é, en",
+          " "
+        ],
+        "ranking": {
+          "preferred_languages": [
+            "en",
+            "ja",
+            "é"
+          ],
+          "max_resolution": "2160p",
+          "max_filesize_gb": 12.5,
+          "keyword_include": [
+            "é",
+            "é",
+            "é"
+          ],
+          "keyword_exclude": [
+            "cam",
+            "cam"
+          ]
+        }
+      }
+    }
+  ]
+}
