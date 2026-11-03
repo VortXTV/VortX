@@ -69,6 +69,7 @@ class PickerFileRecoverySignInTest {
             manager.javaClass.getDeclaredField("requestTestSeam").apply { isAccessible = true }.set(manager, transport)
             manager.installSessionRestoreTestSeam(null)
             assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.SignedOutLocal)
+            val originalDrain = checkNotNull(manager.captureProviderRetryDrainRewrite())
             val model = VortXAccountViewModel(manager).also { models.put("recovery", it) }
             assertTrue(model.openPickerFileRecoverySignIn(checkNotNull(manager.capturePickerAccountSnapshot())))
             model.onLoginChange("synthetic")
@@ -101,6 +102,7 @@ class PickerFileRecoverySignInTest {
             runCurrent()
             assertEquals(VortXAccountFormState.Idle, model.formState.value)
             assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.SignedOutLocal)
+            assertTrue(originalDrain { true }) // An auth-only failure did not replace the ordinary owner.
         } finally {
             first.complete(Unit)
             second.complete(Unit)
@@ -213,6 +215,8 @@ class PickerFileRecoverySignInTest {
             }
 
             val signedOut = checkNotNull(manager.capturePickerAccountSnapshot())
+            val signedOutDrain = checkNotNull(manager.captureProviderRetryDrainRewrite())
+            assertTrue(signedOutDrain { true })
             assertFalse(manager.isPickerFileRecoveryPaused(signedOut))
             assertTrue(model.openPickerFileRecoverySignIn(signedOut))
             model.onLoginChange("fixture")
@@ -239,6 +243,8 @@ class PickerFileRecoverySignInTest {
             assertEquals(RenewalFixtures.account, original.account)
             assertTrue(manager.isPickerFileRecoveryPaused(original))
             assertFalse(manager.isPickerFileRecoveryPaused(signedOut))
+            assertFalse(signedOutDrain { error("A retired drain rewrote the queue") })
+            assertNull(manager.captureProviderRetryDrainRewrite())
             assertNull(manager.captureRealtimeLease())
             assertFalse(manager.syncDown(force = true))
             assertFalse(manager.pushThisDevice())
@@ -264,6 +270,8 @@ class PickerFileRecoverySignInTest {
             assertTrue(awaitStage("Original recovery pause resumes") { resume.await() })
             assertFalse(manager.pickerFileRecoveryPaused.value)
             assertFalse(manager.isPickerFileRecoveryPaused(original))
+            assertFalse(signedOutDrain { error("Resume revived a retired drain") })
+            assertTrue(checkNotNull(manager.captureProviderRetryDrainRewrite()).invoke { true })
             checkNotNull(manager.captureRealtimeLease())
             assertFalse(manager.resumePickerFileRecovery(original))
         } finally {
@@ -272,6 +280,23 @@ class PickerFileRecoverySignInTest {
             runCurrent()
             Dispatchers.resetMain()
         }
+    }
+
+    @Test fun drainRewriteDoesNotSurviveTemporarySecureStoreUnavailability() = runTest {
+        val manager = VortXSyncManager(RevisionContext(), backgroundScope)
+        manager.installSessionRestoreTestSeam(null)
+        assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.SignedOutLocal)
+        val original = checkNotNull(manager.captureProviderRetryDrainRewrite())
+
+        manager.installUnavailableSessionRestoreTestSeam()
+        assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+        assertNull(manager.captureProviderRetryDrainRewrite())
+        assertFalse(original { error("Unavailable owner rewrote the queue") })
+
+        manager.installSessionRestoreTestSeam(null)
+        assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.SignedOutLocal)
+        assertFalse(original { error("A new secure read revived an old drain") })
+        assertTrue(checkNotNull(manager.captureProviderRetryDrainRewrite()).invoke { true })
     }
 
     @Test fun retiredAttemptDoesNotConsumeTheCurrentRecoveryPresentation() = runTest {

@@ -1467,6 +1467,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     val account: StateFlow<Account?> = _account.asStateFlow()
 
     private val _sessionUiState = MutableStateFlow(initialSessionLoad.uiState())
+    // Guarded by operations. A temporary secure-store failure retires a drain even if
+    // the same original session becomes available before it can rewrite the queue.
+    private var providerRetryDrainAvailability = Any()
     /** Tri-state persistence truth for account surfaces, including an explicit unavailable/retry state. */
     val sessionUiState: StateFlow<SessionUiState> = _sessionUiState.asStateFlow()
 
@@ -1530,6 +1533,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         if (available == null) {
             if (_sessionUiState.value != SessionUiState.UnknownOrUnavailable) {
                 com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                    providerRetryDrainAvailability = Any()
                     _sessionUiState.value = SessionUiState.UnknownOrUnavailable
                 }
             }
@@ -1557,6 +1561,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             sessionState.ownerEpoch != persistedOwnerEpoch
         ) {
             com.vortx.android.player.PlaybackOwnerEpoch.transition {
+                providerRetryDrainAvailability = Any()
                 _sessionUiState.value = SessionUiState.UnknownOrUnavailable
             }
             return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(sessionState.ownerEpoch)
@@ -2250,6 +2255,18 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 admission
             }
         }
+
+    /** Only the original ordinary session may replace the rows observed by this retry drain. */
+    internal fun captureProviderRetryDrainRewrite(): ((() -> Boolean) -> Boolean)? = operations.snapshot {
+        if (pickerFileRecoverySession != null) return@snapshot null
+        val original = captureLocalLibraryMutationAdmission() ?: return@snapshot null
+        val availability = providerRetryDrainAvailability
+        val admit: (() -> Boolean) -> Boolean = { commit -> original {
+            pickerFileRecoverySession == null && providerRetryDrainAvailability === availability &&
+                _sessionUiState.value != SessionUiState.UnknownOrUnavailable && commit()
+        } }
+        admit
+    }
 
     /** Same gate semantics as captureLocalLibraryMutationAdmission, with a comparable original scope. */
     internal fun captureLocalLibraryMutationAuthority(): LocalLibraryMutationAuthority? =

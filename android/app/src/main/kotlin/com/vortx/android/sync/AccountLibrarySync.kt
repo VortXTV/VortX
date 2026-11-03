@@ -3,6 +3,7 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.VortXApplication
 import com.vortx.android.account.AccountSyncGate
 import com.vortx.android.account.AccountWatchlistClient
 import com.vortx.android.account.TitleRef
@@ -14,6 +15,8 @@ import com.vortx.android.security.AccountFileProviderWriters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -80,23 +83,25 @@ object AccountLibrarySync {
     fun drainPending(context: Context) {
         if (!AccountSyncGate.activeProfileSyncsAccount()) return
         val appContext = context.applicationContext
-        AccountFileProviderWriters.launchWriter(scope) { drain(queuePrefs(appContext)) }
+        val rewrite = captureDrainRewrite(appContext)
+        AccountFileProviderWriters.launchWriter(scope) { drain(queuePrefs(appContext), rewrite) }
     }
 
     // MARK: - Mirror
 
     private fun mirror(context: Context, add: Boolean, ref: TitleRef) {
-        // Only the gate + a pure id parse run on the caller's thread (the engine mutation fence); every
-        // prefs/token read and the network happen on the launched coroutine so the fence is never held for I/O.
+        // The native dispatch has returned. Capture drain rewrite authority here; preference,
+        // token and network work still runs on the detached worker.
         if (!AccountSyncGate.activeProfileSyncsAccount()) return
         if (!ref.hasUsableId) return
         val appContext = context.applicationContext
+        val rewrite = captureDrainRewrite(appContext)
         AccountFileProviderWriters.launchWriter(scope) {
             // Idempotent: wires the toggle store + both auth token stores so the reads below are live.
             ScrobbleService.init(appContext)
             val prefs = queuePrefs(appContext)
             // Opportunistically retry earlier offline failures before pushing the new change.
-            drain(prefs)
+            drain(prefs, rewrite)
             pushTrakt(prefs, add, ref)
             if (add) pushSimkl(prefs, ref) // SIMKL has no watchlist-remove: a remove mirrors to Trakt only.
         }
@@ -142,14 +147,33 @@ object AccountLibrarySync {
      * whose provider is disconnected or whose epoch no longer matches are DROPPED (terminal), so a stale
      * push can never move one account's watchlist through another's credentials.
      */
-    private suspend fun drain(prefs: SharedPreferences) = queueMutex.withLock {
+    private suspend fun drain(prefs: SharedPreferences, rewrite: ((() -> Boolean) -> Boolean)?) = queueMutex.withLock {
         val queue = withContext(Dispatchers.IO) { readQueue(prefs) }
         if (queue.isEmpty()) return@withLock
         val survivors = ArrayList<QueuedPush>(queue.size)
         for (push in queue) {
             if (!attempt(push)) survivors.add(push)
         }
-        withContext(Dispatchers.IO) { writeQueue(prefs, survivors.takeLast(QUEUE_CAP)) }
+        val publish = rewrite ?: return@withLock
+        withContext<Unit>(Dispatchers.IO) {
+            val replacement = encodeQueue(survivors.takeLast(QUEUE_CAP))
+            val caller = currentCoroutineContext()
+            publish {
+                caller.ensureActive()
+                commitQueue(prefs, replacement)
+            }
+        }
+    }
+
+    private fun captureDrainRewrite(context: Context): ((() -> Boolean) -> Boolean)? {
+        val app = context as? VortXApplication ?: return null
+        val manager = app.syncManager
+        if (manager == null) {
+            if (!app.providerRetryDrainHasNoManager()) return null
+            return { commit -> app.providerRetryDrainHasNoManager() && commit() }
+        }
+        val original = manager.captureProviderRetryDrainRewrite() ?: return null
+        return { commit -> original { app.syncManager === manager && commit() } }
     }
 
     /** True when the push is HANDLED (drop from the queue): a success, or a terminal stale-session drop. */
@@ -189,11 +213,15 @@ object AccountLibrarySync {
     }
 
     private fun writeQueue(prefs: SharedPreferences, pushes: List<QueuedPush>) {
-        val array = JSONArray().apply { pushes.forEach { put(it.toJson()) } }
-        // commit(): the caller holds the mutex and is already on Dispatchers.IO; the write must reach the
-        // backing store before the lock admits the next read-modify-write.
-        prefs.edit().putString(QUEUE_KEY, array.toString()).commit()
+        commitQueue(prefs, encodeQueue(pushes))
     }
+
+    private fun encodeQueue(pushes: List<QueuedPush>): String =
+        JSONArray().apply { pushes.forEach { put(it.toJson()) } }.toString()
+
+    // The caller holds the queue mutex on Dispatchers.IO, including for failed-send enqueue.
+    private fun commitQueue(prefs: SharedPreferences, encoded: String): Boolean =
+        prefs.edit().putString(QUEUE_KEY, encoded).commit()
 
     private enum class Provider { TRAKT, SIMKL }
 

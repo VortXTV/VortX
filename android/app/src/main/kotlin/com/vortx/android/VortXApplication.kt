@@ -261,6 +261,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
         // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.
         wireAccountSync()
+        accountSyncStartupFinished = true
         // Connect the issuer and live consent observer. The repository's typed owner authorization is the
         // only Source Index network entrance; the old Boolean/frontend entrance remains closed.
         wireMoatGroundwork()
@@ -350,6 +351,12 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
     private var sourceIndexSessionObserver: kotlinx.coroutines.Job? = null
     private var sourceIndexConsentObserver: android.content.SharedPreferences.OnSharedPreferenceChangeListener? = null
+    @Volatile private var accountSyncStartupFinished = false
+
+    // The manager is installed at most once, by synchronous application startup.
+    internal fun providerRetryDrainHasNoManager(): Boolean =
+        accountSyncStartupFinished && syncManager == null
+
     var syncManager: VortXSyncManager? = null
         private set(value) {
             if (field !== value) {
