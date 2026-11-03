@@ -1477,7 +1477,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private val _sessionUiState = MutableStateFlow(initialSessionLoad.uiState())
     // Guarded by operations. A temporary secure-store failure retires a drain even if
     // the same original session becomes available before it can rewrite the queue.
-    private var providerRetryDrainAvailability = Any()
+    @Volatile private var providerRetryDrainAvailability = Any()
     /** Tri-state persistence truth for account surfaces, including an explicit unavailable/retry state. */
     val sessionUiState: StateFlow<SessionUiState> = _sessionUiState.asStateFlow()
 
@@ -1597,10 +1597,16 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     internal fun installSessionRestoreTestSeam(
         testSession: Session?,
         ownerEpoch: Long = INITIAL_SESSION_OWNER_EPOCH,
+    ) = installSessionRestoreTestSeam(testSession, ownerEpoch, explicitOwnerEpoch = true)
+
+    internal fun installSessionRestoreTestSeam(
+        testSession: Session?,
+        ownerEpoch: Long,
+        explicitOwnerEpoch: Boolean,
     ) {
         require(ownerEpoch >= INITIAL_SESSION_OWNER_EPOCH)
         require(testSession == null || testSession.account.id.isNotBlank())
-        sessionRestoreTestSeam = SessionLoad.Available(testSession, ownerEpoch)
+        sessionRestoreTestSeam = SessionLoad.Available(testSession, ownerEpoch, explicitOwnerEpoch)
     }
 
     /** Forces the retryable secure-storage-unavailable branch for local recovery-path tests. */
@@ -1653,6 +1659,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     private fun publishPickerFileRecoverySession(owner: Session?) {
         pickerFileRecoveryIntent = null
+        if (pickerFileRecoverySession !== owner) providerRetryDrainAvailability = Any()
         pickerFileRecoverySession = owner
         _pickerFileRecoveryPaused.value = owner != null
     }
@@ -2293,6 +2300,61 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
     }
 
+    internal class ProviderRetryOwner internal constructor(
+        val owner: SessionOwnerSnapshot.Account,
+        private val session: Session,
+        private val current: () -> Boolean,
+    ) {
+        /** This scalar fence is safe to call while the outbox owns its filesystem lock. */
+        fun requireCurrent() { check(current()) }
+
+        fun <T> withDataKey(use: (ByteArray) -> T): T {
+            requireCurrent()
+            val key = session.dataKey.copyOf()
+            try {
+                requireCurrent()
+                return use(key)
+            } finally { key.fill(0) }
+        }
+    }
+
+    /** Capture the original owner before scheduling. Only its worker opener reads secure storage. */
+    internal fun captureProviderRetryOwnerOpener(
+        expected: SessionOwnerSnapshot.Account? = null,
+    ): (() -> ProviderRetryOwner?)? =
+        operations.snapshot { generation ->
+            sessionState.serialized {
+                val original = sessionState.value ?: return@serialized null
+                val epoch = sessionState.ownerEpoch
+                val owner = SessionOwnerSnapshot.Account(original.account.id, epoch)
+                if (expected != null && expected != owner) return@serialized null
+                val availability = providerRetryDrainAvailability
+                val current = {
+                    operations.isCurrentSnapshot(generation) && sessionState.value === original &&
+                        sessionState.ownerEpoch == epoch && !_pickerFileRecoveryPaused.value &&
+                        _sessionUiState.value == SessionUiState.SignedIn(original.account) &&
+                        _account.value == original.account && providerRetryDrainAvailability === availability &&
+                        operations.isCurrentSnapshot(generation)
+                }
+                if (!current()) return@serialized null
+                {
+                    operations.snapshot {
+                        sessionState.serialized open@{
+                            if (!current()) return@open null
+                            val persisted = (sessionRestoreTestSeam ?: store.load()) as? SessionLoad.Available
+                            // A legacy default epoch, an unavailable store or different bytes cannot mint a lease.
+                            if (persisted?.explicitOwnerEpoch != true || persisted.ownerEpoch != epoch ||
+                                !sessionTruthMatches(original, persisted.session) || original.dataKey.size != 32) {
+                                providerRetryDrainAvailability = Any()
+                                return@open null
+                            }
+                            ProviderRetryOwner(owner, original, current)
+                        }
+                    }
+                }
+            }
+        }
+
     /** Same gate semantics as captureLocalLibraryMutationAdmission, with a comparable original scope. */
     internal fun captureLocalLibraryMutationAuthority(): LocalLibraryMutationAuthority? =
         operations.snapshot { generation ->
@@ -2595,9 +2657,15 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     }
 
     private val fileRestoreJournal by lazy { AccountFileRestoreJournal(appContext) }
+    private val fileRestoreProviderRetryOutbox by lazy { ProviderRetryOutbox(appContext) }
     private val fileRestoreTransaction by lazy {
         AccountFileRestoreTransaction(fileRestoreJournal, VortxJniBindings, AccountFileHostAdmission::requireCandidate)
     }
+
+    private data class FileRestoreProviderRetryWitness(
+        val absence: ProviderRetryOutbox.RestoreAbsence,
+        val currency: ProviderRetryOutbox.RestoreCurrency?,
+    )
 
     internal suspend fun readAccountBackupFileRestoreStatus(expected: PickerAccountSnapshot,
         routeCurrent: () -> Boolean): FileRestoreStatus = withContext(nativeWorkDispatcher) {
@@ -2680,6 +2748,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         ?: return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
                     addonWriter.use {
                         val auxiliaryBackings = AtomicReference<List<() -> Boolean>?>(null)
+                        val retryWitness = AtomicReference<FileRestoreProviderRetryWitness?>(null)
+                        fun requireRetryCurrency(currency: ProviderRetryOutbox.RestoreCurrency?) {
+                            if (currency == null || !fileRestoreProviderRetryOutbox.isCurrent(externalOwner.account, currency))
+                                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                        }
                         fun requireManagedIdle() {
                             requireFileRestoreOwner(capture, lease, caller, routeCurrent)
                             if (!fileRestoreExclusion.isCurrent(managed) || !AccountFileProviderWriters.isCurrent(providerWriters) ||
@@ -2687,6 +2760,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                                 throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
                             addonWriter.requireCurrent(externalOwner.account)
                             auxiliaryBackings.get()?.let(::requireAuxiliaryRestoreBackings)
+                            retryWitness.get()?.currency?.let(::requireRetryCurrency)
                         }
                         val entered = AtomicBoolean(false)
                         var outcome: AccountFileRestoreTransaction.Result? = null
@@ -2717,11 +2791,27 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                                         requireAuxiliaryRestoreBackings(currentBackings)
                                         reservation.requireLocalAbsence(externalOwner, scope)
                                         requireIdle(original)
+                                        val retained = retryWitness.get()
+                                        val next = if (retained == null) {
+                                            val observed = fileRestoreProviderRetryOutbox.captureRestoreAbsence(externalOwner.account, providerWriters)
+                                                ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                                            FileRestoreProviderRetryWitness(observed, null)
+                                        } else {
+                                            // Recheck the original physical observation on the worker, including inside grant.take.
+                                            val verified = fileRestoreProviderRetryOutbox.recheckExisting(externalOwner.account, retained.absence)
+                                                ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                                            FileRestoreProviderRetryWitness(retained.absence, verified)
+                                        }
+                                        requireIdle(original)
+                                        check(retryWitness.compareAndSet(retained, next))
+                                        requireIdle(original)
                                     }
                                     override suspend fun putOnce(original: SyncSessionLease,
                                         grant: AccountFileRestoreTransaction.PutGrant): AccountFileRestoreTransaction.RawResponse {
-                                        requireIdle(original)
-                                        return requestFileRestoreRaw(capture, original, grant) { requireIdle(original) }
+                                        return requestFileRestoreRaw(capture, original, grant) {
+                                            requireIdle(original)
+                                            requireRetryCurrency(retryWitness.get()?.currency)
+                                        }
                                     }
                                 }
                                 outcome = fileRestoreTransaction.restore(lease, selected, access)
@@ -4630,7 +4720,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     return SessionLoad.UnknownOrUnavailable
                 }
             if (tokenRaw == null && accountRaw == null && dataKeyRaw == null) {
-                return SessionLoad.Available(null, ownerEpoch)
+                return SessionLoad.Available(null, ownerEpoch, ownerEpochRaw == ownerEpoch.toString())
             }
             val token = tokenRaw?.takeIf { it.isNotBlank() }
                 ?: return SessionLoad.UnknownOrUnavailable
@@ -4648,7 +4738,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
             )
             if (account.id.isBlank()) return SessionLoad.UnknownOrUnavailable
-            return SessionLoad.Available(Session(token, account, dataKey), ownerEpoch)
+            return SessionLoad.Available(Session(token, account, dataKey), ownerEpoch, ownerEpochRaw == ownerEpoch.toString())
         }
 
         fun clear(ownerEpoch: Long): Boolean =
@@ -4676,6 +4766,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         data class Available(
             val session: Session?,
             val ownerEpoch: Long,
+            val explicitOwnerEpoch: Boolean,
         ) : SessionLoad
         data object UnknownOrUnavailable : SessionLoad
     }

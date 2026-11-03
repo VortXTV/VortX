@@ -74,6 +74,54 @@ class SessionRenewalManagerTest {
         } finally { f.close() }
     }
 
+    @Test fun durableProviderRetryRequiresAnExplicitPersistedEpochAndFencesScheduledOwners() = runTest {
+        val f = Fixture(UnconfinedTestDispatcher(testScheduler))
+        try {
+            val owner = f.manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+            f.manager.installSessionRestoreTestSeam(f.original, owner.generation, explicitOwnerEpoch = false)
+            val legacy = requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))
+            assertNull(legacy())
+
+            f.manager.installSessionRestoreTestSeam(f.original, owner.generation)
+            assertNull(legacy())
+            val original = requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))
+            val lease = requireNotNull(original())
+            val scopedKey = lease.withDataKey { key ->
+                assertArrayEquals(f.original.dataKey, key)
+                key
+            }
+            assertTrue(scopedKey.all { it == 0.toByte() })
+            assertArrayEquals(RenewalFixtures.key, f.original.dataKey)
+
+            f.manager.requestSessionRenewalForTest()
+            lease.requireCurrent()
+            assertEquals(owner, requireNotNull(original()).owner)
+
+            val replacement = VortXSyncManager.Session(RenewalFixtures.next, f.original.account, ByteArray(32) { 7 })
+            f.manager.replaceSyncSessionTestSeam(replacement)
+            f.manager.installSessionRestoreTestSeam(replacement, owner.generation)
+            assertNull(original())
+            assertThrows(IllegalStateException::class.java) { lease.withDataKey { error("Retired key escaped") } }
+            val successor = requireNotNull(requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))())
+            successor.withDataKey { assertArrayEquals(replacement.dataKey, it) }
+        } finally { f.close() }
+    }
+
+    @Test fun durableProviderRetryLeaseCannotReviveAfterAnUnavailableRead() = runTest {
+        val f = Fixture(UnconfinedTestDispatcher(testScheduler))
+        try {
+            val owner = f.manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+            val opener = requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))
+            val lease = requireNotNull(opener())
+            f.manager.installUnavailableSessionRestoreTestSeam()
+            assertNull(opener())
+            f.manager.installSessionRestoreTestSeam(f.original, owner.generation)
+            assertNull(opener())
+            assertThrows(IllegalStateException::class.java) { lease.requireCurrent() }
+            assertNotNull(requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))())
+        } finally { f.close() }
+    }
+
     @Test fun renewalCannotDiscardTheOriginalOwnedRawDownloadOrChangeItsBytes() = runTest {
         val f = Fixture(UnconfinedTestDispatcher(testScheduler))
         try {
