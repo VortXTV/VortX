@@ -102,6 +102,7 @@ class SettingsBackupInteropTest {
         "INNextRefreshDate",
         "stremiox.diskCacheBytes",
         "stremiox.serverURL",
+        "stremiox.update.lastChecked",
         "stremiox.videoUpscaling",
         "stremiox.dvRemux",
         "vortx.pgsSubtitleOCR",
