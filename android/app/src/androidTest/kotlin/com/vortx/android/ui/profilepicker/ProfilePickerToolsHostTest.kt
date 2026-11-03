@@ -74,6 +74,7 @@ class ProfilePickerToolsHostTest {
         fun close() { controller.close(); scope.cancel() }
     }
     private class RestoreActions : PickerToolsRestoreActions {
+        override fun canSelect(original: PickerToolsActionGrant) = true
         var reads = 0
         var confirms = 0
         var closes = 0

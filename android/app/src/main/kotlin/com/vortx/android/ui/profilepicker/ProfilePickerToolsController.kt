@@ -114,6 +114,7 @@ internal interface PickerToolsRestoreCandidate : Closeable {
     suspend fun confirm(): RestoreResult
 }
 internal interface PickerToolsRestoreActions {
+    fun canSelect(original: PickerToolsActionGrant): Boolean
     suspend fun status(original: PickerToolsActionGrant, isCurrent: () -> Boolean): FileRestoreStatus
     suspend fun read(original: PickerToolsActionGrant, input: PickerToolsRestoreInput,
         isCurrent: () -> Boolean): PickerToolsRestoreCandidate
@@ -206,6 +207,7 @@ internal class ProfilePickerToolsController(
         var retained: RetainedRestore? = null
     }
     private class RestoreInput(val request: PickerToolsRestoreInputRequest) {
+        @Volatile var requiresPausedOwner = false
         var launched = false
         var selectionClaimed = false
         var confirmationClaimed = false
@@ -255,7 +257,7 @@ internal class ProfilePickerToolsController(
             val route = synchronized(lock) { routeAuthority }
             if (route != null && !routeCurrent(route)) retireRoute(route)
             val original = synchronized(lock) { slot }
-            if (original != null && !authorityCurrent(original)) revoke(original)
+            if (original != null && (!authorityCurrent(original) || !restoreSelectionCurrent(original))) revoke(original)
             synchronized(lock) {
                 val published = publicationAuthority
                 if (published != null && (accounts.authorityRevision != published.first || accounts.sessionMarker != published.second)) {
@@ -357,13 +359,19 @@ internal class ProfilePickerToolsController(
     private fun authorityCurrent(original: Slot): Boolean =
         accounts.authorityRevision == original.revision && accounts.sessionMarker == original.marker &&
             (original.original?.let(accounts::isCurrent) ?: true)
+    private fun restoreSelectionCurrent(original: Slot): Boolean {
+        val work = original.restore ?: return true
+        if (work.input?.requiresPausedOwner != true) return true
+        return restoreActions?.canSelect(work.grant) == true
+    }
+
     private fun current(original: Slot): Boolean {
         val own = synchronized(lock) {
             !closed && slot === original && !original.revoked && _state.value.open &&
                 routeAuthority === original.routeIdentity && attachment?.routeId == original.request.routeId &&
                 _state.value.presentationId == original.presentationId
         }
-        return own && authorityCurrent(original) &&
+        return own && authorityCurrent(original) && restoreSelectionCurrent(original) &&
             (original.diagnosticPolicy?.let { runCatching(it).getOrDefault(false) } ?: true)
     }
     private suspend fun requireCurrent(original: Slot) {
@@ -662,6 +670,10 @@ internal class ProfilePickerToolsController(
                     return@launch null
                 }
             }
+            requireCurrent(original)
+            if (!actions.canSelect(work.grant))
+                return@launch "No retained restore was found. Sign out, then choose Sign in for backup recovery to restore a file."
+            input.requiresPausedOwner = true
             requireCurrent(original)
             phase(original, PickerToolsPhase.CHOOSING_RESTORE_INPUT)
             val selected = when (val selection = input.selection.await()) {

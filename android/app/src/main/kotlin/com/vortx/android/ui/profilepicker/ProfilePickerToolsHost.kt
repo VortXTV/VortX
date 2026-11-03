@@ -91,6 +91,7 @@ internal fun ProfilePickerToolsHost(
                 onRestore = if (controller.restoreAvailable && actionGrant?.original?.account != null)
                     ({ actionGrant?.let(controller::restore) }) else null,
                 recoveryBusy = recoveryBusy || controller.recoveryBusy.value,
+                recoveryPaused = recoveryPaused,
                 recoveryLanding = recoveryLanding,
                 onRecoverySignIn = openRecoverySignIn?.takeIf {
                     controller.restoreAvailable && !recoveryPaused && actionGrant?.original?.let { it.account == null } == true
@@ -213,6 +214,7 @@ internal fun ProfilePickerToolsSurface(
     repairInput: @Composable (PickerToolsRepairInputRequest) -> Unit,
     onRestore: (() -> Unit)?,
     recoveryBusy: Boolean,
+    recoveryPaused: Boolean,
     recoveryLanding: Boolean,
     onRecoverySignIn: (() -> Unit)?,
     onResumeRecovery: (() -> Unit)?,
@@ -236,7 +238,7 @@ internal fun ProfilePickerToolsSurface(
         if (onRepair != null)
             PickerToolsButton("Repair backup", isTv, !state.busy, Modifier.testTag("picker-tools-repair"), onRepair)
         if (onRestore != null) {
-            PickerToolsButton(if (state.restoreStatus == null) "Restore backup" else "Check restore status",
+            PickerToolsButton(if (recoveryPaused && state.restoreStatus == null) "Restore backup" else "Check restore status",
                 isTv, !state.busy && !recoveryBusy, Modifier.testTag("picker-tools-restore"), onRestore)
             state.restoreStatus?.let { status ->
                 Text(status.message, style = VortXTheme.type.body,

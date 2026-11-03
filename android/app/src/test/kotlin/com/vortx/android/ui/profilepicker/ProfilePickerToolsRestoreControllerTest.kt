@@ -57,6 +57,8 @@ class ProfilePickerToolsRestoreControllerTest {
         override fun close() { closes++ }
     }
     private class Actions : PickerToolsRestoreActions {
+        var selectionAllowed = true
+        override fun canSelect(original: PickerToolsActionGrant) = selectionAllowed
         var status: FileRestoreStatus = FileRestoreStatus.Missing
         val statusOwners = mutableListOf<PickerToolsActionGrant>()
         val inputOwners = mutableListOf<PickerToolsActionGrant>()
@@ -489,6 +491,51 @@ class ProfilePickerToolsRestoreControllerTest {
             controller.resumeRecoverySync(controller.openRoute()) { throw AssertionError("signed-out owner reached resume") }
             runCurrent()
             assertEquals(PickerToolsPhase.IDLE, controller.state.value.phase)
+        }
+    }
+
+    @Test fun ordinaryOwnerCanVerifyRetainedStatusButMissingDoesNotLaunchFileSelection() = runTest {
+        val actions = Actions().also { it.selectionAllowed = false }
+        val operation = UUID.randomUUID()
+        controller(backgroundScope, Accounts(), actions).use { controller ->
+            val original = controller.openRoute()
+            controller.restore(original); runCurrent()
+            assertNull(controller.state.value.restoreInput)
+            assertTrue(checkNotNull(controller.state.value.message).contains("Sign in for backup recovery"))
+            assertTrue(actions.inputOwners.isEmpty())
+            actions.status = FileRestoreStatus.Retained(operation, 7L, JournalState.DeliveryUnconfirmed)
+            controller.restore(original); runCurrent()
+            val verify = checkNotNull(controller.state.value.restoreStatus?.verify)
+            controller.verifyRestore(original, verify); runCurrent()
+            assertSame(original, actions.verifies.single().first)
+            assertEquals(operation, actions.verifies.single().second)
+            assertTrue(actions.inputOwners.isEmpty())
+        }
+    }
+
+    @Test fun lostPauseRefusesChooserAndRetiredConfirmationNeverSubmits() = runTest {
+        val beforeLaunch = Actions()
+        controller(backgroundScope, Accounts(), beforeLaunch).use { controller ->
+            val original = controller.openRoute()
+            controller.restore(original); runCurrent()
+            val request = checkNotNull(controller.state.value.restoreInput)
+            beforeLaunch.selectionAllowed = false
+            assertFalse(controller.claimRestoreInputLaunch(request))
+            controller.restoreInputReturned(request, Input); runCurrent()
+            assertNull(controller.state.value.restoreInput)
+            assertTrue(beforeLaunch.inputOwners.isEmpty())
+        }
+        val beforeConfirmation = Actions()
+        controller(backgroundScope, Accounts(), beforeConfirmation).use { controller ->
+            val original = controller.openRoute()
+            controller.restore(original); runCurrent()
+            val request = controller.deliverInput(); runCurrent()
+            assertNotNull(controller.state.value.restoreReview)
+            beforeConfirmation.selectionAllowed = false
+            controller.confirmRestore(original, request, approved = true); runCurrent()
+            assertEquals(0, beforeConfirmation.candidate.confirmations)
+            assertEquals(1, beforeConfirmation.candidate.closes)
+            assertNull(controller.state.value.restoreReview)
         }
     }
 

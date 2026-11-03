@@ -212,7 +212,9 @@ class PickerFileRecoverySignInTest {
                     "presentation=${model.pickerPresentationOpen.value}, paused=${manager.pickerFileRecoveryPaused.value}", timeout)
             }
 
-            assertTrue(model.openPickerFileRecoverySignIn(checkNotNull(manager.capturePickerAccountSnapshot())))
+            val signedOut = checkNotNull(manager.capturePickerAccountSnapshot())
+            assertFalse(manager.isPickerFileRecoveryPaused(signedOut))
+            assertTrue(model.openPickerFileRecoverySignIn(signedOut))
             model.onLoginChange("fixture")
             model.onPasswordChange(password)
             val immediateRetry = async(UnconfinedTestDispatcher(testScheduler)) {
@@ -235,6 +237,8 @@ class PickerFileRecoverySignInTest {
             assertFalse(model.pickerFileRecoverySignIn.value)
             val original = checkNotNull(manager.capturePickerAccountSnapshot())
             assertEquals(RenewalFixtures.account, original.account)
+            assertTrue(manager.isPickerFileRecoveryPaused(original))
+            assertFalse(manager.isPickerFileRecoveryPaused(signedOut))
             assertNull(manager.captureRealtimeLease())
             assertFalse(manager.syncDown(force = true))
             assertFalse(manager.pushThisDevice())
@@ -259,6 +263,7 @@ class PickerFileRecoverySignInTest {
             assertTrue(awaitStage("Retired Restore worker drains") { restore.await() }.exceptionOrNull() is kotlinx.coroutines.CancellationException)
             assertTrue(awaitStage("Original recovery pause resumes") { resume.await() })
             assertFalse(manager.pickerFileRecoveryPaused.value)
+            assertFalse(manager.isPickerFileRecoveryPaused(original))
             checkNotNull(manager.captureRealtimeLease())
             assertFalse(manager.resumePickerFileRecovery(original))
         } finally {

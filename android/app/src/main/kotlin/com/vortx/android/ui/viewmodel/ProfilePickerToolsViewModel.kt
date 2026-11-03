@@ -46,7 +46,8 @@ import java.util.WeakHashMap
 internal class ManagerPickerToolsAccounts(private val manager: VortXSyncManager) : PickerToolsAccounts {
     override val authorityRevision: Long get() = manager.pickerAuthorityRevision.value
     override val sessionMarker: Any get() = manager.sessionUiState.value
-    override val changes: Flow<Unit> = combine(manager.pickerAuthorityRevision, manager.sessionUiState) { _, _ -> Unit }
+    override val changes: Flow<Unit> =
+        combine(manager.pickerAuthorityRevision, manager.sessionUiState, manager.pickerFileRecoveryPaused) { _, _, _ -> Unit }
     override fun capture(): PickerAccountSnapshot? = manager.capturePickerAccountSnapshot()
     override fun isCurrent(original: PickerAccountSnapshot): Boolean = manager.isPickerAccountCurrent(original)
     override suspend fun download(original: PickerAccountSnapshot): ByteArray = manager.downloadAccountBackupFile(original)
@@ -84,6 +85,9 @@ private class ManagerPickerToolsRestoreActions(
     private val manager: VortXSyncManager,
     private val external: AccountFileRestoreExternalExclusion,
 ) : PickerToolsRestoreActions {
+    override fun canSelect(original: PickerToolsActionGrant): Boolean =
+        original.original?.let(manager::isPickerFileRecoveryPaused) == true
+
     override suspend fun status(original: PickerToolsActionGrant, isCurrent: () -> Boolean) =
         manager.readAccountBackupFileRestoreStatus(checkNotNull(original.original), isCurrent)
 

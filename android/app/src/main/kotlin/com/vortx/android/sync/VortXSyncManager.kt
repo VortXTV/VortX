@@ -1618,6 +1618,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private fun pickerFileRecoveryIntentCurrent(intent: PickerFileRecoverySignIn): Boolean =
         pickerFileRecoveryIntent === intent && pickerAccountMatches(intent.original)
 
+    /** Read-only picker selection gate for the exact original paused session. */
+    internal fun isPickerFileRecoveryPaused(expected: PickerAccountSnapshot): Boolean = operations.snapshot {
+        val paused = pickerFileRecoverySession
+        paused != null && sessionState.value === paused && isPickerAccountCurrent(expected)
+    }
+
     /** Scalar check for the app Restore reservation. Do not load secure storage or recapture an owner. */
     internal fun isPickerFileRecoveryOwnerCurrent(
         original: AccountFileRestoreExternalExclusion.Owner,
