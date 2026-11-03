@@ -1,6 +1,7 @@
 package com.vortx.android.ui.screens
 
 import java.io.File
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -75,6 +76,20 @@ class WhosWatchingPickerContractTest {
         assertTrue(source.contains("if (!admission.commit { })"))
         assertTrue(source.contains("openEditAfterUnlock(pending.profile, pending.admission)"))
         assertTrue(source.contains("catch (_: Exception)"))
+    }
+
+    @Test
+    fun `unavailable tv gateway keeps account and Tools reachable without selecting a profile`() {
+        val source = readTvSource()
+        val unavailable = source.substringAfter("if (gateway == null) {", "")
+            .substringBefore("val snapshot = gateway.read()")
+        assertTrue(unavailable.contains("BackHandler(onBack = onDone)"))
+        assertTrue(unavailable.contains("onClick = control.onClick"))
+        assertTrue(unavailable.contains("Open Tools for backup recovery."))
+        assertTrue(unavailable.contains("backFocus.requestFocus()"))
+        assertFalse(unavailable.contains("onDone()"))
+        assertFalse(unavailable.contains("onSelected("))
+        assertTrue(source.contains("if (snapshot.profiles.size <= 1 && !snapshot.selectionPending)"))
     }
 
     private fun readSource(fileName: String): String {

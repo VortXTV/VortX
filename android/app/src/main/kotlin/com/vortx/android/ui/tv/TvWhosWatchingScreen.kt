@@ -65,7 +65,7 @@ import kotlinx.coroutines.CancellationException
 /// Gating mirrors the phone and Apple TV exactly: [ProfileStore.needsPicker] is true for a real roster choice
 /// or an account handoff still awaiting host verification. `pickedThisLaunch` is a transient in-memory flag
 /// that resets every cold start; a pending handoff deliberately keeps the picker mounted even when only one
-/// profile remains. This screen is fail-soft: with no gateway or no pending choice it dismisses itself.
+/// profile remains. An unavailable gateway leaves account and Tools access on the picker.
 ///
 /// Every PIN-protected profile, including the already-active profile when Back is used, prompts for its PIN
 /// through a D-pad numeric keypad before selection (a TV has no reliable soft keyboard), so a Kids remote
@@ -81,15 +81,20 @@ fun TvWhosWatching(
     modifier: Modifier = Modifier,
 ) {
     val (gateway, loading) = rememberTvProfileGateway()
-    if (loading) {
-        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Opening profiles…", style = VortXTheme.type.body)
-        }
-        BackHandler(onBack = onDone)
-        return
-    }
     if (gateway == null) {
-        LaunchedEffect(Unit) { onDone() }
+        val backFocus = remember { FocusRequester() }
+        BackHandler(onBack = onDone)
+        Column(modifier.fillMaxSize().padding(TvDimens.edge),
+            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(if (loading) "Opening profiles…" else "Couldn't open profiles.", style = VortXTheme.type.body)
+            if (!loading) Text("Open Tools for backup recovery.", style = VortXTheme.type.label)
+            accountControl?.let { control ->
+                TvProfileButton(control.label, modifier = Modifier.width(320.dp), onClick = control.onClick)
+            }
+            TvProfileButton("Back", modifier = Modifier.width(320.dp).focusRequester(backFocus), onClick = onDone)
+        }
+        LaunchedEffect(backFocus) { withFrameNanos { }; runCatching { backFocus.requestFocus() } }
         return
     }
     val snapshot = gateway.read()
