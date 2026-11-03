@@ -163,6 +163,15 @@ class AccountFileLegacyAdmissionTest {
         offsets.forEach { number(it.toLong(), 4) }; repeat(6) { out.write(0) }; out.write(4); out.write(1)
         number(objects.size.toLong(), 8); number(0, 8); number(table.toLong(), 8); return out.toByteArray()
     }
+    @Test fun nestedPlistValueAdmissionKeepsTheSettingsDictionaryRequirement() {
+        val xml = "<plist><array><true/><integer>3</integer></array></plist>".toByteArray()
+        val binaryScalar = binary(listOf(byteArrayOf(9)))
+        assertEquals(listOf(true, BigInteger("3")), AccountFilePlist.decodeValue(xml))
+        assertEquals(true, AccountFilePlist.decodeValue(binaryScalar))
+        refuses { AccountFilePlist.decode(xml) }
+        refuses { AccountFilePlist.decode(binaryScalar) }
+        refuses { AccountFilePlist.decodeValue(ByteArray(AccountFilePlist.MAX_BYTES + 1)) }
+    }
     @Test fun binaryRejectsDuplicatesCyclesDepthVisitsExpansionAndInvalidStringBounds() {
         refuses { AccountFilePlist.decode(binary(listOf(byteArrayOf(0xd2.toByte(), 1, 1, 2, 3), byteArrayOf(0x51, 120), byteArrayOf(8), byteArrayOf(9)))) }
         refuses { AccountFilePlist.decode(binary(listOf(byteArrayOf(0xd1.toByte(), 1, 0), byteArrayOf(0x51, 120)))) }

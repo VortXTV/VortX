@@ -24,11 +24,16 @@ internal object AccountFilePlist {
     data class PlistDate(val secondsSince2001: Double)
 
     fun decode(bytes: ByteArray): Map<String, Any> {
-        require(bytes.size <= MAX_BYTES) { "Account plist exceeds limit" }
-        val value = if (bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals("bplist00".toByteArray()))
-            Binary(bytes).root() else xml(bytes)
+        val value = decodeValue(bytes)
         require(value is Map<*, *> && value.keys.all { it is String }) { "Account plist must be a dictionary" }
         @Suppress("UNCHECKED_CAST") return value as Map<String, Any>
+    }
+
+    /** Inspect a nested plist carrier without imposing the settings dictionary shape. */
+    fun decodeValue(bytes: ByteArray): Any {
+        require(bytes.size <= MAX_BYTES) { "Account plist exceeds limit" }
+        return if (bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals("bplist00".toByteArray()))
+            Binary(bytes).root() else xml(bytes)
     }
 
     private class Budget {
