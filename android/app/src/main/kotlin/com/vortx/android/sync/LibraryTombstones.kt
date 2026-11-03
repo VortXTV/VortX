@@ -3,9 +3,49 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.engine.OHJson
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+
+/** Strict restore-only classification. Ordinary tombstone readers keep their tolerant behavior. */
+internal object RestoreTombstoneRows {
+    private const val MAX_JSON_CHARS = 1024 * 1024
+
+    fun inspect(raw: Any?, limit: Int, validID: (String) -> Boolean, kind: Kind): AccountFileLocalPresence = try {
+        fun text(): ByteArray = requireNotNull(raw as? String).also { require(it.length <= MAX_JSON_CHARS) }
+            .toByteArray(Charsets.UTF_8)
+        val size = when (kind) {
+            Kind.STAMPS -> OHJson.Obj(text()).let { stamps ->
+                val ids = stamps.keys
+                require(ids.size <= limit)
+                for (id in ids) {
+                    require(validID(id))
+                    val stamp = OHJson.utf8(stamps.raw(id)).toDoubleOrNull()
+                    require(stamp != null && stamp.isFinite() && stamp >= 0.0)
+                }
+                ids.size
+            }
+            Kind.JSON_IDS, Kind.STRING_SET -> if (kind == Kind.STRING_SET && raw is Set<*>) {
+                require(raw.size <= limit && raw.all { it is String && validID(it) })
+                raw.size
+            } else OHJson.array(text()).let { rows ->
+                require(rows.size <= limit)
+                val ids = rows.map(OHJson::text)
+                require(ids.all(validID) && ids.toSet().size == ids.size)
+                ids.size
+            }
+        }
+        if (size == 0) AccountFileLocalPresence.ABSENT else AccountFileLocalPresence.PRESENT
+    } catch (_: IllegalArgumentException) {
+        AccountFileLocalPresence.UNAVAILABLE
+    } catch (_: IllegalStateException) {
+        AccountFileLocalPresence.UNAVAILABLE
+    }
+
+    enum class Kind { STAMPS, JSON_IDS, STRING_SET }
+}
 
 internal interface LibraryTombstonePersistence {
     fun readMap(key: String): Map<String, Double>
@@ -88,6 +128,7 @@ class LibraryTombstones internal constructor(
     }
 
     fun tombstone(id: String): Boolean = synchronized(LOCK) {
+        noteRestoreWrite()
         if (!isCurrent()) return@synchronized false
         val key = normalize(id)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
@@ -99,6 +140,7 @@ class LibraryTombstones internal constructor(
     }
 
     fun forget(id: String): Boolean = synchronized(LOCK) {
+        noteRestoreWrite()
         if (!isCurrent()) return@synchronized false
         val key = normalize(id)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
@@ -113,6 +155,7 @@ class LibraryTombstones internal constructor(
         legacyIds: List<String>,
         stampsRaw: Map<String, Map<String, Double>>,
     ): Boolean = synchronized(LOCK) {
+        noteRestoreWrite()
         if (!isCurrent() || owner.accountId == null) return@synchronized false
         val state = load()
         val before = effectiveRemoved(state.removedAt, state.addedAt)
@@ -205,17 +248,57 @@ class LibraryTombstones internal constructor(
         private const val MAX_ID_LENGTH = 512
         private val LOCK = Any()
         private data class Owner(val accountId: String?, val namespace: String?, val revision: Long)
-        private var activeOwner = Owner(null, null, 0)
+        @Volatile private var activeOwner = Owner(null, null, 0)
 
         /** Called only at serialized VortX session adoption/clear, before publishing the new account. */
         internal fun activateAccount(accountId: String?) = synchronized(LOCK) {
             val id = accountId?.takeIf { it.isNotBlank() }
-            val namespace = id?.let {
-                MessageDigest.getInstance("SHA-256").digest(it.toByteArray(Charsets.UTF_8))
-                    .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
-            }
+            val namespace = id?.let(::namespaceFor)
             activeOwner = Owner(id, namespace, activeOwner.revision + 1)
         }
+
+        @Volatile private var restoreWrites = 0L
+
+        private fun noteRestoreWrite() {
+            if (restoreWrites < Long.MAX_VALUE) restoreWrites++
+        }
+
+        /** Capture the exact process owner. A later same-account activation retires this check. */
+        internal fun captureRestoreOwner(accountId: String): (() -> Boolean)? = synchronized(LOCK) {
+            val owner = activeOwner.takeIf { it.accountId == accountId } ?: return@synchronized null
+            val original = restoreWrites.takeIf { it < Long.MAX_VALUE } ?: return@synchronized null
+            return@synchronized { activeOwner === owner && restoreWrites == original }
+        }
+
+        internal fun inspectRestoreRows(accountId: String, raw: Map<String, *>): AccountFileLocalPresence {
+            val namespace = namespaceFor(accountId)
+            var present = false
+            for (base in listOf(REMOVED_AT_KEY, ADDED_AT_KEY, LEGACY_DELETED_KEY)) {
+                val prefix = "$base.account."
+                val target = "$prefix$namespace"
+                val kind = if (base == LEGACY_DELETED_KEY) RestoreTombstoneRows.Kind.STRING_SET else RestoreTombstoneRows.Kind.STAMPS
+                for ((key, value) in raw) {
+                    if (key != base && !key.startsWith("$base.")) continue
+                    if (key != base && key != target) {
+                        if (!key.startsWith(prefix) || !key.removePrefix(prefix).matches(restoreNamespace))
+                            return AccountFileLocalPresence.UNAVAILABLE
+                        continue // An exact foreign namespace is outside this account.
+                    }
+                    val row = RestoreTombstoneRows.inspect(value, MAX_ENTRIES,
+                        { id -> id.isNotEmpty() && id.length <= MAX_ID_LENGTH && normalize(id) == id }, kind)
+                    if (row == AccountFileLocalPresence.UNAVAILABLE || key == base && row == AccountFileLocalPresence.PRESENT)
+                        return AccountFileLocalPresence.UNAVAILABLE // Old unscoped rows have no authenticated attribution.
+                    present = present || row == AccountFileLocalPresence.PRESENT
+                }
+            }
+            return if (present) AccountFileLocalPresence.PRESENT else AccountFileLocalPresence.ABSENT
+        }
+
+        private fun namespaceFor(accountId: String): String =
+            MessageDigest.getInstance("SHA-256").digest(accountId.toByteArray(Charsets.UTF_8))
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+        private val restoreNamespace = Regex("[0-9a-f]{64}")
 
         fun normalize(id: String): String = id.trim().lowercase()
 

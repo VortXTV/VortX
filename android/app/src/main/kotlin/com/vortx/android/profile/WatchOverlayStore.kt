@@ -45,6 +45,28 @@ class WatchOverlayStore(
     private var activeUsesEngine: Boolean = true
     private var pushJob: Job? = null
 
+    // Restore observes actual overlay writers and delayed pushes, without blocking either.
+    private val restoreWriters = Any()
+    @Volatile private var restoreGeneration = 0L
+    private var restoreInFlight = 0
+
+    private inline fun <T> overlayWrite(action: () -> T): T {
+        synchronized(restoreWriters) {
+            if (restoreGeneration < Long.MAX_VALUE) restoreGeneration++
+            restoreInFlight++
+        }
+        return try { action() } finally { synchronized(restoreWriters) { restoreInFlight-- } }
+    }
+
+    private fun restoreIdleLocked(): Boolean =
+        restoreGeneration < Long.MAX_VALUE && restoreInFlight == 0 && watch.isEmpty() && pushJob?.isCompleted != false
+
+    internal fun captureRestoreIdle(): (() -> Boolean)? = synchronized(restoreWriters) {
+        if (!restoreIdleLocked()) return@synchronized null
+        val original = restoreGeneration
+        return@synchronized { restoreGeneration == original }
+    }
+
     /** The ACTIVE overlay profile's live watch state, keyed by meta id. Empty for the owner profile. */
     var watch: Map<String, WatchEntry> = emptyMap()
         private set
@@ -54,7 +76,7 @@ class WatchOverlayStore(
      * library (the owner path), so the overlay is cleared and every write below becomes a no-op — the
      * account library is never touched from here. Mirrors Apple `loadWatchCache`.
      */
-    fun activate(profileId: String?, usesEngineHistory: Boolean) {
+    fun activate(profileId: String?, usesEngineHistory: Boolean) = overlayWrite {
         activeProfileId = profileId?.let { UserProfile.normalizeId(it) }
         activeUsesEngine = usesEngineHistory
         watch = if (profileId == null || usesEngineHistory) emptyMap() else load(activeProfileId!!)
@@ -227,9 +249,9 @@ class WatchOverlayStore(
         name: String,
         type: String,
         poster: String?,
-    ): Boolean {
-        if (!overlayActive() || durationSeconds <= 0.0 || positionSeconds < 0.0) return false
-        val id = activeProfileId ?: return false
+    ): Boolean = overlayWrite {
+        if (!overlayActive() || durationSeconds <= 0.0 || positionSeconds < 0.0) return@overlayWrite false
+        val id = activeProfileId ?: return@overlayWrite false
         val previous = watch[metaId] ?: WatchEntry(videoId = videoId, name = name, type = type, poster = poster)
         val watched = if (previous.watchedVideoIds.contains(videoId)) previous.watchedVideoIds else previous.watchedVideoIds + videoId
         val entry = previous.copy(
@@ -243,11 +265,11 @@ class WatchOverlayStore(
             watchedVideoIds = watched,
         )
         val snapshot = watch + (metaId to entry)
-        if (!saveCommitted(id, snapshot)) return false
+        if (!saveCommitted(id, snapshot)) return@overlayWrite false
         watch = snapshot
         onOverlayChanged(watch)
         schedulePush(id)
-        return true
+        return@overlayWrite true
     }
 
     /**
@@ -279,8 +301,8 @@ class WatchOverlayStore(
     }
 
     /** Continue-Watching "dismiss": drop the whole entry (zeroing the offset is not enough). Apple `removeWatchEntry`. */
-    fun removeWatchEntry(metaId: String) {
-        if (!overlayActive() || !watch.containsKey(metaId)) return
+    fun removeWatchEntry(metaId: String) = overlayWrite {
+        if (!overlayActive() || !watch.containsKey(metaId)) return@overlayWrite
         watch = watch - metaId
         persistAndPush()
     }
@@ -296,8 +318,8 @@ class WatchOverlayStore(
      * watched-episodes are lost. Never writes an engine-backed profile's cache. Mirrors Apple
      * `applyRemoteOverlay`. [isEngineBacked] lets the caller pass the target profile's history mode.
      */
-    fun applyRemoteOverlay(profileId: String, incoming: Map<String, WatchEntry>, isEngineBacked: Boolean) {
-        if (incoming.isEmpty() || isEngineBacked) return
+    fun applyRemoteOverlay(profileId: String, incoming: Map<String, WatchEntry>, isEngineBacked: Boolean) = overlayWrite {
+        if (incoming.isEmpty() || isEngineBacked) return@overlayWrite
         val id = UserProfile.normalizeId(profileId)
         val current = load(id).toMutableMap()
         var changed = false
@@ -313,7 +335,7 @@ class WatchOverlayStore(
                 current[metaId] = existing.copy(watchedVideoIds = union); changed = true
             }
         }
-        if (!changed) return
+        if (!changed) return@overlayWrite
         save(id, current)
         if (activeProfileId == id) {
             watch = current
@@ -325,7 +347,7 @@ class WatchOverlayStore(
 
     private fun overlayActive(): Boolean = activeProfileId != null && !activeUsesEngine
 
-    private fun mutate(metaId: String, entry: WatchEntry) {
+    private fun mutate(metaId: String, entry: WatchEntry) = overlayWrite {
         watch = watch + (metaId to entry)
         persistAndPush()
     }
@@ -362,7 +384,7 @@ class WatchOverlayStore(
         prefs.edit().putString(cacheKey(profileId), WatchEntry.encodeMap(map)).commit()
 
     /** Drop a removed profile's cache. Called by [ProfileStore.remove]. */
-    fun clearCache(profileId: String) {
+    fun clearCache(profileId: String) = overlayWrite {
         prefs.edit().remove(cacheKey(UserProfile.normalizeId(profileId))).apply()
     }
 

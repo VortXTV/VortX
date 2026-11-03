@@ -2,6 +2,13 @@ package com.vortx.android.profile
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.vortx.android.data.AddonTombstones
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.sync.LibraryTombstones
+import com.vortx.android.sync.NativeSettingsFence
+import com.vortx.android.sync.SessionOwnerSnapshot
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferences
@@ -80,17 +87,22 @@ internal fun playlistScopeTransition(
  * isolation becomes real the moment a switch happens.
  */
 class ProfileStore private constructor(context: Context) {
-
-
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
     private val overlay = WatchOverlayStore(prefs)
+    private val restoreProfileGeneration = AtomicLong()
+    private val restoreSelectionWriters = AtomicInteger()
+
+    private fun noteRestoreProfileWrite() {
+        restoreProfileGeneration.updateAndGet { if (it == Long.MAX_VALUE) it else it + 1 }
+    }
 
     // ---- Observable-ish state (plain fields; callers on the main thread, mirroring Apple's @Published) ----
 
     var profiles: List<UserProfile> = emptyList()
         private set(value) {
+            noteRestoreProfileWrite()
             // Compare only the selected identity/binding, never the whole preference/roster DTO.
             val changesOwner = captureActiveProfileBinding(field, activeID) != captureActiveProfileBinding(value, activeID)
             if (changesOwner) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
@@ -98,6 +110,7 @@ class ProfileStore private constructor(context: Context) {
         }
     var activeID: String? = null
         private set(value) {
+            noteRestoreProfileWrite()
             if (field != value) com.vortx.android.player.PlaybackOwnerEpoch.transition { field = value }
             else field = value
         }
@@ -108,7 +121,16 @@ class ProfileStore private constructor(context: Context) {
     /** The launch picker shows once per cold start, and only when there is a real choice to make. */
     var pickedThisLaunch: Boolean = false
     /** An admitted selection is not a completed account handoff, including on a one-profile device. */
-    internal var selectionPending: Boolean = false
+    @Volatile internal var selectionPending: Boolean = false
+        set(value) {
+            restoreSelectionWriters.incrementAndGet()
+            try {
+                noteRestoreProfileWrite()
+                field = value
+            } finally {
+                restoreSelectionWriters.decrementAndGet()
+            }
+        }
 
     /**
      * Durable cross-device delete tombstones: profile ids the user has DELETED. The app owns this set so
@@ -116,7 +138,7 @@ class ProfileStore private constructor(context: Context) {
      * cloud blob. The owner id is never tombstoned.
      */
     var deletedProfileIDs: Set<String> = emptySet()
-        private set
+        private set(value) { noteRestoreProfileWrite(); field = value }
 
     // ---- Seams ----
 
@@ -147,6 +169,7 @@ class ProfileStore private constructor(context: Context) {
     private var applyingDiscoveryProjection = false
     private val continueWatchingMigration = ContinueWatchingMigrationCheckpoint<com.vortx.android.sync.SessionOwnerSnapshot.Account>()
     private var acknowledgedNativeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account? = null
+        set(value) { noteRestoreProfileWrite(); field = value }
     private var acknowledgedNativeTraktEpoch: Long? = null
 
     // ---- Derived reads ----
@@ -180,8 +203,11 @@ class ProfileStore private constructor(context: Context) {
         return try { action() } finally { applyingNativeAccountSettings = previous }
     }
     private var nativeProjectionRequest = 0L
+        set(value) { noteRestoreProfileWrite(); field = value }
     private var nativeProjectionMount: Any? = null
+        set(value) { noteRestoreProfileWrite(); field = value }
     private var initialNativeMigrationProfile: UserProfile? = null
+        set(value) { noteRestoreProfileWrite(); field = value }
     private data class NativeProjectionBasis(
         val ownerRevision: Long,
         val profiles: List<UserProfile>, val activeID: String?,
@@ -321,6 +347,7 @@ class ProfileStore private constructor(context: Context) {
 
     /** Only the admitted immutable payload is consumed here. Switch listeners must schedule captures. */
     private fun applyPreparedNativeProjection(value: NativeProfileGateway.Projection, effects: NativeProjectionEffects, forceSettings: Boolean) {
+        noteRestoreProfileWrite()
         val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         val transition = playlistScopeTransition(
             playlistScopeEvidence(beforeBinding, acknowledgedNativeAccount, acknowledgedNativeTraktEpoch),
@@ -365,6 +392,7 @@ class ProfileStore private constructor(context: Context) {
         checkNotNull(nativeGateway).withProjection(value) { applyNativeProjectionLocked(value, forceSettings) }
     }
     private fun applyNativeProjectionLocked(value: NativeProfileGateway.Projection, forceSettings: Boolean) {
+        noteRestoreProfileWrite()
         var acknowledged = value
         val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         val beforeAccount = acknowledgedNativeAccount
@@ -1035,6 +1063,73 @@ class ProfileStore private constructor(context: Context) {
     private fun adoptRosterWatermark(next: Double) {
         if (next > rosterModified) writeRosterClock(next)
     }
+
+    internal sealed interface RestoreDirectState {
+        data object Present : RestoreDirectState
+        data object Unavailable : RestoreDirectState
+
+        /** Issued by the actual ProfileStore. This is a scalar check, never a fresh disk read. */
+        interface Absent : RestoreDirectState {
+            fun requireCurrent(owner: SessionOwnerSnapshot.Account)
+        }
+    }
+
+    private class AbsentRestoreDirectState(
+        private val original: SessionOwnerSnapshot.Account,
+        private val current: () -> Unit,
+    ) : RestoreDirectState.Absent {
+        override fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
+            check(owner == original) { "Original profile Restore owner retired" }
+            current()
+        }
+    }
+
+    /** Existing-only evidence for this instance. Call from an owned IO worker. */
+    internal fun inspectRestoreDirectState(owner: SessionOwnerSnapshot.Account): RestoreDirectState = try {
+        inspectRestoreDirectStateOnWorker(owner)
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        RestoreDirectState.Unavailable
+    }
+
+    private fun inspectRestoreDirectStateOnWorker(owner: SessionOwnerSnapshot.Account): RestoreDirectState {
+        val addOwner = AddonTombstones.captureRestoreOwner(owner.id) ?: return RestoreDirectState.Unavailable
+        val libraryOwner = LibraryTombstones.captureRestoreOwner(owner.id) ?: return RestoreDirectState.Unavailable
+        val (_, raw) = NativeSettingsFence.capture { prefs.all }
+        val (profilePresence, profileCurrent) = ContinueWatchingOwnerGate.serialized {
+            val overlayCurrent = overlay.captureRestoreIdle()
+            val generation = restoreProfileGeneration.get()
+            if (!restoreProfileProcessIdle() || overlayCurrent == null) {
+                val present = if (acknowledgedNativeAccount == owner) AccountFileLocalPresence.PRESENT
+                else AccountFileLocalPresence.UNAVAILABLE
+                present to null
+            } else AccountFileLocalPresence.ABSENT to {
+                restoreProfileGeneration.get() == generation && restoreSelectionWriters.get() == 0 && overlayCurrent()
+            }
+        }
+        if (profilePresence == AccountFileLocalPresence.PRESENT) return RestoreDirectState.Present
+        val addonRows = AddonTombstones.inspectRestoreRows(owner.id, raw)
+        val libraryRows = LibraryTombstones.inspectRestoreRows(owner.id, raw)
+        if (addonRows == AccountFileLocalPresence.PRESENT || libraryRows == AccountFileLocalPresence.PRESENT)
+            return if (addOwner() && libraryOwner()) RestoreDirectState.Present else RestoreDirectState.Unavailable
+        if (addonRows != AccountFileLocalPresence.ABSENT || libraryRows != AccountFileLocalPresence.ABSENT ||
+            raw.keys.any(::isUnattributedProfileKey)) return RestoreDirectState.Unavailable
+        if (profileCurrent == null) return RestoreDirectState.Unavailable
+        val backingCurrent = NativeSettingsFence.capturePristineRestoreBacking(prefs) ?: return RestoreDirectState.Unavailable
+        return AbsentRestoreDirectState(owner) {
+            check(addOwner() && libraryOwner() && profileCurrent() && backingCurrent()) { "Local profile Restore evidence retired" }
+        }.also { it.requireCurrent(owner) }
+    }
+
+    private fun restoreProfileProcessIdle(): Boolean =
+        restoreProfileGeneration.get() < Long.MAX_VALUE && restoreSelectionWriters.get() == 0 &&
+            profiles.isEmpty() && activeID == null && deletedProfileIDs.isEmpty() && nativeProjectionMount == null &&
+            acknowledgedNativeAccount == null && initialNativeMigrationProfile == null &&
+            continueWatchingMigration.witness == null && !selectionPending
+
+    private fun isUnattributedProfileKey(key: String): Boolean =
+        key == LIST_KEY || key.startsWith("$LIST_KEY.") || key == MODIFIED_BITS_KEY || key == EMAIL_KEY
 
     // ---- Delete tombstones ----
 
