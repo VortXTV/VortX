@@ -156,6 +156,7 @@ jobs:
           --tests com.vortx.android.sync.AddonPrefsRestoreWriterExclusionTest
           --tests com.vortx.android.sync.AuxiliaryPrefsRestorePhysicalEvidenceTest
           --tests com.vortx.android.sync.NativeSettingsFenceRestoreExclusionTest
+          --tests com.vortx.android.moat.WatchSignalEnqueueConsentTest
           --tests com.vortx.android.integrations.NativeProviderCredentialsTest
           --tests com.vortx.android.profile.RestoreProfileDirectWritersTest
           --tests com.vortx.android.backup.SettingsBackupInteropTest

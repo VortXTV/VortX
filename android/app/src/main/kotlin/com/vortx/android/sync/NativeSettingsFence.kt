@@ -11,9 +11,12 @@ import java.nio.file.attribute.FileTime
 import android.os.Handler
 import android.os.Looper
 import java.util.WeakHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 
 /** Process settings writer owner and first-open provenance for the exact Restore preferences.
  * Application supplies the wrapper on the credential-protected application context.
@@ -88,15 +91,37 @@ internal object NativeSettingsFence {
      * owns its unsubmitted intent. Return or display refusal before publishing any new UI state.
      */
     fun <T : Any> tryFlatSettingsMutation(operation: () -> T): T? {
-        synchronized(lock) {
-            if (flatRestore != null) return null
-            flatMutations++
-        }
+        if (!enterFlatMutation()) return null
         try {
             return operation()
         } finally {
-            synchronized(lock) { flatMutations-- }
+            leaveFlatMutation()
         }
+    }
+
+    /** Admit before scheduling any work and hold membership through child completion and cleanup. */
+    fun launchFlatSettingsMutation(scope: CoroutineScope, operation: suspend CoroutineScope.() -> Unit): Job? {
+        if (!enterFlatMutation()) return null
+        val job = try {
+            scope.launch(start = CoroutineStart.LAZY, block = operation)
+        } catch (failure: Throwable) {
+            leaveFlatMutation()
+            throw failure
+        }
+        job.invokeOnCompletion { leaveFlatMutation() }
+        job.start()
+        return job
+    }
+
+    private fun enterFlatMutation(): Boolean = synchronized(lock) {
+        if (flatRestore != null) return@synchronized false
+        flatMutations++
+        true
+    }
+
+    private fun leaveFlatMutation() = synchronized(lock) {
+        check(flatMutations > 0) { "Flat settings mutation membership underflow" }
+        flatMutations--
     }
 
     enum class RestoreAuxiliaryBacking(val fileName: String) {

@@ -3,11 +3,16 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -107,6 +112,49 @@ class NativeSettingsFenceRestoreExclusionTest {
         }
     }
 
+    @Test fun queuedAndSuspendedBackgroundWriterExcludeRestoreThroughCancellationDrain() = isolated {
+        open()
+        val entered = CompletableDeferred<Unit>()
+        val releaseDrain = CompletableDeferred<Unit>()
+        var deniedInDrain = false
+        val writer = checkNotNull(NativeSettingsFence.launchFlatSettingsMutation(this) {
+            entered.complete(Unit)
+            try {
+                awaitCancellation()
+            } finally {
+                // Use an active context to test membership rather than cancellation refusal.
+                releaseDrain.complete(Unit)
+                withContext(NonCancellable) {
+                    deniedInDrain = NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) { Unit } == null
+                }
+            }
+        })
+        assertFalse(entered.isCompleted)
+        assertNull(NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) { Unit })
+        entered.await()
+        assertNull(NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) { Unit })
+        writer.cancelAndJoin()
+        assertTrue(releaseDrain.isCompleted)
+        assertTrue(deniedInDrain)
+        assertNotNull(NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) { Unit })
+    }
+
+    @Test fun restoreRefusesNewBackgroundWriterBeforeItsFirstEffectAndCancelledParentDoesNotLeak() = isolated {
+        open()
+        var firstEffect = false
+        assertNotNull(NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) {
+            assertNull(NativeSettingsFence.launchFlatSettingsMutation(this) { firstEffect = true })
+            assertFalse(firstEffect)
+            Unit
+        })
+        val cancelled = Job().apply { cancel() }
+        val unavailable = CoroutineScope(coroutineContext + cancelled)
+        val child = checkNotNull(NativeSettingsFence.launchFlatSettingsMutation(unavailable) { firstEffect = true })
+        child.join()
+        assertFalse(firstEffect)
+        assertNotNull(NativeSettingsFence.withRestoreFlatSettingsExclusion(owner, {}) { Unit })
+    }
+
     private fun open(): SharedPreferences {
         val root = temporary.newFolder()
         val context = object : ContextWrapper(null) {
@@ -121,6 +169,6 @@ class NativeSettingsFenceRestoreExclusionTest {
 
     // These deterministic callbacks share the isolated JVM fixture thread and suspend only on
     // cancellation. No independently running settings work is hidden by the fixture monitor.
-    private fun isolated(test: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) =
+    private fun isolated(test: suspend CoroutineScope.() -> Unit) =
         withIsolatedPristinePreferenceFence { runBlocking { test() } }
 }

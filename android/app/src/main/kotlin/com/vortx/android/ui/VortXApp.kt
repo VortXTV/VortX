@@ -1219,7 +1219,8 @@ fun VortXApp(
                             // consent + a per-title/day dedup INSIDE [WatchSignalClient], independent of the
                             // auto-add-to-Library setting, so the same latch that guards the add covers it once
                             // per playback. A `tmdb:` hub/catalog id resolves to its `tt` identity first
-                            // (fire-and-forget); a `tt` id pings inline. Never blocks and fully fail-soft.
+                            // in the same admitted background job as the ping. Optional telemetry can be
+                            // refused during account Restore without retrying an old playback tick.
                             WatchSignalClient.pingResolvingTmdb(
                                 context = appContext,
                                 contentId = meta.id,

@@ -2,11 +2,13 @@ package com.vortx.android.moat
 
 import android.content.Context
 import com.vortx.android.net.VortXEdgeAuth
+import com.vortx.android.sync.NativeSettingsFence
 import com.vortx.android.trickplay.TmdbImdbResolver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -92,47 +94,53 @@ object WatchSignalClient {
      * worker validates + lowercases it, so any non-conforming value is harmless.
      *
      * A `tmdb:...` library id (hub / TMDB-catalog play) is first resolved to its `tt...` identity so those
-     * watches feed the pool too: a cached mapping pings inline; a cache miss kicks ONE background resolve and
-     * pings when it lands (never blocking the playback tick). A non-tt, non-tmdb id is left to [ping]'s guard.
+     * watches feed the pool too. The same admitted background job resolves, publishes dedup state and sends.
+     * A false result means no work was admitted. Unadmitted optional telemetry is not replayed.
      */
-    fun pingResolvingTmdb(context: Context, contentId: String, type: String, seriesHint: Boolean) {
+    fun pingResolvingTmdb(context: Context, contentId: String, type: String, seriesHint: Boolean): Boolean =
+        enqueueWatchSignal(context, contentId, type, seriesHint, scope)
+
+    internal fun enqueueWatchSignal(
+        context: Context,
+        contentId: String,
+        type: String,
+        seriesHint: Boolean,
+        worker: CoroutineScope,
+    ): Boolean {
         val appContext = context.applicationContext
-        if (contentId.lowercase(Locale.US).startsWith("tmdb")) {
-            val cached = TmdbImdbResolver.cachedImdbId(contentId)
-            if (cached != null) {
-                ping(appContext, cached, type)
-            } else {
-                scope.launch {
-                    val tt = TmdbImdbResolver.resolveImdbId(appContext, contentId, seriesHint)
-                    if (tt != null) ping(appContext, tt, type)
-                }
+        val tmdb = contentId.lowercase(Locale.US).startsWith("tmdb")
+        if (!tmdb && !TT_ID.matches(contentId)) return false
+        // An opt-in after submission must not revive an opted-out playback.
+        val consentAtSubmission = try {
+            MoatConsent.contributeAndConsume(appContext)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+        if (!consentAtSubmission) return false
+        return NativeSettingsFence.launchFlatSettingsMutation(worker) {
+            try {
+                if (!MoatConsent.contributeAndConsume(appContext)) return@launchFlatSettingsMutation
+                val imdbId = if (tmdb) {
+                    TmdbImdbResolver.cachedImdbId(contentId)
+                        ?: TmdbImdbResolver.resolveImdbId(appContext, contentId, seriesHint)
+                } else contentId
+                ensureActive()
+                if (imdbId == null || !TT_ID.matches(imdbId) || !MoatConsent.contributeAndConsume(appContext))
+                    return@launchFlatSettingsMutation
+
+                val day = dayBucket()
+                val watcher = claimWatcher(appContext, "$imdbId|$day") { ensureActive() }
+                    ?: return@launchFlatSettingsMutation
+                ensureActive()
+                postPing(imdbId, day, type, watcher)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // An optional watch signal never fails playback or its process scope.
             }
-            return
-        }
-        ping(appContext, contentId, type) // tt id (or a non-tmdb id the guard below rejects)
-    }
-
-    /**
-     * Send ONE ping for a resolved [contentId], gated + deduped. Mirrors Apple `ping`. The consent check, the
-     * tt-only guard, and the atomic per-title/day claim all run BEFORE the request so a retry storm can never
-     * double-send.
-     */
-    fun ping(context: Context, contentId: String, type: String) {
-        val appContext = context.applicationContext
-        // GIVE-TO-GET: no contribution without pool consent.
-        if (!MoatConsent.contributeAndConsume(appContext)) return
-        // Only real imdb ids witness the pool (a tmdb: / kitsu: / synthetic id is never a shareable identity).
-        if (!TT_ID.matches(contentId)) return
-
-        val day = dayBucket()
-        val marker = "$contentId|$day"
-        // Atomic claim: recorded BEFORE the request so a retry storm can't double-send; one ping per title/day.
-        if (!claimMarker(appContext, marker)) return
-
-        val watcher = watcherId(appContext)
-        scope.launch {
-            postPing(contentId, day, type, watcher)
-        }
+        } != null
     }
 
     private fun postPing(contentId: String, day: String, type: String, watcher: String) {
@@ -159,8 +167,6 @@ object WatchSignalClient {
             // Fail-soft: the worker may not be deployed yet (owner-gated). Any error / non-200 is swallowed; the
             // local marker already prevents a re-send today, and tomorrow's bucket retries naturally.
             conn.responseCode
-        } catch (_: Throwable) {
-            // fire-and-forget: any failure leaves no trace and never disturbs playback
         } finally {
             conn?.disconnect()
         }
@@ -168,32 +174,20 @@ object WatchSignalClient {
 
     // MARK: - Local per-day dedup + watcher id
 
-    /**
-     * Atomically claim [marker]: returns true and records it if it was not already present, false if a prior
-     * tick already claimed it. The whole check-and-record runs under [markerLock]. Mirrors Apple `claimMarker`.
-     */
-    private fun claimMarker(context: Context, marker: String): Boolean {
-        synchronized(markerLock) {
-            val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
-            val current = decodeMarkers(prefs.getString(SENT_KEY, null))
-            val (claimed, next) = claimMarkerIn(current, marker, SENT_CAP)
-            if (!claimed) return false
-            prefs.edit().putString(SENT_KEY, encodeMarkers(next)).apply()
-            return true
-        }
-    }
-
-    /**
-     * The stable per-install watcher id, minted lazily on first use and reused forever after. An opaque random
-     * UUID (non-PII); the worker only ever stores its hash. Mirrors Apple `watcherId`.
-     */
-    private fun watcherId(context: Context): String {
+    /** Claim the title/day and reuse or create the device watcher as one preference edit. */
+    private fun claimWatcher(context: Context, marker: String, checkCurrent: () -> Unit): String? = synchronized(markerLock) {
+        checkCurrent()
         val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
-        val existing = prefs.getString(WATCHER_ID_KEY, null)
-        if (!existing.isNullOrEmpty()) return existing
-        val fresh = UUID.randomUUID().toString()
-        prefs.edit().putString(WATCHER_ID_KEY, fresh).apply()
-        return fresh
+        val current = decodeMarkers(prefs.getString(SENT_KEY, null))
+        val (claimed, next) = claimMarkerIn(current, marker, SENT_CAP)
+        if (!claimed) return@synchronized null
+        val existing = prefs.getString(WATCHER_ID_KEY, null)?.takeIf { it.isNotEmpty() }
+        val watcher = existing ?: UUID.randomUUID().toString()
+        checkCurrent()
+        prefs.edit().putString(SENT_KEY, encodeMarkers(next)).apply {
+            if (existing == null) putString(WATCHER_ID_KEY, watcher)
+        }.apply()
+        watcher
     }
 
     // MARK: - Pure helpers (kept side-effect-free for deterministic tests)
