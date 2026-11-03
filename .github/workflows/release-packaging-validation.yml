@@ -147,6 +147,7 @@ jobs:
           --tests com.vortx.android.sync.AccountBackupRepairTest
           --tests com.vortx.android.sync.AccountFileHostAdmissionTest
           --tests com.vortx.android.sync.AccountFileRestoreJournalTest
+          --tests com.vortx.android.sync.AccountFileRestoreTransactionTest
           --tests com.vortx.android.sync.AccountFileLegacyAdmissionTest
           --tests com.vortx.android.engine.DetachedAccountFileKernelTest
           --tests com.vortx.android.sync.AccountFileProfileMaterialTest
