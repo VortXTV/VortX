@@ -135,6 +135,52 @@ enum Keychain {
     static func settled(_ result: MediaServerStore.SyncSettlement) -> Bool { if case .settled = result { return true }; return false }
     static func settled(_ result: IPTVPlaylistStore.SyncSettlement) -> Bool { if case .settled = result { return true }; return false }
     @MainActor static func main() async throws {
+        // F3 composition: select the actual manager exclusion policy, then execute the whole actual
+        // checked store against its original persisted planning rows. All IO is the declared synthetic
+        // backend; the credential deletion still runs the actual capability/CAS implementation.
+        do {
+            let old = MediaServerRecord(id: id, name: "old", kind: .jellyfin, urls: [], userId: "", addedAt: Date(timeIntervalSince1970: 1))
+            let kept = MediaServerRecord(id: sibling, name: "kept", kind: .plex, urls: [], userId: "", addedAt: Date(timeIntervalSince1970: 3))
+            let world = World(), prior = "10000000-0000-0000-0000-000000000003"
+            world.list = try JSONEncoder().encode([old, kept]); world.removed = [prior: 500]
+            world.secure.values[ms(id)] = "old-token"; world.secure.values[ms(sibling)] = "kept-token"
+            let excluded = VortXSyncManager.receivedProviderSettingsExclusions(media: true, iptv: false)
+            // Model only the call site's incoming empty legacy baseline; honor its actual exclusions.
+            if !excluded.contains("vortx.mediaServers.list") { world.list = Data("[]".utf8) }
+            if !excluded.contains("vortx.mediaServers.removed") { world.removed = [:] }
+            let baseline = try JSONDecoder().decode([MediaServerRecord].self, from: world.list!)
+            let store = MediaServerStore(settlementFixtureIO: world.mediaIO(), servers: baseline)
+            let source = String(decoding: try JSONSerialization.data(withJSONObject: ["v": 1, "servers": [], "removed": [id.uuidString: 2000]]), as: UTF8.self)
+            check(settled(store.applySyncBlobSettled(source, operationID: UUID(), isCurrent: { world.active })),
+                "protected empty cold media baseline permits actual pure-tombstone settlement")
+            check(world.secure.values[ms(id)] == nil && world.secure.writes == 1
+                && world.secure.values[ms(sibling)] == "kept-token" && store.servers == [kept]
+                && world.removed[prior] == 500 && world.removed[id.uuidString] == 2000,
+                "cold media tombstone performs actual credential CAS and retains unrelated rows credentials and removals")
+        }
+        do {
+            let old = IPTVPlaylist(id: "synthetic-playlist", name: "old", kind: .m3u, transportUrl: "https://synthetic.invalid/manifest", createdAt: Date(timeIntervalSince1970: 1))
+            let kept = IPTVPlaylist(id: "kept", name: "kept", kind: .m3u, transportUrl: "https://synthetic.invalid/kept", createdAt: Date(timeIntervalSince1970: 3))
+            let world = World(), keptSlot = "vortx.iptv.cred.kept"
+            world.list = try JSONEncoder().encode([old, kept]); world.removed = ["prior": 500]
+            world.secure.values[iptvSlot] = #"{"m3uURL":"https://synthetic.invalid/old"}"#
+            world.secure.values[keptSlot] = #"{"m3uURL":"https://synthetic.invalid/kept"}"#
+            let retainedCredential = world.secure.values[keptSlot]
+            let excluded = VortXSyncManager.receivedProviderSettingsExclusions(media: false, iptv: true)
+            if !excluded.contains("vortx.iptv.playlists") { world.list = Data("[]".utf8) }
+            if !excluded.contains("vortx.iptv.removed") { world.removed = [:] }
+            let baseline = try JSONDecoder().decode([IPTVPlaylist].self, from: world.list!)
+            let store = IPTVPlaylistStore(settlementFixtureIO: world.iptvIO(), playlists: baseline)
+            let source = String(decoding: try JSONSerialization.data(withJSONObject: ["v": 1, "playlists": [], "removed": ["synthetic-playlist": 2000]]), as: UTF8.self)
+            check(settled(store.applySyncBlobSettled(source, operationID: UUID(), isCurrent: { world.active })),
+                "protected empty cold IPTV baseline permits actual pure-tombstone settlement")
+            check(world.secure.values[iptvSlot] == nil && world.secure.writes == 1
+                && world.secure.values[keptSlot] == retainedCredential && store.playlists == [kept]
+                && world.removed["prior"] == 500 && world.removed["synthetic-playlist"] == 2000,
+                "cold IPTV tombstone performs actual credential CAS and retains unrelated rows credentials and removals")
+        }
+        check(VortXSyncManager.receivedProviderSettingsExclusions(media: false, iptv: false).isEmpty,
+            "ordinary settings-only receive has no new provider exclusions")
         // Enter reads/checked receive from the actual setter's cleanup callback. Its generation
         // is reserved but no transaction/account lock/backend write has begun. No threads or fake
         // busy Boolean substitutes for the actual store-owned lifetime.

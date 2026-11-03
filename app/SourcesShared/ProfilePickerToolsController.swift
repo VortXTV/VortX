@@ -354,7 +354,7 @@ final class ProfilePickerToolsController: ObservableObject {
         }
     }
 
-    private static let providerSettlementMessage = "This backup includes media-server or IPTV data whose complete local recovery cannot yet be verified by this version. Its encrypted recovery copy remains pending and has been kept. Normal profile recovery can continue; this tool will not report the whole backup as loaded."
+    private static let providerSettlementMessage = "This backup’s media-server or IPTV data is still awaiting verified local recovery. After server verification, use Finish loading backup to retry. The encrypted recovery copy has been kept; loading is confirmed only after the local stores finish successfully."
     private static let pendingRestoreMessage = "The backup has not yet been confirmed as loaded on this device. Local changes or account work may still be pending, or the stored backup may have changed. The original encrypted recovery copy is retained. This action does not upload it again."
     private func reportLocalRestore(_ result: ProfilePickerToolsRestoreAction.LocalOutcome,
                                     originalID: UUID, operation captured: Operation) {

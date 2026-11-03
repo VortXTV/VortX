@@ -1192,6 +1192,7 @@ actor SIMKLAuth {
     private func clearCredentialsAndPublishBoundary(
         ownerCapture capture: CredentialScopeRegistry.Capture,
         explicitNativeDisconnect: Bool = false,
+        sourceAuthority: (any VortxMutationAuthority)? = nil,
         mutationGuard: ((() -> Bool) -> Bool)? = nil
     ) async -> Bool {
         let resolvedNamespace = capture.namespace
@@ -1216,7 +1217,17 @@ actor SIMKLAuth {
             recoveryRead: self.credentials.recoveryRead,
             write: self.credentials.write)
         }
-        guard mutationGuard.map({ $0(mutate) }) ?? mutate() else { return false }
+        let clear = { mutationGuard.map({ $0(mutate) }) ?? mutate() }
+        var cleared = false
+        do {
+            // The turnstile and publication boundary may both suspend. Admit the exact
+            // register-checked clear and its notification only from a still-current source.
+            if let sourceAuthority { try sourceAuthority.withActive { cleared = clear() } }
+            else { cleared = clear() }
+        } catch { return false }
+        guard cleared else { return false }
+        // The credential publication boundary is still held. Deliver the committed clear
+        // without the source or provider-store lock across synchronous observers.
         SIMKLAuthBoundary.publish(nil)
         if let nativeIntent {
             return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
@@ -1234,13 +1245,17 @@ actor SIMKLAuth {
         case .failure: return false
         }
     }
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool {
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture,
+        events: [String: VortxNativeProviderCredentials.Register],
+        sourceAuthority: (any VortxMutationAuthority)? = nil) async -> Bool {
         guard ownerCapture() == capture else { return false }
+        do { try sourceAuthority?.withActive {} } catch { return false }
         let generation = nativeCredentialGeneration
         let session = currentSessionID(ownerNamespace: capture.namespace)
         return await performCredentialBoundary {
             guard ownerCapture() == capture else { return false }
-            return await clearCredentialsAndPublishBoundary(ownerCapture: capture, mutationGuard: { mutate in
+            do { try sourceAuthority?.withActive {} } catch { return false }
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture, sourceAuthority: sourceAuthority, mutationGuard: { mutate in
                 guard self.nativeCredentialGeneration == generation,
                       self.currentSessionID(ownerNamespace: capture.namespace) == session else { return false }
                 return VortXSyncManager.withNativeProviderEvents(events, capture: capture, mutation: mutate)

@@ -159,6 +159,7 @@ enum ApiKeySlots {
     static func fanart(_ scope: CredentialScopeRegistry.Scope) -> String { "inert.fanart" }
 }
 enum SettingsBackup {
+    static func decodeDomain(from: Data) throws -> [String: Any] { fatalError("legacy settings coverage was entered") }
     static func restore(from: Data, skipping: Set<String>, excluding: Set<String>) throws -> Int { fatalError("legacy settings were entered") }
     static func appliedKeys(from: Data, excluding: Set<String>) -> Set<String> { [] }
     static func reloadLiveStores() { fatalError("legacy stores were entered") }
@@ -170,13 +171,31 @@ enum AddonTombstones {
 }
 enum LastStreamStore { static func invalidateCache() {} }
 enum SearchHistoryStore { static func merge(_ terms: [String], for profileID: UUID?) { fatalError("search history was entered") } }
-struct MediaServerStore { static let shared = Self(); func applySyncBlob(_ blob: String) { fatalError("media server apply was entered") } }
-struct IPTVPlaylistStore { static let shared = Self(); func applySyncBlob(_ blob: String) { fatalError("IPTV apply was entered") } }
+struct MediaServerStore {
+    static let shared = Self()
+    struct SyncSettlementReceipt {
+        func matches(source: String, operationID: UUID) -> Bool { fatalError("unexpected provider receipt in no-provider fixture") }
+    }
+    enum SyncSettlement { case settled(SyncSettlementReceipt), refused }
+    func applySyncBlobSettled(_ blob: String, operationID: UUID, isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        fatalError("unexpected checked provider apply in no-provider fixture")
+    }
+}
+struct IPTVPlaylistStore {
+    static let shared = Self()
+    struct SyncSettlementReceipt {
+        func matches(source: String, operationID: UUID) -> Bool { fatalError("unexpected provider receipt in no-provider fixture") }
+    }
+    enum SyncSettlement { case settled(SyncSettlementReceipt), refused }
+    func applySyncBlobSettled(_ blob: String, operationID: UUID, isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        fatalError("unexpected checked provider apply in no-provider fixture")
+    }
+}
 struct TraktSessionID: Hashable, Sendable { let rawValue: String }
 struct SIMKLSessionID: Hashable, Sendable { let rawValue: String }
 struct TraktAuth {
     static let shared = Self(); static let storedSessionID: TraktSessionID? = nil; static let isConfigured = false
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool { fatalError("Trakt clear was entered") }
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register], sourceAuthority: (any VortxMutationAuthority)? = nil) async -> Bool { fatalError("Trakt clear was entered") }
     @MainActor func adoptTokens(access: String, refresh: String, expiryUnix: Int,
         ownerCapture: CredentialScopeRegistry.Capture? = nil,
         mutationGuard: (@Sendable (() -> Bool) -> Bool)? = nil) async -> CredentialMutationResult {
@@ -185,7 +204,7 @@ struct TraktAuth {
 }
 struct SIMKLAuth {
     static let shared = Self(); static let storedSessionID: SIMKLSessionID? = nil; static let isConfigured = false
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool { fatalError("SIMKL clear was entered") }
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register], sourceAuthority: (any VortxMutationAuthority)? = nil) async -> Bool { fatalError("SIMKL clear was entered") }
     @MainActor func adoptTokens(access: String, expiryUnix: Int,
         ownerCapture: CredentialScopeRegistry.Capture? = nil,
         mutationGuard: (@Sendable (() -> Bool) -> Bool)? = nil) async -> CredentialMutationResult {
@@ -237,7 +256,7 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
     enum ConflictResolutionOutcome: String { case completed, pending, failed }
     init(directory: URL, baseURL: URL) { self.directory = directory; self.baseURL = baseURL; Self.shared = self }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
-    func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { pendingApplyFixture }
+    func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { pendingApplyFixture || hasPendingReceivedProviderApply(for: capture) }
     func withRemoteApplySuppressed(_ body: () -> Void) { body() }
     func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool { isCurrent(capture) }
     func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
@@ -272,20 +291,20 @@ final class TraktNextEpisodeConsumer<Owner: Hashable & Sendable>: Sendable {}
     func persistLastSyncedVersion() {}
     static let writeSyncDocV2 = true
     func stampSyncSuccess() { stamped += 1 }
-    func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture) async -> Bool { CoreBridge.shared.hasCertifiedNativeSession(capture: credentialCapture, profileID: ProfileStore.shared.activeID) }
+    private func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture, cloudRead: ReceivedProviderCloudAuthority? = nil) async -> Bool { CoreBridge.shared.hasCertifiedNativeSession(capture: credentialCapture, profileID: ProfileStore.shared.activeID) }
     // The ordinary receive schedules install their real fixture session before pulling.
     // The app's cold typed mount and typed mutation authority are outside this fixture.
     private func restoreOwnerHistoryPulledIfNeeded(_ pulled: VersionedPull,
-        capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID) async throws -> Bool? {
+        capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> Bool? {
         throw VortxNativeError.unavailable
     }
-    private func mountOwnerHistoryPulled(plaintext: Data, observation: UUID,
-        capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID) async throws {
+    private func mountOwnerHistoryPulled(plaintext: Data, version: Int, observation: UUID,
+        capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID, cloudAuthority: ReceivedProviderCloudAuthority) async throws {
         throw VortxNativeError.unavailable
     }
     private func commitOwnerHistoryPulled(plaintext: Data, version: Int, observation: UUID,
-        capture: CredentialScopeRegistry.Capture, hostEdits: [VortxNativeHostPreferences.Edit] = [])
-        async throws -> OwnerHistoryMergedAccount {
+        capture: CredentialScopeRegistry.Capture, hostEdits: [VortxNativeHostPreferences.Edit] = [],
+        cloudAuthority: ReceivedProviderCloudAuthority) async throws -> OwnerHistoryMergedAccount {
         throw VortxNativeError.unavailable
     }
     struct Roster { let profiles: [UserProfile]; let modified: Double? }

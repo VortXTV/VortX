@@ -22,7 +22,8 @@ function extract(root, directory) {
     select(shared + 'VortxResourceBridge.swift', 'indirect enum VortxJSON: Codable, Equatable, Sendable {') +
     select(shared + 'Keychain.swift', 'final class KeychainFailureClosedStore: @unchecked Sendable {') +
     select(shared + 'MediaServerProvider.swift', 'enum MediaServerKind: String, Sendable, CaseIterable {') +
-    select(shared + 'MediaServerProvider.swift', 'struct MediaServerConfig: Sendable, Equatable {');
+    select(shared + 'MediaServerProvider.swift', 'struct MediaServerConfig: Sendable, Equatable {') +
+    '\nextension VortXSyncManager {\n' + select(shared + 'VortXSyncManager.swift', '    static func receivedProviderSettingsExclusions(') + '}\n';
   const generatedPath = path.join(directory, 'ActualProviderSupport.swift'); fs.writeFileSync(generatedPath, generated, {flag: 'wx'});
   const whole = [shared + 'OwnerHistoryExactJSON.swift', shared + 'AccountProviderSyncBlob.swift',
     shared + 'MediaServerStore.swift', shared + 'IPTVPlaylistStore.swift', 'app/Tests/AccountProviderSyncSettlementTests.swift'];

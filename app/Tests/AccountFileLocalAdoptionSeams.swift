@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CryptoKit
 import Darwin
 
@@ -18,15 +19,29 @@ import Darwin
     var response = Response.document
     var gets = 0, commits = 0, publications = 0, stamps = 0, mediaApplies = 0, iptvApplies = 0
     var failNative = false, failProvider = false, failMount = false, causalRepublish = false
-    var providerPlan = true
+    var nestedCheckpoint = false, localCheckpointAvailable = false
+    var checkpointPlaintext: Data?, checkpointRevision: Int?, checkpointTyped = false
+    var checkpointGets = 0, checkpointEffects = 0, localReopens = 0
+    var providerPlan = true, failJournal = false
+    var settingsDomain: [String: Any] = [:]
+    var settingsEffects = 0, settingsReloads = 0, puts = 0
+    var lastSettingsExclusions = Set<String>()
+    var suppressionDepth = 0
+    var failMedia = false, failIPTV = false, wrongProviderReceipt = false, wrongProviderOperation = false
+    var mirrorProviderOverride: String?
+    var allowedProviderSources = Set<Data>()
+    var mediaSources: [Data] = [], iptvSources: [Data] = []
+    var mediaOperations: [UUID] = [], iptvOperations: [UUID] = []
     var callback: (@MainActor (String) -> Void)?
     var paused: String?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
     private var observers: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var visited = Set<String>()
+    var boundaryCounts: [String: Int] = [:]
     func visit(_ name: String) async {
         await Task.yield()
         visited.insert(name)
+        boundaryCounts[name, default: 0] += 1
         observers.removeValue(forKey: name)?.forEach { $0.resume() }
         callback?(name)
         if paused == name { await withCheckedContinuation { releaseContinuation = $0 } }
@@ -105,26 +120,75 @@ enum ApiKeySlots {
     }
 }
 enum SettingsBackup {
-    static func restore(from: Data, skipping: Set<String>, excluding: Set<String>) throws -> Int { 0 }
-    static func appliedKeys(from: Data, excluding: Set<String>) -> Set<String> { [] }
-    static func reloadLiveStores() {}
+    static let schema = 1, formatTag = "vortx-backup"
+    // Declared pure fixture policy: all authored keys are syncable and already migrated. Actual
+    // serialization/applied-key methods are inserted unchanged. No UserDefaults is accessed.
+    static func isSyncable(_ key: String) -> Bool { true }
+    static func migratedKey(_ key: String) -> String { key }
+    // @@ACTUAL_SETTINGS_PURE@@
+    @MainActor static func restore(from: Data, skipping: Set<String>, excluding: Set<String>) throws -> Int {
+        let w = AdoptionWorld.current
+        w.lastSettingsExclusions = excluding
+        var count = 0
+        for (key, value) in try decodeDomain(from: from) where !skipping.contains(key) && !excluding.contains(key) {
+            w.settingsDomain[key] = value; w.settingsEffects += 1; count += 1
+        }
+        return count
+    }
+    @MainActor static func reloadLiveStores() { AdoptionWorld.current.settingsReloads += 1 }
 }
 enum ProfileDiscoveryPreferencesStore { static let activeProjectionKeys = Set<String>() }
 enum AddonTombstones { static func preservingLocalSyncStamps<T>(_ body: () throws -> T) rethrows -> T { try body() } }
 enum LastStreamStore { static func invalidateCache() {} }
 enum SearchHistoryStore { static func merge(_ terms: [String], for profileID: UUID?) {} }
-@MainActor struct MediaServerStore { static let shared = Self(); func applySyncBlob(_ blob: String) { AdoptionWorld.current.mediaApplies += 1 } }
-@MainActor struct IPTVPlaylistStore { static let shared = Self(); func applySyncBlob(_ blob: String) { AdoptionWorld.current.iptvApplies += 1 } }
+// These apply methods are explicitly SYNTHETIC store boundaries. Their receipt types below are
+// selected unchanged from production, but only the separate actual-store suite proves store IO.
+@MainActor struct MediaServerStore {
+    static let shared = Self()
+    // @@ACTUAL_MEDIA_RECEIPT_TYPES@@
+    func applySyncBlobSettled(_ blob: String, operationID: UUID, isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        let w = AdoptionWorld.current
+        precondition(w.suppressionDepth > 0 && w.commits > 0, "media must settle under suppression after actual commit boundary")
+        w.callback?("media.before")
+        guard isCurrent() else { return .refused(.superseded) }
+        w.mediaApplies += 1; w.mediaSources.append(Data(blob.utf8)); w.mediaOperations.append(operationID)
+        guard w.allowedProviderSources.contains(Data(blob.utf8)), !w.failMedia else { return .refused(.persistenceUnverified) }
+        let receipt = SyncSettlementReceipt(source: w.wrongProviderReceipt ? blob + " " : blob,
+            operationID: w.wrongProviderOperation ? UUID() : operationID)
+        w.callback?("media.after")
+        return .settled(receipt)
+    }
+}
+@MainActor struct IPTVPlaylistStore {
+    static let shared = Self()
+    // @@ACTUAL_IPTV_RECEIPT_TYPES@@
+    func applySyncBlobSettled(_ blob: String, operationID: UUID, isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        let w = AdoptionWorld.current
+        precondition(w.suppressionDepth > 0 && w.commits > 0, "IPTV must settle under suppression after actual commit boundary")
+        w.callback?("iptv.before")
+        guard isCurrent() else { return .refused(.superseded) }
+        w.iptvApplies += 1; w.iptvSources.append(Data(blob.utf8)); w.iptvOperations.append(operationID)
+        guard w.allowedProviderSources.contains(Data(blob.utf8)), !w.failIPTV else { return .refused(.persistenceUnverified) }
+        let receipt = SyncSettlementReceipt(source: w.wrongProviderReceipt ? blob + " " : blob,
+            operationID: w.wrongProviderOperation ? UUID() : operationID)
+        w.callback?("iptv.after")
+        return .settled(receipt)
+    }
+}
+struct RefusingCloudParentAuthority: VortxMutationAuthority {
+    func withActive(_ operation: () throws -> Void) throws { throw VortxNativeError.superseded }
+}
+@MainActor final class AdoptionReceiveTaskBox { var task: Task<Bool, Never>? }
 enum CredentialMutationResult { case success, rejected }
 @MainActor struct TraktAuth {
     static let shared = Self()
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool { true }
-    func adoptTokens(access: String, refresh: String, expiryUnix: Int, ownerCapture: CredentialScopeRegistry.Capture, mutationGuard: (@MainActor () -> Void) -> Bool) async -> CredentialMutationResult { .success }
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register], sourceAuthority: (any VortxMutationAuthority)? = nil) async -> Bool { true }
+    func adoptTokens(access: String, refresh: String, expiryUnix: Int, ownerCapture: CredentialScopeRegistry.Capture? = nil, mutationGuard: (@Sendable (() -> Bool) -> Bool)? = nil) async -> CredentialMutationResult { .success }
 }
 @MainActor struct SIMKLAuth {
     static let shared = Self()
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool { true }
-    func adoptTokens(access: String, expiryUnix: Int, ownerCapture: CredentialScopeRegistry.Capture, mutationGuard: (@MainActor () -> Void) -> Bool) async -> CredentialMutationResult { .success }
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register], sourceAuthority: (any VortxMutationAuthority)? = nil) async -> Bool { true }
+    func adoptTokens(access: String, expiryUnix: Int, ownerCapture: CredentialScopeRegistry.Capture? = nil, mutationGuard: (@Sendable (() -> Bool) -> Bool)? = nil) async -> CredentialMutationResult { .success }
 }
 struct CredentialProviderRetryOutcome {
     let firstCompleted: Bool, secondCompleted: Bool, superseded: Bool
@@ -142,17 +206,28 @@ struct CredentialProviderRetryOutcome {
     }
 }
 enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} }
-enum SyncBackupUploadFailure { case upgradeRequired }
+enum SyncBackupUploadFailure { case upgradeRequired, other
+    static func classify(status: Int, serverCode: String?) -> Self { .other }
+    var diagnosticCode: String { "synthetic" }
+}
 @MainActor struct OwnerHistoryRawAccountPreparationWorker {
     static let shared = Self()
-    func peerHostProjection(_ data: Data) async throws -> Data { data }
+    func peerHostProjection(_ data: Data) async throws -> Data { await AdoptionWorld.current.visit("typed.projection"); return data }
 }
 
 @MainActor final class VortXSyncManager {
     struct Account { let id: String }
-    var account: Account? = .init(id: AdoptionWorld.account)
-    var dataKey: Data? = AdoptionWorld.key
-    var isSignedIn = true, hasAppliedAccountDoc = false, hasPendingPush = false
+    // Declared owner-mutation collaborators mirror the actual property observer invalidations.
+    var account: Account? = .init(id: AdoptionWorld.account) {
+        willSet { if account?.id != newValue?.id { receivedProviderCloudEpoch.observe() } }
+    }
+    var dataKey: Data? = AdoptionWorld.key {
+        willSet { if dataKey != newValue { receivedProviderCloudEpoch.observe() } }
+    }
+    var isSignedIn = true {
+        willSet { if isSignedIn != newValue { receivedProviderCloudEpoch.observe() } }
+    }
+    var hasAppliedAccountDoc = false, hasPendingPush = false
     var accountFileRestoreBusy = false
     var accountFileRepairOperation: UUID?
     var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
@@ -170,10 +245,12 @@ enum SyncBackupUploadFailure { case upgradeRequired }
     enum ConflictResolutionOutcome { case completed, pending, failed }
     private func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
     private func accountReconnectRequired(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
-    private func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool {
-        pendingDebridApply?.capture == capture || pendingProviderApply?.capture == capture
+    // Actual pending admission methods are selected with the actual receive below.
+    private func withRemoteApplySuppressed(_ body: () -> Void) {
+        AdoptionWorld.current.suppressionDepth += 1
+        defer { AdoptionWorld.current.suppressionDepth -= 1 }
+        body()
     }
-    private func withRemoteApplySuppressed(_ body: () -> Void) { body() }
     private func pullDocVersionedRetrying(credentialCapture: CredentialScopeRegistry.Capture, ifNoneMatch: Int?) async -> VersionedPull {
         let w = AdoptionWorld.current; w.gets += 1
         let plain = w.plaintext, revision = w.revision, observation = w.observation
@@ -186,20 +263,28 @@ enum SyncBackupUploadFailure { case upgradeRequired }
         case .ownerHistory: return .ownerHistory(plaintext: plain, version: revision, observation: observation ?? UUID())
         }
     }
-    private func restoreOwnerHistoryPulledIfNeeded(_ received: VersionedPull, capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UInt64) async throws -> Bool { false }
-    private func mountOwnerHistoryPulled(plaintext: Data, observation: UUID, capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UInt64) async throws { throw VortxNativeError.unavailable }
-    private func commitOwnerHistoryPulled(plaintext: Data, version: Int, observation: UUID, capture: CredentialScopeRegistry.Capture) async throws -> (document: [String: Any], target: PlaybackMutationTarget, read: UUID) { throw VortxNativeError.unavailable }
+    private func restoreOwnerHistoryPulledIfNeeded(_ received: VersionedPull, capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UInt64, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> Bool { await AdoptionWorld.current.visit("cold.restore"); return false }
+    private func mountOwnerHistoryPulled(plaintext: Data, version: Int, observation: UUID, capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UInt64, cloudAuthority: ReceivedProviderCloudAuthority) async throws { throw VortxNativeError.unavailable }
+    private func commitOwnerHistoryPulled(plaintext: Data, version: Int, observation: UUID, capture: CredentialScopeRegistry.Capture, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> (document: [String: Any], target: PlaybackMutationTarget, read: UUID) { throw VortxNativeError.unavailable }
     private static func decodeDecryptedSyncDocument(_ data: Data) throws -> [String: Any] { try JSONSerialization.jsonObject(with: data) as! [String: Any] }
-    private func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool { await AdoptionWorld.current.visit("provider.journal"); return isCurrent(capture) }
+    private func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool { await AdoptionWorld.current.visit("provider.journal"); return isCurrent(capture) && !AdoptionWorld.current.failJournal }
     private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { .init() }
     private func mergedNativeProviderState(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { .init() }
     private func persistMergedNativeProviders(_ providers: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { providers }
-    private func mirrorNativeProviderKeys(_ providers: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] { original as? [String: Any] ?? [:] }
-    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, capture: CredentialScopeRegistry.Capture) async throws -> PlaybackMutationTarget {
+    private func mirrorNativeProviderKeys(_ providers: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] {
+        var mirrored = original as? [String: Any] ?? [:]
+        if let replacement = AdoptionWorld.current.mirrorProviderOverride {
+            mirrored["vortx.mediaServers"] = replacement; mirrored["vortx.iptv"] = replacement
+        }
+        return mirrored
+    }
+    private func commitNativePulledDocument(_ doc: [String: Any], originalPlaintext: Data, capture: CredentialScopeRegistry.Capture,
+        cloudAuthority: ReceivedProviderCloudAuthority) async throws -> PlaybackMutationTarget {
+        try cloudAuthority.withActive {}
         let originalTarget = CoreBridge.shared.captureNativePlaybackTarget()
         await AdoptionWorld.current.visit("native.commit")
         guard !AdoptionWorld.current.failNative else { throw VortxNativeError.unavailable }
-        AdoptionWorld.current.commits += 1
+        try cloudAuthority.withActive { AdoptionWorld.current.commits += 1 }
         return originalTarget // SYNTHETIC native receipt: real C ABI transaction is a separate gate.
     }
     private func nativeMutationDidCommit(credentialCapture: CredentialScopeRegistry.Capture) { hasPendingPush = true }
@@ -207,12 +292,33 @@ enum SyncBackupUploadFailure { case upgradeRequired }
     private func providerApplyIntent(keys: [String: String]?, capture: CredentialScopeRegistry.Capture, version: Int) -> PendingProviderApply? {
         AdoptionWorld.current.providerPlan ? .init(capture: capture, version: version, values: [.trakt: .trakt(access: "fixture", refresh: "fixture", expiryUnix: 1)], failedServices: []) : nil
     }
-    private static func withNativeProviderSnapshot(_ snapshot: VortxNativeProviderCredentials.Document, capture: CredentialScopeRegistry.Capture, mutation: @MainActor () -> Void) -> Bool { mutation(); return true }
+    nonisolated private static func withNativeProviderSnapshot(_ snapshot: VortxNativeProviderCredentials.Document, capture: CredentialScopeRegistry.Capture, mutation: () -> Bool) -> Bool { mutation() }
     private func waitForProviderRemoteApplyRetry(capture: CredentialScopeRegistry.Capture) async -> Bool { false }
-    private func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
-        await AdoptionWorld.current.visit("mount")
-        guard !AdoptionWorld.current.failMount else { return false }
-        CoreBridge.shared.hasNativeSession = true
+    private func pullDocVersionedResult(credentialCapture: CredentialScopeRegistry.Capture) async -> VersionedPull {
+        let w = AdoptionWorld.current; w.checkpointGets += 1
+        let bytes = w.checkpointPlaintext ?? w.plaintext, revision = w.checkpointRevision ?? w.revision
+        await w.visit("checkpoint.GET") // Declared second transport collaborator, not a source replay.
+        if w.checkpointTyped { return .ownerHistory(plaintext: bytes, version: revision, observation: UUID()) }
+        return .doc(doc: (try? JSONSerialization.jsonObject(with: bytes) as? [String: Any]) ?? [:],
+                    version: revision, plaintext: bytes, observation: UUID())
+    }
+    private func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture, cloudRead: ReceivedProviderCloudAuthority? = nil) async -> Bool {
+        let w = AdoptionWorld.current
+        await w.visit("mount")
+        guard !w.failMount else { return false }
+        if w.localCheckpointAvailable {
+            w.localReopens += 1; CoreBridge.shared.hasNativeSession = true
+            return isCurrent(credentialCapture)
+        }
+        if w.nestedCheckpoint {
+            // The real production fallback GET + source admission method is inserted unchanged.
+            // Checkpoint creation here is explicit synthetic IO; real kernel proof is separate.
+            let candidate = await pullNativeCheckpointCloudSource(capture: credentialCapture, authority: cloudRead)
+            guard let authority = candidate.authority else { return false }
+            await w.visit("checkpoint.before_commit")
+            do { try authority.withActive { w.checkpointEffects += 1; CoreBridge.shared.hasNativeSession = true } }
+            catch { return false }
+        } else { CoreBridge.shared.hasNativeSession = true }
         return isCurrent(credentialCapture)
     }
     private func persistLastSyncedVersion() {}
@@ -220,9 +326,63 @@ enum SyncBackupUploadFailure { case upgradeRequired }
     private static func ownedAddons(from doc: [String: Any]) -> [String] { [] }
     private struct Roster { let profiles: [String]; let modified: Double? }
     private static func resolveRoster(from doc: [String: Any]) -> Roster? { nil }
+    // These are unreachable collaborators for the actual push sender preflight negative control.
+    // Reaching transport is counted; a test fails if a pending source permits any PUT.
+    static let writeSyncDocV2 = true
+    private func request(_ method: String, _ path: String, body: [String: Any], auth: Bool,
+        credentialCapture: CredentialScopeRegistry.Capture) async -> (Int, [String: Any]?) {
+        AdoptionWorld.current.puts += 1; return (500, nil)
+    }
+    private func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool { preconditionFailure("push acknowledgment entered") }
+    private func acknowledgeNativeProviders(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws { preconditionFailure("push acknowledgment entered") }
+    private static func markSawDocV2(_ account: String) { preconditionFailure("push stamp entered") }
+    private static func documentVersion(_ value: Any?) -> Int? { preconditionFailure("push rejection entered") }
     // @@ACTUAL_LOCAL_ADOPTION_MANAGER@@
     // Read-only fixture probes. These do not fabricate a witness or invoke its initializer.
+    func fixtureBoundCloudAuthority(plaintext: Data, revision: Int) throws -> any VortxMutationAuthority {
+        try fixtureBoundCloudRead(plaintext: plaintext, revision: revision)
+    }
+    private func fixtureBoundCloudRead(plaintext: Data, revision: Int) throws -> ReceivedProviderCloudAuthority {
+        let read = try captureReceivedProviderCloudAuthority(credentialAuthority.capture())
+        return try requireReceivedProviderCloudSource(.doc(doc: [:], version: revision,
+            plaintext: plaintext, observation: UUID()), authority: read)
+    }
+    func fixtureCaptureCloudAuthority(plaintext: Data, revision: Int) throws -> () throws -> Void {
+        let authority = try fixtureBoundCloudRead(plaintext: plaintext, revision: revision)
+        return { try authority.withActive {} }
+    }
+    func fixtureCloudParentIsRetained(plaintext: Data, revision: Int) -> Bool {
+        guard let authority = try? fixtureBoundCloudRead(plaintext: plaintext, revision: revision) else { return false }
+        return (try? authority.including(RefusingCloudParentAuthority()).withActive {}) == nil
+    }
+    func fixtureCloudCheckpointRead() async -> Bool {
+        let read = try? captureReceivedProviderCloudAuthority(credentialAuthority.capture())
+        let candidate = await pullNativeCheckpointCloudSource(capture: credentialAuthority.capture(), authority: read)
+        guard let authority = candidate.authority else { return false }
+        await AdoptionWorld.current.visit("checkpoint.before_commit")
+        do { try authority.withActive { AdoptionWorld.current.checkpointEffects += 1 }; return true }
+        catch { return false }
+    }
+    func fixtureHighestProviderSource() -> Data? { pendingReceivedProviderApply?.highest.plaintext }
+    func fixtureReservedProviderRevision() -> Int? { pendingReceivedProviderApply?.highest.revision }
+    func fixturePushIsBlocked() async -> Bool {
+        if case .error = await pushSyncDocAt([:], version: lastSyncedVersion + 1, baseRevision: lastSyncedVersion) { return true }
+        return false
+    }
     func fixtureHasCachedReceipt() -> Bool { nativeReceiveReceipt != nil }
+    func fixtureHasPendingApply() -> Bool { hasPendingAccountDocApply(for: credentialAuthority.capture()) }
+    func fixtureHasReceivedPending(for capture: CredentialScopeRegistry.Capture) -> Bool {
+        hasPendingReceivedProviderApply(for: capture)
+    }
+    func fixtureUnrelatedPendingSnapshot() -> @MainActor () -> Bool {
+        let debrid = pendingDebridApply, provider = pendingProviderApply
+        return { (debrid != nil || provider != nil)
+            && self.pendingDebridApply == debrid && self.pendingProviderApply == provider }
+    }
+    func fixtureFailedProviderSource(_ name: String, latest: Bool = false) -> Data? {
+        guard let source = pendingReceivedProviderApply?.carriers[name] else { return nil }
+        return latest ? source.latest.plaintext : source.first.plaintext
+    }
 
 }
 
@@ -256,6 +416,19 @@ extension VortxAccountFileRestoreJournal {
         CoreBridge.shared.session = UUID(); CoreBridge.shared.accountGeneration = UUID()
         CoreBridge.shared.registryGeneration = UUID(); CoreBridge.shared.wrongScope = false; CoreBridge.shared.wrongOwner = false
         return VortXSyncManager()
+    }
+    static let mediaBlob = #"{ "v":1,"servers":[{"id":"30000000-0000-0000-0000-000000000001","kind":"jellyfin","name":"Exact","urls":["https://synthetic.invalid"],"addedAt":1000,"token":"synthetic-token"}],"removed":{},"unknown":1.00 }"#
+    static let iptvBlob = #"{ "v":1,"playlists":[{"id":"synthetic","kind":"m3u","name":"Exact","transportUrl":"https://synthetic.invalid/list","createdAt":1000}],"removed":{},"unknown":"e\u0301" }"#
+    static func providerDocument(media: String? = nil, iptv: String? = nil, settings: [String: Any]? = nil) throws -> Data {
+        var keys: [String: Any] = ["metadata": ["unknown": true]]
+        if let media { keys["vortx.mediaServers"] = media }
+        if let iptv { keys["vortx.iptv"] = iptv }
+        var doc: [String: Any] = ["nativeSync": ["schemaVersion": 5], "nativeHostPreferences": [:], "apiKeys": keys]
+        if let settings { doc["settings"] = try SettingsBackup.encode(domain: settings, bundleID: "fixture", app: "fixture", now: Date(timeIntervalSince1970: 0)).base64EncodedString() }
+        return try JSONSerialization.data(withJSONObject: doc, options: [.sortedKeys])
+    }
+    static func admitProviderFixtures() {
+        AdoptionWorld.current.allowedProviderSources = [Data(mediaBlob.utf8), Data(iptvBlob.utf8)]
     }
     static func retain(operationID: UUID = UUID(), verdict: VortxAccountFileRestore.Verdict = .serverConfirmed) async throws -> VortxAccountFileRestore.Intent {
         let w = AdoptionWorld.current, capture = CredentialScopeRegistry.shared.capture()
@@ -480,13 +653,495 @@ extension VortxAccountFileRestoreJournal {
             _ = await manager.syncDown(routineReceive: failure != "warm")
             check(try await pending(original.operationID), "\(failure) never substitutes for exact full successful source")
         }
+        // Whole production composition; store application is an explicitly synthetic boundary.
+        // Actual read/CAS/defaults/coordinator algorithms remain in the separate store gate.
+        // F1: an admitted original source owns the pending barrier before every early return,
+        // even when the ordinary OAuth plan is empty and the account is already opened.
+        for failure in ["journal", "native", "target"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            manager.hasAppliedAccountDoc = true; w.providerPlan = false
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            let original = try await retain(), exact = w.plaintext
+            if failure == "journal" { w.failJournal = true }
+            if failure == "native" { w.failNative = true }
+            if failure == "target" { w.callback = { if $0 == "native.commit" { CoreBridge.shared.accountGeneration = UUID() } } }
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && manager.fixtureHighestProviderSource() == exact
+                && manager.fixtureFailedProviderSource("vortx.mediaServers") == exact,
+                "early \(failure) keeps original source reservation before checked stores")
+            check(w.mediaApplies == 0 && w.stamps == 0 && manager.lastSyncedVersion == 24,
+                "early \(failure) creates no provider receipt or receive floor")
+            w.failJournal = false; w.failNative = false; w.callback = nil
+            w.revision += 1; w.plaintext = try providerDocument()
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && manager.fixtureFailedProviderSource("vortx.mediaServers") == exact,
+                "omission after early \(failure) conserves failed source")
+            check(await manager.fixturePushIsBlocked() && w.puts == 0,
+                "actual push sender preflight rejects omission after early \(failure)")
+            check(try await pending(original.operationID), "early \(failure) cannot retire original file intent")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            let exact = w.plaintext; w.paused = "cold.restore"
+            let receive = Task { await manager.syncDown(routineReceive: true) }
+            await w.wait("cold.restore")
+            check(manager.fixtureHighestProviderSource() == exact && manager.fixtureHasPendingApply(),
+                "source reservation precedes first cold restoration suspension")
+            receive.cancel(); w.release(); _ = await receive.value
+            check(manager.fixtureHasPendingApply() && w.mediaApplies == 0 && w.stamps == 0,
+                "cancelled cold restoration retains source without provider completion")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            manager.hasAppliedAccountDoc = true; manager.lastSyncedVersion = 25
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            _ = await manager.syncDown(routineReceive: false)
+            check(!manager.fixtureHasPendingApply() && w.commits == 0 && w.mediaApplies == 0,
+                "equal warm hydration never reserves a new provider receive or forces later adoption")
+            w.revision = 24; CoreBridge.shared.hasNativeSession = false
+            _ = await manager.syncDown(routineReceive: true)
+            check(!manager.fixtureHasPendingApply() && w.commits == 0 && w.mediaApplies == 0,
+                "stale authenticated source is rejected before cold restore or reservation")
+        }
+        // F2: successful siblings stay behind the entire response's causality barrier.
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            manager.hasAppliedAccountDoc = true; manager.lastSyncedVersion = 9
+            w.providerPlan = false; w.revision = 11; w.failIPTV = true
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+            let original = try await retain(), exact = w.plaintext
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.mediaApplies == 1 && w.iptvApplies == 1 && manager.fixtureReservedProviderRevision() == 11
+                && manager.fixtureHasPendingApply() && manager.lastSyncedVersion == 9,
+                "partial rev11 settlement retains whole response above durable floor9")
+            let commits = w.commits, effects = w.settingsEffects
+            let changedMedia = mediaBlob.replacingOccurrences(of: "Exact", with: "Contradictory")
+            w.allowedProviderSources.insert(Data(changedMedia.utf8))
+            for revision in [10, 11] {
+                w.revision = revision; w.plaintext = try providerDocument(media: changedMedia)
+                _ = await manager.syncDown(routineReceive: true)
+                check(w.commits == commits && w.settingsEffects == effects && w.mediaApplies == 1 && w.iptvApplies == 1,
+                    "rev\(revision) sibling rollback is refused before native host and provider effects")
+                check(manager.fixtureHighestProviderSource() == exact && manager.fixtureReservedProviderRevision() == 11,
+                    "rev\(revision) contradiction cannot replace retained full-source causality")
+            }
+            w.revision = 11; w.plaintext = exact; w.failIPTV = false
+            _ = await manager.syncDown(routineReceive: true)
+            let remainsPending = try await pending(original.operationID)
+            check(!manager.fixtureHasPendingApply() && manager.lastSyncedVersion == 11
+                && !remainsPending, "exact same-source retry completes both stores and original file")
+        }
+        for shape in ["empty-list", "empty-map", "both", "nonempty", "malformed"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.providerPlan = false; w.failIPTV = true
+            w.settingsDomain["vortx.mediaServers.list"] = Data("retained local metadata".utf8)
+            w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+            _ = await manager.syncDown(routineReceive: true)
+            let calls = w.iptvApplies, commits = w.commits
+            w.revision += 1; w.failIPTV = false
+            var settings: [String: Any] = [:]
+            if shape == "empty-list" || shape == "both" { settings["vortx.mediaServers.list"] = Data("[]".utf8) }
+            if shape == "empty-map" || shape == "both" { settings["vortx.mediaServers.removed"] = [String: Double]() }
+            if shape == "nonempty" { settings["vortx.mediaServers.removed"] = ["30000000-0000-0000-0000-000000000001": 2000.0] }
+            if shape == "malformed" { settings["vortx.mediaServers.list"] = Data("{}".utf8) }
+            w.plaintext = try providerDocument(iptv: iptvBlob, settings: settings)
+            _ = await manager.syncDown(routineReceive: true)
+            if shape == "nonempty" || shape == "malformed" {
+                check(w.iptvApplies == calls && w.commits == commits && manager.fixtureHasPendingApply(),
+                    "omitted sibling \(shape) metadata remains uncovered before effects")
+            } else {
+                check(w.iptvApplies == calls + 1 && w.mediaApplies == 1 && !manager.fixtureHasPendingApply()
+                    && w.settingsDomain["vortx.mediaServers.list"] as? Data == Data("retained local metadata".utf8),
+                    "omitted settled sibling \(shape) permits present failed sibling retry and preserves local baseline")
+            }
+        }
+        // V4 original-read lifetime: temporary owner/key changes cannot be repaired by
+        // reminting a generation after an awaited collaborator returns.
+        for boundary in ["GET", "provider.journal", "native.commit", "provider.settlement", "typed.projection"] {
+            for change in ["key", "account", "signed-in"] {
+                let manager = try reset(), w = AdoptionWorld.current
+                admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+                if boundary == "typed.projection" { w.response = .ownerHistory }
+                let original = try await retain()
+                w.callback = { name in
+                    guard name == boundary else { return }
+                    if change == "key" { manager.dataKey = Data(repeating: 0x42, count: 32); manager.dataKey = AdoptionWorld.key }
+                    if change == "account" { manager.account = .init(id: "other"); manager.account = .init(id: AdoptionWorld.account) }
+                    if change == "signed-in" { manager.isSignedIn = false; manager.isSignedIn = true }
+                }
+                _ = await manager.syncDown(routineReceive: true)
+                check(w.boundaryCounts[boundary] == 1, "V4 \(change) ABA reaches actual \(boundary) receive boundary")
+                check(w.mediaApplies == 0 && w.iptvApplies == 0 && w.stamps == 0 && w.publications == 0,
+                    "original source revoked across \(boundary) prevents both carriers and completion for \(change) ABA")
+                check(try await pending(original.operationID), "\(boundary) \(change) ABA retains unresolved original intent")
+                if boundary == "typed.projection" {
+                    check(w.boundaryCounts["provider.journal"] == nil && w.commits == 0,
+                        "typed projection cannot reacquire current authority after \(change) ABA")
+                }
+            }
+        }
+        for boundary in ["media.before", "media.after", "iptv.before"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.providerPlan = false
+            w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+            let original = try await retain()
+            w.callback = { name in
+                guard name == boundary else { return }
+                manager.dataKey = Data(repeating: 0x42, count: 32); manager.dataKey = AdoptionWorld.key
+            }
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.mediaApplies == (boundary == "media.before" ? 0 : 1) && w.iptvApplies == 0,
+                "two-carrier source revocation at \(boundary) prevents later sibling effects")
+            check(w.stamps == 0 && w.publications == 0 && manager.lastSyncedVersion == 24,
+                "two-carrier revocation at \(boundary) cannot advance floor or full success")
+            check(try await pending(original.operationID), "two-carrier \(boundary) retains original journal intent")
+            check(manager.fixtureFailedProviderSource("vortx.mediaServers") == w.plaintext
+                && manager.fixtureFailedProviderSource("vortx.iptv") == w.plaintext,
+                "two-carrier \(boundary) retains both source reservations until a fresh owned receive")
+        }
+        for shape in ["lower", "same-contradiction", "newer", "exact-repeat"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false; w.nestedCheckpoint = true
+            let exact = w.plaintext
+            w.checkpointRevision = shape == "lower" ? 24 : (shape == "newer" ? 26 : 25)
+            w.checkpointPlaintext = shape == "same-contradiction" ? exact + Data(" ".utf8) : exact
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.checkpointGets == 1, "no-carrier \(shape) executes the nested GET")
+            check(w.checkpointEffects == (shape == "exact-repeat" ? 1 : 0),
+                "nested cloud source remains original even without a pending provider marker: \(shape)")
+        }
+        // The actual fallback GET+admission method is invoked inside the cold collaborator. Native
+        // construction remains declared synthetic; source assertions pin the real caller and commit edges.
+        for shape in ["lower", "same-contradiction", "newer", "exact-repeat"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            manager.lastSyncedVersion = 9; w.revision = 11
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false; w.nestedCheckpoint = true
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            let original = try await retain(), exact = w.plaintext
+            w.checkpointRevision = shape == "lower" ? 10 : (shape == "newer" ? 12 : 11)
+            w.checkpointPlaintext = shape == "same-contradiction" ? exact + Data(" ".utf8) : exact
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.checkpointGets == 1, "cold \(shape) exercises actual second-GET admission helper")
+            if shape == "exact-repeat" {
+                check(w.checkpointEffects == 1 && w.commits == 1 && w.mediaApplies == 1
+                    && !manager.fixtureHasPendingApply(), "fresh exact repeat stays admissible through original receive completion")
+                check(!(try await pending(original.operationID)), "fresh observation UUID does not invalidate same-source file coverage")
+            } else {
+                check(w.checkpointEffects == 0 && w.commits == 0 && w.settingsEffects == 0
+                    && w.mediaApplies == 0 && w.stamps == 0 && manager.lastSyncedVersion == 9,
+                    "nested \(shape) response has zero cloud checkpoint host or provider effects")
+                check(manager.fixtureHighestProviderSource() == exact && manager.fixtureHasPendingApply(),
+                    "auxiliary \(shape) response cannot promote or retire original pending source")
+            }
+        }
+        for typed in [false, true] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            _ = await manager.syncDown(routineReceive: true)
+            let exact = w.plaintext
+            w.checkpointTyped = typed; w.checkpointRevision = w.revision - 1; w.checkpointPlaintext = exact
+            check(!(await manager.fixtureCloudCheckpointRead()) && w.checkpointEffects == 0,
+                "direct \(typed ? "typed" : "generic") cloud checkpoint cannot bypass pending high water")
+            w.checkpointRevision = w.revision; w.checkpointPlaintext = exact + Data(" ".utf8)
+            check(!(await manager.fixtureCloudCheckpointRead()) && w.checkpointEffects == 0,
+                "direct \(typed ? "typed" : "generic") equal-revision contradiction has no effects")
+            w.checkpointPlaintext = exact
+            check(await manager.fixtureCloudCheckpointRead(), "direct exact source remains admissible for \(typed ? "typed" : "generic") checkpoint")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            _ = await manager.syncDown(routineReceive: true)
+            let first = try manager.fixtureCaptureCloudAuthority(plaintext: w.plaintext, revision: w.revision)
+            check((try? first()) != nil, "actual cloud epoch authority admits its original pending source")
+            check(manager.fixtureCloudParentIsRetained(plaintext: w.plaintext, revision: w.revision),
+                "cloud authority composition preserves an existing native source refusal")
+            // A fresh exact GET does not advance the provider-source epoch.
+            _ = await manager.syncDown(routineReceive: true)
+            check((try? first()) != nil, "same original bytes and revision preserve pending source authority")
+            w.revision += 1; w.plaintext.append(Data(" ".utf8))
+            _ = await manager.syncDown(routineReceive: true)
+            check((try? first()) == nil, "higher normal receive revokes older queued cloud authority")
+            let newer = try manager.fixtureCaptureCloudAuthority(plaintext: w.plaintext, revision: w.revision)
+            w.failMedia = false; _ = await manager.syncDown(routineReceive: true)
+            check((try? newer()) == nil, "successful full-tail retirement revokes its delayed cloud conversion authority")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            _ = await manager.syncDown(routineReceive: true)
+            let original = try manager.fixtureCaptureCloudAuthority(plaintext: w.plaintext, revision: w.revision)
+            let capture = CredentialScopeRegistry.shared.capture(), unrelatedPendingIsRetained = manager.fixtureUnrelatedPendingSnapshot()
+            check(manager.fixtureHasReceivedPending(for: capture) && unrelatedPendingIsRetained(),
+                "key retirement starts with received source and independent credential work pending")
+            manager.dataKey = Data(repeating: 0x42, count: 32)
+            check((try? original()) == nil, "key mutation immediately revokes queued cloud authority before any pending query")
+            check(!manager.fixtureHasReceivedPending(for: capture) && manager.fixtureHighestProviderSource() == nil
+                && manager.fixtureFailedProviderSource("vortx.mediaServers") == nil,
+                "owned key retirement clears only its pending source")
+            check(manager.fixtureHasPendingApply() && unrelatedPendingIsRetained(),
+                "key retirement retains exact independent credential pending markers")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+            w.nestedCheckpoint = true; w.localCheckpointAvailable = true
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            w.checkpointRevision = 1; w.checkpointPlaintext = Data("unusable remote".utf8)
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.localReopens == 1 && w.checkpointGets == 0 && w.commits == 1 && w.mediaApplies == 1,
+                "local-only reopen stays usable and outer original receive owns later cloud adoption")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            _ = await manager.syncDown(routineReceive: true)
+            w.paused = "checkpoint.before_commit"
+            let checkpoint = Task { await manager.fixtureCloudCheckpointRead() }
+            await w.wait("checkpoint.before_commit")
+            w.revision += 1; w.plaintext.append(Data(" ".utf8))
+            _ = await manager.syncDown(routineReceive: true)
+            w.release()
+            check(!(await checkpoint.value) && w.checkpointEffects == 0,
+                "queued auxiliary checkpoint source is revoked by higher full receive before its commit")
+        }
+        for boundary in ["media.after", "publication"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob)
+            let original = try await retain()
+            w.callback = { name in
+                guard name == boundary else { return }
+                manager.dataKey = Data(repeating: 0x42, count: 32)
+                manager.dataKey = AdoptionWorld.key
+            }
+            _ = await manager.syncDown(routineReceive: true)
+            check(try await pending(original.operationID), "key change and restoration at \(boundary) cannot mint original completion")
+            check(manager.fixtureHasPendingApply(), "key ABA at \(boundary) retains recovery for a fresh receive")
+        }
+        // A newer row alone does not preserve an independent removal record. Both current exports
+        // retain their explicit removed map, so this conservative collision remains pending.
+        for media in [true, false] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures()
+            let key = media ? "vortx.mediaServers.removed" : "vortx.iptv.removed"
+            let id = media ? "30000000-0000-0000-0000-000000000001" : "synthetic"
+            w.plaintext = try providerDocument(media: media ? mediaBlob : nil, iptv: media ? nil : iptvBlob,
+                settings: [key: [id: 500.0]])
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && w.commits == 0 && w.mediaApplies == 0 && w.iptvApplies == 0,
+                "newer \(media ? "media" : "IPTV") row cannot discard uncovered independent removal history")
+        }
+
+        // F3: actual SettingsBackup decoding + exclusion arguments preserve the cold store baseline.
+        // The companion actual-store fixture below proves checked deletion/CAS, not this synthetic store seam.
+        for media in [true, false] {
+            let manager = try reset(), w = AdoptionWorld.current
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+            let listKey = media ? "vortx.mediaServers.list" : "vortx.iptv.playlists"
+            let removedKey = media ? "vortx.mediaServers.removed" : "vortx.iptv.removed"
+            let localRows = Data("local planning rows with old and unrelated entries".utf8)
+            w.settingsDomain = [listKey: localRows, removedKey: ["prior": 1000.0]]
+            let id = media ? "30000000-0000-0000-0000-000000000001" : "synthetic"
+            let blob = String(decoding: try JSONSerialization.data(withJSONObject: ["v": 1,
+                media ? "servers" : "playlists": [], "removed": [id: 2000]]), as: UTF8.self)
+            w.allowedProviderSources.insert(Data(blob.utf8))
+            w.plaintext = try providerDocument(media: media ? blob : nil, iptv: media ? nil : blob,
+                settings: [listKey: Data("[]".utf8), removedKey: [String: Double](), "fixture.global": "remote"])
+            let original = try await retain()
+            w.callback = { name in
+                if name == (media ? "media.before" : "iptv.before") {
+                    check(w.settingsDomain[listKey] as? Data == localRows
+                        && (w.settingsDomain[removedKey] as? [String: Double])?["prior"] == 1000,
+                        "checked provider sees original local planning rows and removals after cold restore")
+                }
+            }
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.lastSettingsExclusions.contains(listKey) && w.lastSettingsExclusions.contains(removedKey)
+                && !manager.appliedSettingsBaseline.contains(listKey)
+                && w.settingsDomain["fixture.global"] as? String == "remote" && w.settingsReloads == 1,
+                "cold baseline protects checked provider keys while retaining ordinary globals and reload")
+            check(!(try await pending(original.operationID)), "empty legacy list plus checked pure tombstone can complete")
+        }
+        for media in [true, false] {
+            for relationship in ["equal", "newer", "tombstone"] {
+                let manager = try reset(), w = AdoptionWorld.current
+                CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+                let listKey = media ? "vortx.mediaServers.list" : "vortx.iptv.playlists"
+                let id = media ? "30000000-0000-0000-0000-000000000001" : "synthetic"
+                var row: [String: Any] = ["id": id, "name": "Exact", "kind": media ? "jellyfin" : "m3u",
+                    media ? "addedAt" : "createdAt": Date(timeIntervalSince1970: relationship == "newer" ? 0.5 : 1).timeIntervalSinceReferenceDate]
+                if media { row["urls"] = ["https://synthetic.invalid"]; row["userId"] = ""; row["needsReauth"] = true }
+                else { row["transportUrl"] = "https://synthetic.invalid/list" }
+                let blob: String
+                if relationship == "tombstone" {
+                    blob = String(decoding: try JSONSerialization.data(withJSONObject: ["v": 1,
+                        media ? "servers" : "playlists": [], "removed": [id: 2000]]), as: UTF8.self)
+                } else { blob = media ? mediaBlob : iptvBlob }
+                w.allowedProviderSources.insert(Data(blob.utf8))
+                w.plaintext = try providerDocument(media: media ? blob : nil, iptv: media ? nil : blob,
+                    settings: [listKey: try JSONSerialization.data(withJSONObject: [row])])
+                let original = try await retain()
+                _ = await manager.syncDown(routineReceive: true)
+                check(!(try await pending(original.operationID)),
+                    "\(media ? "media" : "IPTV") exact settings coverage permits \(relationship) carrier completion")
+            }
+        }
+        for media in [true, false] {
+            for divergence in ["extra-row", "extra-removal"] {
+                let manager = try reset(), w = AdoptionWorld.current
+                CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+                admitProviderFixtures()
+                let listKey = media ? "vortx.mediaServers.list" : "vortx.iptv.playlists"
+                let removedKey = media ? "vortx.mediaServers.removed" : "vortx.iptv.removed"
+                let id = media ? "40000000-0000-0000-0000-000000000001" : "settings-only"
+                var settings: [String: Any]
+                if divergence == "extra-row" {
+                    settings = [listKey: try JSONSerialization.data(withJSONObject: [["id": id,
+                        media ? "addedAt" : "createdAt": Date(timeIntervalSince1970: 1).timeIntervalSinceReferenceDate]])]
+                } else { settings = [removedKey: [id: 2000.0]] }
+                settings["fixture.global"] = "must-not-apply"
+                w.plaintext = try providerDocument(media: media ? mediaBlob : nil, iptv: media ? nil : iptvBlob, settings: settings)
+                let original = try await retain(), exact = w.plaintext
+                _ = await manager.syncDown(routineReceive: true)
+                check(w.commits == 0 && w.settingsEffects == 0 && w.mediaApplies == 0 && w.iptvApplies == 0
+                    && manager.fixtureHighestProviderSource() == exact && manager.fixtureHasPendingApply(),
+                    "divergent \(media ? "media" : "IPTV") \(divergence) refuses before effects and retains source")
+                check(try await pending(original.operationID), "divergent settings cannot receive file completion")
+            }
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            CoreBridge.shared.hasNativeSession = false; w.providerPlan = false
+            let key = "vortx.mediaServers.list", rows = Data("[]".utf8)
+            w.plaintext = try providerDocument(settings: [key: rows, "vortx.mediaServers.removed": [String: Double](), "fixture.global": "compatible"])
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.settingsDomain[key] as? Data == rows && !w.lastSettingsExclusions.contains(key)
+                && w.settingsDomain["fixture.global"] as? String == "compatible"
+                && w.mediaApplies == 0 && w.iptvApplies == 0 && !manager.fixtureHasPendingApply(),
+                "ordinary settings-only receive retains existing baseline and global behavior")
+        }
+
+        for shape in ["media", "iptv", "both", "cold"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures()
+            w.plaintext = try providerDocument(media: shape == "iptv" ? nil : mediaBlob,
+                iptv: shape == "media" ? nil : iptvBlob)
+            w.mirrorProviderOverride = "synthetic poisoned mirrored value"
+            if shape == "cold" { CoreBridge.shared.hasNativeSession = false }
+            let original = try await retain(), source = w.plaintext
+            let result = await manager.finishAccountBackupFileRestore(original.operationID)
+            guard case .localAdoptionRecorded(let id, let revision) = result,
+                  id == original.operationID, revision == original.revision else { preconditionFailure("checked original provider receive was not completed") }
+            check(w.mediaSources == (shape == "iptv" ? [] : [Data(mediaBlob.utf8)])
+                && w.iptvSources == (shape == "media" ? [] : [Data(iptvBlob.utf8)]),
+                "\(shape) uses exact original carrier strings despite metadata object and poisoned mirror")
+            check(w.mediaApplies == (shape == "iptv" ? 0 : 1) && w.iptvApplies == (shape == "media" ? 0 : 1),
+                "\(shape) invokes each checked store exactly once with no queued or duplicate Void apply")
+            check(Set(w.mediaOperations + w.iptvOperations).count == 1 && w.gets == 1,
+                "\(shape) binds both actual store receipts to one original receive UUID and GET")
+            check(!manager.fixtureHasPendingApply() && w.stamps == 1 && w.publications == 1
+                && manager.lastSyncedVersion == original.revision && w.plaintext == source,
+                "\(shape) settles before ordinary bookkeeping without changing source")
+        }
+        for refusal in ["media", "iptv", "source", "operation"] {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+            let original = try await retain()
+            w.failMedia = refusal == "media"; w.failIPTV = refusal == "iptv"
+            w.wrongProviderReceipt = refusal == "source"; w.wrongProviderOperation = refusal == "operation"
+            _ = await manager.syncDown(routineReceive: true)
+            check(try await pending(original.operationID), "\(refusal) refuses file completion without actual matching provider evidence")
+            check(manager.fixtureHasPendingApply() && w.stamps == 0 && w.publications == 0
+                && manager.lastSyncedVersion == original.baseRevision && !manager.fixtureHasCachedReceipt(),
+                "\(refusal) keeps actual push/ack admission closed without advancing floor or receive cache")
+            w.failMedia = false; w.failIPTV = false; w.wrongProviderReceipt = false; w.wrongProviderOperation = false
+            let result = await manager.finishAccountBackupFileRestore(original.operationID)
+            guard case .localAdoptionRecorded = result else { preconditionFailure("same original GET did not retry settlement") }
+            check(!manager.fixtureHasPendingApply() && w.gets == 2, "\(refusal) retries the original operation through GET and real receipt readback")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            let original = try await retain(), first = w.plaintext
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureFailedProviderSource("vortx.mediaServers") == first, "pending marker retains original failed HTTP source")
+            w.revision -= 1
+            let attempted = w.mediaApplies
+            _ = await manager.syncDown(routineReceive: true)
+            check(w.mediaApplies == attempted && manager.fixtureFailedProviderSource("vortx.mediaServers") == first,
+                "lower revision cannot apply over or replace a pending original provider source")
+            w.revision = original.revision + 1; w.plaintext.append(Data(" ".utf8)); let newer = w.plaintext
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureFailedProviderSource("vortx.mediaServers") == first
+                && manager.fixtureFailedProviderSource("vortx.mediaServers", latest: true) == newer,
+                "newer failed provider retains both first and latest exact source")
+            w.revision += 1; w.plaintext = try providerDocument()
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && w.stamps == 0
+                && manager.fixtureFailedProviderSource("vortx.mediaServers", latest: true) == newer,
+                "later omission cannot erase failed provider data or open push acknowledgment")
+            w.revision = original.revision + 1; w.plaintext = newer; w.failMedia = false
+            let before = w.mediaApplies
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && w.mediaApplies == before && w.stamps == 0,
+                "omitted newer response retains whole-response high water against an older present carrier")
+            w.revision = original.revision + 3
+            _ = await manager.syncDown(routineReceive: true)
+            check(!manager.fixtureHasPendingApply() && w.stamps == 1, "newer present carrier clears pending only after matching settlement")
+            check(try await pending(original.operationID), "newer source settlement does not falsely retire a different original file")
+        }
+        for boundary in ["media.before", "media.after", "iptv.after"] {
+            for change in ["account", "key", "epoch", "profile", "target", "cancel"] {
+                let manager = try reset(), w = AdoptionWorld.current, box = AdoptionReceiveTaskBox()
+                admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+                let original = try await retain()
+                w.callback = { name in
+                    guard name == boundary else { return }
+                    switch change {
+                    case "account": manager.account = .init(id: UUID().uuidString.lowercased())
+                    case "key": manager.dataKey = Data(repeating: 0x42, count: 32)
+                    case "epoch": CredentialScopeRegistry.shared.establish(.account(UUID(uuidString: AdoptionWorld.account)!))
+                    case "profile": ProfileStore.shared.activeID = UUID()
+                    case "target": CoreBridge.shared.accountGeneration = UUID()
+                    default: box.task?.cancel()
+                    }
+                }
+                box.task = Task { await manager.syncDown(routineReceive: true) }; _ = await box.task?.value
+                check(try await pending(original.operationID), "\(change) at \(boundary) cannot certify a full receive")
+                check(w.stamps == 0 && w.publications == 0, "\(change) at \(boundary) cannot reach normal success bookkeeping")
+            }
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob); w.failMedia = true
+            _ = await manager.syncDown(routineReceive: true)
+            let calls = w.mediaApplies, retired = CredentialScopeRegistry.shared.capture()
+            CredentialScopeRegistry.shared.establish(.account(UUID(uuidString: AdoptionWorld.account)!))
+            check(!manager.fixtureHasPendingApply() && manager.fixtureFailedProviderSource("vortx.mediaServers") == nil
+                && w.mediaApplies == calls, "retired epoch clears only its process marker with no provider IO")
+            _ = await manager.syncDown(routineReceive: true)
+            check(manager.fixtureHasPendingApply() && !manager.fixtureHasReceivedPending(for: retired)
+                && manager.fixtureHasPendingApply(), "stale marker query cannot erase a current successor pending source")
+        }
+        do {
+            let manager = try reset(), w = AdoptionWorld.current
+            admitProviderFixtures(); w.plaintext = try providerDocument(media: mediaBlob, iptv: iptvBlob)
+            let original = try await retain(), hold = await holdJournal()
+            let task = Task { await manager.syncDown(routineReceive: true) }
+            await settle { w.publications == 1 }
+            task.cancel(); hold.released.signal(); await hold.task?.value; _ = await task.value
+            check(!(try await pending(original.operationID)) && w.mediaApplies == 1 && w.iptvApplies == 1,
+                "post-mint cancellation may seal genuine provider-complete original historical adoption")
+        }
         for key in ["vortx.mediaServers", "vortx.iptv"] {
             for value in ["\"\"", "\"malformed blob\"", "null", "{}"] {
                 let manager = try reset()
                 AdoptionWorld.current.plaintext = Data("{\"nativeSync\":{\"schemaVersion\":5},\"apiKeys\":{\"\(key)\":\(value)}}".utf8)
                 let original = try await retain(), exact = AdoptionWorld.current.plaintext
                 _ = await manager.syncDown(routineReceive: true)
-                check(try await pending(original.operationID), "unacknowledged \(key) \(value) keeps full-tail completion pending")
+                check(try await pending(original.operationID), "unsettled \(key) \(value) keeps full-tail completion pending")
                 check(AdoptionWorld.current.plaintext == exact, "provider refusal does not strip source carrier")
                 let result = await manager.finishAccountBackupFileRestore(original.operationID)
                 guard case .pending(_, reason: .legacyProviderSettlementUnavailable) = result else { preconditionFailure("typed provider scope missing") }
@@ -544,6 +1199,12 @@ extension VortxAccountFileRestoreJournal {
                 _ = try await journal.unresolved(account: original.accountID, key: damage == "wrong-key" ? Data(repeating: 0x42, count: 32) : AdoptionWorld.key)
                 preconditionFailure("\(damage) journal inventory was not refused")
             } catch { check(true, "\(damage) fails closed without releasing retained source") }
+        }
+        for (value, label) in try await ProviderCloudInstallationFixture.cases(makeManager: { try reset() }) {
+            check(value, label)
+        }
+        for (value, label) in try await ProviderOAuthCloudClearFixture.cases(makeManager: { try reset() }) {
+            check(value, label)
         }
         print("local-adoption synthetic orchestration and real journal checks: \(checks)")
     }

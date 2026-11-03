@@ -63,6 +63,12 @@ if (process.argv[2] === '--extract') {
     '    private func accountReconnectRequired(for capture:', '    private func clearAccountReconnectFailure(for capture:',
     '    private func conditionalReceiveVersion(', '    private func rememberCompletedNativeReceive(',
     '    private func completedFileRestoreReceive(',
+    '    private func hasPendingReceivedProviderApply(', '    private func receivedProviderOwnerIsCurrent(',
+    '    private func receivedProviderTargetIsCurrent(', '    private func receivedProviderSource(',
+    '    private func captureReceivedProviderCloudAuthority(', '    private func requireReceivedProviderCloudSource(',
+    '    private func reserveReceivedProviders(', '    private func finishReceivedProviderApply(',
+    '    static func receivedProviderSettingsExclusions(', '    private func receivedProviderSettingsAreCovered(',
+    '    private func settleReceivedProviders(', '    private func fileRestoreStatusOwnerIsCurrent(',
     '    private func openSyncDocument(', '    private static func decodeDecryptedSyncDocument(', '    private static func documentVersion(',
     '    private func pullDocVersionedResult(', '    private func pullDocVersionedRetrying(',
     '    private func pushSyncDocAt(', '    private func commitNativePulledDocument(', '    private func applyNativeGlobals(',
@@ -80,6 +86,8 @@ if (process.argv[2] === '--extract') {
     return selected;
   }
   const storedDeclarations = [
+    exactDeclaration(/^    private let receivedProviderCloudEpoch = ReceivedProviderCloudEpoch\(\)$/gm, 'provider cloud source epoch'),
+    exactDeclaration(/^    private var pendingReceivedProviderApply: PendingReceivedProviderApply\?$/gm, 'pending received provider source'),
     exactDeclaration(/^    private var nativeDocumentCommitGeneration: UInt64 = 0$/gm, 'conversion generation'),
     exactDeclaration(/^    private var nativeCheckpointGeneration = UUID\(\)$/gm, 'native checkpoint generation'),
     exactDeclaration(/^    private var ws: URLSessionWebSocketTask\?.*$/gm, 'poll socket'),
@@ -130,7 +138,7 @@ if (process.argv[2] === '--extract') {
   combined += '\nextension VortXSyncManager {\n'
     + observation + '\n'
     + conversionMembers.join('\n') + '\n'
-    + ['    struct CompletedFileRestoreReceive: Sendable {', '    private struct NativeReceiveReceipt {', '    private struct OwnerHistoryMergedAccount {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
+    + ['    private final class ReceivedProviderCloudEpoch:', '    private struct ReceivedProviderCloudAuthority:', '    private struct ReceivedProviderSource {', '    private struct FailedReceivedProvider {', '    private struct PendingReceivedProviderApply {', '    private struct CompletedReceivedProviders {', '    private struct FileRestoreStatusOwner {', '    struct CompletedFileRestoreReceive: Sendable {', '    private struct NativeReceiveReceipt {', '    private struct OwnerHistoryMergedAccount {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
       '    private enum ProviderApplyService:', '    private enum ProviderApplyValue:', '    private struct PendingProviderApply:']
       .map(marker => member(manager, marker)).join('\n')
     + '\n' + managerMethods.map(marker => member(manager, marker)).join('\n')

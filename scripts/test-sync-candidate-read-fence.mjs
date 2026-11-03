@@ -19,6 +19,7 @@ const pull = fixtureInputs.extractDeclaration(manager, '    private enum Version
 const completePull = pull.includes('case ownerHistory(');
 const boundary = fixtureInputs.extractDeclaration(current, '    private struct DerivedSyncDoc {') + '\n'
   + pull + '\n' + manager.slice(start, end)
+  + (manager.slice(start, end).includes('let cloudAuthority =') ? '\n        _ = cloudAuthority' : '')
   + '\n        return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture, sourceIsCurrent: { true }'
   + (completePull ? ', plaintextData: originalPlaintext' : '') + ')\n    }';
 mkdirSync('app/build', {recursive: true});

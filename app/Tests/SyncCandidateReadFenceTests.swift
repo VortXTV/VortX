@@ -39,8 +39,17 @@ private typealias NativePlaylistCandidateProjection = Never
         seeds += 1; return ["synthetic": true]
     }
     private func mergeOwnerHistoryForExport(plaintext: Data, version: Int, observation: UUID,
-                                            capture: CredentialScopeRegistry.Capture, orderIntent: AddonOrderIntent?) async -> DerivedSyncDoc? {
+                                            capture: CredentialScopeRegistry.Capture, orderIntent: AddonOrderIntent?, cloudAuthority: FixtureCloudRead? = nil) async -> DerivedSyncDoc? {
         preconditionFailure("Typed owner-history export is outside this fixture")
+    }
+    // No pending provider reservation exists in this prefix-only fixture. This is a declared
+    // credential-current aperture, not an implementation of the actual cloud source epoch.
+    private struct FixtureCloudRead { let current: () -> Bool; var isCurrent: Bool { current() } }
+    private func captureReceivedProviderCloudAuthority(_ capture: CredentialScopeRegistry.Capture) throws -> FixtureCloudRead {
+        .init(current: { self.isCurrent(capture) })
+    }
+    private func requireReceivedProviderCloudSource(_ pulled: VersionedPull, authority: FixtureCloudRead) throws -> FixtureCloudRead {
+        guard authority.isCurrent else { throw NSError(domain: "superseded", code: 1) }; return authority
     }
     func candidate() async -> Bool { await mergeLocalIntoDoc(orderIntent: nil) != nil }
     /* PRODUCTION_READ_BOUNDARY */

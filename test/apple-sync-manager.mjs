@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import xperienceInputs from './xperience-harness-inputs.cjs';
 
 const members = ['nativeGlobalEdits', 'nativeGlobalValue', 'nativeDirtySettingsForExport', 'nativeDirtySettingIsExported', 'clearPushedDirtySettings', 'ensureNativeCheckpoint',
@@ -23,30 +23,41 @@ if (process.argv[2] === '--extract') {
   const hasCompleteReceiptFeature = receiptMethodCount === receiptMembers.length && receiptLedgerPresent
     && receiptRevisionPresent && receiptProjectionPresent;
   assert(!hasAnyReceiptFeature || hasCompleteReceiptFeature, 'partial playlist receipt feature graph');
-  const activeMembers = hasCompleteReceiptFeature ? [...members, ...receiptMembers, ...receiptDependencies] : members;
+  // Select exact whole declarations. A one-line enum and a multiline enum are both
+  // bounded by their actual source; default-argument closures never terminate a method.
+  const block = (text, marker) => {
+    const start = text.indexOf(marker); assert(start >= 0, marker);
+    assert.equal(text.indexOf(marker, start + marker.length), -1, `ambiguous ${marker}`);
+    const lineEnd = text.indexOf('\n', start);
+    assert(lineEnd > start, `missing declaration line end ${marker}`);
+    const singleLine = text.slice(start, lineEnd).trimEnd().endsWith('}');
+    const closing = singleLine ? lineEnd : text.indexOf('\n    }', start);
+    assert(closing > start, `unterminated ${marker}`);
+    const end = singleLine ? closing : closing + 6;
+    return text.slice(start, end);
+  };
+  const hasCompletePull = source.includes('case doc(doc: [String: Any], version: Int, plaintext: Data, observation: UUID?)');
+  const reconnectMembers = ['accountReconnectRequired', 'clearAccountReconnectFailure']
+    .filter(name => source.includes(`${name}(`));
+  const activeMembers = [...members, ...(hasCompleteReceiptFeature ? [...receiptMembers, ...receiptDependencies] : []), ...reconnectMembers];
   const selected = activeMembers.flatMap(name => {
-    const start = source.search(new RegExp(`^    (?:private )?func ${name}\\(`, 'm'));
+    const signatures = [...source.matchAll(new RegExp(`^    (?:private )?func ${name}\\(`, 'gm'))];
+    assert(signatures.length <= 1, `ambiguous production method ${name}`);
+    const start = signatures[0]?.index ?? -1;
     // Older source settles uploads inline. Do not inject the new completion helper into a
     // baseline that does not call it; current source must still supply its actual helper.
     if (name === 'finishSyncUp' && start < 0 && !source.includes('finishSyncUp(operationID)')) return [];
     if (name === 'nativeGlobalValue' && start < 0 && !source.includes('nativeGlobalValue(key)')) return [];
     if (name === 'nativeDirtySettingsForExport' && start < 0 && !source.includes('nativeDirtySettingsForExport(globalEdits')) return [];
     assert(start >= 0, `missing production method ${name}`);
-    const end = source.indexOf('\n    }', start); assert(end > start);
-    return [source.slice(start, end + 6)];
+    return [block(source, signatures[0][0])];
   });
-  selected.push(source.match(/^    private enum VersionedPull .*$/m)[0],
-    source.match(/^    private enum PushOutcome .*$/m)[0]);
+  selected.push(block(source, '    private enum VersionedPull '),
+    block(source, '    private enum PushOutcome '));
   const observation = xperienceInputs.observationProperty(source);
   if (observation) selected.push(observation);
   const profiles = await readFile('app/SourcesShared/Profiles.swift', 'utf8');
   const preferenceFixture = await readFile('app/Tests/NativePreferenceAcknowledgementTests.swift', 'utf8');
-  const block = (text, marker) => {
-    const start = text.indexOf(marker); assert(start >= 0, marker);
-    assert.equal(text.indexOf(marker, start + marker.length), -1, `ambiguous ${marker}`);
-    const end = text.indexOf('\n    }', start); assert(end > start, marker);
-    return text.slice(start, end + 6);
-  };
   const exactDeclaration = (text, expression, label) => {
     const matches = [...text.matchAll(expression)];
     assert.equal(matches.length, 1, `missing or ambiguous ${label}`);
@@ -68,6 +79,18 @@ if (process.argv[2] === '--extract') {
   const backupDecoder = [exactDeclaration(backup, /^    static let formatTag = .*$/gm, 'backup format'),
     ...['    struct Envelope:', '    enum RestoreError:', '    static func decodeDomain('].map(marker => block(backup, marker))].join('\n');
   let peerSource = await readFile('app/Tests/AppleSyncManagerPeer.swift', 'utf8');
+  if (!hasCompletePull) {
+    const currentPattern = 'if case .doc(let doc, let version, _, _) = await pullDocVersionedResult(credentialCapture: capture) {';
+    assert.equal(peerSource.split(currentPattern).length, 2, 'unique fixture-only pull pattern');
+    peerSource = peerSource.replace(currentPattern, 'if case .doc(let doc, let version) = await pullDocVersionedResult(credentialCapture: capture) {');
+  }
+  const credentialValues = await readFile('app/SourcesShared/CredentialScope.swift', 'utf8');
+  const durableRead = xperienceInputs.extractDeclaration(credentialValues, 'enum CredentialDurableReadResult: Equatable, Sendable {');
+  // The current WHOLE Session always needs these actual carrier declarations, even when
+  // a historical manager is selected. Do not substitute the baseline manager's old ABI.
+  const currentManager = await readFile('app/SourcesShared/VortXSyncManager.swift', 'utf8');
+  const carriers = xperienceInputs.ownerHistoryCarriers(currentManager);
+  await writeFile(join(dirname(process.argv[4]), 'OwnerHistoryFixtureCarriers.swift'), carriers.source, { flag: 'wx' });
   if (!hasCompleteReceiptFeature) {
     const receiptFixture = /^[ \t]*\/\/ RECEIPT FIXTURE GRAPH START\n[\s\S]*?^[ \t]*\/\/ RECEIPT FIXTURE GRAPH END\n/gm;
     peerSource = peerSource.replace(receiptFixture, '');
@@ -137,11 +160,21 @@ if (process.argv[2] === '--extract') {
     .replaceAll('PlaybackMutationTarget', 'ManagerPlaybackMutationTarget')
     .replaceAll('VortXSyncManager.shared', 'ManagerHarness.shared');
   const discovery = await readFile('app/SourcesShared/ProfileDiscoveryPreferences.swift', 'utf8');
-  await writeFile(process.argv[4], peerSource + managerEnvironment
+  await writeFile(process.argv[4], peerSource + '\n' + durableRead + '\n' + managerEnvironment
     + '\nextension SettingsBackup {\n' + backupDecoder + '\n}\n'
     + '\nextension ProfileStore {\n' + productionPreferences.join('\n') + '\n}\nextension ProfileDiscoveryPreferencesStore {\n'
     + block(discovery, 'enum Key {') + '\n}\nextension ProfileStore {\n' + productionProfileSave + '\n}\nextension ManagerHarness {\n'
     + productionIntentMethods + '\n' + selected.join('\n') + '\n}\n');
+  const hash = text => createHash('sha256').update(text).digest('hex');
+  await writeFile(join(dirname(process.argv[4]), 'upload-extraction.json'), JSON.stringify({
+    managerPath: process.argv[3], managerSHA256: hash(source), currentSessionCarrierManagerSHA256: hash(currentManager),
+    selectedDeclarationSHA256: selected.map(hash), productionBodyTransformations: [],
+    durableReadSource: 'app/SourcesShared/CredentialScope.swift', durableReadSourceSHA256: hash(credentialValues),
+    durableReadDeclarationSHA256: hash(durableRead),
+    ownerHistoryCarriers: carriers.declarations.map(({ signature, bytes }) => ({ signature, sha256: hash(bytes) })),
+    fixtureOnlyCompatibility: hasCompletePull ? [] : ['two-field VersionedPull fixture pattern'],
+    existingPreferenceHarnessRenamesUnchanged: true
+  }, null, 2) + '\n', { flag: 'wx' });
   process.exit(0);
 }
 const [peerBinary, root] = process.argv.slice(2);
@@ -599,6 +632,7 @@ try {
       conversionPolicySHA256: await digest('app/SourcesShared/NativeForegroundSyncPolicy.swift'),
       conversionAuthoritySHA256: await digest('app/SourcesShared/VortxNativeOwnAccountProducer.swift'),
       backupDecoderSourceSHA256: await digest('app/SourcesShared/SettingsBackup.swift'),
+      genericRawHostBoundary: 'Bridge merge is a declared fixture adapter around actual Session.dispatch and hostPreferencesPublication.rawDocument; it does not execute actual CoreBridge/Facade installation or publication. Generic account/provider projection uses real production serializers. Nonempty provider credentials, legacy material and typed owner-history export remain unavailable and cannot silently pass.',
       conversionBoundary: 'Real manager conversion generation, type, digest, decision, record and roster resolver are extracted. The existing legacy preparation collaborator returns empty synthetic material; peer merge rejects any nonempty material or authority/archive before dispatch. The real SettingsBackup decoder retains this harness existing synthetic isSyncable policy. Producer/transport source compiles for the real Authority type; no producer fetch or direct provider HTTP is invoked.',
       binarySHA256: await digest(peerBinary), librarySHA256: process.env.VORTX_SYNC_TEST_LIBRARY_SHA256,
       headerSHA256: process.env.VORTX_SYNC_TEST_HEADER_SHA256,

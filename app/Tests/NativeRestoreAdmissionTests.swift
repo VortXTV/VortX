@@ -110,7 +110,7 @@ private struct SymmetricKey { init(data: Data) {} }
         precondition(fullOnly, "admission must never accept a lossy summary")
         return resolvedRoster // Decoder is a dependency aperture; the production owner-count gate is real.
     }
-    func publishDetachedNativeSeed(_ value: [String: Any], capture: CredentialScopeRegistry.Capture) async throws -> [String: Any]? {
+    private func publishDetachedNativeSeed(_ value: [String: Any], capture: CredentialScopeRegistry.Capture, cloudAuthority: ReceivedProviderCloudAuthority) async throws -> [String: Any]? {
         seedCalls += 1
         whileSeeding?()
         if seedThrows { throw VortxNativeError.unavailable }
@@ -136,6 +136,8 @@ private struct SymmetricKey { init(data: Data) {} }
               number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
         return number.intValue
     }
+    // Declared no-pending-provider aperture; actual source epoch runs in local-adoption checks.
+    private struct ReceivedProviderCloudAuthority { var isCurrent: Bool { true } }
     /* PRODUCTION_DECLARATIONS */
 
     static var checks = 0
@@ -149,7 +151,7 @@ private struct SymmetricKey { init(data: Data) {} }
     private func expectAdmission(_ expected: NativeRestoreAdmissionFailure, pulled: VersionedPull = .doc(doc: [:], version: 1, plaintext: Data("{}".utf8), observation: nil)) async {
         do {
             _ = try await nativeRestoreDocument(pulled, capture: credentialAuthority.capture(),
-                selectedProfile: ProfileStore.shared.activeID, generation: nativeCheckpointGeneration)
+                selectedProfile: ProfileStore.shared.activeID, generation: nativeCheckpointGeneration, cloudAuthority: .init())
             preconditionFailure("unexpected admission: " + expected.rawValue)
         } catch let error as NativeRestoreAdmissionFailure {
             Self.check(error == expected, "exact typed admission failure: " + expected.rawValue)
@@ -243,7 +245,7 @@ private struct SymmetricKey { init(data: Data) {} }
         let valid = fresh()
         let original = Data(#"{ "preserved":"exact", "unknown":9007199254740993, "negativeZero":-0.0 }"#.utf8)
         let accepted = try await valid.nativeRestoreDocument(.doc(doc: ["preserved": "exact"], version: 1, plaintext: original, observation: nil),
-            capture: valid.credentialAuthority.capture(), selectedProfile: ProfileStore.shared.activeID, generation: valid.nativeCheckpointGeneration)
+            capture: valid.credentialAuthority.capture(), selectedProfile: ProfileStore.shared.activeID, generation: valid.nativeCheckpointGeneration, cloudAuthority: .init())
         check(accepted.document["preserved"] as? String == "exact" && accepted.owners.count == 1, "valid document admitted without rewriting")
         check(accepted.plaintext == original, "admission retains original authenticated plaintext independently of the host projection")
         let old = fresh(); old.lastSyncedVersion = 2; await old.expectAdmission(.staleDocument)
@@ -280,7 +282,7 @@ private struct SymmetricKey { init(data: Data) {} }
         let unconfirmed = fresh(); unconfirmed.seedDocument = nil; await unconfirmed.expectAdmission(.emptySeedUnconfirmed, pulled: .empty)
         let empty = fresh()
         _ = try await empty.nativeRestoreDocument(.empty, capture: empty.credentialAuthority.capture(),
-            selectedProfile: ProfileStore.shared.activeID, generation: empty.nativeCheckpointGeneration)
+            selectedProfile: ProfileStore.shared.activeID, generation: empty.nativeCheckpointGeneration, cloudAuthority: .init())
         check(empty.seedCalls == 1, "confirmed absent authenticated-empty path retains seed attempt")
         let replaced = fresh(); replaced.whileSeeding = { replaced.credentialAuthority.replace("other"); replaced.credentialAuthority.replace("fixture-account") }
         await replaced.expectAdmission(.superseded, pulled: .empty)

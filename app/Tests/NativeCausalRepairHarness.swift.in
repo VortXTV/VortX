@@ -38,6 +38,7 @@
     func restoreAccountDocIfNeeded(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("cold restore outside causal repair proof") }
     func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] { preconditionFailure("empty account outside causal repair proof") }
     func restoreNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("session restore outside causal repair proof") }
+    private func restoreNativeCheckpointWithCloudRead(credentialCapture capture: CredentialScopeRegistry.Capture, userInitiated: Bool, cloudRead: ReceivedProviderCloudAuthority?) async -> Bool { preconditionFailure("cloud session restore outside causal repair proof") }
     func nativePreferenceStore(capture: CredentialScopeRegistry.Capture) throws -> NativePreferenceIntentStore {
         guard isCurrent(capture), let dataKey else { throw VortxNativeError.superseded }
         return NativePreferenceIntentStore(directoryURL: directory.appendingPathComponent("empty-preference-journal"), key: dataKey, namespace: capture.namespace)

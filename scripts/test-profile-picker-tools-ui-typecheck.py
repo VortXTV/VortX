@@ -34,8 +34,11 @@ RECIPE = [
     ('app/SourcesShared/CredentialScope.swift', '    func isCurrent(_ capture: Capture) -> Bool {', 'header', 'registry'),
     ('app/SourcesShared/VortXSyncManager.swift', '    struct Account: Codable, Equatable, Sendable {', 'declaration', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    static let shared = VortXSyncManager()', 'line', 'manager'),
-    ('app/SourcesShared/VortXSyncManager.swift', '    @Published private(set) var account: Account?', 'line', 'manager'),
-    ('app/SourcesShared/VortXSyncManager.swift', '    @Published private(set) var isSignedIn = false', 'line', 'manager'),
+    ('app/SourcesShared/VortXSyncManager.swift', '    private let receivedProviderCloudEpoch = ReceivedProviderCloudEpoch()', 'line', 'manager'),
+    ('app/SourcesShared/VortXSyncManager.swift', '    private final class ReceivedProviderCloudEpoch: @unchecked Sendable {', 'declaration', 'manager'),
+    ('app/SourcesShared/VortxNativeRuntime.swift', 'enum VortxNativeError: Error, Equatable {', 'declaration', ''),
+    ('app/SourcesShared/VortXSyncManager.swift', '    @Published private(set) var account: Account? {', 'declaration', 'manager'),
+    ('app/SourcesShared/VortXSyncManager.swift', '    @Published private(set) var isSignedIn = false {', 'declaration', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    static let credentialScopeDidChangeNote = Notification.Name("vortx.credentialScopeDidChange")', 'line', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    func downloadAccountBackupFile() async throws -> Data {', 'header', 'manager'),
     ('app/SourcesShared/VortXSyncManager.swift', '    func prepareAccountBackupRepair(_ selectedFile: Data) async throws -> VortxAccountFileRepairService.Preview {', 'header', 'manager'),
@@ -99,9 +102,10 @@ process.stdout.write(JSON.stringify({sourceHashes:sources,selections,viewBodyCop
 if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'x86_64'):
     raise SystemExit('Requires macOS and real SwiftUI Apple SDKs')
 mode = sys.argv[1] if len(sys.argv) == 2 else '--macos'
-if mode not in ('--macos', '--tvos-full', '--tvos-lite') or len(sys.argv) > 2:
-    raise SystemExit('Expected --macos, --tvos-full or --tvos-lite')
-tvos = mode != '--macos'
+if mode not in ('--macos', '--ios', '--tvos-full', '--tvos-lite') or len(sys.argv) > 2:
+    raise SystemExit('Expected --macos, --ios, --tvos-full or --tvos-lite')
+tvos = mode.startswith('--tvos-')
+sdk_name = 'appletvos' if tvos else 'iphoneos' if mode == '--ios' else 'macosx'
 if tvos:
     WHOLE.append('app/Sources/Player/PerformanceMode.swift')
 root = ROOT
@@ -133,11 +137,16 @@ if not sdk.startswith('/') or len(sdk)>4096 or any(c in sdk for c in ('\n','\r',
     raise ValueError('Invalid retained SDK path')
 import platform
 arch=platform.machine()
-target='arm64-apple-tvos18.0' if mode!='--macos' else arch+'-apple-macosx14.0'
+target = {
+    '--macos': arch + '-apple-macosx14.0',
+    '--ios': 'arm64-apple-ios16.0',
+    '--tvos-full': 'arm64-apple-tvos18.0',
+    '--tvos-lite': 'arm64-apple-tvos18.0',
+}[mode]
 argv=['/usr/bin/nice','-n','15','/usr/bin/xcrun','swiftc','-parse-as-library','-typecheck',
       '-swift-version','6','-strict-concurrency=complete','-warnings-as-errors','-j','1','-num-threads','1',
       '-target',target,'-sdk',sdk,'-module-cache-path',module_cache,'-import-objc-header',bridge]
-if mode!='--macos': argv+=['-D','VORTX_AETHER_ENGINE','-D','VORTX_NO_EMBEDDED_SERVER' if mode=='--tvos-lite' else 'VORTX_ENGINE_SERVER']
+if mode.startswith('--tvos-'): argv+=['-D','VORTX_AETHER_ENGINE','-D','VORTX_NO_EMBEDDED_SERVER' if mode=='--tvos-lite' else 'VORTX_ENGINE_SERVER']
 argv+=sources
 with pathlib.Path(argv_output).open('x') as output: json.dump({'argv':argv,'targetMode':mode},output,indent=2);output.write('\n')
 os.execv(argv[0],argv)
@@ -166,7 +175,7 @@ extract_stdout,extract_stderr=out/'extract/stdout.bin',out/'extract/stderr.bin'
 compile_argv=out/'compile-argv.json'
 commands={
     'extract':['/usr/bin/nice','-n','15','node',str(extractor),str(root),str(generated),str(recipe_path)],
-    'sdk':['/usr/bin/nice','-n','15','/usr/bin/xcrun','--sdk','appletvos' if tvos else 'macosx','--show-sdk-path'],
+    'sdk':['/usr/bin/nice','-n','15','/usr/bin/xcrun','--sdk',sdk_name,'--show-sdk-path'],
     'compile':[sys.executable,str(compile_driver),mode,str(sdk_stdout),str(compile_argv),str(out/'module-cache'),str(bridge),*[str(root/name) for name in WHOLE],str(generated)],
     'result':[sys.executable,str(verifier),str(root),str(extract_stdout),str(compile_argv),str(out/'typecheck-result.json'),mode],
 }

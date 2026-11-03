@@ -384,6 +384,8 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --ios
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-full
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-lite

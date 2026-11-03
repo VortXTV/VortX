@@ -83,7 +83,7 @@ if (process.argv[2] === '--extract') {
     '    func persistMergedNativeProviders(_ providers: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { providers }',
     '    func mirrorNativeProviderKeys(_ providers: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] { [:] }',
     '    func acknowledgeNativeProviders(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) throws {}',
-    '    func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture) async -> Bool { CoreBridge.shared.hasCertifiedNativeSession(capture: credentialCapture, profileID: ProfileStore.shared.activeID) }'
+    '    private func ensureNativeCheckpoint(credentialCapture: CredentialScopeRegistry.Capture, cloudRead: ReceivedProviderCloudAuthority? = nil) async -> Bool { CoreBridge.shared.hasCertifiedNativeSession(capture: credentialCapture, profileID: ProfileStore.shared.activeID) }'
   ];
   remove.forEach(value => replace(value, ''));
   replace('        return try VortxNativeProviderCredentials(scope: capture.namespace, actor: AppleSyncReceivePublicationPeer.actor)',

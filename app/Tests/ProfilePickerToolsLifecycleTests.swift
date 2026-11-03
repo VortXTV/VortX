@@ -308,8 +308,8 @@ enum VortxAccountFileAccess { enum Failure: Error { case fixture } }
             let h = Harness(), original = UUID()
             h.retained = [.init(operationID: original, state: .serverConfirmed, providerSettlementUnavailable: true)]
             _ = await h.presentReady()
-            check(h.model.restoreNeedsVerification && h.model.status.message?.contains("cannot yet be verified") == true,
-                  "interim provider restriction remains explicit pending history without false loaded copy")
+            check(h.model.restoreNeedsVerification && h.model.canFinishRestore && h.model.status.message?.contains("awaiting verified local recovery") == true,
+                  "provider settlement remains retryable pending history without false loaded copy")
         }
         print("\(checks) actual Tools controller/access checks passed")
     }

@@ -88,8 +88,8 @@ enum VortxAccountFileRestore {
         let state: LocalState
         var pendingReason: LocalPendingReason = .receivePending
     }
-    /// Source presence is intentionally conservative: these legacy stores have no durable apply
-    /// receipt yet. Never strip these keys or pretend awaiting their Void methods proves success.
+    /// Existing-only status identifies source carriers still awaiting a full receive receipt.
+    /// Presence does not disable Finish: only actual checked store settlement can complete them.
     static func hasUnacknowledgedProviderCarrier(_ plaintext: Data) -> Bool {
         guard let raw = try? OwnerHistoryExactJSON.Object(plaintext) else { return true }
         guard let keys = raw["apiKeys"] else { return false }
