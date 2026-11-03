@@ -2683,6 +2683,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     private val fileRestoreJournal by lazy { AccountFileRestoreJournal(appContext) }
     private val fileRestoreProviderRetryOutbox by lazy { ProviderRetryOutbox(appContext) }
+    internal val providerRetryOutbox: ProviderRetryOutbox get() = fileRestoreProviderRetryOutbox
     private val fileRestoreTransaction by lazy {
         AccountFileRestoreTransaction(fileRestoreJournal, VortxJniBindings, AccountFileHostAdmission::requireCandidate)
     }

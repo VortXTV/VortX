@@ -1,7 +1,6 @@
 package com.vortx.android.account
 
 import com.vortx.android.BuildConfig
-import com.vortx.android.integrations.IntegrationsHttp
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.MediaType
@@ -83,11 +82,8 @@ internal fun providerWatchlistUrl(operation: ProviderWatchlistReceipt.Operation)
  *                   routed to `/sync/history/remove`, which deletes watch HISTORY, not the plan-to-watch.
  *   - SIMKL anime rides the `shows` array on every write, exactly as Apple does.
  *
- * SESSION-BOUND: the caller captures the provider's session epoch before any suspend and passes it as
- * [expectedEpoch]; a request whose live token/session no longer matches is dropped before it is sent, so
- * one account's library change can never move through another account's credentials. Every method returns
- * true only on a real 2xx; a transport failure (status 0), an auth error, or any non-2xx returns false so
- * the caller can queue an offline retry. Nothing here logs a token.
+ * A fresh request uses its original native origin and provider epoch. Durable work needs an original
+ * start marker, current credential proof and a response that settles that exact submitted title.
  */
 internal object AccountWatchlistClient {
 
@@ -137,18 +133,6 @@ internal object AccountWatchlistClient {
     }
 
     // MARK: - Trakt
-
-    /**
-     * `POST /sync/watchlist` (add) or `/sync/watchlist/remove`. Skips when not signed in, the session
-     * moved, or the token cannot be refreshed. Returns true only on a 2xx.
-     */
-    suspend fun traktWatchlist(add: Boolean, ref: TitleRef, expectedEpoch: Long): Boolean {
-        if (!ref.hasUsableId || !TraktAuth.isSignedIn) return false
-        if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
-        val token = runCatching { TraktAuth.validToken() }.getOrNull() ?: return false
-        if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
-        return sendTraktWatchlist(add, ref, token, ::legacyPost).isSuccess
-    }
 
     suspend fun traktWatchlist(add: Boolean, ref: TitleRef, expectedEpoch: Long,
         origin: NativeLibraryMirrorOrigin): ProviderMirrorResult {
@@ -211,18 +195,6 @@ internal object AccountWatchlistClient {
 
     // MARK: - SIMKL
 
-    /**
-     * `POST /sync/add-to-list` with `to: "plantowatch"`. Series and anime both ride the `shows` array
-     * (Apple's shape). SIMKL has no watchlist-remove, so [simklWatchlistAdd] is the only SIMKL write here.
-     */
-    suspend fun simklWatchlistAdd(ref: TitleRef, expectedEpoch: Long): Boolean {
-        if (!ref.hasUsableId || !SIMKLAuth.isSignedIn) return false
-        if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
-        val token = runCatching { SIMKLAuth.validToken() }.getOrNull() ?: return false
-        if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
-        return sendSimklWatchlistAdd(ref, token, ::legacyPost).isSuccess
-    }
-
     suspend fun simklWatchlistAdd(ref: TitleRef, expectedEpoch: Long,
         origin: NativeLibraryMirrorOrigin): ProviderMirrorResult {
         if (!ref.hasUsableId) return ProviderMirrorResult.REFUSED
@@ -250,9 +222,6 @@ internal object AccountWatchlistClient {
             JSONArray().put(item),
         )
     }
-
-    private suspend fun legacyPost(url: String, headers: Map<String, String>, body: String): IntegrationsHttp.Response =
-        IntegrationsHttp.request("POST", url, headers, body)
 
     private fun simklIds(ref: TitleRef): JSONObject = JSONObject().apply {
         ref.imdb?.takeIf { it.isNotEmpty() }?.let { put("imdb", it) }

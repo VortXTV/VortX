@@ -147,8 +147,6 @@ internal class NativeLibraryMirrorOrigin(
         return result
     }
 
-    /** Legacy queue drain already has its own account-only rewrite boundary. */
-    fun admitDrainRewrite(action: () -> Boolean): Boolean = account(action)
 }
 
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.

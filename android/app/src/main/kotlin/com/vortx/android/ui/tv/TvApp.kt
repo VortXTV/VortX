@@ -12,7 +12,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.MaterialTheme as TvMaterialTheme
@@ -182,6 +185,12 @@ fun TvApp(
         }
 
         val queueApplicationContext = LocalContext.current.applicationContext
+        val watchlistLifecycle = LocalLifecycleOwner.current.lifecycle
+        LaunchedEffect(watchlistLifecycle, activeProfile?.id, syncManager, sessionUiState) {
+            watchlistLifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                if (!fileRecoveryPausedNow()) com.vortx.android.sync.AccountLibrarySync.drainPending(queueApplicationContext)
+            }
+        }
         val playbackQueue = remember(queueApplicationContext) {
             (queueApplicationContext as? VortXApplication)?.playbackQueue
         }
