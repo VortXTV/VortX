@@ -9,6 +9,7 @@ import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.engine.VortxJniBindings
 import com.vortx.android.metadata.MetadataProviderKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
@@ -2221,18 +2222,98 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private suspend fun downloadAccountBackupFileOwned(expected: PickerAccountSnapshot?): ByteArray {
         val capture = captureAccountFileDownload(expected)
             ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+        val response = fetchOwnedAccountFileResponse(capture)
+        try {
+            val file = AccountBackupFile.encodeServerResponse(response, capture.owner.account.username)
+            if (!isAccountFileDownloadCurrent(capture)) {
+                file.fill(0)
+                throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+            }
+            return file
+        } finally { response.fill(0) }
+    }
+
+    /** Owned authenticated raw GET, without conditional cache, application, backup upload or floor writes. */
+    private suspend fun fetchOwnedAccountFileResponse(capture: AccountFileDownload,
+        candidateCurrent: () -> Boolean = { true }): ByteArray {
+        fun current() = candidateCurrent() && isAccountFileDownloadCurrent(capture)
+        if (!current()) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
         val permit = acquireSyncCallPermit(capture.lease)
             ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
-        val (status, _) = request("GET", "/v1/backup", null, bearerToken = capture.lease.token,
-            callPermit = permit, candidateCurrent = { isAccountFileDownloadCurrent(capture) },
-            accountFileDownload = capture)
-        if (!isAccountFileDownloadCurrent(capture)) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
-        if (status == 404) throw AccountBackupFile.Failure(AccountBackupFile.Reason.NO_BACKUP)
-        if (status != 200) throw AccountBackupFile.Failure(AccountBackupFile.Reason.UNAVAILABLE)
-        val response = capture.response ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.DAMAGED)
-        val file = AccountBackupFile.encodeServerResponse(response, capture.owner.account.username)
-        if (!isAccountFileDownloadCurrent(capture)) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
-        return file
+        try {
+            val (status, _) = request("GET", "/v1/backup", null, bearerToken = capture.lease.token,
+                callPermit = permit, candidateCurrent = ::current, accountFileDownload = capture)
+            currentCoroutineContext().ensureActive()
+            if (!current()) throw AccountBackupFile.Failure(AccountBackupFile.Reason.SESSION_CHANGED)
+            if (status == 404) throw AccountBackupFile.Failure(AccountBackupFile.Reason.NO_BACKUP)
+            if (status != 200) throw AccountBackupFile.Failure(AccountBackupFile.Reason.UNAVAILABLE)
+            val raw = capture.response ?: throw AccountBackupFile.Failure(AccountBackupFile.Reason.DAMAGED)
+            capture.response = null // Transfer these exact HTTP bytes to the operation that requested them.
+            return raw
+        } finally {
+            capture.response?.fill(0)
+            capture.response = null
+        }
+    }
+
+    private val accountFileRepairSlot = Mutex()
+
+    /** Only this manager mints the checked owner witness. The worker owns disposable native handles. */
+    internal suspend fun prepareAccountBackupRepair(expected: PickerAccountSnapshot, selected: ByteArray,
+        routeCurrent: () -> Boolean): AccountFileRepairExport {
+        if (selected.size !in 1..AccountBackupFile.MAXIMUM_FILE_BYTES)
+            throw AccountFileRepairFailure(AccountFileRepairReason.INVALID_FILE)
+        val job = currentCoroutineContext()[Job]
+        if (job?.isActive == false || !routeCurrent()) throw kotlinx.coroutines.CancellationException("Account file route retired")
+        val capture = captureAccountFileDownload(expected)
+            ?: throw kotlinx.coroutines.CancellationException("Account file owner retired")
+        val lease = capture.lease
+        val started = System.nanoTime()
+        fun remainingMillis(): Long = accountFileRepairRemainingMillis(started, System.nanoTime())
+        fun current(): Boolean = job?.isActive != false && routeCurrent() && isAccountFileDownloadCurrent(capture)
+        fun requireCurrent() {
+            if (!current()) throw kotlinx.coroutines.CancellationException("Account file repair retired")
+            if (remainingMillis() == 0L) throw AccountFileRepairFailure(AccountFileRepairReason.EXPIRED)
+        }
+        if (!accountFileRepairSlot.tryLock()) throw AccountFileRepairFailure(AccountFileRepairReason.BUSY)
+        val pending = AtomicReference<AccountFileRepairExport?>()
+        var handedOff = false
+        try {
+            requireCurrent()
+            val raw = try {
+                fetchOwnedAccountFileResponse(capture) { job?.isActive != false && routeCurrent() && remainingMillis() > 0L }
+            } catch (_: AccountBackupFile.Failure) {
+                requireCurrent()
+                throw AccountFileRepairFailure(AccountFileRepairReason.OWNER_UNAVAILABLE)
+            }
+            try {
+                requireCurrent()
+                withContext(Dispatchers.Default) {
+                    val key = lease.dataKeyCopy()
+                    try {
+                        val prepared = prepareAccountFileRepair(selected, raw, lease.accountId, key,
+                            lease.operationGeneration, lease.ownerEpoch, { sawDocV2(lease.accountId) },
+                            VortxJniBindings, ::requireCurrent)
+                        pending.set(AccountFileRepairExport(prepared, ::remainingMillis, checkCurrent = {
+                            requireCurrent()
+                            if (!prepared.headWasVersionBound && sawDocV2(lease.accountId))
+                                throw AccountFileRepairFailure(AccountFileRepairReason.OWNER_UNAVAILABLE)
+                        }, saveCurrent = {
+                            current() && (prepared.headWasVersionBound || !sawDocV2(lease.accountId))
+                        }, onClose = { accountFileRepairSlot.unlock() }))
+                    } finally { key.fill(0) }
+                } // Return Unit across dispatcher handoff, so prompt cancellation can clear pending bytes.
+                requireCurrent()
+                val export = checkNotNull(pending.getAndSet(null))
+                handedOff = true
+                return export
+            } finally { raw.fill(0) }
+        } finally {
+            if (!handedOff) {
+                val abandoned = pending.getAndSet(null)
+                if (abandoned == null) accountFileRepairSlot.unlock() else abandoned.close()
+            }
+        }
     }
 
     /** Raw-body collaborator is restricted to this owned download mode; normal sync/auth is unchanged. */
@@ -3823,7 +3904,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) return@withContext 0 to null
                         if (status != 200) return@withContext status to null
                         val raw = opened.inputStream.use(AccountBackupFile::readBoundedResponse)
-                        if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) return@withContext 0 to null
+                        if (!callPermit.isCurrent() || !candidateCurrent() || !isAccountFileDownloadCurrent(accountFileDownload)) {
+                            raw.fill(0)
+                            return@withContext 0 to null
+                        }
                         accountFileDownload.response = raw
                         return@withContext status to null
                     }

@@ -91,6 +91,10 @@ internal class AccountBackupDocuments internal constructor(private val core: Acc
     suspend fun read(source: Uri, isCurrent: () -> Boolean): AccountBackupBytes =
         ownedProviderWork(isCurrent) { check -> core.read(AccountDocumentHandle(source.toString()), check) }
 
+    suspend fun prepareRepairedCopy(bytes: ByteArray, source: AccountBackupBytes,
+        isCurrent: () -> Boolean): AccountBackupBytes =
+        ownedProviderWork(isCurrent) { check -> core.prepareRepairedCopy(bytes, source, check) }
+
     suspend fun saveNewCopy(
         destinationTree: Uri,
         backup: AccountBackupBytes,
@@ -187,7 +191,10 @@ internal class AccountBackupDocumentCore(
         const val JSON_MIME = "application/json"
     }
 
-    fun prepare(bytes: ByteArray, check: () -> Unit): AccountBackupBytes = sanitised {
+    fun prepare(bytes: ByteArray, check: () -> Unit): AccountBackupBytes = prepareCopy(bytes, null, null, check)
+
+    private fun prepareCopy(bytes: ByteArray, source: AccountDocumentHandle?,
+        sourceIdentity: AccountDocumentIdentity?, check: () -> Unit): AccountBackupBytes = sanitised {
         check()
         if (bytes.isEmpty()) documentFailure(AccountBackupDocumentReason.EMPTY)
         if (bytes.size > MAXIMUM_BYTES) documentFailure(AccountBackupDocumentReason.TOO_LARGE)
@@ -196,8 +203,15 @@ internal class AccountBackupDocumentCore(
             try { AccountBackupFile.inspect(snapshot) }
             catch (_: AccountBackupFile.Failure) { documentFailure(AccountBackupDocumentReason.INVALID_BACKUP) }
             check()
-            AccountBackupBytes(snapshot)
+            AccountBackupBytes(snapshot, source, sourceIdentity)
         } finally { snapshot.fill(0) }
+    }
+
+    fun prepareRepairedCopy(bytes: ByteArray, source: AccountBackupBytes, check: () -> Unit): AccountBackupBytes = sanitised {
+        check()
+        val handle = source.source ?: documentFailure(AccountBackupDocumentReason.UNSAFE_DOCUMENT)
+        val identity = source.sourceIdentity ?: documentFailure(AccountBackupDocumentReason.UNSAFE_DOCUMENT)
+        prepareCopy(bytes, handle, identity, check)
     }
 
     fun read(source: AccountDocumentHandle, check: () -> Unit): AccountBackupBytes = sanitised {

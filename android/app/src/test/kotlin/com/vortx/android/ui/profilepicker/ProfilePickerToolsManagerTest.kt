@@ -2,6 +2,10 @@ package com.vortx.android.ui.profilepicker
 
 import com.vortx.android.security.FailClosedCredentialState
 import com.vortx.android.sync.AccountBackupFile
+import com.vortx.android.sync.AccountFileRepairFailure
+import com.vortx.android.sync.AccountFileRepairExport
+import com.vortx.android.sync.AccountFileRepairPrepared
+import com.vortx.android.sync.AccountFileRepairReason
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.PickerSignOutResult
 import com.vortx.android.sync.RenewalBackend
@@ -73,6 +77,65 @@ class ProfilePickerToolsManagerTest {
             runCurrent(); assertTrue(file.cleared); assertTrue(f.controller.state.value.message!!.contains("read back"))
         } finally { f.close() }
     }
+    @Test fun repairCannotUseTheSelectedFileAsOwnerWitnessAndRefusalReleasesTheRealManagerSlot() = runTest {
+        val f = Fixture(backgroundScope)
+        try {
+            val snapshot = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val selected = AccountBackupFile.encodeServerResponse(f.raw, "Fixture", 0L)
+            val original = selected.copyOf()
+            repeat(2) {
+                // The signed-in head authenticates but contains no full roster. A file or hint
+                // cannot create an owner witness; the disposable native worker is not entered.
+                val failure = runCatching { f.manager.prepareAccountBackupRepair(snapshot, selected) { true } }.exceptionOrNull()
+                assertEquals(AccountFileRepairReason.OWNER_UNAVAILABLE, (failure as AccountFileRepairFailure).reason)
+                assertArrayEquals(original, selected)
+            }
+            assertEquals(2, f.gets)
+        } finally { f.close() }
+    }
+
+    @Test fun verifiedExportCanBeTakenOnceAndKeepsItsOriginalSaveFence() {
+        val bytes = byteArrayOf(1, 2, 3)
+        var current = true; var closes = 0
+        val export = AccountFileRepairExport(AccountFileRepairPrepared(bytes, 2, 5, "fixture", true),
+            deadline = { 10 }, checkCurrent = { check(current) }, saveCurrent = { current }, onClose = { closes++ })
+        try {
+            assertFalse(export.canSave())
+            assertSame(bytes, export.take())
+            assertTrue(export.canSave())
+            assertTrue(runCatching { export.take() }.exceptionOrNull() is AccountFileRepairFailure)
+            current = false
+            assertFalse(export.canSave())
+        } finally { export.close(); export.close() }
+        assertEquals(1, closes)
+        assertArrayEquals(byteArrayOf(1, 2, 3), bytes) // Taken bytes belong to the caller.
+        bytes.fill(0)
+    }
+
+    @Test fun exportErasesBytesIfAuthorityRetiresDuringTheOneShotTransfer() {
+        val bytes = byteArrayOf(1, 2, 3)
+        var checks = 0; var closes = 0
+        val export = AccountFileRepairExport(AccountFileRepairPrepared(bytes, 2, 5, "fixture", true),
+            deadline = { 10 }, checkCurrent = { check(++checks < 2) }, saveCurrent = { checks < 2 }, onClose = { closes++ })
+        export.use {
+            assertTrue(runCatching { it.take() }.isFailure)
+            assertArrayEquals(ByteArray(3), bytes)
+            assertFalse(it.canSave())
+        }
+        assertEquals(1, closes)
+    }
+
+    @Test fun retiredRepairRouteCannotIssueAnAuthenticatedOwnerRead() = runTest {
+        val f = Fixture(backgroundScope)
+        try {
+            val snapshot = checkNotNull(f.manager.capturePickerAccountSnapshot())
+            val selected = AccountBackupFile.encodeServerResponse(f.raw, "Fixture", 0L)
+            val failure = runCatching { f.manager.prepareAccountBackupRepair(snapshot, selected) { false } }.exceptionOrNull()
+            assertTrue(failure is java.util.concurrent.CancellationException)
+            assertEquals(0, f.gets)
+        } finally { f.close() }
+    }
+
     @Test fun failedSecureClearKeepsActualSessionButRetiresOldFileAuthority() = runTest {
         val f = Fixture(backgroundScope)
         try {

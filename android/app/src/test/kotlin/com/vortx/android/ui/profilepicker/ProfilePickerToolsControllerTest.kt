@@ -54,6 +54,163 @@ class ProfilePickerToolsControllerTest {
             return Prepared().also { prepared += it }
         }
     }
+    private class Selected : PickerToolsSelectedBackup {
+        val selected = byteArrayOf(4, 5, 6)
+        val output = Prepared()
+        var closed = false
+        var preparations = 0
+        override fun copyBytes() = selected.copyOf()
+        override suspend fun prepareRepairedCopy(bytes: ByteArray, isCurrent: () -> Boolean): PickerToolsPreparedBackup {
+            assertTrue(isCurrent())
+            assertArrayEquals(byteArrayOf(7, 8, 9), bytes)
+            preparations++
+            return output
+        }
+        override fun close() { closed = true }
+    }
+    private class Export : PickerToolsRepairExport {
+        override val profileCount = 2
+        override val nativeSchema = 5
+        override val byteCount = 3
+        override val sha256 = "fixed-synthetic-digest"
+        var releases = 0
+        var closed = false
+        var ownerCurrent = true
+        var expiresInMillis = 60_000L
+        val rawOutput = byteArrayOf(7, 8, 9)
+        override fun remainingMillis() = expiresInMillis
+        override fun canSave() = releases == 1 && !closed && ownerCurrent
+        override fun take(): ByteArray {
+            assertEquals(0, releases)
+            assertFalse(closed)
+            releases++
+            return rawOutput
+        }
+        override fun close() { closed = true }
+    }
+
+    @Test fun repairReadsOriginalOnceAndReleasesOneCopyAfterCurrentPreviewApproval() = runTest {
+        val accounts = Accounts()
+        val file = Selected()
+        val export = Export()
+        var returnedInput: ByteArray? = null
+        var reads = 0
+        val controller = ProfilePickerToolsController(accounts, Preparer(), backgroundScope,
+            repairPreparer = PickerToolsRepairPreparer { owner, bytes, current ->
+                assertTrue(accounts.isCurrent(owner)); assertTrue(current())
+                assertArrayEquals(file.selected, bytes)
+                returnedInput = bytes
+                export
+            })
+        try {
+            val route = controller.attachPicker()
+            controller.open(route)
+            val grant = checkNotNull(controller.renderedActions(route))
+            controller.repair(grant)
+            val request = checkNotNull(controller.state.value.repairInput)
+            controller.repairInputReturned(request) { error("unlaunched input accepted") }
+            assertTrue(controller.claimRepairInputLaunch(request))
+            assertFalse(controller.claimRepairInputLaunch(request))
+            controller.repairInputReturned(request) { current -> assertTrue(current()); reads++; file }
+            controller.repairInputReturned(request) { error("duplicate input accepted") }
+            runCurrent()
+            assertEquals(1, reads)
+            assertEquals(0, accounts.gets) // Only the distinct repair worker owns its head GET.
+            assertArrayEquals(ByteArray(3), checkNotNull(returnedInput))
+            assertEquals(PickerToolsRepairReview(request, 2, 5, 3), controller.state.value.repairReview)
+            assertNull(controller.state.value.destination)
+            assertEquals(0, export.releases)
+            val rotated = controller.attachPicker()
+            controller.confirmRepair(grant, request, approved = true) // stale attachment cannot approve.
+            runCurrent()
+            assertEquals(0, export.releases)
+            val active = checkNotNull(controller.renderedActions(rotated))
+            controller.confirmRepair(active, request, approved = true)
+            controller.confirmRepair(active, request, approved = true)
+            runCurrent()
+            val destination = checkNotNull(controller.state.value.destination)
+            controller.destinationReturned(destination) { _, _ -> error("unlaunched repair destination accepted") }
+            assertTrue(controller.claimDestinationLaunch(destination))
+            controller.destinationReturned(destination) { ready, current ->
+                assertTrue(current())
+                PickerToolsSaveReceipt(ready.byteCount, ready.sha256)
+            }
+            runCurrent()
+            assertEquals(1, export.releases)
+            assertEquals(1, file.preparations)
+            assertArrayEquals(ByteArray(3), export.rawOutput)
+            assertTrue(export.closed && file.closed && file.output.cleared)
+            assertTrue(controller.state.value.message!!.contains("read back successfully"))
+        } finally { controller.close() }
+    }
+
+    @Test fun expiredPreviewRetiresFileAndDoesNotAcceptLateConfirmation() = runTest {
+        val accounts = Accounts(); val file = Selected()
+        val export = Export().also { it.expiresInMillis = 0 }
+        val controller = ProfilePickerToolsController(accounts, Preparer(), backgroundScope,
+            repairPreparer = PickerToolsRepairPreparer { _, _, _ -> export })
+        try {
+            val route = controller.attachPicker(); controller.open(route)
+            val grant = checkNotNull(controller.renderedActions(route)); controller.repair(grant)
+            val request = checkNotNull(controller.state.value.repairInput)
+            assertTrue(controller.claimRepairInputLaunch(request))
+            controller.repairInputReturned(request) { file }; runCurrent()
+            controller.confirmRepair(grant, request, approved = true); runCurrent()
+            assertEquals(0, export.releases); assertTrue(export.closed && file.closed)
+            assertNull(controller.state.value.destination)
+            assertEquals(PickerToolsFailure.REPAIR_EXPIRED.message, controller.state.value.message)
+        } finally { controller.close() }
+    }
+
+    @Test fun lateRepairWorkerCannotReleaseItsPreviewOrFreeTheBusySlotBeforeReturn() = runTest {
+        val accounts = Accounts(); val file = Selected(); val export = Export()
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val controller = ProfilePickerToolsController(accounts, Preparer(), backgroundScope,
+            repairPreparer = PickerToolsRepairPreparer { _, _, current ->
+                withContext(NonCancellable) {
+                    entered.complete(Unit); release.await(); assertFalse(current()); export
+                }
+            })
+        try {
+            val route = controller.attachPicker(); controller.open(route)
+            val grant = checkNotNull(controller.renderedActions(route)); controller.repair(grant)
+            val request = checkNotNull(controller.state.value.repairInput)
+            assertTrue(controller.claimRepairInputLaunch(request))
+            controller.repairInputReturned(request) { file }; runCurrent(); assertTrue(entered.isCompleted)
+            accounts.replaceSameAccount(); runCurrent()
+            val newer = controller.attachPicker(); controller.open(newer)
+            val newerGrant = checkNotNull(controller.renderedActions(newer))
+            controller.download(newerGrant); runCurrent(); assertEquals(0, accounts.gets)
+            controller.repairInputReturned(request) { error("retired source reached a new route") }
+            release.complete(Unit); runCurrent()
+            assertTrue(file.closed && export.closed); assertEquals(0, export.releases)
+            assertNull(controller.state.value.repairReview)
+            controller.download(newerGrant); runCurrent(); assertEquals(1, accounts.gets)
+        } finally { release.complete(Unit); controller.close() }
+    }
+
+    @Test fun accountWitnessLossBeforeDestinationBlocksProviderEvenAfterConfirmedRepair() = runTest {
+        val accounts = Accounts(); val file = Selected(); val export = Export()
+        val controller = ProfilePickerToolsController(accounts, Preparer(), backgroundScope,
+            repairPreparer = PickerToolsRepairPreparer { _, _, _ -> export })
+        try {
+            val route = controller.attachPicker(); controller.open(route)
+            val grant = checkNotNull(controller.renderedActions(route)); controller.repair(grant)
+            val request = checkNotNull(controller.state.value.repairInput)
+            assertTrue(controller.claimRepairInputLaunch(request))
+            controller.repairInputReturned(request) { file }; runCurrent()
+            controller.confirmRepair(grant, request, approved = true); runCurrent()
+            val destination = checkNotNull(controller.state.value.destination)
+            assertTrue(controller.claimDestinationLaunch(destination))
+            export.ownerCurrent = false
+            controller.destinationReturned(destination) { _, _ -> error("revoked key witness reached provider") }
+            runCurrent()
+            assertEquals(1, export.releases)
+            assertTrue(file.closed && export.closed && file.output.cleared)
+            assertNull(controller.state.value.message)
+        } finally { controller.close() }
+    }
+
     @Test fun sameAccountNewEpochBetweenGetAndPublicationCannotReachDestinationAndClearsRaw() = runTest {
         val accounts = Accounts(); val files = Preparer(); val done = CompletableDeferred<Unit>()
         val raw = byteArrayOf(1, 2, 3)

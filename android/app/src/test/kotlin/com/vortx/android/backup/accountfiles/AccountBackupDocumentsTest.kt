@@ -45,6 +45,7 @@ class AccountBackupDocumentsTest {
         val entries = linkedMapOf<String, Entry>()
         var createResult = "new"
         var returnedName: String? = null
+        var returnedIdentity: AccountDocumentIdentity? = null
         var returnedParent: String? = "root"
         var returnedBytes = byteArrayOf()
         var lieAboutEmptySize = false
@@ -105,8 +106,9 @@ class AccountBackupDocumentsTest {
             createCount += 1
             if (!entries.containsKey(createResult)) {
                 val actualSize = if (lieAboutEmptySize) 0 else returnedBytes.size.toLong()
-                entries[createResult] = Entry(meta(createResult, returnedName ?: name, size = actualSize,
-                    modified = returnedLastModified), returnedBytes.copyOf(), returnedParent)
+                val metadata = meta(createResult, returnedName ?: name, size = actualSize, modified = returnedLastModified)
+                entries[createResult] = Entry(metadata.copy(identity = returnedIdentity ?: metadata.identity),
+                    returnedBytes.copyOf(), returnedParent)
             }
             return AccountDocumentHandle(createResult)
         }
@@ -202,6 +204,46 @@ class AccountBackupDocumentsTest {
             assertArrayEquals(accountBytes(), provider.entries.getValue("new").data)
         }
         assertEquals(4, allocations.size) // Source accumulator/result, then readback accumulator/result.
+    }
+
+    @Test fun repairedCopyRetainsOriginalReadIdentityEvenIfProviderRebindsTheInputHandle() {
+        val provider = FakeProvider()
+        val original = accountBytes()
+        provider.add("selected-source", "original.json", original, parent = null)
+        val core = provider.core()
+        core.read(source) {}.use { selected ->
+            val observed = checkNotNull(selected.sourceIdentity)
+            val existing = provider.entries.getValue("selected-source")
+            existing.metadata = existing.metadata.copy(identity = AccountDocumentIdentity("fixture.provider", "rebound"))
+            provider.returnedIdentity = observed
+            core.prepareRepairedCopy(accountBytes(), selected) {}.use { repaired ->
+                assertEquals(observed, repaired.sourceIdentity)
+                failed(AccountBackupDocumentReason.UNSAFE_DOCUMENT) {
+                    core.saveNewCopy(tree, repaired, AccountBackupCopyKind.REPAIRED, check = {})
+                }
+                assertEquals(0, provider.outputOpenCount); assertTrue(provider.deleted.isEmpty())
+                assertArrayEquals(original, existing.data)
+            }
+        }
+    }
+
+    @Test fun repairedCopyUsesSeparateNameAndVerifiesExactEncryptedBytes() {
+        val provider = FakeProvider()
+        val original = accountBytes()
+        provider.add("selected-source", "original.json", original, parent = null)
+        val core = provider.core()
+        val repairedBytes = (original.toString(Charsets.UTF_8) + "\n").toByteArray(Charsets.UTF_8)
+        core.read(source) {}.use { selected ->
+            core.prepareRepairedCopy(repairedBytes, selected) {}.use { repaired ->
+                val receipt = core.saveNewCopy(tree, repaired, AccountBackupCopyKind.REPAIRED, check = {})
+                assertEquals("vortx-account-repaired-$suffix.json", receipt.displayName)
+                assertEquals(repaired.byteCount, receipt.byteCount)
+                assertEquals(repaired.sha256, receipt.sha256)
+                assertTrue(receipt.providerReadbackOnly)
+                assertArrayEquals(repairedBytes, provider.entries.getValue("new").data)
+                assertArrayEquals(original, provider.entries.getValue("selected-source").data)
+            }
+        }
     }
 
     @Test fun oversizedSourceReadWipesTheAccumulatedPrefix() {

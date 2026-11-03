@@ -75,6 +75,13 @@ internal fun ProfilePickerToolsHost(
             ProfilePickerToolsSurface(state, isTv, diagnosticAllowed = runCatching(requiredPolicy).getOrDefault(false),
                 onBack = ::close,
                 onDownload = { actionGrant?.let(controller::download) },
+                onRepair = if (controller.repairAvailable) ({ actionGrant?.let(controller::repair) }) else null,
+                onRepairDecision = { request, approved -> actionGrant?.let { controller.confirmRepair(it, request, approved) } },
+                repairInput = { request ->
+                    key(request.routeId, request.operationId) {
+                        PickerToolsRepairInput(model, request, isTv)
+                    }
+                },
                 onDiagnostics = { actionGrant?.let { grant -> model.diagnostics(grant, context) { requiredPolicy() } } },
                 destination = { request ->
                     // This composition identity and callback both belong to the original request.
@@ -126,6 +133,28 @@ private fun PickerToolsDestination(model: ProfilePickerToolsViewModel, request: 
     }
 }
 
+/** The selected URI is delivered only to the original operation and never enters saved state. */
+@Composable
+private fun PickerToolsRepairInput(model: ProfilePickerToolsViewModel, request: PickerToolsRepairInputRequest, isTv: Boolean) {
+    val registry = LocalActivityResultRegistryOwner.current?.activityResultRegistry
+    var launcher by remember(registry, request) { mutableStateOf<ActivityResultLauncher<Array<String>>?>(null) }
+    DisposableEffect(registry, request) {
+        val originalRequest = request
+        val registered = registry?.register("picker-tools-input-${request.routeId}-${request.operationId}",
+            ActivityResultContracts.OpenDocument()) { uri -> model.repairInputReturned(originalRequest, uri) }
+        launcher = registered
+        onDispose { registered?.unregister(); launcher = null }
+    }
+    PickerToolsButton("Choose backup file", isTv, true, Modifier.testTag("picker-tools-repair-input")) {
+        if (!model.controller.claimRepairInputLaunch(request)) return@PickerToolsButton
+        val originalLauncher = launcher
+        if (originalLauncher == null) model.controller.repairInputRefused(request, PickerToolsFailure.NO_FILE_PROVIDER)
+        else try { originalLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }
+        catch (_: ActivityNotFoundException) { model.controller.repairInputRefused(request, PickerToolsFailure.NO_FILE_PROVIDER) }
+        catch (_: SecurityException) { model.controller.repairInputRefused(request, PickerToolsFailure.DESTINATION_UNAVAILABLE) }
+    }
+}
+
 @Composable
 internal fun ProfilePickerToolsSurface(
     state: PickerToolsState,
@@ -133,6 +162,9 @@ internal fun ProfilePickerToolsSurface(
     diagnosticAllowed: Boolean,
     onBack: () -> Unit,
     onDownload: () -> Unit,
+    onRepair: (() -> Unit)?,
+    onRepairDecision: (PickerToolsRepairInputRequest, Boolean) -> Unit,
+    repairInput: @Composable (PickerToolsRepairInputRequest) -> Unit,
     onDiagnostics: () -> Unit,
     destination: @Composable (PickerToolsDestinationRequest) -> Unit,
 ) {
@@ -142,17 +174,34 @@ internal fun ProfilePickerToolsSurface(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Tools", style = VortXTheme.type.sectionTitle)
-        Text("Save an encrypted copy of your signed-in VortX account backup, or share a diagnostic log.",
+        Text("Download an encrypted account backup, repair a selected backup into a separate copy, or share a diagnostic log.",
             style = VortXTheme.type.body, modifier = Modifier.widthIn(max = 680.dp))
         PickerToolsButton("Back to profiles", isTv, true,
             Modifier.focusRequester(firstFocus).testTag("picker-tools-back"), onBack)
         PickerToolsButton("Download backup", isTv, !state.busy, Modifier.testTag("picker-tools-download"), onDownload)
+        if (onRepair != null)
+            PickerToolsButton("Repair backup", isTv, !state.busy, Modifier.testTag("picker-tools-repair"), onRepair)
         if (diagnosticAllowed) PickerToolsButton("Save or share diagnostic log", isTv, !state.busy,
             Modifier.testTag("picker-tools-diagnostics"), onDiagnostics)
         else Text("Diagnostic sharing is unavailable while profiles are locked or their roster is unavailable.",
             style = VortXTheme.type.label, modifier = Modifier.widthIn(max = 680.dp))
         when (state.phase) {
             PickerToolsPhase.DOWNLOADING -> Text("Downloading encrypted account backup…")
+            PickerToolsPhase.CHOOSING_REPAIR_INPUT -> {
+                Text("Choose an encrypted VortX backup for your signed-in account.")
+                state.repairInput?.let { repairInput(it) }
+            }
+            PickerToolsPhase.PREPARING_REPAIR -> Text("Checking the selected backup and preparing a repaired copy…")
+            PickerToolsPhase.REVIEWING_REPAIR -> state.repairReview?.let { review ->
+                Text("Ready to save a repaired encrypted copy with ${review.profileCount} profiles (schema ${review.nativeSchema}, ${review.byteCount} bytes).")
+                Text("The original backup and your cloud backup will stay in place.")
+                PickerToolsButton("Save repaired copy", isTv, true, Modifier.testTag("picker-tools-repair-confirm")) {
+                    onRepairDecision(review.request, true)
+                }
+                PickerToolsButton("Cancel repair", isTv, true, Modifier.testTag("picker-tools-repair-cancel")) {
+                    onRepairDecision(review.request, false)
+                }
+            }
             PickerToolsPhase.AWAITING_DESTINATION -> {
                 Text("Choose a folder for a separate new copy. Your existing files will stay in place.")
                 state.destination?.let { destination(it) }
@@ -164,7 +213,7 @@ internal fun ProfilePickerToolsSurface(
         }
         state.message?.let { Text(it, style = VortXTheme.type.body,
             modifier = Modifier.widthIn(max = 680.dp).semantics { liveRegion = LiveRegionMode.Polite }.testTag("picker-tools-status")) }
-        Text("Account-file repair and restore are not available here yet.", style = VortXTheme.type.label,
+        Text("Account-file restore is not available here yet.", style = VortXTheme.type.label,
             modifier = Modifier.widthIn(max = 680.dp))
     }
     LaunchedEffect(Unit) { withFrameNanos { }; runCatching { firstFocus.requestFocus() } }

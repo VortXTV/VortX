@@ -10,7 +10,10 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.backup.accountfiles.AccountBackupBytes
+import com.vortx.android.backup.accountfiles.AccountBackupCopyKind
 import com.vortx.android.backup.accountfiles.AccountBackupDocuments
+import com.vortx.android.sync.AccountFileRepairFailure
+import com.vortx.android.sync.AccountFileRepairReason
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.profilepicker.PickerToolsAccounts
@@ -20,6 +23,10 @@ import com.vortx.android.ui.profilepicker.PickerToolsDestinationRequest
 import com.vortx.android.ui.profilepicker.PickerToolsException
 import com.vortx.android.ui.profilepicker.PickerToolsFailure
 import com.vortx.android.ui.profilepicker.PickerToolsPreparedBackup
+import com.vortx.android.ui.profilepicker.PickerToolsRepairExport
+import com.vortx.android.ui.profilepicker.PickerToolsRepairInputRequest
+import com.vortx.android.ui.profilepicker.PickerToolsRepairPreparer
+import com.vortx.android.ui.profilepicker.PickerToolsSelectedBackup
 import com.vortx.android.ui.profilepicker.PickerToolsSaveReceipt
 import com.vortx.android.ui.profilepicker.PickerToolsWorkGate
 import com.vortx.android.ui.profilepicker.ProfilePickerToolsController
@@ -44,12 +51,21 @@ private object UnavailablePickerToolsAccounts : PickerToolsAccounts {
     override fun isCurrent(original: PickerAccountSnapshot) = false
     override suspend fun download(original: PickerAccountSnapshot): ByteArray = throw PickerToolsException(PickerToolsFailure.SAVE_FAILED)
 }
-private class SafPickerToolsBackup(val bytes: AccountBackupBytes) : PickerToolsPreparedBackup {
+private class SafPickerToolsBackup(val bytes: AccountBackupBytes,
+    val kind: AccountBackupCopyKind = AccountBackupCopyKind.ACCOUNT) : PickerToolsPreparedBackup {
     override val byteCount get() = bytes.byteCount
     override val sha256 get() = bytes.sha256
     override fun close() = bytes.close()
     override fun toString() = "SafPickerToolsBackup"
 }
+private fun AccountFileRepairFailure.toPickerRefusal() = PickerToolsException(when (reason) {
+    AccountFileRepairReason.BUSY -> PickerToolsFailure.REPAIR_BUSY
+    AccountFileRepairReason.ALREADY_REPAIRED -> PickerToolsFailure.ALREADY_REPAIRED
+    AccountFileRepairReason.OWNER_UNAVAILABLE -> PickerToolsFailure.REPAIR_OWNER_UNAVAILABLE
+    AccountFileRepairReason.ACCOUNT_UNSUPPORTED -> PickerToolsFailure.REPAIR_ACCOUNT_UNSUPPORTED
+    AccountFileRepairReason.EXPIRED -> PickerToolsFailure.REPAIR_EXPIRED
+    AccountFileRepairReason.INVALID_FILE -> PickerToolsFailure.INVALID_REPAIR_FILE
+})
 
 /** Activity-owned, ephemeral only. It retains neither an Activity nor any SavedStateHandle/Bundle. */
 internal class ProfilePickerToolsViewModel private constructor(
@@ -64,17 +80,46 @@ internal class ProfilePickerToolsViewModel private constructor(
             ProfilePickerToolsController(manager?.let(::ManagerPickerToolsAccounts) ?: UnavailablePickerToolsAccounts,
                 PickerToolsBackupPreparer { bytes, current ->
                     SafPickerToolsBackup(checkNotNull(model.documents).prepare(bytes, current))
-                }, model.viewModelScope, workGate)
+                }, model.viewModelScope, workGate, manager?.let { source ->
+                    PickerToolsRepairPreparer { owner, bytes, current ->
+                        val operation = try { source.prepareAccountBackupRepair(owner, bytes, current) }
+                        catch (refusal: AccountFileRepairFailure) { throw refusal.toPickerRefusal() }
+                        object : PickerToolsRepairExport {
+                            override val profileCount get() = operation.profileCount
+                            override val nativeSchema get() = operation.nativeSchema
+                            override val byteCount get() = operation.byteCount
+                            override val sha256 get() = operation.sha256
+                            override fun remainingMillis() = operation.remainingMillis()
+                            override fun canSave() = operation.canSave()
+                            override fun take() = try { operation.take() }
+                                catch (refusal: AccountFileRepairFailure) { throw refusal.toPickerRefusal() }
+                            override fun close() = operation.close()
+                        }
+                    }
+                })
         },
     )
     /** Test collaborator replaces I/O/transport only; the actual controller and route/slot logic remain. */
     internal constructor(controller: ProfilePickerToolsController) : this(null, { controller })
+    fun repairInputReturned(request: PickerToolsRepairInputRequest, uri: Uri?) {
+        if (uri == null) { controller.repairInputRefused(request); return }
+        controller.repairInputReturned(request) { current ->
+            val provider = checkNotNull(documents)
+            val source = provider.read(uri, current)
+            object : PickerToolsSelectedBackup {
+                override fun copyBytes() = source.copyBytes()
+                override suspend fun prepareRepairedCopy(bytes: ByteArray, isCurrent: () -> Boolean) =
+                    SafPickerToolsBackup(provider.prepareRepairedCopy(bytes, source, isCurrent), AccountBackupCopyKind.REPAIRED)
+                override fun close() = source.close()
+            }
+        }
+    }
     fun destinationReturned(request: PickerToolsDestinationRequest, tree: Uri?) {
         if (tree == null) { controller.destinationRefused(request); return }
         controller.destinationReturned(request) { prepared, current ->
             val original = prepared as? SafPickerToolsBackup
                 ?: throw PickerToolsException(PickerToolsFailure.WRONG_RECEIPT)
-            val receipt = checkNotNull(documents).saveNewCopy(tree, original.bytes, isCurrent = current)
+            val receipt = checkNotNull(documents).saveNewCopy(tree, original.bytes, kind = original.kind, isCurrent = current)
             PickerToolsSaveReceipt(receipt.byteCount, receipt.sha256)
         }
     }
