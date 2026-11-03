@@ -388,10 +388,12 @@ final class MediaServerCoordinator {
     static let shared = MediaServerCoordinator()
 
     private var providers: [any MediaServerProviding] = []
+    private var installedConfiguration: [MediaServerConfig] = []
 
     /// (Re)build providers from the given configs. Call after a config changes (the future Settings surface
     /// will own the config list, like `DebridKeys` owns debrid keys). Unusable configs are skipped.
     func reload(configs: [MediaServerConfig]) {
+        installedConfiguration = configs
         providers = configs.compactMap { config in
             switch config.kind {
             // Jellyfin AND Emby share the same REST surface + X-Emby-Token auth, so one actor serves both.
@@ -399,6 +401,11 @@ final class MediaServerCoordinator {
             case .plex: return PlexProvider(config: config)
             }
         }
+    }
+
+    /// Local configuration publication readback, not remote authentication or reachability.
+    func matchesInstalledConfiguration(_ configs: [MediaServerConfig]) -> Bool {
+        installedConfiguration == configs && providers.count == configs.count
     }
 
     var hasAnyProvider: Bool { !providers.isEmpty }

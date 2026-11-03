@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 
 /// Local record of the personal media servers (Plex / Jellyfin / Emby) the user has connected. Mirrors the
 /// `DebridKeys` / `IPTVPlaylistStore` split: the NON-secret management metadata (display name, kind, ordered
@@ -175,9 +176,15 @@ final class MediaServerStore: ObservableObject {
 
     /// Rebuild the coordinator's providers from the current servers. Hops to the main actor because the
     /// coordinator is `@MainActor` (mirrors `DebridKeys.setKey` -> `DebridCoordinator.reload`).
+    private var coordinatorReloadGeneration = UUID()
+    private var coordinatorReloadTask: Task<Void, Never>?
     private func reloadCoordinator() {
-        let built = configs()
-        Task { @MainActor in MediaServerCoordinator.shared.reload(configs: built) }
+        let built = configs(), generation = UUID()
+        coordinatorReloadGeneration = generation
+        coordinatorReloadTask = Task { @MainActor [weak self] in
+            guard self?.coordinatorReloadGeneration == generation else { return }
+            MediaServerCoordinator.shared.reload(configs: built)
+        }
     }
 
     // MARK: Persistence
@@ -331,4 +338,173 @@ final class MediaServerStore: ObservableObject {
         if let data = try? JSONEncoder().encode(servers) { UserDefaults.standard.set(data, forKey: Self.listKey) }
         reloadCoordinator()
     }
+    // MARK: - Source-bound received-provider settlement
+
+    enum SyncSettlementRefusal: String, Sendable { case superseded, busy, malformed, credentialUnavailable, persistenceUnverified, publicationUnverified }
+    struct SyncSettlementReceipt: Sendable {
+        private let digest: Data
+        private let operationID: UUID
+        fileprivate init(source: String, operationID: UUID) {
+            digest = AccountProviderSyncBlob.digest(source); self.operationID = operationID
+        }
+        func matches(source: String, operationID: UUID) -> Bool {
+            self.operationID == operationID && digest == AccountProviderSyncBlob.digest(source)
+        }
+    }
+    enum SyncSettlement: Sendable { case settled(SyncSettlementReceipt), refused(SyncSettlementRefusal) }
+    /// Explicit effects for the actual algorithm's disposable fixture. Production always constructs
+    /// the real Keychain/defaults/coordinator adapter; the alternate initializer is test-flag-only.
+    struct SyncSettlementIO {
+        var credential: (String) -> CredentialDurableReadResult
+        var confirmedRead: (String, () -> Bool) -> KeychainFailureClosedStore.ConfirmedRead?
+        var compare: (KeychainFailureClosedStore.ConfirmedRead, String?, String, () -> Bool) -> CredentialMutationResult
+        var list: () throws -> Data?
+        var removed: () throws -> [String: Double]
+        var synchronize: () -> Bool
+        var persist: (Data, [String: Double], () -> Bool) -> Bool
+        var coordinator: ([MediaServerConfig]) -> Bool
+    }
+    #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+    private var settlementFixtureIO: SyncSettlementIO?
+    init(settlementFixtureIO: SyncSettlementIO, servers: [MediaServerRecord] = []) {
+        self.settlementFixtureIO = settlementFixtureIO; self.servers = servers
+    }
+    func fixtureQueueLegacyCoordinatorReload() { reloadCoordinator() }
+    func fixtureDrainLegacyCoordinatorReload() async { await coordinatorReloadTask?.value }
+    #endif
+    private func receivedSettlementIO() -> SyncSettlementIO {
+        #if ACCOUNT_PROVIDER_SETTLEMENT_TESTING
+        if let settlementFixtureIO { return settlementFixtureIO }
+        #endif
+        return .init(credential: { Keychain.confirmedString($0) },
+            confirmedRead: { Keychain.confirmedRead($0, isCurrentOwner: $1) },
+            compare: { Keychain.compareAndSetConfirmed($0, with: $1, for: $2, isCurrentOwner: $3) },
+            list: { try AccountProviderSyncBlob.defaultsData(UserDefaults.standard.object(forKey: Self.listKey)) },
+            removed: { try AccountProviderSyncBlob.defaultsRemoved(UserDefaults.standard.object(forKey: Self.removedKey)) },
+            synchronize: { UserDefaults.standard.synchronize() },
+            persist: { bytes, removed, owns in
+                guard owns() else { return false }
+                UserDefaults.standard.set(removed, forKey: Self.removedKey)
+                guard owns() else { return false }
+                UserDefaults.standard.set(bytes, forKey: Self.listKey)
+                return owns() && UserDefaults.standard.synchronize()
+            }, coordinator: { configs in
+                MediaServerCoordinator.shared.reload(configs: configs)
+                return MediaServerCoordinator.shared.matchesInstalledConfiguration(configs)
+            })
+    }
+    /// Synchronous MainActor apply, genuinely finished before return. The caller retains the original
+    /// receive UUID and checks account/key/epoch/cancellation in isCurrent before every effect. The
+    /// publication boundary prevents owner rebinding inside secure/defaults callbacks; it never waits.
+    func applySyncBlobSettled(_ json: String, operationID: UUID,
+                              isCurrent: @escaping () -> Bool) -> SyncSettlement {
+        let owns: () -> Bool = { !Task.isCancelled && isCurrent() }
+        guard owns() else { return .refused(.superseded) }
+        guard CredentialPublicationOutbox.acquireBoundary() == .acquired else { return .refused(.busy) }
+        defer { CredentialPublicationOutbox.endBoundary() }
+        let io = receivedSettlementIO()
+        var failureStage = SyncSettlementRefusal.malformed
+        do {
+            let root = try AccountProviderSyncBlob.root(json)
+            let remote = try AccountProviderSyncBlob.rows(root, "servers")
+            let remoteRemoved = try AccountProviderSyncBlob.removed(root)
+            failureStage = .persistenceUnverified
+            guard owns(), io.synchronize(), owns() else { return .refused(.persistenceUnverified) }
+            let originalData = try io.list(), originalRemoved = try io.removed()
+            let original = try originalData.map { try JSONDecoder().decode([MediaServerRecord].self, from: $0) } ?? []
+            guard original == servers, Set(original.map(\.id)).count == original.count,
+                  original.allSatisfy({ AccountProviderSyncBlob.validDate($0.addedAt) }) else { return .refused(.persistenceUnverified) }
+            var removed = originalRemoved
+            for (id, stamp) in remoteRemoved where stamp > (removed[id] ?? 0) { removed[id] = stamp }
+            let effectiveRemoved = removed.reduce(into: [UUID: Double]()) { result, entry in
+                if let id = UUID(uuidString: entry.key), entry.value > (result[id] ?? -Double.infinity) { result[id] = entry.value }
+            }
+            var records = Dictionary(uniqueKeysWithValues: original.map { ($0.id, $0) })
+            // Each slot keeps its original actual read capability throughout planning. Coalesce a
+            // delete followed by a newer remote re-add to one final CAS against that same read;
+            // never fabricate a missing-state capability after a merely planned deletion.
+            var actions: [String: (KeychainFailureClosedStore.ConfirmedRead, String?)] = [:]
+            var actionOrder: [String] = []
+            var observations: [String: KeychainFailureClosedStore.ConfirmedRead] = [:]
+            var credentials: [String: CredentialDurableReadResult] = [:]
+            // A tombstone-only source must retire older local records too. A newer local
+            // re-add wins; no absent remote row is interpreted as deletion.
+            for record in original {
+                if let stamp = effectiveRemoved[record.id], stamp > record.addedAt.timeIntervalSince1970 * 1000 {
+                    let slot = tokenAccount(record.id)
+                    guard let observation = io.confirmedRead(slot, owns) else { return .refused(.credentialUnavailable) }
+                    observations[slot] = observation
+                    let prior = observation.result
+                    if prior != .missing { actions[slot] = (observation, nil); actionOrder.append(slot) }
+                    credentials[slot] = .missing; records.removeValue(forKey: record.id)
+                }
+            }
+            var seen: Set<UUID> = []
+            failureStage = .malformed
+            for row in remote {
+                let idText = try AccountProviderSyncBlob.string(row, "id")
+                guard let id = UUID(uuidString: idText), seen.insert(id).inserted,
+                      let kind = MediaServerKind(rawValue: try AccountProviderSyncBlob.string(row, "kind")),
+                      let urlsRaw = row["urls"] else { return .refused(.malformed) }
+                let urls = try JSONDecoder().decode([String].self, from: urlsRaw)
+                let name = try AccountProviderSyncBlob.string(row, "name")
+                let date = try AccountProviderSyncBlob.date(row, "addedAt")
+                let user = try AccountProviderSyncBlob.string(row, "userId", default: "")
+                let machine = try AccountProviderSyncBlob.optionalString(row, "machineId")
+                let incomingToken = try AccountProviderSyncBlob.optionalString(row, "token")
+                let slot = tokenAccount(id)
+                guard owns() else { return .refused(.superseded) }
+                if let stamp = effectiveRemoved[id], stamp > date.timeIntervalSince1970 * 1000 { continue }
+                if let local = records[id], local.addedAt > date { continue }
+                if observations[slot] == nil {
+                    guard let observation = io.confirmedRead(slot, owns) else { return .refused(.credentialUnavailable) }
+                    observations[slot] = observation
+                }
+                guard let observation = observations[slot] else { return .refused(.credentialUnavailable) }
+                let prior = credentials[slot] ?? observation.result
+                var accepted = try AccountProviderSyncBlob.value(prior)
+                if (accepted ?? "").isEmpty, let incomingToken, !incomingToken.isEmpty {
+                    if actions[slot] == nil { actionOrder.append(slot) }
+                    actions[slot] = (observation, incomingToken); accepted = incomingToken
+                    credentials[slot] = .value(incomingToken)
+                } else { credentials[slot] = prior }
+                records[id] = MediaServerRecord(id: id, name: name, kind: kind, urls: urls, userId: user,
+                    machineId: machine, addedAt: date, needsReauth: (accepted ?? "").isEmpty)
+            }
+            // Parsing/planning finished before the first credential mutation. A lost local compare
+            // refuses instead of overwriting; completed earlier effects are not rolled back blindly.
+            for slot in actionOrder {
+                guard let (expected, value) = actions[slot] else { return .refused(.credentialUnavailable) }
+                guard owns() else { return .refused(.superseded) }
+                guard io.compare(expected, value, slot, owns) == .success,
+                      AccountProviderSyncBlob.sameCredential((io.confirmedRead(slot, owns)?.result ?? .failure), value.map(CredentialDurableReadResult.value) ?? .missing)
+                else { return .refused(.credentialUnavailable) }
+            }
+            let next = records.values.sorted { $0.addedAt == $1.addedAt ? $0.id.uuidString < $1.id.uuidString : $0.addedAt > $1.addedAt }
+            var configs: [MediaServerConfig] = []
+            for record in next {
+                let slot = tokenAccount(record.id), actual = (io.confirmedRead(tokenAccount(record.id), owns)?.result ?? .failure)
+                guard actual != .failure else { return .refused(.credentialUnavailable) }
+                if let expected = credentials[slot], !AccountProviderSyncBlob.sameCredential(actual, expected) { return .refused(.credentialUnavailable) }
+                credentials[slot] = actual
+                if let token = try AccountProviderSyncBlob.value(actual), !token.isEmpty, let base = record.urls.first {
+                    configs.append(.init(kind: record.kind, baseURL: base, apiKey: token, userId: record.userId,
+                        id: record.id, displayName: record.name, urls: record.urls))
+                }
+            }
+            guard owns(), try io.list() == originalData, try io.removed() == originalRemoved else { return .refused(.persistenceUnverified) }
+            failureStage = .persistenceUnverified
+            let bytes = try JSONEncoder().encode(next)
+            guard io.persist(bytes, removed, owns), owns(), try io.list() == bytes, try io.removed() == removed else { return .refused(.persistenceUnverified) }
+            coordinatorReloadGeneration = UUID() // Retire older queued coordinator projections.
+            servers = next
+            guard owns(), servers == next, io.coordinator(configs), owns() else { return .refused(.publicationUnverified) }
+            for (slot, expected) in credentials {
+                guard AccountProviderSyncBlob.sameCredential((io.confirmedRead(slot, owns)?.result ?? .failure), expected) else { return .refused(.credentialUnavailable) }
+            }
+            guard owns(), try io.list() == bytes, try io.removed() == removed, servers == next else { return .refused(.persistenceUnverified) }
+            return .settled(.init(source: json, operationID: operationID))
+        } catch { return .refused(owns() ? failureStage : .superseded) }
+    }
+
 }
