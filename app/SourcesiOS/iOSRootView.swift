@@ -405,10 +405,10 @@ struct iOSRootView: View {
         // MacProfileCoverHost / MacRootProfileCoverOverlay) instead of a content-sized `.sheet` that
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
-        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerAdmission: profiles.manualPickerToolsAdmission(), manualPickerDismissal: profiles.manualPickerDismissal()) }
+        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
         #else
         shellWithTabPreferenceRouting
-            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerAdmission: profiles.manualPickerToolsAdmission(), manualPickerDismissal: profiles.manualPickerDismissal()) }
+            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation()) }
         #endif
     }
 

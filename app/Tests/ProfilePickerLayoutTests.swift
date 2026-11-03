@@ -59,7 +59,7 @@ enum ProfilePickerLayoutTests {
         precondition(pin.contains("pinTarget = profile"))
         precondition(pin.contains("pinCredential = CredentialScopeRegistry.shared.capture()"),
                      "A PIN prompt retains the credential generation it was opened under")
-        precondition(picker.contains(".disabled(pinTarget != nil || profileAction.isRunning)"))
+        precondition(picker.contains(".disabled(manualPINPending || pinTarget != nil || profileAction.isRunning)"))
         precondition(!picker.contains("nativeUnsupportedSettings"))
         precondition(!picker.contains("Reconnect the owner's Stremio account"))
         precondition(picker.contains("if !nativeSync.isSignedIn"))
@@ -150,7 +150,7 @@ enum ProfilePickerLayoutTests {
               picker.components(separatedBy: access).count == 2,
               picker.components(separatedBy: start).count == 2,
               picker.components(separatedBy: end).count == 2,
-              let grid = picker.range(of: ".disabled(pinTarget != nil || profileAction.isRunning)"),
+              let grid = picker.range(of: ".disabled(manualPINPending || pinTarget != nil || profileAction.isRunning)"),
               let insetRange = picker.range(of: inset), let controlRange = picker.range(of: access),
               grid.lowerBound < insetRange.lowerBound, insetRange.lowerBound < controlRange.lowerBound,
               let helpStart = picker.range(of: start), let helpEnd = picker.range(of: end),
@@ -158,8 +158,8 @@ enum ProfilePickerLayoutTests {
         let help = String(picker[helpStart.upperBound..<helpEnd.lowerBound])
         let accountInset = String(picker[insetRange.upperBound..<helpStart.lowerBound])
         return accountInset.contains("onSignIn: {\n                                    openAccountHelp()")
-            && accountInset.contains(".disabled(pinTarget != nil)")
-            && accountInset.contains(".accessibilityHidden(pinTarget != nil)")
+            && accountInset.contains(".disabled(manualPINPending || pinTarget != nil)")
+            && accountInset.contains(".accessibilityHidden(manualPINPending || pinTarget != nil)")
             && help.contains("deferredSelection.cancel()")
             && help.contains("accountHelpAllowsDiagnostics = exportAllowedBeforeProfile && pinTarget == nil")
             && help.contains("accountHelpDiagnosticCredential = CredentialScopeRegistry.shared.capture()")

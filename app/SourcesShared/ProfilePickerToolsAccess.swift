@@ -20,6 +20,18 @@ struct ProfilePickerToolsDiagnosticGrant: Sendable {
     }
 }
 
+/// A pending manual PIN must be both mounted and active. Captured SwiftUI View values may
+/// retain an old scenePhase, so queued verification callbacks consult this live actor reference.
+@MainActor
+final class ProfilePickerPINInteractionAdmission {
+    private var mounted = false
+    private var active = false
+    var permitsVerification: Bool { mounted && active }
+    func appear(isActive: Bool) { mounted = true; active = isActive }
+    func sceneDidChange(isActive: Bool) { active = isActive }
+    func disappear() { mounted = false; active = false }
+}
+
 /// Live reference, not a SwiftUI Environment snapshot. Retirement is one-way for the route.
 @MainActor
 final class ProfilePickerToolsRouteAdmission {

@@ -45,13 +45,20 @@ function member(source, signature) {
 const inset = member(picker, '.safeAreaInset(edge: .bottom)');
 const recoveryButton = member(picker, '@ViewBuilder private var toolsButton:');
 const tools = sources['app/SourcesShared/ProfilePickerToolsView.swift'];
-assert(inset.includes('toolsButton') && !inset.includes('profileAction.isRunning'));
+// Back deliberately waits for an owned profile action; Tools itself stays reachable on failure.
+assert(inset.includes('toolsButton'));
+assert(inset.includes('if manualPickerDismissal != nil')
+  && inset.includes('Button("Back") { closeManualPicker() }')
+  && inset.includes('.disabled(profileAction.isRunning || accountAuthentication.blocksDismissal)'));
 assert(tools.includes('DiagnosticLogExportButton(grant: route.diagnostics)')
   && !recoveryButton.includes('profileAction.isRunning'));
 assert(inset.includes('.frame(maxWidth: .infinity)') && inset.includes('.profileFocusSection()'));
 assert(recoveryButton.includes('.focused($diagnosticFocused)') && recoveryButton.includes('focusDiagnosticRecovery()'));
-assert(picker.indexOf('.safeAreaInset(edge: .bottom)') > picker.indexOf('.disabled(pinTarget != nil || profileAction.isRunning)'));
-assert(inset.includes('.disabled(pinTarget != nil)') && inset.includes('.accessibilityHidden(pinTarget != nil)'));
+const pickerGridGate = picker.indexOf('.disabled(manualPINPending || pinTarget != nil || profileAction.isRunning)');
+const pickerAccountInset = picker.indexOf('.safeAreaInset(edge: .bottom)');
+assert(pickerGridGate >= 0 && pickerAccountInset > pickerGridGate,
+  'account tools must follow the real protected-PIN/profile-work grid gate');
+assert(inset.includes('.disabled(manualPINPending || pinTarget != nil)') && inset.includes('.accessibilityHidden(manualPINPending || pinTarget != nil)'));
 // A PIN-protected profile keeps the whole-device log behind a profile unlock, except when loading failed.
 assert(member(picker, 'private func diagnosticGrant()').includes('exportAllowedBeforeProfile && pinTarget == nil'));
 assert(tools.includes('.disabled(!route.diagnostics.permitsExport)'));

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 
 // Generated fixture executes the actual production picker methods and selected event callbacks.
 // It does not instantiate SwiftUI, the app, Keychain, checkpoint storage, or any account client.
@@ -25,7 +26,7 @@ struct UserProfile: Equatable {
     var accentID = "test"
     var pin: String?
     var isKids = false
-    var hasPin: Bool { pin != nil }
+    /* ACTUAL_PIN_VERIFIER */
 }
 
 // Explicit account-scope collaborators for actual openTools route capture. No account I/O.
@@ -73,6 +74,9 @@ enum CredentialScope: Equatable, Sendable {
     }
 }
 
+// The actual nested presentation type is extracted into FakeStore without changing its body.
+typealias ProfileStore = FakeStore
+
 @MainActor final class FakeCore {
     struct Admission {
         let owner: CredentialScopeRegistry.Capture
@@ -99,6 +103,8 @@ enum CredentialScope: Equatable, Sendable {
     var account: Account? = .init(id: "fixture-account")
     var accountReconnectRequired = false
     var preparations = 0
+    var signOuts = 0
+    func signOut() { signOuts += 1 }
     var continuation: CheckedContinuation<Bool, Never>?
     func prepareNativeProfileSelection(credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
         preparations += 1
@@ -134,14 +140,48 @@ enum FakeScene { case active, background }
     func credentialDidChange() { credentialChanges += 1 }
     func dismiss(_ id: UUID) { dismissed.append(id) }
 }
+// Exact input/Unlock callback bodies; this inert object does not instantiate SwiftUI.
+@MainActor final class PINOverlayHarness {
+    let profile: UserProfile
+    let onUnlock: () -> Void
+    let onCancel: () -> Void
+    var input = ""
+    var wrong = false
+    init(profile: UserProfile, onUnlock: @escaping () -> Void, onCancel: @escaping () -> Void) {
+        self.profile = profile; self.onUnlock = onUnlock; self.onCancel = onCancel
+    }
+    func enter(_ raw: String) {
+        input = raw
+        /* ACTUAL_PIN_INPUT_CHANGE */
+    }
+    func pressUnlock() { /* ACTUAL_PIN_UNLOCK */
+    }
+    func cancel() { onCancel() } // The actual Cancel button is verified to dispatch this callback.
+}
+
+// The actual account-control confirmation body, with an inert account client.
+@MainActor final class PickerAccountControlsHarness {
+    let sync: FakeSync
+    let admission: () -> Bool
+    var signOutAccountID: String?
+    var signOutCredential: CredentialScopeRegistry.Capture?
+    var retirements = 0
+    init(sync: FakeSync, admission: @escaping () -> Bool) {
+        self.sync = sync; self.admission = admission
+        signOutAccountID = sync.account?.id
+        signOutCredential = CredentialScopeRegistry.shared.capture()
+    }
+    func beforeConfirmedSignOut() { retirements += 1 }
+    func confirm() { /* ACTUAL_SIGN_OUT_CONFIRM */
+    }
+}
+
 // The root setter bodies are production-extracted; these are explicit presentation collaborators.
 @MainActor final class PickerRootHarness {
     let profiles: FakeStore
     let profileAuthentication = FakeAuthentication()
     init(_ profiles: FakeStore) { self.profiles = profiles }
-    func admissionAtConstruction() -> @MainActor @Sendable () -> Bool { /* ACTUAL_ROOT_PICKER_ARGUMENT */
-    }
-    func dismissalAtConstruction() -> (@MainActor @Sendable () -> Void)? { /* ACTUAL_ROOT_PICKER_DISMISSAL_ARGUMENT */
+    func presentationAtConstruction() -> ProfileStore.PickerPresentation { /* ACTUAL_ROOT_PICKER_ARGUMENT */
     }
     func setIOSPresented(_ presented: Bool) { /* ACTUAL_IOS_PICKER_DISMISSAL */
     }
@@ -174,20 +214,21 @@ enum FakeScene { case active, background }
     @Cell var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture? = nil
     @Cell var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil
     @Cell var toolsRoute: ProfilePickerToolsRoute? = nil
-    @Cell var pickerAdmission: (@MainActor @Sendable () -> Bool)? = nil
-    @Cell var manualPickerDismissal: (@MainActor @Sendable () -> Void)? = nil
+    @Cell var pickerPresentation: ProfileStore.PickerPresentation
+    @Cell var manualPINPending: Bool
+    /* ACTUAL_MANUAL_PIN_INTERACTION_STATE */
 
     init(_ profiles: [UserProfile], manualPicker: Bool = false, originalStore: FakeStore? = nil,
-         capturedAdmission: (@MainActor @Sendable () -> Bool)? = nil,
-         capturedDismissal: (@MainActor @Sendable () -> Void)? = nil) {
-        CredentialScopeRegistry.shared.change()
-        store = originalStore ?? FakeStore(profiles)
-        core = FakeCore(store)
-        if manualPicker { store.requestPicker() }
-        let pickerAdmission = capturedAdmission ?? store.manualPickerToolsAdmission()
-        let manualPickerDismissal = capturedDismissal ?? store.manualPickerDismissal()
+         capturedPresentation: ProfileStore.PickerPresentation? = nil) {
+        // Existing originalStore/context construction must not manufacture an owner change.
+        if originalStore == nil { CredentialScopeRegistry.shared.change() }
+        let fixtureStore = originalStore ?? FakeStore(profiles)
+        store = fixtureStore
+        core = FakeCore(fixtureStore)
+        if manualPicker { fixtureStore.requestPicker() }
+        let pickerPresentation = capturedPresentation ?? fixtureStore.pickerPresentation()
         /* ACTUAL_PICKER_STATE_INITIALIZER */
-        /* ACTUAL_PICKER_DISMISSAL_INITIALIZER */
+        /* ACTUAL_PICKER_PIN_INITIALIZER */
     }
     func installObservers() {
         profileAction.$errorMessage.dropFirst().sink { _ in
@@ -204,12 +245,23 @@ enum FakeScene { case active, background }
     func stop() { lifetime.live = false; lifetime.subscriptions.removeAll(); disappear() }
     func tap(_ profile: UserProfile) { pick(profile) }
     func openToolsForTest() { openTools() }
+    func diagnosticGrantForTest() -> ProfilePickerToolsDiagnosticGrant { diagnosticGrant() }
+    func manualPINOverlay(targetOverride: UserProfile? = nil) -> PINOverlayHarness {
+        let target = targetOverride ?? pickerPresentation.pinChallenge!
+        return PINOverlayHarness(profile: target, onUnlock: { /* ACTUAL_MANUAL_PIN_UNLOCK_DISPATCH */
+        }, onCancel: { /* ACTUAL_MANUAL_PIN_CANCEL_DISPATCH */
+        })
+    }
     func backForTest() { closeManualPicker() }
-    func appearForTest() {} // Production has no appearance-time admission capture.
+    var hasManualBackForTest: Bool { manualPickerDismissal != nil }
+    func appearForTest() { /* ACTUAL_APPEAR_EVENT */
+    }
+    func sceneChangedForTest(_ phase: FakeScene) { /* ACTUAL_SCENE_EVENT */
+    }
     func closeToolsForTest() { if let route = toolsRoute { closeTools(route.id) } }
     func unlock(_ prompt: UserProfile) { finishPIN(prompt) }
     func resume() { resumeDeferredSelection() }
-    func foreground() { scenePhase = .active; resumeDeferredSelection() }
+    func foreground() { scenePhase = .active; sceneChangedForTest(.active) }
     func dismissAuth() { signInNeeded = false; signInChanged(false) }
     func signInChanged(_ presented: Bool) { /* ACTUAL_SIGNIN_EVENT */
     }
@@ -230,6 +282,7 @@ enum FakeScene { case active, background }
     }
 
 /* ACTUAL_PICKER_ADMISSION */
+/* ACTUAL_PICKER_DISMISSAL_PROJECTION */
 /* ACTUAL_PREPARING */
 /* ACTUAL_METHODS */
 }
@@ -257,8 +310,221 @@ enum FakeScene { case active, background }
     @MainActor static func busy(_ h: PickerHarness) {
         h.core.certified = false; h.nativeSync.nativeCheckpointStatus = "restoring"
     }
+    @MainActor static func protectedProfile(legacy: Bool = false) -> UserProfile {
+        var profile = UserProfile(name: "Synthetic protected adult")
+        profile.pin = legacy ? "2468" : UserProfile.pinHash("2468", profileID: profile.id)
+        return profile
+    }
+    @MainActor static func submit(_ overlay: PINOverlayHarness, _ input: String) {
+        overlay.enter(input); overlay.pressUnlock()
+    }
+    @MainActor static func assertNoProfileMutation(_ h: PickerHarness) {
+        precondition(h.store.selected.isEmpty && h.store.finishPickerArguments.isEmpty
+                     && h.nativeSync.preparations == 0 && h.account.reloads == 0
+                     && h.editorProfile == nil && !h.store.pickedThisLaunch)
+    }
     @MainActor static func main() async {
         var passed = 0
+        do {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            let queuedUnlock = h.manualPINOverlay()
+            precondition(h.scenePhase == .active && h.pickerPresentation.permitsPresentation())
+            submit(queuedUnlock, "2468")
+            precondition(h.manualPINPending && !h.pickerPresentation.permitsTools(), "no verification before appearance")
+            h.sceneChangedForTest(.active)
+            submit(queuedUnlock, "2468")
+            precondition(h.manualPINPending && !h.pickerPresentation.permitsTools(), "active scene does not mount the picker")
+            h.appearForTest(); submit(queuedUnlock, "2468")
+            precondition(!h.manualPINPending && h.pickerPresentation.permitsTools())
+            assertNoProfileMutation(h); h.stop(); passed += 1
+        }
+        for retirement in ["inactive", "disappear"] {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            let queuedUnlock = h.manualPINOverlay() // Captures the still-active View snapshot.
+            if retirement == "inactive" { h.sceneChangedForTest(.background) }
+            else { h.disappear() }
+            // Deliberately do NOT mutate scenePhase: the old callback would pass a captured
+            // Environment snapshot check. Only the real shared lifecycle reference can refuse.
+            precondition(h.scenePhase == .active)
+            submit(queuedUnlock, "2468")
+            precondition(h.manualPINPending && !h.pickerPresentation.permitsTools(), retirement)
+            h.sceneChangedForTest(.active)
+            if retirement == "disappear" {
+                submit(queuedUnlock, "2468")
+                precondition(h.manualPINPending && !h.pickerPresentation.permitsTools(),
+                             "scene activation alone must not remount an outgoing picker")
+                h.appearForTest()
+            }
+            submit(queuedUnlock, "2468")
+            precondition(!h.manualPINPending && h.pickerPresentation.permitsTools(), "mounted foreground retry")
+            assertNoProfileMutation(h); h.stop(); passed += 1
+        }
+        // The real verifier includes the legacy format; only synthetic PINs and profiles are used.
+        for legacy in [false, true] {
+            let profile = protectedProfile(legacy: legacy)
+            let h = PickerHarness([profile], manualPicker: true)
+            h.appearForTest()
+            precondition(h.store.canRequestPicker && h.store.needsPicker
+                         && h.pickerPresentation.permitsPresentation()
+                         && !h.pickerPresentation.permitsTools() && h.manualPINPending)
+            h.openToolsForTest(); h.recoverAccount(); h.add(); h.edit(); h.tap(profile)
+            precondition(h.toolsRoute == nil && !h.accountHelpNeeded && !h.isEditing)
+            let pendingLog = h.diagnosticGrantForTest()
+            precondition(!pendingLog.permitsExport)
+            let controls = PickerAccountControlsHarness(sync: h.nativeSync,
+                admission: { h.pickerPresentation.permitsTools() })
+            controls.confirm(); precondition(h.nativeSync.signOuts == 0 && controls.retirements == 0)
+            assertNoProfileMutation(h)
+            let overlay = h.manualPINOverlay()
+            submit(overlay, "0000")
+            precondition(overlay.wrong && h.manualPINPending && !h.pickerPresentation.permitsTools())
+            submit(overlay, "2468")
+            precondition(!overlay.wrong && !h.manualPINPending && h.pickerPresentation.permitsTools()
+                         && h.store.needsPicker)
+            assertNoProfileMutation(h)
+            h.openToolsForTest()
+            let route = h.toolsRoute!
+            precondition(route.accountFiles.permits(route.accountFiles.owner!))
+            precondition(!route.diagnostics.permitsExport, "PIN success does not add a diagnostic exception")
+            h.disappear(); h.restoreChanged(.ready)
+            precondition(route.accountFiles.permits(route.accountFiles.owner!), "child cover retains original unlock")
+            h.closeToolsForTest(); h.backForTest()
+            precondition(!h.store.needsPicker && !h.pickerPresentation.permitsTools())
+            h.stop(); passed += 1
+        }
+        for failure in ["restore", "profile"] {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            h.core.certified = false; h.nativeSync.nativeCheckpointStatus = "not_started"
+            if failure == "restore" { h.nativeSync.accountRestoreState = .failed }
+            else {
+                h.profileAction.start(operation: { false }, failureMessage: { "Synthetic failed profile opening" })
+                await until("synthetic profile failure before PIN") { h.profileAction.errorMessage != nil }
+            }
+            precondition(!h.diagnosticGrantForTest().permitsExport, "failure cannot bypass pending manual PIN")
+            submit(h.manualPINOverlay(), "2468")
+            precondition(h.pickerPresentation.permitsTools())
+            assertNoProfileMutation(h) // Tools recovery does not require or run native profile preparation.
+            h.openToolsForTest(); let route = h.toolsRoute!
+            precondition(route.accountFiles.permits(route.accountFiles.owner!) && route.diagnostics.permitsExport,
+                         "only the existing failure diagnostic policy applies after the PIN gate")
+            h.stop(); passed += 1
+        }
+        for absentPIN in [Optional<String>.none, .some("")] {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            var forged = h.pickerPresentation.pinChallenge!; forged.pin = absentPIN
+            // pinMatches deliberately accepts no-PIN profiles. The protected completion must not.
+            precondition(!forged.hasPin && forged.pinMatches("2468"))
+            submit(h.manualPINOverlay(targetOverride: forged), "2468")
+            precondition(h.manualPINPending && !h.pickerPresentation.permitsTools())
+            assertNoProfileMutation(h); h.stop(); passed += 1
+        }
+        for afterUnlock in [false, true] {
+            for change in ["owner", "owner-aba", "pin", "removed-pin", "empty-pin", "kids", "active", "roster", "count", "replacement", "dismissal"] {
+                let original = protectedProfile()
+                let h = PickerHarness([original], manualPicker: true)
+                h.appearForTest()
+                let overlay = h.manualPINOverlay()
+                if afterUnlock { submit(overlay, "2468") }
+                let originalGrant = h.pickerPresentation.permitsTools
+                var oldRoute: ProfilePickerToolsRoute?
+                if afterUnlock { h.openToolsForTest(); oldRoute = h.toolsRoute }
+                switch change {
+                case "owner": CredentialScopeRegistry.shared.change()
+                case "owner-aba": CredentialScopeRegistry.shared.change(); CredentialScopeRegistry.shared.change()
+                case "pin": h.store.profiles[0].pin = UserProfile.pinHash("1357", profileID: original.id)
+                case "removed-pin": h.store.profiles[0].pin = nil
+                case "empty-pin": h.store.profiles[0].pin = ""
+                case "kids": h.store.profiles[0].isKids = true
+                case "active": h.store.activeID = UUID()
+                case "roster": h.store.profiles[0] = protectedProfile()
+                case "count": h.store.profiles.append(UserProfile(name: "Another adult"))
+                case "replacement": h.store.requestPicker()
+                case "dismissal": h.store.pickedThisLaunch = true
+                default: preconditionFailure()
+                }
+                // Observe invalidity before returning to the old projection: no request resurrection.
+                precondition(!originalGrant(), change)
+                if let oldRoute { precondition(!oldRoute.accountFiles.permits(oldRoute.accountFiles.owner!), change) }
+                submit(overlay, "2468")
+                precondition(!originalGrant(), "old correct input cannot reauthorize " + change)
+                h.store.profiles = [original]; h.store.activeID = original.id
+                // Retry the old correct callback after eligibility returns: a pending false
+                // grant alone would not prove that observed retirement survived the round trip.
+                submit(overlay, "2468")
+                precondition(!originalGrant(), "restored values do not revive original " + change)
+                if change != "replacement" { precondition(!h.store.needsPicker, change) }
+                h.store.requestPicker()
+                let replacement = PickerHarness([], originalStore: h.store)
+                replacement.appearForTest()
+                precondition(replacement.manualPINPending && !replacement.pickerPresentation.permitsTools())
+                submit(replacement.manualPINOverlay(), "2468")
+                precondition(replacement.pickerPresentation.permitsTools() && !originalGrant())
+                assertNoProfileMutation(replacement)
+                h.stop(); replacement.stop(); passed += 1
+            }
+        }
+        for blocker in ["background", "normal-pin", "authentication", "running"] {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            let overlay = h.manualPINOverlay()
+            if blocker == "background" { h.sceneChangedForTest(.background) }
+            if blocker == "normal-pin" { h.pinTarget = h.store.profiles[0] }
+            if blocker == "authentication" { h.accountAuthentication.blocksDismissal = true }
+            if blocker == "running" {
+                let capture = CredentialScopeRegistry.shared.capture()
+                h.profileAction.start(operation: { await h.nativeSync.prepareNativeProfileSelection(credentialCapture: capture) },
+                    failureMessage: { "Synthetic running action" })
+                await until("manual PIN action held") { h.nativeSync.continuation != nil }
+            }
+            submit(overlay, "2468")
+            precondition(h.manualPINPending && !h.pickerPresentation.permitsTools(), blocker)
+            h.sceneChangedForTest(.active); h.pinTarget = nil; h.accountAuthentication.blocksDismissal = false
+            if blocker == "running" {
+                h.nativeSync.complete(false)
+                await until("manual PIN action ends") { !h.profileAction.isRunning }
+            }
+            submit(overlay, "2468")
+            precondition(!h.manualPINPending && h.pickerPresentation.permitsTools(), blocker)
+            h.stop(); passed += 1
+        }
+        do {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            let overlay = h.manualPINOverlay()
+            h.accountAuthentication.blocksDismissal = true
+            overlay.cancel(); precondition(h.store.needsPicker)
+            h.accountAuthentication.blocksDismissal = false
+            overlay.cancel(); precondition(!h.store.needsPicker && !h.pickerPresentation.permitsTools())
+            h.stop(); passed += 1
+        }
+        do {
+            let store = FakeStore([protectedProfile()]); store.requestPicker()
+            let root = PickerRootHarness(store)
+            let a = PickerHarness([], originalStore: store, capturedPresentation: root.presentationAtConstruction())
+            let oldOverlay = a.manualPINOverlay()
+            store.requestPicker() // B exists before A's first appearance.
+            a.appearForTest(); submit(oldOverlay, "2468"); oldOverlay.cancel()
+            precondition(!a.pickerPresentation.permitsTools() && store.needsPicker)
+            let b = PickerHarness([], originalStore: store, capturedPresentation: root.presentationAtConstruction())
+            b.appearForTest()
+            submit(b.manualPINOverlay(), "2468")
+            precondition(b.pickerPresentation.permitsTools() && !a.pickerPresentation.permitsTools())
+            a.stop(); b.stop(); passed += 1
+        }
+        do {
+            let h = PickerHarness([protectedProfile()], manualPicker: true)
+            h.appearForTest()
+            h.nativeSync.isSignedIn = false; h.nativeSync.account = nil
+            submit(h.manualPINOverlay(), "2468"); h.openToolsForTest()
+            precondition(h.toolsRoute?.accountFiles.owner == nil, "local PIN creates no account owner")
+            CredentialScopeRegistry.shared.change()
+            h.nativeSync.isSignedIn = true; h.nativeSync.account = .init(id: "fixture-account")
+            precondition(!h.pickerPresentation.permitsTools(), "sign-in requires a fresh original request")
+            h.stop(); passed += 1
+        }
         for count in 0...1 {
             for observer in ["root", "grant"] {
                 let profiles = (0..<count).map { UserProfile(name: "Original \($0)") }
@@ -278,7 +544,7 @@ enum FakeScene { case active, background }
         }
         do {
             let h = PickerHarness([], manualPicker: true)
-            precondition(h.manualPickerDismissal != nil && h.store.needsPicker)
+            precondition(h.hasManualBackForTest && h.store.needsPicker)
             h.openToolsForTest(); precondition(h.toolsRoute != nil)
             h.closeToolsForTest(); precondition(h.store.needsPicker)
             h.accountAuthentication.blocksDismissal = true
@@ -301,7 +567,7 @@ enum FakeScene { case active, background }
             let current = PickerHarness([], originalStore: old.store)
             current.backForTest(); precondition(!old.store.needsPicker)
             let ordinary = PickerHarness([UserProfile(name: "A"), UserProfile(name: "B")])
-            precondition(ordinary.manualPickerDismissal == nil)
+            precondition(!ordinary.hasManualBackForTest)
             ordinary.backForTest(); precondition(ordinary.store.needsPicker, "ordinary picker has no manual Back")
             old.stop(); current.stop(); ordinary.stop(); passed += 1
         }
@@ -312,11 +578,11 @@ enum FakeScene { case active, background }
             let root = PickerRootHarness(store)
             // The actual root argument is evaluated and retained by the actual State assignment
             // while constructing A. No appearance event has occurred when B replaces the request.
-            let a = PickerHarness([], originalStore: store, capturedAdmission: root.admissionAtConstruction(), capturedDismissal: root.dismissalAtConstruction())
+            let a = PickerHarness([], originalStore: store, capturedPresentation: root.presentationAtConstruction())
             store.requestPicker()
             a.appearForTest(); a.openToolsForTest(); a.recoverAccount(); a.add(); a.edit()
             precondition(a.toolsRoute == nil && !a.accountHelpNeeded && a.editorProfile == nil && !a.isEditing)
-            let b = PickerHarness([], originalStore: store, capturedAdmission: root.admissionAtConstruction(), capturedDismissal: root.dismissalAtConstruction())
+            let b = PickerHarness([], originalStore: store, capturedPresentation: root.presentationAtConstruction())
             b.appearForTest(); b.openToolsForTest()
             let route = b.toolsRoute!
             precondition(route.accountFiles.permits(route.accountFiles.owner!))
@@ -369,10 +635,9 @@ enum FakeScene { case active, background }
                 passed += 1
             }
         }
-        for restriction in ["kids", "pin", "unmatched", "empty-stale-active"] {
+        for restriction in ["kids", "unmatched", "empty-stale-active"] {
             var profile = UserProfile(name: "Restricted")
             if restriction == "kids" { profile.isKids = true }
-            if restriction == "pin" { profile.pin = "synthetic-pin" }
             let store = FakeStore(restriction == "empty-stale-active" ? [] : [profile])
             if restriction == "unmatched" || restriction == "empty-stale-active" { store.activeID = UUID() }
             precondition(!store.canRequestPicker)

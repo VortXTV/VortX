@@ -80,8 +80,10 @@ struct ProfilePickerView: View {
     @State private var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant?
     @State private var toolsRoute: ProfilePickerToolsRoute?
     /// Bound when the root constructs this picker, before delayed presentation or first appearance.
-    @State private var pickerAdmission: (@MainActor @Sendable () -> Bool)?
-    @State private var manualPickerDismissal: (@MainActor @Sendable () -> Void)?
+    @State private var pickerPresentation: ProfileStore.PickerPresentation
+    /// Display state only; every effect separately requires the original request's Tools admission.
+    @State private var manualPINPending: Bool
+    @State private var manualPINInteraction = ProfilePickerPINInteractionAdmission()
     @StateObject private var profileAction = ProfileMutationPresentation()
     @StateObject private var accountAuthentication: AccountAuthenticationPresentation
     @StateObject private var artwork = ProfilePickerArtwork.shared
@@ -107,11 +109,10 @@ struct ProfilePickerView: View {
     }
 
     init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil,
-         pickerAdmission: @escaping @MainActor @Sendable () -> Bool,
-         manualPickerDismissal: (@MainActor @Sendable () -> Void)?) {
+         pickerPresentation: ProfileStore.PickerPresentation) {
         self.core = core
-        _pickerAdmission = State(initialValue: pickerAdmission)
-        _manualPickerDismissal = State(initialValue: manualPickerDismissal)
+        _pickerPresentation = State(initialValue: pickerPresentation)
+        _manualPINPending = State(initialValue: pickerPresentation.pinChallenge != nil)
         _accountAuthentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
     }
 
@@ -199,8 +200,8 @@ struct ProfilePickerView: View {
                         .frame(minHeight: geometry.size.height,
                                alignment: layout.isPhone ? .bottom : .center)
                     }
-                    .disabled(pinTarget != nil || profileAction.isRunning)
-                    .accessibilityHidden(pinTarget != nil)
+                    .disabled(manualPINPending || pinTarget != nil || profileAction.isRunning)
+                    .accessibilityHidden(manualPINPending || pinTarget != nil)
                     // Outside the disabled picker: a stuck profile/restore must not block its own log.
                     .safeAreaInset(edge: .bottom) {
                         VStack(spacing: Theme.Space.md) {
@@ -229,13 +230,17 @@ struct ProfilePickerView: View {
                         // Outside the disabled grid, including when profile opening fails.
                         .frame(maxWidth: .infinity)
                         .profileFocusSection()
-                        .disabled(pinTarget != nil)
-                        .accessibilityHidden(pinTarget != nil)
+                        .disabled(manualPINPending || pinTarget != nil)
+                        .accessibilityHidden(manualPINPending || pinTarget != nil)
                     }
                 }
             }
 
-            if let target = pinTarget {
+            if manualPINPending, let target = pickerPresentation.pinChallenge {
+                PinGateOverlay(profile: target,
+                               onUnlock: { finishManualPIN(target) },
+                               onCancel: { closeManualPicker() })
+            } else if let target = pinTarget {
                 PinGateOverlay(profile: target,
                                onUnlock: {
                                    finishPIN(target)
@@ -265,7 +270,8 @@ struct ProfilePickerView: View {
             ProfilePickerToolsView(route: route,
                 services: .live(restore: .live, accountGrant: route.accountFiles)) { closeTools(route.id) }
         }
-        .disabled(!pickerAdmissionPermits)
+        .onAppear { manualPINInteraction.appear(isActive: scenePhase == .active) }
+        .disabled(!pickerPresentation.permitsPresentation())
         .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
             guard artworkIsVisible else {
@@ -277,6 +283,7 @@ struct ProfilePickerView: View {
             artwork.startRotation(reduceMotion: reduceMotion)
         }
         .onDisappear {
+            manualPINInteraction.disappear()
             artwork.stopRotation()
             // A full-screen Tools child must retain only the failed-profile diagnostic exception.
             profileAction.cancel(preservingFailure: toolsRoute != nil || accountHelpNeeded)
@@ -310,7 +317,10 @@ struct ProfilePickerView: View {
             }
         }
         .onValueChange(of: signInNeeded) { presented in if !presented { finishPendingSignIn() } }
-        .onValueChange(of: scenePhase) { phase in if phase == .active { resumeDeferredSelection() } }
+        .onValueChange(of: scenePhase) { phase in
+            manualPINInteraction.sceneDidChange(isActive: phase == .active)
+            if phase == .active { resumeDeferredSelection() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             profileAction.cancel()
             deferredSelection.cancel()
@@ -325,7 +335,18 @@ struct ProfilePickerView: View {
         }
     }
 
-    private var pickerAdmissionPermits: Bool { pickerAdmission?() ?? false }
+    private var pickerAdmissionPermits: Bool { pickerPresentation.permitsTools() }
+    private var manualPickerDismissal: (@MainActor @Sendable () -> Void)? { pickerPresentation.dismiss }
+
+    private func finishManualPIN(_ target: UserProfile) {
+        guard manualPINPending, manualPINInteraction.permitsVerification, pinTarget == nil,
+              !profileAction.isRunning, !accountAuthentication.blocksDismissal,
+              let challenge = pickerPresentation.pinChallenge, target.id == challenge.id,
+              target.hasPin, target.pin == challenge.pin, pickerPresentation.permitsPresentation(),
+              pickerPresentation.unlockPIN?() == true else { return }
+        // Only updates the displayed phase. This flag never authorizes Tools or account effects.
+        manualPINPending = false
+    }
 
     private func closeManualPicker() {
         guard pinTarget == nil, !profileAction.isRunning, !accountAuthentication.blocksDismissal else { return }
@@ -345,7 +366,7 @@ struct ProfilePickerView: View {
     }
 
     private func diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant {
-        let manualAdmission: @MainActor @Sendable () -> Bool = pickerAdmission ?? { false }
+        let manualAdmission = pickerPresentation.permitsTools
         let permitted = exportAllowedBeforeProfile && pinTarget == nil && manualAdmission()
         let credential = CredentialScopeRegistry.shared.capture()
         let store = store, sync = nativeSync, action = profileAction
@@ -357,7 +378,7 @@ struct ProfilePickerView: View {
     }
 
     private func openTools() {
-        let manualAdmission: @MainActor @Sendable () -> Bool = pickerAdmission ?? { false }
+        let manualAdmission = pickerPresentation.permitsTools
         guard pinTarget == nil, manualAdmission() else { return }
         let grant = diagnosticGrant()
         let routeID = UUID()
@@ -400,14 +421,14 @@ struct ProfilePickerView: View {
 
     private func focusDiagnosticRecovery() {
         #if os(tvOS)
-        guard pinTarget == nil, exportAllowedBeforeProfile,
+        guard pickerAdmissionPermits, pinTarget == nil, exportAllowedBeforeProfile,
               nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed else { return }
         diagnosticFocused = true
         #endif
     }
 
     private var artworkIsVisible: Bool {
-        scenePhase == .active && pinTarget == nil && editorProfile == nil &&
+        scenePhase == .active && !manualPINPending && pinTarget == nil && editorProfile == nil &&
         !signInNeeded && !accountHelpNeeded && toolsRoute == nil && !profileAction.isRunning
     }
 

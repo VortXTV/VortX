@@ -260,7 +260,7 @@ struct RootView: View {
             }
         }
         .fullScreenCover(isPresented: pickerPresented) {
-            ProfilePickerView(authentication: profileAuthentication, pickerAdmission: profiles.manualPickerToolsAdmission(), manualPickerDismissal: profiles.manualPickerDismissal())
+            ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())
         }
         .onAppear { syncShellCover() }
         .onChange(of: splashDone) { _, _ in syncShellCover() }

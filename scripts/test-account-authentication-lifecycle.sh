@@ -84,8 +84,8 @@ assert '.onValueChange(of: account.isSignedIn)' in touch
 assert 'guard !showVortXEmail, !vortxAuthentication.blocksDismissal,' in touch
 assert 'core.signedInWithLegacyAuthKey()' in touch
 assert 'VortXAccountJoinerView(onSignedIn:' in touch
-assert sources['tvroot'].count('ProfilePickerView(authentication: profileAuthentication, pickerAdmission: profiles.manualPickerToolsAdmission(), manualPickerDismissal: profiles.manualPickerDismissal())')==1
-assert sources['touchroot'].count('ProfilePickerView(authentication: profileAuthentication, pickerAdmission: profiles.manualPickerToolsAdmission(), manualPickerDismissal: profiles.manualPickerDismissal())')==2
+assert sources['tvroot'].count('ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())')==1
+assert sources['touchroot'].count('ProfilePickerView(authentication: profileAuthentication, pickerPresentation: profiles.pickerPresentation())')==2
 assert 'authentication: accountAuthentication)' in profiles
 assert 'accountAuthentication.credentialDidChange()' in profiles
 assert '.sheet(item: $qrPresentation)' in settings

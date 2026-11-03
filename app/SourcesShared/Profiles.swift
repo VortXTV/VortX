@@ -714,15 +714,30 @@ final class ProfileStore: ObservableObject {
             nativeProfileError = nil; return true
         } catch { CoreBridge.shared.reportNativeProfileFailure("open", error: error); nativeProfileError = "Couldn't open this profile. Tap again to try once more."; return false }
     }
-    /// Cold launch only asks when there is a choice. An explicit request also opens an empty
-    /// roster or the current unprotected adult profile so its backup Tools remain reachable.
+    /// Cold launch only asks when there is a choice. An explicit manual request can also
+    /// reopen an empty roster or the current adult; a protected adult must pass its own PIN.
     @Published var pickedThisLaunch = false {
         didSet { if pickedThisLaunch { manualPickerRequest = nil } }
     }
+    @MainActor struct PickerPresentation {
+        let permitsPresentation: @MainActor @Sendable () -> Bool
+        let permitsTools: @MainActor @Sendable () -> Bool
+        let pinChallenge: UserProfile?
+        let unlockPIN: (@MainActor @Sendable () -> Bool)?
+        let dismiss: (@MainActor @Sendable () -> Void)?
+    }
     @MainActor private final class ManualPickerRequest {
         let profileID: UUID?
+        let pinChallenge: UserProfile?
+        let credential: CredentialScopeRegistry.Capture?
+        var pinUnlocked: Bool
         var revoked = false
-        init(profileID: UUID?) { self.profileID = profileID }
+        init(profile: UserProfile?) {
+            profileID = profile?.id
+            pinChallenge = profile.flatMap { $0.hasPin ? $0 : nil }
+            credential = pinChallenge == nil ? nil : CredentialScopeRegistry.shared.capture()
+            pinUnlocked = pinChallenge == nil
+        }
     }
     private var manualPickerRequest: ManualPickerRequest?
 
@@ -730,19 +745,39 @@ final class ProfileStore: ObservableObject {
         if profiles.isEmpty { return activeID == nil }
         if profiles.count > 1 { return true }
         guard let profile = profiles.first, profile.id == activeID else { return false }
-        return !profile.isKids && !profile.hasPin
+        return !profile.isKids
     }
 
     func requestPicker() {
         guard canRequestPicker else { return }
         // The established multi-profile switcher keeps its existing admission policy.
-        manualPickerRequest = profiles.count > 1 ? nil : .init(profileID: profiles.first?.id)
+        manualPickerRequest = profiles.count > 1 ? nil : .init(profile: profiles.first)
         pickedThisLaunch = false
     }
 
-    /// Capture this at route creation: dismissal or another manual request retires the original
-    /// admission. Eligibility is checked against the live roster at every existing grant boundary.
-    func manualPickerToolsAdmission() -> @MainActor @Sendable () -> Bool {
+    private func manualPickerRequestPermits(_ request: ManualPickerRequest) -> Bool {
+        guard !pickedThisLaunch, manualPickerRequest === request, !request.revoked else { return false }
+        let permitted: Bool
+        if let profileID = request.profileID {
+            if profiles.count == 1, activeID == profileID, let profile = profiles.first,
+               profile.id == profileID, !profile.isKids {
+                if let challenge = request.pinChallenge, let credential = request.credential {
+                    permitted = profile.hasPin && profile.pin == challenge.pin
+                        && CredentialScopeRegistry.shared.isCurrent(credential)
+                } else {
+                    permitted = !profile.hasPin
+                }
+            } else { permitted = false }
+        } else {
+            permitted = profiles.isEmpty && activeID == nil
+        }
+        // A root read can auto-dismiss the Mac cover without invoking its binding setter.
+        // Observed ineligibility retires this request, including a changed/removed PIN or owner.
+        if !permitted { request.revoked = true }
+        return permitted
+    }
+
+    func manualPickerPresentationAdmission() -> @MainActor @Sendable () -> Bool {
         guard !pickedThisLaunch else { return { false } }
         guard let request = manualPickerRequest else {
             return { [weak self] in
@@ -750,30 +785,44 @@ final class ProfileStore: ObservableObject {
                 return !self.pickedThisLaunch && self.manualPickerRequest == nil
             }
         }
+        return { [weak self] in self?.manualPickerRequestPermits(request) == true }
+    }
+
+    /// Pending PIN presentation is not Tools authority. Existing grant boundaries always
+    /// check this original request and its successful local PIN admission independently.
+    func manualPickerToolsAdmission() -> @MainActor @Sendable () -> Bool {
+        guard let request = manualPickerRequest else { return manualPickerPresentationAdmission() }
         return { [weak self] in
-            guard let self, !self.pickedThisLaunch, self.manualPickerRequest === request,
-                  !request.revoked else { return false }
-            let permitted: Bool
-            if let profileID = request.profileID {
-                permitted = self.profiles.count == 1 && self.activeID == profileID
-                    && self.profiles.first?.id == profileID && self.canRequestPicker
-            } else {
-                permitted = self.profiles.isEmpty && self.activeID == nil
-            }
-            // A root read may auto-dismiss the Mac cover without invoking its binding setter.
-            // Once observed ineligible, this exact request must never reopen or revive a grant.
-            if !permitted { request.revoked = true }
-            return permitted
+            self?.manualPickerRequestPermits(request) == true && request.pinUnlocked
         }
     }
-    /// The original manual route alone may finish itself. A late Back from an old picker cannot
-    /// consume a replacement request; ordinary cold/profile-switch presentation has no new Back.
+
+    /// The original manual route alone may finish itself. A late Back/Cancel cannot consume
+    /// a replacement request; ordinary cold/profile-switch presentation has no new Back.
     func manualPickerDismissal() -> (@MainActor @Sendable () -> Void)? {
         guard !pickedThisLaunch, let request = manualPickerRequest else { return nil }
         return { [weak self] in
             guard let self, self.manualPickerRequest === request else { return }
             self.pickedThisLaunch = true
         }
+    }
+
+    /// Capture once at root construction, before delayed appearance. The protected success
+    /// callback is handed only to the existing PIN gate; it performs no account/profile mutation.
+    func pickerPresentation() -> PickerPresentation {
+        let request = manualPickerRequest
+        let unlock: (@MainActor @Sendable () -> Bool)?
+        if let request, request.pinChallenge != nil {
+            unlock = { [weak self] in
+                guard let self, self.manualPickerRequestPermits(request), !request.pinUnlocked else { return false }
+                request.pinUnlocked = true
+                return true
+            }
+        } else { unlock = nil }
+        return .init(permitsPresentation: manualPickerPresentationAdmission(),
+                     permitsTools: manualPickerToolsAdmission(),
+                     pinChallenge: request?.pinChallenge, unlockPIN: unlock,
+                     dismiss: manualPickerDismissal())
     }
     /// The ACTIVE overlay profile's private watch state, keyed by meta id. Drives its Continue
     /// Watching rail, resume, and watched markers. Empty for the owner profile (it uses the
@@ -912,7 +961,7 @@ final class ProfileStore: ObservableObject {
     var active: UserProfile? { profiles.first { $0.id == activeID } }
     var needsPicker: Bool {
         guard !pickedThisLaunch else { return false }
-        if manualPickerRequest != nil { return manualPickerToolsAdmission()() }
+        if manualPickerRequest != nil { return manualPickerPresentationAdmission()() }
         return profiles.count > 1
     }
 
