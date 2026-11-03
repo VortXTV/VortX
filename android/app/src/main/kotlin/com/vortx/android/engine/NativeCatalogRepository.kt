@@ -130,9 +130,21 @@ internal class NativeLibraryMirrorOrigin(
     val expectedAccount: SessionOwnerSnapshot.Account,
     private val account: (() -> Boolean) -> Boolean,
     private val mount: (() -> Boolean) -> Boolean,
+    private val acquireCall: () -> com.vortx.android.sync.SessionOperationCoordinator.OutboundCallPermit? = { null },
 ) {
-    fun admit(action: () -> Boolean): Boolean = synchronized(session) {
-        runCatching { session.accepts(owner) }.getOrDefault(false) && account { mount(action) }
+    /** Session stays outermost when a worker subsequently enters credential and owner admission. */
+    fun withOriginalNativeOwner(action: () -> Boolean): Boolean = synchronized(session) {
+        runCatching { session.accepts(owner) }.getOrDefault(false) && action()
+    }
+
+    fun admitAccountMount(action: () -> Boolean): Boolean = account { mount(action) }
+
+    fun admit(action: () -> Boolean): Boolean = withOriginalNativeOwner { admitAccountMount(action) }
+
+    fun acquireCallPermit(): com.vortx.android.sync.SessionOperationCoordinator.OutboundCallPermit? {
+        var result: com.vortx.android.sync.SessionOperationCoordinator.OutboundCallPermit? = null
+        admit { acquireCall().also { result = it } != null }
+        return result
     }
 
     /** Legacy queue drain already has its own account-only rewrite boundary. */

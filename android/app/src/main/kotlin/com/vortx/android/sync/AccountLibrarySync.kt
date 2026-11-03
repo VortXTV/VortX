@@ -8,6 +8,7 @@ import com.vortx.android.account.AccountSyncGate
 import com.vortx.android.account.AccountWatchlistClient
 import com.vortx.android.account.TitleRef
 import com.vortx.android.engine.NativeLibraryMirrorOrigin
+import com.vortx.android.integrations.ProviderMirrorResult
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
@@ -103,28 +104,28 @@ object AccountLibrarySync {
             val prefs = queuePrefs(appContext)
             // Opportunistically retry earlier offline failures before pushing the new change.
             drain(prefs, origin::admitDrainRewrite)
-            if (origin.admit { true }) pushTrakt(prefs, origin.expectedAccount, add, ref)
-            if (add && origin.admit { true }) pushSimkl(prefs, origin.expectedAccount, ref) // SIMKL has no watchlist-remove.
+            if (origin.admit { true }) pushTrakt(prefs, origin, add, ref)
+            if (add && origin.admit { true }) pushSimkl(prefs, origin, ref) // SIMKL has no watchlist-remove.
         }
     }
 
     /** Push one change to Trakt when connected + enabled; queue it on a network failure. */
-    private suspend fun pushTrakt(prefs: SharedPreferences, owner: SessionOwnerSnapshot.Account, add: Boolean, ref: TitleRef) {
+    private suspend fun pushTrakt(prefs: SharedPreferences, origin: NativeLibraryMirrorOrigin, add: Boolean, ref: TitleRef) {
         if (!ScrobbleService.isToggleOn(ScrobbleService.KEY_TRAKT_WATCHLIST, true)) return
-        val epoch = TraktAuth.watchlistEpoch(owner) ?: return
-        val ok = AccountWatchlistClient.traktWatchlist(add, ref, epoch, owner)
-        if (!ok) {
+        val epoch = TraktAuth.watchlistEpoch(origin.expectedAccount) ?: return
+        val outcome = AccountWatchlistClient.traktWatchlist(add, ref, epoch, origin)
+        if (outcome == ProviderMirrorResult.ATTEMPTED_FAILURE) {
             enqueue(prefs, QueuedPush(Provider.TRAKT, add, ref, epoch))
             Log.d(TAG, "trakt watchlist ${if (add) "add" else "remove"} queued for retry")
         }
     }
 
     /** Push one ADD to SIMKL when connected + enabled; queue it on a network failure. */
-    private suspend fun pushSimkl(prefs: SharedPreferences, owner: SessionOwnerSnapshot.Account, ref: TitleRef) {
+    private suspend fun pushSimkl(prefs: SharedPreferences, origin: NativeLibraryMirrorOrigin, ref: TitleRef) {
         if (!ScrobbleService.isToggleOn(ScrobbleService.KEY_SIMKL_WATCHLIST, true)) return
-        val epoch = SIMKLAuth.watchlistEpoch(owner) ?: return
-        val ok = AccountWatchlistClient.simklWatchlistAdd(ref, epoch, owner)
-        if (!ok) {
+        val epoch = SIMKLAuth.watchlistEpoch(origin.expectedAccount) ?: return
+        val outcome = AccountWatchlistClient.simklWatchlistAdd(ref, epoch, origin)
+        if (outcome == ProviderMirrorResult.ATTEMPTED_FAILURE) {
             enqueue(prefs, QueuedPush(Provider.SIMKL, add = true, ref, epoch))
             Log.d(TAG, "simkl watchlist add queued for retry")
         }

@@ -412,11 +412,11 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         val manager = syncManager ?: return null
         val mounted = nativeAccounts.captureLibraryMirrorMount(session) ?: return null
         if (com.vortx.android.integrations.NativeProviderVault.scope(mounted.account) != owner.scope.accountID) return null
-        val original = manager.captureOrdinaryProviderOwnerAdmission() ?: return null
+        val original = manager.captureProviderMirrorCallAuthority() ?: return null
         // Verify persistence with the captured generation held, before the library dispatch.
-        if (!original { syncManager === manager && manager.sessionOwnerSnapshot() == mounted.account }) return null
+        if (!original.admit { syncManager === manager && manager.sessionOwnerSnapshot() == mounted.account }) return null
         return com.vortx.android.engine.NativeLibraryMirrorOrigin(session, owner, mounted.account,
-            { action -> original { syncManager === manager && action() } }, mounted::admit)
+            { action -> original.admit { syncManager === manager && action() } }, mounted::admit, original.acquire)
     }
 
     /** Typed native mount plus persistence-backed VortX credential epoch, captured before any query. */

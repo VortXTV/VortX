@@ -3,7 +3,13 @@ import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.flow.MutableStateFlow
 // Provider payload/secure admission collaborators only; no encrypted persistence is claimed here.
 internal object NativeProviderCredentials { val GROUPS=listOf(setOf("trakt")) }
-internal object TraktAuth { var currentSessionEpoch:Long?=1 }
+internal object TraktAuth {
+    var currentSessionEpoch:Long?=1
+    fun profileProjectionEpoch(guard:NativeProviderAccess.Guard):Long? =
+        NativeProviderAccess.guarded(guard) { currentSessionEpoch }
+    fun profileProjectionEpochIsCurrent(guard:NativeProviderAccess.Guard,expected:Long?):Boolean =
+        NativeProviderAccess.guarded(guard) { currentSessionEpoch == expected } == true
+}
 internal object ScrobbleService { const val KEY_TRAKT_CONTINUE_WATCHING="legacy.trakt" }
 internal object NativeProviderAccess {
     data class Guard(val owner:SessionOwnerSnapshot.Account,val revision:Long)

@@ -91,6 +91,10 @@ expected = {
         "successful native checkpoint cannot mirror through a replacement same-scope mount",
         "optional mirror exceptions preserve durable save and removal success",
         "actual caller cancellation after checkpoint remains cancellation",
+        "fresh provider refusal at actual interceptor opens no socket",
+        "claimed provider call cancels on original manager or credential retirement",
+        "fresh provider redirects and retry-after stay on one prepared call",
+        "canceled provider callback holds the writer until actual drain",
         "deliberate saves and removals mirror to watchlists after the commit while plain adds never do",
     },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": {

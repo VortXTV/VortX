@@ -18,7 +18,7 @@ import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
-/** Real immutable JNI; every resource is an in-memory fixture, never a provider request. */
+/** Real immutable JNI with synthetic resources and, for mirror transport, loopback only. */
 class NativeRepositoryMutationJniTest {
     private val scope = VortxAccountScope("account.mutation-fixture", "owner")
     private val fixtureMirrorAccount = com.vortx.android.sync.SessionOwnerSnapshot.Account("fixture-account", 1)
@@ -432,6 +432,22 @@ class NativeRepositoryMutationJniTest {
                 assertTrue(checkNotNull(store.value).contains("tt0000006"))
             }
         }
+    }
+
+    @Test fun `fresh provider refusal at actual interceptor opens no socket`() = runBlocking {
+        open(Store(), Transport()).use { ProviderMirrorTransportJniFixture.refusedAtInterceptor(it) }
+    }
+
+    @Test fun `claimed provider call cancels on original manager or credential retirement`() = runBlocking {
+        open(Store(), Transport()).use { ProviderMirrorTransportJniFixture.cancelsAfterStart(it) }
+    }
+
+    @Test fun `fresh provider redirects and retry-after stay on one prepared call`() = runBlocking {
+        open(Store(), Transport()).use { ProviderMirrorTransportJniFixture.onePreparedCall(it) }
+    }
+
+    @Test fun `canceled provider callback holds the writer until actual drain`() = runBlocking {
+        open(Store(), Transport()).use { ProviderMirrorTransportJniFixture.holdsWriterThroughCallback() }
     }
 
     @Test fun `deliberate saves and removals mirror to watchlists after the commit while plain adds never do`() = runBlocking {

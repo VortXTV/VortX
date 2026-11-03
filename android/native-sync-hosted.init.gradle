@@ -16,7 +16,7 @@ allprojects {
                 "com.vortx.android.sync.VortXSyncManagerBackupRevisionTest": 14L,
                 "com.vortx.android.sync.NativeAccountSyncTest": 19L,
                 "com.vortx.android.integrations.NativeProspectiveProviderTest": 2L,
-                "com.vortx.android.engine.NativeRepositoryMutationJniTest": 14L,
+                "com.vortx.android.engine.NativeRepositoryMutationJniTest": 18L,
                 "com.vortx.android.engine.NativeOwnerHistoryJniTest": 5L,
                 "com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest": 25L,
                 "com.vortx.android.engine.NativeRawHostPreferencesTest": 22L,

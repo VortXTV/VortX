@@ -13,6 +13,7 @@ import com.vortx.android.sync.SessionOwnerSnapshot
 internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>? = null) {
     private val mutationLock = Any()
     private var generation = 0L
+    private val outbound = mutableSetOf<ProviderCallTicket>()
 
     fun operation(): Operation = synchronized(mutationLock) {
         Operation(generation, nativeKeys?.let { runCatching { NativeProviderAccess.capture(it) {}?.first }.getOrNull() })
@@ -39,6 +40,8 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
     fun invalidate(mutation: () -> Unit) {
         synchronized(mutationLock) {
             generation += 1
+            outbound.forEach(ProviderCallTicket::retire)
+            outbound.clear()
             if (nativeKeys == null) mutation()
             else check(NativeProviderAccess.capture(nativeKeys, mutation) != null) { "Provider account unavailable" }
         }
@@ -63,6 +66,23 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
                     CredentialMutationResult.Applied(mutation())
                 }
             }
+
+        fun attachOutbound(ticket: ProviderCallTicket): Boolean = synchronized(mutationLock) {
+            val guard = nativeGuard ?: return@synchronized false
+            generation == expectedGeneration && NativeProviderAccess.attachOutbound(guard, ticket) && outbound.add(ticket)
+        }
+
+        fun claimOutbound(ticket: ProviderCallTicket, claim: () -> Boolean): Boolean = synchronized(mutationLock) {
+            val guard = nativeGuard ?: return@synchronized false
+            generation == expectedGeneration && ticket in outbound && NativeProviderAccess.claimOutbound(guard, ticket, claim)
+        }
+
+        fun closeOutbound(ticket: ProviderCallTicket) {
+            synchronized(mutationLock) {
+                outbound.remove(ticket)
+                NativeProviderAccess.detachOutbound(ticket)
+            }
+        }
 
         /** Only a read after acquiring the provider's single-flight mutex may reuse a peer winner. */
         fun <T> readCurrentOwner(read: () -> T): CredentialMutationResult<T> = synchronized(mutationLock) {

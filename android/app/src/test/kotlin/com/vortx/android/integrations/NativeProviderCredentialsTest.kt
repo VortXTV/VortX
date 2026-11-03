@@ -16,6 +16,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 internal class NativeProviderTestStore : CredentialStoreAccess {
     val values = linkedMapOf<String, String?>()
@@ -313,6 +314,93 @@ class NativeProviderCredentialsTest {
             owner.current = original.copy(generation = 3)
             assertNull(coordinator.snapshotForOwner(original) { fail("Same ID with a new epoch performed a token read") })
         }
+    }
+
+    @Test fun `retired prestart stays refused while claimed status zero and HTTP failure stay attempted`() {
+        val failure = IntegrationsHttp.Response(0, "")
+        val rejected = ProviderCallTicket {}
+        rejected.retire()
+        rejected.close()
+        assertFalse(rejected.claim())
+        assertSame(ProviderMirrorResponse.Refused, rejected.outcome(failure))
+        assertEquals(ProviderMirrorResult.REFUSED, rejected.outcome(failure).result())
+
+        val claimed = ProviderCallTicket {}
+        assertTrue(claimed.claim())
+        assertFalse(claimed.claim())
+        claimed.retire()
+        claimed.close()
+        assertEquals(ProviderMirrorResponse.Started(failure), claimed.outcome(failure))
+        assertEquals(ProviderMirrorResult.ATTEMPTED_FAILURE, claimed.outcome(failure).result())
+        val unauthorized = IntegrationsHttp.Response(401, "")
+        assertEquals(ProviderMirrorResponse.Started(unauthorized), claimed.outcome(unauthorized))
+        assertEquals(ProviderMirrorResult.ATTEMPTED_FAILURE, claimed.outcome(unauthorized).result())
+        assertEquals(ProviderMirrorResult.SUCCEEDED, claimed.outcome(IntegrationsHttp.Response(200, "")).result())
+    }
+
+    @Test fun `first IO tickets retire on exact provider change but not an unrelated edit`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        bind(NativeProviderTestStore(), owner)
+        assertTrue(NativeProviderAccess.edit(tuple("fixture"), mapOf("traktCreated" to "100")))
+        assertTrue(NativeProviderAccess.edit(mapOf("simklAccess" to "fixture-simkl", "simklExpiry" to "0")))
+        val trakt = checkNotNull(CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0])
+            .snapshotForOwner(account) { true }).operation
+        val simkl = checkNotNull(CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1])
+            .snapshotForOwner(account) { true }).operation
+        val canceled = List(3) { CompletableDeferred<Unit>() }
+        val started = ProviderCallTicket { canceled[0].complete(Unit) }
+        val pending = ProviderCallTicket { canceled[1].complete(Unit) }
+        val other = ProviderCallTicket { canceled[2].complete(Unit) }
+        try {
+            assertTrue(trakt.attachOutbound(started))
+            assertTrue(trakt.attachOutbound(pending))
+            assertTrue(simkl.attachOutbound(other))
+            assertTrue(trakt.claimOutbound(started, started::claim))
+            assertFalse(trakt.claimOutbound(started, started::claim))
+            assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "unrelated")))
+            assertTrue(simkl.claimOutbound(other, other::claim))
+            assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "same-provider-events"), mapOf("traktCreated" to "101")))
+            assertFalse(trakt.claimOutbound(pending) { fail("Retired refresh lineage reached first IO"); true })
+            withTimeout(3_000) { canceled[0].await(); canceled[1].await() }
+            assertFalse(canceled[2].isCompleted)
+            assertTrue(NativeProviderAccess.edit(mapOf("simklAccess" to "successor", "simklExpiry" to "0")))
+            withTimeout(3_000) { canceled[2].await() }
+        } finally {
+            trakt.closeOutbound(started)
+            trakt.closeOutbound(pending)
+            simkl.closeOutbound(other)
+            listOf(started, pending, other).forEach(ProviderCallTicket::close)
+        }
+    }
+
+    @Test fun `binding replacement and failed local provider invalidation cancel prepared calls`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        val store = NativeProviderTestStore()
+        bind(store, owner)
+        assertTrue(NativeProviderAccess.edit(tuple("fixture")))
+        val coordinator = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0])
+        val started = checkNotNull(coordinator.snapshotForOwner(account) { true }).operation
+        val canceled = CompletableDeferred<Unit>()
+        val first = ProviderCallTicket { canceled.complete(Unit) }
+        try {
+            assertTrue(started.attachOutbound(first))
+            assertTrue(started.claimOutbound(first, first::claim))
+            assertThrows(IllegalStateException::class.java) { coordinator.invalidate { error("Synthetic failed provider mutation") } }
+            withTimeout(3_000) { canceled.await() }
+            assertFalse(started.claimOutbound(first, first::claim))
+        } finally { started.closeOutbound(first); first.close() }
+
+        val pending = checkNotNull(coordinator.snapshotForOwner(account) { true }).operation
+        val rebindCanceled = CompletableDeferred<Unit>()
+        val second = ProviderCallTicket { rebindCanceled.complete(Unit) }
+        try {
+            assertTrue(pending.attachOutbound(second))
+            bind(store, owner)
+            assertFalse(pending.claimOutbound(second) { fail("Retired binding reached first IO"); true })
+            withTimeout(3_000) { rebindCanceled.await() }
+        } finally { pending.closeOutbound(second); second.close() }
     }
 
     @Test fun `captured OAuth operation rejects newer remote intent and same-account reopen ABA`() {

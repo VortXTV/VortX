@@ -126,17 +126,15 @@ object SIMKLAuth {
         }?.value
     }
 
-    internal fun validWatchlistToken(expected: SessionOwnerSnapshot.Account, epoch: Long): String? {
+    internal fun validWatchlistCredential(expected: SessionOwnerSnapshot.Account, epoch: Long): ProviderMirrorCredential? {
         val snapshot = tokenMutations.snapshotForOwner(expected) {
             if (currentSessionEpoch() == epoch) tokenStore?.validToken() else null
         } ?: return null
-        return snapshot.value?.takeIf { snapshot.operation.isCurrent() }
-    }
-
-    internal fun isWatchlistTokenCurrent(expected: SessionOwnerSnapshot.Account, epoch: Long, token: String): Boolean =
-        tokenMutations.snapshotForOwner(expected) {
+        val token = snapshot.value ?: return null
+        return ProviderMirrorCredential(token, snapshot.operation) {
             currentSessionEpoch() == epoch && tokenStore?.validToken() == token
-        }?.value == true
+        }
+    }
 
     /// A live access token, or throws [SIMKLException.NotSignedIn]. SIMKL tokens are long-lived and do not
     /// refresh; a recorded expiry in the past (rare) throws so the UI can re-prompt.

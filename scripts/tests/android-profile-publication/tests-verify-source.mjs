@@ -58,7 +58,7 @@ for(const [name,path] of [['gateway','NativeProfileGateway.kt'],['cwGate','Conti
   snippets[name]=read('profile/'+path);assert.equal(fixture('tests-extracted/'+path),snippets[name]);
 }
 for(const [name,text] of Object.entries(snippets)) assert.equal(hash(text),manifest.hashes[name],`${name}: reviewed hash changed`);
-for(const marker of ['    internal suspend fun attachNativeGateway(','    internal suspend fun refreshNativeProjectionInBackground(','    private fun prepareNativeProjection(','    private fun applyPreparedNativeProjection(','    internal fun clearNativeProjection(']) assert.equal(method(bootstrapExtract,marker),method(store,marker));
+for(const marker of ['internal object RestoreProfileDirectWriters','    private fun noteRestoreProfileWrite(','    internal suspend fun attachNativeGateway(','    private suspend fun attachNativeGatewayAsWriter(','    internal suspend fun refreshNativeProjectionInBackground(','    private fun prepareNativeProjection(','    private fun applyPreparedNativeProjection(','    internal fun clearNativeProjection(','    private fun clearNativeProjectionAsWriter(']) assert.equal(method(bootstrapExtract,marker),method(store,marker),marker);
 const fields=store.slice(store.indexOf('    private var nativeProjectionRequest ='),store.indexOf('    /** Bootstrap remains suspended'));
 assert(bootstrapExtract.includes(fields),'Bootstrap fields/basis/receipt types must match actual source');
 const capture=method(coordinator,'    internal fun captureProfilePresentation(');
@@ -73,11 +73,12 @@ assert.match(snippets.storeBoundary,/ContinueWatchingOwnerGate\.serialized[\s\S]
 assert.match(snippets.currentProjection,/runtime\.withCurrentRead[\s\S]*check\(admit\(runtime\)/);
 assert.match(snippets.withProjection,/check\(current == expected\)/);
 const add=method(store,'    fun add(profile: UserProfile)');
+assert.match(method(store,'    private fun <T> withDirectProfileWrite('),/RestoreProfileDirectWriters\.write \{\s*ContinueWatchingOwnerGate\.serialized \{ action\(\) \}/);
 function nativeAdd(text) {
-  assert.match(text,/fun add\(profile: UserProfile\) = ContinueWatchingOwnerGate\.serialized \{/,'Native add must hold CW gate');
+  assert.match(text,/fun add\(profile: UserProfile\) = withDirectProfileWrite \{/,'Native add must hold Restore writer and CW gates');
   assert.match(text,/applyNativeProjection\(checkNotNull\(nativeGateway\)\.save\(profile, adding = true\)\)/);
 }
-nativeAdd(add);assert.throws(()=>nativeAdd(add.replace('= ContinueWatchingOwnerGate.serialized {','{')),/Native add must hold CW gate/);
+nativeAdd(add);assert.throws(()=>nativeAdd(add.replace('= withDirectProfileWrite {','{')),/Native add must hold Restore writer and CW gates/);
 const pending=method(store,'    private fun capturePendingNativeContinueWatchingDiscovery(');
 assert.match(pending,/val current = gateway\.read\(\)[\s\S]*gateway\.withProjection\(current\)/);
 assert.match(pending,/readbackIsCurrent = \{ saved -> nativeGateway\?\.read\(\) == saved \}/);
@@ -98,18 +99,29 @@ assert.match(synchronousProjection,/playlistScopeTransition\([\s\S]*providerGuar
 assert.match(synchronousProjection,/if \(transition == PlaylistScopeTransition\.AUTHORITY_BOUNDARY\) notifyPlaylistScopeListeners\(transition\)/);
 assert.match(synchronousProjection,/activateProfileState\(it, resetUnset = true, playlistTransition = transition\)/);
 const apply=method(store,'    private fun applyPreparedNativeProjection(');
-assert.doesNotMatch(apply,/\.read\(|NativeProviderAccess\.(?:capture|current|guarded)|currentSessionEpoch|\.save\(/);
+assert.doesNotMatch(apply,/\.read\(|NativeProviderAccess\.(?:capture|current|guarded)|currentSessionEpoch|profileProjectionEpoch|\.save\(/);
 assert.match(apply,/withoutNativePreferenceCapture/);
 assert.match(apply,/PlaylistScopeTransition\.AUTHORITY_BOUNDARY/);
 assert.match(apply,/notifyPlaylistScopeListeners\(transition\)/);
-const attach=method(store,'    internal suspend fun attachNativeGateway(');
+assert.match(method(store,'    internal suspend fun attachNativeGateway('),/RestoreProfileDirectWriters\.begin\(\)[\s\S]*attachNativeGatewayAsWriter\([\s\S]*finally \{ RestoreProfileDirectWriters\.end\(\) \}/);
+const attach=method(store,'    private suspend fun attachNativeGatewayAsWriter(');
 assert.match(attach,/withContext\(Dispatchers\.IO\)[\s\S]*gateway\.prepareProjection/);
 assert.match(attach,/prepared\.publishIfCurrent/);
 assert.match(attach,/NativeProviderAccess\.revision\.value == currentEffects\.providerRevision/);
 assert.match(attach,/if \(prepared\.requiresRecovery\)[\s\S]*continueWatchingMigration\.restore[\s\S]*check\(!recoveryRequired\)/);
 assert.match(attach,/check\(\+\+attempt < 4\)[\s\S]*delay\(50L \* attempt\)/);
 const prepare=method(store,'    private fun prepareNativeProjection(');
-assert.match(prepare,/NativeProviderAccess\.capture/);assert.match(prepare,/TraktAuth\.currentSessionEpoch/);
+assert.match(prepare,/NativeProviderAccess\.capture/);
+for (const boundary of [prepare, synchronousProjection, pending]) {
+  assert.match(boundary,/TraktAuth[.:]+profileProjectionEpoch\b/);
+  assert.match(boundary,/TraktAuth\.profileProjectionEpochIsCurrent\(/);
+  assert.doesNotMatch(boundary,/TraktAuth\.currentSessionEpoch/);
+}
+const trakt=read('integrations/TraktAuth.kt');
+const projectionEpoch=method(trakt,'    private fun <T> withProfileProjectionEpoch(');
+assert.match(projectionEpoch,/guard\.keys != NativeProviderCredentials\.GROUPS\[0\]/);
+assert.match(projectionEpoch,/NativeProviderAccess\.guarded\(guard\)/);
+assert.doesNotMatch(projectionEpoch,/tokenMutations|snapshotForOwner/);
 assert.match(prepare,/Native provider authority is unavailable/);
 assert.match(prepare,/previousAcknowledgement\?\.takeIf/);
 const publicationTail=capture.slice(capture.indexOf('PreparedProjection('));
@@ -117,6 +129,7 @@ assert.doesNotMatch(publicationTail,/session\.(?:read|owned|withCurrentRead)|cap
 assert.match(publicationTail,/mounted\.get\(\) === current && changes\.value == epoch && session\.updates\.value == version/);
 const forYou=read('foryou/ForYouStore.kt');
 const forYouExtract=fixture('tests-extracted/ForYouReloadBoundary.kt');
+assert.equal(method(forYouExtract,'internal object ForYouEditFields'),method(forYou,'internal object ForYouEditFields'));
 const forYouBody=forYou.slice(forYou.indexOf('class ForYouStore internal constructor('),forYou.indexOf('    companion object {\n        internal const val LOCAL_KEY'));
 assert(forYouExtract.includes(forYouBody),'Entire actual ForYou Store through native/local writes must match');
 assert(forYouExtract.includes(forYou.slice(forYou.indexOf('interface ForYouNativeGateway {'),forYou.indexOf('/**\n * The active profile'))),'Actual ForYou Snapshot and State must match');

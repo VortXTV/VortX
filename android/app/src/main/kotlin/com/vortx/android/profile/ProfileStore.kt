@@ -387,7 +387,7 @@ class ProfileStore private constructor(context: Context) {
         val guard = checkNotNull(captured?.first?.takeIf { captured.second == value }) {
             "Native provider authority is unavailable. Retry this account."
         }
-        val epoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+        val epoch = com.vortx.android.integrations.TraktAuth.profileProjectionEpoch(guard)
         var acknowledgement = previousAcknowledgement?.takeIf {
             it.account == guard.owner && it.traktEpoch == epoch && it.profileID == value.activeID && incoming?.discovery == it.discovery
         }
@@ -402,8 +402,7 @@ class ProfileStore private constructor(context: Context) {
             save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(guard) {
                 if (gateway.read() == value) gateway.save(edited, adding = false) else null
             } },
-            authorityIsCurrent = { com.vortx.android.integrations.NativeProviderAccess.current(guard) &&
-                com.vortx.android.integrations.TraktAuth.currentSessionEpoch == epoch },
+            authorityIsCurrent = { com.vortx.android.integrations.TraktAuth.profileProjectionEpochIsCurrent(guard, epoch) },
             readbackIsCurrent = { saved -> gateway.read() == saved },
         )?.let { saved ->
             acknowledgement = NativeLegacyAcknowledgement(guard.owner, saved.activeID, checkNotNull(epoch),
@@ -478,7 +477,7 @@ class ProfileStore private constructor(context: Context) {
             // withProjection already validated this value and still holds Session/auth/mount admission.
             com.vortx.android.integrations.NativeProviderCredentials.GROUPS[0]) { value }
         val providerGuard = capturedProvider?.first?.takeIf { capturedProvider?.second == value }
-        val traktEpoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+        val traktEpoch = providerGuard?.let(com.vortx.android.integrations.TraktAuth::profileProjectionEpoch)
         if (previous != null && (previous.id != value.activeID || acknowledgedNativeAccount != providerGuard?.owner)) {
             continueWatchingMigration.retire()
             prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
@@ -496,8 +495,8 @@ class ProfileStore private constructor(context: Context) {
             save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(checkNotNull(providerGuard)) {
                 if (nativeGateway?.read() == value) checkNotNull(nativeGateway).save(edited, adding = false) else null
             } },
-            authorityIsCurrent = { providerGuard != null && com.vortx.android.integrations.NativeProviderAccess.current(providerGuard) &&
-                com.vortx.android.integrations.TraktAuth.currentSessionEpoch == traktEpoch },
+            authorityIsCurrent = { providerGuard != null &&
+                com.vortx.android.integrations.TraktAuth.profileProjectionEpochIsCurrent(providerGuard, traktEpoch) },
             readbackIsCurrent = { saved -> nativeGateway?.read() == saved },
         )?.let { saved ->
             acknowledged = saved
@@ -974,7 +973,7 @@ class ProfileStore private constructor(context: Context) {
                     com.vortx.android.integrations.NativeProviderCredentials.GROUPS[0]) { current }
                 val guard = captured?.first
                 val projection = captured?.second
-                val epoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+                val epoch = guard?.let(com.vortx.android.integrations.TraktAuth::profileProjectionEpoch)
                 // Unrelated discovery edits join the pending legacy choice in one checkpoint. The temporary
                 // Local projection is not an explicit source edit and must never overwrite the qualified choice.
                 continueWatchingMigration.retainDiscoveryCapture(profile, ProfileDiscoveryPreferencesStore.capture(prefs))
@@ -983,8 +982,7 @@ class ProfileStore private constructor(context: Context) {
                     save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(checkNotNull(guard)) {
                         if (nativeGateway?.read() == projection) checkNotNull(nativeGateway).save(edited, adding = false) else null
                     } }, authorityIsCurrent = { guard != null && acknowledgedNativeAccount == guard.owner &&
-                        com.vortx.android.integrations.NativeProviderAccess.current(guard) &&
-                        com.vortx.android.integrations.TraktAuth.currentSessionEpoch == epoch },
+                        com.vortx.android.integrations.TraktAuth.profileProjectionEpochIsCurrent(guard, epoch) },
                     readbackIsCurrent = { saved -> nativeGateway?.read() == saved },
                 )?.let { saved ->
                     applyNativeProjection(saved, forceSettings = true)

@@ -2280,6 +2280,19 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         admit
     }
 
+    internal class ProviderMirrorCallAuthority(
+        val admit: (() -> Boolean) -> Boolean,
+        val acquire: () -> SessionOperationCoordinator.OutboundCallPermit?,
+    )
+
+    /** Capture call issuance with the original ordinary owner before the native checkpoint. */
+    internal fun captureProviderMirrorCallAuthority(): ProviderMirrorCallAuthority? = operations.snapshot { generation ->
+        val admit = captureOrdinaryProviderOwnerAdmission() ?: return@snapshot null
+        ProviderMirrorCallAuthority(admit) {
+            operations.acquireSessionCallPermit(generation) { admit { true } }
+        }
+    }
+
     /** Same gate semantics as captureLocalLibraryMutationAdmission, with a comparable original scope. */
     internal fun captureLocalLibraryMutationAuthority(): LocalLibraryMutationAuthority? =
         operations.snapshot { generation ->

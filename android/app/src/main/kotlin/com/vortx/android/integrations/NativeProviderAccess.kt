@@ -108,18 +108,25 @@ internal object NativeProviderAccess {
     private class Binding(val vault: NativeProviderVault, val admission: NativeProviderAdmission, val changed: (SessionOwnerSnapshot.Account) -> Unit)
     @Volatile private var binding: Binding? = null
     private val storeLock = Any()
+    private val outbound = mutableMapOf<ProviderCallTicket, OutboundCredential>()
     private val changes = MutableStateFlow(0L)
     val revision = changes.asStateFlow()
     private val changeLock = Any()
 
     fun bind(vault: NativeProviderVault, admission: NativeProviderAdmission, changed: (SessionOwnerSnapshot.Account) -> Unit) =
         AccountFileProviderWriters.withWriter(Unit) {
-            synchronized(storeLock) { binding = Binding(vault, admission, changed) }
+            synchronized(storeLock) {
+                retireOutbound { true }
+                binding = Binding(vault, admission, changed)
+            }
             notifyChanged()
         }
 
     fun unbindForTest() = AccountFileProviderWriters.withWriter(Unit) {
-        synchronized(storeLock) { binding = null }
+        synchronized(storeLock) {
+            retireOutbound { true }
+            binding = null
+        }
         notifyChanged()
     }
 
@@ -128,6 +135,52 @@ internal object NativeProviderAccess {
 
     data class Guard internal constructor(val owner: SessionOwnerSnapshot.Account, val keys: Set<String>, val events: JSONObject, internal val bindingIdentity: Any)
     data class Read(val values: Map<String, String?>, val revision: Long, val owner: SessionOwnerSnapshot.Account)
+
+    private class OutboundCredential(val guard: Guard, val createdAt: String?) {
+        fun matches(candidate: NativeProviderCredentials): Boolean =
+            NativeProviderCredentials.same(guard.events, candidate.events(guard.keys)) &&
+                (guard.keys != NativeProviderCredentials.GROUPS[0] || candidate.auxiliary("traktCreated") == createdAt)
+    }
+
+    fun attachOutbound(guard: Guard, ticket: ProviderCallTicket): Boolean =
+        access(guard.owner) { selected, _, value ->
+            val observed = OutboundCredential(guard, value.auxiliary("traktCreated"))
+            if (selected !== guard.bindingIdentity || !observed.matches(value) || ticket in outbound) false
+            else { outbound[ticket] = observed; true }
+        } == true
+
+    fun claimOutbound(guard: Guard, ticket: ProviderCallTicket, claim: () -> Boolean): Boolean =
+        access(guard.owner) { selected, _, value ->
+            val original = outbound[ticket]
+            original != null && original.guard === guard && selected === guard.bindingIdentity &&
+                original.matches(value) && claim()
+        } == true
+
+    fun detachOutbound(ticket: ProviderCallTicket) {
+        synchronized(storeLock) { outbound.remove(ticket) }
+    }
+
+    private fun retireOutbound(retired: (OutboundCredential) -> Boolean) {
+        val entries = outbound.iterator()
+        while (entries.hasNext()) {
+            val (ticket, observed) = entries.next()
+            if (retired(observed)) {
+                entries.remove()
+                ticket.retire()
+            }
+        }
+    }
+
+    private fun commit(selected: Binding, owner: SessionOwnerSnapshot.Account, candidate: NativeProviderCredentials) {
+        retireOutbound { it.guard.bindingIdentity === selected && it.guard.owner == owner && !it.matches(candidate) }
+        try {
+            selected.vault.commit(owner, candidate)
+        } catch (failure: Exception) {
+            // A failed durable acknowledgement cannot prove that the old credential is still live.
+            retireOutbound { it.guard.bindingIdentity === selected && it.guard.owner == owner }
+            throw failure
+        }
+    }
 
     /** Opaque app-sensitive lifetime. It exports no credential-bearing fields or generated toString. */
     class Prospective internal constructor(private val selected: Any,
@@ -189,7 +242,7 @@ internal object NativeProviderAccess {
     fun edit(values: Map<String, String?>, auxiliary: Map<String, String?> = emptyMap()): Boolean {
         val success = runCatching { access { binding, owner, candidate ->
             candidate.edit(values, auxiliary)
-            binding.vault.commit(owner, candidate)
+            commit(binding, owner, candidate)
             // Admission is still held: a switch cannot redirect this exact account's dirty event.
             binding.changed(owner)
             true
@@ -200,14 +253,14 @@ internal object NativeProviderAccess {
     fun merge(owner: SessionOwnerSnapshot.Account, document: JSONObject): JSONObject? {
         val result = access(owner) { selected, captured, candidate ->
             candidate.merge(document)
-            selected.vault.commit(captured, candidate)
+            commit(selected, captured, candidate)
             candidate.mirror(document)
         }
         if (result != null) notifyChanged()
         return result
     }
     fun acknowledge(owner: SessionOwnerSnapshot.Account, sent: JSONObject): Boolean = access(owner) { selected, captured, candidate ->
-        candidate.acknowledge(sent); selected.vault.commit(captured, candidate); true
+        candidate.acknowledge(sent); commit(selected, captured, candidate); true
     } == true
     fun hasPending(owner: SessionOwnerSnapshot.Account): Boolean? = access(owner) { _, _, value -> value.hasPending() }
 

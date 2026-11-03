@@ -5,7 +5,11 @@ import com.vortx.android.integrations.IntegrationsHttp
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.MediaType
-import com.vortx.android.sync.SessionOwnerSnapshot
+import com.vortx.android.engine.NativeLibraryMirrorOrigin
+import com.vortx.android.integrations.ProviderMirrorResult
+import com.vortx.android.integrations.ProviderMirrorTransport
+import com.vortx.android.integrations.result
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -82,31 +86,40 @@ internal object AccountWatchlistClient {
         if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
         val token = runCatching { TraktAuth.validToken() }.getOrNull() ?: return false
         if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
-        return sendTraktWatchlist(add, ref, token)
+        return sendTraktWatchlist(add, ref, token, ::legacyPost).isSuccess
     }
 
     suspend fun traktWatchlist(add: Boolean, ref: TitleRef, expectedEpoch: Long,
-        expectedOwner: SessionOwnerSnapshot.Account): Boolean {
-        if (!ref.hasUsableId) return false
-        val token = runCatching { TraktAuth.validWatchlistToken(expectedOwner, expectedEpoch) }.getOrNull() ?: return false
-        if (!TraktAuth.isWatchlistTokenCurrent(expectedOwner, expectedEpoch, token)) return false
-        return sendTraktWatchlist(add, ref, token)
+        origin: NativeLibraryMirrorOrigin): ProviderMirrorResult {
+        if (!ref.hasUsableId) return ProviderMirrorResult.REFUSED
+        val preparation = try {
+            TraktAuth.prepareWatchlistCredential(origin, expectedEpoch)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) { TraktAuth.MirrorPreparation.Refused }
+        val credential = when (preparation) {
+            TraktAuth.MirrorPreparation.Refused -> return ProviderMirrorResult.REFUSED
+            TraktAuth.MirrorPreparation.RefreshFailed -> return ProviderMirrorResult.REFRESH_FAILED
+            TraktAuth.MirrorPreparation.RefreshSucceeded -> return ProviderMirrorResult.REFRESH_SUCCEEDED
+            is TraktAuth.MirrorPreparation.Ready -> preparation.credential
+        }
+        return sendTraktWatchlist(add, ref, credential.bearer) { url, headers, body ->
+            ProviderMirrorTransport.post(origin, credential.operation, credential.matches, url, headers, body)
+        }.result()
     }
 
-    private suspend fun sendTraktWatchlist(add: Boolean, ref: TitleRef, token: String): Boolean {
-        val response = IntegrationsHttp.request(
-            method = "POST",
-            urlString = "${TraktAuth.API_BASE}${if (add) "/sync/watchlist" else "/sync/watchlist/remove"}",
-            headers = mapOf(
+    private suspend fun <T> sendTraktWatchlist(add: Boolean, ref: TitleRef, token: String,
+        post: suspend (String, Map<String, String>, String) -> T): T =
+        post(
+            "${TraktAuth.API_BASE}${if (add) "/sync/watchlist" else "/sync/watchlist/remove"}",
+            mapOf(
                 "Content-Type" to "application/json",
                 "trakt-api-version" to "2",
                 "trakt-api-key" to traktClientId,
                 "Authorization" to "Bearer $token",
             ),
-            body = traktBody(ref).toString(),
+            traktBody(ref).toString(),
         )
-        return response.isSuccess
-    }
 
     /**
      * `{ movies: [ { ids } ] }` for a movie, `{ shows: [ { ids } ] }` for a series. When [TitleRef.isSeries]
@@ -144,18 +157,21 @@ internal object AccountWatchlistClient {
         if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
         val token = runCatching { SIMKLAuth.validToken() }.getOrNull() ?: return false
         if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
-        return sendSimklWatchlistAdd(ref, token)
+        return sendSimklWatchlistAdd(ref, token, ::legacyPost).isSuccess
     }
 
     suspend fun simklWatchlistAdd(ref: TitleRef, expectedEpoch: Long,
-        expectedOwner: SessionOwnerSnapshot.Account): Boolean {
-        if (!ref.hasUsableId) return false
-        val token = runCatching { SIMKLAuth.validWatchlistToken(expectedOwner, expectedEpoch) }.getOrNull() ?: return false
-        if (!SIMKLAuth.isWatchlistTokenCurrent(expectedOwner, expectedEpoch, token)) return false
-        return sendSimklWatchlistAdd(ref, token)
+        origin: NativeLibraryMirrorOrigin): ProviderMirrorResult {
+        if (!ref.hasUsableId) return ProviderMirrorResult.REFUSED
+        val credential = runCatching { SIMKLAuth.validWatchlistCredential(origin.expectedAccount, expectedEpoch) }.getOrNull()
+            ?: return ProviderMirrorResult.REFUSED
+        return sendSimklWatchlistAdd(ref, credential.bearer) { url, headers, body ->
+            ProviderMirrorTransport.post(origin, credential.operation, credential.matches, url, headers, body)
+        }.result()
     }
 
-    private suspend fun sendSimklWatchlistAdd(ref: TitleRef, token: String): Boolean {
+    private suspend fun <T> sendSimklWatchlistAdd(ref: TitleRef, token: String,
+        post: suspend (String, Map<String, String>, String) -> T): T {
         val item = JSONObject().apply {
             put("ids", simklIds(ref))
             put("to", "plantowatch")
@@ -164,14 +180,15 @@ internal object AccountWatchlistClient {
             if (ref.isSeries == true) "shows" else "movies",
             JSONArray().put(item),
         )
-        val response = IntegrationsHttp.request(
-            method = "POST",
-            urlString = "${SIMKLAuth.API_BASE}/sync/add-to-list?${SIMKLAuth.requiredQuery()}",
-            headers = SIMKLAuth.authHeaders(token),
-            body = body.toString(),
+        return post(
+            "${SIMKLAuth.API_BASE}/sync/add-to-list?${SIMKLAuth.requiredQuery()}",
+            SIMKLAuth.authHeaders(token),
+            body.toString(),
         )
-        return response.isSuccess
     }
+
+    private suspend fun legacyPost(url: String, headers: Map<String, String>, body: String): IntegrationsHttp.Response =
+        IntegrationsHttp.request("POST", url, headers, body)
 
     private fun simklIds(ref: TitleRef): JSONObject = JSONObject().apply {
         ref.imdb?.takeIf { it.isNotEmpty() }?.let { put("imdb", it) }
