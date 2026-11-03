@@ -22,6 +22,7 @@ import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaRef
+import com.vortx.android.engine.SourceTitleMatch
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
@@ -1346,12 +1347,10 @@ class DetailViewModel(
                     sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
                 ) {
                     val raw = sourcePublicationBridge.accept(request, update.sourcePublicationId, update.groups)
-                    // The assembly coalescer applies this same pure filter later, but immediate paint and the
-                    // once-latched Smart Source pick run before that publication. Filter their shared input
-                    // now so direct-links-only can never flash or auto-play a raw torrent. Keep [raw] for the
-                    // model/capture/cache lanes: their display assembly filters before ranking, while capture
-                    // intentionally sees eligible torrent descriptors before the viewer-only display filter.
-                    val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)
+                    // Immediate paint and the once-latched Smart Source pick share the same captured
+                    // admission/title-match policy as the coalescer. Keep [raw] for model/capture/cache:
+                    // contribution capture intentionally precedes viewer-only display filtering.
+                    val displayRaw = SourceListModel.displayGroups(raw, ctx)
                     if (displayRaw.isNotEmpty() || update.terminal) {
                         sourcesReady = true
                         _streams.value = UiState.Success(displayRaw)
@@ -1465,7 +1464,21 @@ class DetailViewModel(
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
             contentId = contentId,
+            titleMatch = titleMatchTarget(episodeId),
+            titleMatchThreshold = sourcePrefs.titleMatchThreshold,
         )
+
+    /// The opened movie or episode for the optional title-match filter; a channel or TV page has no single release.
+    private fun titleMatchTarget(episodeId: String?): SourceTitleMatch.Target? {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return null
+        return when (detail.type) {
+            MediaType.MOVIE -> SourceTitleMatch.Target(detail.name, year = SourceTitleMatch.year(detail.releaseInfo))
+            MediaType.SERIES -> detail.videos.firstOrNull { it.id == episodeId }
+                ?.let { SourceTitleMatch.Target(detail.name, season = it.season, episode = it.episode) }
+                ?: SourceTitleMatch.Target(detail.name)
+            else -> null
+        }
+    }
 
     private fun playbackSourcePreferences() = sourcePrefs.snapshot(
         playbackAudioPreference.languages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
@@ -2064,7 +2077,7 @@ class DetailViewModel(
         sourceModel.setContext(ctx)
         sourceModel.setMediaServerGroups(emptyList())
         sourceModel.setRawGroups(visible)
-        _streams.value = UiState.Success(SourceListModel.directLinkDisplayGroups(visible, ctx.directLinksOnly))
+        _streams.value = UiState.Success(SourceListModel.displayGroups(visible, ctx))
         sourceSettlement.value = EpisodeSourceSettlement(request, settled = true)
         sourcesReady = true
     }
@@ -2536,9 +2549,12 @@ class DetailViewModel(
         val sticky = sourceSticky.preference(id)
         val prefs = playbackSourcePreferences()
         val directOnly = PlaybackBehaviorSettings.directLinksOnly(app)
+        val displayContext = SourceListModel.Context(prefs = prefs, directLinksOnly = directOnly,
+            titleMatch = SourceTitleMatch.Target(detail.name, season = target.season, episode = target.episode),
+            titleMatchThreshold = sourcePrefs.titleMatchThreshold)
         val unhealthy = ProviderHealth.activeAddons()
         return preparedEpisodeSlot.prepare(ticket, target.id, preparation, choose = { groups ->
-            StreamRanking.best(SourceListModel.directLinkDisplayGroups(groups, directOnly),
+            StreamRanking.best(SourceListModel.displayGroups(groups, displayContext),
                 continuity = continuity, binge = binge, pin = pin, sticky = sticky,
                 providerPenalty = { it in unhealthy }, prefs = prefs)
         })

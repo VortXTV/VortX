@@ -132,11 +132,11 @@ protocol SourcePrefsReading {
     func matches(_ regex: NSRegularExpression, _ text: String) -> Bool
 }
 
-enum SourceType: String, CaseIterable, Codable {
+enum SourceType: String, CaseIterable, Codable, Sendable {
     case mediaServer, debrid, usenet, torrent, direct
 }
 
-struct StubPrefs: SourcePrefsReading {
+struct StubPrefs: SourcePrefsReading, Sendable {
     var useAddonOrder = false
     var typeOrder: [SourceType] = [.debrid, .usenet, .torrent, .direct]
     var noFiltersActive = true
@@ -169,6 +169,7 @@ struct StubPrefs: SourcePrefsReading {
 }
 
 enum SourcePreferences {
+    typealias Snapshot = StubPrefs
     static var stub = StubPrefs()
     static var reading: SourcePrefsReading { stub }
 }

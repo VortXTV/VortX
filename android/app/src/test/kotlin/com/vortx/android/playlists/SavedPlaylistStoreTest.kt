@@ -212,6 +212,9 @@ class SavedPlaylistStoreTest {
 
         fun rawRegisters(): JSONObject = JSONObject(registers.toString())
 
+        fun receiptOwnerIsActive(editID: String): Boolean =
+            receiptOwners[UUID.fromString(editID)]?.active == true
+
         fun markSaved(editID: String, version: Long) {
             receiptStates[UUID.fromString(editID)] = NativePlaylistCloudReceiptLedger.State.Saved(version)
             receiptHints.value += 1
@@ -461,7 +464,9 @@ class SavedPlaylistStoreTest {
         store.nativeProjectionWillChange()
         gateway.emitPlaylistHint() // Mirrors the Session playlist pulse after its before-change callback.
         runCurrent()
-        assertEquals(0, gateway.retiredReceiptOwners)
+        // A later projection-only owner may retire here. The accepted edit must retain its
+        // original receipt owner, which alone can acknowledge this pending write.
+        assertTrue(gateway.receiptOwnerIsActive(accepted.editID))
         assertEquals(SavedPlaylistStatus.LocalPending,
             requireNotNull(store.catalog(owner)).playlists.single().status)
 

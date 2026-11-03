@@ -1,5 +1,7 @@
 package com.vortx.android.sources
 
+import com.vortx.android.engine.SourceTitleMatchThreshold
+
 import android.content.Context
 import android.content.SharedPreferences
 import com.vortx.android.engine.StreamRanking
@@ -253,6 +255,11 @@ class SourcePreferencesStore(context: Context) {
         get() = prefs.getInt(MAX_RESOLUTION_KEY, DEFAULT_MAX_RESOLUTION)
         set(value) { prefs.edit().putInt(MAX_RESOLUTION_KEY, value).apply() }
 
+    /** Hide sources whose release name matches the opened title below this percent (0 = off; #172). */
+    var titleMatchThreshold: Int
+        get() = SourceTitleMatchThreshold.admitted(prefs.getInt(TITLE_MATCH_THRESHOLD_KEY, 0)) ?: 0
+        set(value) { prefs.edit().putInt(TITLE_MATCH_THRESHOLD_KEY, value).apply() }
+
     var minResolution: Int
         get() = prefs.getInt(MIN_RESOLUTION_KEY, DEFAULT_MIN_RESOLUTION)
         set(value) { prefs.edit().putInt(MIN_RESOLUTION_KEY, value).apply() }
@@ -410,6 +417,7 @@ class SourcePreferencesStore(context: Context) {
         const val HIDE_UNKNOWN_RES_KEY = "stremiox.streaming.hideUnknownResolution"
         const val PREFERRED_AUDIO_KEY = "stremiox.streaming.preferredAudioOnly"
         const val MAX_FILE_SIZE_KEY = "stremiox.streaming.maxFileSizeGB"
+        const val TITLE_MATCH_THRESHOLD_KEY = "stremiox.streaming.titleMatchThreshold"
         const val HDR_ONLY_KEY = "stremiox.streaming.hdrOnly"
         const val EXCLUDE_AV1_KEY = "stremiox.streaming.excludeAV1"
         const val DEFAULT_SORT_KEY = "stremiox.streaming.defaultSourceSort"

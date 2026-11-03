@@ -71,13 +71,42 @@ class DirectLinkDisplayGroupsTest {
     fun `detail immediate paint and smart picks consume the shared filtered input`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
 
-        assertTrue(source.contains("val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)"))
+        assertTrue(source.contains("val displayRaw = SourceListModel.displayGroups(raw, ctx)"))
         assertTrue(source.contains("_streams.value = UiState.Success(displayRaw)"))
         assertTrue(source.contains("val assembled = sourceModel.awaitSettledTarget("))
-        assertTrue(source.contains("assembled?.best"))
+        assertTrue("Settled Smart Source pick must observe current publication visibility", settledPickUsesCurrentVisibleGroups(source))
         assertTrue(source.contains("displayRaw,\n                                continuity = null,"))
         assertTrue(source.contains("sticky = sticky,"))
         assertTrue(source.contains("providerPenalty = unhealthy,"))
+    }
+
+    @Test
+    fun `settled pick source contract rejects visibility and post await admission bypasses`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        assertTrue(settledPickUsesCurrentVisibleGroups(source))
+        listOf(
+            "sourcePublicationBridge.visibleGroups(request, state.groups)" to "state.groups",
+            "if (visible === state.groups) state.best else StreamRanking.best(" to "state.best ?: StreamRanking.best(",
+            "if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@collect" to "",
+        ).forEach { (before, after) ->
+            assertTrue("Negative control must change production source: $before", source.contains(before))
+            assertFalse("Unsafe settled pick was accepted: $before", settledPickUsesCurrentVisibleGroups(source.replace(before, after)))
+        }
+    }
+
+    private fun settledPickUsesCurrentVisibleGroups(source: String): Boolean {
+        val await = source.indexOf("val assembled = sourceModel.awaitSettledTarget(")
+        val use = source.indexOf("assembled?.let { state ->", await.coerceAtLeast(0))
+        if (await < 0 || use <= await) return false
+        val admission = source.substring(await, use)
+        if (!admission.contains("requestGeneration = request.generation") || !admission.contains("streamId = episodeId") ||
+            !admission.contains("if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@collect")) return false
+        val body = bracedBlock(source, use).content
+        val visible = body.indexOf("val visible = sourcePublicationBridge.visibleGroups(request, state.groups)")
+        val pick = body.indexOf("if (visible === state.groups) state.best else StreamRanking.best(")
+        return visible >= 0 && pick > visible && body.substring(pick).contains("visible,") &&
+            listOf("continuity = hint?.first", "binge = hint?.second", "pin = currentPin()", "sticky = sticky",
+                "providerPenalty = unhealthy", "prefs = ctx.prefs").all { body.substring(pick).contains(it) }
     }
 
     @Test

@@ -34,7 +34,7 @@ internal object NativeHostPreferences {
     // Dedicated raw import records never become profile DTO attributes or generic DTO edits.
     private const val rawImportPrefix = "xperience.import."
     private const val playbackDecimals = "subSizeScale maxFileSizeGB"
-    private const val playbackIntegers = "maxResolution minResolution"
+    private const val playbackIntegers = "maxResolution minResolution titleMatchThreshold"
     private const val discoveryIntegerArrays = "selectedProviders providerOrder"
     internal enum class NumericValueKind { SCALAR, INTEGER_ARRAY }
 
@@ -303,12 +303,17 @@ internal object NativeHostPreferences {
         for (id in profiles.keys()) {
             require(nativeRoster.has(id)) { "Host preference profile is not in native roster" }
             if (nativeRoster.getJSONObject(id).getBoolean("deleted")) continue
-            val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", nativeRoster.getJSONObject(id).getString("name"))
             val fields = profiles.getJSONObject(id).getJSONObject("fields")
-            for (field in fields.keys()) {
-                // Dedicated per-item ledgers never become generic profile DTO attributes.
-                if (field.startsWith(NativeWatchlistCodec.PREFIX) || field.startsWith(NativePlaylist.PREFIX) ||
-                    field.startsWith(rawImportPrefix)) continue
+            // Dedicated per-item ledgers never become generic profile DTO attributes, and a
+            // ledger-only bucket never materializes a DTO stub: its first register is not a
+            // profile preference change and must not invalidate the native owner.
+            val projectable = fields.keys().asSequence().filterNot { field ->
+                field.startsWith(NativeWatchlistCodec.PREFIX) || field.startsWith(NativePlaylist.PREFIX) ||
+                    field.startsWith(rawImportPrefix)
+            }.toList()
+            if (projectable.isEmpty()) continue
+            val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", nativeRoster.getJSONObject(id).getString("name"))
+            for (field in projectable) {
                 val value = fields.getJSONObject(field).get("value")
                 if (value == JSONObject.NULL) target.remove(field) else target.put(field, value)
             }

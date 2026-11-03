@@ -83,6 +83,7 @@ struct UserProfile: Codable, Identifiable, Equatable, Sendable {
         var keywordsAreRegex: Bool? = nil
         var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 4000 (4K; legacy web docs may carry 2160, healed in fold via gatedMaxResolution)
         var maxFileSizeGB: Double? = nil       // 0 = no cap
+        var titleMatchThreshold: Int? = nil    // 0 = off, else 50 / 70 / 90 percent (#172)
         var minResolution: Int? = nil          // 0 = no floor, else 720 / 1080 / 2160 (#117)
         var hideUnknownResolution: Bool? = nil // drop sources with no recognizable resolution (#117)
         var preferredAudioOnly: Bool? = nil    // drop clearly-foreign-audio releases, best effort (#117)
@@ -374,7 +375,8 @@ final class ProfileStore: ObservableObject {
          SourcePreferences.addonOrderKey, SourcePreferences.excludeKey, SourcePreferences.includeKey,
          SourcePreferences.safetyKey, SourcePreferences.hideDeadKey, SourcePreferences.instantOnlyKey,
          SourcePreferences.maxResolutionKey, SourcePreferences.minResolutionKey, SourcePreferences.hideUnknownResKey,
-         SourcePreferences.preferredAudioKey, SourcePreferences.maxFileSizeKey, SourcePreferences.hdrOnlyKey,
+         SourcePreferences.preferredAudioKey, SourcePreferences.maxFileSizeKey, SourcePreferences.titleMatchThresholdKey,
+         SourcePreferences.hdrOnlyKey,
          SourcePreferences.excludeAV1Key, SourcePreferences.regexKey, SourcePreferences.preferKey,
          SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
     }
@@ -1324,6 +1326,7 @@ final class ProfileStore: ObservableObject {
             keywordsAreRegex: d["keywordsAreRegex"] as? Bool ?? base?.keywordsAreRegex,
             maxResolution: gatedMaxResolution(d["maxResolution"] as? Int) ?? base?.maxResolution,
             maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB,
+            titleMatchThreshold: SourceTitleMatch.admittedThreshold(d["titleMatchThreshold"]) ?? base?.titleMatchThreshold,
             minResolution: gatedMinResolution(d["minResolution"] as? Int) ?? base?.minResolution,
             hideUnknownResolution: d["hideUnknownResolution"] as? Bool ?? base?.hideUnknownResolution,
             preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly,
@@ -1481,6 +1484,7 @@ final class ProfileStore: ObservableObject {
             keywordsAreRegex: SourcePreferences.shared.keywordsAreRegex,
             maxResolution: SourcePreferences.shared.maxResolution,
             maxFileSizeGB: SourcePreferences.shared.maxFileSizeGB,
+            titleMatchThreshold: SourcePreferences.shared.titleMatchThreshold,
             minResolution: SourcePreferences.shared.minResolution,
             hideUnknownResolution: SourcePreferences.shared.hideUnknownResolution,
             preferredAudioOnly: SourcePreferences.shared.preferredAudioOnly,
@@ -1565,6 +1569,8 @@ final class ProfileStore: ObservableObject {
         else if resetUnset { d.set(SourcePreferences.defaultMaxResolution, forKey: SourcePreferences.maxResolutionKey) }
         if let v = p?.maxFileSizeGB { d.set(v, forKey: SourcePreferences.maxFileSizeKey) }
         else if resetUnset { d.set(SourcePreferences.defaultMaxFileSizeGB, forKey: SourcePreferences.maxFileSizeKey) }
+        if let v = p?.titleMatchThreshold { d.set(v, forKey: SourcePreferences.titleMatchThresholdKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultTitleMatchThreshold, forKey: SourcePreferences.titleMatchThresholdKey) }
         if let v = p?.minResolution { d.set(v, forKey: SourcePreferences.minResolutionKey) }
         else if resetUnset { d.set(SourcePreferences.defaultMinResolution, forKey: SourcePreferences.minResolutionKey) }
         if let v = p?.hideUnknownResolution { d.set(v, forKey: SourcePreferences.hideUnknownResKey) }

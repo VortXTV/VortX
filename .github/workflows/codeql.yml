@@ -96,10 +96,22 @@ jobs:
           ./gradlew :app:testPlayDebugUnitTest
           -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
           --tests com.vortx.android.sync.AndroidRealtimeSyncTest
+          --tests com.vortx.android.engine.SourceTitleMatchTest
+          --tests com.vortx.android.engine.NativePlaylistTest
+          --tests com.vortx.android.playlists.SavedPlaylistStoreTest
           --tests com.vortx.android.sync.DurableSessionStateTest
           --tests com.vortx.android.sync.NativeAccountSyncTest
           --tests com.vortx.android.sync.VortXSessionOwnerTransitionContractTest
           --no-daemon --stacktrace
+
+      - name: Retain Android recovery unit test results
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CodeQL-Android-recovery-unit-results
+          path: android/app/build/test-results/testPlayDebugUnitTest/*.xml
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Perform CodeQL analysis
         if: ${{ always() && !cancelled() && steps.android_compile.outcome == 'success' }}

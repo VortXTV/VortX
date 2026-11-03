@@ -235,6 +235,7 @@ internal object NativeWebsiteProfileEdits {
             "subSizeScale" -> require(value is Number && value.toDouble().isFinite() && value.toDouble() in 0.6..1.8)
             "maxFileSizeGB" -> require(value is Number && value.toDouble().isFinite() && value.toDouble() in 0.0..100000.0)
             "maxResolution" -> require(value is Number && value.toInt() in setOf(0, 720, 1080, 2160) && value.toDouble() == value.toInt().toDouble())
+            "titleMatchThreshold" -> require(SourceTitleMatchThreshold.admitted(value) != null)
             in playbackBooleans -> require(value is Boolean)
             "sourceTypeOrder" -> require(value is JSONArray && (0 until value.length()).map { value.getString(it) }.let { it.distinct().size == it.size && it.all { item -> item in setOf("debrid", "torrent", "usenet", "direct") } })
             else -> throw IllegalArgumentException("Unsupported website playback preference")

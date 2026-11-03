@@ -57,7 +57,13 @@ class AndroidRealtimeSyncTest {
         var host: JSONObject? = null
         var applyGate: CompletableDeferred<Unit>? = null
         var applyEntered: CompletableDeferred<Unit>? = null
-        override fun retire() {}
+        var provideUploadComposer = true
+        private var appliedRead: NativeAccountReadCapture? = null
+        private var appliedRaw: ByteArray? = null
+        override fun retire() {
+            appliedRead = null; appliedRaw?.fill(0); appliedRaw = null
+            mount = Any()
+        }
         override fun captureUploadOrigin(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean) =
             object : NativeAccountUploadCurrency.Origin { override fun isCurrent() = isCurrent.invoke() }
         private fun currency(original: NativeAccountUploadCurrency.Origin): NativeAccountUploadCurrency {
@@ -82,13 +88,46 @@ class AndroidRealtimeSyncTest {
             originalRaw: ByteArray, original: NativeAccountUploadCurrency.Origin, isCurrent: () -> Boolean,
             action: (NativeAccountExport, NativeAccountMountToken?, ((JSONObject) -> ByteArray)?, NativeHostUploadAcknowledgment?, NativeAccountUploadCurrency) -> T): T? {
             val currency = currency(original)
-            val exported = exportDocument(account) ?: return null
-            return currency.withCurrentSession { if (!isCurrent()) null else action(exported, currentMountToken(account), null, null, currency) }
+            return currency.withCurrentSession {
+                if (!isCurrent()) return@withCurrentSession null
+                check(account == source.account && appliedRead?.sameObservation(source) == true) {
+                    "Original synthetic upload read changed"
+                }
+                check(appliedRaw?.contentEquals(originalRaw) == true) { "Synthetic upload bytes changed" }
+                val exported = exportDocument(account) ?: return@withCurrentSession null
+                var active = true
+                // This test collaborator has synthetic facts, not a JNI checkpoint. Explicitly issue
+                // its synchronous composer after the actual manager GET/apply; do not label a DTO
+                // rawAccount or relax the production generic-source conservation guard.
+                val compose: ((JSONObject) -> ByteArray)? = if (!provideUploadComposer) null else { providers ->
+                    check(active && isCurrent() && currency.isCurrent()) { "Synthetic upload export expired" }
+                    val replacements = linkedMapOf("nativeSync" to exported.nativeSync.toString().toByteArray(Charsets.UTF_8))
+                    exported.hostPreferences?.let { replacements["nativeHostPreferences"] = it.toString().toByteArray(Charsets.UTF_8) }
+                    for (field in listOf("nativeProviderCredentials", "apiKeys")) {
+                        providers.optJSONObject(field)?.let { replacements[field] = it.toString().toByteArray(Charsets.UTF_8) }
+                    }
+                    com.vortx.android.engine.NativeOwnerHistoryAccount(originalRaw)
+                        .replacingOwned(replacements).validateBudget(writeV2 = true)
+                }
+                try { action(exported, currentMountToken(account), compose, null, currency) }
+                finally { active = false }
+            }
         }
         override fun currentMountToken(account: SessionOwnerSnapshot.Account) =
             if (reopenFails || !provideMountToken) null else NativeAccountMountToken(mount, mountRevision)
         override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
             reopens++; check(isCurrent()); reopenError?.let { throw it }; if (reopenFails) error("checkpoint unavailable"); return true
+        }
+        override suspend fun applyRawDocument(account: SessionOwnerSnapshot.Account, captured: NativeAccountReadCapture,
+            isCurrent: () -> Boolean): Boolean {
+            val raw = captured.copyRawForApply(account)
+            var retained = false
+            try {
+                if (!super<NativeAccountGateway>.applyRawDocument(account, captured, isCurrent) || !isCurrent()) return false
+                appliedRaw?.fill(0); appliedRaw = raw; appliedRead = captured
+                retained = true
+                return true
+            } finally { if (!retained) raw.fill(0) }
         }
         override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean {
             applied++; applyEntered?.complete(Unit); applyGate?.await()
@@ -214,12 +253,26 @@ class AndroidRealtimeSyncTest {
             check(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
             check(manager.currentSession() == null)
         }
-        suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); NativeProviderAccess.unbindForTest() }
+        suspend fun close() { realtime.stop(); manager.cancelSyncTestWork(); gateway.retire(); NativeProviderAccess.unbindForTest() }
     }
 
     private fun test(block: suspend TestScope.() -> Unit) = runTest {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
-        try { block() } finally { NativeProviderAccess.unbindForTest(); Dispatchers.resetMain() }
+        val previousNotifications = NativeSettingsFence.queuedNotificationsForTest
+        NativeSettingsFence.queuedNotificationsForTest = mutableListOf()
+        try { block() } finally {
+            NativeSettingsFence.queuedNotificationsForTest = previousNotifications
+            NativeProviderAccess.unbindForTest(); Dispatchers.resetMain()
+        }
+    }
+
+    private fun drainSettingsNotifications() {
+        val notifications = checkNotNull(NativeSettingsFence.queuedNotificationsForTest)
+        while (notifications.isNotEmpty()) {
+            val batch = notifications.toList()
+            notifications.clear()
+            batch.forEach { it() }
+        }
     }
 
     @Test fun synchronousSocketStartupFailureRetainsSessionWorkerPollingAndRetry() = test {
@@ -551,6 +604,49 @@ class AndroidRealtimeSyncTest {
         } finally { f.close() }
     }
 
+    @Test fun `generic fixture without issued composer cannot PUT or acknowledge pending edits`() = test {
+        val f = Fixture(testScheduler)
+        try {
+            f.gateway.provideUploadComposer = false
+            f.settingsDirty(JSONObject().put("vortx.player.matchFrameRate", 120.0))
+            val retainedCloud = f.cloud.toString()
+            f.edit("retained-local")
+            runCurrent(); advanceTimeBy(2_501); runCurrent()
+            assertTrue(f.gateway.exports > 0)
+            assertEquals(0, f.puts); assertTrue(f.dirty()); assertEquals(10L, f.manager.lastAppliedVersion())
+            assertEquals(120.0, f.settingsDirty().getDouble("vortx.player.matchFrameRate"), 0.0)
+            assertEquals(retainedCloud, f.cloud.toString())
+            assertTrue(f.gateway.carrier.getJSONObject("facts").getBoolean("retained-local"))
+        } finally { f.close() }
+    }
+
+    @Test fun `synthetic upload composer requires the exact applied observation bytes and scope`() = test {
+        val gateway = Gateway()
+        val principal = SessionOwnerSnapshot.Account(account.id, 1)
+        val raw = document().toString().toByteArray(Charsets.UTF_8)
+        fun read() = NativeAccountReadCapture.fromAuthenticatedPull(principal, 1, account.id, 1, 10, raw)
+        val first = read(); val other = read()
+        val original = gateway.captureUploadOrigin(principal) { true }
+        var escaped: ((JSONObject) -> ByteArray)? = null
+        try {
+            assertTrue(gateway.applyRawDocument(principal, first) { true })
+            assertTrue(runCatching { gateway.withUploadExport(principal, other, raw, original, { true }) {
+                _, _, _, _, _ -> fail("Unapplied observation admitted")
+            } }.exceptionOrNull() is IllegalStateException)
+            assertTrue(runCatching { gateway.withUploadExport(principal, first, raw + byteArrayOf(32), original, { true }) {
+                _, _, _, _, _ -> fail("Different source bytes admitted")
+            } }.exceptionOrNull() is IllegalStateException)
+            gateway.withUploadExport(principal, first, raw, original, { true }) { _, _, compose, _, _ ->
+                val composer = requireNotNull(compose)
+                escaped = composer
+                val candidate = composer(JSONObject())
+                try { assertEquals("preserved", JSONObject(String(candidate, Charsets.UTF_8)).getString("foreign")) }
+                finally { candidate.fill(0) }
+            }
+            assertTrue(runCatching { requireNotNull(escaped)(JSONObject()) }.exceptionOrNull() is IllegalStateException)
+        } finally { first.retire(); other.retire(); gateway.retire(); raw.fill(0) }
+    }
+
     @Test fun `continuous progress does not postpone upload and PUT edit survives exact ACK`() = test {
         val f = Fixture(testScheduler)
         try {
@@ -634,6 +730,7 @@ class AndroidRealtimeSyncTest {
             first.settingsDirty(retained); first.putFails = true; first.edit("library-edit")
             runCurrent(); advanceTimeBy(2_501); runCurrent()
             assertEquals(1, first.puts); assertTrue(first.dirty())
+            assertEquals("invalid", context.getSharedPreferences("vortx_settings", 0).getString("stremiox.autoSkipDelaySeconds", null))
             assertEquals(retained.toString(), first.settingsDirty().toString())
         } finally { first.close() }
         val second = Fixture(testScheduler, context)
@@ -642,6 +739,7 @@ class AndroidRealtimeSyncTest {
             second.manager.setRealtimeForeground(true); runCurrent()
             advanceTimeBy(2_501); runCurrent()
             assertEquals(1, second.puts); assertFalse(second.dirty())
+            assertEquals("invalid", context.getSharedPreferences("vortx_settings", 0).getString("stremiox.autoSkipDelaySeconds", null))
             assertTrue(second.cloud.getJSONObject("nativeSync").getJSONObject("facts").getBoolean("library-edit"))
             assertEquals(retained.toString(), second.settingsDirty().toString())
             assertFalse(second.cloud.has("nativeHostPreferences"))
@@ -651,8 +749,58 @@ class AndroidRealtimeSyncTest {
             assertTrue(second.gateway.carrier.getJSONObject("facts").getBoolean("peer-after-upload"))
             assertEquals(second.version, second.manager.lastAppliedVersion())
             assertEquals(1, second.puts); assertFalse(second.dirty())
+            assertEquals("invalid", context.getSharedPreferences("vortx_settings", 0).getString("stremiox.autoSkipDelaySeconds", null))
             assertEquals(retained.toString(), second.settingsDirty().toString())
+            context.getSharedPreferences("vortx_settings", 0).edit().putInt("stremiox.autoSkipDelaySeconds", 3).commit()
+            second.edit("after-setting-type-repair")
+            runCurrent(); advanceTimeBy(2_501); runCurrent()
+            assertEquals(2, second.puts); assertFalse(second.dirty())
+            assertEquals(3, second.cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals")
+                .getJSONObject("fields").getJSONObject("stremiox.autoSkipDelaySeconds").getInt("value"))
+            assertFalse(second.settingsDirty().has("stremiox.autoSkipDelaySeconds"))
+            assertEquals(setOf("stremiox.theme.oled", "stremiox.audioLang"), second.settingsDirty().keys().asSequence().toSet())
         } finally { second.close() }
+    }
+
+    @Test fun `dirty unsupported local value survives an older valid host receive and upload own apply`() = test {
+        val field = "stremiox.autoSkipDelaySeconds"
+        val principal = com.vortx.android.engine.VortxAccountScope(scopeId, UserProfile.OWNER_ID)
+        val olderHost = com.vortx.android.engine.NativeHostPreferences.empty(principal).also { host ->
+            host.getJSONObject("globals").getJSONObject("fields").put(field,
+                JSONObject().put("clock", 1).put("actor", "00000000-0000-0000-0000-000000000222").put("value", 3))
+            com.vortx.android.engine.NativeHostPreferences.validate(principal, host)
+        }
+        for (dirty in listOf(true, false)) {
+            val context = MemoryContext()
+            val prefs = context.getSharedPreferences("vortx_settings", 0)
+            prefs.edit().putString(field, "invalid").commit()
+            val f = Fixture(testScheduler, context)
+            try {
+                if (dirty) f.settingsDirty(JSONObject().put(field, 125.75))
+                // The synthetic checkpoint and incoming cloud each contain an eligible, schema-valid
+                // older INT. The actual manager receive/own-apply must consult the local dirty stamp.
+                f.gateway.host = JSONObject(olderHost.toString())
+                f.cloud.put("nativeHostPreferences", JSONObject(olderHost.toString()))
+                f.version++
+                assertTrue(f.manager.syncDown())
+                assertEquals(f.version, f.manager.lastAppliedVersion())
+                if (dirty) {
+                    assertEquals("invalid", prefs.getString(field, null))
+                    assertEquals(125.75, f.settingsDirty().getDouble(field), 0.0)
+                    f.edit("library-with-protected-invalid-setting")
+                    runCurrent(); advanceTimeBy(2_501); runCurrent()
+                    assertEquals(1, f.puts); assertFalse(f.dirty())
+                    assertEquals("invalid", prefs.getString(field, null))
+                    assertEquals(125.75, f.settingsDirty().getDouble(field), 0.0)
+                    assertTrue(NativeSyncPublicationPolicy.same(olderHost, f.cloud.getJSONObject("nativeHostPreferences")))
+                } else {
+                    // Positive control proves this same valid incoming register really reaches
+                    // application; only the dirty-key guard preserves the unsupported local value.
+                    assertEquals(3, prefs.getInt(field, -1))
+                    assertFalse(f.settingsDirty().has(field))
+                }
+            } finally { f.close() }
+        }
     }
 
     @Test fun `global setting alone schedules native upload and acknowledgement does not echo`() = test {
@@ -665,13 +813,17 @@ class AndroidRealtimeSyncTest {
             // This is the real preference listener; no library/native edit or manual sync is used.
             f.context.getSharedPreferences("vortx_settings", 0).edit()
                 .putBoolean("vortx.player.matchFrameRate", true).commit()
+            assertTrue(checkNotNull(NativeSettingsFence.queuedNotificationsForTest).isNotEmpty())
+            assertFalse(f.dirty()) // Production notifications are delivered after the preference replacement.
+            drainSettingsNotifications()
             assertTrue(f.dirty()); assertTrue(f.settingsDirty().has("vortx.player.matchFrameRate"))
             runCurrent(); advanceTimeBy(2_501); runCurrent()
+            drainSettingsNotifications()
             assertEquals(1, f.puts); assertFalse(f.dirty())
             assertFalse(f.settingsDirty().has("vortx.player.matchFrameRate"))
             assertTrue(f.cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals")
                 .getJSONObject("fields").getJSONObject("vortx.player.matchFrameRate").getBoolean("value"))
-            assertTrue(f.routinePull()); advanceTimeBy(10_000); runCurrent()
+            assertTrue(f.routinePull()); drainSettingsNotifications(); advanceTimeBy(10_000); runCurrent()
             assertEquals(1, f.puts); assertFalse(f.dirty())
         } finally { f.close() }
     }
@@ -684,15 +836,21 @@ class AndroidRealtimeSyncTest {
             f.cloud.put("nativeHostPreferences", JSONObject(f.gateway.host!!.toString()))
             assertTrue(f.routinePull())
             assertTrue(f.context.getSharedPreferences("vortx_settings", 0).getBoolean("vortx.player.matchFrameRate", false))
+            assertTrue(checkNotNull(NativeSettingsFence.queuedNotificationsForTest).isNotEmpty())
+            drainSettingsNotifications() // Remote own-apply already rebased the shadow before delivery.
+            assertFalse(f.dirty())
             // These are the same flat mirror writes made by ProfileStore.applyPlayback after a
             // native projection, outside the manager's applyingRemote window.
             f.context.getSharedPreferences("vortx_settings", 0).edit()
                 .putString("stremiox.theme.accent", "fixture").putString("stremiox.sub.color", "yellow").commit()
+            drainSettingsNotifications()
             runCurrent(); advanceTimeBy(10_000); runCurrent()
             assertEquals(0, f.puts); assertFalse(f.dirty())
             assertFalse(f.settingsDirty().has("vortx.player.matchFrameRate"))
             // A later real global edit must not export the retained profile mirror stamp either.
             f.context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("vortx.player.matchFrameRate", false).commit()
+            drainSettingsNotifications()
+            assertTrue(f.dirty())
             runCurrent(); advanceTimeBy(2_501); runCurrent()
             assertEquals(1, f.puts)
             assertFalse(f.cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals")
@@ -757,7 +915,11 @@ class AndroidRealtimeSyncTest {
             assertTrue(f.cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals").getJSONObject("fields")
                 .getJSONObject("stremiox.autoSkip").getBoolean("value"))
             assertEquals(126.75, f.settingsDirty().getDouble("stremiox.autoSkip"), 0.0)
-            advanceTimeBy(2_500); runCurrent()
+            assertEquals(10L, f.manager.lastAppliedVersion()) // Newer local globals prevented the old own-apply/ACK.
+            advanceTimeBy(2_499); runCurrent()
+            assertEquals(1, f.puts); assertTrue(f.dirty())
+            assertEquals(126.75, f.settingsDirty().getDouble("stremiox.autoSkip"), 0.0)
+            advanceTimeBy(2_501); runCurrent() // Existing failed-own-apply retry backoff is five seconds.
             assertEquals(2, f.puts); assertFalse(f.dirty())
             assertFalse(f.cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals").getJSONObject("fields")
                 .getJSONObject("stremiox.autoSkip").getBoolean("value"))

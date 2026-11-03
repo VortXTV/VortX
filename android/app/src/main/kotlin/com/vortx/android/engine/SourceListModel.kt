@@ -94,6 +94,8 @@ class SourceListModel(
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
         val contentId: String? = null, // canonical auxiliary target id
+        val titleMatch: SourceTitleMatch.Target? = null, // the opened title, for the title-match filter (#172)
+        val titleMatchThreshold: Int = 0, // SourcePreferencesStore.titleMatchThreshold; 0 = off
     )
 
     // ---- Binding + input setters ----
@@ -247,6 +249,8 @@ class SourceListModel(
         ctx.directLinksOnly,
         ctx.disabledAddons.sorted().joinToString(","),
         ctx.contentId,
+        ctx.titleMatch,
+        ctx.titleMatchThreshold,
     ).hashCode()
 
     /// O(1) rebuild signature: input hashes + source epochs. Equal signature = the published output is already
@@ -317,7 +321,7 @@ class SourceListModel(
                 ),
             )
 
-            assembled = directLinkDisplayGroups(assembled, ctx.directLinksOnly)
+            assembled = displayGroups(assembled, ctx)
 
             // Install the frozen snapshot so tiers()/resolutionOptions() (which read the installed reading) and
             // the explicit-prefs rankedGroups()/best() all rank against the SAME frozen copy, never a live
@@ -343,6 +347,14 @@ class SourceListModel(
                 requestGeneration = ctx.requestGeneration,
                 streamId = ctx.streamId,
             )
+        }
+
+        /** One captured display policy for coalesced, immediate and prepared-source paths. */
+        fun displayGroups(groups: List<StreamGroup>, ctx: Context): List<StreamGroup> {
+            val direct = directLinkDisplayGroups(groups, ctx.directLinksOnly)
+            val admitted = StreamRanking.applyUserFilters(direct, ctx.prefs)
+            // Fallback can restore only ordinarily admitted rows, never parental/diagnostic denials.
+            return StreamRanking.titleMatched(admitted, ctx.titleMatch, ctx.titleMatchThreshold)
         }
 
         /**

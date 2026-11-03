@@ -1421,6 +1421,8 @@ struct DetailView: View {
                                                                   type: m.type.isEmpty ? effectiveType : m.type,
                                                                   name: m.name, poster: m.poster,
                                                                   season: nil, episode: nil),
+                                               titleMatchTarget: SourceTitleMatch.Target(title: m.name,
+                                                   year: SourceTitleMatch.year(from: m.releaseInfo)),
                                                identityRoles: sourceIndexRoles,
                                                initialStartAtSeconds: validInitialResumeSeconds,
                                                initialTraktSessionID: initialTraktSessionID,
@@ -3011,6 +3013,8 @@ struct CoreEpisodeStreams: View {
                                    meta: PlaybackMeta(libraryId: meta.id, videoId: currentVideo.id, type: meta.type,
                                                       name: meta.name, poster: meta.poster,
                                                       season: currentVideo.season, episode: currentVideo.episode),
+                                   titleMatchTarget: SourceTitleMatch.Target(title: meta.name,
+                                       season: currentVideo.season, episode: currentVideo.episode),
                                    episodes: episodes,
                                    // Detail metadata is a launch/current-season view, not proof of a settled full-title
                                    // CoreMetaDetails aggregation. Terminal refresh may upgrade this only from its exact
@@ -3210,6 +3214,8 @@ struct CoreStreamList: View {
     /// The mounting detail/episode view's existing owner; never replace pending intent authority with a singleton.
     @ObservedObject var profiles: ProfileStore
     var meta: PlaybackMeta? = nil
+    /// The mounting movie or episode owns the release target. Live pages leave it nil.
+    var titleMatchTarget: SourceTitleMatch.Target? = nil
     var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
     var seriesInventoryAuthority: AppleCWSeriesInventory.Authority = .launch
     /// The episode id to scope stream assembly + the readiness gate to (binge-desync fix, symptom 3). Set by the
@@ -3521,7 +3527,8 @@ struct CoreStreamList: View {
         sourceList.setContext(
             metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin,
             auxiliaryTarget: auxiliaryTarget,
-            mediaServerTarget: mediaServerTarget
+            mediaServerTarget: mediaServerTarget,
+            titleMatch: titleMatchTarget
         )
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best
@@ -4854,7 +4861,7 @@ struct CoreStreamList: View {
         }
         #if VORTX_AETHER_ENGINE
         if !stream.isYouTubeTrailer, PlayerEngineRouter.aetherEngineAvailable {
-            Button("AetherEngine (testing)") {
+            Button("AetherEngine") {
                 play(stream, enginePreference: .aether, sourceOrigin: origin)
             }
         }

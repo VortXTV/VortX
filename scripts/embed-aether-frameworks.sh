@@ -24,6 +24,11 @@ for name in "${frameworks[@]}"; do
   framework="${destination}/${name}.framework"
   rm -rf "${destination:?}/${name}.framework"
   ditto "$source" "$framework"
+  # SwiftPM's binary artifacts may be read-only (0555 executables, 0444 resources).
+  # Keep their execution/other permission bits, and never follow framework symlinks.
+  # Normalize only this new embedded copy, before stripping and code signing, so
+  # the installed app's owner can update file metadata such as quarantine xattrs.
+  find -P "$framework" \( -type d -o -type f \) -exec chmod u+w {} +
   rm -rf "${framework}/Headers" "${framework}/Modules" "${framework}"/Versions/*/Headers "${framework}"/Versions/*/Modules
   if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
     codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --preserve-metadata=identifier "$framework"

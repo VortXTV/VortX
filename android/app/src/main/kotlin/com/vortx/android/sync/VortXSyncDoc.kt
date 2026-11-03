@@ -514,6 +514,7 @@ object VortXSyncDoc {
         includeKeywords = p.optStringOrNull("includeKeywords"),
         keywordsAreRegex = if (p.has("keywordsAreRegex")) p.optBoolean("keywordsAreRegex") else null,
         maxResolution = if (p.has("maxResolution")) p.optInt("maxResolution") else null,
+        titleMatchThreshold = com.vortx.android.engine.SourceTitleMatchThreshold.admitted(p.opt("titleMatchThreshold")),
         maxFileSizeGB = if (p.has("maxFileSizeGB")) p.optDouble("maxFileSizeGB") else null,
         minResolution = if (p.has("minResolution")) p.optInt("minResolution") else null,
         hideUnknownResolution = if (p.has("hideUnknownResolution")) p.optBoolean("hideUnknownResolution") else null,
@@ -658,7 +659,7 @@ object VortXSyncDoc {
     private val PLAYBACK_KEYS = setOf("audioLang", "subtitleLang", "forcedPolicy", "subFont", "subSize", "subColor",
         "subBackground", "subSizeScale", "subBrightness", "sourceTypeOrder", "useAddonOrder", "safetyMode", "instantOnly",
         "hideDeadTorrents", "hdrOnly", "excludeAV1", "excludeKeywords", "includeKeywords", "keywordsAreRegex", "maxResolution",
-        "maxFileSizeGB", "minResolution", "hideUnknownResolution", "preferredAudioOnly", "preferKeywords", "avoidBehavior", "autoPickBest")
+        "maxFileSizeGB", "titleMatchThreshold", "minResolution", "hideUnknownResolution", "preferredAudioOnly", "preferKeywords", "avoidBehavior", "autoPickBest")
     private val SUMMARY_PLAYBACK_KEYS = PLAYBACK_KEYS - setOf("forcedPolicy", "preferKeywords", "avoidBehavior", "autoPickBest") + "forced"
     private val DISCOVERY_KEYS = setOf("hiddenCatalogs", "catalogOrder", "hiddenHubCategories", "regionOverrideCaptured",
         "regionOverride", "filtersCaptured", "filtersData", "selectedProviders", "providerOrder", "tabVisibilityCaptured",
@@ -714,6 +715,7 @@ object VortXSyncDoc {
         pb.includeKeywords?.let { put("includeKeywords", it) }
         pb.keywordsAreRegex?.let { put("keywordsAreRegex", it) }
         pb.maxResolution?.let { put("maxResolution", it) }
+        pb.titleMatchThreshold?.let { put("titleMatchThreshold", it) }
         pb.maxFileSizeGB?.let { put("maxFileSizeGB", it) }
         pb.minResolution?.let { put("minResolution", it) }
         pb.hideUnknownResolution?.let { put("hideUnknownResolution", it) }

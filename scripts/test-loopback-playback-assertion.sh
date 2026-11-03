@@ -144,11 +144,16 @@ loopback_verify() {
   shasum -a 256 --check "$loopback_dir/generated-before.sha256" > "$loopback_dir/generated-check.log" 2>&1
 }
 loopback_verify
+loopback_host_arch="$(uname -m)"
+case "$loopback_host_arch" in
+  arm64|x86_64) ;;
+  *) echo "Unsupported macOS fixture host architecture: $loopback_host_arch" >&2; exit 1 ;;
+esac
 loopback_phase=compile
 loopback_run 60 "$loopback_dir/compile-process.json" /usr/bin/xcrun swiftc \
   -swift-version 6 -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   -j 1 -num-threads 1 -whole-module-optimization -D LOOPBACK_PLAYBACK_ASSERTION_RAM_UIKIT \
-  -target arm64-apple-macosx14.0 \
+  -target "${loopback_host_arch}-apple-macosx14.0" \
   -module-cache-path "$loopback_dir/module-cache" \
   "$loopback_dir/WholeLoopbackPlaybackAssertion.swift" "$loopback_fixture" \
   -o "$loopback_dir/loopback-tests" > "$loopback_dir/compiler.log" 2>&1

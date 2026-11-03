@@ -27,6 +27,16 @@ on:
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-source-title-match.sh"
+      - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/test-aether-engine-picker.sh"
+      - "scripts/embed-aether-frameworks.sh"
+      - "scripts/tests/test_embed_aether_permissions.py"
+      - "scripts/build-aether-dovi-tv-simulator.sh"
+      - "scripts/aether-dovi-provider.py"
+      - "scripts/verify-aether-dovi-processed.py"
+      - "scripts/tests/test_aether_dovi_provider.py"
+      - "test/fixtures/source-title-match.json"
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
@@ -51,6 +61,7 @@ on:
       - "scripts/test-addon-stream-publication.sh"
       - "scripts/test-native-preference-acknowledgement.sh"
       - "scripts/test-binge-language-continuity.sh"
+      - "scripts/test-ranking-cache-concurrency.sh"
       - "test/mpv-bounded-child.mjs"
       - "test/cw-worker-currentness.mjs"
       - "test/cw-profile-fixture.cjs"
@@ -113,6 +124,16 @@ on:
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-source-title-match.sh"
+      - "scripts/test-aether-playback-boundary.sh"
+      - "scripts/test-aether-engine-picker.sh"
+      - "scripts/embed-aether-frameworks.sh"
+      - "scripts/tests/test_embed_aether_permissions.py"
+      - "scripts/build-aether-dovi-tv-simulator.sh"
+      - "scripts/aether-dovi-provider.py"
+      - "scripts/verify-aether-dovi-processed.py"
+      - "scripts/tests/test_aether_dovi_provider.py"
+      - "test/fixtures/source-title-match.json"
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
@@ -137,6 +158,7 @@ on:
       - "scripts/test-addon-stream-publication.sh"
       - "scripts/test-native-preference-acknowledgement.sh"
       - "scripts/test-binge-language-continuity.sh"
+      - "scripts/test-ranking-cache-concurrency.sh"
       - "test/mpv-bounded-child.mjs"
       - "test/cw-worker-currentness.mjs"
       - "test/cw-profile-fixture.cjs"
@@ -201,8 +223,9 @@ jobs:
     if: ${{ !inputs.native_media_candidates && !inputs.apple_hotfix_checks }}
     # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
     # runner generation as Apple packaging instead of the older default SDK.
-    runs-on: macos-26
-    timeout-minutes: 10
+    runs-on: macos-26-intel
+    # The serial Intel roster takes over 20 minutes; retain time for every final check.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure ripgrep is available
@@ -242,6 +265,8 @@ jobs:
       - run: bash scripts/test-next-preparation-attempt.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_builder_startup.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/tests/test_aether_dovi_provider.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/tests/test_native_apple_package.py
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
@@ -321,6 +346,18 @@ jobs:
       - run: bash scripts/test-native-preference-acknowledgement.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-apple-parity-contracts.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-source-title-match.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-ranking-cache-concurrency.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-binge-language-continuity.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/tests/test_embed_aether_permissions.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-aether-playback-boundary.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-aether-engine-picker.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: node test/native-callback-generation.mjs
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
