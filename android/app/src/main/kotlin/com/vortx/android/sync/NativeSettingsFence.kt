@@ -11,6 +11,9 @@ import java.nio.file.attribute.FileTime
 import android.os.Handler
 import android.os.Looper
 import java.util.WeakHashMap
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /** Process settings writer owner and first-open provenance for the exact Restore preferences.
  * Application supplies the wrapper on the credential-protected application context.
@@ -24,6 +27,77 @@ internal object NativeSettingsFence {
     @Volatile private var openedBackings = emptySet<String>()
     private val originalRestoreBackings = mutableMapOf<String, Fenced>()
     private const val SETTINGS = "vortx_settings"
+    @Volatile private var flatRestore: FlatRestore? = null
+    private var flatMutations = 0
+
+    internal interface HeldRestoreFlatSettings {
+        /** Scalar transport check. The caller separately checks the original session and route. */
+        fun requireCurrent(owner: SessionOwnerSnapshot.Account)
+    }
+
+    private class FlatRestore(
+        private val owner: SessionOwnerSnapshot.Account,
+        private val wrapper: Fenced,
+        private val pristine: PristineBacking,
+        private val job: Job?,
+    ) : HeldRestoreFlatSettings {
+        override fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
+            job?.ensureActive()
+            check(this.owner == owner && flatRestore === this && wrapper.pristine === pristine) {
+                "Original flat settings Restore admission retired"
+            }
+        }
+    }
+
+    /** A terminal edit from an ingress that has not yet been adapted to refuse before side effects. */
+    internal class RestoreFlatSettingsBusy : IllegalStateException("Account Restore is using local settings")
+
+    /**
+     * Hold the actual settings writer lane. This is only safe to compose after reachable settings
+     * writers handle refusal at ingress or their owner has positively quiesced them.
+     */
+    suspend fun <T : Any> withRestoreFlatSettingsExclusion(
+        owner: SessionOwnerSnapshot.Account,
+        requireOriginal: () -> Unit,
+        operation: suspend (HeldRestoreFlatSettings) -> T,
+    ): T? {
+        val job = currentCoroutineContext()[Job]
+        job?.ensureActive()
+        requireOriginal()
+        val held = synchronized(lock) {
+            if (flatRestore != null || flatMutations != 0) return null
+            val wrapper = originalRestoreBackings[SETTINGS]
+            val pristine = wrapper?.pristine
+            if (wrapper == null || pristine == null)
+                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+            FlatRestore(owner, wrapper, pristine, job).also { flatRestore = it }
+        }
+        try {
+            requireOriginal()
+            held.requireCurrent(owner)
+            return operation(held)
+        } finally {
+            synchronized(lock) {
+                if (flatRestore === held) flatRestore = null
+            }
+        }
+    }
+
+    /**
+     * Run a synchronous mutation only after the writer is admitted. Null means the caller still
+     * owns its unsubmitted intent. Return or display refusal before publishing any new UI state.
+     */
+    fun <T : Any> tryFlatSettingsMutation(operation: () -> T): T? {
+        synchronized(lock) {
+            if (flatRestore != null) return null
+            flatMutations++
+        }
+        try {
+            return operation()
+        } finally {
+            synchronized(lock) { flatMutations-- }
+        }
+    }
 
     enum class RestoreAuxiliaryBacking(val fileName: String) {
         SYNC_STATE("vortx_sync_state"),
@@ -215,6 +289,9 @@ internal object NativeSettingsFence {
                     return replaceBacking(commit)
                 }
                 return synchronized(lock) {
+                    // Keep the staged editor untouched on refusal. In particular, apply() must
+                    // not claim success by returning without submitting its changes.
+                    if (name == SETTINGS && flatRestore != null) throw RestoreFlatSettingsBusy()
                     pristine = null
                     check(revision < Long.MAX_VALUE) { "Settings revision exhausted" }
                     revision += 1 // Every attempted replacement retires observations, including ABA/failure.
