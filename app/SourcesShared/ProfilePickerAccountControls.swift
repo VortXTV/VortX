@@ -6,6 +6,7 @@ struct ProfilePickerAccountControls: View {
     @ObservedObject private var sync = VortXSyncManager.shared
     let onSignIn: () -> Void
     let beforeConfirmedSignOut: () -> Void
+    var admission: () -> Bool = { true }
     @State private var confirmingSignOut = false
     @State private var signOutAccountID: String?
     @State private var signOutCredential: CredentialScopeRegistry.Capture?
@@ -23,6 +24,7 @@ struct ProfilePickerAccountControls: View {
                         .buttonStyle(ChipButtonStyle())
                 }
                 Button(sync.isSignedIn ? "Sign out" : "Sign in") {
+                    guard admission() else { return }
                     if sync.isSignedIn, let account = sync.account {
                         signOutAccountID = account.id
                         signOutCredential = CredentialScopeRegistry.shared.capture()
@@ -36,12 +38,12 @@ struct ProfilePickerAccountControls: View {
         .confirmationDialog("Sign out of your VortX account?", isPresented: $confirmingSignOut,
                             titleVisibility: .visible) {
             Button("Sign out", role: .destructive) {
-                guard let capture = signOutCredential,
+                guard admission(), let capture = signOutCredential,
                       CredentialScopeRegistry.shared.isCurrent(capture),
                       sync.isSignedIn, sync.account?.id == signOutAccountID else { return }
                 beforeConfirmedSignOut()
                 // Retiring picker presentation is not permission to affect a new session.
-                guard CredentialScopeRegistry.shared.isCurrent(capture),
+                guard admission(), CredentialScopeRegistry.shared.isCurrent(capture),
                       sync.isSignedIn, sync.account?.id == signOutAccountID else { return }
                 sync.signOut()
                 signOutAccountID = nil

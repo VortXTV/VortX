@@ -714,9 +714,67 @@ final class ProfileStore: ObservableObject {
             nativeProfileError = nil; return true
         } catch { CoreBridge.shared.reportNativeProfileFailure("open", error: error); nativeProfileError = "Couldn't open this profile. Tap again to try once more."; return false }
     }
-    /// The launch picker shows once per cold start, and only when there is a real choice to make.
-    /// Settings re-opens it by flipping this back to false.
-    @Published var pickedThisLaunch = false
+    /// Cold launch only asks when there is a choice. An explicit request also opens an empty
+    /// roster or the current unprotected adult profile so its backup Tools remain reachable.
+    @Published var pickedThisLaunch = false {
+        didSet { if pickedThisLaunch { manualPickerRequest = nil } }
+    }
+    @MainActor private final class ManualPickerRequest {
+        let profileID: UUID?
+        var revoked = false
+        init(profileID: UUID?) { self.profileID = profileID }
+    }
+    private var manualPickerRequest: ManualPickerRequest?
+
+    var canRequestPicker: Bool {
+        if profiles.isEmpty { return activeID == nil }
+        if profiles.count > 1 { return true }
+        guard let profile = profiles.first, profile.id == activeID else { return false }
+        return !profile.isKids && !profile.hasPin
+    }
+
+    func requestPicker() {
+        guard canRequestPicker else { return }
+        // The established multi-profile switcher keeps its existing admission policy.
+        manualPickerRequest = profiles.count > 1 ? nil : .init(profileID: profiles.first?.id)
+        pickedThisLaunch = false
+    }
+
+    /// Capture this at route creation: dismissal or another manual request retires the original
+    /// admission. Eligibility is checked against the live roster at every existing grant boundary.
+    func manualPickerToolsAdmission() -> @MainActor @Sendable () -> Bool {
+        guard !pickedThisLaunch else { return { false } }
+        guard let request = manualPickerRequest else {
+            return { [weak self] in
+                guard let self else { return false }
+                return !self.pickedThisLaunch && self.manualPickerRequest == nil
+            }
+        }
+        return { [weak self] in
+            guard let self, !self.pickedThisLaunch, self.manualPickerRequest === request,
+                  !request.revoked else { return false }
+            let permitted: Bool
+            if let profileID = request.profileID {
+                permitted = self.profiles.count == 1 && self.activeID == profileID
+                    && self.profiles.first?.id == profileID && self.canRequestPicker
+            } else {
+                permitted = self.profiles.isEmpty && self.activeID == nil
+            }
+            // A root read may auto-dismiss the Mac cover without invoking its binding setter.
+            // Once observed ineligible, this exact request must never reopen or revive a grant.
+            if !permitted { request.revoked = true }
+            return permitted
+        }
+    }
+    /// The original manual route alone may finish itself. A late Back from an old picker cannot
+    /// consume a replacement request; ordinary cold/profile-switch presentation has no new Back.
+    func manualPickerDismissal() -> (@MainActor @Sendable () -> Void)? {
+        guard !pickedThisLaunch, let request = manualPickerRequest else { return nil }
+        return { [weak self] in
+            guard let self, self.manualPickerRequest === request else { return }
+            self.pickedThisLaunch = true
+        }
+    }
     /// The ACTIVE overlay profile's private watch state, keyed by meta id. Drives its Continue
     /// Watching rail, resume, and watched markers. Empty for the owner profile (it uses the
     /// account library directly).
@@ -852,7 +910,11 @@ final class ProfileStore: ObservableObject {
     var activeUsesEngineHistory: Bool { active?.usesEngineHistory ?? true }
 
     var active: UserProfile? { profiles.first { $0.id == activeID } }
-    var needsPicker: Bool { profiles.count > 1 && !pickedThisLaunch }
+    var needsPicker: Bool {
+        guard !pickedThisLaunch else { return false }
+        if manualPickerRequest != nil { return manualPickerToolsAdmission()() }
+        return profiles.count > 1
+    }
 
     /// The Keychain slot the rest of the app reads the session from right now. StremioAccount and
     /// CoreBridge resolve their token through this, so a profile switch re-points both at once.

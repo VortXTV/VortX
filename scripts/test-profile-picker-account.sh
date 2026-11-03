@@ -45,6 +45,7 @@ fixture = '''import Foundation
     var signOutAccountID: String? = "A"
     var signOutCredential: CredentialScopeRegistry.Capture? = CredentialScopeRegistry.shared.capture()
     var beforeConfirmedSignOut: () -> Void = {}
+    var admission: () -> Bool = { true }
     func confirm() {
 ''' + body + '''
     }
@@ -70,7 +71,14 @@ fixture = '''import Foundation
             changedAccountDuringRetirement?.sync.account = .init(id: "B")
         }
         changedAccountDuringRetirement.confirm(); precondition(changedAccountDuringRetirement.sync.signOuts == 0)
-        print("PASS: 7 actual sign-out handler ownership schedules")
+        let retiredPicker = Harness(); retiredPicker.admission = { false }
+        retiredPicker.confirm(); precondition(retiredPicker.sync.signOuts == 0)
+        let retiredDuringCallback = Harness()
+        retiredDuringCallback.beforeConfirmedSignOut = { [weak retiredDuringCallback] in
+            retiredDuringCallback?.admission = { false }
+        }
+        retiredDuringCallback.confirm(); precondition(retiredDuringCallback.sync.signOuts == 0)
+        print("PASS: 9 actual sign-out handler ownership schedules")
     }
 }
 '''

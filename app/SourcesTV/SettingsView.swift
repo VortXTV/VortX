@@ -385,14 +385,13 @@ struct SettingsView: View {
                         Label("Add Profile", systemImage: "plus")
                     }
                     .buttonStyle(ChipButtonStyle())
-                    if profiles.profiles.count > 1 {
-                        Button {
-                            profiles.pickedThisLaunch = false   // re-presents the launch picker
-                        } label: {
-                            Label("Switch Profile", systemImage: "person.2.fill")
-                        }
-                        .buttonStyle(ChipButtonStyle())
+                    Button {
+                        profiles.requestPicker()
+                    } label: {
+                        Label("Profiles & Tools", systemImage: "person.2.fill")
                     }
+                    .buttonStyle(ChipButtonStyle())
+                    .disabled(!profiles.canRequestPicker)
                 }
                 .padding(.vertical, Theme.Space.xs / 2)
             }

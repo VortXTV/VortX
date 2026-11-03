@@ -79,6 +79,9 @@ struct ProfilePickerView: View {
     @State private var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture?
     @State private var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant?
     @State private var toolsRoute: ProfilePickerToolsRoute?
+    /// Bound when the root constructs this picker, before delayed presentation or first appearance.
+    @State private var pickerAdmission: (@MainActor @Sendable () -> Bool)?
+    @State private var manualPickerDismissal: (@MainActor @Sendable () -> Void)?
     @StateObject private var profileAction = ProfileMutationPresentation()
     @StateObject private var accountAuthentication: AccountAuthenticationPresentation
     @StateObject private var artwork = ProfilePickerArtwork.shared
@@ -103,8 +106,12 @@ struct ProfilePickerView: View {
         return !store.profiles.contains { $0.pin != nil }
     }
 
-    init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil) {
+    init(core: CoreBridge = .shared, authentication: AccountAuthenticationPresentation? = nil,
+         pickerAdmission: @escaping @MainActor @Sendable () -> Bool,
+         manualPickerDismissal: (@MainActor @Sendable () -> Void)?) {
         self.core = core
+        _pickerAdmission = State(initialValue: pickerAdmission)
+        _manualPickerDismissal = State(initialValue: manualPickerDismissal)
         _accountAuthentication = StateObject(wrappedValue: authentication ?? AccountAuthenticationPresentation())
     }
 
@@ -207,7 +214,14 @@ struct ProfilePickerView: View {
                                     pinTarget = nil; pinCredential = nil; pinIsForEditing = false
                                     signInCredential = nil; signInProfileID = nil
                                     signInNeeded = false; accountHelpNeeded = false
-                                })
+                                },
+                                admission: { pickerAdmissionPermits })
+                            if manualPickerDismissal != nil {
+                                Button("Back") { closeManualPicker() }
+                                    .buttonStyle(ChipButtonStyle())
+                                    .disabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
+                                    .accessibilityIdentifier("manual-profile-picker-back")
+                            }
                             toolsButton
                         }
                         .padding(.horizontal, 24)
@@ -251,6 +265,7 @@ struct ProfilePickerView: View {
             ProfilePickerToolsView(route: route,
                 services: .live(restore: .live, accountGrant: route.accountFiles)) { closeTools(route.id) }
         }
+        .disabled(!pickerAdmissionPermits)
         .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
             guard artworkIsVisible else {
@@ -310,9 +325,17 @@ struct ProfilePickerView: View {
         }
     }
 
+    private var pickerAdmissionPermits: Bool { pickerAdmission?() ?? false }
+
+    private func closeManualPicker() {
+        guard pinTarget == nil, !profileAction.isRunning, !accountAuthentication.blocksDismissal else { return }
+        manualPickerDismissal?()
+    }
+
     @ViewBuilder private var toolsButton: some View {
         Button { openTools() } label: { Label("Tools", systemImage: "wrench.and.screwdriver") }
             .buttonStyle(ChipButtonStyle())
+            .disabled(!pickerAdmissionPermits)
             .accessibilityIdentifier("profile-picker-tools")
             .accessibilityHint("Download, repair or restore a backup, or export diagnostic logs.")
             #if os(tvOS)
@@ -322,17 +345,20 @@ struct ProfilePickerView: View {
     }
 
     private func diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant {
-        let permitted = exportAllowedBeforeProfile && pinTarget == nil
+        let manualAdmission: @MainActor @Sendable () -> Bool = pickerAdmission ?? { false }
+        let permitted = exportAllowedBeforeProfile && pinTarget == nil && manualAdmission()
         let credential = CredentialScopeRegistry.shared.capture()
         let store = store, sync = nativeSync, action = profileAction
         return .init(allowed: permitted, credential: credential, admission: {
+            guard manualAdmission() else { return false }
             if sync.accountReconnectRequired || action.errorMessage != nil || sync.accountRestoreState == .failed { return true }
             return !store.profiles.contains { $0.pin != nil }
         })
     }
 
     private func openTools() {
-        guard pinTarget == nil else { return }
+        let manualAdmission: @MainActor @Sendable () -> Bool = pickerAdmission ?? { false }
+        guard pinTarget == nil, manualAdmission() else { return }
         let grant = diagnosticGrant()
         let routeID = UUID()
         let credential = CredentialScopeRegistry.shared.capture()
@@ -344,7 +370,7 @@ struct ProfilePickerView: View {
         let routeAdmission = ProfilePickerToolsRouteAdmission(isForeground: scenePhase == .active)
         let fileGrant = ProfilePickerToolsAccountGrant(owner: originalOwner, admission: { [self] in
             // No diagnostic failure exception grants account files. PIN and foreground remain live.
-            self.pinTarget == nil && self.toolsRoute?.id == routeID && routeAdmission.permits
+            manualAdmission() && self.pinTarget == nil && self.toolsRoute?.id == routeID && routeAdmission.permits
         })
         deferredSelection.cancel()
         profileAction.cancel(preservingFailure: true)
@@ -362,6 +388,7 @@ struct ProfilePickerView: View {
     }
 
     private func openAccountHelp() {
+        guard pickerAdmissionPermits, pinTarget == nil else { return }
         deferredSelection.cancel()
         // Opening the account form must not grant device-wide log access that the
         // picker refused. Freeze this route's grant before auth changes its roster.
@@ -453,12 +480,14 @@ struct ProfilePickerView: View {
                               isEditing: isEditing, side: side, nameTextSize: nameTextSize) { pick(profile) }
         } else if index == store.profiles.count {
             ProfilePickerActionTile(title: "Add", symbol: "plus", side: side, nameTextSize: nameTextSize) {
+                guard pickerAdmissionPermits else { return }
                 deferredSelection.cancel()
                 editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
             }
         } else {
             ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
                                     symbol: isEditing ? "checkmark" : "pencil", side: side, nameTextSize: nameTextSize) {
+                guard pickerAdmissionPermits else { return }
                 deferredSelection.cancel()
                 isEditing.toggle()
             }
@@ -466,6 +495,7 @@ struct ProfilePickerView: View {
     }
 
     private func pick(_ profile: UserProfile) {
+        guard pickerAdmissionPermits else { return }
         guard !nativeSync.accountReconnectRequired else {
             deferredSelection.cancel(); profileAction.cancel(); return
         }

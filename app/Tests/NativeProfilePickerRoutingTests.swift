@@ -8,11 +8,15 @@ struct Cell<Value> {
     final class Box { var value: Value; init(_ value: Value) { self.value = value } }
     let box: Box
     init(wrappedValue: Value) { box = Box(wrappedValue) }
+    init(initialValue: Value) { box = Box(initialValue) }
     var wrappedValue: Value {
         get { box.value }
         nonmutating set { box.value = newValue }
     }
 }
+
+// Explicit SwiftUI State initialization seam. The assigned value comes from the actual initializer.
+typealias State<Value> = Cell<Value>
 
 struct UserProfile: Equatable {
     var id = UUID()
@@ -20,6 +24,7 @@ struct UserProfile: Equatable {
     var avatar = "test"
     var accentID = "test"
     var pin: String?
+    var isKids = false
     var hasPin: Bool { pin != nil }
 }
 
@@ -45,7 +50,8 @@ enum CredentialScope: Equatable, Sendable {
     var profiles: [UserProfile]
     var activeID: UUID?
     var nativeProfileError: String?
-    var pickedThisLaunch = false
+    /* ACTUAL_PICKER_PRESENTATION_STATE */
+    /* ACTUAL_PICKER_NEEDED */
     var selectResult = true
     var selected: [UUID] = []
     var finishPickerArguments: [Bool] = []
@@ -116,6 +122,7 @@ enum FakeScene { case active, background }
 
 @MainActor final class FakeAuthentication {
     var credentialChanges = 0
+    var blocksDismissal = false
     func credentialDidChange() { credentialChanges += 1 }
 }
 /// Explicit controller collaborator for extracted picker retirement. Real Tools schedules have their own suite.
@@ -127,6 +134,21 @@ enum FakeScene { case active, background }
     func credentialDidChange() { credentialChanges += 1 }
     func dismiss(_ id: UUID) { dismissed.append(id) }
 }
+// The root setter bodies are production-extracted; these are explicit presentation collaborators.
+@MainActor final class PickerRootHarness {
+    let profiles: FakeStore
+    let profileAuthentication = FakeAuthentication()
+    init(_ profiles: FakeStore) { self.profiles = profiles }
+    func admissionAtConstruction() -> @MainActor @Sendable () -> Bool { /* ACTUAL_ROOT_PICKER_ARGUMENT */
+    }
+    func dismissalAtConstruction() -> (@MainActor @Sendable () -> Void)? { /* ACTUAL_ROOT_PICKER_DISMISSAL_ARGUMENT */
+    }
+    func setIOSPresented(_ presented: Bool) { /* ACTUAL_IOS_PICKER_DISMISSAL */
+    }
+    func setTVPresented(_ presented: Bool) { /* ACTUAL_TV_PICKER_DISMISSAL */
+    }
+}
+
 @MainActor struct PickerHarness {
     let store: FakeStore
     let core: FakeCore
@@ -152,11 +174,20 @@ enum FakeScene { case active, background }
     @Cell var accountHelpDiagnosticCredential: CredentialScopeRegistry.Capture? = nil
     @Cell var accountHelpDiagnosticGrant: ProfilePickerToolsDiagnosticGrant? = nil
     @Cell var toolsRoute: ProfilePickerToolsRoute? = nil
+    @Cell var pickerAdmission: (@MainActor @Sendable () -> Bool)? = nil
+    @Cell var manualPickerDismissal: (@MainActor @Sendable () -> Void)? = nil
 
-    init(_ profiles: [UserProfile]) {
+    init(_ profiles: [UserProfile], manualPicker: Bool = false, originalStore: FakeStore? = nil,
+         capturedAdmission: (@MainActor @Sendable () -> Bool)? = nil,
+         capturedDismissal: (@MainActor @Sendable () -> Void)? = nil) {
         CredentialScopeRegistry.shared.change()
-        store = FakeStore(profiles)
+        store = originalStore ?? FakeStore(profiles)
         core = FakeCore(store)
+        if manualPicker { store.requestPicker() }
+        let pickerAdmission = capturedAdmission ?? store.manualPickerToolsAdmission()
+        let manualPickerDismissal = capturedDismissal ?? store.manualPickerDismissal()
+        /* ACTUAL_PICKER_STATE_INITIALIZER */
+        /* ACTUAL_PICKER_DISMISSAL_INITIALIZER */
     }
     func installObservers() {
         profileAction.$errorMessage.dropFirst().sink { _ in
@@ -172,6 +203,10 @@ enum FakeScene { case active, background }
     }
     func stop() { lifetime.live = false; lifetime.subscriptions.removeAll(); disappear() }
     func tap(_ profile: UserProfile) { pick(profile) }
+    func openToolsForTest() { openTools() }
+    func backForTest() { closeManualPicker() }
+    func appearForTest() {} // Production has no appearance-time admission capture.
+    func closeToolsForTest() { if let route = toolsRoute { closeTools(route.id) } }
     func unlock(_ prompt: UserProfile) { finishPIN(prompt) }
     func resume() { resumeDeferredSelection() }
     func foreground() { scenePhase = .active; resumeDeferredSelection() }
@@ -194,6 +229,7 @@ enum FakeScene { case active, background }
     func recoverAccount() { /* ACTUAL_RECOVERY_ACTION */
     }
 
+/* ACTUAL_PICKER_ADMISSION */
 /* ACTUAL_PREPARING */
 /* ACTUAL_METHODS */
 }
@@ -223,6 +259,166 @@ enum FakeScene { case active, background }
     }
     @MainActor static func main() async {
         var passed = 0
+        for count in 0...1 {
+            for observer in ["root", "grant"] {
+                let profiles = (0..<count).map { UserProfile(name: "Original \($0)") }
+                let store = FakeStore(profiles)
+                store.requestPicker()
+                let original = store.manualPickerToolsAdmission()
+                if count == 0 { store.activeID = UUID() } else { store.profiles[0].isKids = true }
+                if observer == "root" { precondition(!store.needsPicker) } else { precondition(!original()) }
+                // Mac can remove the cover directly, without invoking a binding setter.
+                // Returning to the original projection cannot revive that observed-retired request.
+                if count == 0 { store.activeID = nil } else { store.profiles[0].isKids = false }
+                precondition(!store.needsPicker && !original(), "observed retirement is one-way")
+                store.requestPicker()
+                precondition(store.needsPicker && store.manualPickerToolsAdmission()() && !original())
+                passed += 1
+            }
+        }
+        do {
+            let h = PickerHarness([], manualPicker: true)
+            precondition(h.manualPickerDismissal != nil && h.store.needsPicker)
+            h.openToolsForTest(); precondition(h.toolsRoute != nil)
+            h.closeToolsForTest(); precondition(h.store.needsPicker)
+            h.accountAuthentication.blocksDismissal = true
+            h.backForTest(); precondition(h.store.needsPicker)
+            h.accountAuthentication.blocksDismissal = false
+            let capture = CredentialScopeRegistry.shared.capture()
+            h.profileAction.start(operation: { await h.nativeSync.prepareNativeProfileSelection(credentialCapture: capture) },
+                failureMessage: { "Synthetic held profile operation" }, onSuccess: {})
+            await until("manual Back held by profile action") { h.nativeSync.continuation != nil }
+            h.backForTest(); precondition(h.store.needsPicker)
+            h.nativeSync.complete(false)
+            await until("manual Back profile action ends") { !h.profileAction.isRunning }
+            h.backForTest(); precondition(!h.store.needsPicker && h.store.pickedThisLaunch)
+            h.stop(); passed += 1
+        }
+        do {
+            let old = PickerHarness([], manualPicker: true)
+            old.store.requestPicker()
+            old.backForTest(); precondition(old.store.needsPicker, "stale Back cannot consume replacement")
+            let current = PickerHarness([], originalStore: old.store)
+            current.backForTest(); precondition(!old.store.needsPicker)
+            let ordinary = PickerHarness([UserProfile(name: "A"), UserProfile(name: "B")])
+            precondition(ordinary.manualPickerDismissal == nil)
+            ordinary.backForTest(); precondition(ordinary.store.needsPicker, "ordinary picker has no manual Back")
+            old.stop(); current.stop(); ordinary.stop(); passed += 1
+        }
+        for count in 0...1 {
+            let profiles = (0..<count).map { UserProfile(name: "Original \($0)") }
+            let store = FakeStore(profiles)
+            store.requestPicker()
+            let root = PickerRootHarness(store)
+            // The actual root argument is evaluated and retained by the actual State assignment
+            // while constructing A. No appearance event has occurred when B replaces the request.
+            let a = PickerHarness([], originalStore: store, capturedAdmission: root.admissionAtConstruction(), capturedDismissal: root.dismissalAtConstruction())
+            store.requestPicker()
+            a.appearForTest(); a.openToolsForTest(); a.recoverAccount(); a.add(); a.edit()
+            precondition(a.toolsRoute == nil && !a.accountHelpNeeded && a.editorProfile == nil && !a.isEditing)
+            let b = PickerHarness([], originalStore: store, capturedAdmission: root.admissionAtConstruction(), capturedDismissal: root.dismissalAtConstruction())
+            b.appearForTest(); b.openToolsForTest()
+            let route = b.toolsRoute!
+            precondition(route.accountFiles.permits(route.accountFiles.owner!))
+            a.stop(); b.stop(); passed += 1
+        }
+        // Actual store state/gate plus both actual root dismissal setters. No SwiftUI host is created.
+        for change in ["dismissal", "replacement", "kids", "pin", "stale-empty", "became-multiple"] {
+            let empty = change == "stale-empty"
+            let h = PickerHarness(empty ? [] : [UserProfile(name: "Original adult")], manualPicker: true)
+            h.openToolsForTest(); precondition(h.toolsRoute != nil)
+            h.closeToolsForTest()
+            switch change {
+            case "dismissal": h.store.pickedThisLaunch = true
+            case "replacement": h.store.requestPicker()
+            case "kids": h.store.profiles[0].isKids = true
+            case "pin": h.store.profiles[0].pin = "synthetic-pin"
+            case "stale-empty": h.store.activeID = UUID()
+            case "became-multiple": h.store.profiles.append(UserProfile(name: "Another adult"))
+            default: preconditionFailure()
+            }
+            h.appearForTest() // Reappearance cannot adopt the new request or reinterpret nil as ordinary.
+            h.openToolsForTest(); h.recoverAccount(); h.add(); h.edit()
+            precondition(h.toolsRoute == nil && !h.accountHelpNeeded && h.editorProfile == nil && !h.isEditing, change)
+            if change != "replacement" { precondition(!h.store.needsPicker, "manual-only eligibility retired") }
+            h.stop(); passed += 1
+        }
+        for count in 0...2 {
+            for platform in ["iOS/Mac", "tvOS"] {
+                let store = FakeStore((0..<count).map { UserProfile(name: "Synthetic \($0)") })
+                let root = PickerRootHarness(store)
+                precondition(store.needsPicker == (count > 1), "ordinary cold launch")
+                store.requestPicker()
+                precondition(store.needsPicker, "explicit zero/one/multiple request")
+                let admission = store.manualPickerToolsAdmission()
+                precondition(admission())
+                root.profileAuthentication.blocksDismissal = true
+                if platform == "tvOS" { root.setTVPresented(false) } else { root.setIOSPresented(false) }
+                precondition(store.needsPicker && admission(), "authentication still blocks dismissal")
+                root.profileAuthentication.blocksDismissal = false
+                if platform == "tvOS" { root.setTVPresented(true) } else { root.setIOSPresented(true) }
+                precondition(store.needsPicker, "presenting does not consume the request")
+                if platform == "tvOS" { root.setTVPresented(false) } else { root.setIOSPresented(false) }
+                precondition(!store.needsPicker && store.pickedThisLaunch, "dismissal consumes the request")
+                precondition(!admission(), "original presentation admission retired")
+                store.pickedThisLaunch = false
+                precondition(store.needsPicker == (count > 1), "ordinary reset does not recreate a manual request")
+                store.requestPicker()
+                precondition(store.needsPicker, "explicit reopen")
+                if count < 2 { precondition(!admission(), "replacement does not revive old admission") }
+                passed += 1
+            }
+        }
+        for restriction in ["kids", "pin", "unmatched", "empty-stale-active"] {
+            var profile = UserProfile(name: "Restricted")
+            if restriction == "kids" { profile.isKids = true }
+            if restriction == "pin" { profile.pin = "synthetic-pin" }
+            let store = FakeStore(restriction == "empty-stale-active" ? [] : [profile])
+            if restriction == "unmatched" || restriction == "empty-stale-active" { store.activeID = UUID() }
+            precondition(!store.canRequestPicker)
+            store.requestPicker()
+            precondition(!store.needsPicker, restriction)
+            store.profiles = [profile, UserProfile(name: "Existing alternative")]
+            precondition(store.canRequestPicker && store.needsPicker, "existing multi-profile policy remains")
+            passed += 1
+        }
+        for change in ["empty-populated", "kids", "pin", "active", "roster", "dismissal", "replacement", "pending-pin", "credential"] {
+            let empty = change == "empty-populated"
+            let h = PickerHarness(empty ? [] : [UserProfile(name: "Current adult")], manualPicker: true)
+            h.openToolsForTest()
+            let route = h.toolsRoute!
+            let owner = route.accountFiles.owner!
+            precondition(route.accountFiles.permits(owner) && route.diagnostics.permitsExport)
+            switch change {
+            case "empty-populated": h.store.profiles.append(UserProfile(name: "Restored adult"))
+            case "kids": h.store.profiles[0].isKids = true
+            case "pin": h.store.profiles[0].pin = "synthetic-pin"
+            case "active": h.store.activeID = UUID()
+            case "roster": h.store.profiles[0] = UserProfile(name: "Replacement adult")
+            case "dismissal": h.store.pickedThisLaunch = true
+            case "replacement": h.store.requestPicker()
+            case "pending-pin": h.pinTarget = h.store.profiles[0]
+            case "credential": CredentialScopeRegistry.shared.change()
+            default: preconditionFailure()
+            }
+            precondition(!route.accountFiles.permits(owner), change)
+            // Pending-PIN diagnostic revocation is an existing separate policy; this delta adds
+            // the original manual admission to every pre-existing diagnostic grant boundary.
+            if change != "pending-pin" { precondition(!route.diagnostics.permitsExport, change) }
+            h.stop(); passed += 1
+        }
+        do {
+            let h = PickerHarness([UserProfile(name: "Current adult")], manualPicker: true)
+            let original = h.store.manualPickerToolsAdmission()
+            let admission = h.core.captureNativeProfileActionAdmission()
+            let selected = await h.store.selectNative(h.store.profiles[0], admission: admission, finishPicker: false)
+            precondition(selected)
+            precondition(h.store.needsPicker && original(), "editor selection retains manual parent")
+            h.tap(h.store.profiles[0])
+            await until("manual ordinary selection finishes") { !h.profileAction.isRunning }
+            precondition(h.store.pickedThisLaunch && !h.store.needsPicker && !original())
+            h.stop(); passed += 1
+        }
         do {
             let (h, _, _) = fixture(pin: "synthetic-pin")
             h.recoverAccount()

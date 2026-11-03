@@ -12,11 +12,15 @@ mkdir -p "$picker_repo_root/app/build"
 picker_test_dir="$(mktemp -d "$picker_repo_root/app/build/profile-picker-routing.XXXXXX")"
 printf 'Retained synthetic picker test output: %s\n' "$picker_test_dir"
 
-ruby - "$picker_repo_root" "$picker_template" "$picker_test_dir" <<'RUBY'
+ruby - "$picker_repo_root" "$picker_template" "$picker_test_dir" "$picker_script_dir/test-native-profile-picker-routing.sh" <<'RUBY'
 require 'digest'
-root, template_path, out = ARGV
+root, template_path, out, runner_path = ARGV
 source_path = File.join(root, 'app/SourcesShared/ProfilesView.swift')
 source = File.read(source_path)
+store_path = File.join(root, 'app/SourcesShared/Profiles.swift')
+store_source = File.read(store_path)
+ios_root_path = File.join(root, 'app/SourcesiOS/iOSRootView.swift')
+tv_root_path = File.join(root, 'app/SourcesTV/RootTabView.swift')
 template = File.read(template_path)
 
 def between(source, begin_marker, end_marker)
@@ -26,16 +30,40 @@ def between(source, begin_marker, end_marker)
   source[first...last]
 end
 
+# Actual manual request state and eligibility; synthetic profile/account collaborators stay explicit.
+store_state = '    @Published var pickedThisLaunch = false {' + between(store_source,
+  '    @Published var pickedThisLaunch = false {', "    /// The ACTIVE overlay profile's private watch state")
+needed = '    var needsPicker: Bool {' + between(store_source, '    var needsPicker: Bool {', "\n    }\n") + "\n    }\n"
+root_dismissals = [ios_root_path, tv_root_path].map do |path|
+  root_picker = between(File.read(path), '    private var pickerPresented: Binding<Bool> {', "\n    }\n")
+  between(root_picker, '            set: { presented in', "\n            }\n")
+end
+
 # Limit extraction to the actual picker; never use a similarly named editor callback.
 picker = between(source, 'struct ProfilePickerView: View {',
                  '/// A bounded public Cinemeta')
+# Bind construction before appearance. The argument is taken from the real iOS root and required
+# at both iOS/App Store call sites and the TV root; the actual initializer assignment is verbatim.
+root_call_prefix = 'ProfilePickerView(authentication: profileAuthentication, pickerAdmission: '
+root_argument = between(File.read(ios_root_path), root_call_prefix, ', manualPickerDismissal: ')
+dismissal_prefix = root_call_prefix + root_argument + ', manualPickerDismissal: '
+dismissal_argument = between(File.read(ios_root_path), dismissal_prefix, ') }')
+root_call = dismissal_prefix + dismissal_argument + ')'
+raise 'Missing exact iOS/Mac construction admission' unless File.read(ios_root_path).scan(root_call).length == 2
+raise 'Missing exact TV construction admission' unless File.read(tv_root_path).scan(root_call).length == 1
+initializer = between(picker, '    init(core: CoreBridge = .shared, authentication:', "\n    }\n")
+state_initializers = initializer.lines.select { |line| line.strip.start_with?('_pickerAdmission = State(initialValue:') }
+raise 'Missing unique original State admission' unless state_initializers.length == 1
+dismissal_initializers = initializer.lines.select { |line| line.strip.start_with?('_manualPickerDismissal = State(initialValue:') }
+raise 'Missing unique original State dismissal' unless dismissal_initializers.length == 1
+raise 'Appearance must not recapture admission' if picker.include?('capturePickerAdmission()')
 methods = '    private func pick(_ profile: UserProfile) {' + between(picker,
   '    private func pick(_ profile: UserProfile) {', "\n}\n")
 methods += "\n" + '    private func focusDiagnosticRecovery() {' + between(picker,
   '    private func focusDiagnosticRecovery() {', "\n    }\n") + "\n    }\n"
 methods += "\n" + '    private func openAccountHelp() {' + between(picker,
   '    private func openAccountHelp() {', "\n    }\n") + "\n    }\n"
-for name in ['diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant', 'closeTools(_ id: UUID)', 'openTools()']
+for name in ['closeManualPicker()', 'diagnosticGrant() -> ProfilePickerToolsDiagnosticGrant', 'closeTools(_ id: UUID)', 'openTools()']
   signature = "    private func #{name} {"
   methods += "\n" + signature + between(picker, signature, "\n    }\n") + "\n    }\n"
 end
@@ -57,7 +85,16 @@ account_help_event = between(picker, '.onValueChange(of: accountHelpNeeded) { pr
 signin_event = between(picker, '.onValueChange(of: signInNeeded) { presented in', " }\n")
 
 replacements = {
+  '/* ACTUAL_ROOT_PICKER_ARGUMENT */' => 'return ' + root_argument,
+  '/* ACTUAL_ROOT_PICKER_DISMISSAL_ARGUMENT */' => 'return ' + dismissal_argument,
+  '/* ACTUAL_PICKER_STATE_INITIALIZER */' => state_initializers.first,
+  '/* ACTUAL_PICKER_DISMISSAL_INITIALIZER */' => dismissal_initializers.first,
+  '/* ACTUAL_PICKER_PRESENTATION_STATE */' => store_state,
+  '/* ACTUAL_PICKER_NEEDED */' => needed,
+  '/* ACTUAL_IOS_PICKER_DISMISSAL */' => root_dismissals[0],
+  '/* ACTUAL_TV_PICKER_DISMISSAL */' => root_dismissals[1],
   '/* ACTUAL_METHODS */' => methods,
+  '/* ACTUAL_PICKER_ADMISSION */' => picker.lines.find { |line| line.start_with?('    private var pickerAdmissionPermits: Bool {') } || (raise 'Missing picker admission projection'),
   '/* ACTUAL_PREPARING */' => preparing,
   '/* ACTUAL_RESTORE_EVENT */' => restore_event,
   '/* ACTUAL_CREDENTIAL_EVENT */' => credential_event,
@@ -74,7 +111,8 @@ replacements.each do |marker, value|
 end
 raise 'Unresolved extraction marker' if template.include?('/* ACTUAL_')
 File.write(File.join(out, 'NativeProfilePickerRouting.generated.swift'), template)
-paths = [source_path, File.join(root, 'app/SourcesShared/NativeProfileActionPreparation.swift'),
+paths = [source_path, store_path, ios_root_path, tv_root_path, template_path, runner_path,
+         File.join(root, 'app/SourcesShared/NativeProfileActionPreparation.swift'),
          File.join(root, 'app/SourcesShared/ProfileMutationPresentation.swift'),
          File.join(root, 'app/SourcesShared/ProfilePickerToolsAccess.swift')]
 receipt = paths.map { |path| "#{Digest::SHA256.file(path).hexdigest}  #{path}" }.join("\n") + "\n"
