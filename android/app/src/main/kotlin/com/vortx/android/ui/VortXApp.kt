@@ -606,7 +606,9 @@ fun VortXApp(
         // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
         // watching" before any content renders. It self-dismisses when the store has nothing to pick.
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
-        val pickerToolsModel = rememberPickerToolsModel(syncManager)
+        val restoreExclusion = (appContext as? com.vortx.android.VortXApplication)
+            ?.pickerAccountFileRestoreExclusion(syncManager)
+        val pickerToolsModel = rememberPickerToolsModel(syncManager, externalRestore = restoreExclusion)
         val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
         val pickerFileRecoveryPaused = fileRecoveryPausedNow()
         LaunchedEffect(pickerFileRecoveryPaused) {

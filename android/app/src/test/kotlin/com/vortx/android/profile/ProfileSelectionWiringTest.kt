@@ -45,7 +45,11 @@ class ProfileSelectionWiringTest {
     @Test fun `tools wraps only main picker while account and native selection guards remain separate`() {
         for (path in listOf("ui/VortXApp.kt", "ui/tv/TvApp.kt")) {
             val host = source(path)
-            assertTrue(host.contains("val pickerToolsModel = rememberPickerToolsModel(syncManager)"))
+            assertTrue(host.contains("val pickerToolsModel = rememberPickerToolsModel(syncManager, externalRestore = restoreExclusion)"))
+            assertTrue(host.contains("?.pickerAccountFileRestoreExclusion(syncManager)"))
+            assertTrue(host.contains("pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()"))
+            assertTrue(host.contains("statusOnlyOwner = original, statusOnlyAdmission = statusAdmission"))
+            assertTrue(host.contains("(pickerToolsState.open && pickerToolsModel.state.value.open)"))
             assertTrue(host.contains("ProfilePickerToolsHost(pickerToolsModel, isTv ="))
             assertTrue(host.contains("diagnosticAdmission = ::currentPickerDiagnosticExportAllowed"))
             assertTrue(host.contains("pickerToolsState.open"))
@@ -75,6 +79,23 @@ class ProfileSelectionWiringTest {
         // The existing account form and settings diagnostics retain their independently legitimate uses.
         assertTrue(source("ui/screens/VortXAccountScreen.kt").contains("DiagnosticLogAction("))
         assertTrue(source("ui/screens/DiagnosticsSettingsScreen.kt").contains("shareDiagnosticLog(context)"))
+    }
+
+    @Test fun `restore exclusion is one application binding for the exact attached manager`() {
+        val app = source("VortXApplication.kt")
+        val binding = "pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)"
+        val attachment = app.indexOf("manager.attachNativeGateway(nativeAccounts)")
+        val publication = app.indexOf(binding)
+        assertTrue(attachment >= 0 && publication > attachment)
+        assertEquals(publication, app.lastIndexOf(binding))
+        assertTrue(app.contains("it.first === expected && syncManager === expected"))
+        val model = source("ui/viewmodel/ProfilePickerToolsViewModel.kt")
+        assertTrue(model.contains("if (manager != null && externalRestore != null)"))
+        for (path in listOf("MainActivity.kt", "ui/tv/TvActivity.kt")) {
+            val activity = source(path)
+            assertTrue(activity.contains("syncManager = app.syncManager"))
+            assertFalse(activity.contains("ApplicationAccountFileRestoreExclusion("))
+        }
     }
 
     @Test fun `settings selections preserve typed result to the same host`() {

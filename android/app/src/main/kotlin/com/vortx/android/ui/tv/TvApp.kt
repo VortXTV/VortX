@@ -118,7 +118,9 @@ fun TvApp(
         // Ordinary browse navigation is metadata and survives the pre-profile Tools return.
         var shellDestination by rememberSaveable { mutableStateOf(TvDestination.HOME) }
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
-        val pickerToolsModel = rememberPickerToolsModel(syncManager)
+        val restoreExclusion = (LocalContext.current.applicationContext as? VortXApplication)
+            ?.pickerAccountFileRestoreExclusion(syncManager)
+        val pickerToolsModel = rememberPickerToolsModel(syncManager, externalRestore = restoreExclusion)
         val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
         val sessionUiState by (
             syncManager?.sessionUiState?.collectAsStateWithLifecycle()

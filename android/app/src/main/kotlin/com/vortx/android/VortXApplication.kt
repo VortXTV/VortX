@@ -58,6 +58,8 @@ import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.PlaylistScopeTransition
 import com.vortx.android.update.UpdateChecker
+import com.vortx.android.sync.AccountFileRestoreExternalExclusion
+import com.vortx.android.sync.ApplicationAccountFileRestoreExclusion
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.CoroutineScope
@@ -372,6 +374,11 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             }
         }
 
+    private var pickerFileRestoreBinding: Pair<VortXSyncManager, AccountFileRestoreExternalExclusion>? = null
+
+    internal fun pickerAccountFileRestoreExclusion(expected: VortXSyncManager?): AccountFileRestoreExternalExclusion? =
+        pickerFileRestoreBinding?.takeIf { it.first === expected && syncManager === expected }?.second
+
     /**
      * Wire the VortX-account issuer and live consent invalidation. Legacy Source Index Boolean methods
      * remain closed; the repository-owned path supplies a captured native/account authorization.
@@ -521,6 +528,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
             override fun onActivityDestroyed(activity: Activity) {}
         })
+        pickerFileRestoreBinding = manager to ApplicationAccountFileRestoreExclusion(this, manager)
     }
 
     /// The one [CatalogRepository] the whole app shares, backed by the VortX engine session.
