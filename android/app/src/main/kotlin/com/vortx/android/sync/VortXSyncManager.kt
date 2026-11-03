@@ -434,6 +434,11 @@ internal class SessionOperationCoordinator {
         }
     }
 
+    /** Run only a local first-I/O claim while this coordinator still owns the exact permit. */
+    fun admitSessionCall(permit: OutboundCallPermit, claim: () -> Boolean): Boolean = synchronized(lock) {
+        permit.owner == OutboundCallOwner.SESSION && isPermitCurrentLocked(permit) && claim()
+    }
+
     internal inner class AuthOperation internal constructor(
         private val expectedAuthGeneration: Long,
     ) {
@@ -2304,9 +2309,14 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val owner: SessionOwnerSnapshot.Account,
         private val session: Session,
         private val current: () -> Boolean,
+        private val acquire: () -> SessionOperationCoordinator.OutboundCallPermit?,
+        private val admit: (SessionOperationCoordinator.OutboundCallPermit, () -> Boolean) -> Boolean,
     ) {
         /** This scalar fence is safe to call while the outbox owns its filesystem lock. */
         fun requireCurrent() { check(current()) }
+        fun acquireCallPermit(): SessionOperationCoordinator.OutboundCallPermit? = acquire()
+        fun admitCall(permit: SessionOperationCoordinator.OutboundCallPermit, claim: () -> Boolean): Boolean =
+            admit(permit, claim)
 
         fun <T> withDataKey(use: (ByteArray) -> T): T {
             requireCurrent()
@@ -2348,7 +2358,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                                 providerRetryDrainAvailability = Any()
                                 return@open null
                             }
-                            ProviderRetryOwner(owner, original, current)
+                            ProviderRetryOwner(owner, original, current,
+                                { operations.acquireSessionCallPermit(generation, current) },
+                                { permit, claim -> operations.admitSessionCall(permit) { current() && claim() } })
                         }
                     }
                 }

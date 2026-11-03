@@ -86,6 +86,15 @@ class SessionRenewalManagerTest {
             assertNull(legacy())
             val original = requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))
             val lease = requireNotNull(original())
+            val permit = requireNotNull(lease.acquireCallPermit())
+            var permitRetired = false
+            assertTrue(permit.attachCancellation { permitRetired = true })
+            assertTrue(lease.admitCall(permit) { true })
+            val foreign = SessionOperationCoordinator()
+            val foreignPermit = requireNotNull(foreign.acquireSessionCallPermit(foreign.snapshot { it }) { true })
+            try {
+                assertFalse(lease.admitCall(foreignPermit) { error("Foreign call was admitted") })
+            } finally { foreignPermit.close() }
             val scopedKey = lease.withDataKey { key ->
                 assertArrayEquals(f.original.dataKey, key)
                 key
@@ -95,12 +104,18 @@ class SessionRenewalManagerTest {
 
             f.manager.requestSessionRenewalForTest()
             lease.requireCurrent()
+            assertTrue(permit.isCurrent())
             assertEquals(owner, requireNotNull(original()).owner)
 
             val replacement = VortXSyncManager.Session(RenewalFixtures.next, f.original.account, ByteArray(32) { 7 })
             f.manager.replaceSyncSessionTestSeam(replacement)
             f.manager.installSessionRestoreTestSeam(replacement, owner.generation)
             assertNull(original())
+            assertTrue(permitRetired)
+            assertFalse(permit.isCurrent())
+            assertFalse(lease.admitCall(permit) { error("Retired call was admitted") })
+            assertNull(lease.acquireCallPermit())
+            permit.close()
             assertThrows(IllegalStateException::class.java) { lease.withDataKey { error("Retired key escaped") } }
             val successor = requireNotNull(requireNotNull(f.manager.captureProviderRetryOwnerOpener(owner))())
             successor.withDataKey { assertArrayEquals(replacement.dataKey, it) }
