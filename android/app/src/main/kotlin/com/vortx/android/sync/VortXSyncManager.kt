@@ -10,6 +10,8 @@ import com.vortx.android.data.AddonTombstones
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.engine.VortxJniBindings
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.engine.VortxAccountScope
 import com.vortx.android.metadata.MetadataProviderKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
@@ -38,13 +40,24 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.ContinuationInterceptor
+import okhttp3.Authenticator
+import okhttp3.CookieJar
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okio.BufferedSink
 
 /**
  * Publish the app-owned effective add-on removal set and its LWW stamps without replacing any other `vortx`
@@ -820,6 +833,18 @@ internal class DurablePendingSyncState(
         cancelled
     }
 
+    fun inspectFileRestorePending(accountId: String): AccountFileLocalPresence = synchronized(lock) {
+        val observed = truthByAccount[accountId]
+        when {
+            owner?.accountId == accountId && attempt != null -> AccountFileLocalPresence.PRESENT
+            observed.isDirty() -> AccountFileLocalPresence.PRESENT
+            observed == PendingMarkerTruth.READ_UNKNOWN -> AccountFileLocalPresence.UNAVAILABLE
+            else -> try {
+                if (readDirty(accountId)) AccountFileLocalPresence.PRESENT else AccountFileLocalPresence.ABSENT
+            } catch (_: Exception) { AccountFileLocalPresence.UNAVAILABLE }
+        }
+    }
+
     private fun resolveTruth(accountId: String): PendingMarkerTruth {
         val known = truthByAccount[accountId]
         if (known != null && known != PendingMarkerTruth.READ_UNKNOWN) return known
@@ -842,6 +867,69 @@ internal class DurablePendingSyncState(
     private fun PendingMarkerTruth?.isDirty(): Boolean =
         this == PendingMarkerTruth.DIRTY_CONFIRMED ||
             this == PendingMarkerTruth.DIRTY_UNCONFIRMED
+}
+
+/**
+ * Required cross-subsystem writer reservation. Only a real application composition that holds
+ * these gates may supply it. It is deliberately not installed by the manager or any picker.
+ */
+internal fun interface AccountFileRestoreExternalExclusion {
+    /** Run the callback at most once, only while the actual issuer-owned gates are held. */
+    suspend fun withReservation(original: Owner, requireOriginal: () -> Unit,
+        operation: suspend (Reservation) -> Unit)
+
+    class Owner internal constructor(
+        val account: SessionOwnerSnapshot.Account,
+        val operationGeneration: Long,
+    ) {
+        override fun toString() = "AccountFileRestoreExternalExclusion.Owner"
+    }
+
+    interface Reservation {
+        /** Recheck original native/direct-writer reservation, including undrained work. */
+        fun requireCurrent(original: Owner)
+        /** Existing-only proof for external stores and for the exact physical prefs backing. */
+        fun requireLocalAbsence(original: Owner, scope: VortxAccountScope)
+    }
+}
+
+/** Manager writer slots are held through actual coroutine return, without holding this monitor. */
+internal class AccountFileRestoreManagerExclusion {
+    class Reservation internal constructor()
+    private val lock = Any()
+    private var writers = 0
+    private var reservation: Reservation? = null
+    private var invalidated = false
+
+    fun tryReserve(): Reservation? = synchronized(lock) {
+        if (writers != 0 || reservation != null) return@synchronized null
+        invalidated = false
+        Reservation().also { reservation = it }
+    }
+
+    fun isCurrent(original: Reservation): Boolean = synchronized(lock) {
+        reservation === original && !invalidated && writers == 0
+    }
+
+    fun release(original: Reservation) {
+        synchronized(lock) { if (reservation === original) reservation = null }
+    }
+
+    fun enterWriter(observedEdit: Boolean): Boolean = synchronized(lock) {
+        if (reservation != null) {
+            if (!observedEdit) return@synchronized false
+            // The direct writer already changed data. Preserve its real marker and retire
+            // Restore admission, while holding its reservation until the call drains.
+            invalidated = true
+        }
+        writers++
+        true
+    }
+
+    fun exitWriter() = synchronized(lock) {
+        check(writers > 0)
+        writers--
+    }
 }
 
 /**
@@ -1033,11 +1121,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
      * Otherwise diff the live domain against the shadow, mark any changed SYNCABLE key dirty (per account,
      * durable), and re-baseline. No-op marking while signed out (nothing to protect).
      */
-    private fun noteLocalSettingsChange() {
+    private fun noteLocalSettingsChange() = accountFileManagedWriter(Unit, observedEdit = true) {
         val lease = captureSyncLease()
-        if (lease == null) { refreshSettingsShadow(); return }
+        if (lease == null) { refreshSettingsShadow(); return@accountFileManagedWriter }
         var changed = emptySet<String>()
-        if (!publishIfSyncLeaseCurrent(lease) {
+        if (!publishIfSyncLeaseCurrent(lease, preserveObservedEdit = true) {
             NativeSettingsFence.mutateBookkeeping {
                 val current = currentSyncableDomain()
                 changed = if (!applyingRemote) SettingsDirtyKeys.changedSyncableKeys(settingsShadow, current) {
@@ -1050,7 +1138,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     writeDirtySettings(dirty)
                 }
             }
-        }) return
+        }) return@accountFileManagedWriter
         // Native receives can remain bodyless indefinitely. Exportable global edits must own
         // their own durable retry instead of waiting for an unrelated library/profile mutation.
         // Profile mirrors and remote application do not create a second upload intent.
@@ -1185,6 +1273,12 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     // Native joins and their host/credential/stamp receipts form one transaction. A broadcast,
     // foreground catch-up, and a queued local push must not interleave those receipts.
     private val nativeSyncMutex = Mutex()
+    private val fileRestoreExclusion = AccountFileRestoreManagerExclusion()
+
+    private inline fun <T> accountFileManagedWriter(refused: T, observedEdit: Boolean = false, work: () -> T): T {
+        if (!fileRestoreExclusion.enterWriter(observedEdit)) return refused
+        return try { work() } finally { fileRestoreExclusion.exitWriter() }
+    }
     // Auth completion is not foreground intent. Only the process lifecycle may enable the
     // socket/poll; a late sign-in/reconcile result must not reopen it after background stop.
     private var realtimeForeground = false
@@ -1216,27 +1310,29 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     @Volatile private var libraryGateway: AccountLibrarySyncGateway? = null
     @Volatile private var nativeGateway: NativeAccountGateway? = null
     private var nativeProviderStore: com.vortx.android.integrations.CredentialStoreAccess? = null
+    @Volatile private var fileRestoreProviderVault: com.vortx.android.integrations.NativeProviderVault? = null
     private var nativeProviderTestStore = false
 
     private fun bindNativeProviders() {
         val credentials = nativeProviderStore ?: com.vortx.android.integrations.SecureTokenStore(appContext, "vortx_native_provider_credentials")
             .also { nativeProviderStore = it }
+        val vault = com.vortx.android.integrations.NativeProviderVault(credentials, if (nativeProviderTestStore) null else { owner ->
+            // Only explicitly account-qualified old slots can migrate. The legacy global
+            // debrid/metadata slots and unscoped OAuth tuples are never attributed here.
+            val debrid = com.vortx.android.integrations.SecureTokenStore(appContext, DebridKeys.ENCRYPTED_FILE)
+            val metadata = com.vortx.android.integrations.SecureTokenStore(appContext, "vortx_metadata_credentials")
+            val debridNames = DebridService.entries.associate { "vortx.debrid.${it.id}.account.${owner.id}" to it.id }
+            val metadataNames = MetadataProviderKeys.Slot.entries.associate { "${it.key}.account.${owner.id}" to it.syncKey }
+            val api = JSONObject()
+            for ((store, names) in listOf(debrid to debridNames, metadata to metadataNames)) {
+                val values = store.confirmedSnapshot(*names.keys.toTypedArray())
+                check(values.availability == com.vortx.android.security.PersistentCredentialAvailability.AVAILABLE)
+                names.forEach { (key, wire) -> values.values[key]?.takeIf(String::isNotEmpty)?.let { api.put(wire, it) } }
+            }
+            JSONObject().put("apiKeys", api)
+        })
         com.vortx.android.integrations.NativeProviderAccess.bind(
-            com.vortx.android.integrations.NativeProviderVault(credentials, if (nativeProviderTestStore) null else { owner ->
-                // Only explicitly account-qualified old slots can migrate. The legacy global
-                // debrid/metadata slots and unscoped OAuth tuples are never attributed here.
-                val debrid = com.vortx.android.integrations.SecureTokenStore(appContext, DebridKeys.ENCRYPTED_FILE)
-                val metadata = com.vortx.android.integrations.SecureTokenStore(appContext, "vortx_metadata_credentials")
-                val debridNames = DebridService.entries.associate { "vortx.debrid.${it.id}.account.${owner.id}" to it.id }
-                val metadataNames = MetadataProviderKeys.Slot.entries.associate { "${it.key}.account.${owner.id}" to it.syncKey }
-                val api = JSONObject()
-                for ((store, names) in listOf(debrid to debridNames, metadata to metadataNames)) {
-                    val values = store.confirmedSnapshot(*names.keys.toTypedArray())
-                    check(values.availability == com.vortx.android.security.PersistentCredentialAvailability.AVAILABLE)
-                    names.forEach { (key, wire) -> values.values[key]?.takeIf(String::isNotEmpty)?.let { api.put(wire, it) } }
-                }
-                JSONObject().put("apiKeys", api)
-            }),
+            vault,
             object : com.vortx.android.integrations.NativeProviderAdmission {
                 override fun <T> withCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
                     operations.snapshot { sessionState.serialized {
@@ -1249,6 +1345,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 if (lease != null && lease.accountId == owner.id && lease.ownerEpoch == owner.generation) armPendingSync(lease, recordEdit = true)
             },
         )
+        fileRestoreProviderVault = vault
     }
 
     internal fun attachNativeGateway(gateway: NativeAccountGateway) {
@@ -1558,8 +1655,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     private fun publishIfSyncLeaseCurrent(
         lease: SyncSessionLease,
+        preserveObservedEdit: Boolean = false,
         publication: () -> Unit,
-    ): Boolean {
+    ): Boolean = accountFileManagedWriter(false, observedEdit = preserveObservedEdit) {
         val result = operations.mutateIfCurrent(lease.operationGeneration) {
             sessionState.serialized {
                 if (!sessionMatchesLease(lease)) {
@@ -1570,7 +1668,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 }
             }
         }
-        return when (result) {
+        return@accountFileManagedWriter when (result) {
             is SessionMutationResult.Applied -> result.value
             SessionMutationResult.Stale -> false
         }
@@ -2316,6 +2414,333 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
     }
 
+    internal sealed interface FileRestoreStatus {
+        data object Missing : FileRestoreStatus
+        data object Unavailable : FileRestoreStatus
+        data class Retained(val operationId: UUID, val revision: Long, val state: AccountFileRestoreJournal.State) : FileRestoreStatus
+    }
+
+    // Existing-only status/Verify never build an alternate owner from a selected profile,
+    // never reopen a secure store for a second Session, and never run Restore's PUT path.
+    private fun captureFileRestoreOwner(expected: PickerAccountSnapshot): AccountFileDownload? = operations.snapshot {
+        if (expected.account == null || !isPickerAccountCurrent(expected)) return@snapshot null
+        sessionState.serialized {
+            val owner = sessionState.value ?: return@serialized null
+            if (owner.dataKey.size != 32) return@serialized null
+            val lease = captureSyncLease() ?: return@serialized null
+            AccountFileDownload(lease, owner, expected)
+        }
+    }
+
+    private fun requireFileRestoreOwner(capture: AccountFileDownload, original: SyncSessionLease,
+        caller: Job?, routeCurrent: () -> Boolean) {
+        caller?.ensureActive()
+        if (capture.lease !== original || !routeCurrent() || !isAccountFileDownloadCurrent(capture))
+            throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+    }
+
+    private val fileRestoreJournal by lazy { AccountFileRestoreJournal(appContext) }
+    private val fileRestoreTransaction by lazy {
+        AccountFileRestoreTransaction(fileRestoreJournal, VortxJniBindings, AccountFileHostAdmission::requireCandidate)
+    }
+
+    internal suspend fun readAccountBackupFileRestoreStatus(expected: PickerAccountSnapshot,
+        routeCurrent: () -> Boolean): FileRestoreStatus = withContext(nativeWorkDispatcher) {
+        val caller = currentCoroutineContext()[Job]
+        val capture = captureFileRestoreOwner(expected) ?: return@withContext FileRestoreStatus.Unavailable
+        val lease = capture.lease
+        val key = lease.dataKeyCopy()
+        try {
+            requireFileRestoreOwner(capture, lease, caller, routeCurrent)
+            val result = when (val stored = fileRestoreJournal.readExisting(lease.accountId, key)) {
+                AccountFileRestoreJournal.Read.Missing -> FileRestoreStatus.Missing
+                AccountFileRestoreJournal.Read.Unavailable -> FileRestoreStatus.Unavailable
+                is AccountFileRestoreJournal.Read.Present -> stored.snapshot.let {
+                    FileRestoreStatus.Retained(it.intent.operationId, it.intent.revision, it.state)
+                }
+            }
+            requireFileRestoreOwner(capture, lease, caller, routeCurrent)
+            result
+        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (_: Exception) { FileRestoreStatus.Unavailable }
+        finally { key.fill(0) }
+    }
+
+    /** Historical journal facts survive retirement, but their result must stay with the original route. */
+    private suspend fun withFileRestoreResult(expected: PickerAccountSnapshot, routeCurrent: () -> Boolean,
+        operation: suspend (AccountFileDownload, Job?) -> AccountFileRestoreTransaction.Result): AccountFileRestoreTransaction.Result {
+        val capture = captureFileRestoreOwner(expected)
+            ?: return fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+        val lease = capture.lease
+        val caller = currentCoroutineContext()[Job]
+        try { requireFileRestoreOwner(capture, lease, caller, routeCurrent) }
+        catch (refusal: AccountFileRestoreTransaction.Refusal) { return fileRestoreNotSubmitted(refusal.reason) }
+
+        return try {
+            withContext(nativeWorkDispatcher) {
+                requireFileRestoreOwner(capture, lease, caller, routeCurrent)
+                operation(capture, caller)
+            }
+        } finally {
+            // This runs on the original caller after the worker and all reservation cleanup drain.
+            // A retired result may describe an actual prior send. It cannot become NotSubmitted.
+            try { requireFileRestoreOwner(capture, lease, caller, routeCurrent) }
+            catch (_: AccountFileRestoreTransaction.Refusal) {
+                throw kotlinx.coroutines.CancellationException("Account file restore result retired")
+            }
+        }
+    }
+
+    internal suspend fun verifyAccountBackupFileRestore(expected: PickerAccountSnapshot, operationId: UUID,
+        routeCurrent: () -> Boolean): AccountFileRestoreTransaction.Result = withFileRestoreResult(expected, routeCurrent) { capture, caller ->
+        if (!accountFileRepairSlot.tryLock()) return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+        try {
+            val access = FileRestoreReads(capture, caller, routeCurrent)
+            try { access.requireCurrent(capture.lease) }
+            catch (refusal: AccountFileRestoreTransaction.Refusal) { return@withFileRestoreResult fileRestoreNotSubmitted(refusal.reason) }
+            fileRestoreTransaction.verify(capture.lease, operationId, access)
+        } finally { accountFileRepairSlot.unlock() }
+    }
+
+    /** Only an independently installed actual cross-subsystem exclusion may activate this entry. */
+    internal suspend fun restoreAccountBackupFile(expected: PickerAccountSnapshot, selected: ByteArray,
+        routeCurrent: () -> Boolean, external: AccountFileRestoreExternalExclusion): AccountFileRestoreTransaction.Result =
+        withFileRestoreResult(expected, routeCurrent) { capture, caller ->
+            val lease = capture.lease
+            if (!accountFileRepairSlot.tryLock())
+                return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+            try {
+                val managed = fileRestoreExclusion.tryReserve()
+                    ?: return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+                try {
+                    val capturedNativeGateway = nativeGateway
+                    val externalOwner = AccountFileRestoreExternalExclusion.Owner(
+                        SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch), lease.operationGeneration)
+                    fun requireManagedIdle() {
+                        requireFileRestoreOwner(capture, lease, caller, routeCurrent)
+                        if (!fileRestoreExclusion.isCurrent(managed) || nativeSyncMutex.isLocked ||
+                            nativeGateway !== capturedNativeGateway || applyingRemote)
+                            throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
+                    }
+                    val entered = AtomicBoolean(false)
+                    var outcome: AccountFileRestoreTransaction.Result? = null
+                    try {
+                        requireManagedIdle()
+                        external.withReservation(externalOwner, ::requireManagedIdle) { reservation ->
+                            check(entered.compareAndSet(false, true))
+                            requireManagedIdle()
+                            val reads = FileRestoreReads(capture, caller, routeCurrent)
+                            val access = object : AccountFileRestoreTransaction.ExclusiveRestore, AccountFileRestoreTransaction.AuthenticatedReads by reads {
+                                override fun requireIdle(original: SyncSessionLease) {
+                                    reads.requireCurrent(original)
+                                    requireManagedIdle()
+                                    reservation.requireCurrent(externalOwner)
+                                    requireManagedIdle()
+                                }
+                                override fun requireCurrent(original: SyncSessionLease) = requireIdle(original)
+                                override suspend fun getHead(original: SyncSessionLease): AccountFileRestoreTransaction.RawResponse =
+                                    requestFileRestoreRaw(capture, original, null) { requireIdle(original) }
+
+                                override fun requireLocalAbsence(original: SyncSessionLease, scope: VortxAccountScope) {
+                                    requireIdle(original)
+                                    if (scope.accountID != "account.${lease.accountId}")
+                                        throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+                                    requireManagedFileRestoreAbsence(externalOwner.account) { requireIdle(original) }
+                                    reservation.requireLocalAbsence(externalOwner, scope)
+                                    requireIdle(original)
+                                }
+                                override suspend fun putOnce(original: SyncSessionLease,
+                                    grant: AccountFileRestoreTransaction.PutGrant): AccountFileRestoreTransaction.RawResponse {
+                                    requireIdle(original)
+                                    return requestFileRestoreRaw(capture, original, grant) { requireIdle(original) }
+                                }
+                            }
+                            outcome = fileRestoreTransaction.restore(lease, selected, access)
+                        }
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                    catch (refusal: AccountFileRestoreTransaction.Refusal) {
+                        return@withFileRestoreResult outcome ?: fileRestoreNotSubmitted(refusal.reason)
+                    } catch (_: Exception) {
+                        return@withFileRestoreResult outcome
+                            ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                    }
+                    outcome ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+                } finally { fileRestoreExclusion.release(managed) }
+            } finally { accountFileRepairSlot.unlock() }
+        }
+
+    private fun fileRestoreNotSubmitted(reason: AccountFileRestoreTransaction.Reason) =
+        AccountFileRestoreTransaction.Result.NotSubmitted(reason)
+
+    private inner class FileRestoreReads(private val capture: AccountFileDownload, private val caller: Job?,
+        private val routeCurrent: () -> Boolean) : AccountFileRestoreTransaction.AuthenticatedReads {
+        override fun requireCurrent(original: SyncSessionLease) = requireFileRestoreOwner(capture, original, caller, routeCurrent)
+
+        override fun policy(original: SyncSessionLease): AccountFileRestoreTransaction.HeadPolicy {
+            requireCurrent(original)
+            val result = try {
+                AccountFileRestoreTransaction.HeadPolicy(lastSyncedVersion(original), sawDocV2(original.accountId), writeSyncDocV2)
+            } catch (_: Exception) {
+                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+            }
+            requireCurrent(original)
+            return result
+        }
+
+        override suspend fun getHead(original: SyncSessionLease): AccountFileRestoreTransaction.RawResponse =
+            requestFileRestoreRaw(capture, original, null) { requireCurrent(original) }
+    }
+
+    private fun requireManagedFileRestoreAbsence(owner: SessionOwnerSnapshot.Account, checkCurrent: () -> Unit) {
+        fun witness(inspect: () -> AccountFileLocalPresence) {
+            checkCurrent()
+            val result = try { inspect() }
+            catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: Exception) { AccountFileLocalPresence.UNAVAILABLE }
+            checkCurrent()
+            when (result) {
+                AccountFileLocalPresence.ABSENT -> Unit
+                AccountFileLocalPresence.PRESENT ->
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.PENDING_LOCAL_CHANGES)
+                AccountFileLocalPresence.UNAVAILABLE ->
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+            }
+        }
+        witness { if (nativeReceiveReceipt == null) AccountFileLocalPresence.ABSENT else AccountFileLocalPresence.PRESENT }
+        witness { pendingState.inspectFileRestorePending(owner.id) }
+        witness {
+            NativeSettingsFence.capture {
+                val raw = dirtyPrefs.all
+                if (raw.containsKey(dirtySettingsStorageKey(owner.id))) {
+                    // A present malformed, empty or unstamped marker cannot prove clean absence.
+                    AccountFileLocalPresence.PRESENT
+                } else {
+                    val values = currentSyncableDomain()
+                    val keys = settingsPrefs.all.keys.filter(SettingsBackup::isSyncable)
+                    if (keys.any { it !in values }) AccountFileLocalPresence.UNAVAILABLE
+                    else if (SettingsDirtyKeys.changedSyncableKeys(settingsShadow, values, SettingsBackup::isSyncable).isNotEmpty())
+                        AccountFileLocalPresence.PRESENT else AccountFileLocalPresence.ABSENT
+                }
+            }.second
+        }
+        witness { libraryPublicationProofs.inspectRestorePresence(owner.id) }
+        witness { addonPublicationProofs.inspectRestorePresence(owner.id) }
+        witness { ownerWatchedIntents.inspectRestorePresence(owner.id) }
+        witness {
+            val vault = fileRestoreProviderVault ?: return@witness AccountFileLocalPresence.UNAVAILABLE
+            val result = vault.inspectRestorePresence(owner)
+            if (fileRestoreProviderVault === vault) result else AccountFileLocalPresence.UNAVAILABLE
+        }
+        witness { debridKeys.inspectQualifiedRestorePresence(owner.id) }
+        witness { metadataKeys.inspectQualifiedRestorePresence(owner.id) }
+    }
+
+    // The network interceptor admits one request attempt, including any HTTP follow-up
+    // internally considered by the client. The PUT body itself additionally refuses replay.
+    private class FileRestoreNetworkAttempt(private val checkCurrent: () -> Unit) {
+        private val entered = AtomicBoolean(false)
+        fun enter() {
+            if (!entered.compareAndSet(false, true)) throw IOException("Repeated account file request")
+            checkCurrent()
+        }
+    }
+    private val fileRestoreHttp by lazy {
+        OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+            .cookieJar(CookieJar.NO_COOKIES).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE)
+            .retryOnConnectionFailure(false).callTimeout(TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+            .addNetworkInterceptor { chain ->
+                checkNotNull(chain.request().tag(FileRestoreNetworkAttempt::class.java)).enter()
+                chain.proceed(chain.request())
+            }.build()
+    }
+
+    /** Blocking structured I/O on the transaction's owned worker. No detached callback can use
+     * the grant after the operation returns. Account retirement disconnects through the permit. */
+    private fun requestFileRestoreRaw(capture: AccountFileDownload, original: SyncSessionLease,
+        grant: AccountFileRestoreTransaction.PutGrant?, checkCurrent: () -> Unit): AccountFileRestoreTransaction.RawResponse {
+        checkCurrent()
+        val permit = acquireSyncCallPermit(original)
+            ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+        var renewal: SessionRenewalCapture? = null
+        var bodyBytes: ByteArray? = null
+        var pendingRaw: ByteArray? = null
+        try {
+            val captured = captureSessionRenewal(original.token, permit)
+                ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+            renewal = captured
+            fun requireDispatch() {
+                checkCurrent()
+                if (!permit.isCurrent() || captured.owner !== capture.owner ||
+                    capture.owner.currentBearer != captured.sentToken)
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+            }
+            val method = if (grant == null) "GET" else "PUT"
+            requireDispatch()
+            val bytes = grant?.take(original)
+            bodyBytes = bytes
+            val request = Request.Builder().url("$BASE/v1/backup").header("Authorization", "Bearer ${captured.sentToken}")
+                .header("Cache-Control", "no-cache, no-store")
+                .tag(FileRestoreNetworkAttempt::class.java, FileRestoreNetworkAttempt(::requireDispatch)).apply {
+                    if (bytes == null) get()
+                    else put(object : RequestBody() {
+                        private val wrote = AtomicBoolean(false)
+                        override fun contentType() = "application/json; charset=utf-8".toMediaType()
+                        override fun contentLength() = bytes.size.toLong()
+                        override fun isOneShot() = true
+                        override fun writeTo(sink: BufferedSink) {
+                            if (!wrote.compareAndSet(false, true)) throw IOException("Repeated account file body")
+                            requireDispatch()
+                            sink.write(bytes)
+                        }
+                    })
+                }.build()
+            val call = fileRestoreHttp.newCall(request)
+            if (!permit.attachCancellation(call::cancel))
+                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+            requireDispatch()
+            val result = call.execute().use { response ->
+                checkCurrent()
+                if (!permit.isCurrent() || response.request.url != request.url || response.request.method != method ||
+                    response.priorResponse != null || response.cacheResponse != null)
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.HEAD_UNAVAILABLE)
+                if (response.code == 200) response.body.byteStream().use { input ->
+                    pendingRaw = if (grant == null) AccountBackupFile.readBoundedResponse(input) else readFileRestoreControl(input)
+                }
+                checkCurrent()
+                if (!permit.isCurrent())
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+                storeSessionRenewal(response.headers.values("X-VortX-Session").singleOrNull(), captured, permit,
+                    method, "/v1/backup", response.code, null, response.header("ETag"), pendingRaw?.isEmpty() != false)
+                checkCurrent()
+                if (!permit.isCurrent())
+                    throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+                AccountFileRestoreTransaction.RawResponse(response.code, pendingRaw)
+            }
+            pendingRaw = null
+            return result
+        } finally {
+            permit.close()
+            bodyBytes?.fill(0)
+            pendingRaw?.fill(0)
+            renewal?.dataKey?.fill(0)
+        }
+    }
+
+    private fun readFileRestoreControl(input: InputStream): ByteArray {
+        val limit = AccountFileRestoreTransaction.CONTROL_RESPONSE_LIMIT
+        val storage = ByteArray(limit + 1)
+        try {
+            var used = 0
+            while (used < storage.size) {
+                val count = input.read(storage, used, storage.size - used)
+                if (count < 0) return storage.copyOf(used)
+                if (count == 0) throw IOException("Invalid account control response")
+                used += count
+            }
+            throw IOException("Account control response exceeded its bound")
+        } finally { storage.fill(0) }
+    }
+
     /** Raw-body collaborator is restricted to this owned download mode; normal sync/auth is unchanged. */
     @Volatile private var accountFileTransportTestSeam: (suspend (String, String, String?) -> Pair<Int, ByteArray?>)? = null
     internal fun installAccountFileTransportTestSeam(transport: suspend (String, String, String?) -> Pair<Int, ByteArray?>) {
@@ -2567,9 +2992,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         return synced && isSyncLeaseCurrent(lease)
     }
 
-    private suspend fun syncUp(lease: SyncSessionLease): Boolean {
-        if (!isSyncLeaseCurrent(lease) || requiresUpgrade(lease)) return false
-        return try { withContext(nativeWorkDispatcher) {
+    private suspend fun syncUp(lease: SyncSessionLease): Boolean = accountFileManagedWriter(false) {
+        if (!isSyncLeaseCurrent(lease) || requiresUpgrade(lease)) return@accountFileManagedWriter false
+        return@accountFileManagedWriter try { withContext(nativeWorkDispatcher) {
             nativeSyncMutex.withLock {
                 val gateway = nativeGateway ?: return@withLock false
                 runNativeAccountAttempt(onUnavailable = { markNativeAccountUnavailable(lease, gateway) }) {
@@ -3232,9 +3657,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         lease: SyncSessionLease,
         force: Boolean = false,
         routineReceive: Boolean = false,
-    ): Boolean {
-        if (!isSyncLeaseCurrent(lease)) return false
-        return try { withContext(nativeWorkDispatcher) {
+    ): Boolean = accountFileManagedWriter(false) {
+        if (!isSyncLeaseCurrent(lease)) return@accountFileManagedWriter false
+        return@accountFileManagedWriter try { withContext(nativeWorkDispatcher) {
             nativeSyncMutex.withLock {
                 val gateway = nativeGateway ?: return@withLock false
                 runNativeAccountAttempt(onUnavailable = { markNativeAccountUnavailable(lease, gateway) }) {
@@ -3312,9 +3737,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     /** Executes the native dispatch while the VortX session identity remains serialized with adopt/sign-out. */
     private fun syncLeaseAdmission(lease: SyncSessionLease): ((() -> Boolean) -> Boolean) = { dispatch ->
-        operations.snapshot { generation ->
-            sessionState.serialized {
-                if (generation == lease.operationGeneration && sessionMatchesLease(lease)) dispatch() else false
+        accountFileManagedWriter(false) {
+            operations.snapshot { generation ->
+                sessionState.serialized {
+                    if (generation == lease.operationGeneration && sessionMatchesLease(lease)) dispatch() else false
+                }
             }
         }
     }
@@ -3403,8 +3830,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         lease: SyncSessionLease,
         recordEdit: Boolean,
         progressOnly: Boolean = false,
-    ): Boolean {
-        if (!isSyncLeaseCurrent(lease)) return false
+    ): Boolean = accountFileManagedWriter(refused = true, observedEdit = recordEdit) {
+        if (!isSyncLeaseCurrent(lease)) return@accountFileManagedWriter false
         val owner = pendingOwner(lease)
         val proposedAttempt = PendingSyncAttempt(owner)
         val claim = if (recordEdit) {
@@ -3414,8 +3841,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
         claim.replacedJob?.cancel()
         // Keep the durable marker and edits, but a writer upgrade cannot be repaired by retries.
-        if (requiresUpgrade(lease)) return claim.blockPull
-        val attempt = claim.attemptToStart ?: return claim.blockPull
+        if (requiresUpgrade(lease)) return@accountFileManagedWriter claim.blockPull
+        val attempt = claim.attemptToStart ?: return@accountFileManagedWriter claim.blockPull
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val runningJob = currentCoroutineContext()[Job] ?: return@launch
@@ -3434,10 +3861,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     waitForUploadWindow(attempt, runningJob, retryDelayMs.takeIf { it > SYNC_DEBOUNCE_MS })
                 },
                 attempt = {
-                    if (!pendingState.ensureMarker(attempt, runningJob)) {
-                        false
-                    } else {
-                        val editGeneration = pendingState.captureEditGeneration(attempt, runningJob) ?: return@runPendingSyncRetryLoop false
+                    accountFileManagedWriter(false) writer@ {
+                        if (!pendingState.ensureMarker(attempt, runningJob)) return@writer false
+                        val editGeneration = pendingState.captureEditGeneration(attempt, runningJob)
+                            ?: return@writer false
                         val synced = syncUp(lease)
                         DiagnosticsLog.log("sync", "upload result=${if (synced) "accepted" else "failed"}")
                         if (synced) pendingState.acknowledgeUpload(attempt, runningJob, editGeneration)
@@ -3456,15 +3883,15 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
         if (!pendingState.attachJob(attempt, job)) {
             job.cancel()
-            return claim.blockPull
+            return@accountFileManagedWriter claim.blockPull
         }
         if (!isSyncLeaseCurrent(lease)) {
             pendingState.abandon(attempt, job)
             job.cancel()
-            return claim.blockPull
+            return@accountFileManagedWriter claim.blockPull
         }
         job.start()
-        return claim.blockPull
+        return@accountFileManagedWriter claim.blockPull
     }
 
     /**
