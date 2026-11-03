@@ -2,7 +2,6 @@ import Foundation
 import Network
 import Security
 import CoreImage
-import Darwin
 
 // Network collaborators are deliberately small. Production drivers use ONE serial callback queue.
 // Every callback MUST be asynchronous on that queue, never inline in start/receive/send/cancel.
@@ -52,7 +51,7 @@ final class ProfilePickerToolsLANTransfer {
         static var production: Self {
             .init(clock: { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 },
                   capability: { try ProfilePickerToolsLANSupport.capability() },
-                  ipv4: { ProfilePickerToolsLANSupport.ipv4() }, qr: { ProfilePickerToolsLANSupport.qr($0) },
+                  ipv4: { VXLocalLANAddress.currentIPv4() }, qr: { ProfilePickerToolsLANSupport.qr($0) },
                   listener: { try ProfilePickerToolsLANNetworkListener() },
                   timer: { queue, tick, cancelled in
                       ProfilePickerToolsLANDispatchTimer(queue: queue, tick: tick, cancelled: cancelled)
@@ -763,7 +762,7 @@ private final class ProfilePickerToolsLANDispatchTimer: ProfilePickerToolsLANTim
     }
     func cancel() { source.cancel() }
 }
-/// Narrow copies of the currently private diagnostic LAN/QR patterns; no diagnostic payload or parser.
+/// Transport capability and QR generation for Tools.
 private enum ProfilePickerToolsLANSupport {
     static func capability() throws -> ProfilePickerToolsTransferPolicy.Capability {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -772,27 +771,6 @@ private enum ProfilePickerToolsLANSupport {
         }
         guard status == errSecSuccess else { throw ProfilePickerToolsLANTransfer.Failure.entropy }
         return try .init(hex: bytes.map { String(format: "%02x", $0) }.joined())
-    }
-    static func ipv4() -> String? {
-        var address: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&address) == 0, let first = address else { return nil }
-        defer { freeifaddrs(address) }
-        var preferred: String?, fallback: String?
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let pointer = cursor {
-            defer { cursor = pointer.pointee.ifa_next }
-            let flags = Int32(pointer.pointee.ifa_flags)
-            guard flags & (IFF_UP | IFF_RUNNING) == (IFF_UP | IFF_RUNNING), flags & IFF_LOOPBACK == 0,
-                  let socket = pointer.pointee.ifa_addr, socket.pointee.sa_family == UInt8(AF_INET) else { continue }
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(socket, socklen_t(socket.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let end = host.firstIndex(of: 0) ?? host.endIndex
-            let value = String(decoding: host[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            guard !value.isEmpty, !value.hasPrefix("169.254") else { continue }
-            if String(cString: pointer.pointee.ifa_name) == "en0" { preferred = value }
-            else if fallback == nil { fallback = value }
-        }
-        return preferred ?? fallback
     }
     static func qr(_ value: String) -> CGImage? {
         guard let bytes = value.data(using: .utf8), let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }

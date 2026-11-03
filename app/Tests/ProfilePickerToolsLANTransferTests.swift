@@ -187,6 +187,7 @@ private final class FakeConnection: ProfilePickerToolsLANConnection, @unchecked 
         precondition(predicate(), "fixture boundary did not settle")
     }
     static func main() async throws {
+        VXLocalLANAddressTests.run()
         do {
             do { _ = try Harness(.download, entropyFails: true); preconditionFailure("entropy accepted") }
             catch { check(true, "injected entropy-provider failure stops before listener/timer/publication") }

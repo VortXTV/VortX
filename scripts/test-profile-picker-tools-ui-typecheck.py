@@ -19,7 +19,8 @@ WHOLE = [
         'ProfilePickerToolsServices', 'ProfilePickerToolsRestoreAction', 'DiagnosticLogExportButton',
         'VortxAccountFileAccess', 'ChipButtonStyle', 'ReducedMotion', 'VisualEffects',
         'ValueChangeObservation', 'ProfilePickerToolsTransferPolicy', 'ProfilePickerToolsTransferPhonePage',
-        'ProfilePickerToolsTVTransfer', 'ProfilePickerToolsTVTransferLive', 'ProfilePickerToolsLANTransfer')
+        'ProfilePickerToolsTVTransfer', 'ProfilePickerToolsTVTransferLive', 'ProfilePickerToolsLANTransfer',
+        'VXLocalLANAddress', 'ConnectivityMonitor')
 ] + ['app/Tests/ProfilePickerToolsUITypecheckFixture.swift']
 # Exact non-View declaration/header seams from actual source, not mirrored API types.
 RECIPE = [
@@ -124,7 +125,7 @@ extractor.write_text(NODE.replace("const [root,output]=process.argv.slice(1), re
 ).replace("path.join(process.argv[1],", "path.join(process.argv[2],"))
 compile_driver = out / 'typecheck-with-retained-sdk.py'
 compile_driver.write_text(r'''import json,os,pathlib,sys
-mode,sdk_output,argv_output,module_cache,*sources=sys.argv[1:]
+mode,sdk_output,argv_output,module_cache,bridge,*sources=sys.argv[1:]
 with pathlib.Path(sdk_output).open('rb') as stream: raw=stream.read(16_385)
 if len(raw)>16_384: raise ValueError('SDK output exceeded bound')
 sdk=raw.decode().strip()
@@ -135,7 +136,7 @@ arch=platform.machine()
 target='arm64-apple-tvos18.0' if mode!='--macos' else arch+'-apple-macosx14.0'
 argv=['/usr/bin/nice','-n','15','/usr/bin/xcrun','swiftc','-parse-as-library','-typecheck',
       '-swift-version','6','-strict-concurrency=complete','-warnings-as-errors','-j','1','-num-threads','1',
-      '-target',target,'-sdk',sdk,'-module-cache-path',module_cache]
+      '-target',target,'-sdk',sdk,'-module-cache-path',module_cache,'-import-objc-header',bridge]
 if mode!='--macos': argv+=['-D','VORTX_AETHER_ENGINE','-D','VORTX_NO_EMBEDDED_SERVER' if mode=='--tvos-lite' else 'VORTX_ENGINE_SERVER']
 argv+=sources
 with pathlib.Path(argv_output).open('x') as output: json.dump({'argv':argv,'targetMode':mode},output,indent=2);output.write('\n')
@@ -158,14 +159,15 @@ print('PASS whole SwiftUI Tools source/API typecheck '+mode)
 ''')
 sources = sorted(set(WHOLE + [entry[0] for entry in RECIPE]))
 runner = Path(__file__).resolve()
-base_inputs = [root / source for source in sources] + [runner, root/'test/xperience-harness-inputs.cjs', recipe_path, extractor, compile_driver, verifier]
+bridge = root / 'app/SourcesShared/VXLocalLANInterface.h'
+base_inputs = [root / source for source in sources] + [runner, root/'test/xperience-harness-inputs.cjs', recipe_path, extractor, compile_driver, verifier, bridge]
 sdk_stdout,sdk_stderr=out/'sdk/stdout.bin',out/'sdk/stderr.bin'
 extract_stdout,extract_stderr=out/'extract/stdout.bin',out/'extract/stderr.bin'
 compile_argv=out/'compile-argv.json'
 commands={
     'extract':['/usr/bin/nice','-n','15','node',str(extractor),str(root),str(generated),str(recipe_path)],
     'sdk':['/usr/bin/nice','-n','15','/usr/bin/xcrun','--sdk','appletvos' if tvos else 'macosx','--show-sdk-path'],
-    'compile':[sys.executable,str(compile_driver),mode,str(sdk_stdout),str(compile_argv),str(out/'module-cache'),*[str(root/name) for name in WHOLE],str(generated)],
+    'compile':[sys.executable,str(compile_driver),mode,str(sdk_stdout),str(compile_argv),str(out/'module-cache'),str(bridge),*[str(root/name) for name in WHOLE],str(generated)],
     'result':[sys.executable,str(verifier),str(root),str(extract_stdout),str(compile_argv),str(out/'typecheck-result.json'),mode],
 }
 inputs={'extract':base_inputs,'sdk':base_inputs+[generated,extract_stdout,extract_stderr],

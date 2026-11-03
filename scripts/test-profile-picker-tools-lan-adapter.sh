@@ -32,7 +32,9 @@ print('LAN adapter receipt directory: ' + str(out), flush=True)
 sources = ['app/SourcesShared/ProfilePickerToolsTransferPolicy.swift',
            'app/SourcesShared/ProfilePickerToolsTransferPhonePage.swift',
            'app/SourcesShared/ProfilePickerToolsLANTransfer.swift',
-           'app/Tests/ProfilePickerToolsLANTransferTests.swift']
+           'app/SourcesShared/VXLocalLANAddress.swift',
+           'app/Tests/ProfilePickerToolsLANTransferTests.swift',
+           'app/Tests/VXLocalLANAddressTests.swift']
 runner = root / 'scripts/test-profile-picker-tools-lan-adapter.sh'
 verifier = out / 'verify-lan-adapter-result.py'
 compile_driver = out / 'compile-with-retained-sdk.py'
@@ -56,7 +58,7 @@ print('PASS exact whole-adapter completion and 32-assertion floor')
 # SDK discovery is a separate retained/drained phase. Parse its bounded output INSIDE
 # the owned compile phase, then exec the exact compiler in that same owned group.
 compile_driver.write_text(r'''import json, os, pathlib, sys
-sdk_stdout, argv_receipt, binary, *sources = sys.argv[1:]
+sdk_stdout, argv_receipt, binary, bridge, *sources = sys.argv[1:]
 with pathlib.Path(sdk_stdout).open('rb') as stream:
     raw = stream.read(16_385)
 if len(raw) > 16_384:
@@ -67,18 +69,19 @@ if not sdk.startswith('/') or len(sdk) > 4096 or any(c in sdk for c in ('\n','\r
 argv = ['/usr/bin/nice','-n','15','/usr/bin/xcrun','swiftc','-swift-version','6',
     '-strict-concurrency=complete','-warnings-as-errors','-j','1','-num-threads','1',
     '-parse-as-library','-sdk',sdk,'-module-cache-path',str(pathlib.Path(binary).parent/'module-cache'),
-    *sources,'-o',binary]
+    '-import-objc-header',bridge,*sources,'-o',binary]
 with pathlib.Path(argv_receipt).open('x') as output:
     json.dump({'argv':argv,'sdk':sdk},output,indent=2); output.write('\n')
 os.execv(argv[0],argv)
 ''')
 
-base_inputs = [root / source for source in sources] + [runner, verifier, compile_driver]
+bridge = root / 'app/SourcesShared/VXLocalLANInterface.h'
+base_inputs = [root / source for source in sources] + [runner, verifier, compile_driver, bridge]
 sdk_stdout, sdk_stderr = out / 'sdk/stdout.bin', out / 'sdk/stderr.bin'
 compile_argv = out / 'compile-argv.json'
 commands = {
     'sdk': ['/usr/bin/nice','-n','15','/usr/bin/xcrun','--sdk','macosx','--show-sdk-path'],
-    'compile': [sys.executable,str(compile_driver),str(sdk_stdout),str(compile_argv),str(binary),*sources],
+    'compile': [sys.executable,str(compile_driver),str(sdk_stdout),str(compile_argv),str(binary),str(bridge),*sources],
     'runtime': ['nice','-n','15',str(binary)],
     'result': [sys.executable,str(verifier),str(out / 'runtime/stdout.bin'),str(out / 'adapter-result.json')],
 }

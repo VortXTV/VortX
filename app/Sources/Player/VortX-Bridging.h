@@ -29,6 +29,9 @@ static inline CFStringRef _Nonnull VortXTVKeychainAuthenticationUIFailCompatibil
 // Process-lifetime C-owned crash signal state; no Swift executes on a fatal signal.
 #include "VortXCrashSignal.h"
 
+// Read the local interface media type for LAN sharing when path metadata is unavailable.
+#include "../../SourcesShared/VXLocalLANInterface.h"
+
 // Network shares over SMB: the libsmbclient calls the share browser makes (see the header for why these are
 // declared rather than imported). Quoted path relative to this header, like the QuickJS bridge below.
 #include "../../SourcesShared/SMB/VortXSMBShim.h"

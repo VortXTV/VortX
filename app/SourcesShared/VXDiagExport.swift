@@ -2,7 +2,6 @@ import Foundation
 import Network
 import CoreImage
 import SwiftUI
-import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IPv4 discovery
 import os
 
 /// One-shot LAN export for the rolling diagnostic log (`VXProbe.logFileURL`). Apple TV has no share
@@ -86,10 +85,10 @@ final class VXDiagExport: @unchecked Sendable {
     // MARK: - Public contract
 
     /// Start (idempotent) the LAN log server and return `(url, qr)` for display, or nil when there is no
-    /// Wi-Fi IPv4 to advertise or the listener cannot start. `url` is `http://LANIP:PORT/`; `qr` encodes it.
+    /// Wi-Fi or Ethernet IPv4 to advertise or the listener cannot start. `url` is `http://LANIP:PORT/`; `qr` encodes it.
     func start() -> (url: String, qr: Image)? {
         guard let ip = Self.lanIPv4() else {
-            NSLog("[diag] export: no LAN IPv4 (not on Wi-Fi?)")
+            NSLog("[diag] export: no usable Wi-Fi or Ethernet IPv4")
             return nil
         }
         guard let boundPort = ensureListening() else {
@@ -528,38 +527,8 @@ final class VXDiagExport: @unchecked Sendable {
         exportPayload().body
     }
 
-    /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
-    /// no extra entitlement is needed; falls back to the first non-loopback IPv4 if `en0` is not present.
     private static func lanIPv4() -> String? {
-        var addr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addr) == 0, let first = addr else { return nil }
-        defer { freeifaddrs(addr) }
-
-        var preferred: String?   // en0 (Wi-Fi)
-        var fallback: String?    // any other non-loopback IPv4
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let ptr = cursor {
-            defer { cursor = ptr.pointee.ifa_next }
-            let flags = Int32(ptr.pointee.ifa_flags)
-            guard flags & (IFF_UP | IFF_RUNNING) == (IFF_UP | IFF_RUNNING),
-                  flags & IFF_LOOPBACK == 0,
-                  let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
-
-            let name = String(cString: ptr.pointee.ifa_name)
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
-                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            let terminator = host.firstIndex(of: 0) ?? host.endIndex
-            let ip = String(decoding: host[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            guard !ip.isEmpty, !ip.hasPrefix("169.254") else { continue }   // skip link-local
-
-            if name == "en0" {
-                preferred = ip
-            } else if fallback == nil {
-                fallback = ip
-            }
-        }
-        return preferred ?? fallback
+        VXLocalLANAddress.currentIPv4()
     }
 
     /// Generate a scaled QR CGImage for `string` with CoreImage (no external dependency). Returns nil if
