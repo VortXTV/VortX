@@ -1,4 +1,4 @@
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 import Combine
 import Foundation
 
@@ -35,10 +35,7 @@ final class ProfilePickerToolsController: ObservableObject {
     static let shared = ProfilePickerToolsController()
     static let maximumFileBytes = 10 * 1024 * 1024
 
-    struct Owner: Equatable, Sendable {
-        let credential: CredentialScopeRegistry.Capture
-        let accountID: String
-    }
+    typealias Owner = ProfilePickerToolsAccountOwner
     struct Selected: Sendable { let bytes: Data; let sha256: String }
     struct Saved: Sendable { let filename: String; let bytes: Int; let sha256: String }
     struct Repair: Identifiable, Sendable { let id: UUID; let profiles: Int; let bytes: Int }
@@ -53,6 +50,7 @@ final class ProfilePickerToolsController: ObservableObject {
     }
     enum Stage: Equatable {
         case idle, choosingInput, reading, downloading, preparing
+        case waitingForPhone, waitingForNetworkDrain, outputAvailable, localSendComplete
         case reviewRepair, confirmRestore, choosingDestination, saving, restoring, checkingRestore, finishingRestore, draining
     }
     struct Status: Equatable {
@@ -66,23 +64,42 @@ final class ProfilePickerToolsController: ObservableObject {
         let owner: @MainActor () -> Owner?
         let isCurrent: @MainActor (Owner) -> Bool
         let download: @MainActor () async throws -> Data
+        #if os(iOS) || os(macOS)
         let read: @Sendable (URL) async throws -> Selected
         let digest: @Sendable (Data) async -> String
         let save: @Sendable (Data, String, CopyKind, URL) async throws -> Saved
+        #endif
         let prepareRepair: @MainActor (Data) async throws -> Repair
         let takeRepair: @MainActor (UUID) throws -> Data
         let cancelRepair: @MainActor (UUID) -> Void
         let restore: ProfilePickerToolsRestoreAction
+        var transfer: ProfilePickerToolsTVTransfer.Configuration? = nil
+        // Credential/account continuity outlives a retired presentation; action admission does not.
+        var ownerIsCurrent: (@MainActor (Owner) -> Bool)? = nil
     }
 
     @Published private(set) var status = Status()
     @Published private(set) var picker: Picker?
     @Published private(set) var isBusy = false
     @Published private(set) var restoreNeedsVerification = false
+    @Published private(set) var tvPublication: ProfilePickerToolsTVTransfer.Publication?
+    @Published private(set) var canRetryTVOutput = false
+    @Published private(set) var canRetryTVInput = false
+    private var routeOwner: Owner?
     private var routeID: UUID?
     private var services: Services?
     private var operation: Operation?
     private var task: Task<Void, Never>?
+    private struct OriginalRestore {
+        let owner: Owner
+        let operationID: UUID
+        let confirmed: Bool
+        let action: ProfilePickerToolsRestoreAction
+        let isCurrent: @MainActor (Owner) -> Bool
+    }
+    // A real submit result may arrive after its view closes. Keep the original typed observation
+    // privately; publish it only when an exact same-owner route is later admitted.
+    private var originalRestore: OriginalRestore?
     private var pendingRestoreOwner: Owner?
     private var pendingRestoreID: UUID?
     private var pendingRestoreAction: ProfilePickerToolsRestoreAction?
@@ -91,7 +108,7 @@ final class ProfilePickerToolsController: ObservableObject {
     @Published private(set) var canFinishRestore = false
 
     @MainActor private final class Operation {
-        let id = UUID()
+        let id: UUID
         let routeID: UUID
         let owner: Owner
         let action: Action
@@ -101,8 +118,17 @@ final class ProfilePickerToolsController: ObservableObject {
         var repairID: UUID?
         var bytes: Data?
         var digest: String?
+        let transferOwner: ProfilePickerToolsTransferPolicy.Owner
+        var transfer: (any ProfilePickerToolsTransferChannel)?
+        var networkClosedForRestore = false
+        var retainedRestoreOutcome: ProfilePickerToolsRestoreAction.Outcome?
+        var terminalMessage: String?
         init(routeID: UUID, owner: Owner, action: Action, services: Services) {
+            let identifier = UUID()
+            self.id = identifier
             self.routeID = routeID; self.owner = owner; self.action = action; self.services = services
+            // Opaque transfer fence only. The actual UInt64 epoch remains in owner.credential.
+            transferOwner = .init(sessionID: UUID(), routeID: routeID, operationID: identifier, credentialGeneration: UUID())
         }
     }
     private enum Refusal: Error { case stale, tooLarge, invalidSelection }
@@ -114,9 +140,14 @@ final class ProfilePickerToolsController: ObservableObject {
         if routeID != id, let previous = routeID { dismiss(previous) }
         routeID = id
         self.services = services
+        routeOwner = services.owner() // Captured once for this route, never at a later action or callback.
         if let owner = pendingRestoreOwner, !services.isCurrent(owner) {
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
             restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
+        }
+        if let retained = originalRestore, retained.owner == routeOwner,
+           services.isCurrent(retained.owner), retained.isCurrent(retained.owner) {
+            publishRestoreObservation(retained)
         }
         if operation != nil {
             status = Status(stage: .draining,
@@ -127,17 +158,33 @@ final class ProfilePickerToolsController: ObservableObject {
         }
     }
 
-    var accountActionsAvailable: Bool { services?.owner() != nil }
+    var accountActionsAvailable: Bool {
+        guard let owner = routeOwner, let services else { return false }
+        return services.isCurrent(owner)
+    }
+    // Bounded, read-only scheduling seam; immutable identity only, never account material.
+    var retainedRestoreOperationID: UUID? {
+        guard let value = operation?.retainedRestoreOutcome else { return nil }
+        switch value {
+        case .deliveryUnconfirmed(let id), .uploadAccepted(let id), .serverConfirmed(let id): return id
+        case .notSubmitted, .conflict: return nil
+        }
+    }
     var canRestore: Bool { accountActionsAvailable && !isBusy && !restoreNeedsVerification }
 
     func begin(_ action: Action, route id: UUID) {
         guard [.download, .repair, .restore].contains(action),
               routeID == id, operation == nil, task == nil, let services,
-              let owner = services.owner(), services.isCurrent(owner),
+              let owner = routeOwner, services.isCurrent(owner),
               action != .restore || !restoreNeedsVerification else { return }
         let captured = Operation(routeID: id, owner: owner, action: action, services: services)
         operation = captured; isBusy = true
         status = Status()
+        if captured.services.transfer != nil {
+            beginTV(captured)
+            return
+        }
+        #if os(iOS) || os(macOS)
         if action == .download {
             start(captured, stage: .downloading) { [self] in
                 try require(captured)
@@ -149,8 +196,10 @@ final class ProfilePickerToolsController: ObservableObject {
             status.stage = .choosingInput
             picker = Picker(id: UUID(), operationID: captured.id, routeID: id, purpose: .input)
         }
+        #endif
     }
 
+    #if os(iOS) || os(macOS)
     /// The picker host captures this immutable request. A delayed callback cannot use today's picker ID.
     func picked(_ request: Picker, result: Result<[URL], Error>) {
         guard let captured = operation, picker?.id == request.id,
@@ -199,22 +248,33 @@ final class ProfilePickerToolsController: ObservableObject {
         }
     }
 
+    #endif
+
     func saveRepair(route id: UUID) {
         guard routeID == id, let captured = operation, status.stage == .reviewRepair,
-              let previewID = captured.repairID, isCurrent(captured), task == nil else { return }
+              let previewID = captured.repairID, isCurrent(captured), task == nil,
+              captured.transfer?.hasOwnedWork != true else { return }
         start(captured, stage: .preparing) { [self] in
             try require(captured)
             let bytes = try captured.services.takeRepair(previewID)
             captured.repairID = nil
             try require(captured)
-            try await prepareDestination(bytes, operation: captured)
+            if let transfer = captured.transfer {
+                try installTVOutput(bytes, operation: captured, transfer: transfer)
+            } else {
+                #if os(iOS) || os(macOS)
+                try await prepareDestination(bytes, operation: captured)
+                #endif
+            }
         }
     }
 
     /// Only this explicit confirmation admits the dedicated restore action. There is no retry/PUT loop.
     func confirmRestore(route id: UUID) {
         guard routeID == id, let captured = operation, status.stage == .confirmRestore,
-              isCurrent(captured), task == nil, let bytes = captured.bytes else { return }
+              isCurrent(captured), task == nil, let bytes = captured.bytes,
+              captured.transfer == nil || (captured.networkClosedForRestore
+                && captured.transfer?.networkIsDrained == true && captured.transfer?.hasOwnedWork == false) else { return }
         start(captured, stage: .restoring) { [self] in
             try require(captured)
             let outcome = await captured.services.restore.submit(bytes)
@@ -247,7 +307,7 @@ final class ProfilePickerToolsController: ObservableObject {
     /// Restart discovery uses the same retained task/owner/route slot as every other Tools action.
     private func discoverRestore(route id: UUID) {
         guard !Task.isCancelled, routeID == id, operation == nil, task == nil, let services,
-              let owner = services.owner(), services.isCurrent(owner) else { return }
+              let owner = routeOwner, services.isCurrent(owner) else { return }
         let captured = Operation(routeID: id, owner: owner, action: .restoreStatus, services: services)
         operation = captured; isBusy = true
         start(captured, stage: .checkingRestore) { [self] in
@@ -257,7 +317,7 @@ final class ProfilePickerToolsController: ObservableObject {
             case .available(let records):
                 if let pending = records.first(where: { $0.state != .loaded }) {
                     pendingRestoreOwner = captured.owner; pendingRestoreID = pending.operationID
-                    pendingRestoreAction = captured.services.restore; pendingRestoreIsCurrent = captured.services.isCurrent
+                    pendingRestoreAction = captured.services.restore; pendingRestoreIsCurrent = captured.services.ownerIsCurrent ?? captured.services.isCurrent
                     restoreNeedsVerification = true
                     canVerifyRestore = pending.state == .needsVerification
                     canFinishRestore = pending.state == .serverConfirmed
@@ -306,6 +366,7 @@ final class ProfilePickerToolsController: ObservableObject {
                 return
             }
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
+            if originalRestore?.operationID == id, originalRestore?.owner == captured.owner { originalRestore = nil }
             restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
             finish(captured, message: "The restored backup was loaded on this device. Its encrypted recovery copy has been kept. Opening the current profile may still be in progress.")
         case .pending(let id) where id == originalID:
@@ -322,16 +383,24 @@ final class ProfilePickerToolsController: ObservableObject {
     }
 
     private func retainRestoreOutcome(_ outcome: ProfilePickerToolsRestoreAction.Outcome, operation captured: Operation) {
-        guard captured.services.isCurrent(captured.owner) else { return }
-        let id: UUID
+        captured.retainedRestoreOutcome = outcome // Original immutable result survives cancelled/stale UI.
+        let id: UUID, confirmed: Bool
         switch outcome {
-        case .deliveryUnconfirmed(let value), .uploadAccepted(let value): id = value; canVerifyRestore = true; canFinishRestore = false
-        case .serverConfirmed(let value): id = value; canVerifyRestore = false; canFinishRestore = true
+        case .deliveryUnconfirmed(let value), .uploadAccepted(let value): id = value; confirmed = false
+        case .serverConfirmed(let value): id = value; confirmed = true
         case .notSubmitted, .conflict: return
         }
-        pendingRestoreOwner = captured.owner; pendingRestoreID = id
-        pendingRestoreAction = captured.services.restore
-        pendingRestoreIsCurrent = captured.services.isCurrent
+        let retained = OriginalRestore(owner: captured.owner, operationID: id, confirmed: confirmed,
+            action: captured.services.restore, isCurrent: captured.services.ownerIsCurrent ?? captured.services.isCurrent)
+        originalRestore = retained
+        guard operation === captured, routeID == captured.routeID, routeOwner == captured.owner,
+              captured.services.isCurrent(captured.owner) else { return }
+        publishRestoreObservation(retained)
+    }
+    private func publishRestoreObservation(_ retained: OriginalRestore) {
+        pendingRestoreOwner = retained.owner; pendingRestoreID = retained.operationID
+        pendingRestoreAction = retained.action; pendingRestoreIsCurrent = retained.isCurrent
+        canVerifyRestore = !retained.confirmed; canFinishRestore = retained.confirmed
         restoreNeedsVerification = true
     }
 
@@ -356,25 +425,28 @@ final class ProfilePickerToolsController: ObservableObject {
     func cancel(operationID: UUID? = nil) {
         guard let captured = operation, operationID == nil || captured.id == operationID else { return }
         captured.cancelled = true
-        picker = nil
-        captured.bytes = nil; captured.digest = nil
+        picker = nil; tvPublication = nil; canRetryTVInput = false; canRetryTVOutput = false
+        // Keep exact input/output and possible-send state inside the original operation until drain.
         if let id = captured.repairID { captured.services.cancelRepair(id); captured.repairID = nil }
         task?.cancel()
-        if task != nil {
-            status = Status(stage: .draining,
-                message: "Cancellation requested. Waiting for the current file provider or account operation to return. If saving had started, check the selected folder for a partial or completed copy.")
-        } else {
-            operation = nil; isBusy = false
-            status = Status(message: "Cancelled.")
-        }
+        status = Status(stage: .draining,
+            message: captured.terminalMessage ?? "Cancellation requested. Waiting for the original file, account and phone-transfer work to return.")
+        captured.transfer?.retire()
+        releaseIfDrained(captured)
     }
 
     func dismiss(_ id: UUID) {
         guard routeID == id else { return }
         cancel()
         routeID = nil
-        services = nil
-        if task == nil { status = Status() }
+        services = nil; routeOwner = nil
+        if operation == nil { status = Status() }
+    }
+
+    /// Foreground/PIN/route changes revoke the original operation without recapturing authority.
+    func admissionDidChange(route id: UUID? = nil, revoked: Bool = false) {
+        guard id == nil || routeID == id else { return }
+        if let captured = operation, revoked || !isCurrent(captured) { cancel(operationID: captured.id) }
     }
 
     func credentialDidChange() {
@@ -383,7 +455,7 @@ final class ProfilePickerToolsController: ObservableObject {
             pendingRestoreOwner = nil; pendingRestoreID = nil; pendingRestoreAction = nil; pendingRestoreIsCurrent = nil
             restoreNeedsVerification = false; canVerifyRestore = false; canFinishRestore = false
         }
-        if task == nil {
+        if operation == nil, task == nil {
             status = Status()
             if let id = routeID { discoverRestore(route: id) }
         }
@@ -391,11 +463,12 @@ final class ProfilePickerToolsController: ObservableObject {
 
     private func isCurrent(_ captured: Operation) -> Bool {
         operation === captured && routeID == captured.routeID && !captured.cancelled
-            && !Task.isCancelled && captured.services.isCurrent(captured.owner)
+            && !Task.isCancelled && routeOwner == captured.owner && captured.services.isCurrent(captured.owner)
     }
     private func require(_ captured: Operation) throws {
         guard isCurrent(captured) else { throw Refusal.stale }
     }
+    #if os(iOS) || os(macOS)
     private func prepareDestination(_ bytes: Data, operation captured: Operation) async throws {
         guard !bytes.isEmpty, bytes.count <= Self.maximumFileBytes else { throw Refusal.tooLarge }
         try require(captured)
@@ -406,6 +479,7 @@ final class ProfilePickerToolsController: ObservableObject {
         status.fileBytes = bytes.count
         picker = Picker(id: UUID(), operationID: captured.id, routeID: captured.routeID, purpose: .destination)
     }
+    #endif
     private func start(_ captured: Operation, stage: Stage,
                        body: @escaping @MainActor () async throws -> Void) {
         guard task == nil, isCurrent(captured) else { return }
@@ -422,22 +496,32 @@ final class ProfilePickerToolsController: ObservableObject {
         }
     }
     private func returned(_ captured: Operation) {
-        guard operation === captured else { task = nil; return }
+        guard operation === captured else { return }
         task = nil
-        if captured.cancelled || routeID != captured.routeID || !captured.services.isCurrent(captured.owner) {
+        if captured.transfer != nil { tvChanged(captured) }
+        releaseIfDrained(captured)
+    }
+    private func releaseIfDrained(_ captured: Operation) {
+        guard operation === captured, task == nil,
+              captured.transfer == nil || captured.transfer?.isDrained == true else { return }
+        if captured.cancelled || captured.completed || routeID != captured.routeID
+            || !captured.services.isCurrent(captured.owner) {
             if let id = captured.repairID { captured.services.cancelRepair(id) }
-            operation = nil; isBusy = false; picker = nil; status = Status()
+            captured.bytes = nil; captured.digest = nil; captured.transfer = nil
+            operation = nil; isBusy = false; picker = nil
+            tvPublication = nil; canRetryTVOutput = false; canRetryTVInput = false
+            if routeID != captured.routeID { status = Status() }
+            else if captured.cancelled { status = Status(message: captured.terminalMessage ?? "Cancelled.") }
             if let currentRoute = routeID,
                currentRoute != captured.routeID || !captured.services.isCurrent(captured.owner) {
-                // returned() still runs inside the retired, possibly cancelled worker. Discovery
-                // must claim its slot from a fresh task, never inherit that task's cancellation.
+                // This may still be the original cancelled controller worker. Claim discovery
+                // only in a fresh task, after checking the exact route and empty owned slot.
                 Task { @MainActor [weak self] in
-                    guard let self, self.routeID == currentRoute else { return }
+                    guard let self, self.routeID == currentRoute,
+                          self.operation == nil, self.task == nil else { return }
                     self.discoverRestore(route: currentRoute)
                 }
             }
-        } else if captured.completed {
-            operation = nil; isBusy = false
         }
     }
     private func finish(_ captured: Operation, message: String) {
@@ -445,20 +529,180 @@ final class ProfilePickerToolsController: ObservableObject {
         captured.bytes = nil; captured.digest = nil
         // Task remains retained until its actual closure returns; returned() releases the slot.
         captured.completed = true
+        captured.transfer?.retire()
+        tvPublication = nil; canRetryTVOutput = false; canRetryTVInput = false
         status = Status(message: message)
+        releaseIfDrained(captured)
     }
     private func fail(_ captured: Operation, message: String) {
         guard operation === captured else { return }
         captured.bytes = nil; captured.digest = nil; picker = nil
         captured.completed = true
         status = Status(message: message)
-        if task == nil { operation = nil; isBusy = false }
+        captured.transfer?.retire()
+        tvPublication = nil; canRetryTVOutput = false; canRetryTVInput = false
+        releaseIfDrained(captured)
     }
+    private func beginTV(_ captured: Operation) {
+        guard let configuration = captured.services.transfer else { return }
+        let mode: ProfilePickerToolsTransferPolicy.Mode
+        switch captured.action { case .download: mode = .download; case .repair: mode = .repair; default: mode = .restore }
+        let input: ProfilePickerToolsTVTransfer.Receiver?
+        if captured.action == .download {
+            input = nil
+        } else {
+            input = { @MainActor @Sendable [weak self, weak captured] value in
+                guard let self, let captured else { return }
+                await self.receiveTVInput(value, operation: captured)
+            }
+        }
+        do {
+            try require(captured)
+            let transfer = try configuration.make(.init(owner: captured.transferOwner, mode: mode,
+                liveGrant: { [weak self, weak captured] supplied in
+                    guard let self, let captured, supplied == captured.transferOwner else { return false }
+                    return self.isCurrent(captured)
+                }, input: input, changed: { [weak self, weak captured] supplied in
+                    guard let self, let captured, supplied == captured.transferOwner else { return }
+                    self.tvChanged(captured)
+                }))
+            captured.transfer = transfer
+            if captured.action == .download {
+                start(captured, stage: .downloading) { [self] in
+                    let bytes = try await captured.services.download()
+                    try require(captured)
+                    // One immutable GET snapshot. A phone retry never enters this closure again.
+                    try installTVOutput(bytes, operation: captured, transfer: transfer)
+                    try transfer.start()
+                    tvChanged(captured)
+                }
+            } else {
+                status = Status(stage: .waitingForPhone,
+                    message: "Scan the QR with a phone on the same trusted Wi-Fi, then choose one encrypted backup file.")
+                try transfer.start()
+                tvChanged(captured)
+            }
+        } catch { fail(captured, message: "Phone transfer could not start. Check this TV's local-network permission and trusted Wi-Fi, then start a new action.") }
+    }
+
+    private func receiveTVInput(_ input: ProfilePickerToolsTransferPolicy.ImmutableInput,
+                                operation captured: Operation) async {
+        guard input.owner == captured.transferOwner, !captured.completed, captured.bytes == nil,
+              let configuration = captured.services.transfer, let transfer = captured.transfer else { return }
+        do {
+            try require(captured)
+            guard !input.bytes.isEmpty, input.bytes.count <= Self.maximumFileBytes else { throw Refusal.tooLarge }
+            // Original Data only; no JSON reconstruction, filename, URL or browser-provided authority.
+            captured.bytes = input.bytes
+            status = Status(stage: .reading, fileBytes: input.bytes.count)
+            try await configuration.inspect(input.bytes)
+            try require(captured)
+            if captured.action == .repair {
+                status.stage = .preparing
+                let preview = try await captured.services.prepareRepair(input.bytes)
+                captured.repairID = preview.id
+                try require(captured)
+                try transfer.showReview(owner: captured.transferOwner)
+                status = Status(stage: .reviewRepair,
+                    message: "Review this supported repair on the TV. Your original file stays unchanged.",
+                    fileBytes: preview.bytes, profiles: preview.profiles)
+            } else {
+                try transfer.showReview(owner: captured.transferOwner)
+                captured.networkClosedForRestore = true
+                status = Status(stage: .waitingForNetworkDrain,
+                    message: "The encrypted file is received. Closing and draining the phone connection before TV confirmation.",
+                    fileBytes: input.bytes.count)
+                try transfer.closeNetworkForRestore(owner: captured.transferOwner)
+            }
+        } catch {
+            if let id = captured.repairID { captured.services.cancelRepair(id); captured.repairID = nil }
+            if isCurrent(captured) { fail(captured, message: Self.message(error)) }
+            else { cancel(operationID: captured.id) }
+        }
+        // The adapter still owns this exact callback until its actual return is acknowledged.
+    }
+
+    private func installTVOutput(_ bytes: Data, operation captured: Operation,
+                                 transfer: any ProfilePickerToolsTransferChannel) throws {
+        try require(captured)
+        guard !bytes.isEmpty, bytes.count <= Self.maximumFileBytes else { throw Refusal.tooLarge }
+        captured.bytes = bytes
+        try transfer.installOutput(bytes, snapshotID: UUID(), owner: captured.transferOwner)
+        status = Status(stage: .outputAvailable,
+            message: "Scan the QR and download this encrypted copy on your phone. Keep this screen open.", fileBytes: bytes.count)
+    }
+
+    private func tvChanged(_ captured: Operation) {
+        guard operation === captured, let transfer = captured.transfer,
+              transfer.owner == captured.transferOwner else { return }
+        if !isCurrent(captured) {
+            if !captured.cancelled && !captured.completed { cancel(operationID: captured.id) }
+            releaseIfDrained(captured)
+            return
+        }
+        if captured.completed { releaseIfDrained(captured); return }
+        // A retired adapter cannot admit another action while an external account worker returns.
+        if transfer.failed || transfer.isDrained {
+            captured.terminalMessage = transfer.failed
+                ? "Phone transfer failed. Check trusted Wi-Fi and this TV's local-network permission before starting another action."
+                : "The phone transfer closed or expired. Any possible restore remains subject to its retained verification; it will not be uploaded again automatically."
+            cancel(operationID: captured.id)
+            return
+        }
+        tvPublication = transfer.publication
+        canRetryTVOutput = task == nil && !transfer.hasOwnedWork && transfer.attemptsAreDrained
+            && transfer.outputInfo != nil && transfer.localSendOutcome != nil
+        canRetryTVInput = task == nil && !transfer.hasOwnedWork && transfer.attemptsAreDrained
+            && captured.action != .download && captured.bytes == nil && transfer.stage == .closed
+        if captured.networkClosedForRestore, task == nil, !transfer.hasOwnedWork, transfer.networkIsDrained {
+            status.stage = .confirmRestore
+            status.message = "Phone transfer is closed. Confirm on this TV to replace the backup stored for your signed-in account."
+        }
+        if let outcome = transfer.localSendOutcome {
+            status.stage = .localSendComplete
+            switch outcome {
+            case .tvFinishedSendingCheckPhone:
+                status.message = "TV finished sending. Check the download on your phone and save it there."
+            case .failedCheckPhone:
+                status.message = "TV could not confirm its complete send. Check your phone; after this attempt drains, Retry same file uses this exact copy."
+            }
+        } else if canRetryTVInput {
+            status.message = "The upload stopped before a complete file was accepted. Retry phone upload, then rescan the new QR."
+        }
+    }
+
+    func retryTVOutput(route id: UUID) {
+        guard routeID == id, let captured = operation, isCurrent(captured),
+              task == nil, canRetryTVOutput, let transfer = captured.transfer,
+              !transfer.hasOwnedWork, transfer.attemptsAreDrained else { return }
+        do {
+            // No GET, conversion, takeRepair, new snapshot, owner or deadline here.
+            try transfer.retrySameOutput(owner: captured.transferOwner)
+            status.stage = .outputAvailable
+            status.message = "Rescan the new QR to download the same encrypted copy. Check and save the file on your phone."
+            tvChanged(captured)
+        } catch { status.message = "This phone transfer can no longer be retried. Close this action before starting another." }
+    }
+
+    func retryTVInput(route id: UUID) {
+        guard routeID == id, let captured = operation, isCurrent(captured),
+              task == nil, canRetryTVInput, captured.bytes == nil, let transfer = captured.transfer,
+              !transfer.hasOwnedWork, transfer.attemptsAreDrained else { return }
+        do {
+            try transfer.retryInput(owner: captured.transferOwner)
+            status.stage = .waitingForPhone
+            status.message = "Rescan the new QR and choose the encrypted backup file on your phone."
+            tvChanged(captured)
+        } catch { status.message = "This upload can no longer be retried. Close this action before starting another." }
+    }
+
     private static func message(_ error: Error) -> String {
         if let failure = error as? VortxAccountFileRepairService.Failure { return failure.errorDescription ?? "The backup could not be prepared." }
+        #if os(iOS) || os(macOS)
         if error is VortxAccountFileAccess.Failure {
             return "The file operation could not be completed or verified. Your selected original was not overwritten. If saving had started, check the destination for a partial copy."
         }
+        #endif
         if let refusal = error as? Refusal, case .tooLarge = refusal { return "Choose a nonempty backup of 10 MiB or less." }
         return "The backup operation could not be completed. Check your sign-in, connection and selected file, then try again."
     }

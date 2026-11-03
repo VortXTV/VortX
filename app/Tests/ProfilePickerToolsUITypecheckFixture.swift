@@ -33,7 +33,7 @@ extension View {
     var body: some View {
         VStack {
             ProfilePickerToolsView(route: route,
-                services: .live(restore: .live), onClose: {})
+                services: .live(restore: .live, accountGrant: route.accountFiles), onClose: {})
             DiagnosticLogExportButton(grant: route.diagnostics)
             DiagnosticLogExportButton() // Existing unlocked-settings call sites retain this API.
         }

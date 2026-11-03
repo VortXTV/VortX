@@ -39,7 +39,7 @@
 	     does not trip this gate (matches iOS, where the Tailscale server already connected with just the
 	     ATS key). No effect for embedded-server users (loopback is exempt). (issue #58) -->
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>VortX connects to the streaming server you point it at, such as one you run at home on your local network or reach over Tailscale.</string>
+	<string>VortX connects to your streaming servers and, when you choose a backup action in Tools, transfers an encrypted backup file to or from a phone on the same trusted Wi-Fi.</string>
 	<!-- VortX's OWN URL scheme, the first one this app has registered. The Top Shelf extension mints
 	     links against it to hand a tap back to the app (StremioTVApp's onOpenURL routes them), and it
 	     is the general front door for any later deep link.

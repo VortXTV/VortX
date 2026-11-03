@@ -1,18 +1,38 @@
 import Foundation
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 extension ProfilePickerToolsController.Services {
     @MainActor
-    static func live(restore: ProfilePickerToolsRestoreAction) -> Self {
+    static func live(restore: ProfilePickerToolsRestoreAction, accountGrant: ProfilePickerToolsAccountGrant) -> Self {
         let sync = VortXSyncManager.shared
+        #if os(tvOS)
         return Self(owner: {
-            let credential = CredentialScopeRegistry.shared.capture()
-            guard sync.isSignedIn, let account = sync.account,
-                  let canonical = CredentialScope(canonicalRemoteAccountID: account.id),
-                  credential.scope == canonical else { return nil }
-            return .init(credential: credential, accountID: account.id)
+            guard let owner = accountGrant.owner, accountGrant.permits(owner),
+                  sync.isSignedIn, sync.account?.id == owner.accountID else { return nil }
+            return owner
         }, isCurrent: { owner in
+            accountGrant.permits(owner)
+                && sync.isSignedIn && sync.account?.id == owner.accountID
+        }, download: {
+            try await sync.downloadAccountBackupFile()
+        }, prepareRepair: { bytes in
+            let preview = try await sync.prepareAccountBackupRepair(bytes)
+            return .init(id: preview.id, profiles: preview.profileCount, bytes: preview.fileBytes)
+        }, takeRepair: { id in
+            try sync.takeAccountBackupRepairExport(id)
+        }, cancelRepair: { id in
+            sync.cancelAccountBackupRepair(id)
+        }, restore: restore, transfer: .live, ownerIsCurrent: { owner in
             CredentialScopeRegistry.shared.isCurrent(owner.credential)
+                && sync.isSignedIn && sync.account?.id == owner.accountID
+        })
+        #else
+        return Self(owner: {
+            guard let owner = accountGrant.owner, accountGrant.permits(owner),
+                  sync.isSignedIn, sync.account?.id == owner.accountID else { return nil }
+            return owner
+        }, isCurrent: { owner in
+            accountGrant.permits(owner)
                 && sync.isSignedIn && sync.account?.id == owner.accountID
         }, download: {
             try await sync.downloadAccountBackupFile()
@@ -35,7 +55,11 @@ extension ProfilePickerToolsController.Services {
             try sync.takeAccountBackupRepairExport(id)
         }, cancelRepair: { id in
             sync.cancelAccountBackupRepair(id)
-        }, restore: restore)
+        }, restore: restore, ownerIsCurrent: { owner in
+            CredentialScopeRegistry.shared.isCurrent(owner.credential)
+                && sync.isSignedIn && sync.account?.id == owner.accountID
+        })
+        #endif
     }
 }
 #endif

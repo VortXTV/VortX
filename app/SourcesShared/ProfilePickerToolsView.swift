@@ -8,28 +8,21 @@ import UniformTypeIdentifiers
 struct ProfilePickerToolsView: View {
     let route: ProfilePickerToolsRoute
     let onClose: () -> Void
-    #if os(iOS) || os(macOS)
+    @Environment(\.scenePhase) private var scenePhase
     let services: ProfilePickerToolsController.Services
     @ObservedObject private var controller = ProfilePickerToolsController.shared
     @StateObject private var lifetime: ProfilePickerToolsLease
-    #endif
     #if os(tvOS)
-    private enum Focus: Hashable { case diagnostics, back }
+    private enum Focus: Hashable { case download, repair, restore, approveRepair, confirmRestore, retryOutput, retryInput, verify, finish, cancel, diagnostics, back }
     @FocusState private var focused: Focus?
     #endif
 
-    #if os(iOS) || os(macOS)
     init(route: ProfilePickerToolsRoute, services: ProfilePickerToolsController.Services,
          onClose: @escaping () -> Void) {
         self.route = route; self.services = services; self.onClose = onClose
         _lifetime = StateObject(wrappedValue: ProfilePickerToolsLease(
             routeID: route.id, controller: ProfilePickerToolsController.shared))
     }
-    #else
-    init(route: ProfilePickerToolsRoute, onClose: @escaping () -> Void) {
-        self.route = route; self.onClose = onClose
-    }
-    #endif
 
     var body: some View {
         GeometryReader { geometry in
@@ -42,11 +35,7 @@ struct ProfilePickerToolsView: View {
                     Text("Backups and troubleshooting, without opening a profile.")
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textSecondary)
-                    #if os(tvOS)
-                    companionGuidance
-                    #else
                     accountFileActions
-                    #endif
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
                         Text("Export diagnostic logs").font(Theme.Typography.eyebrow)
                         DiagnosticLogExportButton(grant: route.diagnostics)
@@ -90,19 +79,35 @@ struct ProfilePickerToolsView: View {
                 .id(request.id)
             }
         }
-        .onAppear { controller.present(route.id, services: services) }
+        #endif
+        .onAppear {
+            route.admission?.setForeground(scenePhase == .active)
+            controller.present(route.id, services: services)
+            #if os(tvOS)
+            focused = route.focusDiagnostics && route.diagnostics.permitsExport ? .diagnostics
+                : controller.accountActionsAvailable ? .download : .back
+            #endif
+        }
         .onReceive(NotificationCenter.default.publisher(for: VortXSyncManager.credentialScopeDidChangeNote)) { _ in
             controller.credentialDidChange()
         }
-        #else
-        .onAppear {
-            focused = route.focusDiagnostics && route.diagnostics.permitsExport ? .diagnostics : .back
+        .onValueChange(of: scenePhase) { phase in
+            route.admission?.setForeground(phase == .active)
+            if phase != .active { controller.admissionDidChange(route: route.id, revoked: true) }
+        }
+        #if os(tvOS)
+        .onValueChange(of: controller.status.stage) { stage in
+            switch stage {
+            case .reviewRepair: focused = .approveRepair
+            case .confirmRestore: focused = .confirmRestore
+            case .waitingForPhone, .outputAvailable, .localSendComplete: focused = .cancel
+            default: break
+            }
         }
         .onExitCommand { close() }
         #endif
     }
 
-    #if os(iOS) || os(macOS)
     private var accountFileActions: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             if !controller.accountActionsAvailable {
@@ -116,8 +121,16 @@ struct ProfilePickerToolsView: View {
             .buttonStyle(ChipButtonStyle())
             .disabled(!controller.accountActionsAvailable || controller.isBusy)
             .accessibilityIdentifier("profile-tools-download-backup")
+                    #if os(tvOS)
+                    .focused($focused, equals: .download)
+                    #endif
+            #if os(tvOS)
+            Text("Download the encrypted backup to a phone on the same trusted Wi-Fi. Keep this TV screen open.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            #else
             Text("Choose a destination folder. A new encrypted account-backup file is created and checked after saving.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            #endif
             Button { controller.begin(.repair, route: route.id) } label: {
                 Label("Repair backup", systemImage: "wrench.and.screwdriver")
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -125,8 +138,16 @@ struct ProfilePickerToolsView: View {
             .buttonStyle(ChipButtonStyle())
             .disabled(!controller.accountActionsAvailable || controller.isBusy)
             .accessibilityIdentifier("profile-tools-repair-backup")
+                    #if os(tvOS)
+                    .focused($focused, equals: .repair)
+                    #endif
+            #if os(tvOS)
+            Text("Upload a backup of 10 MiB or less from your phone. Review the repair on this TV, then download a separate repaired copy.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            #else
             Text("Choose a backup of 10 MiB or less. A supported repair is saved separately; selecting or repairing a file does not restore it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            #endif
             Button { controller.begin(.restore, route: route.id) } label: {
                 Label("Restore backup", systemImage: "arrow.uturn.backward")
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -134,12 +155,21 @@ struct ProfilePickerToolsView: View {
             .buttonStyle(ChipButtonStyle())
             .disabled(!controller.canRestore)
             .accessibilityIdentifier("profile-tools-restore-backup")
+                    #if os(tvOS)
+                    .focused($focused, equals: .restore)
+                    #endif
             Text(controller.restoreNeedsVerification
                 ? "The previous restore needs verification or local recovery. Do not upload it again."
                 : "Choose a backup, review it, then confirm replacing the backup stored for the signed-in account.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            #if os(tvOS)
+            phoneTransfer
+            #endif
             if let name = controller.status.selectedFilename {
-                Text(name).font(Theme.Typography.label).textSelection(.enabled)
+                Text(name).font(Theme.Typography.label)
+                    #if os(iOS) || os(macOS)
+                    .textSelection(.enabled)
+                    #endif
             }
             if let bytes = controller.status.fileBytes {
                 Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
@@ -155,18 +185,24 @@ struct ProfilePickerToolsView: View {
                     .accessibilityIdentifier("profile-tools-result")
             }
             switch controller.status.stage {
-            case .reading, .downloading, .preparing, .saving, .restoring, .checkingRestore, .finishingRestore, .draining:
+            case .reading, .downloading, .preparing, .saving, .restoring, .checkingRestore, .finishingRestore, .waitingForNetworkDrain, .draining:
                 ProgressView(progressLabel).tint(Theme.Palette.accent)
             case .reviewRepair:
-                Button("Save repaired copy") { controller.saveRepair(route: route.id) }
+                Button(repairApprovalLabel) { controller.saveRepair(route: route.id) }
                     .buttonStyle(ChipButtonStyle())
                     .accessibilityIdentifier("profile-tools-save-repaired-copy")
+                    #if os(tvOS)
+                    .focused($focused, equals: .approveRepair)
+                    #endif
             case .confirmRestore:
                 Button("Replace account backup", role: .destructive) {
                     controller.confirmRestore(route: route.id)
                 }
                 .buttonStyle(ChipButtonStyle())
                 .accessibilityIdentifier("profile-tools-confirm-restore")
+                    #if os(tvOS)
+                    .focused($focused, equals: .confirmRestore)
+                    #endif
                 .accessibilityHint("Uploads this selected file to replace the account backup. Local profiles are not applied by this tool.")
             default: EmptyView()
             }
@@ -174,18 +210,27 @@ struct ProfilePickerToolsView: View {
                 Button("Verify restore") { controller.verifyRestore(route: route.id) }
                     .buttonStyle(ChipButtonStyle())
                     .accessibilityIdentifier("profile-tools-verify-restore")
+                    #if os(tvOS)
+                    .focused($focused, equals: .verify)
+                    #endif
                     .accessibilityHint("Checks the stored backup without uploading the selected file again.")
             }
             if controller.canFinishRestore, !controller.isBusy {
                 Button("Finish loading backup") { controller.finishRestore(route: route.id) }
                     .buttonStyle(ChipButtonStyle())
                     .accessibilityIdentifier("profile-tools-finish-loading-backup")
+                    #if os(tvOS)
+                    .focused($focused, equals: .finish)
+                    #endif
                     .accessibilityHint("Receives the stored backup through normal account recovery without uploading the file again.")
             }
             if controller.isBusy {
                 Button("Cancel file action", role: .cancel) { controller.cancel() }
                     .buttonStyle(ChipButtonStyle())
                     .accessibilityIdentifier("profile-tools-cancel-file-action")
+                    #if os(tvOS)
+                    .focused($focused, equals: .cancel)
+                    #endif
             }
         }
         .toolsFocusSection()
@@ -197,32 +242,52 @@ struct ProfilePickerToolsView: View {
         case .preparing: "Preparing backup copy…"
         case .saving: "Saving and checking the new copy…"
         case .restoring: "Submitting or verifying the confirmed restore…"
+        case .waitingForNetworkDrain: "Closing the phone connection before TV confirmation…"
         case .checkingRestore: "Checking retained restore status…"
         case .finishingRestore: "Loading the restored backup…"
         default: "Waiting for the previous operation to finish…"
         }
     }
-    #else
-    private var companionGuidance: some View {
+    private var repairApprovalLabel: String {
+        #if os(tvOS)
+        "Make repaired copy available"
+        #else
+        "Save repaired copy"
+        #endif
+    }
+
+    #if os(tvOS)
+    private var phoneTransfer: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            Text("Download backup").font(Theme.Typography.body)
-            Text("Use Tools on your Mac, iPhone or iPad, signed into the same VortX account, and choose a destination folder.")
+            Text("Use the same trusted Wi-Fi. This local HTTP transfer is not private from other people on that network. Account name, export time and any other outer file metadata may be visible. The backup contents remain encrypted.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            Text("Repair backup").font(Theme.Typography.body)
-            Text("Choose the file in Tools on a Mac, iPhone or iPad. Apple TV cannot select or repair backup files.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            Text("Restore backup").font(Theme.Typography.body)
-            Text("Review and confirm the account-file restore from Tools on a Mac, iPhone or iPad. This TV screen does not upload or convert a backup.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            if let publication = controller.tvPublication {
+                Image(decorative: publication.image, scale: 1)
+                    .interpolation(.none).resizable().scaledToFit().frame(width: 260, height: 260)
+                    .background(Color.white).accessibilityLabel("Phone backup transfer QR code")
+                Text("Scan with your phone camera: " + publication.address)
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            } else if controller.status.stage == .waitingForPhone {
+                ProgressView("Starting phone transfer…").tint(Theme.Palette.accent)
+            }
+            if controller.canRetryTVOutput {
+                Button("Retry same file") { controller.retryTVOutput(route: route.id) }
+                    .buttonStyle(ChipButtonStyle()).focused($focused, equals: .retryOutput)
+                    .accessibilityIdentifier("profile-tools-retry-same-file")
+                    .accessibilityHint("Displays a fresh QR for the exact same encrypted copy. Check and save it on your phone.")
+            }
+            if controller.canRetryTVInput {
+                Button("Retry phone upload") { controller.retryTVInput(route: route.id) }
+                    .buttonStyle(ChipButtonStyle()).focused($focused, equals: .retryInput)
+                    .accessibilityIdentifier("profile-tools-retry-phone-upload")
+            }
         }
-        .toolsFocusSection()
     }
     #endif
 
     private func close() {
-        #if os(iOS) || os(macOS)
+        route.admission?.retire()
         controller.dismiss(route.id)
-        #endif
         onClose()
     }
 }

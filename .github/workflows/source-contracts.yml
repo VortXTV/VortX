@@ -56,9 +56,13 @@ on:
       - "scripts/test-profile-picker-tools.sh"
       - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-lan-adapter.sh"
+      - "scripts/test-profile-picker-tools-tv-composition.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
       - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/test-account-provider-sync-settlement.sh"
+      - "scripts/run-account-provider-sync-settlement.py"
+      - "test/account-provider-sync-settlement-inputs.cjs"
       - "scripts/run-account-file-local-adoption.py"
       - "test/account-file-local-adoption-inputs.cjs"
       - "scripts/run-account-file-restore-manager.py"
@@ -167,9 +171,13 @@ on:
       - "scripts/test-profile-picker-tools.sh"
       - "scripts/test-profile-picker-tools-transfer.sh"
       - "scripts/test-profile-picker-tools-lan-adapter.sh"
+      - "scripts/test-profile-picker-tools-tv-composition.sh"
       - "scripts/test-profile-picker-tools-ui-typecheck.py"
       - "scripts/test-account-file-restore-manager.sh"
       - "scripts/test-account-file-local-adoption.sh"
+      - "scripts/test-account-provider-sync-settlement.sh"
+      - "scripts/run-account-provider-sync-settlement.py"
+      - "test/account-provider-sync-settlement-inputs.cjs"
       - "scripts/run-account-file-local-adoption.py"
       - "test/account-file-local-adoption-inputs.cjs"
       - "scripts/run-account-file-restore-manager.py"
@@ -362,11 +370,19 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-profile-picker-tools-lan-adapter.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-profile-picker-tools-tv-composition.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-full
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: python3 scripts/test-profile-picker-tools-ui-typecheck.py --tvos-lite
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-file-restore-manager.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-file-local-adoption.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-account-provider-sync-settlement.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-authentication-lifecycle.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}

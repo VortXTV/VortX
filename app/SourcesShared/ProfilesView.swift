@@ -248,12 +248,8 @@ struct ProfilePickerView: View {
                 .environmentObject(VortXSyncManager.shared)
         }
         .profileCover(item: $toolsRoute) { route in
-            #if os(tvOS)
-            ProfilePickerToolsView(route: route) { closeTools(route.id) }
-            #else
             ProfilePickerToolsView(route: route,
-                services: .live(restore: .live)) { closeTools(route.id) }
-            #endif
+                services: .live(restore: .live, accountGrant: route.accountFiles)) { closeTools(route.id) }
         }
         .interactiveDismissDisabled(profileAction.isRunning || accountAuthentication.blocksDismissal)
         .task(id: artworkTaskKey) {
@@ -307,9 +303,7 @@ struct ProfilePickerView: View {
             accountHelpDiagnosticCredential = nil
             accountHelpDiagnosticGrant = nil
             if let route = toolsRoute { closeTools(route.id) }
-            #if os(iOS) || os(macOS)
             ProfilePickerToolsController.shared.credentialDidChange()
-            #endif
             accountAuthentication.credentialDidChange()
             pinTarget = nil; pinCredential = nil; pinIsForEditing = false
             signInCredential = nil; signInProfileID = nil
@@ -340,17 +334,29 @@ struct ProfilePickerView: View {
     private func openTools() {
         guard pinTarget == nil else { return }
         let grant = diagnosticGrant()
+        let routeID = UUID()
+        let credential = CredentialScopeRegistry.shared.capture()
+        let originalOwner: ProfilePickerToolsController.Owner?
+        if nativeSync.isSignedIn, let account = nativeSync.account,
+           let canonical = CredentialScope(canonicalRemoteAccountID: account.id), credential.scope == canonical {
+            originalOwner = .init(credential: credential, accountID: account.id)
+        } else { originalOwner = nil }
+        let routeAdmission = ProfilePickerToolsRouteAdmission(isForeground: scenePhase == .active)
+        let fileGrant = ProfilePickerToolsAccountGrant(owner: originalOwner, admission: { [self] in
+            // No diagnostic failure exception grants account files. PIN and foreground remain live.
+            self.pinTarget == nil && self.toolsRoute?.id == routeID && routeAdmission.permits
+        })
         deferredSelection.cancel()
         profileAction.cancel(preservingFailure: true)
-        toolsRoute = .init(diagnostics: grant,
-            focusDiagnostics: nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed)
+        toolsRoute = .init(id: routeID, diagnostics: grant,
+            focusDiagnostics: nativeSync.accountReconnectRequired || profileAction.errorMessage != nil || nativeSync.accountRestoreState == .failed,
+            accountFiles: fileGrant, admission: routeAdmission)
     }
 
     private func closeTools(_ id: UUID) {
         guard toolsRoute?.id == id else { return }
-        #if os(iOS) || os(macOS)
+        toolsRoute?.admission?.retire()
         ProfilePickerToolsController.shared.dismiss(id)
-        #endif
         toolsRoute = nil
         profileAction.cancel()
     }

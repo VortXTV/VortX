@@ -23,8 +23,17 @@ struct UserProfile: Equatable {
     var hasPin: Bool { pin != nil }
 }
 
+// Explicit account-scope collaborators for actual openTools route capture. No account I/O.
+enum CredentialScope: Equatable, Sendable {
+    case fixture
+    init?(canonicalRemoteAccountID: String) {
+        guard canonicalRemoteAccountID == "fixture-account" else { return nil }
+        self = .fixture
+    }
+}
+
 @MainActor final class CredentialScopeRegistry {
-    struct Capture: Equatable, Sendable { let generation: Int }
+    struct Capture: Equatable, Sendable { let generation: Int; var scope: CredentialScope { .fixture } }
     static let shared = CredentialScopeRegistry()
     private var generation = 0
     func capture() -> Capture { .init(generation: generation) }
@@ -80,6 +89,8 @@ struct UserProfile: Equatable {
     @Published var nativeCheckpointStatus = "mounted"
     @Published var accountRestoreState = RestoreState.idle
     var isSignedIn = true
+    struct Account { let id: String }
+    var account: Account? = .init(id: "fixture-account")
     var accountReconnectRequired = false
     var preparations = 0
     var continuation: CheckedContinuation<Bool, Never>?
@@ -109,6 +120,7 @@ enum FakeScene { case active, background }
 }
 /// Explicit controller collaborator for extracted picker retirement. Real Tools schedules have their own suite.
 @MainActor final class ProfilePickerToolsController {
+    typealias Owner = ProfilePickerToolsAccountOwner
     static let shared = ProfilePickerToolsController()
     var credentialChanges = 0
     var dismissed: [UUID] = []

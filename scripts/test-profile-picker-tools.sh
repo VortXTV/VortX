@@ -7,7 +7,9 @@ import hashlib,json,pathlib,subprocess
 root=pathlib.Path.cwd()
 out=root/'app/build/profile-picker-tools'
 out.mkdir(parents=True,exist_ok=True)
-sources=['app/SourcesShared/ProfilePickerToolsAccess.swift',
+sources=['app/SourcesShared/ProfilePickerToolsTransferPolicy.swift',
+         'app/SourcesShared/ProfilePickerToolsTVTransfer.swift',
+         'app/SourcesShared/ProfilePickerToolsAccess.swift',
          'app/SourcesShared/ProfilePickerToolsController.swift',
          'app/Tests/ProfilePickerToolsLifecycleTests.swift']
 (out/'source-sha256.json').write_text(json.dumps({p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in sources},indent=2)+'\n')
