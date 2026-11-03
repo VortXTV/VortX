@@ -1,7 +1,13 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.account.AccountWatchlistClient
+import com.vortx.android.account.providerWatchlistUrl
+import com.vortx.android.account.watchlistOperation
 import com.vortx.android.engine.NativeLibraryMirrorOrigin
+import com.vortx.android.sync.ProviderRetryOutbox
+import com.vortx.android.sync.ProviderRetryStart
 import com.vortx.android.sync.SessionOperationCoordinator
+import com.vortx.android.sync.VortXSyncManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +27,7 @@ import okhttp3.RequestBody
 import okhttp3.Response
 import okio.BufferedSink
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -33,6 +40,8 @@ internal class ProviderCallTicket(private val cancel: () -> Unit) {
     private val state = AtomicInteger(0)
 
     fun claim(): Boolean = state.compareAndSet(0, CLAIMED)
+
+    fun isClaimedAndCurrent(): Boolean = state.get() == CLAIMED
 
     fun retire() {
         val previous = state.getAndUpdate { it or RETIRED }
@@ -74,8 +83,12 @@ internal class ProviderMirrorCredential(
     val matches: () -> Boolean,
 )
 
-/** Only the newly produced native mirror uses this transport. Legacy rows do not gain authority. */
+internal enum class DurableProviderPost { Refused, Unsettled, Confirmed }
+
+/** The fresh and durable paths each need their original authority. Legacy rows remain outside both. */
 internal object ProviderMirrorTransport {
+    private const val MAX_RECEIPT_REQUEST_BYTES = 4_096
+    private const val MAX_RECEIPT_RESPONSE_BYTES = 32_768
     private val client = OkHttpClient.Builder()
         .followRedirects(false)
         .followSslRedirects(false)
@@ -95,17 +108,19 @@ internal object ProviderMirrorTransport {
         }
         .build()
 
-    private class FirstIo(
+    private fun interface FirstIo { fun claim(): Boolean }
+
+    private class FreshFirstIo(
         private val origin: NativeLibraryMirrorOrigin,
         private val operation: CredentialMutationCoordinator.Operation,
         private val manager: SessionOperationCoordinator.OutboundCallPermit,
         private val ticket: ProviderCallTicket,
         private val caller: Job?,
         private val matches: () -> Boolean,
-    ) {
+    ) : FirstIo {
         // Session -> credential -> original manager -> vault -> exact native mount.
         // The callback claims a scalar once and leaves every monitor before chain.proceed.
-        fun claim(): Boolean = try {
+        override fun claim(): Boolean = try {
             origin.withOriginalNativeOwner {
                 operation.claimOutbound(ticket) {
                     matches() && origin.admitAccountMount {
@@ -115,6 +130,57 @@ internal object ProviderMirrorTransport {
             }
         } catch (_: Exception) { false }
     }
+
+    private class DurableFirstIo(
+        private val owner: VortXSyncManager.ProviderRetryOwner,
+        private val origin: NativeLibraryMirrorOrigin?,
+        private val credential: DurableProviderMirrorCredential,
+        private val manager: SessionOperationCoordinator.OutboundCallPermit,
+        private val ticket: ProviderCallTicket,
+        private val caller: Job?,
+        private val start: ProviderRetryStart,
+    ) : FirstIo {
+        override fun claim(): Boolean = underOriginal {
+            ticket.claim() && start.tryClaimFirstIo()
+        }
+
+        fun confirm(): Boolean = underOriginal {
+            ticket.isClaimedAndCurrent() && start.wasClaimed()
+        }
+
+        private fun underOriginal(action: () -> Boolean): Boolean = try {
+            fun guardedClaim(): Boolean = credential.operation.claimOutbound(ticket) {
+                // The exact retry guard already confirmed the persisted credential under the vault gate.
+                // This reenters the same manager gate and runs only scalar checks and claims.
+                credential.matches() && owner.admitCall(manager) {
+                    fun currentClaim() = caller?.isActive != false && action()
+                    if (origin == null) currentClaim() else origin.admitAccountMount(::currentClaim)
+                }
+            }
+            if (origin == null) guardedClaim() else origin.withOriginalNativeOwner(::guardedClaim)
+        } catch (_: Exception) { false }
+    }
+
+    private class JsonBody(private val bytes: ByteArray) : RequestBody() {
+        private val wrote = AtomicBoolean(false)
+        private val submitted = AtomicBoolean(false)
+
+        override fun contentType() = "application/json".toMediaType()
+        override fun contentLength() = bytes.size.toLong()
+        override fun isOneShot() = true
+
+        override fun writeTo(sink: BufferedSink) {
+            if (!wrote.compareAndSet(false, true)) throw IOException("Repeated provider request body")
+            sink.write(bytes)
+            submitted.set(true)
+        }
+
+        fun wasSubmitted(): Boolean = submitted.get()
+    }
+
+    private fun preparedCall(url: String, headers: Map<String, String>, body: JsonBody, firstIo: FirstIo): Call =
+        client.newCall(Request.Builder().url(url).tag(FirstIo::class.java, firstIo)
+            .apply { headers.forEach { (name, value) -> header(name, value) } }.post(body).build())
 
     suspend fun post(
         origin: NativeLibraryMirrorOrigin,
@@ -134,20 +200,7 @@ internal object ProviderMirrorTransport {
             lateinit var call: Call
             val ticket = ProviderCallTicket { call.cancel() }
             try {
-                val request = Request.Builder().url(url)
-                    .tag(FirstIo::class.java, FirstIo(origin, operation, permit, ticket, caller[Job], matches))
-                    .apply { headers.forEach { (name, value) -> header(name, value) } }
-                    .post(object : RequestBody() {
-                        private val wrote = AtomicBoolean(false)
-                        override fun contentType() = "application/json".toMediaType()
-                        override fun contentLength() = bytes.size.toLong()
-                        override fun isOneShot() = true
-                        override fun writeTo(sink: BufferedSink) {
-                            if (!wrote.compareAndSet(false, true)) throw IOException("Repeated provider request body")
-                            sink.write(bytes)
-                        }
-                    }).build()
-                call = client.newCall(request)
+                call = preparedCall(url, headers, JsonBody(bytes), FreshFirstIo(origin, operation, permit, ticket, caller[Job], matches))
                 if (!permit.attachCancellation(call::cancel) || !operation.attachOutbound(ticket)) {
                     call.cancel()
                     return ProviderMirrorResponse.Refused
@@ -165,8 +218,113 @@ internal object ProviderMirrorTransport {
         } finally { permit.close() }
     }
 
+    /** Use the fixed watchlist wire and verify one correlated response against the exact submitted bytes. */
+    suspend fun postDurable(
+        owner: VortXSyncManager.ProviderRetryOwner,
+        origin: NativeLibraryMirrorOrigin?,
+        credential: DurableProviderMirrorCredential,
+        start: ProviderRetryStart,
+        receipt: ProviderWatchlistReceipt.Operation,
+    ): DurableProviderPost {
+        val caller = currentCoroutineContext()
+        caller.ensureActive()
+        val lane = start.head.lane
+        if (owner.owner != lane.owner || (origin != null && origin.expectedAccount != lane.owner) || start.wasClaimed())
+            return DurableProviderPost.Refused
+        if (lane.provider.watchlistOperation(start.head.row.add) != receipt || !durableCredentialMatches(lane, start.head.row, credential))
+            return DurableProviderPost.Refused
+        val body = AccountWatchlistClient.durableRequestBody(lane, start.head.row) ?: return DurableProviderPost.Refused
+        if (body.length !in 1..MAX_RECEIPT_REQUEST_BYTES) return DurableProviderPost.Refused
+        val permit = try { owner.acquireCallPermit() } catch (_: Exception) { null } ?: return DurableProviderPost.Refused
+        try {
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            lateinit var call: Call
+            val ticket = ProviderCallTicket { call.cancel() }
+            try {
+                if (bytes.size !in 1..MAX_RECEIPT_REQUEST_BYTES) return DurableProviderPost.Refused
+                val requestBody = JsonBody(bytes)
+                val firstIo = DurableFirstIo(owner, origin, credential, permit, ticket, caller[Job], start)
+                val identityHeaders = AccountWatchlistClient.durableRequestHeaders(lane.provider, credential.bearer) +
+                    ("Accept-Encoding" to "identity")
+                call = preparedCall(providerWatchlistUrl(receipt), identityHeaders, requestBody, firstIo)
+                if (!permit.attachCancellation(call::cancel) || !credential.operation.attachOutbound(ticket)) {
+                    call.cancel()
+                    return DurableProviderPost.Refused
+                }
+                val confirmed = awaitDrained(call, false) { response ->
+                    requestBody.wasSubmitted() && exactReceipt(call.request(), requestBody, bytes, receipt, response)
+                }
+                return when {
+                    !start.wasClaimed() -> DurableProviderPost.Refused
+                    confirmed && firstIo.confirm() -> DurableProviderPost.Confirmed
+                    else -> DurableProviderPost.Unsettled
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return if (start.wasClaimed()) DurableProviderPost.Unsettled else DurableProviderPost.Refused
+            } finally {
+                credential.operation.closeOutbound(ticket)
+                ticket.close()
+                bytes.fill(0)
+            }
+        } finally { permit.close() }
+    }
+
+    private fun durableCredentialMatches(
+        lane: ProviderRetryOutbox.Lane,
+        row: ProviderRetryOutbox.Row,
+        credential: DurableProviderMirrorCredential,
+    ): Boolean {
+        val group = when (lane.provider) {
+            ProviderRetryOutbox.Provider.TRAKT -> NativeProviderCredentials.GROUPS[0]
+            ProviderRetryOutbox.Provider.SIMKL -> NativeProviderCredentials.GROUPS[1]
+        }
+        if (credential.guard.owner != lane.owner || credential.guard.keys != group ||
+            !credential.operation.ownsRetryGuard(credential.guard) || !credential.matches()) return false
+        val captured = credential.copyProof() ?: return false
+        val original = row.credentialProof()
+        return try { captured.size == original.size && MessageDigest.isEqual(original, captured) }
+        finally { original.fill(0); captured.fill(0) }
+    }
+
+    private fun exactReceipt(
+        request: Request, body: JsonBody, bytes: ByteArray, operation: ProviderWatchlistReceipt.Operation, response: Response,
+    ): Boolean {
+        if (response.code != operation.successStatus || response.priorResponse != null || response.cacheResponse != null ||
+            response.networkResponse == null ||
+            response.request.url != request.url || response.request.method != "POST" || response.request.body !== body ||
+            response.headers.values("Content-Encoding").any { !it.equals("identity", ignoreCase = true) }) return false
+        val expectedSize = response.body.contentLength()
+        if (expectedSize == 0L || expectedSize > MAX_RECEIPT_RESPONSE_BYTES) return false
+        val scratch = ByteArray(MAX_RECEIPT_RESPONSE_BYTES + 1)
+        try {
+            val stream = response.body.byteStream()
+            var size = 0
+            while (size < scratch.size) {
+                val read = stream.read(scratch, size, scratch.size - size)
+                if (read == -1) break
+                if (read <= 0) return false
+                size += read
+            }
+            if (size !in 1..MAX_RECEIPT_RESPONSE_BYTES || (expectedSize >= 0 && size.toLong() != expectedSize)) return false
+            val exactResponse = scratch.copyOf(size)
+            try {
+                return when (ProviderWatchlistReceipt.evaluate(operation, bytes, response.code, exactResponse)) {
+                    ProviderWatchlistReceipt.Outcome.ADDED, ProviderWatchlistReceipt.Outcome.ALREADY_PRESENT,
+                    ProviderWatchlistReceipt.Outcome.REMOVED, ProviderWatchlistReceipt.Outcome.STATUS_CONFIRMED -> true
+                    ProviderWatchlistReceipt.Outcome.ITEM_REPORTED_NOT_FOUND, ProviderWatchlistReceipt.Outcome.UNVERIFIED -> false
+                }
+            } finally { exactResponse.fill(0) }
+        } finally { scratch.fill(0) }
+    }
+
     /** Keep the parent writer lease until the prepared call's callback has closed its response. */
-    private suspend fun awaitDrained(call: Call): IntegrationsHttp.Response {
+    private suspend fun awaitDrained(call: Call): IntegrationsHttp.Response = awaitDrained(call, failed()) {
+        IntegrationsHttp.Response(it.code, it.body.string())
+    }
+
+    private suspend fun <T> awaitDrained(call: Call, failed: T, decode: (Response) -> T): T {
         val drained = CompletableDeferred<Unit>()
         try {
             return suspendCancellableCoroutine { continuation ->
@@ -175,17 +333,17 @@ internal object ProviderMirrorTransport {
                     drained.complete(Unit)
                     return@suspendCancellableCoroutine
                 }
-                fun finish(result: IntegrationsHttp.Response) {
+                fun finish(result: T) {
                     drained.complete(Unit)
                     if (continuation.isActive) continuation.resume(result)
                 }
                 try {
                     call.enqueue(object : Callback {
-                        override fun onFailure(call: Call, e: IOException) { finish(failed()) }
+                        override fun onFailure(call: Call, e: IOException) { finish(failed) }
                         override fun onResponse(call: Call, response: Response) {
-                            var result = failed()
+                            var result = failed
                             try {
-                                result = response.use { IntegrationsHttp.Response(it.code, it.body.string()) }
+                                result = response.use(decode)
                             } catch (_: Exception) {
                                 // Decode or transport failure is reported through the existing status 0.
                             } finally { finish(result) }
@@ -193,7 +351,7 @@ internal object ProviderMirrorTransport {
                     })
                 } catch (_: Exception) {
                     call.cancel()
-                    finish(failed())
+                    finish(failed)
                 }
             }
         } finally {

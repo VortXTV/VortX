@@ -139,6 +139,19 @@ object TraktAuth {
         }?.value
     }
 
+    internal fun captureDurableWatchlistCredential(
+        expected: SessionOwnerSnapshot.Account,
+        persistedOwnerEpoch: Long,
+        dataKey: ByteArray,
+    ): DurableProviderMirrorCredential? = tokenMutations.snapshotRetryForOwner(
+        expected, persistedOwnerEpoch, dataKey, ProviderRetryCredentialProof.Provider.TRAKT,
+    ) { captured ->
+        val now = nowSeconds()
+        val expires = captured.expiresAtSeconds
+        val created = captured.createdAtSeconds?.takeIf { it < expires } ?: now
+        isConfigured && !traktTokenExpired(expires, expires - created, now)
+    }
+
     internal sealed interface MirrorPreparation {
         data object Refused : MirrorPreparation
         data object RefreshFailed : MirrorPreparation
@@ -664,16 +677,12 @@ data class TraktToken(
     val expiresAtSeconds: Long get() = createdAt + expiresIn
 
     val isExpired: Boolean
-        get() {
-            val now = System.currentTimeMillis() / 1000L
-            val remaining = expiresAtSeconds - now
-            val leeway = minOf(DEFAULT_LEEWAY_SECONDS, expiresIn / 2)
-            return remaining <= leeway
-        }
+        get() = traktTokenExpired(expiresAtSeconds, expiresIn, System.currentTimeMillis() / 1000L)
+}
 
-    private companion object {
-        const val DEFAULT_LEEWAY_SECONDS = 1800L // 30 minutes, matching the Apple defaultLeeway
-    }
+private fun traktTokenExpired(expiresAt: Long, lifetime: Long, now: Long): Boolean {
+    val leeway = minOf(1800L, lifetime / 2) // 30 minutes, matching the Apple defaultLeeway.
+    return expiresAt - now <= leeway
 }
 
 /// Typed errors for the Trakt auth flow, mapping to the documented device/token status codes plus

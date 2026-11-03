@@ -6,9 +6,16 @@ import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.MediaType
 import com.vortx.android.engine.NativeLibraryMirrorOrigin
+import com.vortx.android.integrations.DurableProviderMirrorCredential
+import com.vortx.android.integrations.DurableProviderPost
 import com.vortx.android.integrations.ProviderMirrorResult
 import com.vortx.android.integrations.ProviderMirrorTransport
+import com.vortx.android.integrations.ProviderWatchlistReceipt
 import com.vortx.android.integrations.result
+import com.vortx.android.sync.ProviderRetryDispatchOutcome
+import com.vortx.android.sync.ProviderRetryOutbox
+import com.vortx.android.sync.ProviderRetryStart
+import com.vortx.android.sync.VortXSyncManager
 import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
@@ -51,6 +58,17 @@ internal data class TitleRef(
     }
 }
 
+internal fun ProviderRetryOutbox.Provider.watchlistOperation(add: Boolean): ProviderWatchlistReceipt.Operation? = when (this) {
+    ProviderRetryOutbox.Provider.TRAKT -> if (add) ProviderWatchlistReceipt.Operation.TRAKT_ADD else ProviderWatchlistReceipt.Operation.TRAKT_REMOVE
+    ProviderRetryOutbox.Provider.SIMKL -> if (add) ProviderWatchlistReceipt.Operation.SIMKL_ADD else null
+}
+
+internal fun providerWatchlistUrl(operation: ProviderWatchlistReceipt.Operation): String = when (operation) {
+    ProviderWatchlistReceipt.Operation.TRAKT_ADD -> "${TraktAuth.API_BASE}/sync/watchlist"
+    ProviderWatchlistReceipt.Operation.TRAKT_REMOVE -> "${TraktAuth.API_BASE}/sync/watchlist/remove"
+    ProviderWatchlistReceipt.Operation.SIMKL_ADD -> "${SIMKLAuth.API_BASE}/sync/add-to-list?${SIMKLAuth.requiredQuery()}"
+}
+
 /**
  * The authenticated Trakt + SIMKL WATCHLIST write wire, the account-mutating half of two-way watchlist
  * sync (the READ half - remote watchlist -> home rails - already lives in
@@ -74,6 +92,49 @@ internal data class TitleRef(
 internal object AccountWatchlistClient {
 
     private val traktClientId: String get() = BuildConfig.TRAKT_CLIENT_ID.trim()
+    private val durableImdb = Regex("tt[0-9]{1,20}")
+
+    /** Call before minting a start. Multi-ID and unknown-media rows cannot be settled by this wire. */
+    fun isDurableWatchlistSupported(provider: ProviderRetryOutbox.Provider, add: Boolean, ref: TitleRef): Boolean {
+        if (ref.isSeries == null || provider.watchlistOperation(add) == null) return false
+        val imdb = ref.imdb
+        return if (imdb != null) ref.tmdb == null && durableImdb.matches(imdb) else (ref.tmdb ?: 0) > 0
+    }
+
+    /** The retry caller owns the original session, start and prepared existing-only credential. */
+    suspend fun dispatchDurable(
+        lane: ProviderRetryOutbox.Lane,
+        row: ProviderRetryOutbox.Row,
+        start: ProviderRetryStart,
+        owner: VortXSyncManager.ProviderRetryOwner,
+        origin: NativeLibraryMirrorOrigin?,
+        credential: DurableProviderMirrorCredential,
+    ): ProviderRetryDispatchOutcome {
+        if (start.head.lane != lane || start.head.row !== row || owner.owner != lane.owner)
+            return ProviderRetryDispatchOutcome.Refused
+        val ref = TitleRef(row.imdb, row.tmdb, row.isSeries)
+        if (!isDurableWatchlistSupported(lane.provider, row.add, ref)) return ProviderRetryDispatchOutcome.Refused
+        val receipt = checkNotNull(lane.provider.watchlistOperation(row.add))
+        return when (ProviderMirrorTransport.postDurable(owner, origin, credential, start, receipt)) {
+            DurableProviderPost.Refused -> ProviderRetryDispatchOutcome.Refused
+            DurableProviderPost.Unsettled -> ProviderRetryDispatchOutcome.Unsettled
+            DurableProviderPost.Confirmed -> ProviderRetryDispatchOutcome.Accepted(start, lane, row.operationId, row.add, ref)
+        }
+    }
+
+    internal fun durableRequestHeaders(provider: ProviderRetryOutbox.Provider, bearer: String): Map<String, String> = when (provider) {
+        ProviderRetryOutbox.Provider.TRAKT -> traktHeaders(bearer)
+        ProviderRetryOutbox.Provider.SIMKL -> SIMKLAuth.authHeaders(bearer)
+    }
+
+    internal fun durableRequestBody(lane: ProviderRetryOutbox.Lane, row: ProviderRetryOutbox.Row): String? {
+        val ref = TitleRef(row.imdb, row.tmdb, row.isSeries)
+        if (!isDurableWatchlistSupported(lane.provider, row.add, ref)) return null
+        return when (lane.provider) {
+            ProviderRetryOutbox.Provider.TRAKT -> traktBody(ref).toString()
+            ProviderRetryOutbox.Provider.SIMKL -> simklBody(ref).toString()
+        }
+    }
 
     // MARK: - Trakt
 
@@ -111,15 +172,17 @@ internal object AccountWatchlistClient {
     private suspend fun <T> sendTraktWatchlist(add: Boolean, ref: TitleRef, token: String,
         post: suspend (String, Map<String, String>, String) -> T): T =
         post(
-            "${TraktAuth.API_BASE}${if (add) "/sync/watchlist" else "/sync/watchlist/remove"}",
-            mapOf(
-                "Content-Type" to "application/json",
-                "trakt-api-version" to "2",
-                "trakt-api-key" to traktClientId,
-                "Authorization" to "Bearer $token",
-            ),
+            providerWatchlistUrl(checkNotNull(ProviderRetryOutbox.Provider.TRAKT.watchlistOperation(add))),
+            traktHeaders(token),
             traktBody(ref).toString(),
         )
+
+    private fun traktHeaders(token: String): Map<String, String> = mapOf(
+        "Content-Type" to "application/json",
+        "trakt-api-version" to "2",
+        "trakt-api-key" to traktClientId,
+        "Authorization" to "Bearer $token",
+    )
 
     /**
      * `{ movies: [ { ids } ] }` for a movie, `{ shows: [ { ids } ] }` for a series. When [TitleRef.isSeries]
@@ -171,19 +234,20 @@ internal object AccountWatchlistClient {
     }
 
     private suspend fun <T> sendSimklWatchlistAdd(ref: TitleRef, token: String,
-        post: suspend (String, Map<String, String>, String) -> T): T {
+        post: suspend (String, Map<String, String>, String) -> T): T = post(
+        providerWatchlistUrl(ProviderWatchlistReceipt.Operation.SIMKL_ADD),
+        SIMKLAuth.authHeaders(token),
+        simklBody(ref).toString(),
+    )
+
+    private fun simklBody(ref: TitleRef): JSONObject {
         val item = JSONObject().apply {
             put("ids", simklIds(ref))
             put("to", "plantowatch")
         }
-        val body = JSONObject().put(
+        return JSONObject().put(
             if (ref.isSeries == true) "shows" else "movies",
             JSONArray().put(item),
-        )
-        return post(
-            "${SIMKLAuth.API_BASE}/sync/add-to-list?${SIMKLAuth.requiredQuery()}",
-            SIMKLAuth.authHeaders(token),
-            body.toString(),
         )
     }
 

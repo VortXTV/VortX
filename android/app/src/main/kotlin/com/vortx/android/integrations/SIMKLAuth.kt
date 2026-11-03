@@ -126,6 +126,17 @@ object SIMKLAuth {
         }?.value
     }
 
+    internal fun captureDurableWatchlistCredential(
+        expected: SessionOwnerSnapshot.Account,
+        persistedOwnerEpoch: Long,
+        dataKey: ByteArray,
+    ): DurableProviderMirrorCredential? = tokenMutations.snapshotRetryForOwner(
+        expected, persistedOwnerEpoch, dataKey, ProviderRetryCredentialProof.Provider.SIMKL,
+    ) { captured ->
+        val expiry = captured.expiresAtSeconds
+        isConfigured && (expiry == 0L || System.currentTimeMillis() / 1000L < expiry)
+    }
+
     internal fun validWatchlistCredential(expected: SessionOwnerSnapshot.Account, epoch: Long): ProviderMirrorCredential? {
         val snapshot = tokenMutations.snapshotForOwner(expected) {
             if (currentSessionEpoch() == epoch) tokenStore?.validToken() else null

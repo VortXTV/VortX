@@ -72,9 +72,22 @@ class ProviderRetryOutboxTest {
             override fun close() {}
         }
         val title = TitleRef("tt0123456", null, false)
+        assertEquals(ProviderRetryCoordinator.Submit.UnsupportedTitle,
+            coordinator.submit(session, Provider.TRAKT, true, title.copy(isSeries = null)))
+        assertEquals(Read.Missing, original.readHead(trakt, key) {})
+        val otherLane = Lane(foreign, Provider.SIMKL)
+        val otherSession = object : ProviderRetrySession by session { override val owner = foreign }
+        val unsupported = row(99)
+        assertEquals(Append.Enqueued, original.append(otherLane, key, unsupported) {})
+        coordinator.drain(otherSession, Provider.SIMKL)
+        assertEquals(unsupported.operationId, pending(original, otherLane).row.operationId)
+        assertFalse(exists(startFile(record(otherLane))))
+        assertEquals(0, preparations)
+
         assertEquals(ProviderRetryCoordinator.Submit.Settled, coordinator.submit(session, Provider.TRAKT, true, title))
         assertEquals(Read.Missing, original.readHead(trakt, key) {})
         assertFalse(exists(startFile(record(trakt))))
+        reserved { assertTrue(original.captureRestoreAbsence(account, it) != null) }
 
         settle = false
         assertEquals(ProviderRetryCoordinator.Submit.RecordedUnsettled, coordinator.submit(session, Provider.TRAKT, false, title))

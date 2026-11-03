@@ -37,6 +37,27 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
             }
         }
 
+    fun snapshotRetryForOwner(
+        expected: SessionOwnerSnapshot.Account,
+        persistedOwnerEpoch: Long,
+        dataKey: ByteArray,
+        provider: ProviderRetryCredentialProof.Provider,
+        eligible: (NativeProviderAccess.RetryCredential) -> Boolean,
+    ): DurableProviderMirrorCredential? = synchronized(mutationLock) {
+        if (nativeKeys != provider.keys.toSet()) return@synchronized null
+        val captured = NativeProviderAccess.captureRetryCredential(expected, persistedOwnerEpoch, dataKey, provider)
+            ?: return@synchronized null
+        var handedOff = false
+        try {
+            if (!eligible(captured)) return@synchronized null
+            DurableProviderMirrorCredential(captured, Operation(generation, captured.guard), eligible).also {
+                handedOff = true
+            }
+        } finally {
+            if (!handedOff) captured.close()
+        }
+    }
+
     fun invalidate(mutation: () -> Unit) {
         synchronized(mutationLock) {
             generation += 1
@@ -51,6 +72,9 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
         private val expectedGeneration: Long,
         private val nativeGuard: NativeProviderAccess.Guard?,
     ) {
+        fun ownsRetryGuard(guard: NativeProviderAccess.Guard): Boolean =
+            guard.isExistingOnlyRetry && nativeGuard === guard
+
         fun isCurrent(): Boolean = synchronized(mutationLock) {
             generation == expectedGeneration && (nativeKeys == null || nativeGuard?.let { runCatching { NativeProviderAccess.current(it) }.getOrDefault(false) } == true)
         }
@@ -96,6 +120,7 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
             awaitValue: suspend () -> T,
             publish: (T) -> R,
         ): CredentialMutationResult<R> {
+            if (nativeGuard?.isExistingOnlyRetry == true) return CredentialMutationResult.Stale
             if (nativeKeys == null) {
                 val value = awaitValue()
                 return mutate { publish(value) }
@@ -112,6 +137,23 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
             }
         }
     }
+}
+
+/** One provider's exact captured original, its ordinary retirement generation, and a live expiry gate. */
+internal class DurableProviderMirrorCredential(
+    private val captured: NativeProviderAccess.RetryCredential,
+    val operation: CredentialMutationCoordinator.Operation,
+    private val eligible: (NativeProviderAccess.RetryCredential) -> Boolean,
+) : AutoCloseable {
+    init { require(operation.ownsRetryGuard(captured.guard)) }
+
+    val guard: NativeProviderAccess.Guard get() = captured.guard
+    val bearer: String get() = captured.accessToken
+    fun copyProof(): ByteArray? = captured.copyProof()
+
+    /** The operation separately rechecks exact owner, vault, selected events and local creation time. */
+    fun matches(): Boolean = captured.isOpen() && eligible(captured)
+    override fun close() { captured.close() }
 }
 
 internal data class CredentialOperationSnapshot<T>(

@@ -1349,6 +1349,19 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 override fun <T> withOrdinaryCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
                     withProviderOwner(expected, allowPaused = false, action = action)
 
+                // The retry worker already verified its original persisted Session. A provider
+                // claim must not reopen the session store while entering the existing vault.
+                override fun <T> withExistingRetryCurrent(expected: SessionOwnerSnapshot.Account,
+                    action: (SessionOwnerSnapshot.Account) -> T): T? = operations.snapshot {
+                    sessionState.serialized {
+                        val current = sessionState.value ?: return@serialized null
+                        if (pickerFileRecoverySession != null || sessionState.ownerEpoch != expected.generation ||
+                            current.account.id != expected.id || _account.value != current.account ||
+                            _sessionUiState.value != SessionUiState.SignedIn(current.account)) return@serialized null
+                        action(expected)
+                    }
+                }
+
                 private fun <T> withProviderOwner(expected: SessionOwnerSnapshot.Account?, allowPaused: Boolean,
                     action: (SessionOwnerSnapshot.Account) -> T): T? = operations.snapshot { sessionState.serialized {
                         val current = sessionState.value

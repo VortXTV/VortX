@@ -1,5 +1,6 @@
 package com.vortx.android.sync
 
+import com.vortx.android.account.AccountWatchlistClient
 import com.vortx.android.account.TitleRef
 import com.vortx.android.engine.NativeLibraryMirrorOrigin
 import com.vortx.android.security.AccountFileProviderWriters
@@ -49,7 +50,7 @@ internal interface ProviderRetryCredential : AutoCloseable {
     ): ProviderRetryDispatchOutcome
 }
 
-/** No production implementation exists in outbox V2. A memory flag or a V2 read cannot mint it. */
+/** Only a durably recorded original head can mint its start capability. */
 internal interface ProviderRetryStartLedger {
     /**
      * Under the same original outbox issuer, mark the exact authenticated, never-claimed head
@@ -130,7 +131,7 @@ internal class ProviderRetryCoordinator(
         add: Boolean,
         ref: TitleRef,
     ): Submit = AccountFileProviderWriters.withEffectfulWriter(Submit.Unavailable) {
-        if (!ref.hasUsableId || provider == ProviderRetryOutbox.Provider.SIMKL && !add)
+        if (!AccountWatchlistClient.isDurableWatchlistSupported(provider, add, ref))
             return@withEffectfulWriter Submit.UnsupportedTitle
         val lane = ProviderRetryOutbox.Lane(session.owner, provider)
         withLane(lane) {
@@ -171,6 +172,7 @@ internal class ProviderRetryCoordinator(
                 requireCurrent()
                 val original = (session.withDataKey { outbox.readHead(lane, it, requireCurrent) }
                     as? ProviderRetryOutbox.Read.Pending)?.head ?: return@withLane
+                if (!supports(original)) return@withLane
                 val credential = session.prepareCredential(provider) ?: return@withLane
                 credential.use {
                     val proof = credential.copyProof()
@@ -200,6 +202,7 @@ internal class ProviderRetryCoordinator(
                     (session.withDataKey { outbox.readHead(lane, it, requireCurrent) }
                         as? ProviderRetryOutbox.Read.Pending)?.head ?: return false
                 }
+                if (!supports(head)) return false
                 val original = head.row.credentialProof()
                 val matches = try { MessageDigest.isEqual(original, proof) } finally { original.fill(0) }
                 // A different proof can also mean unavailable or ambiguous origin. Preserve FIFO and
@@ -224,6 +227,10 @@ internal class ProviderRetryCoordinator(
             // Persistence or settlement may already be ambiguous. A later exact read owns recovery.
             return false
         }
+    }
+
+    private fun supports(head: ProviderRetryOutbox.Snapshot): Boolean = with(head.row) {
+        AccountWatchlistClient.isDurableWatchlistSupported(head.lane.provider, add, TitleRef(imdb, tmdb, isSeries))
     }
 
     private suspend fun currentAssertion(session: ProviderRetrySession): () -> Unit {
