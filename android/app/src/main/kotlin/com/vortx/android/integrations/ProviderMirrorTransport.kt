@@ -45,14 +45,14 @@ internal class ProviderCallTicket(private val cancel: () -> Unit) {
 
     fun retire() {
         val previous = state.getAndUpdate { it or RETIRED }
-        if (previous and (RETIRED or CLOSED) == 0)
+        if ((previous and (RETIRED or CLOSED)) == 0)
             Dispatchers.IO.dispatch(EmptyCoroutineContext, Runnable { cancel() })
     }
 
     fun close() { state.getAndUpdate { it or CLOSED } }
 
     fun outcome(response: IntegrationsHttp.Response): ProviderMirrorResponse =
-        if (state.get() and CLAIMED != 0) ProviderMirrorResponse.Started(response) else ProviderMirrorResponse.Refused
+        if ((state.get() and CLAIMED) != 0) ProviderMirrorResponse.Started(response) else ProviderMirrorResponse.Refused
 
     private companion object {
         const val CLAIMED = 1

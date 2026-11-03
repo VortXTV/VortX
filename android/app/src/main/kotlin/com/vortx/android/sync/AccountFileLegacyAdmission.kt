@@ -12,6 +12,7 @@ import com.vortx.android.profile.UserProfile
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.util.Base64
+import java.util.Objects
 import java.util.UUID
 
 /** Pure interpretation, NOT authenticated account/owner authority. The future manager must supply
@@ -116,7 +117,7 @@ internal object AccountFileLegacyAdmission {
         }
         if (settings != null && full != null) {
             val a = requireNotNull(settings); val b = requireNotNull(full)
-            require(a.clock == b.clock && a.known.size == b.known.size &&
+            require(Objects.equals(a.clock, b.clock) && a.known.size == b.known.size &&
                 a.known.zip(b.known).all { (left, right) -> left.contentEquals(right) }) { "Conflicting account roster carriers" }
         }
         val accepted = full ?: settings ?: error("Full account roster unavailable")

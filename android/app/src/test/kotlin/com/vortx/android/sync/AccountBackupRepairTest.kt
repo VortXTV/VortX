@@ -5,6 +5,7 @@ import com.vortx.android.engine.OHJson
 import com.vortx.android.engine.VortxRuntimeBindings
 import java.util.Date
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -245,10 +246,10 @@ class AccountBackupRepairTest {
         f.context().use { context -> AccountBackupRepair.convert(file, context, AccountBackupRepairFixture.Bindings()) { count++ }.close() }
         assertTrue(count > 20)
         for (stop in 1..count) {
-            val bindings = AccountBackupRepairFixture.Bindings(); var calls = 0
+            val bindings = AccountBackupRepairFixture.Bindings(); val calls = AtomicInteger()
             f.context().use { context ->
                 val result = runCatching { AccountBackupRepair.convert(file, context, bindings) {
-                    if (++calls == stop) throw CancellationException("Synthetic original owner/operation retired")
+                    if (calls.incrementAndGet() == stop) throw CancellationException("Synthetic original owner/operation retired")
                 } }
                 assertTrue("Fence $stop", result.exceptionOrNull() is CancellationException)
             }
@@ -281,10 +282,10 @@ class AccountBackupRepairTest {
             AccountBackupRepairFixture.Bindings()) { count++ }.close() }
         assertTrue(count > 20)
         for (stop in 1..count) {
-            val bindings = AccountBackupRepairFixture.Bindings(); var checks = 0
+            val bindings = AccountBackupRepairFixture.Bindings(); val checks = AtomicInteger()
             f.context().use { context ->
                 val attempt = runCatching { AccountBackupRepair.validateReimport(selected, context, bindings) {
-                    if (++checks == stop) throw CancellationException("Synthetic original reimport retired")
+                    if (checks.incrementAndGet() == stop) throw CancellationException("Synthetic original reimport retired")
                 } }
                 assertTrue("Reimport fence $stop", attempt.exceptionOrNull() is CancellationException)
             }
