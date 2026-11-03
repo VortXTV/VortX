@@ -38,6 +38,8 @@ import com.vortx.android.ui.profilepicker.PickerToolsWorkGate
 import com.vortx.android.ui.profilepicker.ProfilePickerToolsController
 import com.vortx.android.ui.screens.shareDiagnosticLog
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOf
 import java.util.UUID
@@ -47,7 +49,7 @@ internal class ManagerPickerToolsAccounts(private val manager: VortXSyncManager)
     override val authorityRevision: Long get() = manager.pickerAuthorityRevision.value
     override val sessionMarker: Any get() = manager.sessionUiState.value
     override val changes: Flow<Unit> =
-        combine(manager.pickerAuthorityRevision, manager.sessionUiState, manager.pickerFileRecoveryPaused) { _, _, _ -> Unit }
+        combine(manager.pickerAuthorityRevision, manager.sessionUiState, manager.pickerFileRecoveryPaused) { _, _, _ -> }
     override fun capture(): PickerAccountSnapshot? = manager.capturePickerAccountSnapshot()
     override fun isCurrent(original: PickerAccountSnapshot): Boolean = manager.isPickerAccountCurrent(original)
     override suspend fun download(original: PickerAccountSnapshot): ByteArray = manager.downloadAccountBackupFile(original)
@@ -122,6 +124,19 @@ internal class ProfilePickerToolsViewModel private constructor(
 ) : ViewModel() {
     val controller = createController(this)
     val state get() = controller.state
+    private val _restoreStatusOwner = MutableStateFlow<PickerAccountSnapshot?>(null)
+    val restoreStatusOwner = _restoreStatusOwner.asStateFlow()
+
+    fun openRestoreStatus(original: PickerAccountSnapshot) {
+        _restoreStatusOwner.compareAndSet(null, original)
+    }
+
+    fun closeRestoreStatus(original: PickerAccountSnapshot) {
+        if (_restoreStatusOwner.value !== original) return
+        controller.retireRestoreStatusRoute(original)
+        _restoreStatusOwner.compareAndSet(original, null)
+    }
+
     constructor(manager: VortXSyncManager?, context: Context, workGate: PickerToolsWorkGate = PickerToolsWorkGate(),
         externalRestore: AccountFileRestoreExternalExclusion? = null) : this(
         AccountBackupDocuments(context.applicationContext),
@@ -185,7 +200,11 @@ internal class ProfilePickerToolsViewModel private constructor(
             shareDiagnosticLog(applicationContext, mayShare = admission)
         }
     }
-    override fun onCleared() { controller.close(); super.onCleared() }
+    override fun onCleared() {
+        controller.close()
+        _restoreStatusOwner.value = null
+        super.onCleared()
+    }
 }
 
 internal class PickerToolsModelHolder : ViewModel() {

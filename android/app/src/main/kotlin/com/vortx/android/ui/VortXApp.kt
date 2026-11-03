@@ -119,6 +119,9 @@ import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
+import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryAction
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryCurrent
 import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
 import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
 import com.vortx.android.ui.profilepicker.rememberPickerFileRecoveryPause
@@ -624,6 +627,25 @@ fun VortXApp(
         LaunchedEffect(syncManager, vortxSessionUi) {
             if (vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
         }
+        val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
+        restoreStatusOwner?.let { original ->
+            val statusAdmission = {
+                pickerToolsModel.restoreStatusOwner.value === original && pickerToolsModel.controller.restoreAvailable &&
+                    !fileRecoveryPausedNow() && pickerRestoreStatusEntryCurrent(syncManager, original)
+            }
+            if (statusAdmission()) {
+                ProfilePickerToolsHost(pickerToolsModel, isTv = false,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed,
+                    recoveryLanding = true, statusOnlyOwner = original, statusOnlyAdmission = statusAdmission) {
+                    PickerRestoreStatusLanding(isTv = false) {
+                        pickerToolsModel.closeRestoreStatus(original)
+                    }
+                }
+            } else LaunchedEffect(original) {
+                pickerToolsModel.closeRestoreStatus(original)
+            }
+            return@VortXTheme
+        }
         var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionPresentation?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { presentation ->
             val request = presentation.request
@@ -635,7 +657,8 @@ fun VortXApp(
                 onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
-        if (showWhosWatching || pickerAccountOpen || pickerToolsState.open || pickerFileRecoveryPaused || showFileRecoveryEntry) {
+        if (showWhosWatching || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+            pickerFileRecoveryPaused || showFileRecoveryEntry) {
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 fileRecoveryPaused = pickerFileRecoveryPaused,
                 accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
@@ -2159,6 +2182,8 @@ fun VortXApp(
                         }
                     },
                     onProfilesClick = { showProfiles = true },
+                    onOpenProfilePickerTools = pickerRestoreStatusEntryAction(syncManager,
+                        pickerToolsModel.controller.restoreAvailable, fileRecoveryPausedNow, pickerToolsModel::openRestoreStatus),
                     onAppearanceScreenClick = { showAppearance = true },
                     onTabBarScreenClick = { showTabBar = true },
                     onAccountClick = { showAccount = true },

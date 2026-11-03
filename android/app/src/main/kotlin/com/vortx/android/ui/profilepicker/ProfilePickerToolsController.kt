@@ -170,7 +170,13 @@ internal class ProfilePickerToolsController(
 ) : Closeable {
     private val lock = Any()
     private var attachment: PickerToolsAttachment? = null
-    private class RouteAuthority(val routeId: String, val original: PickerAccountSnapshot?, val revision: Long, val marker: Any)
+    private class RouteAuthority(
+        val routeId: String,
+        val original: PickerAccountSnapshot?,
+        val revision: Long,
+        val marker: Any,
+        val statusOwner: PickerAccountSnapshot?,
+    )
     private var routeAuthority: RouteAuthority? = null
     private var slot: Slot? = null
     private var closed = false
@@ -237,7 +243,7 @@ internal class ProfilePickerToolsController(
         val original: PickerAccountSnapshot?,
         val revision: Long,
         val marker: Any,
-        val diagnosticPolicy: (() -> Boolean)? = null,
+        val requiredPolicy: (() -> Boolean)? = null,
         val repair: PickerToolsRepairInputRequest? = null,
         val restore: RestoreWork? = null,
         val recoveryAction: RecoveryAction? = null,
@@ -280,32 +286,49 @@ internal class ProfilePickerToolsController(
 
     /** Captured once per picker route, before rendering either Tools entry or menu callbacks.
      * An unavailable capture never gains file authority later; diagnostics still use the route/policy. */
-    private fun captureRouteAuthority(): RouteAuthority {
+    private fun captureRouteAuthority(statusOwner: PickerAccountSnapshot?): RouteAuthority {
         val revision = accounts.authorityRevision
         val marker = accounts.sessionMarker
-        val original = accounts.capture()
-        return RouteAuthority(UUID.randomUUID().toString(), original, revision, marker)
+        val original = statusOwner ?: accounts.capture()
+        return RouteAuthority(UUID.randomUUID().toString(), original, revision, marker, statusOwner)
     }
     private fun routeCurrent(route: RouteAuthority): Boolean =
         accounts.authorityRevision == route.revision && accounts.sessionMarker == route.marker &&
             (route.original?.let(accounts::isCurrent) ?: true)
 
     /** Rotation retains original route authority but replaces attachment/callback identity. */
-    fun attachPicker(): PickerToolsAttachment = synchronized(lock) {
-        check(!closed)
-        val route = routeAuthority ?: captureRouteAuthority().also { routeAuthority = it }
-        PickerToolsAttachment(route.routeId, UUID.randomUUID().toString()).also { attachment = it }
-    }
-    private fun retireRoute(expected: RouteAuthority) {
-        val cancel = synchronized(lock) {
-            if (routeAuthority !== expected) return
-            routeAuthority = null; attachment = null; publicationAuthority = null; retainedRestore = null
-            val generation = _state.value.routeGeneration + 1L
-            _state.value = PickerToolsState(routeGeneration = generation, cancellingFileSave = isCancellingFileSave(),
-                phase = if (slot == null) PickerToolsPhase.IDLE else PickerToolsPhase.CANCELLING)
-            slot?.takeIf { it.routeIdentity === expected }?.also { it.revoked = true }
+    fun attachPicker(statusOwner: PickerAccountSnapshot? = null): PickerToolsAttachment {
+        var cancel: Slot? = null
+        val attached = synchronized(lock) {
+            check(!closed)
+            routeAuthority?.takeIf { it.statusOwner !== statusOwner }?.let { cancel = retireRouteLocked(it) }
+            val route = routeAuthority ?: captureRouteAuthority(statusOwner).also { routeAuthority = it }
+            PickerToolsAttachment(route.routeId, UUID.randomUUID().toString()).also { attachment = it }
         }
         cancel?.job?.cancel()
+        return attached
+    }
+
+    /** Close only the original status route, including when rotation left it without a UI attachment. */
+    fun retireRestoreStatusRoute(original: PickerAccountSnapshot) {
+        val cancel = synchronized(lock) {
+            routeAuthority?.takeIf { it.statusOwner === original }?.let(::retireRouteLocked)
+        }
+        cancel?.job?.cancel()
+    }
+
+    private fun retireRoute(expected: RouteAuthority) {
+        val cancel = synchronized(lock) { retireRouteLocked(expected) }
+        cancel?.job?.cancel()
+    }
+
+    private fun retireRouteLocked(expected: RouteAuthority): Slot? {
+        if (routeAuthority !== expected) return null
+        routeAuthority = null; attachment = null; publicationAuthority = null; retainedRestore = null
+        val generation = _state.value.routeGeneration + 1L
+        _state.value = PickerToolsState(routeGeneration = generation, cancellingFileSave = isCancellingFileSave(),
+            phase = if (slot == null) PickerToolsPhase.IDLE else PickerToolsPhase.CANCELLING)
+        return slot?.takeIf { it.routeIdentity === expected }?.also { it.revoked = true }
     }
     fun detachPicker(expected: PickerToolsAttachment, changingConfigurations: Boolean) {
         if (changingConfigurations) return
@@ -372,7 +395,7 @@ internal class ProfilePickerToolsController(
                 _state.value.presentationId == original.presentationId
         }
         return own && authorityCurrent(original) && restoreSelectionCurrent(original) &&
-            (original.diagnosticPolicy?.let { runCatching(it).getOrDefault(false) } ?: true)
+            (original.requiredPolicy?.let { runCatching(it).getOrDefault(false) } ?: true)
     }
     private suspend fun requireCurrent(original: Slot) {
         currentCoroutineContext().ensureActive()
@@ -390,13 +413,14 @@ internal class ProfilePickerToolsController(
         }
         job?.cancel()
     }
-    private fun admit(expected: PickerToolsActionGrant, diagnosticPolicy: (() -> Boolean)? = null,
+    private fun admit(expected: PickerToolsActionGrant, requiredPolicy: (() -> Boolean)? = null,
         repair: Boolean = false, restoreSelection: Boolean = false, restoreVerify: PickerToolsRestoreVerifyRequest? = null,
-        recoveryAction: RecoveryAction? = null): Slot? {
+        recoveryAction: RecoveryAction? = null, statusOnly: Boolean = false): Slot? {
         if (!currentGrant(expected)) return null
         return synchronized(lock) {
             if (closed || attachment != expected.attachment || routeAuthority !== expected.routeIdentity ||
-                !_state.value.open || _state.value.presentationId != expected.presentationId || slot != null) return null
+                !_state.value.open || _state.value.presentationId != expected.presentationId || slot != null ||
+                (routeAuthority?.statusOwner != null) != statusOnly) return null
             // All authority comes from the immutable rendered grant, never a new capture at click time.
             val request = PickerToolsDestinationRequest(expected.attachment.routeId, UUID.randomUUID().toString())
             val restore = when {
@@ -410,7 +434,7 @@ internal class ProfilePickerToolsController(
                 else -> null
             }
             val candidate = Slot(request, expected.presentationId, expected.routeIdentity, expected.original,
-                expected.revision, expected.marker, diagnosticPolicy,
+                expected.revision, expected.marker, requiredPolicy,
                 if (repair) PickerToolsRepairInputRequest(request.routeId, request.operationId) else null,
                 restore, recoveryAction)
             if (candidate.usesRecoveryGate && !recoveryGate.reserve(candidate)) {
@@ -653,10 +677,11 @@ internal class ProfilePickerToolsController(
         }
     }
 
-    fun restore(expected: PickerToolsActionGrant) {
+    fun restore(expected: PickerToolsActionGrant, statusOnlyAdmission: (() -> Boolean)? = null) {
         val actions = restoreActions ?: return
         if (expected.original?.account == null) return
-        val original = admit(expected, restoreSelection = true) ?: return
+        val original = admit(expected, requiredPolicy = statusOnlyAdmission, restoreSelection = true,
+            statusOnly = statusOnlyAdmission != null) ?: return
         val work = checkNotNull(original.restore)
         val input = checkNotNull(work.input)
         phase(original, PickerToolsPhase.CHECKING_RESTORE)
@@ -671,6 +696,7 @@ internal class ProfilePickerToolsController(
                 }
             }
             requireCurrent(original)
+            if (statusOnlyAdmission != null) return@launch "No retained restore was found."
             if (!actions.canSelect(work.grant))
                 return@launch "No retained restore was found. Sign out, then choose Sign in for backup recovery to restore a file."
             input.requiresPausedOwner = true
@@ -751,10 +777,12 @@ internal class ProfilePickerToolsController(
         completion.complete(approved)
     }
 
-    fun verifyRestore(expected: PickerToolsActionGrant, request: PickerToolsRestoreVerifyRequest) {
+    fun verifyRestore(expected: PickerToolsActionGrant, request: PickerToolsRestoreVerifyRequest,
+        statusOnlyAdmission: (() -> Boolean)? = null) {
         val actions = restoreActions ?: return
         if (expected.original?.account == null) return
-        val original = admit(expected, restoreVerify = request) ?: return
+        val original = admit(expected, requiredPolicy = statusOnlyAdmission, restoreVerify = request,
+            statusOnly = statusOnlyAdmission != null) ?: return
         val work = checkNotNull(original.restore)
         val operationId = checkNotNull(work.verify).record.operationId
         phase(original, PickerToolsPhase.VERIFYING_RESTORE)
@@ -838,7 +866,7 @@ internal class ProfilePickerToolsController(
             }
             return
         }
-        val original = admit(expected, diagnosticPolicy = policy) ?: return
+        val original = admit(expected, requiredPolicy = policy) ?: return
         phase(original, PickerToolsPhase.SHARING_DIAGNOSTICS)
         launch(original) {
             requireCurrent(original)

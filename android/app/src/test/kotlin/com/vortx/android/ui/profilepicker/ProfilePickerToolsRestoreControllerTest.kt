@@ -6,6 +6,7 @@ import com.vortx.android.sync.AccountFileRestoreTransaction.Result as RestoreRes
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.VortXSyncManager.FileRestoreStatus
+import com.vortx.android.ui.viewmodel.ProfilePickerToolsViewModel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -510,6 +511,77 @@ class ProfilePickerToolsRestoreControllerTest {
             assertSame(original, actions.verifies.single().first)
             assertEquals(operation, actions.verifies.single().second)
             assertTrue(actions.inputOwners.isEmpty())
+        }
+    }
+
+    @Test fun statusOnlyEntryNeverSelectsAndRechecksItsAdmissionBeforeVerify() = runTest {
+        val actions = Actions()
+        val operation = UUID.randomUUID()
+        var allowed = true
+        val entryCurrent = { allowed }
+        val accounts = Accounts()
+        controller(backgroundScope, accounts, actions).use { controller ->
+            val owner = accounts.capture()
+            val attachment = controller.attachPicker(owner)
+            controller.open(attachment)
+            val original = checkNotNull(controller.renderedActions(attachment))
+            assertSame(owner, original.original)
+            // Even a current paused owner cannot turn this explicit status entry into a file picker.
+            controller.restore(original, entryCurrent); runCurrent()
+            assertEquals("No retained restore was found.", controller.state.value.message)
+            assertNull(controller.state.value.restoreInput)
+            assertTrue(actions.inputOwners.isEmpty())
+            actions.status = FileRestoreStatus.Retained(operation, 7L, JournalState.DeliveryUnconfirmed)
+            controller.restore(original, entryCurrent); runCurrent()
+            val request = checkNotNull(controller.state.value.restoreStatus?.verify)
+            controller.verifyRestore(original, request, entryCurrent)
+            allowed = false
+            runCurrent()
+            assertTrue(actions.verifies.isEmpty())
+        }
+    }
+
+    @Test fun rotationRetiresExactStatusRouteBeforeNormalPickerCanInheritItsOpenState() = runTest {
+        val accounts = Accounts()
+        val actions = Actions()
+        controller(backgroundScope, accounts, actions).use { controller ->
+            val model = ProfilePickerToolsViewModel(controller)
+            val owner = accounts.capture()
+            model.openRestoreStatus(owner)
+            val attachment = controller.attachPicker(owner)
+            controller.open(attachment)
+            val statusGrant = checkNotNull(controller.renderedActions(attachment))
+            controller.restore(statusGrant)
+            runCurrent()
+            assertTrue(actions.statusOwners.isEmpty()) // Full Tools admission cannot borrow a status route.
+            val operation = UUID.randomUUID()
+            actions.status = FileRestoreStatus.Retained(operation, 7L, JournalState.DeliveryUnconfirmed)
+            controller.restore(statusGrant) { true }; runCurrent()
+            assertNotNull(controller.state.value.restoreStatus?.verify)
+
+            controller.detachPicker(attachment, changingConfigurations = true)
+            assertTrue(controller.state.value.open)
+            // The recreated root rejects the former profile/pause policy before attaching a host.
+            model.closeRestoreStatus(owner)
+            assertFalse(controller.state.value.open)
+            assertNull(model.restoreStatusOwner.value)
+            assertNull(controller.state.value.restoreStatus)
+            val ordinary = controller.attachPicker()
+            assertNotEquals(attachment.routeId, ordinary.routeId)
+            assertNull(controller.renderedActions(ordinary))
+            controller.restore(statusGrant) { true }; runCurrent()
+            assertEquals(1, actions.statusOwners.size)
+
+            val successorOwner = accounts.capture()
+            val successor = controller.attachPicker(successorOwner)
+            controller.open(successor)
+            controller.retireRestoreStatusRoute(owner)
+            assertTrue(controller.state.value.open)
+            assertSame(successorOwner, checkNotNull(controller.renderedActions(successor)).original)
+            // A mode mismatch also retires inherited state if no close callback reaches the host.
+            val afterMismatch = controller.attachPicker()
+            assertFalse(controller.state.value.open)
+            assertNotEquals(successor.routeId, afterMismatch.routeId)
         }
     }
 

@@ -58,13 +58,18 @@ internal fun ProfilePickerToolsHost(
     recoveryLanding: Boolean = recoveryPaused,
     openRecoverySignIn: ((PickerAccountSnapshot) -> Boolean)? = null,
     resumeRecoverySync: (suspend (PickerAccountSnapshot) -> Boolean)? = null,
+    statusOnlyOwner: PickerAccountSnapshot? = null,
+    statusOnlyAdmission: (() -> Boolean)? = null,
     picker: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
     val controller = model.controller
     val state by model.state.collectAsStateWithLifecycle()
     val recoveryBusy by controller.recoveryBusy.collectAsStateWithLifecycle()
-    val attachment = remember(model, state.routeGeneration) { controller.attachPicker() }
+    check((statusOnlyOwner == null) == (statusOnlyAdmission == null))
+    val attachment = if (statusOnlyOwner == null)
+        remember(model, state.routeGeneration) { controller.attachPicker() }
+    else remember(model, state.routeGeneration, statusOnlyOwner) { controller.attachPicker(statusOnlyOwner) }
     val actionGrant = remember(model, attachment, state.presentationId) { controller.renderedActions(attachment) }
     val requiredPolicy by rememberUpdatedState(diagnosticAdmission)
     val entryFocus = remember { FocusRequester() }
@@ -75,10 +80,15 @@ internal fun ProfilePickerToolsHost(
             controller.detachPicker(attachment, pickerActivity(context)?.isChangingConfigurations == true)
         }
     }
-    BackHandler(enabled = state.open, onBack = ::close)
+    // A mode-mismatched attach may synchronously retire the previously collected presentation.
+    val presentationCurrent = state.presentationId == controller.state.value.presentationId
+    BackHandler(enabled = state.open && presentationCurrent, onBack = ::close)
     Box(Modifier.fillMaxSize()) {
-        if (state.open) {
-            ProfilePickerToolsSurface(state, isTv, diagnosticAllowed = runCatching(requiredPolicy).getOrDefault(false),
+        if (state.open && presentationCurrent) {
+            val statusOnly = statusOnlyAdmission != null
+            ProfilePickerToolsSurface(state, isTv,
+                diagnosticAllowed = !statusOnly && runCatching(requiredPolicy).getOrDefault(false),
+                statusOnly = statusOnly,
                 onBack = ::close,
                 onDownload = { actionGrant?.let(controller::download) },
                 onRepair = if (controller.repairAvailable) ({ actionGrant?.let(controller::repair) }) else null,
@@ -89,7 +99,7 @@ internal fun ProfilePickerToolsHost(
                     }
                 },
                 onRestore = if (controller.restoreAvailable && actionGrant?.original?.account != null)
-                    ({ actionGrant?.let(controller::restore) }) else null,
+                    ({ actionGrant?.let { controller.restore(it, statusOnlyAdmission) } }) else null,
                 recoveryBusy = recoveryBusy || controller.recoveryBusy.value,
                 recoveryPaused = recoveryPaused,
                 recoveryLanding = recoveryLanding,
@@ -101,7 +111,7 @@ internal fun ProfilePickerToolsHost(
                 onRestoreDecision = { request, approved ->
                     actionGrant?.let { controller.confirmRestore(it, request, approved) }
                 },
-                onVerifyRestore = { request -> actionGrant?.let { controller.verifyRestore(it, request) } },
+                onVerifyRestore = { request -> actionGrant?.let { controller.verifyRestore(it, request, statusOnlyAdmission) } },
                 restoreInput = { request ->
                     key(request.routeId, request.operationId) {
                         PickerToolsRestoreInput(model, request, isTv)
@@ -207,6 +217,7 @@ internal fun ProfilePickerToolsSurface(
     state: PickerToolsState,
     isTv: Boolean,
     diagnosticAllowed: Boolean,
+    statusOnly: Boolean,
     onBack: () -> Unit,
     onDownload: () -> Unit,
     onRepair: (() -> Unit)?,
@@ -230,15 +241,22 @@ internal fun ProfilePickerToolsSurface(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Tools", style = VortXTheme.type.sectionTitle)
-        Text("Download an encrypted account backup, repair a selected backup into a separate copy, or share a diagnostic log.",
+        Text(if (statusOnly) "Check a retained backup restore or verify the cloud backup."
+            else "Download an encrypted account backup, repair a selected backup into a separate copy, or share a diagnostic log.",
             style = VortXTheme.type.body, modifier = Modifier.widthIn(max = 680.dp))
-        PickerToolsButton(if (recoveryLanding) "Back to recovery" else "Back to profiles", isTv, true,
+        PickerToolsButton(when {
+            statusOnly -> "Back to profile tools"
+            recoveryLanding -> "Back to recovery"
+            else -> "Back to profiles"
+        }, isTv, true,
             Modifier.focusRequester(firstFocus).testTag("picker-tools-back"), onBack)
-        PickerToolsButton("Download backup", isTv, !state.busy, Modifier.testTag("picker-tools-download"), onDownload)
-        if (onRepair != null)
-            PickerToolsButton("Repair backup", isTv, !state.busy, Modifier.testTag("picker-tools-repair"), onRepair)
+        if (!statusOnly) {
+            PickerToolsButton("Download backup", isTv, !state.busy, Modifier.testTag("picker-tools-download"), onDownload)
+            if (onRepair != null)
+                PickerToolsButton("Repair backup", isTv, !state.busy, Modifier.testTag("picker-tools-repair"), onRepair)
+        }
         if (onRestore != null) {
-            PickerToolsButton(if (recoveryPaused && state.restoreStatus == null) "Restore backup" else "Check restore status",
+            PickerToolsButton(if (!statusOnly && recoveryPaused && state.restoreStatus == null) "Restore backup" else "Check restore status",
                 isTv, !state.busy && !recoveryBusy, Modifier.testTag("picker-tools-restore"), onRestore)
             state.restoreStatus?.let { status ->
                 Text(status.message, style = VortXTheme.type.body,
@@ -259,7 +277,7 @@ internal fun ProfilePickerToolsSurface(
                 Modifier.testTag("picker-tools-recovery-resume"), onResumeRecovery)
         if (diagnosticAllowed) PickerToolsButton("Save or share diagnostic log", isTv, !state.busy,
             Modifier.testTag("picker-tools-diagnostics"), onDiagnostics)
-        else Text("Diagnostic sharing is unavailable while profiles are locked or their roster is unavailable.",
+        else if (!statusOnly) Text("Diagnostic sharing is unavailable while profiles are locked or their roster is unavailable.",
             style = VortXTheme.type.label, modifier = Modifier.widthIn(max = 680.dp))
         when (state.phase) {
             PickerToolsPhase.DOWNLOADING -> Text("Downloading encrypted account backup…")
@@ -338,6 +356,19 @@ internal fun PickerFileRecoveryLanding(isTv: Boolean, accountControl: ProfilePic
         accountControl?.let {
             PickerToolsButton(it.label, isTv, true, Modifier.testTag("picker-recovery-account"), it.onClick)
         }
+    }
+}
+
+@Composable
+internal fun PickerRestoreStatusLanding(isTv: Boolean, onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize().background(VortXTheme.colors.canvas)
+        .verticalScroll(rememberScrollState()).padding(if (isTv) 48.dp else 24.dp).padding(top = 56.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Profile picker tools", style = VortXTheme.type.sectionTitle)
+        Text("Open Tools to check a retained backup restore.", style = VortXTheme.type.body)
+        PickerToolsButton("Back to Settings", isTv, true, Modifier.testTag("picker-restore-status-back"), onBack)
     }
 }
 

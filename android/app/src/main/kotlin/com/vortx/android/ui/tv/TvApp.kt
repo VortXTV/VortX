@@ -55,6 +55,9 @@ import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
+import com.vortx.android.ui.profilepicker.PickerRestoreStatusLanding
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryAction
+import com.vortx.android.ui.profilepicker.pickerRestoreStatusEntryCurrent
 import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
 import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
 import com.vortx.android.ui.profilepicker.rememberPickerFileRecoveryPause
@@ -109,6 +112,8 @@ fun TvApp(
         // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
         // skip it by construction, because ProfileStore.needsPicker is false in both cases.
         var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        // Ordinary browse navigation is metadata and survives the pre-profile Tools return.
+        var shellDestination by rememberSaveable { mutableStateOf(TvDestination.HOME) }
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
         val pickerToolsModel = rememberPickerToolsModel(syncManager)
         val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
@@ -126,6 +131,25 @@ fun TvApp(
         LaunchedEffect(syncManager, sessionUiState) {
             if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
         }
+        val restoreStatusOwner by pickerToolsModel.restoreStatusOwner.collectAsStateWithLifecycle()
+        restoreStatusOwner?.let { original ->
+            val statusAdmission = {
+                pickerToolsModel.restoreStatusOwner.value === original && pickerToolsModel.controller.restoreAvailable &&
+                    !fileRecoveryPausedNow() && pickerRestoreStatusEntryCurrent(syncManager, original)
+            }
+            if (statusAdmission()) {
+                ProfilePickerToolsHost(pickerToolsModel, isTv = true,
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed,
+                    recoveryLanding = true, statusOnlyOwner = original, statusOnlyAdmission = statusAdmission) {
+                    PickerRestoreStatusLanding(isTv = true) {
+                        pickerToolsModel.closeRestoreStatus(original)
+                    }
+                }
+            } else LaunchedEffect(original) {
+                pickerToolsModel.closeRestoreStatus(original)
+            }
+            return@VortXTheme
+        }
         var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionRequest?>(null) }
         if (!pickerFileRecoveryPaused) profileSelection?.let { request ->
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
@@ -134,7 +158,8 @@ fun TvApp(
                 onChooseAgain = { profileSelection = null; showPicker = true })
             return@VortXTheme
         }
-        if (showPicker || pickerAccountOpen || pickerToolsState.open || pickerFileRecoveryPaused || showFileRecoveryEntry) {
+        if (showPicker || pickerAccountOpen || (pickerToolsState.open && pickerToolsModel.state.value.open) ||
+            pickerFileRecoveryPaused || showFileRecoveryEntry) {
             // The picker owns Back, its nested editor and exact native selection admission.
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
                 fileRecoveryPaused = pickerFileRecoveryPaused,
@@ -196,9 +221,6 @@ fun TvApp(
             mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
         }
         val autoAdvanceStreak = remember { intArrayOf(0) }
-        // The browse destination belongs above the player overlay. Returning from a cloud or link play must
-        // recreate the same Search surface rather than a fresh HOME shell.
-        var shellDestination by remember { mutableStateOf(TvDestination.HOME) }
         var searchFocusRestoreSignal by remember { mutableStateOf(0) }
         val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
             PlayerLaunchPolicy.effectivePreference(
@@ -918,6 +940,10 @@ fun TvApp(
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
                 TvShell(
+                    onOpenProfilePickerTools = if (shellDestination == TvDestination.SETTINGS)
+                        pickerRestoreStatusEntryAction(syncManager, pickerToolsModel.controller.restoreAvailable,
+                            fileRecoveryPausedNow, pickerToolsModel::openRestoreStatus)
+                    else null,
                     onProfileSelected = {
                         retireLibraryPlayRoute()
                         profileSelection = it

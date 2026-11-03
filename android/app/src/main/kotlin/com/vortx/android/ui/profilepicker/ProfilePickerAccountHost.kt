@@ -38,6 +38,31 @@ internal fun rememberPickerFileRecoveryPause(pause: StateFlow<Boolean>?): () -> 
     }
 }
 
+private fun pickerRestoreStatusProfileAllowed(): Boolean = runCatching {
+    ContinueWatchingOwnerGate.serialized {
+        val store = ProfileStore.sharedOrNull() ?: return@serialized false
+        !store.selectionPending &&
+            (store.active?.let { !it.isKids } ?: (store.profiles.isEmpty() && store.activeID == null))
+    }
+}.getOrDefault(false)
+
+internal fun pickerRestoreStatusEntryCurrent(manager: VortXSyncManager?, original: PickerAccountSnapshot): Boolean =
+    original.account != null && manager?.isPickerAccountCurrent(original) == true && pickerRestoreStatusProfileAllowed()
+
+/** Navigation only. The Tools controller still admits status and Verify under its rendered grant. */
+internal fun pickerRestoreStatusEntryAction(
+    manager: VortXSyncManager?,
+    restoreAvailable: Boolean,
+    recoveryPaused: () -> Boolean,
+    open: (PickerAccountSnapshot) -> Unit,
+): (() -> Unit)? {
+    if (!restoreAvailable || recoveryPaused() || !pickerRestoreStatusProfileAllowed()) return null
+    val original = manager?.capturePickerAccountSnapshot()?.takeIf { it.account != null } ?: return null
+    return {
+        if (!recoveryPaused() && pickerRestoreStatusEntryCurrent(manager, original)) open(original)
+    }
+}
+
 class ProfilePickerAccountControl(val label: String, val onClick: () -> Unit)
 
 /** No roster/failure fallback grants pre-profile diagnostic access. Staging re-reads this policy. */

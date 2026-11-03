@@ -680,6 +680,7 @@ fun SettingsScreen(
     onUsenetServersClick: (() -> Unit)? = null,
     onNzbIndexersClick: (() -> Unit)? = null,
     onImportedCollectionsClick: (() -> Unit)? = null,
+    onOpenProfilePickerTools: (() -> Unit)? = null,
 ) {
     val accountValue = when (authState) {
         is AuthState.SignedIn -> authState.email ?: "Signed in"
@@ -726,6 +727,9 @@ fun SettingsScreen(
         // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
         // makes the whole multi-profile subsystem reachable.
         SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
+        onOpenProfilePickerTools?.let {
+            SettingRow(VortXIcons.profiles, "Profile picker tools", "Check a retained backup restore", onClick = it)
+        }
         SettingRow(
             VortXIcons.settings,
             "Appearance",
