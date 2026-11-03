@@ -1,5 +1,6 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.engine.AccountFileLocalPresence
@@ -108,11 +109,17 @@ internal object NativeProviderAccess {
     val revision = changes.asStateFlow()
     private val changeLock = Any()
 
-    fun bind(vault: NativeProviderVault, admission: NativeProviderAdmission, changed: (SessionOwnerSnapshot.Account) -> Unit) {
-        synchronized(storeLock) { binding = Binding(vault, admission, changed) }
+    fun bind(vault: NativeProviderVault, admission: NativeProviderAdmission, changed: (SessionOwnerSnapshot.Account) -> Unit) =
+        AccountFileProviderWriters.withWriter(Unit) {
+            synchronized(storeLock) { binding = Binding(vault, admission, changed) }
+            notifyChanged()
+        }
+
+    fun unbindForTest() = AccountFileProviderWriters.withWriter(Unit) {
+        synchronized(storeLock) { binding = null }
         notifyChanged()
     }
-    fun unbindForTest() { synchronized(storeLock) { binding = null }; notifyChanged() }
+
     fun accountChanged() { notifyChanged() }
     private fun notifyChanged() = synchronized(changeLock) { changes.value += 1 }
 
@@ -125,28 +132,35 @@ internal object NativeProviderAccess {
         fun <T> withCurrent(document: JSONObject, action: (JSONObject) -> T): T {
             val original = checkNotNull(observation) { "Provider observation retired" }
             val binding = selected as Binding
-            return checkNotNull(binding.admission.withCurrent(original.owner) {
-                synchronized(storeLock) {
-                    check(NativeProviderAccess.binding === binding) { "Provider binding changed" }
-                    binding.vault.requireCurrent(original)
-                    action(binding.vault.prospective(original, document))
+            return checkNotNull(AccountFileProviderWriters.withWriter<T?>(null) {
+                binding.admission.withCurrent(original.owner) {
+                    synchronized(storeLock) {
+                        check(NativeProviderAccess.binding === binding) { "Provider binding changed" }
+                        binding.vault.requireCurrent(original)
+                        action(binding.vault.prospective(original, document))
+                    }
                 }
             }) { "Provider account changed" }
         }
         override fun close() { observation = null }
     }
-    fun captureProspective(owner: SessionOwnerSnapshot.Account): Prospective? {
-        val selected = binding ?: return null
-        return selected.admission.withCurrent(owner) {
-            synchronized(storeLock) {
-                check(binding === selected) { "Provider binding changed" }
-                Prospective(selected, selected.vault.observe(owner))
+    fun captureProspective(owner: SessionOwnerSnapshot.Account): Prospective? =
+        AccountFileProviderWriters.withWriter<Prospective?>(null) {
+            val selected = binding ?: return@withWriter null
+            selected.admission.withCurrent(owner) {
+                synchronized(storeLock) {
+                    check(binding === selected) { "Provider binding changed" }
+                    Prospective(selected, selected.vault.observe(owner))
+                }
             }
         }
-    }
 
-    fun inspectRestoreVaultPresence(owner: SessionOwnerSnapshot.Account): AccountFileLocalPresence {
+    /** Existing-only inspection may run under the Restore reservation. The ordinary load
+     * seeds a missing vault and therefore cannot be used as an absence witness. */
+    fun inspectRestoreVaultPresence(owner: SessionOwnerSnapshot.Account,
+                                   expectedVault: NativeProviderVault): AccountFileLocalPresence {
         val selected = binding ?: return AccountFileLocalPresence.UNAVAILABLE
+        if (selected.vault !== expectedVault) return AccountFileLocalPresence.UNAVAILABLE
         return selected.admission.withCurrent(owner) {
             synchronized(storeLock) {
                 if (binding !== selected) AccountFileLocalPresence.UNAVAILABLE
@@ -155,13 +169,16 @@ internal object NativeProviderAccess {
         } ?: AccountFileLocalPresence.UNAVAILABLE
     }
 
-    private fun <T> access(expected: SessionOwnerSnapshot.Account? = null, action: (Binding, SessionOwnerSnapshot.Account, NativeProviderCredentials) -> T): T? {
-        val selected = binding ?: return null
-        return selected.admission.withCurrent(expected) { owner -> synchronized(storeLock) {
-            check(binding === selected) { "Provider binding changed" }
-            action(selected, owner, selected.vault.load(owner))
-        } }
-    }
+    private fun <T> access(expected: SessionOwnerSnapshot.Account? = null,
+                           action: (Binding, SessionOwnerSnapshot.Account, NativeProviderCredentials) -> T): T? =
+        AccountFileProviderWriters.withWriter<T?>(null) {
+            val selected = binding ?: return@withWriter null
+            selected.admission.withCurrent(expected) { owner -> synchronized(storeLock) {
+                check(binding === selected) { "Provider binding changed" }
+                action(selected, owner, selected.vault.load(owner))
+            } }
+        }
+
     fun read(keys: Set<String>): Read? = runCatching { access { selected, owner, value ->
         Read(keys.associateWith(value::value), selected.vault.revision(owner, value), owner)
     } }.getOrNull()

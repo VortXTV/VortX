@@ -10,6 +10,7 @@ import com.google.crypto.tink.TinkProtoKeysetFormat
 import com.google.crypto.tink.integration.android.AndroidKeystoreKmsClient
 import com.google.crypto.tink.subtle.Hex
 import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.sync.AccountFileRestoreManagerExclusion
 import java.io.File
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -22,6 +23,33 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
 import java.util.UUID
+
+/** The three app-owned provider carriers have ordinary open/reopen paths outside the manager.
+ * Count them from process startup, including before the process provider binding exists. */
+internal object AccountFileProviderWriters {
+    private val carriers = setOf("vortx_native_provider_credentials", "vortx_debrid_keys", "vortx_metadata_credentials")
+    private val exclusion = AccountFileRestoreManagerExclusion()
+
+    fun contains(carrier: String): Boolean = carrier in carriers
+
+    fun <T> withCarrierWriter(carrier: String, refused: T, work: () -> T): T =
+        if (contains(carrier)) withWriter(refused, work) else work()
+
+    fun <T> withWriter(refused: T, work: () -> T): T {
+        if (!exclusion.enterWriter(observedEdit = false)) return refused
+        return try { work() } finally { exclusion.exitWriter() }
+    }
+
+    /** Retain only writer membership during structured transport and publication. */
+    suspend fun <T> withEffectfulWriter(refused: T, work: suspend () -> T): T {
+        if (!exclusion.enterWriter(observedEdit = false)) return refused
+        return try { work() } finally { exclusion.exitWriter() }
+    }
+
+    fun tryReserve(): AccountFileRestoreManagerExclusion.Reservation? = exclusion.tryReserve()
+    fun isCurrent(reservation: AccountFileRestoreManagerExclusion.Reservation): Boolean = exclusion.isCurrent(reservation)
+    fun release(reservation: AccountFileRestoreManagerExclusion.Reservation) = exclusion.release(reservation)
+}
 
 /**
  * A tiny encrypted credential store that never falls back to disk plaintext.
@@ -44,9 +72,10 @@ internal class FailClosedCredentialStore(
         RestoreCredentialOpenGate.forStore(encryptedFileName, backingFile, File(appContext.dataDir, "no_backup"))
     else null
     private val state: FailClosedCredentialState
+    private var initialProviderPurgePending = AccountFileProviderWriters.contains(encryptedFileName)
 
     init {
-        purgeLegacyPlaintext()
+        if (!initialProviderPurgePending) purgeLegacyPlaintext()
         state = FailClosedCredentialState(
             backend = openBackend(),
             onBackendFailure = { error ->
@@ -56,7 +85,13 @@ internal class FailClosedCredentialStore(
         )
     }
 
-    private fun openBackend(): CredentialBackend? =
+    private fun openBackend(): CredentialBackend? = withCarrierWriter(null) {
+        // Construction/refetch may initialize encrypted preferences or recover an Android
+        // backup. Defer both the open and its initial purge if Restore already holds the gate.
+        if (initialProviderPurgePending) {
+            purgeLegacyPlaintext()
+            initialProviderPurgePending = false
+        }
         openCredentialBackendOrNull({
             val gate = restoreGate
             if (gate == null) {
@@ -71,6 +106,10 @@ internal class FailClosedCredentialStore(
         }) { error ->
             Log.e(tag, "Encrypted credential storage unavailable; using memory only", error)
         }
+    }
+
+    private fun <T> withCarrierWriter(refused: T, work: () -> T): T =
+        AccountFileProviderWriters.withCarrierWriter(encryptedFileName, refused, work)
 
     private fun openEncryptedPreferences(): SharedPreferences {
         val masterKey = MasterKey.Builder(appContext)
@@ -85,10 +124,12 @@ internal class FailClosedCredentialStore(
         )
     }
 
-    fun string(key: String): String? = state.string(key)
+    fun string(key: String): String? = withCarrierWriter<String?>(null) { state.string(key) }
 
     fun confirmedSnapshot(vararg keys: String): PersistentCredentialSnapshot =
-        state.confirmedSnapshot(*keys)
+        withCarrierWriter(PersistentCredentialSnapshot(PersistentCredentialAvailability.UNAVAILABLE, emptyMap())) {
+            state.confirmedSnapshot(*keys)
+        }
 
     /** Presence only. Never reopen the encrypted backend or expose a credential value. */
     fun inspectExisting(vararg keys: String): AccountFileLocalPresence =
@@ -99,20 +140,18 @@ internal class FailClosedCredentialStore(
         state.inspectExisting(key, isInert)
 
     fun setIfConfirmedAbsent(key: String, value: String): ConditionalCredentialWrite =
-        state.writeIfConfirmedAbsent(key, value)
+        withCarrierWriter(ConditionalCredentialWrite.UNAVAILABLE) { state.writeIfConfirmedAbsent(key, value) }
 
-    fun set(key: String, value: String?): Boolean = state.write(mapOf(key to value))
+    fun set(key: String, value: String?): Boolean = set(mapOf(key to value))
 
-    fun set(values: Map<String, String?>): Boolean = state.write(values)
+    fun set(values: Map<String, String?>): Boolean = withCarrierWriter(false) { state.write(values) }
 
     fun replaceConfirmed(expected: Map<String, String?>, updates: Map<String, String?>): Boolean =
-        state.replaceConfirmed(expected, updates)
+        withCarrierWriter(false) { state.replaceConfirmed(expected, updates) }
 
-    fun setAndPurgeLegacy(values: Map<String, String?>): Boolean =
-        writeThenPurgeLegacy(
-            write = { state.write(values) },
-            purge = ::purgeLegacyPlaintext,
-        )
+    fun setAndPurgeLegacy(values: Map<String, String?>): Boolean = withCarrierWriter(false) {
+        writeThenPurgeLegacy(write = { state.write(values) }, purge = ::purgeLegacyPlaintext)
+    }
 
     fun clear(vararg keys: String): Boolean =
         setAndPurgeLegacy(keys.associateWith { null })

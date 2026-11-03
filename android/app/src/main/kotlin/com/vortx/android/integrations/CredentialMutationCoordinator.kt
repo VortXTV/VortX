@@ -1,5 +1,7 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.security.AccountFileProviderWriters
+
 /**
  * Orders durable credential publication against explicit sign-out.
  *
@@ -63,8 +65,20 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
             awaitValue: suspend () -> T,
             publish: (T) -> R,
         ): CredentialMutationResult<R> {
-            val value = awaitValue()
-            return mutate { publish(value) }
+            if (nativeKeys == null) {
+                val value = awaitValue()
+                return mutate { publish(value) }
+            }
+            // A device poll may consume its code and a refresh can rotate a remote token
+            // before the response arrives. Keep Restore out through structured cleanup and
+            // the same owner-fenced publication. Neither admission monitor spans the await.
+            return AccountFileProviderWriters.withEffectfulWriter<CredentialMutationResult<R>>(
+                CredentialMutationResult.Stale,
+            ) {
+                if (!isCurrent()) return@withEffectfulWriter CredentialMutationResult.Stale
+                val value = awaitValue()
+                mutate { publish(value) }
+            }
         }
     }
 }

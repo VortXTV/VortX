@@ -1,5 +1,7 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.sync.SessionOwnerSnapshot
@@ -8,8 +10,12 @@ import org.junit.After
 import org.junit.Assert.*
 import org.junit.Test
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 
 internal class NativeProviderTestStore : CredentialStoreAccess {
     val values = linkedMapOf<String, String?>()
@@ -19,6 +25,10 @@ internal class NativeProviderTestStore : CredentialStoreAccess {
     override fun confirmedSnapshot(vararg keys: String) = PersistentCredentialSnapshot(
         if (unavailable) PersistentCredentialAvailability.UNAVAILABLE else PersistentCredentialAvailability.AVAILABLE,
         if (unavailable) emptyMap() else keys.associateWith(values::get))
+    override fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence =
+        if (unavailable) AccountFileLocalPresence.UNAVAILABLE
+        else if (values[key]?.let { !isInert(it) } == true) AccountFileLocalPresence.PRESENT
+        else AccountFileLocalPresence.ABSENT
     override fun set(key: String, value: String?) = set(mapOf(key to value))
     override fun set(values: Map<String, String?>): Boolean {
         if (failWrite || unavailable) return false
@@ -103,6 +113,163 @@ class NativeProviderCredentialsTest {
         }
     }
     private fun bind(store: NativeProviderTestStore, owner: Owner) = NativeProviderAccess.bind(NativeProviderVault(store), owner) {}
+
+    @Test fun `Restore excludes lazy provider bootstrap direct writes and binding replacement`() {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        val store = NativeProviderTestStore()
+        var legacyReads = 0
+        var changed = 0
+        val vault = NativeProviderVault(store) { legacyReads++; JSONObject() }
+        NativeProviderAccess.bind(vault, owner) { changed++ }
+        val replacement = NativeProviderVault(NativeProviderTestStore())
+
+        val reservation = checkNotNull(AccountFileProviderWriters.tryReserve())
+        try {
+            assertNull(NativeProviderAccess.read(setOf("tmdb")))
+            assertNull(NativeProviderAccess.captureProspective(account))
+            assertNull(NativeProviderAccess.capture(setOf("tmdb")) { error("Guarded read must not run") })
+            assertFalse(NativeProviderAccess.authorize("tmdb", "synthetic", 0) { error("Issue must not run") })
+            assertNull(NativeProviderAccess.merge(account, JSONObject()))
+            assertNull(NativeProviderAccess.hasPending(account))
+            assertFalse(NativeProviderAccess.edit(mapOf("tmdb" to "synthetic")))
+            assertFalse(NativeProviderAccess.acknowledge(account, JSONObject()))
+            val oauth = NativeProviderAccess.oauthStore("simkl")
+            assertFalse(oauth.set(mapOf("vortx.simkl.accessToken" to "synthetic", "vortx.simkl.expiresAt" to "2000000000")))
+            assertEquals(PersistentCredentialAvailability.UNAVAILABLE,
+                oauth.confirmedSnapshot("vortx.simkl.accessToken").availability)
+            NativeProviderAccess.bind(replacement, owner) { error("Replacement must not publish") }
+            NativeProviderAccess.unbindForTest()
+            assertEquals(AccountFileLocalPresence.ABSENT, NativeProviderAccess.inspectRestoreVaultPresence(account, vault))
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                NativeProviderAccess.inspectRestoreVaultPresence(account, replacement))
+            assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                NativeProviderAccess.inspectRestoreVaultPresence(account.copy(generation = 2), vault))
+            assertTrue(AccountFileProviderWriters.isCurrent(reservation))
+            assertTrue(store.values.isEmpty())
+            assertEquals(0, legacyReads)
+            assertEquals(0, changed)
+        } finally {
+            AccountFileProviderWriters.release(reservation)
+        }
+        assertNotNull(NativeProviderAccess.read(setOf("tmdb")))
+        assertEquals(1, legacyReads)
+        assertTrue(NativeProviderAccess.edit(mapOf("tmdb" to "synthetic")))
+        assertEquals(1, changed)
+    }
+
+    @Test fun `provider physical carriers are counted before binding and refused during reservation`() {
+        val carriers = listOf("vortx_native_provider_credentials", "vortx_debrid_keys", "vortx_metadata_credentials")
+        for (carrier in carriers) {
+            assertTrue(AccountFileProviderWriters.withCarrierWriter(carrier, false) {
+                assertNull(AccountFileProviderWriters.tryReserve())
+                true
+            })
+        }
+        val reservation = checkNotNull(AccountFileProviderWriters.tryReserve())
+        try {
+            for (carrier in carriers) {
+                assertFalse(AccountFileProviderWriters.withCarrierWriter(carrier, false) {
+                    error("Direct physical provider opener/writer must not run")
+                })
+            }
+            assertTrue(AccountFileProviderWriters.withCarrierWriter("synthetic-unrelated-store", false) { true })
+            assertTrue(AccountFileProviderWriters.isCurrent(reservation))
+        } finally { AccountFileProviderWriters.release(reservation) }
+        assertTrue(AccountFileProviderWriters.withCarrierWriter(carriers.first(), false) { true })
+    }
+
+    @Test fun `native one-shot publication holds provider writer through await and publish`() = runBlocking {
+        val account = SessionOwnerSnapshot.Account(id, 1)
+        val owner = Owner(account)
+        bind(NativeProviderTestStore(), owner)
+        val operation = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1]).operation()
+        val entered = CompletableDeferred<Unit>()
+        val finish = CompletableDeferred<Unit>()
+        var requests = 0
+        val response = async {
+            operation.publishAfter(
+                awaitValue = {
+                    requests++
+                    entered.complete(Unit)
+                    finish.await()
+                    "synthetic-token"
+                },
+                publish = { token ->
+                    assertNull(AccountFileProviderWriters.tryReserve())
+                    NativeProviderAccess.oauthStore("simkl").set(
+                        mapOf("vortx.simkl.accessToken" to token, "vortx.simkl.expiresAt" to "0"),
+                    )
+                },
+            )
+        }
+        try {
+            entered.await()
+            assertNull(AccountFileProviderWriters.tryReserve())
+            finish.complete(Unit)
+            assertEquals(CredentialMutationResult.Applied(true), response.await())
+            assertEquals(1, requests)
+            val next = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[1]).operation()
+            val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+            try {
+                val refused = next.publishAfter(
+                    awaitValue = { requests++; "must not issue" },
+                    publish = { error("Must not publish under Restore") },
+                )
+                assertSame(CredentialMutationResult.Stale, refused)
+                assertEquals(1, requests)
+            } finally {
+                AccountFileProviderWriters.release(restore)
+            }
+
+            val pending = next.publishAfter(
+                awaitValue = { requests++; "pending" },
+                publish = { it },
+            )
+            assertEquals(CredentialMutationResult.Applied("pending"), pending)
+            val afterPending = checkNotNull(AccountFileProviderWriters.tryReserve())
+            AccountFileProviderWriters.release(afterPending)
+            assertEquals(2, requests)
+        } finally {
+            finish.complete(Unit)
+            response.cancelAndJoin()
+        }
+    }
+
+    @Test fun `native publication retains provider writer during cancellation cleanup`() = runBlocking {
+        bind(NativeProviderTestStore(), Owner(SessionOwnerSnapshot.Account(id, 1)))
+        val operation = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[0]).operation()
+        val entered = CompletableDeferred<Unit>()
+        val cleaning = CompletableDeferred<Unit>()
+        val cleanupComplete = CompletableDeferred<Unit>()
+        val response = async {
+            operation.publishAfter(
+                awaitValue = {
+                    entered.complete(Unit)
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) {
+                            cleaning.complete(Unit)
+                            cleanupComplete.await()
+                        }
+                    }
+                },
+                publish = { error("Cancelled response must not publish") },
+            )
+        }
+        try {
+            entered.await()
+            response.cancel()
+            cleaning.await()
+            assertNull(AccountFileProviderWriters.tryReserve())
+        } finally {
+            cleanupComplete.complete(Unit)
+            response.cancelAndJoin()
+        }
+        val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+        AccountFileProviderWriters.release(restore)
+    }
 
     @Test fun `actual OAuth persistence commits tuple and intent atomically and secure failure changes neither`() {
         val store = NativeProviderTestStore(); val owner = Owner(SessionOwnerSnapshot.Account(id, 1)); bind(store, owner)
@@ -210,10 +377,13 @@ class NativeProviderCredentialsTest {
             }
         }
         entered.await()
+        assertNull(AccountFileProviderWriters.tryReserve())
         val follower = async { TraktAuth.refreshAfterSerialization(waiting, persistence) { error("Second refresh must reuse the winner") } }
         release.complete(Unit)
         assertEquals("fresh", winner.await().accessToken); assertEquals("fresh", follower.await().accessToken)
         assertEquals(1, requests)
+        val restore = checkNotNull(AccountFileProviderWriters.tryReserve())
+        AccountFileProviderWriters.release(restore)
         val obsolete = coordinator.operation()
         owner.current = SessionOwnerSnapshot.Account(id, 2)
         var rejected = false

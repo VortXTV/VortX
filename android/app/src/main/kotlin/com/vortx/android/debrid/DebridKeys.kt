@@ -5,6 +5,7 @@ import android.util.AtomicFile
 import com.vortx.android.BuildConfig
 import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.integrations.NativeProviderAccess
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import java.io.ByteArrayInputStream
@@ -234,7 +235,12 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
             store.set(values)
         }
 
-    override fun legacyOwnerReservation(): LegacyOwnerReservation {
+    override fun legacyOwnerReservation(): LegacyOwnerReservation =
+        AccountFileProviderWriters.withWriter<LegacyOwnerReservation>(LegacyOwnerReservation.InvalidOrUnavailable) {
+            readLegacyOwnerReservation()
+        }
+
+    private fun readLegacyOwnerReservation(): LegacyOwnerReservation {
         val bytes = try {
             // Always enter AtomicFile.openRead. On older Android releases it restores a valid backup before
             // opening the base file; checking baseFile first would misclassify that recoverable state as absent.
@@ -261,23 +267,21 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
         return LegacyOwnerClaimCodec.decode(bytes)
     }
 
-    override fun claimLegacyOwner(owner: String): Boolean {
-        when (val existing = legacyOwnerReservation()) {
-            is LegacyOwnerReservation.Claimed -> return existing.owner == owner
-            LegacyOwnerReservation.InvalidOrUnavailable -> return false
-            LegacyOwnerReservation.Missing -> Unit
+    override fun claimLegacyOwner(owner: String): Boolean = AccountFileProviderWriters.withWriter(false) {
+        when (val existing = readLegacyOwnerReservation()) {
+            is LegacyOwnerReservation.Claimed -> existing.owner == owner
+            LegacyOwnerReservation.InvalidOrUnavailable -> false
+            LegacyOwnerReservation.Missing -> writeLegacyOwner(owner)
         }
-        return writeLegacyOwner(owner)
     }
 
-    override fun repairLegacyOwner(owner: String): Boolean {
-        when (val existing = legacyOwnerReservation()) {
-            is LegacyOwnerReservation.Claimed -> return existing.owner == owner
+    override fun repairLegacyOwner(owner: String): Boolean = AccountFileProviderWriters.withWriter(false) {
+        when (val existing = readLegacyOwnerReservation()) {
+            is LegacyOwnerReservation.Claimed -> existing.owner == owner
             LegacyOwnerReservation.InvalidOrUnavailable,
             LegacyOwnerReservation.Missing,
-            -> Unit
+            -> writeLegacyOwner(owner)
         }
-        return writeLegacyOwner(owner)
     }
 
     private fun writeLegacyOwner(owner: String): Boolean {

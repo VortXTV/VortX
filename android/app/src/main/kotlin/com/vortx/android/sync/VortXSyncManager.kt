@@ -13,6 +13,7 @@ import com.vortx.android.engine.VortxJniBindings
 import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.engine.VortxAccountScope
 import com.vortx.android.metadata.MetadataProviderKeys
+import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
@@ -1348,22 +1349,27 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         fileRestoreProviderVault = vault
     }
 
-    internal fun attachNativeGateway(gateway: NativeAccountGateway) {
-        nativeGateway = gateway
-        bindNativeProviders()
-        gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
-        scope.launch { syncDown(force = true) }
-        scope.launch { sessionUiState.collect { state ->
-            com.vortx.android.integrations.NativeProviderAccess.accountChanged()
-            if (state !is SessionUiState.SignedIn) gateway.retire()
-        } }
-    }
-    internal fun installNativeGatewayTestSeam(gateway: NativeAccountGateway, credentials: com.vortx.android.integrations.CredentialStoreAccess? = null) {
-        nativeGateway = gateway
-        if (credentials != null) { nativeProviderStore = credentials; nativeProviderTestStore = true }
-        bindNativeProviders()
-        gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
-    }
+    internal fun attachNativeGateway(gateway: NativeAccountGateway) =
+        AccountFileProviderWriters.withWriter(Unit) {
+            nativeGateway = gateway
+            bindNativeProviders()
+            gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
+            scope.launch { syncDown(force = true) }
+            scope.launch { sessionUiState.collect { state ->
+                com.vortx.android.integrations.NativeProviderAccess.accountChanged()
+                if (state !is SessionUiState.SignedIn) gateway.retire()
+            } }
+            Unit
+        }
+
+    internal fun installNativeGatewayTestSeam(gateway: NativeAccountGateway,
+        credentials: com.vortx.android.integrations.CredentialStoreAccess? = null) =
+        AccountFileProviderWriters.withWriter(Unit) {
+            nativeGateway = gateway
+            if (credentials != null) { nativeProviderStore = credentials; nativeProviderTestStore = true }
+            bindNativeProviders()
+            gateway.installPlaylistAccountProducer(NativePlaylistAccountProducer(::capturePlaylistAccountWrite))
+        }
 
     /** Capture once before the edit suspends. GET operation generation is intentionally absent:
      * this edit owns a new current authenticated admission, plus the coordinator's original raw GET.
@@ -2512,6 +2518,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             try {
                 val managed = fileRestoreExclusion.tryReserve()
                     ?: return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+                val providerWriters = AccountFileProviderWriters.tryReserve()
+                if (providerWriters == null) {
+                    fileRestoreExclusion.release(managed)
+                    return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+                }
                 try {
                     val capturedNativeGateway = nativeGateway
                     val externalOwner = AccountFileRestoreExternalExclusion.Owner(
@@ -2522,8 +2533,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         val auxiliaryBackings = AtomicReference<List<() -> Boolean>?>(null)
                         fun requireManagedIdle() {
                             requireFileRestoreOwner(capture, lease, caller, routeCurrent)
-                            if (!fileRestoreExclusion.isCurrent(managed) || nativeSyncMutex.isLocked ||
-                                nativeGateway !== capturedNativeGateway || applyingRemote)
+                            if (!fileRestoreExclusion.isCurrent(managed) || !AccountFileProviderWriters.isCurrent(providerWriters) ||
+                                nativeSyncMutex.isLocked || nativeGateway !== capturedNativeGateway || applyingRemote)
                                 throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
                             addonWriter.requireCurrent(externalOwner.account)
                             auxiliaryBackings.get()?.let(::requireAuxiliaryRestoreBackings)
@@ -2575,7 +2586,10 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                         }
                         outcome ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
                     }
-                } finally { fileRestoreExclusion.release(managed) }
+                } finally {
+                    AccountFileProviderWriters.release(providerWriters)
+                    fileRestoreExclusion.release(managed)
+                }
             } finally { accountFileRepairSlot.unlock() }
         }
 
@@ -2655,7 +2669,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         witness { ownerWatchedIntents.inspectRestorePresence(owner.id) }
         witness {
             val vault = fileRestoreProviderVault ?: return@witness AccountFileLocalPresence.UNAVAILABLE
-            val result = vault.inspectRestorePresence(owner)
+            val result = com.vortx.android.integrations.NativeProviderAccess.inspectRestoreVaultPresence(owner, vault)
             if (fileRestoreProviderVault === vault) result else AccountFileLocalPresence.UNAVAILABLE
         }
         witness { debridKeys.inspectQualifiedRestorePresence(owner.id) }
