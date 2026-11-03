@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.profile.RestoreProfileDirectWriters
 import com.vortx.android.engine.OHJson
 import org.json.JSONArray
 import org.json.JSONObject
@@ -127,36 +128,36 @@ class LibraryTombstones internal constructor(
         }
     }
 
-    fun tombstone(id: String): Boolean = synchronized(LOCK) {
+    fun tombstone(id: String): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
-        if (!isCurrent()) return@synchronized false
+        if (!isCurrent()) return@withDirectRestoreWrite false
         val key = normalize(id)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load()
         val wasRemoved = isRemoved(key, state)
         state.removedAt[key] = maxOf(state.removedAt[key] ?: 0.0, nowMs())
-        if (!save(state)) return@synchronized false
+        if (!save(state)) return@withDirectRestoreWrite false
         !wasRemoved && isRemoved(key, state)
     }
 
-    fun forget(id: String): Boolean = synchronized(LOCK) {
+    fun forget(id: String): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
-        if (!isCurrent()) return@synchronized false
+        if (!isCurrent()) return@withDirectRestoreWrite false
         val key = normalize(id)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load()
         val wasRemoved = isRemoved(key, state)
         state.addedAt[key] = maxOf(state.addedAt[key] ?: 0.0, nowMs())
-        if (!save(state)) return@synchronized false
+        if (!save(state)) return@withDirectRestoreWrite false
         wasRemoved && !isRemoved(key, state)
     }
 
     fun merge(
         legacyIds: List<String>,
         stampsRaw: Map<String, Map<String, Double>>,
-    ): Boolean = synchronized(LOCK) {
+    ): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
-        if (!isCurrent() || owner.accountId == null) return@synchronized false
+        if (!isCurrent() || owner.accountId == null) return@withDirectRestoreWrite false
         val state = load()
         val before = effectiveRemoved(state.removedAt, state.addedAt)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
@@ -185,12 +186,16 @@ class LibraryTombstones internal constructor(
             state.removedAt[id] = maxOf(state.removedAt[id] ?: 0.0, MIGRATION_EPOCH_MS)
         }
 
-        if (!save(state)) return@synchronized false
+        if (!save(state)) return@withDirectRestoreWrite false
         if (maxFutureSeen > 0.0) {
             Log.d(TAG, "library tombstone fold saw a stamp ${maxFutureSeen.toLong()} beyond now+48h (peer clock skew)")
         }
         val after = load()
         isCurrent() && effectiveRemoved(after.removedAt, after.addedAt) != before
+    }
+
+    private inline fun <T> withDirectRestoreWrite(action: () -> T): T = RestoreProfileDirectWriters.write {
+        synchronized(LOCK) { action() }
     }
 
     private fun isCurrent(): Boolean = owner == activeOwner
@@ -251,10 +256,12 @@ class LibraryTombstones internal constructor(
         @Volatile private var activeOwner = Owner(null, null, 0)
 
         /** Called only at serialized VortX session adoption/clear, before publishing the new account. */
-        internal fun activateAccount(accountId: String?) = synchronized(LOCK) {
-            val id = accountId?.takeIf { it.isNotBlank() }
-            val namespace = id?.let(::namespaceFor)
-            activeOwner = Owner(id, namespace, activeOwner.revision + 1)
+        internal fun activateAccount(accountId: String?) = RestoreProfileDirectWriters.retirement {
+            synchronized(LOCK) {
+                val id = accountId?.takeIf { it.isNotBlank() }
+                val namespace = id?.let(::namespaceFor)
+                activeOwner = Owner(id, namespace, activeOwner.revision + 1)
+            }
         }
 
         @Volatile private var restoreWrites = 0L

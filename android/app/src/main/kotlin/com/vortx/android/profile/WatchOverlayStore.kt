@@ -50,12 +50,12 @@ class WatchOverlayStore(
     @Volatile private var restoreGeneration = 0L
     private var restoreInFlight = 0
 
-    private inline fun <T> overlayWrite(action: () -> T): T {
+    private inline fun <T> overlayWrite(action: () -> T): T = RestoreProfileDirectWriters.write {
         synchronized(restoreWriters) {
             if (restoreGeneration < Long.MAX_VALUE) restoreGeneration++
             restoreInFlight++
         }
-        return try { action() } finally { synchronized(restoreWriters) { restoreInFlight-- } }
+        try { action() } finally { synchronized(restoreWriters) { restoreInFlight-- } }
     }
 
     private fun restoreIdleLocked(): Boolean =

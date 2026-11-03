@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.profile.RestoreProfileDirectWriters
 import com.vortx.android.sync.RestoreTombstoneRows
 import java.util.UUID
 import org.json.JSONArray
@@ -121,11 +122,11 @@ class AddonTombstones internal constructor(
      * Record an add-on removal so it sticks across devices. Callers MUST guard PROTECTED before calling.
      * Returns true when the url becomes NEWLY effectively-removed.
      */
-    fun tombstone(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+    fun tombstone(transportUrl: String): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
         val scope = currentScope()
         val key = normalize(transportUrl)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.removedAt[key] = maxOf(state.removedAt[key] ?: 0.0, nowMs())
@@ -137,11 +138,11 @@ class AddonTombstones internal constructor(
      * Forget a removal tombstone so an EXPLICIT fresh install of the same add-on is honored instead of being
      * suppressed forever by an old removal. Returns true when the url flips from removed to present.
      */
-    fun forget(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+    fun forget(transportUrl: String): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
         val scope = currentScope()
         val key = normalize(transportUrl)
-        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
+        if (key.isEmpty() || key.length > MAX_ID_LENGTH) return@withDirectRestoreWrite false
         val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.addedAt[key] = maxOf(state.addedAt[key] ?: 0.0, nowMs())
@@ -162,11 +163,11 @@ class AddonTombstones internal constructor(
         legacyIds: List<String>,
         stamps: Map<String, Map<String, Double>>,
         webIds: List<String> = emptyList(),
-    ): Boolean = synchronized(PROCESS_LOCK) {
+    ): Boolean = withDirectRestoreWrite {
         noteRestoreWrite()
         val scope = currentScope()
         // Cloud entries are account data. Never mint or fold them into the anonymous local-only namespace.
-        if (!scope.isSyncable) return@synchronized false
+        if (!scope.isSyncable) return@withDirectRestoreWrite false
         val state = load(scope)
         val before = effectiveRemoved(state)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
@@ -217,10 +218,10 @@ class AddonTombstones internal constructor(
      * currently-installed add-ons, so a stale pre-tombstone peer array cannot re-uninstall an add-on the user
      * demonstrably has. Skips any url whose folded removedAt is a real, post-epoch removal.
      */
-    fun baselineInstalled(transportUrls: List<String>) = synchronized(PROCESS_LOCK) {
+    fun baselineInstalled(transportUrls: List<String>) = withDirectRestoreWrite {
         noteRestoreWrite()
         val scope = currentScope()
-        if (transportUrls.isEmpty()) return
+        if (transportUrls.isEmpty()) return@withDirectRestoreWrite
         val state = load(scope)
         val now = nowMs()
         for (raw in transportUrls) {
@@ -234,6 +235,10 @@ class AddonTombstones internal constructor(
     }
 
     // ---- State ----
+
+    private inline fun <T> withDirectRestoreWrite(action: () -> T): T = RestoreProfileDirectWriters.write {
+        synchronized(PROCESS_LOCK) { action() }
+    }
 
     private fun isRemoved(url: String, state: State): Boolean =
         (state.removedAt[url] ?: 0.0) > (state.addedAt[url] ?: 0.0)
@@ -340,7 +345,7 @@ class AddonTombstones internal constructor(
         private val activeAccountScope: String? get() = activeAccount.id
 
         /** Session ownership comes only from VortXSyncManager. Signed-out state is device-local only. */
-        fun activateAccount(accountId: String?) {
+        fun activateAccount(accountId: String?) = RestoreProfileDirectWriters.retirement {
             activeAccount = ActiveAccount(accountId?.takeIf { it.isNotBlank() })
         }
 

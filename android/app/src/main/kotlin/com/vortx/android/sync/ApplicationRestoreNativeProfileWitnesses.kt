@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicReference
 internal class ApplicationRestoreNativeProfileWitnesses private constructor(
     private val original: AccountFileRestoreExternalExclusion.Owner,
     private val native: NativeAccountCoordinator.RestoreNativeExclusion,
-    private val profiles: ProfileStore,
+    private val profileWriters: ProfileStore.HeldRestoreDirectExclusion,
     private val requireApplicationOwner: () -> Unit,
 ) {
     private class Bound(val scope: VortxAccountScope, val profile: ProfileStore.RestoreDirectState.Absent)
@@ -24,6 +24,7 @@ internal class ApplicationRestoreNativeProfileWitnesses private constructor(
         requireApplicationOwner()
         val captured = bound.get()
         native.requireCurrent(owner.account, captured?.scope)
+        profileWriters.requireCurrent(owner.account)
         captured?.profile?.requireCurrent(owner.account)
         requireApplicationOwner()
     }
@@ -36,7 +37,7 @@ internal class ApplicationRestoreNativeProfileWitnesses private constructor(
             AccountFileLocalPresence.PRESENT -> refuse(AccountFileRestoreTransaction.Reason.PENDING_LOCAL_CHANGES)
             AccountFileLocalPresence.UNAVAILABLE -> refuse(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
         }
-        val observation = when (val state = profiles.inspectRestoreDirectState(owner.account)) {
+        val observation = when (val state = profileWriters.inspectStateOnWorker(owner.account)) {
             is ProfileStore.RestoreDirectState.Absent -> state
             ProfileStore.RestoreDirectState.Present -> refuse(AccountFileRestoreTransaction.Reason.PENDING_LOCAL_CHANGES)
             ProfileStore.RestoreDirectState.Unavailable -> refuse(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
@@ -66,7 +67,9 @@ internal class ApplicationRestoreNativeProfileWitnesses private constructor(
             }
             requireApplicationOwner()
             return application.nativeStreamingAccounts().withRestoreNativeExclusion(original.account, ::requireApplicationOwner) { native ->
-                operation(ApplicationRestoreNativeProfileWitnesses(original, native, profiles, ::requireApplicationOwner))
+                profiles.withRestoreDirectExclusion(original.account, ::requireApplicationOwner) { profileWriters ->
+                    operation(ApplicationRestoreNativeProfileWitnesses(original, native, profileWriters, ::requireApplicationOwner))
+                } ?: refuse(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
             }
         }
 

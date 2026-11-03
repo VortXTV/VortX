@@ -19,11 +19,66 @@ import com.vortx.android.sources.SourceType
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import org.json.JSONArray
+
+/** One process lane for actual direct profile, overlay and tombstone writes. */
+internal object RestoreProfileDirectWriters {
+    internal class Reservation {
+        @Volatile var revoked = false
+    }
+
+    private val lock = Any()
+    @Volatile private var held: Reservation? = null
+    private var activeWriters = 0
+
+    fun reserve(): Reservation? = synchronized(lock) {
+        if (held != null || activeWriters != 0) null else Reservation().also { held = it }
+    }
+
+    fun isHeld(): Boolean = held != null
+
+    fun requireCurrent(original: Reservation) {
+        check(held === original && !original.revoked) { "Local profile Restore exclusion retired" }
+    }
+
+    fun release(original: Reservation) = synchronized(lock) {
+        check(held === original) { "Local profile Restore reservation changed" }
+        held = null
+    }
+
+    fun begin(): Boolean = synchronized(lock) {
+        if (held != null) false else {
+            activeWriters++
+            true
+        }
+    }
+
+    fun end() = synchronized(lock) {
+        check(activeWriters > 0)
+        activeWriters--
+        Unit
+    }
+
+    inline fun <T> write(action: () -> T): T {
+        check(begin()) { "Local profile changes are busy during backup Restore" }
+        return try { action() } finally { end() }
+    }
+
+    /** Account retirement must complete. Revoke before publishing any transition, retaining the
+     * original reservation until its operation drains. The callback runs outside the gate monitor. */
+    fun <T> retirement(action: () -> T): T {
+        synchronized(lock) {
+            held?.revoked = true
+            activeWriters++
+        }
+        return try { action() } finally { end() }
+    }
+}
 
 internal fun activateProfileInOrder(
     transitionHome: () -> Unit,
@@ -98,6 +153,10 @@ class ProfileStore private constructor(context: Context) {
         restoreProfileGeneration.updateAndGet { if (it == Long.MAX_VALUE) it else it + 1 }
     }
 
+    private fun <T> withDirectProfileWrite(action: () -> T): T = RestoreProfileDirectWriters.write {
+        ContinueWatchingOwnerGate.serialized { action() }
+    }
+
     // ---- Observable-ish state (plain fields; callers on the main thread, mirroring Apple's @Published) ----
 
     var profiles: List<UserProfile> = emptyList()
@@ -123,12 +182,15 @@ class ProfileStore private constructor(context: Context) {
     /** An admitted selection is not a completed account handoff, including on a one-profile device. */
     @Volatile internal var selectionPending: Boolean = false
         set(value) {
-            restoreSelectionWriters.incrementAndGet()
-            try {
-                noteRestoreProfileWrite()
-                field = value
-            } finally {
-                restoreSelectionWriters.decrementAndGet()
+            // A selection lifecycle transition cannot be stranded by an old Restore.
+            RestoreProfileDirectWriters.retirement {
+                restoreSelectionWriters.incrementAndGet()
+                try {
+                    noteRestoreProfileWrite()
+                    field = value
+                } finally {
+                    restoreSelectionWriters.decrementAndGet()
+                }
             }
         }
 
@@ -197,10 +259,10 @@ class ProfileStore private constructor(context: Context) {
 
     private var nativeGateway: NativeProfileGateway? = null
     private var applyingNativeAccountSettings = false
-    internal fun <T> withoutNativePreferenceCapture(action: () -> T): T {
+    internal fun <T> withoutNativePreferenceCapture(action: () -> T): T = RestoreProfileDirectWriters.write {
         val previous = applyingNativeAccountSettings
         applyingNativeAccountSettings = true
-        return try { action() } finally { applyingNativeAccountSettings = previous }
+        try { action() } finally { applyingNativeAccountSettings = previous }
     }
     private var nativeProjectionRequest = 0L
         set(value) { noteRestoreProfileWrite(); field = value }
@@ -231,12 +293,18 @@ class ProfileStore private constructor(context: Context) {
     /** Bootstrap remains suspended until a current projection is installed. Expensive captures and
      * durable legacy migration run on IO; plain host fields and preference listeners stay on Main. */
     internal suspend fun attachNativeGateway(gateway: NativeProfileGateway, mountIdentity: Any, forceSettings: Boolean = false) {
+        check(RestoreProfileDirectWriters.begin()) { "Local profile changes are busy during backup Restore" }
+        try { attachNativeGatewayAsWriter(gateway, mountIdentity, forceSettings) }
+        finally { RestoreProfileDirectWriters.end() }
+    }
+
+    private suspend fun attachNativeGatewayAsWriter(gateway: NativeProfileGateway, mountIdentity: Any, forceSettings: Boolean) {
         val request = withContext(Dispatchers.Main) {
             ContinueWatchingOwnerGate.serialized {
                 if (nativeProjectionMount !== mountIdentity) {
                     val initial = nativeProjectionMount == null
                     if (initial) initialNativeMigrationProfile = active ?: initialNativeMigrationProfile
-                    clearNativeProjection(retireLegacy = !initial, retireMigration = !initial)
+                    clearNativeProjectionAsWriter(retireLegacy = !initial, retireMigration = !initial)
                 }
                 nativeGateway = gateway
                 nativeProjectionMount = mountIdentity
@@ -368,12 +436,15 @@ class ProfileStore private constructor(context: Context) {
         acknowledgedNativeAccount = effects.account; acknowledgedNativeTraktEpoch = effects.traktEpoch
         initialNativeMigrationProfile = null
     }
-    internal fun refreshNativeProjection(forceSettings: Boolean = false) = ContinueWatchingOwnerGate.serialized {
+    internal fun refreshNativeProjection(forceSettings: Boolean = false) = withDirectProfileWrite {
         checkNotNull(nativeGateway).withCurrentProjection { current ->
             applyNativeProjectionLocked(current, forceSettings)
         }
     }
-    internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) = ContinueWatchingOwnerGate.serialized {
+    internal fun clearNativeProjection(retireLegacy: Boolean = true, retireMigration: Boolean = true) =
+        RestoreProfileDirectWriters.retirement { clearNativeProjectionAsWriter(retireLegacy, retireMigration) }
+
+    private fun clearNativeProjectionAsWriter(retireLegacy: Boolean, retireMigration: Boolean) = ContinueWatchingOwnerGate.serialized {
         nativeProjectionRequest++
         nativeProjectionMount = null
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
@@ -644,7 +715,7 @@ class ProfileStore private constructor(context: Context) {
     // ---- Selection / CRUD ----
 
     /** Make [candidate] active: applies its prefs immediately and reports the account work left. Apple `select`. */
-    fun select(candidate: UserProfile): SwitchOutcome = ContinueWatchingOwnerGate.serialized {
+    fun select(candidate: UserProfile): SwitchOutcome = withDirectProfileWrite {
         check(profiles.firstOrNull { it.id == candidate.id } == candidate) { "Profile changed; unlock the current profile again" }
         capturePlaybackLocked()
         captureDiscoveryLocked()
@@ -678,11 +749,11 @@ class ProfileStore private constructor(context: Context) {
         return if (!token.isNullOrEmpty()) SwitchOutcome.SwitchAccount(token) else SwitchOutcome.NeedsSignIn
     }
 
-    fun add(profile: UserProfile) = ContinueWatchingOwnerGate.serialized {
+    fun add(profile: UserProfile) = withDirectProfileWrite {
         applyNativeProjection(checkNotNull(nativeGateway).save(profile, adding = true))
     }
 
-    fun update(profile: UserProfile) = ContinueWatchingOwnerGate.serialized {
+    fun update(profile: UserProfile) = withDirectProfileWrite {
         applyNativeProjection(checkNotNull(nativeGateway).save(profile, adding = false))
     }
 
@@ -718,7 +789,7 @@ class ProfileStore private constructor(context: Context) {
     fun isAddonDisabledForActive(base: String): Boolean = (active?.disabledAddons ?: emptyList()).contains(base)
 
     /** Remove a profile (never the last one). Mirrors Apple `remove`. */
-    fun remove(profile: UserProfile): SwitchOutcome? = ContinueWatchingOwnerGate.serialized {
+    fun remove(profile: UserProfile): SwitchOutcome? = withDirectProfileWrite {
         applyNativeProjection(checkNotNull(nativeGateway).remove(profile.id))
         SwitchOutcome.SameAccount
     }
@@ -877,14 +948,19 @@ class ProfileStore private constructor(context: Context) {
      * echoing back as roster edits. Mirrors Apple `capturePlayback`.
      */
     fun capturePlayback() = ContinueWatchingOwnerGate.serialized {
-        capturePlaybackLocked()
+        if (active == null) return@serialized
+        RestoreProfileDirectWriters.write { capturePlaybackLocked() }
     }
 
     /** Called by active Discover/catalog setting writers after their flat-key mutation commits. */
     fun captureDiscovery(continueWatchingEdit: Boolean = false) = ContinueWatchingOwnerGate.serialized {
-        if (shouldCaptureDiscovery(applyingDiscoveryProjection)) {
-            if (continueWatchingEdit) continueWatchingMigration.retire()
-            captureDiscoveryLocked()
+        if (RestoreProfileDirectWriters.isHeld() && active == null &&
+            continueWatchingMigration.snapshot().let { it.witness == null && it.pendingDiscovery == null }) return@serialized
+        RestoreProfileDirectWriters.write {
+            if (shouldCaptureDiscovery(applyingDiscoveryProjection)) {
+                if (continueWatchingEdit) continueWatchingMigration.retire()
+                captureDiscoveryLocked()
+            }
         }
     }
 
@@ -1043,7 +1119,10 @@ class ProfileStore private constructor(context: Context) {
             // An older app updates only the canonical Long and leaves our exact-bits key behind. Heal both
             // representations from the newest valid value so returning to this build cannot revive that stale key.
             if (exactBits != resolved.toRawBits() || legacySeconds != resolved.toLong()) {
-                writeRosterClock(resolved)
+                // A read remains available. Defer optional housekeeping during Restore.
+                if (RestoreProfileDirectWriters.begin()) {
+                    try { writeRosterClock(resolved) } finally { RestoreProfileDirectWriters.end() }
+                }
             }
             return resolved
         }
@@ -1085,6 +1164,56 @@ class ProfileStore private constructor(context: Context) {
         override fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
             check(owner == original) { "Original profile Restore owner retired" }
             current()
+        }
+    }
+
+    internal interface HeldRestoreDirectExclusion {
+        /** Scalar check. The manager separately checks the original auth permit. */
+        fun requireCurrent(owner: SessionOwnerSnapshot.Account)
+        fun inspectStateOnWorker(owner: SessionOwnerSnapshot.Account): RestoreDirectState
+    }
+
+    /** Reserve the actual direct writer lane without retaining a monitor over the operation. */
+    internal suspend fun <T : Any> withRestoreDirectExclusion(
+        originalOwner: SessionOwnerSnapshot.Account,
+        requireOriginal: () -> Unit,
+        operation: suspend (HeldRestoreDirectExclusion) -> T,
+    ): T? {
+        val job = currentCoroutineContext()[Job]
+        job?.ensureActive()
+        requireOriginal()
+        val reservation = RestoreProfileDirectWriters.reserve() ?: return null
+        try {
+            // A delayed overlay push or existing process state belongs to ordinary sync.
+            val idle = ContinueWatchingOwnerGate.serialized {
+                restoreProfileProcessIdle() && overlay.captureRestoreIdle() != null
+            }
+            if (!idle) return null
+            val held = object : HeldRestoreDirectExclusion {
+                override fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
+                    check(owner == originalOwner) { "Original profile Restore owner retired" }
+                    job?.ensureActive()
+                    RestoreProfileDirectWriters.requireCurrent(reservation)
+                }
+
+                override fun inspectStateOnWorker(owner: SessionOwnerSnapshot.Account): RestoreDirectState {
+                    requireCurrent(owner)
+                    requireOriginal()
+                    val state = inspectRestoreDirectState(owner)
+                    requireOriginal()
+                    requireCurrent(owner)
+                    if (state !is RestoreDirectState.Absent) return state
+                    return AbsentRestoreDirectState(owner) {
+                        requireCurrent(owner)
+                        state.requireCurrent(owner)
+                    }
+                }
+            }
+            requireOriginal()
+            held.requireCurrent(originalOwner)
+            return operation(held)
+        } finally {
+            RestoreProfileDirectWriters.release(reservation)
         }
     }
 
@@ -1159,10 +1288,10 @@ class ProfileStore private constructor(context: Context) {
     }
 
     /** Fold incoming tombstones into the local set (dropping the owner defensively). Apple `mergeDeletedTombstones`. */
-    fun mergeDeletedTombstones(incoming: List<String>): Boolean = ContinueWatchingOwnerGate.serialized {
+    fun mergeDeletedTombstones(incoming: List<String>): Boolean = withDirectProfileWrite {
         val add = incoming.map { UserProfile.normalizeId(it) }
             .filter { it != UserProfile.OWNER_ID && !deletedProfileIDs.contains(it) }
-        if (add.isEmpty()) return@serialized false
+        if (add.isEmpty()) return@withDirectProfileWrite false
         deletedProfileIDs = deletedProfileIDs + add
         saveDeletedTombstones()
         pruneTombstonedProfiles()
@@ -1170,13 +1299,13 @@ class ProfileStore private constructor(context: Context) {
     }
 
     /** Remove any live profile whose id is tombstoned (never the owner). Apple `pruneTombstonedProfiles`. */
-    private fun pruneTombstonedProfiles() = ContinueWatchingOwnerGate.serialized {
+    private fun pruneTombstonedProfiles() = withDirectProfileWrite {
         val beforeProfiles = profiles
         val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         val beforeAccount = acknowledgedNativeAccount
         val beforeTraktEpoch = acknowledgedNativeTraktEpoch
         val pruned = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
-        if (pruned == beforeProfiles) return@serialized
+        if (pruned == beforeProfiles) return@withDirectProfileWrite
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             profiles = pruned
             if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
@@ -1196,7 +1325,7 @@ class ProfileStore private constructor(context: Context) {
     // ---- Roster sync folds ----
 
     /** Adopt a remote roster wholesale (newest side wins). Mirrors Apple `adoptRemoteRoster`. */
-    fun adoptRemoteRoster(remote: List<UserProfile>) {
+    fun adoptRemoteRoster(remote: List<UserProfile>) = RestoreProfileDirectWriters.write {
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             val beforeBinding = captureActiveProfileBinding(profiles, activeID)
             val beforeAccount = acknowledgedNativeAccount
@@ -1210,7 +1339,7 @@ class ProfileStore private constructor(context: Context) {
      * Re-read the roster from the restored defaults (after a settings-backup restore), KEEPING this
      * device's active selection (selection is per-device). Mirrors Apple `reloadFromDefaults`.
      */
-    fun reloadFromDefaults() = ContinueWatchingOwnerGate.serialized {
+    fun reloadFromDefaults() = withDirectProfileWrite {
         refreshNativeProjection()
     }
 
@@ -1224,8 +1353,8 @@ class ProfileStore private constructor(context: Context) {
     fun mergeInRoster(
         incoming: List<UserProfile>,
         incomingModified: Double? = null,
-    ) = ContinueWatchingOwnerGate.serialized {
-        if (incoming.isEmpty()) return@serialized
+    ) = withDirectProfileWrite {
+        if (incoming.isEmpty()) return@withDirectProfileWrite
         val beforeBinding = captureActiveProfileBinding(profiles, activeID)
         val beforeAccount = acknowledgedNativeAccount
         val beforeTraktEpoch = acknowledgedNativeTraktEpoch
