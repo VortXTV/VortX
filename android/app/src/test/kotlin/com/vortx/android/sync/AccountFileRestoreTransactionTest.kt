@@ -175,7 +175,7 @@ class AccountFileRestoreTransactionTest {
         assertTrue(runCatching { checkNotNull(x.retainedGrant).take(x.lease) }.exceptionOrNull() is Refusal)
     }
 
-    @Test fun authenticatedDestinationWithResolvableOwnerStillRejectsQueuedOwnAndHeldMaterial() = runBlocking {
+    @Test fun authenticatedDestinationWithResolvableOwnerStillRejectsQueuedOwnHeldAndPendingMaterial() = runBlocking {
         val legacy = f.source(settings = false)
         val queued = listOf("profileEdits", "profileEditEvents", "webAddonEdits").map { key ->
             OHJson.Obj(legacy).set(key, OHJson.literal("null")).encoded()
@@ -193,7 +193,17 @@ class AccountFileRestoreTransactionTest {
                 OHJson.literal("""[{"transportUrl":"https://fixture.invalid/manifest.json","name":"old"}]"""))
             head.set("vortx", vortx.encoded()).encoded()
         }
-        for (unsupported in queued + listOf(independent, held)) {
+        val pending = OHJson.Obj(legacy).let { head ->
+            val vortx = head.obj("vortx").set("deletedAddonsTs",
+                OHJson.literal("""{"https://fixture.invalid/historical/manifest.json":{"addedAt":1000.75,"removedAt":1000.5}}"""))
+            head.set("vortx", vortx.encoded()).encoded()
+        }
+        val pendingAdmission = AccountFileLegacyAdmission.admitLegacy(pending, f.owner)
+        val pendingFailure = assertThrows(IllegalArgumentException::class.java) {
+            pendingAdmission.prepareMaterial(VortxAccountScope("account.${f.account}", f.owner))
+        }
+        assertEquals("Account file contains pending source evidence", pendingFailure.message)
+        for (unsupported in queued + listOf(independent, held, pending)) {
             // The old gate accepted this full roster. Keep selected bytes valid and separate.
             assertEquals(f.owner, AccountFileLegacyAdmission.legacyOwnerID(unsupported))
             val x = Fixture()
