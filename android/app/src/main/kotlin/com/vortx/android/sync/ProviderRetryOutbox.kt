@@ -17,6 +17,7 @@ import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
@@ -32,7 +33,7 @@ internal class ProviderRetryOutbox private constructor(
     private val appIdentity: () -> AppIdentity,
     private val unixMetadata: (Path) -> UnixMetadata,
     private val beforeDirectoryForce: (Path) -> Unit,
-) {
+) : ProviderRetryStartLedger {
     constructor(context: Context) : this(context.dataDir.toPath(), {
         check(!context.isDeviceProtectedStorage)
         val uid = Os.geteuid()
@@ -116,6 +117,28 @@ internal class ProviderRetryOutbox private constructor(
         internal fun matches(revision: String, head: Row): Boolean = this.revision == revision && row.same(head)
     }
 
+    private class StartedHead(
+        val issuer: Any,
+        override val head: Snapshot,
+        val marker: Node,
+        val markerRevision: String,
+        private val requireCurrent: () -> Unit,
+    ) : ProviderRetryStart {
+        private val attempted = AtomicBoolean(false)
+        private val claimed = AtomicBoolean(false)
+
+        fun requireOriginal() = requireCurrent()
+
+        override fun tryClaimFirstIo(): Boolean {
+            if (!attempted.compareAndSet(false, true)) return false
+            try { requireCurrent() } catch (_: Exception) { return false }
+            claimed.set(true)
+            return true
+        }
+
+        override fun wasClaimed(): Boolean = claimed.get()
+    }
+
     /** Capture is only for the Restore worker. It gives no dispatch permission. */
     class RestoreAbsence internal constructor(
         private val issuer: Any,
@@ -169,23 +192,72 @@ internal class ProviderRetryOutbox private constructor(
             Append.Enqueued
         }
 
-    /** Caller must establish exact provider settlement or confirmed replacement before calling. */
-    fun retireHead(lane: Lane, dataKey: ByteArray, expected: Snapshot, requireCurrent: () -> Unit): Retire =
-        ordinary(Retire.Unavailable, requireCurrent) {
-            if (!expected.issuedBy(issuer, lane)) return@ordinary Retire.Changed
+    override fun claimBeforeIo(
+        lane: Lane, dataKey: ByteArray, expected: Snapshot, requireCurrent: () -> Unit,
+    ): ProviderRetryStart? = ordinary(null, requireCurrent) {
+        if (!expected.issuedBy(issuer, lane)) return@ordinary null
+        val names = paths(lane)
+        val keys = namespace(names, create = false) ?: return@ordinary null
+        val old = readRecord(names, keys, lane, sealKey(dataKey)) ?: return@ordinary null
+        if (!expected.matches(old.revision, old.rows.first())) return@ordinary null
+        val markerKey = sealKey(dataKey, "start")
+        val plaintext = startPayload(old)
+        val sealed = try { seal(markerKey, startAad(lane), plaintext) } finally { plaintext.fill(0) }
+        val revision = digest(sealed)
+        requireDurable(names, keys, old, requireCurrent)
+        requireCurrent()
+        writePrivate(names.start, sealed)
+        val marker = checkNotNull(node(names.start, directory = false))
+        val started = StartedHead(issuer, expected, marker, revision, requireCurrent)
+        requireRecord(names, keys, old, start = marker)
+        requireStart(names, lane, markerKey, old, started)
+        syncDirectory(names.epoch)
+        requireRecord(names, keys, old, start = marker)
+        requireStart(names, lane, markerKey, old, started)
+        started
+    }
+
+    override fun retireAccepted(
+        lane: Lane, dataKey: ByteArray, start: ProviderRetryStart, accepted: ProviderRetryDispatchOutcome.Accepted,
+        requireCurrent: () -> Unit,
+    ): Retire {
+        val started = start as? StartedHead ?: return Retire.Changed
+        val expected = started.head
+        if (started.issuer !== issuer || !expected.issuedBy(issuer, lane) || !started.wasClaimed() ||
+            !accepted.matches(start)) return Retire.Changed
+        fun requireOriginal() {
+            started.requireOriginal()
+            requireCurrent()
+        }
+        return ordinary(Retire.Unavailable, ::requireOriginal) {
             val key = sealKey(dataKey)
+            val markerKey = sealKey(dataKey, "start")
             val names = paths(lane)
             val keys = namespace(names, create = false) ?: return@ordinary Retire.Changed
-            val old = readRecord(names, keys, lane, key) ?: return@ordinary Retire.Changed
+            val old = readRecord(names, keys, lane, key, started.marker) ?: return@ordinary Retire.Changed
             if (!expected.matches(old.revision, old.rows.first())) return@ordinary Retire.Changed
-            requireCurrent()
-            if (old.rows.size == 1) {
-                retireLast(names, keys, old, requireCurrent)
+            requireStart(names, lane, markerKey, old, started)
+            requireOriginal()
+            val successor = if (old.rows.size == 1) {
+                requireRecord(names, keys, old, start = started.marker)
+                requireOriginal()
+                Files.delete(names.record)
+                requireRecord(names, keys, null, start = started.marker)
+                syncDirectory(names.epoch)
+                null
             } else {
-                publish(names, keys, lane, key, old.rows.drop(1), old, requireCurrent)
+                publish(names, keys, lane, key, old.rows.drop(1), old, ::requireOriginal, start = started.marker)
             }
+            // Keep the start veto until the original ciphertext is durably gone or replaced.
+            requireRecord(names, keys, successor, start = started.marker)
+            requireStart(names, lane, markerKey, old, started)
+            requireOriginal()
+            Files.delete(names.start)
+            syncDirectory(names.epoch)
+            requireRecord(names, keys, successor)
             Retire.Retired
         }
+    }
 
     fun captureRestoreAbsence(
         owner: SessionOwnerSnapshot.Account,
@@ -209,7 +281,7 @@ internal class ProviderRetryOutbox private constructor(
     fun isCurrent(owner: SessionOwnerSnapshot.Account, verified: RestoreCurrency): Boolean =
         verified.isCurrent(issuer, owner)
 
-    private data class Paths(val account: Path, val epoch: Path, val record: Path, val stage: Path, val retirement: Path)
+    private data class Paths(val account: Path, val epoch: Path, val record: Path, val stage: Path, val retirement: Path, val start: Path)
     private data class AppIdentity(val uid: Int, val gid: Int)
     internal data class UnixMetadata(val uid: Int, val gid: Int, val mode: Int)
     private data class Node(val identity: Any, val modified: FileTime, val size: Long)
@@ -225,7 +297,7 @@ internal class ProviderRetryOutbox private constructor(
         val account = accountDirectory(lane.owner.id)
         val epoch = account.resolve("e-${lane.owner.generation}")
         val name = lane.provider.fileName
-        return Paths(account, epoch, epoch.resolve(name), epoch.resolve("$name.stage"), epoch.resolve("$name.retire"))
+        return Paths(account, epoch, epoch.resolve(name), epoch.resolve("$name.stage"), epoch.resolve("$name.retire"), epoch.resolve("$name.start"))
     }
 
     private fun node(path: Path, directory: Boolean, platformDirectory: Boolean = false): Node? {
@@ -304,7 +376,7 @@ internal class ProviderRetryOutbox private constructor(
         }
     }
 
-    private fun checkedLane(names: Paths, keys: List<Any>, requireNoStage: Boolean = true, retirement: Node? = null) {
+    private fun checkedLane(names: Paths, keys: List<Any>, requireNoStage: Boolean = true, start: Node? = null) {
         check(namespace(names, create = false) == keys)
         Files.newDirectoryStream(names.epoch).use { entries ->
             var count = 0
@@ -313,15 +385,16 @@ internal class ProviderRetryOutbox private constructor(
             }
         }
         if (requireNoStage) check(node(names.stage, directory = false) == null)
-        check(node(names.retirement, directory = false) == retirement)
+        check(node(names.retirement, directory = false) == null)
+        check(node(names.start, directory = false) == start)
     }
 
-    private fun readRecord(names: Paths, keys: List<Any>, lane: Lane, key: SecretKeySpec): Record? {
-        checkedLane(names, keys)
+    private fun readRecord(names: Paths, keys: List<Any>, lane: Lane, key: SecretKeySpec, start: Node? = null): Record? {
+        checkedLane(names, keys, start = start)
         val info = node(names.record, directory = false) ?: return null
         val sealed = readSealed(names.record, info)
         val rows = decode(lane, key, sealed)
-        checkedLane(names, keys)
+        checkedLane(names, keys, start = start)
         check(node(names.record, directory = false) == info)
         return Record(info, digest(sealed), rows)
     }
@@ -339,33 +412,32 @@ internal class ProviderRetryOutbox private constructor(
     }
 
     private fun requireRecord(
-        names: Paths, keys: List<Any>, old: Record?, requireNoStage: Boolean = true, retirement: Node? = null,
+        names: Paths, keys: List<Any>, old: Record?, requireNoStage: Boolean = true, start: Node? = null,
     ) {
-        checkedLane(names, keys, requireNoStage, retirement)
+        checkedLane(names, keys, requireNoStage, start)
         val node = node(names.record, directory = false)
         check(node == old?.node)
         if (node != null) check(digest(readSealed(names.record, node)) == checkNotNull(old).revision)
     }
 
-    private fun retireLast(names: Paths, keys: List<Any>, old: Record, requireCurrent: () -> Unit) {
-        requireRecord(names, keys, old)
-        requireCurrent()
-        FileChannel.open(names.retirement, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
-            LinkOption.NOFOLLOW_LINKS), PRIVATE_FILE).use { it.force(true) }
-        val marker = checkNotNull(node(names.retirement, directory = false)).also { check(it.size == 0L) }
-        requireRecord(names, keys, old, retirement = marker)
-        syncDirectory(names.epoch)
-        requireRecord(names, keys, old, retirement = marker)
-        requireCurrent()
-        Files.delete(names.record)
-        requireRecord(names, keys, null, retirement = marker)
-        syncDirectory(names.epoch)
-        requireRecord(names, keys, null, retirement = marker)
-        requireCurrent()
-        // Only an already durable ciphertext deletion can release the crash veto.
-        Files.delete(names.retirement)
-        syncDirectory(names.epoch)
-        requireRecord(names, keys, null)
+    private fun startPayload(old: Record): ByteArray = ByteBuffer.allocate(START_PLAIN_BYTES).apply {
+        putInt(START_FORMAT)
+        val id = old.rows.first().operationId
+        putLong(id.mostSignificantBits)
+        putLong(id.leastSignificantBits)
+        put(old.revision.toByteArray(Charsets.US_ASCII))
+        check(!hasRemaining())
+    }.array()
+
+    private fun requireStart(names: Paths, lane: Lane, key: SecretKeySpec, old: Record, started: StartedHead) {
+        val marker = checkNotNull(node(names.start, directory = false))
+        check(marker == started.marker && marker.size == START_SEALED_BYTES.toLong())
+        val sealed = readSealed(names.start, marker)
+        check(digest(sealed) == started.markerRevision)
+        val plaintext = open(key, startAad(lane), sealed)
+        val expected = startPayload(old)
+        try { check(MessageDigest.isEqual(plaintext, expected)) }
+        finally { plaintext.fill(0); expected.fill(0) }
     }
 
     private fun forceParents(names: Paths) {
@@ -383,24 +455,19 @@ internal class ProviderRetryOutbox private constructor(
 
     private fun publish(
         names: Paths, keys: List<Any>, lane: Lane, key: SecretKeySpec, rows: List<Row>, old: Record?,
-        requireCurrent: () -> Unit,
-    ) {
+        requireCurrent: () -> Unit, start: Node? = null,
+    ): Record {
         val sealed = encode(lane, key, rows)
         val revision = digest(sealed)
-        requireRecord(names, keys, old)
+        requireRecord(names, keys, old, start = start)
         requireCurrent()
         forceParents(names)
-        requireRecord(names, keys, old)
+        requireRecord(names, keys, old, start = start)
         requireCurrent()
-        FileChannel.open(names.stage, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
-            LinkOption.NOFOLLOW_LINKS), PRIVATE_FILE).use { channel ->
-            val bytes = ByteBuffer.wrap(sealed)
-            while (bytes.hasRemaining()) check(channel.write(bytes) > 0)
-            channel.force(true)
-        }
+        writePrivate(names.stage, sealed)
         val stage = checkNotNull(node(names.stage, directory = false))
         check(digest(readSealed(names.stage, stage)) == revision)
-        requireRecord(names, keys, old, requireNoStage = false)
+        requireRecord(names, keys, old, requireNoStage = false, start = start)
         requireCurrent()
         check(node(names.stage, directory = false) == stage)
         if (old == null) {
@@ -410,8 +477,18 @@ internal class ProviderRetryOutbox private constructor(
             Files.move(names.stage, names.record, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         }
         syncDirectory(names.epoch)
-        val observed = checkNotNull(readRecord(names, keys, lane, key))
+        val observed = checkNotNull(readRecord(names, keys, lane, key, start))
         check(observed.revision == revision && observed.rows.size == rows.size && observed.rows.zip(rows).all { (a, b) -> a.same(b) })
+        return observed
+    }
+
+    private fun writePrivate(path: Path, sealed: ByteArray) {
+        FileChannel.open(path, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+            LinkOption.NOFOLLOW_LINKS), PRIVATE_FILE).use { channel ->
+            val bytes = ByteBuffer.wrap(sealed)
+            while (bytes.hasRemaining()) check(channel.write(bytes) > 0)
+            channel.force(true)
+        }
     }
 
     private fun encode(lane: Lane, key: SecretKeySpec, rows: List<Row>): ByteArray {
@@ -421,22 +498,11 @@ internal class ProviderRetryOutbox private constructor(
             putInt(rows.size)
             rows.forEach { it.encode(this) }
         }.array()
-        try {
-            val cipher = Cipher.getInstance(CIPHER)
-            cipher.init(Cipher.ENCRYPT_MODE, key)
-            check(cipher.iv.size == NONCE_BYTES)
-            cipher.updateAAD(aad(lane))
-            return cipher.iv + cipher.doFinal(plaintext)
-        } finally {
-            plaintext.fill(0)
-        }
+        return try { seal(key, aad(lane), plaintext) } finally { plaintext.fill(0) }
     }
 
     private fun decode(lane: Lane, key: SecretKeySpec, sealed: ByteArray): List<Row> {
-        val cipher = Cipher.getInstance(CIPHER)
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BYTES * 8, sealed, 0, NONCE_BYTES))
-        cipher.updateAAD(aad(lane))
-        val plaintext = cipher.doFinal(sealed, NONCE_BYTES, sealed.size - NONCE_BYTES)
+        val plaintext = open(key, aad(lane), sealed)
         try {
             val input = ByteBuffer.wrap(plaintext)
             check(input.int == FORMAT)
@@ -489,10 +555,13 @@ internal class ProviderRetryOutbox private constructor(
         private const val DOMAIN = "vortx-android-provider-retry-outbox-v1"
         private const val CIPHER = "AES/GCM/NoPadding"
         private const val FORMAT = 0x56505231 // VPR1
+        private const val START_FORMAT = 0x56505331 // VPS1
+        private const val START_PLAIN_BYTES = 4 + 16 + 64
         private const val HEADER_BYTES = 8
         private const val PROOF_BYTES = 32
         private const val NONCE_BYTES = 12
         private const val TAG_BYTES = 16
+        private const val START_SEALED_BYTES = NONCE_BYTES + TAG_BYTES + START_PLAIN_BYTES
         private const val IMDB_MAX_BYTES = 32
         private const val ROW_MIN_BYTES = 16 + 1 + 1 + 4 + 1 + PROOF_BYTES
         private const val ROW_CAP = 200
@@ -508,7 +577,9 @@ internal class ProviderRetryOutbox private constructor(
         private val PRIVATE_DIRECTORY = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))
         private val PRIVATE_FILE = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
         private val IMDB = Regex("tt[0-9]{1,30}")
-        private val VALID_LEAVES = Provider.entries.flatMap { listOf(it.fileName, "${it.fileName}.stage", "${it.fileName}.retire") }.toSet()
+        private val VALID_LEAVES = Provider.entries.flatMap {
+            listOf(it.fileName, "${it.fileName}.stage", "${it.fileName}.retire", "${it.fileName}.start")
+        }.toSet()
         private val PROCESS_LOCK = Any()
 
         internal fun forJvmFixture(
@@ -522,14 +593,31 @@ internal class ProviderRetryOutbox private constructor(
         private fun aad(lane: Lane): ByteArray =
             "$DOMAIN\u0000${lane.owner.id}\u0000${lane.owner.generation}\u0000${lane.provider.fileName}".toByteArray(Charsets.US_ASCII)
 
+        private fun startAad(lane: Lane): ByteArray = "$DOMAIN/start\u0000".toByteArray(Charsets.US_ASCII) + aad(lane)
+
+        private fun seal(key: SecretKeySpec, aad: ByteArray, plaintext: ByteArray): ByteArray {
+            val cipher = Cipher.getInstance(CIPHER)
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            check(cipher.iv.size == NONCE_BYTES)
+            cipher.updateAAD(aad)
+            return cipher.iv + cipher.doFinal(plaintext)
+        }
+
+        private fun open(key: SecretKeySpec, aad: ByteArray, sealed: ByteArray): ByteArray {
+            val cipher = Cipher.getInstance(CIPHER)
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BYTES * 8, sealed, 0, NONCE_BYTES))
+            cipher.updateAAD(aad)
+            return cipher.doFinal(sealed, NONCE_BYTES, sealed.size - NONCE_BYTES)
+        }
+
         private fun digest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes)
             .joinToString("") { "%02x".format(java.util.Locale.ROOT, it.toInt() and 255) }
 
-        private fun sealKey(dataKey: ByteArray): SecretKeySpec {
+        private fun sealKey(dataKey: ByteArray, purpose: String = "seal"): SecretKeySpec {
             require(dataKey.size == 32)
             val mac = Mac.getInstance("HmacSHA256")
             mac.init(SecretKeySpec(dataKey, "HmacSHA256"))
-            val derived = mac.doFinal("$DOMAIN/seal".toByteArray(Charsets.US_ASCII))
+            val derived = mac.doFinal("$DOMAIN/$purpose".toByteArray(Charsets.US_ASCII))
             return try { SecretKeySpec(derived, "AES") } finally { derived.fill(0) }
         }
     }

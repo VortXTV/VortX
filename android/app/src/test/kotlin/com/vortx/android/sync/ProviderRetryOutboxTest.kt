@@ -1,5 +1,6 @@
 package com.vortx.android.sync
 
+import com.vortx.android.account.TitleRef
 import com.vortx.android.security.AccountFileProviderWriters
 import com.vortx.android.sync.ProviderRetryOutbox.Append
 import com.vortx.android.sync.ProviderRetryOutbox.Lane
@@ -16,6 +17,7 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,6 +40,52 @@ class ProviderRetryOutboxTest {
     private val wrongKey = ByteArray(32) { (it + 79).toByte() }
     private val proof = ByteArray(32) { (it + 41).toByte() }
 
+    @Test fun coordinatorRetiresVerifiedDeliveryAndHoldsAmbiguousDeliveryAcrossReopen() = runBlocking {
+        val original = outbox()
+        val coordinator = ProviderRetryCoordinator(original, original)
+        var settle = true
+        var preparations = 0
+        var dispatches = 0
+        val credential = object : ProviderRetryCredential {
+            override fun copyProof() = proof.copyOf()
+            override suspend fun dispatch(lane: Lane, row: Row, start: ProviderRetryStart): ProviderRetryDispatchOutcome {
+                assertTrue(exists(startFile(record(lane))))
+                assertTrue(start.tryClaimFirstIo())
+                assertFalse(start.tryClaimFirstIo())
+                dispatches++
+                return if (settle) accepted(start) else ProviderRetryDispatchOutcome.Unsettled
+            }
+            override fun close() {}
+        }
+        val session = object : ProviderRetrySession {
+            override val owner = account
+            override fun requireCurrent() {}
+            override fun <T> withDataKey(block: (ByteArray) -> T): T {
+                val copy = key.copyOf()
+                return try { block(copy) } finally { copy.fill(0) }
+            }
+            override fun isEnabled(provider: Provider) = true
+            override suspend fun prepareCredential(provider: Provider): ProviderRetryCredential {
+                preparations++
+                return credential
+            }
+            override fun close() {}
+        }
+        val title = TitleRef("tt0123456", null, false)
+        assertEquals(ProviderRetryCoordinator.Submit.Settled, coordinator.submit(session, Provider.TRAKT, true, title))
+        assertEquals(Read.Missing, original.readHead(trakt, key) {})
+        assertFalse(exists(startFile(record(trakt))))
+
+        settle = false
+        assertEquals(ProviderRetryCoordinator.Submit.RecordedUnsettled, coordinator.submit(session, Provider.TRAKT, false, title))
+        val reopened = outbox()
+        ProviderRetryCoordinator(reopened, reopened).drain(session, Provider.TRAKT)
+        assertEquals(2, preparations)
+        assertEquals(2, dispatches)
+        assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
+        reserved { assertNull(reopened.captureRestoreAbsence(account, it)) }
+    }
+
     @Test fun restoredOriginalHeadSurvivesReopenAndRetirementChecksExactFifoRevision() {
         val outbox = outbox()
         val first = row(1)
@@ -47,18 +95,22 @@ class ProviderRetryOutboxTest {
         assertEquals(Append.Unavailable, outbox.append(trakt, key, row(1, add = false)) {})
         val previous = pending(outbox, trakt)
         assertEquals(Append.Enqueued, outbox.append(trakt, key, second) {})
-        assertEquals(Retire.Changed, outbox.retireHead(trakt, key, previous) {})
+        assertNull(outbox.claimBeforeIo(trakt, key, previous) {})
 
         val reopened = outbox()
         val live = pending(reopened, trakt)
         assertEquals(first.operationId, live.row.operationId)
         assertArrayEquals(proof, live.row.credentialProof())
-        assertEquals(Retire.Changed, reopened.retireHead(trakt, key, pending(outbox, trakt)) {})
-        assertEquals(Retire.Retired, reopened.retireHead(trakt, key, live) {})
+        assertNull(reopened.claimBeforeIo(trakt, key, pending(outbox, trakt)) {})
+        val firstStart = requireNotNull(reopened.claimBeforeIo(trakt, key, live) {})
+        assertTrue(firstStart.tryClaimFirstIo())
+        assertEquals(Retire.Retired, reopened.retireAccepted(trakt, key, firstStart, accepted(firstStart)) {})
         val next = pending(reopened, trakt)
         assertEquals(second.operationId, next.row.operationId)
         assertFalse(next.row.add)
-        assertEquals(Retire.Retired, reopened.retireHead(trakt, key, next) {})
+        val secondStart = requireNotNull(reopened.claimBeforeIo(trakt, key, next) {})
+        assertTrue(secondStart.tryClaimFirstIo())
+        assertEquals(Retire.Retired, reopened.retireAccepted(trakt, key, secondStart, accepted(secondStart)) {})
         assertEquals(Read.Missing, reopened.readHead(trakt, key) {})
         assertFalse(Files.exists(record(trakt), LinkOption.NOFOLLOW_LINKS))
         reserved { assertTrue(reopened.captureRestoreAbsence(account, it) != null) }
@@ -158,17 +210,17 @@ class ProviderRetryOutboxTest {
         assertTrue(Files.newDirectoryStream(unexpected).use { !it.iterator().hasNext() })
     }
 
-    @Test fun lastRowRetirementFailsClosedAtEachDurabilityBoundary() {
-        // Mark directory force, ciphertext deletion force, then marker removal force.
+    @Test fun lastRowStartAndSettlementFailClosedAtEachDurabilityBoundary() {
+        // Start directory force, ciphertext deletion force, then marker removal force.
         val expectedBeforeForce = listOf(true to true, false to true, false to false)
         for (failedForce in 1..3) {
             val root = temporary.newFolder("retirement-force-$failedForce").toPath()
             val record = record(trakt, root)
-            val marker = record.resolveSibling("${record.fileName}.retire")
+            val marker = startFile(record)
             val observed = mutableListOf<Pair<Boolean, Boolean>>()
             var retiring = false
             val outbox = outbox(root) { path ->
-                if (retiring && path == record.parent) {
+                if (retiring && path == record.parent && (exists(marker) || observed.isNotEmpty())) {
                     observed.add(exists(record) to exists(marker))
                     if (observed.size == failedForce) throw IOException("Synthetic directory force failure")
                 }
@@ -177,7 +229,14 @@ class ProviderRetryOutboxTest {
             val snapshot = pending(outbox, trakt)
             val bytes = Files.readAllBytes(record)
             retiring = true
-            assertEquals(Retire.Unavailable, outbox.retireHead(trakt, key, snapshot) {})
+            val start = outbox.claimBeforeIo(trakt, key, snapshot) {}
+            if (failedForce == 1) {
+                assertNull(start)
+            } else {
+                requireNotNull(start)
+                assertTrue(start.tryClaimFirstIo())
+                assertEquals(Retire.Unavailable, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+            }
             assertEquals(expectedBeforeForce.take(failedForce), observed)
             assertEquals(failedForce == 1, exists(record))
             assertEquals(failedForce < 3, exists(marker))
@@ -188,7 +247,7 @@ class ProviderRetryOutboxTest {
                 assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
                 assertEquals(Append.Unavailable, reopened.append(trakt, key, row(2)) {})
                 reserved { assertNull(reopened.captureRestoreAbsence(account, it)) }
-                assertEquals(0L, Files.size(marker))
+                assertTrue(Files.size(marker) > 0L)
             } else {
                 // The earlier force completed before marker unlink. A returning marker is a
                 // conservative refusal, but a missing one cannot resurrect the old ciphertext.
@@ -203,11 +262,13 @@ class ProviderRetryOutboxTest {
     @Test fun interruptionAfterRecordUnlinkRetainsOriginalRetirementVeto() {
         val outbox = outbox()
         val record = record(trakt)
-        val marker = record.resolveSibling("${record.fileName}.retire")
+        val marker = startFile(record)
         assertEquals(Append.Enqueued, outbox.append(trakt, key, row(1)) {})
         val snapshot = pending(outbox, trakt)
+        val start = requireNotNull(outbox.claimBeforeIo(trakt, key, snapshot) {})
+        assertTrue(start.tryClaimFirstIo())
         val cancelled = runCatching {
-            outbox.retireHead(trakt, key, snapshot) {
+            outbox.retireAccepted(trakt, key, start, accepted(start)) {
                 if (!exists(record) && exists(marker)) throw CancellationException()
             }
         }
@@ -218,6 +279,106 @@ class ProviderRetryOutboxTest {
         reserved { assertNull(reopened.captureRestoreAbsence(account, it)) }
         assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
         assertTrue(exists(marker))
+    }
+
+    @Test fun durableStartIsSingleUseAndSettlementRequiresOriginalGuardAndExactReceipt() {
+        val outbox = outbox()
+        val record = record(trakt)
+        assertEquals(Append.Enqueued, outbox.append(trakt, key, row(1)) {})
+        val original = Files.readAllBytes(record)
+        val snapshot = pending(outbox, trakt)
+        var current = true
+        val start = requireNotNull(outbox.claimBeforeIo(trakt, key, snapshot) { check(current) })
+        assertTrue(start.head === snapshot)
+        val marker = Files.readAllBytes(startFile(record))
+        assertEquals(Retire.Changed, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+        assertTrue(start.tryClaimFirstIo())
+        assertTrue(start.wasClaimed())
+        assertFalse(start.tryClaimFirstIo())
+
+        val other = object : ProviderRetryStart {
+            override val head = snapshot
+            override fun tryClaimFirstIo(): Boolean = true
+            override fun wasClaimed(): Boolean = true
+        }
+        assertEquals(Retire.Changed, outbox.retireAccepted(trakt, key, other, accepted(other)) {})
+        assertEquals(Retire.Changed, outbox.retireAccepted(trakt, key, start, accepted(other)) {})
+        assertEquals(Retire.Changed, outbox.retireAccepted(trakt, key, start, accepted(start, operationId = UUID(0, 9))) {})
+        assertEquals(Retire.Changed, outbox.retireAccepted(simkl, key, start, accepted(start)) {})
+        assertEquals(Retire.Changed, outbox().retireAccepted(trakt, key, start, accepted(start)) {})
+        current = false
+        assertEquals(Retire.Unavailable, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+        current = true
+        assertEquals(Read.Unavailable, outbox().readHead(trakt, key) {})
+        assertNull(outbox.claimBeforeIo(trakt, key, snapshot) {})
+        assertEquals(Append.Unavailable, outbox.append(trakt, key, row(2)) {})
+        reserved { assertNull(outbox.captureRestoreAbsence(account, it)) }
+        assertArrayEquals(original, Files.readAllBytes(record))
+        assertArrayEquals(marker, Files.readAllBytes(startFile(record)))
+
+        val tampered = marker.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
+        Files.write(startFile(record), tampered)
+        assertEquals(Retire.Unavailable, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+        assertArrayEquals(original, Files.readAllBytes(record))
+        assertArrayEquals(tampered, Files.readAllBytes(startFile(record)))
+    }
+
+    @Test fun refusedFirstIoConsumesTheIssuedAttemptAndLeavesStartAndOldRetireVetoHeld() {
+        val outbox = outbox()
+        val record = record(trakt)
+        assertEquals(Append.Enqueued, outbox.append(trakt, key, row(1)) {})
+        var current = true
+        val start = requireNotNull(outbox.claimBeforeIo(trakt, key, pending(outbox, trakt)) { check(current) })
+        current = false
+        assertFalse(start.tryClaimFirstIo())
+        current = true
+        assertFalse(start.tryClaimFirstIo())
+        assertFalse(start.wasClaimed())
+        assertEquals(Retire.Changed, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+        assertTrue(exists(startFile(record)))
+        assertEquals(Read.Unavailable, outbox().readHead(trakt, key) {})
+
+        val oldVeto = record(simkl).let { it.resolveSibling("${it.fileName}.retire") }
+        Files.createFile(oldVeto, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+        assertEquals(Read.Unavailable, outbox.readHead(simkl, key) {})
+        assertEquals(Append.Unavailable, outbox.append(simkl, key, row(2)) {})
+        assertTrue(exists(oldVeto))
+    }
+
+    @Test fun failedFifoPublicationKeepsDurableStartAndHoldsBothOldAndSuccessorReopen() {
+        for (failedForce in 1..2) {
+            val root = temporary.newFolder("fifo-force-$failedForce").toPath()
+            val record = record(trakt, root)
+            val marker = startFile(record)
+            var forceCount = 0
+            var settling = false
+            val outbox = outbox(root) { path ->
+                if (settling && path == record.parent && ++forceCount == failedForce)
+                    throw IOException("Synthetic FIFO directory force failure")
+            }
+            assertEquals(Append.Enqueued, outbox.append(trakt, key, row(1)) {})
+            assertEquals(Append.Enqueued, outbox.append(trakt, key, row(2)) {})
+            val original = Files.readAllBytes(record)
+            val start = requireNotNull(outbox.claimBeforeIo(trakt, key, pending(outbox, trakt)) {})
+            val originalMarker = Files.readAllBytes(marker)
+            assertTrue(start.tryClaimFirstIo())
+            settling = true
+            assertEquals(Retire.Unavailable, outbox.retireAccepted(trakt, key, start, accepted(start)) {})
+            val reopened = outbox(root)
+            if (failedForce == 1) {
+                // Either directory image can survive interruption while the durable marker stays.
+                assertArrayEquals(originalMarker, Files.readAllBytes(marker))
+                assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
+                Files.write(record, original)
+                assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
+            } else {
+                assertFalse(exists(marker))
+                assertEquals(row(2).operationId, pending(reopened, trakt).row.operationId)
+                Files.createFile(marker, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+                assertEquals(Read.Unavailable, reopened.readHead(trakt, key) {})
+            }
+            reserved { assertNull(reopened.captureRestoreAbsence(account, it)) }
+        }
     }
 
     @Test fun relatedParentAliasesRefuseButForeignOwnerAliasesRemainUnopened() {
@@ -248,6 +409,11 @@ class ProviderRetryOutboxTest {
     private fun pending(outbox: ProviderRetryOutbox, lane: Lane): ProviderRetryOutbox.Snapshot =
         (outbox.readHead(lane, key) {} as Read.Pending).head
 
+    private fun accepted(start: ProviderRetryStart, operationId: UUID = start.head.row.operationId): ProviderRetryDispatchOutcome.Accepted {
+        val row = start.head.row
+        return ProviderRetryDispatchOutcome.Accepted(start, start.head.lane, operationId, row.add, TitleRef(row.imdb, row.tmdb, row.isSeries))
+    }
+
     private fun row(id: Long, add: Boolean = true): Row = Row(UUID(0, id), add, "tt0123456", 145, null, proof)
 
     private fun outbox(root: Path = appRoot(), beforeDirectoryForce: (Path) -> Unit = {}): ProviderRetryOutbox {
@@ -264,6 +430,7 @@ class ProviderRetryOutboxTest {
     }
 
     private fun exists(path: Path): Boolean = Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+    private fun startFile(record: Path): Path = record.resolveSibling("${record.fileName}.start")
 
     private fun unix(path: Path): ProviderRetryOutbox.UnixMetadata {
         val attrs = Files.readAttributes(path, "unix:uid,gid,mode", LinkOption.NOFOLLOW_LINKS)
