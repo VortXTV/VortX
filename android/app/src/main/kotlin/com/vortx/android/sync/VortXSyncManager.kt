@@ -2516,55 +2516,65 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                     val capturedNativeGateway = nativeGateway
                     val externalOwner = AccountFileRestoreExternalExclusion.Owner(
                         SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch), lease.operationGeneration)
-                    fun requireManagedIdle() {
-                        requireFileRestoreOwner(capture, lease, caller, routeCurrent)
-                        if (!fileRestoreExclusion.isCurrent(managed) || nativeSyncMutex.isLocked ||
-                            nativeGateway !== capturedNativeGateway || applyingRemote)
-                            throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
-                    }
-                    val entered = AtomicBoolean(false)
-                    var outcome: AccountFileRestoreTransaction.Result? = null
-                    try {
-                        requireManagedIdle()
-                        external.withReservation(externalOwner, ::requireManagedIdle) { reservation ->
-                            check(entered.compareAndSet(false, true))
-                            requireManagedIdle()
-                            val reads = FileRestoreReads(capture, caller, routeCurrent)
-                            val access = object : AccountFileRestoreTransaction.ExclusiveRestore, AccountFileRestoreTransaction.AuthenticatedReads by reads {
-                                override fun requireIdle(original: SyncSessionLease) {
-                                    reads.requireCurrent(original)
-                                    requireManagedIdle()
-                                    reservation.requireCurrent(externalOwner)
-                                    requireManagedIdle()
-                                }
-                                override fun requireCurrent(original: SyncSessionLease) = requireIdle(original)
-                                override suspend fun getHead(original: SyncSessionLease): AccountFileRestoreTransaction.RawResponse =
-                                    requestFileRestoreRaw(capture, original, null) { requireIdle(original) }
-
-                                override fun requireLocalAbsence(original: SyncSessionLease, scope: VortxAccountScope) {
-                                    requireIdle(original)
-                                    if (scope.accountID != "account.${lease.accountId}")
-                                        throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
-                                    requireManagedFileRestoreAbsence(externalOwner.account) { requireIdle(original) }
-                                    reservation.requireLocalAbsence(externalOwner, scope)
-                                    requireIdle(original)
-                                }
-                                override suspend fun putOnce(original: SyncSessionLease,
-                                    grant: AccountFileRestoreTransaction.PutGrant): AccountFileRestoreTransaction.RawResponse {
-                                    requireIdle(original)
-                                    return requestFileRestoreRaw(capture, original, grant) { requireIdle(original) }
-                                }
-                            }
-                            outcome = fileRestoreTransaction.restore(lease, selected, access)
+                    val addonWriter = addonPrefs.tryReserveRestoreWriter(externalOwner.account)
+                        ?: return@withFileRestoreResult fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
+                    addonWriter.use {
+                        val auxiliaryBackings = AtomicReference<List<() -> Boolean>?>(null)
+                        fun requireManagedIdle() {
+                            requireFileRestoreOwner(capture, lease, caller, routeCurrent)
+                            if (!fileRestoreExclusion.isCurrent(managed) || nativeSyncMutex.isLocked ||
+                                nativeGateway !== capturedNativeGateway || applyingRemote)
+                                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
+                            addonWriter.requireCurrent(externalOwner.account)
+                            auxiliaryBackings.get()?.let(::requireAuxiliaryRestoreBackings)
                         }
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                    catch (refusal: AccountFileRestoreTransaction.Refusal) {
-                        return@withFileRestoreResult outcome ?: fileRestoreNotSubmitted(refusal.reason)
-                    } catch (_: Exception) {
-                        return@withFileRestoreResult outcome
-                            ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                        val entered = AtomicBoolean(false)
+                        var outcome: AccountFileRestoreTransaction.Result? = null
+                        try {
+                            requireManagedIdle()
+                            external.withReservation(externalOwner, ::requireManagedIdle) { reservation ->
+                                check(entered.compareAndSet(false, true))
+                                requireManagedIdle()
+                                val reads = FileRestoreReads(capture, caller, routeCurrent)
+                                val access = object : AccountFileRestoreTransaction.ExclusiveRestore, AccountFileRestoreTransaction.AuthenticatedReads by reads {
+                                    override fun requireIdle(original: SyncSessionLease) {
+                                        reads.requireCurrent(original)
+                                        requireManagedIdle()
+                                        reservation.requireCurrent(externalOwner)
+                                        requireManagedIdle()
+                                    }
+                                    override fun requireCurrent(original: SyncSessionLease) = requireIdle(original)
+                                    override suspend fun getHead(original: SyncSessionLease): AccountFileRestoreTransaction.RawResponse =
+                                        requestFileRestoreRaw(capture, original, null) { requireIdle(original) }
+
+                                    override fun requireLocalAbsence(original: SyncSessionLease, scope: VortxAccountScope) {
+                                        requireIdle(original)
+                                        if (scope.accountID != "account.${lease.accountId}")
+                                            throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
+                                        requireManagedFileRestoreAbsence(externalOwner.account) { requireIdle(original) }
+                                        val currentBackings = captureAuxiliaryRestoreBackings(externalOwner.account, addonWriter)
+                                        auxiliaryBackings.compareAndSet(null, currentBackings)
+                                        requireAuxiliaryRestoreBackings(currentBackings)
+                                        reservation.requireLocalAbsence(externalOwner, scope)
+                                        requireIdle(original)
+                                    }
+                                    override suspend fun putOnce(original: SyncSessionLease,
+                                        grant: AccountFileRestoreTransaction.PutGrant): AccountFileRestoreTransaction.RawResponse {
+                                        requireIdle(original)
+                                        return requestFileRestoreRaw(capture, original, grant) { requireIdle(original) }
+                                    }
+                                }
+                                outcome = fileRestoreTransaction.restore(lease, selected, access)
+                            }
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                        catch (refusal: AccountFileRestoreTransaction.Refusal) {
+                            return@withFileRestoreResult outcome ?: fileRestoreNotSubmitted(refusal.reason)
+                        } catch (_: Exception) {
+                            return@withFileRestoreResult outcome
+                                ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+                        }
+                        outcome ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
                     }
-                    outcome ?: fileRestoreNotSubmitted(AccountFileRestoreTransaction.Reason.BUSY)
                 } finally { fileRestoreExclusion.release(managed) }
             } finally { accountFileRepairSlot.unlock() }
         }
@@ -2589,6 +2599,23 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
         override suspend fun getHead(original: SyncSessionLease): AccountFileRestoreTransaction.RawResponse =
             requestFileRestoreRaw(capture, original, null) { requireCurrent(original) }
+    }
+
+    /** Physical probes run only on the owned transaction worker. Dispatch uses their retained scalars. */
+    private fun captureAuxiliaryRestoreBackings(owner: SessionOwnerSnapshot.Account,
+        addonWriter: AddonPrefsStore.RestoreWriteExclusion): List<() -> Boolean> {
+        fun verified(backing: (() -> Boolean)?): () -> Boolean = backing
+            ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+        return listOf(
+            verified(syncState.captureRestoreBacking()),
+            verified(NativeSettingsFence.capturePristineRestoreBacking(dirtyPrefs, NativeSettingsFence.RestoreAuxiliaryBacking.DIRTY_SETTINGS)),
+            verified(addonPrefs.captureRestoreBacking(owner, addonWriter)),
+        )
+    }
+
+    private fun requireAuxiliaryRestoreBackings(backings: List<() -> Boolean>) {
+        if (backings.any { !it() })
+            throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
     }
 
     private fun requireManagedFileRestoreAbsence(owner: SessionOwnerSnapshot.Account, checkCurrent: () -> Unit) {
@@ -4479,6 +4506,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
     private class SyncStateStore(appContext: Context) {
         private val prefs: SharedPreferences =
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
+
+        fun captureRestoreBacking(): (() -> Boolean)? =
+            NativeSettingsFence.capturePristineRestoreBacking(prefs, NativeSettingsFence.RestoreAuxiliaryBacking.SYNC_STATE)
 
         fun lastVersion(accountId: String): Long = prefs.getLong(KEY_VERSION + accountId, 0L)
         fun hasLastVersion(accountId: String): Boolean = prefs.contains(KEY_VERSION + accountId)

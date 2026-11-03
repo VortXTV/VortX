@@ -3,6 +3,7 @@ package com.vortx.android.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.vortx.android.model.AddonOrder
+import com.vortx.android.sync.NativeSettingsFence
 import com.vortx.android.sync.SessionOwnerSnapshot
 import java.io.Closeable
 import org.json.JSONArray
@@ -152,6 +153,14 @@ class AddonPrefsStore(
                 heldRestoreWriter = it
             }
         }
+
+    internal fun captureRestoreBacking(original: SessionOwnerSnapshot.Account,
+        exclusion: RestoreWriteExclusion): (() -> Boolean)? {
+        exclusion.requireCurrent(original)
+        val backing = NativeSettingsFence.capturePristineRestoreBacking(prefs, NativeSettingsFence.RestoreAuxiliaryBacking.ADDON_PREFS)
+        exclusion.requireCurrent(original)
+        return backing
+    }
 
     private inline fun <T> withRestoreWrite(refused: T, action: () -> T): T {
         synchronized(restoreWriterLock) {

@@ -153,6 +153,7 @@ jobs:
           --tests com.vortx.android.sync.AccountFileRestoreManagerBindingTest
           --tests com.vortx.android.sync.NativeSettingsFencePristineBackingTest
           --tests com.vortx.android.sync.AddonPrefsRestoreWriterExclusionTest
+          --tests com.vortx.android.sync.AuxiliaryPrefsRestorePhysicalEvidenceTest
           --tests com.vortx.android.sync.AccountFileLegacyAdmissionTest
           --tests com.vortx.android.engine.DetachedAccountFileKernelTest
           --tests com.vortx.android.sync.AccountFileProfileMaterialTest

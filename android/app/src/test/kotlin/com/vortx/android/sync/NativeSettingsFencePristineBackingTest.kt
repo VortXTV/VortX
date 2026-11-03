@@ -3,6 +3,8 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import com.vortx.android.integrations.ScrobbleService
+import com.vortx.android.profile.ProfileStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -112,6 +114,34 @@ class NativeSettingsFencePristineBackingTest {
         assertNull(NativeSettingsFence.capturePristineRestoreBacking(wrapper))
     }
 
+    @Test fun profileRetirementLeavesTheAbsentDefaultOffPreferenceUntouched() = isolatedFirstOpen {
+        val root = temporary.newFolder()
+        val wrapper = open(root, preferences())
+        val profileContext = object : ContextWrapper(null) {
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(name: String, mode: Int): SharedPreferences {
+                assertEquals(SETTINGS, name)
+                assertEquals(Context.MODE_PRIVATE, mode)
+                return wrapper
+            }
+        }
+        val constructor = ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
+        constructor.isAccessible = true
+        val profiles = constructor.newInstance(profileContext)
+        val key = ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING
+        val pristine = checkNotNull(NativeSettingsFence.capturePristineRestoreBacking(wrapper))
+
+        profiles.clearNativeProjection()
+        assertFalse(wrapper.contains(key))
+        assertTrue(pristine())
+
+        assertTrue(wrapper.edit().putBoolean(key, true).commit())
+        profiles.clearNativeProjection()
+        assertTrue(wrapper.contains(key))
+        assertFalse(wrapper.getBoolean(key, true))
+        assertFalse(pristine())
+    }
+
     private fun open(root: File, backing: SharedPreferences): SharedPreferences =
         NativeSettingsFence.open(context(root), SETTINGS, Context.MODE_PRIVATE) {
             Files.createDirectories(root.toPath().resolve("shared_prefs"))
@@ -125,31 +155,41 @@ class NativeSettingsFencePristineBackingTest {
 
     private fun preferences(): SharedPreferences = RevisionContext().getSharedPreferences(SETTINGS, Context.MODE_PRIVATE)
 
-    // Each case models a different process's first open. Preserve the surrounding test JVM's state.
-    private fun isolatedFirstOpen(test: () -> Unit) {
-        val fence = NativeSettingsFence
-        fun field(name: String) = fence.javaClass.getDeclaredField(name).apply { isAccessible = true }
-        synchronized(field("lock").get(fence)) {
-            val fields = listOf("settingsOpened", "originalRestoreBacking", "revision").map(::field)
-            val previous = fields.map { it.get(fence) }
-            @Suppress("UNCHECKED_CAST")
-            val wrappers = field("wrappers").get(fence) as MutableMap<SharedPreferences, Any>
-            val previousWrappers = java.util.IdentityHashMap(wrappers)
-            try {
-                fields[0].setBoolean(fence, false)
-                fields[1].set(fence, null)
-                fields[2].setLong(fence, 0)
-                wrappers.clear()
-                test()
-            } finally {
-                wrappers.clear()
-                wrappers.putAll(previousWrappers)
-                fields.zip(previous).forEach { (field, value) -> field.set(fence, value) }
-            }
-        }
-    }
+    private fun isolatedFirstOpen(test: () -> Unit) = withIsolatedPristinePreferenceFence(test)
 
     private companion object {
         const val SETTINGS = "vortx_settings"
+    }
+}
+
+/** Each case models a separate process's first open. Retain the other tests' actual wrapper identities. */
+internal fun withIsolatedPristinePreferenceFence(test: () -> Unit) {
+    val fence = NativeSettingsFence
+    fun field(name: String) = fence.javaClass.getDeclaredField(name).apply { isAccessible = true }
+    synchronized(field("lock").get(fence)) {
+        val opened = field("openedBackings")
+        val revision = field("revision")
+        val previousOpened = opened.get(fence)
+        val previousRevision = revision.getLong(fence)
+        @Suppress("UNCHECKED_CAST")
+        val originals = field("originalRestoreBackings").get(fence) as MutableMap<String, Any>
+        val previousOriginals = originals.toMap()
+        @Suppress("UNCHECKED_CAST")
+        val wrappers = field("wrappers").get(fence) as MutableMap<SharedPreferences, Any>
+        val previousWrappers = java.util.IdentityHashMap(wrappers)
+        try {
+            opened.set(fence, emptySet<String>())
+            revision.setLong(fence, 0L)
+            originals.clear()
+            wrappers.clear()
+            test()
+        } finally {
+            wrappers.clear()
+            wrappers.putAll(previousWrappers)
+            originals.clear()
+            originals.putAll(previousOriginals)
+            revision.setLong(fence, previousRevision)
+            opened.set(fence, previousOpened)
+        }
     }
 }

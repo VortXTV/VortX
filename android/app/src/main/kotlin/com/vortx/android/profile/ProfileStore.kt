@@ -382,7 +382,11 @@ class ProfileStore private constructor(context: Context) {
                 acknowledgedNativeAccount = null; acknowledgedNativeTraktEpoch = null
                 initialNativeMigrationProfile = null
             }
-            if (retireLegacy) prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+            if (retireLegacy) NativeSettingsFence.capture {
+                val legacyKey = com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING
+                // An absent preference already means off. Keep a fresh settings backing untouched.
+                if (prefs.contains(legacyKey)) prefs.edit().putBoolean(legacyKey, false).apply()
+            }
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
             notifyHomeTransitionListeners(); notifyPlaylistScopeListeners(PlaylistScopeTransition.AUTHORITY_BOUNDARY)
             publishActiveProfile(); notifySwitchListeners()
