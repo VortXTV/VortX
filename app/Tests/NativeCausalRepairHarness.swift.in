@@ -55,7 +55,7 @@
     func fixtureBaseline() { refreshSettingsShadow() }
     func fixtureStop() { pendingSync?.cancel() }
     func fixtureDocument() async -> [String: Any] {
-        if case .doc(let doc, _) = await pullDocVersionedResult() { return doc }
+        if case .doc(let doc, _, _, _) = await pullDocVersionedResult() { return doc }
         preconditionFailure("expected encrypted fixture document")
     }
 // END MANAGER ENVIRONMENT

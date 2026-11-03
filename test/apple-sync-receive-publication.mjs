@@ -60,6 +60,7 @@ if (process.argv[2] === '--extract') {
     source('app/SourcesShared/CoreModels.swift'), source('app/SourcesShared/StremioAccount.swift'),
     source('app/SourcesShared/CatalogPreferences.swift'), source('app/SourcesShared/HomeRailPreferences.swift')]);
   const managerMethods = ['    private static func sawDocV2(', '    private static func markSawDocV2(',
+    '    private func accountReconnectRequired(for capture:', '    private func clearAccountReconnectFailure(for capture:',
     '    private func conditionalReceiveVersion(', '    private func rememberCompletedNativeReceive(',
     '    private func completedFileRestoreReceive(',
     '    private func openSyncDocument(', '    private static func decodeDecryptedSyncDocument(', '    private static func documentVersion(',
@@ -102,7 +103,7 @@ if (process.argv[2] === '--extract') {
   combined += '\n' + xperienceInputs.extractDeclaration(credentialValues.text, 'enum CredentialScope: Equatable, Hashable, Sendable {')
     + '\nenum VortxAccountFileRestore {\n'
     + member(restoreValues, '    static func hasUnacknowledgedProviderCarrier(')
-    + member(restoreValues, '    static func digest(') + '\n}\nenum VortxAccountFileRepairService {\n'
+    + '\n' + member(restoreValues, '    static func digest(') + '\n}\nenum VortxAccountFileRepairService {\n'
     + member(repairValues, '    static func digest(') + '\n}\n';
   // This existing publication lane has no file intents; it observes the new call without
   // inventing journal success. The dedicated local-adoption suite executes the actual journal.
@@ -122,8 +123,8 @@ if (process.argv[2] === '--extract') {
         let base: Int?
         switch await pullDocVersionedResult(credentialCapture: capture) {
         case .empty: base = nil
-        case .doc(_, let revision): base = revision
-        case .failed, .unchanged: return false
+        case .doc(_, let revision, _, _): base = revision
+        case .ownerHistory, .failed, .unchanged: return false
         }
         guard isCurrent(capture), dataKey == capturedKey,
               SyncDocumentRevisionPolicy.next(after: base) == version else { return false }
@@ -166,7 +167,7 @@ if (process.argv[2] === '--extract') {
   const lifetime = currentMember('private struct NativeCallbackLifetime:');
   combined += '\n' + lifetime + '\nextension CoreBridge {\n'
     + coreMembers.map(currentMember).join('\n')
-    + '\n' + slice(core, '    static let decoder:', '\n    }()', true)
+    + '\n' + slice(core, '    @MainActor static let decoder:', '\n    }()', true)
     + '\n' + slice(core, '    func rebuildContinueWatching()', '\n    /// Record an owner-tagged history receipt')
     + '\n    @MainActor func refreshProfilesForFixture() throws { try refreshNativeProfiles() }\n}\n';
   const historyFixture = await source('app/Tests/AppleHistoryFixture.swift');

@@ -23,8 +23,8 @@ final class CredentialScopeRegistry: @unchecked Sendable {
     typealias Scope = CredentialScope
     struct Capture: Hashable, Sendable {
         let generation: UInt64
-        var namespace: String { "synthetic.receive-publication" }
-        var scope: Scope { .account(UUID(uuidString: AppleSyncReceivePublicationPeer.account)!) }
+        var namespace: String { scope.storageNamespace }
+        var scope: Scope { .account(AppleSyncReceivePublicationPeer.accountID) }
     }
     static let shared = CredentialScopeRegistry()
     private let lock = NSLock()
@@ -215,7 +215,8 @@ struct SIMKLContinueWatchingShadow {
     struct Account { let id: String }
     let directory: URL; let baseURL: URL
     let credentialAuthority = CredentialScopeRegistry.shared
-    var account: Account? = .init(id: AppleSyncReceivePublicationPeer.account)
+    private var accountReconnectFailureCapture: CredentialScopeRegistry.Capture?
+    var account: Account? = .init(id: AppleSyncReceivePublicationPeer.accountID.uuidString.lowercased())
     var dataKey: Data? = AppleSyncReceivePublicationPeer.key
     var isSignedIn = true; var hasAppliedAccountDoc = false; var hasPendingPush = false
     var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
@@ -307,7 +308,8 @@ struct SIMKLContinueWatchingShadow {
 }
 
 @main @MainActor enum AppleSyncReceivePublicationPeer {
-    nonisolated static let account = "synthetic.receive-publication"
+    nonisolated static let accountID = UUID(uuidString: "20000000-0000-4000-8000-000000000041")!
+    nonisolated static let account = CredentialScope.account(accountID).storageNamespace
     nonisolated static let owner = "10000000-0000-0000-0000-000000000041"
     nonisolated static let actor = "00000000-0000-4000-8000-000000000041"
     nonisolated static let viewer = "10000000-0000-0000-0000-000000000042"

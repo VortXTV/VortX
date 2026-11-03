@@ -112,7 +112,7 @@ if (process.argv[2] === '--extract') {
   combined += '\nextension VortXSyncManager {\n' + markers.map(marker => member(source, 'app/SourcesShared/VortXSyncManager.swift', marker)).join('\n') + '\n}\n';
   const core = await production('app/SourcesShared/CoreBridge.swift');
   combined += '\nextension CoreBridge {\n' + member(core, 'app/SourcesShared/CoreBridge.swift', '    func settleResidentNativeSession(')
-    + '\n' + member(core, 'app/SourcesShared/CoreBridge.swift', '    var nativeRegistryBinding:') + '\n}\n';
+    + '\n}\n';
   const backup = await production('app/SourcesShared/SettingsBackup.swift');
   const start = backup.indexOf('    private static let skipPrefixes =');
   const end = backup.indexOf('\n    }', backup.indexOf('    static func migratedKey(')) + 6;
