@@ -483,6 +483,20 @@ check(installAddon.contains("let mutationToken = capturePublicationToken()")
                 && !installAddon.contains("if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }")
                 && installAddon.contains("AddonTombstones.forget(identityURL.absoluteString)"),
               "installer rechecks after awaits and atomically replaces without pre-uninstall or premature native tombstone changes")
+let addonFailurePresentation = member(bridge, "private func addonMutationFailureMessage(_ token:")
+let addonFailureClassification = member(bridge, "private static func addonMutationFailureMessage(publicationCurrent:")
+check(appearsBefore("let mutationCredential = CredentialScopeRegistry.shared.capture()", "await AddonURLGuard.fetch(url)", in: installAddon)
+      && installAddon.components(separatedBy: "message: addonMutationFailureMessage(mutationToken, credential: mutationCredential)").count == 8
+      && !installAddon.contains("message: Self.accountTransitionMessage")
+      && addonFailurePresentation.contains("publicationCurrent: publicationEpochMatches(token)")
+      && addonFailurePresentation.contains("operationCredentialCurrent: CredentialScopeRegistry.shared.isCurrent(credential)")
+      && addonFailurePresentation.contains("nativeCredentialCapture.map { CredentialScopeRegistry.shared.isCurrent($0) }")
+      && addonFailurePresentation.contains("available: nativeFacadeStorage?.isAvailable == true")
+      && addonFailurePresentation.contains("logoutPending: logoutAccountMutationPending")
+      && !addonFailurePresentation.contains("dispatchCtx") && !addonFailurePresentation.contains("await ")
+      && addonFailureClassification.contains("installedCredentialCurrent != false, !logoutPending else { return accountTransitionMessage }")
+      && addonFailureClassification.contains("guard nativeAvailable, installedCredentialCurrent != nil else { return profileUnavailableMessage }"),
+      "installer failure presentation retains original owner/epoch and distinguishes unavailable native data without granting mutation authority")
 check(hydrateAddons.contains("guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }")
                 && hydrateAddons.contains("if dispatchCtx([\"action\": \"InstallAddonLocal\", \"args\": addon.installDescriptor])")
                 && hydrateAddons.contains("installedCount += 1"),

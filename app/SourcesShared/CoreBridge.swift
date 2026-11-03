@@ -1483,6 +1483,7 @@ final class CoreBridge: ObservableObject {
     private static let manifestCacheTTL: TimeInterval = 60
     private static let manifestCacheCap = 64
     private static let accountTransitionMessage = String(localized: "Your account is switching or signing out. Try again in a moment.")
+    private static let profileUnavailableMessage = String(localized: "Your profile data is unavailable right now. Try opening your profile again. If this continues, export diagnostic logs from the profile picker.")
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -1918,8 +1919,9 @@ final class CoreBridge: ObservableObject {
     func installAddonConfirmed(urlString: String, replacingExisting: Bool = false,
                                replacingDescriptor: CoreDescriptor? = nil) async -> AddonInstallOutcome {
         let mutationToken = capturePublicationToken()
+        let mutationCredential = CredentialScopeRegistry.shared.capture()
         guard addonMutationStillAllowed(mutationToken) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
         // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
         // debrid key). Normalizing it to /configure/manifest.json fetches a valid-shaped but DEAD default from
@@ -1949,7 +1951,7 @@ final class CoreBridge: ObservableObject {
         } else {
             let fetchResult = await AddonURLGuard.fetch(url)
             guard addonMutationStillAllowed(mutationToken) else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             switch fetchResult {
             case .failure(let rejection):
@@ -2013,7 +2015,7 @@ final class CoreBridge: ObservableObject {
         let action: [String: Any]
         if let replacingDescriptor {
             guard let old = rawAddonsByUrl[replacingDescriptor.transportUrl] else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             action = ["action": addonMutationAction("ReplaceAddon", local: "ReplaceAddonLocal"),
                       "args": ["old": old, "new": descriptor]]
@@ -2022,7 +2024,7 @@ final class CoreBridge: ObservableObject {
                 // Existing native membership is updated by the kernel's atomic replacement,
                 // which retains its slot and deletion receipts. Install rejects a duplicate URL.
                 guard let old = rawAddonsByUrl[identity] else {
-                    return .failed(retryable: true, message: Self.accountTransitionMessage)
+                    return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
                 }
                 action = ["action": "ReplaceAddonLocal", "args": ["old": old, "new": descriptor]]
             } else {
@@ -2035,13 +2037,13 @@ final class CoreBridge: ObservableObject {
             AddonTombstones.forget(identityURL.absoluteString)
         }
         guard addonMutationStillAllowed(mutationToken), dispatchCtx(action, beforeDispatch: clearTombstoneBeforeDispatch) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
 
         let installConfirmed = await awaitAddonInstalled(identity, replacingManifest: previousManifest,
                                                          expectedManifest: manifest)
         guard addonMutationStillAllowed(mutationToken) else {
-            return .failed(retryable: true, message: Self.accountTransitionMessage)
+            return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
         }
         guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
@@ -2052,7 +2054,7 @@ final class CoreBridge: ObservableObject {
             // view that can lag or omit disabled membership.
             if usesNativeProfileState { return .installed }
             guard addonMutationStillAllowed(mutationToken) else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
+                return .failed(retryable: true, message: addonMutationFailureMessage(mutationToken, credential: mutationCredential))
             }
             // Distinct URLs must prove the old descriptor disappeared. A pre-existing target alone cannot
             // acknowledge a rejected replace action; preserving old/order is safer than tombstoning data.
@@ -5370,6 +5372,36 @@ final class CoreBridge: ObservableObject {
     /// overlay history remains available while a prior owner account is completing Logout.
     private var logoutAccountMutationPending: Bool {
         signedOutRepairRequestState.withLock { $0 != nil }
+    }
+
+    /// Presentation only: a missing native session is not proof of an account transition.
+    /// The original owner/epoch still wins over unavailable storage after any installer await.
+    @MainActor
+    private func addonMutationFailureMessage(_ token: PublicationToken,
+                                             credential: CredentialScopeRegistry.Capture) -> String {
+        let native = nativeFacadeLock.withLock {
+            (available: nativeFacadeStorage?.isAvailable == true,
+             credentialCurrent: nativeCredentialCapture.map { CredentialScopeRegistry.shared.isCurrent($0) })
+        }
+        return Self.addonMutationFailureMessage(
+            publicationCurrent: publicationEpochMatches(token),
+            operationCredentialCurrent: CredentialScopeRegistry.shared.isCurrent(credential),
+            installedCredentialCurrent: native.credentialCurrent,
+            logoutPending: logoutAccountMutationPending,
+            nativeAvailable: native.available)
+    }
+
+    /// Kept separate from mutation admission: changing a message never grants permission to dispatch.
+    private static func addonMutationFailureMessage(publicationCurrent: Bool,
+                                                    operationCredentialCurrent: Bool,
+                                                    installedCredentialCurrent: Bool?,
+                                                    logoutPending: Bool,
+                                                    nativeAvailable: Bool) -> String {
+        guard publicationCurrent, operationCredentialCurrent,
+              installedCredentialCurrent != false, !logoutPending else { return accountTransitionMessage }
+        guard nativeAvailable, installedCredentialCurrent != nil else { return profileUnavailableMessage }
+        // Preserve the existing response for other dispatch/replacement refusals in this narrow change.
+        return accountTransitionMessage
     }
 
     /// Add-on operations have local tombstone side effects, so they require the same immutable
