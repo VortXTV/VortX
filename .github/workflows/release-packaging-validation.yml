@@ -157,8 +157,12 @@ jobs:
           --tests com.vortx.android.sync.AuxiliaryPrefsRestorePhysicalEvidenceTest
           --tests com.vortx.android.sync.NativeSettingsFenceRestoreExclusionTest
           --tests com.vortx.android.sync.ProviderRetryRestoreBackingTest
+          --tests com.vortx.android.sync.ProviderRetryOutboxTest
           --tests com.vortx.android.moat.WatchSignalEnqueueConsentTest
           --tests com.vortx.android.integrations.NativeProviderCredentialsTest
+          --tests com.vortx.android.integrations.NativeProviderRetryVaultTest
+          --tests com.vortx.android.integrations.ProviderRetryCredentialProofTest
+          --tests com.vortx.android.integrations.ProviderWatchlistReceiptTest
           --tests com.vortx.android.profile.RestoreProfileDirectWritersTest
           --tests com.vortx.android.backup.SettingsBackupInteropTest
           --tests com.vortx.android.sync.AccountFileLegacyAdmissionTest
@@ -209,6 +213,56 @@ jobs:
           --tests 'com.vortx.android.engine.NativeOwnAccountSourcesTest.malformed own row is held without losing valid siblings or raw source bytes'
           --no-daemon --stacktrace
 
+      - name: Test isolated Android backup Restore submission
+        shell: bash
+        working-directory: android
+        run: |
+          set -euo pipefail
+          play_results=app/build/test-results/testPlayDebugUnitTest
+          retained=app/build/recovery-isolated
+          mkdir -p "$retained"
+          test ! -e "$retained/aggregate-play"
+          mv "$play_results" "$retained/aggregate-play"
+          test ! -e "$play_results"
+          ./gradlew :app:testPlayDebugUnitTest \
+            -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true \
+            --tests com.vortx.android.sync.AccountFileRestoreManagerPutTest \
+            --no-daemon --max-workers=1 --no-parallel --no-build-cache --stacktrace
+          python3 - "$play_results" <<'PY'
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          name = "com.vortx.android.sync.AccountFileRestoreManagerPutTest"
+          results = pathlib.Path(sys.argv[1])
+          reports = list(results.glob("TEST-*.xml"))
+          if [report.name for report in reports] != [f"TEST-{name}.xml"]:
+              raise SystemExit(f"Unexpected isolated test reports: {reports}")
+          suite = ET.parse(reports[0]).getroot()
+          summary = {"name": name, "tests": "4", "failures": "0", "errors": "0", "skipped": "0"}
+          if suite.tag != "testsuite" or suite.get("disabled", "0") != "0" or any(
+              suite.get(field) != value for field, value in summary.items()
+          ):
+              raise SystemExit(f"Invalid isolated test summary: {suite.attrib}")
+          cases = suite.findall("testcase")
+          expected = {
+              "originalAbsentOutboxReachesOneActualPutAndConfirmedReadbackWithoutSyncSideEffects",
+              "existingCurrentAccountPendingSidecarVetoesBeforeJournalAndPut",
+              "mutationInsideGrantTakeCannotReplaceTheFirstAbsentOutboxObservationOrReplayTheJournal",
+              "originalPermitRetirementAtTheSyntheticDispatchBoundaryReleasesNoBody",
+          }
+          if len(cases) != len(expected) or {case.get("name") for case in cases} != expected:
+              raise SystemExit("Isolated Restore test roster differs from the reviewed cases")
+          if any(
+              case.get("classname") != name
+              or case.get("disabled", "0") != "0"
+              or case.get("status", "run").lower() not in {"run", "passed"}
+              or any(child.tag in {"skipped", "error", "failure", "disabled", "ignored"} for child in case)
+              for case in cases
+          ):
+              raise SystemExit("Isolated Restore test did not execute successfully")
+          PY
+
       - name: Test Full player native-load metadata identity
         working-directory: android
         run: >-
@@ -224,6 +278,7 @@ jobs:
         with:
           name: Android-recovery-unit-results
           path: |
+            android/app/build/recovery-isolated/aggregate-play/*.xml
             android/app/build/test-results/testPlayDebugUnitTest/*.xml
             android/app/build/test-results/testFullDebugUnitTest/*.xml
           if-no-files-found: error
