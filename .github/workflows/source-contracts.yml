@@ -26,6 +26,7 @@ on:
       - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
+      - "scripts/test-addon-mutation-failure-presentation.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
@@ -49,6 +50,7 @@ on:
       - "test/subtitle-mount-owner-fixture.cjs"
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
+      - "scripts/test-sync-candidate-read-fence.mjs"
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-account-file-access.sh"
@@ -141,6 +143,7 @@ on:
       - "test/apple-nzb-operation-http.py"
       - "scripts/test-tv-search-collections.sh"
       - "scripts/test-addon-selfhosted.sh"
+      - "scripts/test-addon-mutation-failure-presentation.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-source-title-match.sh"
       - "scripts/test-aether-playback-boundary.sh"
@@ -164,6 +167,7 @@ on:
       - "test/subtitle-mount-owner-fixture.cjs"
       - "scripts/test-subtitle-timing-policy.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
+      - "scripts/test-sync-candidate-read-fence.mjs"
       - "scripts/test-native-bootstrap-archive.sh"
       - "scripts/test-account-backup-file.sh"
       - "scripts/test-account-file-access.sh"
@@ -293,6 +297,9 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-addon-selfhosted.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: bash scripts/test-addon-mutation-failure-presentation.sh
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        timeout-minutes: 2
       - run: bash scripts/test-episode-source-isolation.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - name: Fetch immutable public next-episode cancellation baseline
@@ -356,6 +363,9 @@ jobs:
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-sync-derived-document-revisions.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+      - run: node scripts/test-sync-candidate-read-fence.mjs
+        if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
+        timeout-minutes: 2
       - run: bash scripts/test-native-bootstrap-archive.sh
         if: ${{ !cancelled() && steps.apple_prerequisites.outcome == 'success' }}
       - run: bash scripts/test-account-backup-file.sh
