@@ -54,8 +54,10 @@ import com.vortx.android.BuildConfig
 import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
+import com.vortx.android.ui.profilepicker.PickerFileRecoveryLanding
 import com.vortx.android.ui.profilepicker.ProfilePickerAccountHost
 import com.vortx.android.ui.profilepicker.rememberPickerAccountModel
+import com.vortx.android.ui.profilepicker.rememberPickerFileRecoveryPause
 import com.vortx.android.ui.profilepicker.currentPickerDiagnosticExportAllowed
 import com.vortx.android.ui.profilepicker.ProfilePickerToolsHost
 import com.vortx.android.ui.viewmodel.rememberPickerToolsModel
@@ -93,16 +95,10 @@ fun TvApp(
     syncManager: VortXSyncManager? = null,
     deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
+    val fileRecoveryPausedNow = rememberPickerFileRecoveryPause(syncManager?.pickerFileRecoveryPaused)
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf(null) })
-    val queueApplicationContext = LocalContext.current.applicationContext
-    val playbackQueue = remember(queueApplicationContext) {
-        (queueApplicationContext as? VortXApplication)?.playbackQueue
-    }
-    val queueState by (playbackQueue?.state?.collectAsStateWithLifecycle()
-        ?: remember { mutableStateOf<PlaybackQueueState?>(null) })
-
     VortXTheme(
         accentId = activeProfile?.accentID ?: VortXAccents.default.id,
         oled = activeProfile?.oled ?: false,
@@ -116,34 +112,61 @@ fun TvApp(
         val pickerAccountModel = rememberPickerAccountModel(syncManager)
         val pickerToolsModel = rememberPickerToolsModel(syncManager)
         val pickerToolsState by pickerToolsModel.state.collectAsStateWithLifecycle()
+        val sessionUiState by (
+            syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
+        )
+        val pickerFileRecoveryPaused = fileRecoveryPausedNow()
         val pickerAccountOpen by (pickerAccountModel?.pickerPresentationOpen?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(false) })
-        var profileSelection by remember { mutableStateOf<ProfileSelectionRequest?>(null) }
-        profileSelection?.let { request ->
+        // A clean zero/one-profile launch may skip the ordinary picker. Give it an explicit cold entry.
+        var dismissedFileRecoveryEntry by rememberSaveable(syncManager) { mutableStateOf(false) }
+        val showFileRecoveryEntry = !dismissedFileRecoveryEntry && !showPicker &&
+            pickerToolsModel.controller.restoreAvailable && sessionUiState == VortXSyncManager.SessionUiState.SignedOut
+        LaunchedEffect(syncManager, sessionUiState) {
+            if (sessionUiState is VortXSyncManager.SessionUiState.SignedIn) dismissedFileRecoveryEntry = true
+        }
+        var profileSelection by remember(pickerFileRecoveryPaused) { mutableStateOf<ProfileSelectionRequest?>(null) }
+        if (!pickerFileRecoveryPaused) profileSelection?.let { request ->
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, native = true) }
             ProfileSelectionSurface(request, handoff,
                 onComplete = { profileSelection = null; showPicker = false },
                 onChooseAgain = { profileSelection = null; showPicker = true })
             return@VortXTheme
         }
-        if (showPicker || pickerAccountOpen || pickerToolsState.open) {
+        if (showPicker || pickerAccountOpen || pickerToolsState.open || pickerFileRecoveryPaused || showFileRecoveryEntry) {
             // The picker owns Back, its nested editor and exact native selection admission.
             ProfilePickerAccountHost(syncManager, pickerAccountModel, diagnosticAdmission = ::currentPickerDiagnosticExportAllowed, retirePickerUi = { profileSelection = null },
+                fileRecoveryPaused = pickerFileRecoveryPaused,
                 accountScreen = { model, closeAccount, requestSignOut, diagnosticAdmission, notice ->
                     TvPickerVortXAccountScreen(model, closeAccount, onSignOutRequest = requestSignOut, diagnosticAdmission = diagnosticAdmission, dismissalNotice = notice)
                 }) { control ->
                 ProfilePickerToolsHost(pickerToolsModel, isTv = true,
-                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed) {
-                    TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
+                    diagnosticAdmission = ::currentPickerDiagnosticExportAllowed,
+                    recoveryPaused = pickerFileRecoveryPaused,
+                    recoveryLanding = pickerFileRecoveryPaused || showFileRecoveryEntry,
+                    openRecoverySignIn = pickerAccountModel?.let { it::openPickerFileRecoverySignIn },
+                    resumeRecoverySync = syncManager?.let { it::resumePickerFileRecovery }) {
+                    if (pickerFileRecoveryPaused || showFileRecoveryEntry) {
+                        PickerFileRecoveryLanding(isTv = true, accountControl = control,
+                            onContinue = if (pickerFileRecoveryPaused) null else ({ dismissedFileRecoveryEntry = true }))
+                    } else TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it }, accountControl = control)
                 }
             }
             return@VortXTheme
         }
 
+        val queueApplicationContext = LocalContext.current.applicationContext
+        val playbackQueue = remember(queueApplicationContext) {
+            (queueApplicationContext as? VortXApplication)?.playbackQueue
+        }
+        val queueState by (playbackQueue?.state?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf<PlaybackQueueState?>(null) })
+
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var unavailableContinueWatching by remember { mutableStateOf<String?>(null) }
-        unavailableContinueWatching?.let { message ->
+        if (!fileRecoveryPausedNow()) unavailableContinueWatching?.let { message ->
             androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
                 title = { androidx.compose.material3.Text("Continue Watching") }, text = { androidx.compose.material3.Text(message) },
                 confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
@@ -186,6 +209,7 @@ fun TvApp(
         }
 
         fun isLibraryPlayCurrent(request: RandomTitlePlayRequest): Boolean {
+            if (fileRecoveryPausedNow()) return false
             val store = profileStore ?: return false
             val owner = repo.continueWatchingOwner()
             // Use the actual roster selection, never activeProfileId's owner fallback.
@@ -216,6 +240,7 @@ fun TvApp(
             playingMeta = null
         }
         fun openLibraryPlay(item: MetaItem) {
+            if (fileRecoveryPausedNow()) return
             retireLibraryPlayRoute()
             val store = profileStore ?: return
             val profile = store.active ?: return
@@ -245,6 +270,7 @@ fun TvApp(
         }
         LaunchedEffect(repo, profileStore, activeProfile, playbackQueue, queueState?.revision) {
             fun retireIfChanged() {
+                if (fileRecoveryPausedNow()) return
                 val owner = repo.continueWatchingOwner()
                 playbackQueue?.bindOwner(owner)
                 if (showingPlaybackQueueFor != null && showingPlaybackQueueFor != owner) showingPlaybackQueueFor = null
@@ -261,6 +287,7 @@ fun TvApp(
 
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
+            if (fileRecoveryPausedNow()) return@LaunchedEffect
             val target = event.target
             retireLibraryPlayRoute()
             importedCollectionsEntry = null
@@ -276,10 +303,6 @@ fun TvApp(
         val debridKeys = remember(appContext) { DebridKeys(appContext) }
         // Collect session truth so an account-generation transition recreates the title ViewModel and drops
         // account-derived cache badges/resume refs on TV just as it does in the phone shell.
-        val sessionUiState by (
-            syncManager?.sessionUiState?.collectAsStateWithLifecycle()
-                ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
-        )
         val debridOwnerEpoch = remember(sessionUiState) {
             debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
         }
@@ -361,6 +384,7 @@ fun TvApp(
         val queuePolicyForComposition = queuePolicyEpoch
         val queueProfileForComposition = profileStore?.active
         fun queueOwnerIsSelected(owner: ContinueWatchingOwner): Boolean {
+            if (fileRecoveryPausedNow()) return false
             val store = profileStore ?: return false
             return !store.needsPicker && store.active?.id == owner.profileId &&
                 store.active == queueProfileForComposition && queuePolicyEpoch == queuePolicyForComposition &&
@@ -376,6 +400,7 @@ fun TvApp(
             policyEpoch = queuePolicyForComposition,
         )
         fun openQueuePlay(token: PlaybackQueueToken, automatic: Boolean = false): Boolean {
+            if (fileRecoveryPausedNow()) return false
             val queue = playbackQueue ?: return false
             val store = profileStore ?: return false
             val profile = store.active ?: return false
@@ -408,12 +433,12 @@ fun TvApp(
                 showingSavedPlaylistFor = null
             }
         }
-        if (showingPlaybackQueueFor == currentQueueOwner && visibleQueueState != null) {
+        if (!fileRecoveryPausedNow() && showingPlaybackQueueFor == currentQueueOwner && visibleQueueState != null) {
             PlaybackQueueSheet(
                 state = visibleQueueState,
                 onDismiss = { if (queueOwnerIsSelected(currentQueueOwner)) showingPlaybackQueueFor = null },
                 onManageSavedPlaylists = {
-                    if (showingPlaybackQueueFor == currentQueueOwner) {
+                    if (showingPlaybackQueueFor == currentQueueOwner && queueOwnerIsSelected(currentQueueOwner)) {
                         val app = queueApplicationContext as? VortXApplication
                         val controller = app?.savedPlaylistStore
                         if (controller != null) {

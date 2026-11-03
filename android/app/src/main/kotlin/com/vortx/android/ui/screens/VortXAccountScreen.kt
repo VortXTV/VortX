@@ -270,10 +270,12 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
     val formState by viewModel.formState.collectAsStateWithLifecycle()
     val totpRequired by viewModel.totpRequired.collectAsStateWithLifecycle()
     val qrJoinState by viewModel.qrJoinState.collectAsStateWithLifecycle()
+    val recoverySignIn by viewModel.pickerFileRecoverySignIn.collectAsStateWithLifecycle()
     val submitting = formState is VortXAccountFormState.Submitting
 
-    LaunchedEffect(mode) {
-        if (mode == VortXAccountMode.SIGN_IN) viewModel.startQrJoiner() else viewModel.stopQrJoiner()
+    LaunchedEffect(mode, recoverySignIn) {
+        if (mode == VortXAccountMode.SIGN_IN && !recoverySignIn) viewModel.startQrJoiner()
+        else viewModel.stopQrJoiner()
     }
     DisposableEffect(viewModel) {
         onDispose(viewModel::stopQrJoiner)
@@ -286,18 +288,19 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
         ) {
             Text(
                 when (mode) {
-                    VortXAccountMode.SIGN_IN -> "Sign in to VortX"
+                    VortXAccountMode.SIGN_IN -> if (recoverySignIn) "Backup recovery sign-in" else "Sign in to VortX"
                     VortXAccountMode.REGISTER -> "Create your VortX account"
                     VortXAccountMode.RECOVER -> "Recover your account"
                 },
                 style = VortXTheme.type.cardTitle,
             )
             Text(
-                "One account for every device. Profiles and watch progress sync end-to-end encrypted; " +
+                if (recoverySignIn) "Regular sync stays paused after sign-in. Use Tools to recover a backup or resume sync."
+                else "One account for every device. Profiles and watch progress sync end-to-end encrypted; " +
                     "only your devices can read them.",
                 style = VortXTheme.type.body.copy(color = colors.textSecondary),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+            if (!recoverySignIn) Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
                 Chip("Sign in", selected = mode == VortXAccountMode.SIGN_IN, enabled = !submitting,
                     onClick = { viewModel.onModeChange(VortXAccountMode.SIGN_IN) })
                 Chip("Create", selected = mode == VortXAccountMode.REGISTER, enabled = !submitting,
@@ -305,7 +308,7 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
                 Chip("Recover", selected = mode == VortXAccountMode.RECOVER, enabled = !submitting,
                     onClick = { viewModel.onModeChange(VortXAccountMode.RECOVER) })
             }
-            if (mode == VortXAccountMode.SIGN_IN) {
+            if (mode == VortXAccountMode.SIGN_IN && !recoverySignIn) {
                 QrJoinerBlock(qrJoinState, viewModel::retryQrJoiner)
                 Text(
                     "or sign in with your password",
@@ -363,6 +366,7 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
             PrimaryButton(
                 text = when {
                     submitting -> "Working…"
+                    recoverySignIn -> "Sign in for backup recovery"
                     mode == VortXAccountMode.SIGN_IN -> "Sign In"
                     mode == VortXAccountMode.REGISTER -> "Create Account"
                     else -> "Reset Password"

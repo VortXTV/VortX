@@ -2,6 +2,8 @@ package com.vortx.android.ui.profilepicker
 
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -24,10 +26,12 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.core.app.ActivityOptionsCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.vortx.android.sync.AccountFileRestoreExternalExclusion
 import com.vortx.android.sync.AccountFileRestoreTransaction
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.viewmodel.PickerToolsModelHolder
 import com.vortx.android.ui.viewmodel.ProfilePickerToolsViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,20 +49,20 @@ import java.util.UUID
 @RunWith(AndroidJUnit4::class)
 class ProfilePickerToolsHostTest {
     @get:Rule val compose = createComposeRule()
-    private class Accounts : PickerToolsAccounts {
+    private class Accounts(private val signedIn: Boolean) : PickerToolsAccounts {
         private val issuer = Any(); private val session = Any()
         private val account = VortXSyncManager.Account("10000000-0000-0000-0000-000000000001", "fixture@example.invalid", "Fixture", false)
         override val authorityRevision = 0L
         override val sessionMarker: Any = Unit
         override val changes = flowOf(Unit)
-        override fun capture() = PickerAccountSnapshot(issuer, 0, 0, 1, session, account)
-        override fun isCurrent(original: PickerAccountSnapshot) = original.matchesAuthority(issuer, 0, 0) && original.matchesOwner(issuer, 1, session)
+        override fun capture() = PickerAccountSnapshot(issuer, 0, 0, 1, session.takeIf { signedIn }, account.takeIf { signedIn })
+        override fun isCurrent(original: PickerAccountSnapshot) = original.matchesAuthority(issuer, 0, 0) && original.matchesOwner(issuer, 1, session.takeIf { signedIn })
         var gets = 0
         override suspend fun download(original: PickerAccountSnapshot): ByteArray { gets++; return byteArrayOf(1, 2, 3) }
     }
-    private class Fixture(restore: PickerToolsRestoreActions? = null) {
+    private class Fixture(restore: PickerToolsRestoreActions? = null, signedIn: Boolean = true) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val accounts = Accounts()
+        val accounts = Accounts(signedIn)
         val policy = mutableStateOf(false)
         val controller = ProfilePickerToolsController(accounts, PickerToolsBackupPreparer { _, current ->
             check(current())
@@ -211,5 +215,56 @@ class ProfilePickerToolsHostTest {
             assertEquals(1, actions.closes)
             assertEquals(0, f.accounts.gets)
         } finally { f.close() }
+    }
+
+    @Test fun signedOutToolsShowsOnlyExplicitRecoverySignInForRestoreEntry() {
+        val f = Fixture(RestoreActions(), signedIn = false)
+        var opened = 0
+        try {
+            compose.setContent { VortXTheme {
+                ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { false },
+                    openRecoverySignIn = { original -> assertNull(original.account); opened++; true }) {}
+            } }
+            compose.onNodeWithTag("profile-picker-tools").performClick()
+            compose.onNodeWithTag("picker-tools-restore").assertDoesNotExist()
+            compose.onNodeWithTag("picker-tools-restore-verify").assertDoesNotExist()
+            compose.onNodeWithTag("picker-tools-recovery-sign-in").performScrollTo().performClick()
+            compose.waitUntil { opened == 1 }
+            assertEquals(1, opened)
+            assertEquals(0, f.accounts.gets)
+        } finally { f.close() }
+    }
+
+    @Test fun twoActualActivityModelHoldersShareOneManagerRecoveryGateEvenAfterDelegateRemoval() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation().context
+        val prefix = "picker-recovery-holder-${UUID.randomUUID()}-"
+        val context = object : ContextWrapper(instrumentation) {
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(name: String, mode: Int) =
+                instrumentation.getSharedPreferences(prefix + name, mode)
+        }
+        val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val manager = VortXSyncManager(context, managerScope)
+        val phone = PickerToolsModelHolder()
+        val tv = PickerToolsModelHolder()
+        try {
+            // A nominal test collaborator that must never run. No account or provider operation is initiated.
+            val external = AccountFileRestoreExternalExclusion { _, _, _ -> throw AssertionError("unexpected exclusion") }
+            compose.runOnIdle {
+                val a = phone.model(manager = manager, applicationContext = context, externalRestore = external)
+                val b = tv.model(manager = manager, applicationContext = context, externalRestore = external)
+                assertNotSame(a.controller, b.controller)
+                assertTrue(a.controller.restoreAvailable)
+                assertTrue(b.controller.restoreAvailable)
+                assertSame(a.controller.recoveryBusy, b.controller.recoveryBusy)
+                val successor = tv.model(manager = manager, applicationContext = context)
+                assertNotSame(b.controller, successor.controller)
+                assertFalse(successor.controller.restoreAvailable)
+                assertSame(a.controller.recoveryBusy, successor.controller.recoveryBusy)
+            }
+        } finally {
+            compose.runOnIdle { phone.model(null, context); tv.model(null, context) }
+            managerScope.cancel()
+        }
     }
 }

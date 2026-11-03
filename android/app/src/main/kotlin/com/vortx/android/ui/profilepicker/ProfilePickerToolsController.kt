@@ -42,6 +42,7 @@ internal data class PickerToolsState(
 internal enum class PickerToolsPhase {
     IDLE, DOWNLOADING, CHOOSING_REPAIR_INPUT, PREPARING_REPAIR, REVIEWING_REPAIR,
     CHECKING_RESTORE, CHOOSING_RESTORE_INPUT, READING_RESTORE, REVIEWING_RESTORE, RESTORING, VERIFYING_RESTORE,
+    OPENING_RECOVERY_SIGN_IN, RESUMING_RECOVERY_SYNC,
     AWAITING_DESTINATION, SAVING, SHARING_DIAGNOSTICS, CANCELLING,
 }
 @ConsistentCopyVisibility
@@ -164,6 +165,7 @@ internal class ProfilePickerToolsController(
     private val workGate: PickerToolsWorkGate = PickerToolsWorkGate(),
     private val repairPreparer: PickerToolsRepairPreparer? = null,
     private val restoreActions: PickerToolsRestoreActions? = null,
+    private val recoveryGate: PickerToolsWorkGate = PickerToolsWorkGate(),
 ) : Closeable {
     private val lock = Any()
     private var attachment: PickerToolsAttachment? = null
@@ -176,6 +178,7 @@ internal class ProfilePickerToolsController(
     val state: StateFlow<PickerToolsState> = _state.asStateFlow()
     val repairAvailable: Boolean get() = repairPreparer != null
     val restoreAvailable: Boolean get() = restoreActions != null
+    val recoveryBusy: StateFlow<Boolean> get() = recoveryGate.busy
     private var retainedRestore: RetainedRestore? = null
     private class RetainedRestore(val grant: PickerToolsActionGrant, val record: FileRestoreStatus.Retained) {
         val verify = when (record.state) {
@@ -221,6 +224,10 @@ internal class ProfilePickerToolsController(
         class Read(val read: suspend (() -> Boolean) -> PickerToolsSelectedBackup) : RepairSelection
         class Refused(val failure: PickerToolsFailure?) : RepairSelection
     }
+    private enum class RecoveryAction(val failed: String) {
+        SIGN_IN("Backup recovery sign-in could not be opened."),
+        RESUME("Regular sync could not be resumed. Check your account and try again."),
+    }
     private class Slot(
         val request: PickerToolsDestinationRequest,
         val presentationId: String,
@@ -231,7 +238,9 @@ internal class ProfilePickerToolsController(
         val diagnosticPolicy: (() -> Boolean)? = null,
         val repair: PickerToolsRepairInputRequest? = null,
         val restore: RestoreWork? = null,
+        val recoveryAction: RecoveryAction? = null,
     ) {
+        val usesRecoveryGate: Boolean get() = restore != null || recoveryAction != null
         @Volatile var revoked = false
         @Volatile var entered = false
         var job: Job? = null
@@ -374,7 +383,8 @@ internal class ProfilePickerToolsController(
         job?.cancel()
     }
     private fun admit(expected: PickerToolsActionGrant, diagnosticPolicy: (() -> Boolean)? = null,
-        repair: Boolean = false, restoreSelection: Boolean = false, restoreVerify: PickerToolsRestoreVerifyRequest? = null): Slot? {
+        repair: Boolean = false, restoreSelection: Boolean = false, restoreVerify: PickerToolsRestoreVerifyRequest? = null,
+        recoveryAction: RecoveryAction? = null): Slot? {
         if (!currentGrant(expected)) return null
         return synchronized(lock) {
             if (closed || attachment != expected.attachment || routeAuthority !== expected.routeIdentity ||
@@ -393,8 +403,14 @@ internal class ProfilePickerToolsController(
             }
             val candidate = Slot(request, expected.presentationId, expected.routeIdentity, expected.original,
                 expected.revision, expected.marker, diagnosticPolicy,
-                if (repair) PickerToolsRepairInputRequest(request.routeId, request.operationId) else null, restore)
+                if (repair) PickerToolsRepairInputRequest(request.routeId, request.operationId) else null,
+                restore, recoveryAction)
+            if (candidate.usesRecoveryGate && !recoveryGate.reserve(candidate)) {
+                _state.value = _state.value.copy(message = "A backup recovery operation is still running. Wait for it to finish.")
+                return null
+            }
             if (!workGate.reserve(candidate)) {
+                if (candidate.usesRecoveryGate) recoveryGate.release(candidate)
                 _state.value = _state.value.copy(phase = PickerToolsPhase.CANCELLING, message = null,
                     cancellingFileSave = workGate.savingFile)
                 null
@@ -429,6 +445,7 @@ internal class ProfilePickerToolsController(
             publicationAuthority = if (publish) original.revision to original.marker else null
             slot = null
             workGate.release(original)
+            if (original.usesRecoveryGate) recoveryGate.release(original)
             retainedRestore = if (publish) original.restore?.retained else null
             _state.value = _state.value.copy(phase = PickerToolsPhase.IDLE, destination = null, repairInput = null,
                 repairReview = null, restoreInput = null, restoreReview = null, restoreStatus = retainedRestore?.presentation(),
@@ -443,6 +460,7 @@ internal class ProfilePickerToolsController(
             catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) {
                 message = when {
+                    original.recoveryAction != null -> original.recoveryAction.failed
                     original.restore != null -> when (_state.value.phase) {
                         PickerToolsPhase.CHECKING_RESTORE -> restoreStatusUnavailable
                         PickerToolsPhase.READING_RESTORE -> "The selected backup could not be read safely."
@@ -605,9 +623,31 @@ internal class ProfilePickerToolsController(
         }
     }
 
+    /** Explicit recovery entry uses the signed-out snapshot rendered by this Tools route. */
+    fun beginRecoverySignIn(expected: PickerToolsActionGrant, open: (PickerAccountSnapshot) -> Boolean) {
+        if (!restoreAvailable || expected.original?.account != null || expected.original == null) return
+        val original = admit(expected, recoveryAction = RecoveryAction.SIGN_IN) ?: return
+        phase(original, PickerToolsPhase.OPENING_RECOVERY_SIGN_IN)
+        launch(original) {
+            requireCurrent(original)
+            if (open(checkNotNull(original.original))) null else RecoveryAction.SIGN_IN.failed
+        }
+    }
+
+    /** The shared slot admits Resume only after any selected-file/provider/Verify work drains. */
+    fun resumeRecoverySync(expected: PickerToolsActionGrant, resume: suspend (PickerAccountSnapshot) -> Boolean) {
+        if (expected.original?.account == null) return
+        val original = admit(expected, recoveryAction = RecoveryAction.RESUME) ?: return
+        phase(original, PickerToolsPhase.RESUMING_RECOVERY_SYNC)
+        launch(original) {
+            requireCurrent(original)
+            if (resume(checkNotNull(original.original))) "Regular sync resumed." else RecoveryAction.RESUME.failed
+        }
+    }
+
     fun restore(expected: PickerToolsActionGrant) {
         val actions = restoreActions ?: return
-        if (!requireFileGrant(expected, "restoring")) return
+        if (expected.original?.account == null) return
         val original = admit(expected, restoreSelection = true) ?: return
         val work = checkNotNull(original.restore)
         val input = checkNotNull(work.input)
@@ -701,7 +741,7 @@ internal class ProfilePickerToolsController(
 
     fun verifyRestore(expected: PickerToolsActionGrant, request: PickerToolsRestoreVerifyRequest) {
         val actions = restoreActions ?: return
-        if (!requireFileGrant(expected, "verifying")) return
+        if (expected.original?.account == null) return
         val original = admit(expected, restoreVerify = request) ?: return
         val work = checkNotNull(original.restore)
         val operationId = checkNotNull(work.verify).record.operationId

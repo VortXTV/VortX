@@ -11,6 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModel
@@ -25,6 +26,17 @@ import com.vortx.android.sync.PickerSignOutResult
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.viewmodel.ReplacingViewModelStoreOwner
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
+import kotlinx.coroutines.flow.StateFlow
+
+/** Collected state schedules recomposition; a newer live pause also denies old callbacks. */
+@Composable
+internal fun rememberPickerFileRecoveryPause(pause: StateFlow<Boolean>?): () -> Boolean {
+    val observed = pause?.collectAsStateWithLifecycle()
+    val currentSource = rememberUpdatedState(pause)
+    return remember(pause, observed) {
+        { currentSource.value !== pause || observed?.value == true || pause?.value == true }
+    }
+}
 
 class ProfilePickerAccountControl(val label: String, val onClick: () -> Unit)
 
@@ -68,6 +80,7 @@ internal fun ProfilePickerAccountHost(
     retirePickerUi: () -> Unit,
     diagnosticAdmission: () -> Boolean,
     accountScreen: @Composable (VortXAccountViewModel, () -> Unit, () -> Unit, () -> Boolean, String?) -> Unit,
+    fileRecoveryPaused: Boolean = false,
     picker: @Composable (ProfilePickerAccountControl?) -> Unit,
 ) {
     if (syncManager == null || model == null) { picker(null); return }
@@ -88,7 +101,7 @@ internal fun ProfilePickerAccountHost(
         else if (syncManager.capturePickerAccountSnapshot()?.account != null) requestSignOut()
         else model.openPickerPresentation()
     }
-    if (open) {
+    if (open && !fileRecoveryPaused) {
         BackHandler { closeForm() }
         accountScreen(model, ::closeForm, ::requestSignOut, diagnosticAdmission, dismissalNotice)
     } else {

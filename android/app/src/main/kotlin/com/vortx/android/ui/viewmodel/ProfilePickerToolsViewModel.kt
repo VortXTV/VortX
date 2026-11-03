@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOf
 import java.util.UUID
+import java.util.WeakHashMap
 
 internal class ManagerPickerToolsAccounts(private val manager: VortXSyncManager) : PickerToolsAccounts {
     override val authorityRevision: Long get() = manager.pickerAuthorityRevision.value
@@ -101,6 +102,15 @@ private class ManagerPickerToolsRestoreActions(
         manager.verifyAccountBackupFileRestore(checkNotNull(original.original), operationId, isCurrent)
 }
 
+/** Process-local gate shared by every activity holder using the exact application manager.
+ * An active slot owns its manager through real return. An empty gate does not retain its key. */
+private object ManagerPickerRecoveryGates {
+    private val gates = WeakHashMap<VortXSyncManager, PickerToolsWorkGate>()
+    fun forManager(manager: VortXSyncManager): PickerToolsWorkGate = synchronized(gates) {
+        gates.getOrPut(manager) { PickerToolsWorkGate() }
+    }
+}
+
 /** Activity-owned, ephemeral only. It retains neither an Activity nor any SavedStateHandle/Bundle. */
 internal class ProfilePickerToolsViewModel private constructor(
     private val documents: AccountBackupDocuments?,
@@ -133,7 +143,7 @@ internal class ProfilePickerToolsViewModel private constructor(
                     }
                 }, restoreActions = if (manager != null && externalRestore != null)
                     ManagerPickerToolsRestoreActions(checkNotNull(model.documents), manager, externalRestore)
-                else null)
+                else null, recoveryGate = manager?.let(ManagerPickerRecoveryGates::forManager) ?: PickerToolsWorkGate())
         },
     )
     /** Test collaborator replaces I/O/transport only; the actual controller and route/slot logic remain. */

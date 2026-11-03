@@ -80,9 +80,10 @@ class ProfilePickerToolsRestoreControllerTest {
     }
 
     private fun controller(scope: CoroutineScope, accounts: Accounts, actions: Actions? = null,
-        gate: PickerToolsWorkGate = PickerToolsWorkGate()) = ProfilePickerToolsController(
+        gate: PickerToolsWorkGate = PickerToolsWorkGate(),
+        recoveryGate: PickerToolsWorkGate = PickerToolsWorkGate()) = ProfilePickerToolsController(
         accounts, PickerToolsBackupPreparer { _, _ -> error("unexpected file preparation") },
-        scope, gate, restoreActions = actions,
+        scope, gate, restoreActions = actions, recoveryGate = recoveryGate,
     )
     private fun ProfilePickerToolsController.openRoute(): PickerToolsActionGrant {
         val route = attachPicker()
@@ -414,6 +415,132 @@ class ProfilePickerToolsRestoreControllerTest {
             assertFalse(message.contains("synthetic private"))
             assertFalse(message.contains("new copy"))
             assertEquals(1, failActions.candidate.closes)
+        }
+    }
+
+    @Test fun explicitRecoverySignInNeedsDelegateAndExactCurrentSignedOutGrant() = runTest {
+        controller(backgroundScope, Accounts(signedIn = false)).use { controller ->
+            controller.beginRecoverySignIn(controller.openRoute()) { throw AssertionError("disabled recovery reached auth") }
+            runCurrent()
+            assertEquals(PickerToolsPhase.IDLE, controller.state.value.phase)
+        }
+        val accounts = Accounts(signedIn = false)
+        val opened = mutableListOf<PickerAccountSnapshot>()
+        controller(backgroundScope, accounts, Actions()).use { controller ->
+            val original = controller.openRoute()
+            controller.beginRecoverySignIn(original) { opened += it; true }
+            controller.beginRecoverySignIn(original) { throw AssertionError("duplicate recovery reached auth") }
+            runCurrent()
+            assertSame(original.original, opened.single())
+            accounts.replace(differentAccount = false)
+            controller.beginRecoverySignIn(original) { throw AssertionError("retired recovery reached auth") }
+            runCurrent()
+            val signedIn = controller.openRoute()
+            controller.beginRecoverySignIn(signedIn) { throw AssertionError("signed-in recovery reached auth") }
+            runCurrent()
+            assertEquals(1, opened.size)
+        }
+    }
+
+    @Test fun resumeWaitsForActualRetiredRestoreDrainAndUsesOriginalSignedInOwner() = runTest {
+        val actions = Actions()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val resumed = mutableListOf<PickerAccountSnapshot>()
+        actions.select = { current ->
+            withContext(NonCancellable) {
+                entered.complete(Unit); release.await(); assertFalse(current()); actions.candidate
+            }
+        }
+        controller(backgroundScope, Accounts(), actions).use { controller ->
+            try {
+                val original = controller.openRoute()
+                controller.restore(original); runCurrent()
+                controller.deliverInput(); runCurrent()
+                assertTrue(entered.isCompleted)
+                controller.closeTools(original.attachment)
+                controller.open(original.attachment)
+                val reopened = checkNotNull(controller.renderedActions(original.attachment))
+                controller.resumeRecoverySync(original) { throw AssertionError("closed presentation reached resume") }
+                controller.resumeRecoverySync(reopened) { throw AssertionError("undrained selection reached resume") }
+                runCurrent()
+                assertEquals(PickerToolsPhase.CANCELLING, controller.state.value.phase)
+                assertFalse(controller.state.value.cancellingFileSave)
+                release.complete(Unit); runCurrent()
+                assertEquals(1, actions.candidate.closes)
+                controller.resumeRecoverySync(reopened) { resumed += it; true }
+                runCurrent()
+                assertSame(original.original, resumed.single())
+                assertEquals("Regular sync resumed.", controller.state.value.message)
+                assertEquals(0, actions.candidate.confirmations)
+            } finally { release.complete(Unit) }
+        }
+    }
+
+    @Test fun staleOwnerAndSignedOutGrantCannotResumeEvenWithAQueuedCallback() = runTest {
+        val accounts = Accounts()
+        controller(backgroundScope, accounts, Actions()).use { controller ->
+            val original = controller.openRoute()
+            accounts.replace(differentAccount = true)
+            controller.resumeRecoverySync(original) { throw AssertionError("retired owner reached resume") }
+            runCurrent()
+        }
+        controller(backgroundScope, Accounts(signedIn = false), Actions()).use { controller ->
+            controller.resumeRecoverySync(controller.openRoute()) { throw AssertionError("signed-out owner reached resume") }
+            runCurrent()
+            assertEquals(PickerToolsPhase.IDLE, controller.state.value.phase)
+        }
+    }
+
+    @Test fun separateActivitySlotsCannotResumeThroughSharedRecoveryGateUntilOtherHolderActuallyDrains() = runTest {
+        val managerGate = PickerToolsWorkGate()
+        val phoneGate = PickerToolsWorkGate()
+        val tvGate = PickerToolsWorkGate()
+        val actions = Actions()
+        val entered = CompletableDeferred<Unit>()
+        val returnFromProvider = CompletableDeferred<Unit>()
+        val resumed = mutableListOf<PickerAccountSnapshot>()
+        actions.select = { current ->
+            withContext(NonCancellable) {
+                entered.complete(Unit)
+                returnFromProvider.await()
+                assertFalse(current())
+                actions.candidate
+            }
+        }
+        val phone = controller(backgroundScope, Accounts(), actions, phoneGate, managerGate)
+        // A default-null replacement must still share the recovery gate for its paused Resume exit.
+        val tv = controller(backgroundScope, Accounts(), gate = tvGate, recoveryGate = managerGate)
+        try {
+            val phoneOwner = phone.openRoute()
+            val tvOwner = tv.openRoute()
+            phone.restore(phoneOwner); runCurrent()
+            assertNotNull(phone.state.value.restoreInput)
+            assertTrue(phone.recoveryBusy.value)
+            assertTrue(tv.recoveryBusy.value)
+            assertFalse(tvGate.busy.value)
+            tv.resumeRecoverySync(tvOwner) { throw AssertionError("Resume overlapped the other holder's SAF selection") }
+            runCurrent()
+            phone.deliverInput(); runCurrent()
+            assertTrue(entered.isCompleted)
+            phone.close()
+            tv.resumeRecoverySync(tvOwner) { throw AssertionError("Resume overlapped retired provider cleanup") }
+            runCurrent()
+            assertTrue(managerGate.busy.value)
+            assertFalse(tvGate.busy.value)
+            assertEquals(0, actions.candidate.closes)
+            returnFromProvider.complete(Unit); runCurrent()
+            assertEquals(1, actions.candidate.closes)
+            assertFalse(phoneGate.busy.value)
+            assertFalse(tv.recoveryBusy.value)
+            tv.resumeRecoverySync(tvOwner) { resumed += it; true }
+            runCurrent()
+            assertSame(tvOwner.original, resumed.single())
+            assertFalse(managerGate.busy.value)
+        } finally {
+            returnFromProvider.complete(Unit)
+            phone.close()
+            tv.close()
         }
     }
 }
