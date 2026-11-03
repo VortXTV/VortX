@@ -1,6 +1,7 @@
 package com.vortx.android.sync
 
 import android.content.Context
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import org.json.JSONArray
@@ -17,6 +18,9 @@ data class AccountLibraryRestoreResult(val accepted: Boolean, val restored: List
 internal interface LibraryProofPersistence {
     /** Failure is unavailable storage, success(null) is positively absent data. */
     fun read(key: String): Result<String?>
+    fun inspectExisting(vararg keys: String): AccountFileLocalPresence = AccountFileLocalPresence.UNAVAILABLE
+    fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence =
+        AccountFileLocalPresence.UNAVAILABLE
     fun write(key: String, value: String): Boolean
 }
 
@@ -29,8 +33,19 @@ internal class OwnerLibraryPublicationProofs(private val persistence: LibraryPro
             return if (snapshot.availability == PersistentCredentialAvailability.AVAILABLE) Result.success(snapshot.values[key])
             else Result.failure(IllegalStateException("Publication proof storage unavailable"))
         }
+        override fun inspectExisting(vararg keys: String) = store.inspectExisting(*keys)
+        override fun inspectExisting(key: String, isInert: (String) -> Boolean) =
+            store.inspectExisting(key, isInert)
         override fun write(key: String, value: String): Boolean = store.set(key, value)
     })
+
+    @Synchronized fun inspectRestorePresence(account: String): AccountFileLocalPresence {
+        val key = accountKey(account)
+        val ledger = persistence.inspectExisting(key)
+        if (ledger != AccountFileLocalPresence.ABSENT) return ledger
+        // Clearing the last pending operation writes the exact empty object.
+        return persistence.inspectExisting("$key.pending") { it == "{}" }
+    }
 
     @Synchronized fun owns(account: String, native: NativeLibraryOwner, item: VortXSyncDoc.OwnerLibraryItem): Boolean {
         return published(account, native, item) != null

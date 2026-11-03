@@ -2,6 +2,7 @@ package com.vortx.android.metadata
 
 import android.content.Context
 import com.vortx.android.BuildConfig
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
@@ -56,10 +57,12 @@ class MetadataProviderKeys(context: Context) {
         ),
     }
 
+    /** Existing account-qualified backup source only; caller already holds original admission. */
+    internal fun inspectQualifiedRestorePresence(account: String): AccountFileLocalPresence =
+        store.inspectExisting(*Slot.entries.map { "${it.key}.account.$account" }.toTypedArray())
+
     /** The stored value for [slot], or empty when unset. The value never leaves the secure store otherwise. */
-    fun value(slot: Slot): String = synchronized(OWNER_LOCK) {
-        NativeProviderAccess.read(setOf(slot.syncKey))?.values?.get(slot.syncKey).orEmpty()
-    }
+    fun value(slot: Slot): String = currentValue(slot)
 
     fun hasValue(slot: Slot): Boolean = value(slot).isNotEmpty()
 
@@ -120,6 +123,11 @@ class MetadataProviderKeys(context: Context) {
     }
 
     companion object {
+        /** Owner-admitted ordinary read for artwork callers that need no legacy wrappers. */
+        internal fun currentValue(slot: Slot): String = synchronized(OWNER_LOCK) {
+            NativeProviderAccess.read(setOf(slot.syncKey))?.values?.get(slot.syncKey).orEmpty()
+        }
+
         private const val CREDENTIALS_FILE = "vortx_metadata_credentials"
         private val OWNER_LOCK = Any()
         private val revisionCounter = AtomicLong(0L)

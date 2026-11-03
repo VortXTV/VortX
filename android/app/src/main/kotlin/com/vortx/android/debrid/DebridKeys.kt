@@ -3,6 +3,7 @@ package com.vortx.android.debrid
 import android.content.Context
 import android.util.AtomicFile
 import com.vortx.android.BuildConfig
+import com.vortx.android.engine.AccountFileLocalPresence
 import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
@@ -185,6 +186,7 @@ internal object LegacyOwnerClaimCodec {
 internal interface DebridKeyValueStore {
     val adoptionDomain: Any get() = this
     fun snapshot(vararg keys: String): DebridStorageSnapshot
+    fun inspectExisting(vararg keys: String): AccountFileLocalPresence = AccountFileLocalPresence.UNAVAILABLE
     fun write(values: Map<String, String?>): Boolean
     fun legacyOwnerReservation(): LegacyOwnerReservation
     fun claimLegacyOwner(owner: String): Boolean
@@ -208,6 +210,8 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
     )
     private val legacyClaimStore =
         AtomicFile(File(context.noBackupFilesDir, DebridKeys.LEGACY_CLAIM_FILE))
+
+    override fun inspectExisting(vararg keys: String): AccountFileLocalPresence = store.inspectExisting(*keys)
 
     override fun snapshot(vararg keys: String): DebridStorageSnapshot {
         val snapshot = store.confirmedSnapshot(*keys)
@@ -319,6 +323,12 @@ class DebridKeys private constructor(
         activeOwner = PROCESS_OWNER_BINDING::currentOwner,
         nativeMode = true,
     )
+
+    /** Exact account-qualified rollback slots used by native provider migration. No adoption. */
+    internal fun inspectQualifiedRestorePresence(account: String): AccountFileLocalPresence {
+        val scope = DebridOwnerScope.Account(account)
+        return store.inspectExisting(*DebridService.entries.map { it.storageKey(scope) }.toTypedArray())
+    }
 
     /// The stored key for [service], or an empty string when none is set.
     @Synchronized

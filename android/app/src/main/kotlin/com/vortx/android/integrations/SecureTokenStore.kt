@@ -5,6 +5,7 @@ import com.vortx.android.security.ConditionalCredentialWrite
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
+import com.vortx.android.engine.AccountFileLocalPresence
 
 /// AES-encrypted-at-rest key/value store for the external-sync OAuth tokens (Trakt, SIMKL). This is the
 /// Android analogue of the Apple Keychain those token sets live in (see `TraktAuth.swift` /
@@ -19,6 +20,9 @@ import com.vortx.android.security.PersistentCredentialSnapshot
 internal interface CredentialStoreAccess {
     fun string(key: String): String?
     fun confirmedSnapshot(vararg keys: String): PersistentCredentialSnapshot
+    fun inspectExisting(vararg keys: String): AccountFileLocalPresence = AccountFileLocalPresence.UNAVAILABLE
+    fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence =
+        AccountFileLocalPresence.UNAVAILABLE
 
     /// Single-key compatibility view. An unavailable backend is never reported as cached credential truth.
     fun confirmedString(key: String): String? {
@@ -54,6 +58,12 @@ internal class SecureTokenStore(context: Context, fileName: String) : Credential
     /// distinguish an absent field from a present empty field; only the single-string views collapse empty.
     override fun confirmedSnapshot(vararg keys: String): PersistentCredentialSnapshot =
         projectConfirmedSnapshot(store.confirmedSnapshot(*keys))
+
+    override fun inspectExisting(vararg keys: String): AccountFileLocalPresence =
+        store.inspectExisting(*keys)
+
+    override fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence =
+        store.inspectExisting(key, isInert)
 
     fun setIfConfirmedAbsent(key: String, value: String): ConditionalCredentialWrite =
         store.setIfConfirmedAbsent(key, value)

@@ -2,6 +2,8 @@ package com.vortx.android.integrations
 
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.engine.NativeProfileOverlayWitness
 import com.vortx.android.sync.SessionOwnerSnapshot
 import org.json.JSONObject
 import java.util.UUID
@@ -23,6 +25,23 @@ internal class NativeProviderVault(private val secure: CredentialStoreAccess, pr
     /** Full sensitive record observation, not the selected-provider event revision. No toString. */
     class Observation internal constructor(internal val owner: SessionOwnerSnapshot.Account,
         internal val generation: Long, internal val sealed: String?, internal val legacy: String?)
+
+    /** Never load or seed a record. An exact startup shell with no state is inert; the manager
+     * must still confirm the separate qualified legacy stores. */
+    fun inspectRestorePresence(owner: SessionOwnerSnapshot.Account): AccountFileLocalPresence =
+        secure.inspectExisting(key(owner)) { raw ->
+            require(raw.length <= 4_096)
+            val root = NativeProfileOverlayWitness.parseDocument(raw.toByteArray(Charsets.UTF_8))
+            val actor = root.opt("actor") as? String
+            val document = root.optJSONObject("document")
+            root.keys().asSequence().toSet() == setOf("actor", "counter", "document", "pending", "auxiliary", "baseline") &&
+                actor != null && runCatching { UUID.fromString(actor).toString() == actor }.getOrDefault(false) &&
+                (root.opt("counter") as? Number)?.toString() == "0" &&
+                document != null && document.keys().asSequence().toSet() == setOf("schemaVersion", "scope", "fields") &&
+                (document.opt("schemaVersion") as? Number)?.toString() == "1" &&
+                document.opt("scope") == scope(owner) && document.optJSONObject("fields")?.length() == 0 &&
+                listOf("pending", "auxiliary", "baseline").all { root.optJSONObject(it)?.length() == 0 }
+        }
 
     fun observe(owner: SessionOwnerSnapshot.Account): Observation {
         val snapshot = secure.confirmedSnapshot(key(owner))
@@ -124,6 +143,16 @@ internal object NativeProviderAccess {
                 Prospective(selected, selected.vault.observe(owner))
             }
         }
+    }
+
+    fun inspectRestoreVaultPresence(owner: SessionOwnerSnapshot.Account): AccountFileLocalPresence {
+        val selected = binding ?: return AccountFileLocalPresence.UNAVAILABLE
+        return selected.admission.withCurrent(owner) {
+            synchronized(storeLock) {
+                if (binding !== selected) AccountFileLocalPresence.UNAVAILABLE
+                else selected.vault.inspectRestorePresence(owner)
+            }
+        } ?: AccountFileLocalPresence.UNAVAILABLE
     }
 
     private fun <T> access(expected: SessionOwnerSnapshot.Account? = null, action: (Binding, SessionOwnerSnapshot.Account, NativeProviderCredentials) -> T): T? {
