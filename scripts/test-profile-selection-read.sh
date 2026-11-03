@@ -51,10 +51,30 @@ for (const field of ['continueWatchingSource', 'continueWatchingWindow']) {
   assert.ok(scalar.includes('let ' + field + ': String?'), 'checked stored discovery field: ' + field);
   assert.ok(projector.includes('$0.discovery?.' + field), 'real stored roster projection: ' + field);
 }
+const manualStart = profiles.indexOf('    @Published var pickedThisLaunch = false {');
+const manualEnd = profiles.indexOf("    /// The ACTIVE overlay profile's private watch state", manualStart);
+assert.ok(manualStart >= 0 && manualEnd > manualStart, 'actual manual request state exists');
+const manualState = profiles.slice(manualStart, manualEnd);
+assert.ok(manualState.includes('private func beginManualPickerPublication(')
+  && manualState.includes('private func endManualPickerPublication()')
+  && manualState.includes('manualPickerPublicationDepth == 0'), 'manual publication dependency closure');
+for (const [marker, proposed] of [
+  ['@Published private(set) var profiles:', 'beginManualPickerPublication(profiles: newValue, activeID: activeID)'],
+  ['@Published private(set) var activeID:', 'beginManualPickerPublication(profiles: profiles, activeID: newValue)']
+]) {
+  const observer = full(profiles, marker);
+  assert.ok(observer.includes(proposed) && observer.indexOf(proposed) < observer.indexOf('ProfileSelectionRead.beginMutation()'),
+    'manual retirement precedes Published/legacy publication: ' + marker);
+  assert.ok(observer.includes('didSet {\n            endManualPickerPublication()'),
+    'manual completion checks actual stored values before callbacks: ' + marker);
+}
 const template = fs.readFileSync('app/Tests/ProfileSelectionReadTests.swift', 'utf8');
 fs.writeFileSync(out + '/Combined.swift', template
   .replace('// PRODUCTION_PROFILE_SELECTION_READ', full(profiles, 'enum ProfileSelectionRead {'))
   .replace('// PRODUCTION_PROFILE_SELECTION_OBSERVERS', observers)
+  .replace('// PRODUCTION_MANUAL_PICKER_STATE', manualState)
+  .replace('// PRODUCTION_PICKER_REQUIREMENT', full(profiles, 'var needsPicker: Bool {'))
+  .replace('// PRODUCTION_PROFILE_PIN_PRESENCE', full(profiles, 'var hasPin: Bool {'))
   .replace('// PRODUCTION_PROFILE_SELECTION_INIT_FINISH', finish));
 function checkWorkerReads(source) {
   const startup = full(source, 'func start()');

@@ -264,6 +264,7 @@ final class ProfileStore: ObservableObject {
     private var legacySelectionMutationRetirements: [Bool] = []
     @Published private(set) var profiles: [UserProfile] = [] {
         willSet {
+            beginManualPickerPublication(profiles: newValue, activeID: activeID)
             ProfileSelectionRead.beginMutation()
             let retiresSession = Self.legacyWatchBinding(in: profiles, activeID: activeID)
                 != Self.legacyWatchBinding(in: newValue, activeID: activeID)
@@ -271,6 +272,7 @@ final class ProfileStore: ObservableObject {
             LegacyWatchOwnership.beginProfileMutation(retire: retiresSession)
         }
         didSet {
+            endManualPickerPublication()
             let retiresSession = legacyRosterMutationRetirements.removeLast()
             if retiresSession { retireLegacyHistoryNotices() }
             ProfileSelectionRead.endMutation(selectionReadSnapshot())
@@ -279,12 +281,14 @@ final class ProfileStore: ObservableObject {
     }
     @Published private(set) var activeID: UUID? {
         willSet {
+            beginManualPickerPublication(profiles: profiles, activeID: newValue)
             ProfileSelectionRead.beginMutation()
             let retiresSession = activeID != newValue
             legacySelectionMutationRetirements.append(retiresSession)
             LegacyWatchOwnership.beginProfileMutation(retire: retiresSession)
         }
         didSet {
+            endManualPickerPublication()
             let retiresSession = legacySelectionMutationRetirements.removeLast()
             if retiresSession { retireLegacyHistoryNotices() }
             ProfileSelectionRead.endMutation(selectionReadSnapshot())
@@ -740,6 +744,27 @@ final class ProfileStore: ObservableObject {
         }
     }
     private var manualPickerRequest: ManualPickerRequest?
+    private var manualPickerPublicationDepth = 0
+
+    /// Revoke before Published subscribers can use the outgoing values, and reject creation
+    /// from an intermediate roster. A final stored-value check also covers nested publication.
+    private func beginManualPickerPublication(profiles: [UserProfile], activeID: UUID?) {
+        manualPickerPublicationDepth += 1
+        retireManualPickerForPublication(profiles: profiles, activeID: activeID)
+    }
+
+    private func endManualPickerPublication() {
+        precondition(manualPickerPublicationDepth > 0)
+        retireManualPickerForPublication(profiles: profiles, activeID: activeID)
+        manualPickerPublicationDepth -= 1
+    }
+
+    private func retireManualPickerForPublication(profiles: [UserProfile], activeID: UUID?) {
+        guard let request = manualPickerRequest, !request.revoked else { return }
+        if !manualPickerRequestMatches(request, profiles: profiles, activeID: activeID) {
+            request.revoked = true
+        }
+    }
 
     var canRequestPicker: Bool {
         if profiles.isEmpty { return activeID == nil }
@@ -749,14 +774,14 @@ final class ProfileStore: ObservableObject {
     }
 
     func requestPicker() {
-        guard canRequestPicker else { return }
+        guard manualPickerPublicationDepth == 0, canRequestPicker else { return }
         // The established multi-profile switcher keeps its existing admission policy.
         manualPickerRequest = profiles.count > 1 ? nil : .init(profile: profiles.first)
         pickedThisLaunch = false
     }
 
-    private func manualPickerRequestPermits(_ request: ManualPickerRequest) -> Bool {
-        guard !pickedThisLaunch, manualPickerRequest === request, !request.revoked else { return false }
+    private func manualPickerRequestMatches(_ request: ManualPickerRequest,
+                                            profiles: [UserProfile], activeID: UUID?) -> Bool {
         let permitted: Bool
         if let profileID = request.profileID {
             if profiles.count == 1, activeID == profileID, let profile = profiles.first,
@@ -771,8 +796,14 @@ final class ProfileStore: ObservableObject {
         } else {
             permitted = profiles.isEmpty && activeID == nil
         }
-        // A root read can auto-dismiss the Mac cover without invoking its binding setter.
-        // Observed ineligibility retires this request, including a changed/removed PIN or owner.
+        return permitted
+    }
+
+    private func manualPickerRequestPermits(_ request: ManualPickerRequest) -> Bool {
+        guard !pickedThisLaunch, manualPickerRequest === request, !request.revoked else { return false }
+        let permitted = manualPickerRequestMatches(request, profiles: profiles, activeID: activeID)
+        // Publication catches profile ABA even without a UI read. Keep the live check for
+        // credential retirement and for a root that auto-dismisses without its binding setter.
         if !permitted { request.revoked = true }
         return permitted
     }
