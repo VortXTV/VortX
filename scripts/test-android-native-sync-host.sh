@@ -22,6 +22,7 @@ nice -n 15 ./gradlew :app:testPlayDebugUnitTest \
   --tests com.vortx.android.sync.VortXSyncManagerBackupRevisionTest \
   --tests com.vortx.android.sync.NativeAccountSyncTest \
   --tests com.vortx.android.integrations.NativeProspectiveProviderTest \
+  --tests com.vortx.android.engine.NativeRepositoryMutationJniTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryJniTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
   --tests com.vortx.android.engine.NativeRawHostPreferencesTest \
@@ -75,6 +76,22 @@ expected = {
     "com.vortx.android.integrations.NativeProspectiveProviderTest": {
         "absent vault observes qualified legacy fallback without initializing secure storage",
         "complete vault witness rejects same encoded replacement and pending only change",
+    },
+    "com.vortx.android.engine.NativeRepositoryMutationJniTest": {
+        "whole series and season use exact isolated inventory and one durable commit",
+        "foreign video malformed inventory and failed bulk commit never mutate playback",
+        "profile switch during inventory lookup cannot mark either profile",
+        "action acknowledgments without a matching watched projection cannot commit",
+        "validated addon replacement keeps order disabled intent and unchanged peers atomically",
+        "invalid failed protected and stale addon replacements preserve original state",
+        "queued visibility action rejects switched and ABA profile before any mutation",
+        "visibility acknowledges full installed list and retained row can turn back on",
+        "queued visibility cannot use a replaced same-scope session or a copied stale row",
+        "mount retirement after provider lookup but before admission never writes either checkpoint",
+        "successful native checkpoint cannot mirror through a replacement same-scope mount",
+        "optional mirror exceptions preserve durable save and removal success",
+        "actual caller cancellation after checkpoint remains cancellation",
+        "deliberate saves and removals mirror to watchlists after the commit while plain adds never do",
     },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": {
         "openForkRequestAndQuiescentCloseUseRealPrivateSessionProtocol",
@@ -163,6 +180,7 @@ jni_required = {
         "generic frozen receipt survives fresh GET while rejected candidate and retired lifetime cannot ACK",
     },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": set(expected["com.vortx.android.engine.NativeOwnerHistoryJniTest"]),
+    "com.vortx.android.engine.NativeRepositoryMutationJniTest": set(expected["com.vortx.android.engine.NativeRepositoryMutationJniTest"]),
     "com.vortx.android.engine.DetachedAccountFileKernelJniTest": set(expected["com.vortx.android.engine.DetachedAccountFileKernelJniTest"]),
     "com.vortx.android.sync.AccountBackupRepairJniTest": set(expected["com.vortx.android.sync.AccountBackupRepairJniTest"]),
 }
