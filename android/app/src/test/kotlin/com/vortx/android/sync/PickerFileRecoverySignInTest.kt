@@ -1,6 +1,13 @@
 package com.vortx.android.sync
 
 import androidx.lifecycle.ViewModelStore
+import com.vortx.android.engine.AccountFileLocalPresence
+import com.vortx.android.integrations.CredentialStoreAccess
+import com.vortx.android.integrations.NativeProviderAccess
+import com.vortx.android.integrations.NativeProviderVault
+import com.vortx.android.security.AccountFileProviderWriters
+import com.vortx.android.security.PersistentCredentialAvailability
+import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.ui.viewmodel.VortXAccountFormState
 import com.vortx.android.ui.viewmodel.VortXAccountMode
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
@@ -28,6 +35,40 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PickerFileRecoverySignInTest {
+    private class CountingProviderStore : CredentialStoreAccess {
+        private val values = mutableMapOf<String, String>()
+        var ordinaryReads = 0
+            private set
+        var existingProbes = 0
+            private set
+        var writes = 0
+            private set
+
+        override fun string(key: String): String? {
+            ordinaryReads++
+            return values[key]
+        }
+
+        override fun confirmedSnapshot(vararg keys: String): PersistentCredentialSnapshot {
+            ordinaryReads++
+            return PersistentCredentialSnapshot(PersistentCredentialAvailability.AVAILABLE, keys.associateWith(values::get))
+        }
+
+        override fun inspectExisting(key: String, isInert: (String) -> Boolean): AccountFileLocalPresence {
+            existingProbes++
+            return if (values[key]?.let { !isInert(it) } == true) AccountFileLocalPresence.PRESENT
+            else AccountFileLocalPresence.ABSENT
+        }
+
+        override fun set(key: String, value: String?): Boolean = set(mapOf(key to value))
+        override fun set(values: Map<String, String?>): Boolean {
+            writes++
+            values.forEach { (key, value) -> if (value == null) this.values.remove(key) else this.values[key] = value }
+            return true
+        }
+        override fun clear(vararg keys: String): Boolean = set(keys.associateWith { null })
+    }
+
     @Test fun signedOutGrantCannotBeReusedAfterCancelOrResumeWithoutAnAdoptedOwner() = runTest {
         val manager = VortXSyncManager(RevisionContext(), backgroundScope)
         manager.installSessionRestoreTestSeam(null)
@@ -161,6 +202,7 @@ class PickerFileRecoverySignInTest {
         val manager = VortXSyncManager(RevisionContext(), backgroundScope)
         var persisted = 0
         var loginRequests = 0
+        val providerStore = CountingProviderStore()
         val password = "fixture-password"
         val salt = ByteArray(16) { 23 }
         val masterKey = VortXCrypto.masterKey(password, salt, VortXCrypto.MIN_ITERS)
@@ -215,6 +257,16 @@ class PickerFileRecoverySignInTest {
             }
 
             val signedOut = checkNotNull(manager.capturePickerAccountSnapshot())
+            // Exercise the manager's actual NativeProviderAdmission with only the vault's backing synthetic.
+            manager.installNativeGatewayTestSeam(object : NativeAccountGateway {
+                override fun retire() = Unit
+                override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject,
+                    isCurrent: () -> Boolean): Boolean = error("Unexpected native application")
+                override fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport? =
+                    error("Unexpected native export")
+            }, providerStore)
+            val vault = manager.javaClass.getDeclaredField("fileRestoreProviderVault")
+                .apply { isAccessible = true }.get(manager) as NativeProviderVault
             val signedOutDrain = checkNotNull(manager.captureProviderRetryDrainRewrite())
             assertTrue(signedOutDrain { true })
             assertFalse(manager.isPickerFileRecoveryPaused(signedOut))
@@ -249,10 +301,32 @@ class PickerFileRecoverySignInTest {
             assertFalse(manager.syncDown(force = true))
             assertFalse(manager.pushThisDevice())
 
+            val providerOwner = manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+            assertTrue(AccountFileProviderWriters.withWriter(false) { true })
+            assertNull(NativeProviderAccess.read(setOf("tmdb")))
+            assertFalse(NativeProviderAccess.edit(mapOf("tmdb" to "synthetic")))
+            assertNull(NativeProviderAccess.captureProspective(providerOwner))
+            assertEquals(0, providerStore.ordinaryReads)
+            assertEquals(0, providerStore.writes)
+            assertEquals(0, providerStore.existingProbes)
+
             var routeCurrent = true
             val restore = async {
                 runCatching {
-                    manager.restoreAccountBackupFile(original, byteArrayOf(1), { routeCurrent }) { _, _, _ ->
+                    manager.restoreAccountBackupFile(original, byteArrayOf(1), { routeCurrent }) { owner, requireOriginal, _ ->
+                        requireOriginal()
+                        assertEquals(providerOwner, owner.account)
+                        assertFalse(AccountFileProviderWriters.withWriter(false) { true })
+                        assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                            NativeProviderAccess.inspectRestoreVaultPresence(owner.account.copy(generation = owner.account.generation + 1), vault))
+                        val otherVault = NativeProviderVault(CountingProviderStore())
+                        assertEquals(AccountFileLocalPresence.UNAVAILABLE,
+                            NativeProviderAccess.inspectRestoreVaultPresence(owner.account, otherVault))
+                        assertEquals(AccountFileLocalPresence.ABSENT,
+                            NativeProviderAccess.inspectRestoreVaultPresence(owner.account, vault))
+                        assertEquals(1, providerStore.existingProbes)
+                        assertEquals(0, providerStore.ordinaryReads)
+                        assertEquals(0, providerStore.writes)
                         enteredRestore.complete(Unit)
                         withContext(NonCancellable) { releaseRestore.await() }
                     }
@@ -274,10 +348,20 @@ class PickerFileRecoverySignInTest {
             assertTrue(checkNotNull(manager.captureProviderRetryDrainRewrite()).invoke { true })
             checkNotNull(manager.captureRealtimeLease())
             assertFalse(manager.resumePickerFileRecovery(original))
+
+            assertNull(checkNotNull(NativeProviderAccess.read(setOf("tmdb"))).values["tmdb"])
+            assertEquals(2, providerStore.ordinaryReads) // Load and read back one new inert vault.
+            assertEquals(1, providerStore.writes)
+            checkNotNull(NativeProviderAccess.captureProspective(providerOwner)).use { prospective ->
+                assertTrue(prospective.withCurrent(JSONObject()) { true })
+            }
+            assertEquals(4, providerStore.ordinaryReads) // Capture and recheck the same bound vault.
+            assertEquals(1, providerStore.writes)
         } finally {
             releaseRestore.complete(Unit)
             models.clear()
             runCurrent()
+            NativeProviderAccess.unbindForTest()
             Dispatchers.resetMain()
         }
     }

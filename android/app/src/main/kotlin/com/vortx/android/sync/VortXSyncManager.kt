@@ -1339,7 +1339,15 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
             vault,
             object : com.vortx.android.integrations.NativeProviderAdmission {
                 override fun <T> withCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
-                    operations.snapshot { sessionState.serialized {
+                    withProviderOwner(expected, allowPaused = true, action = action)
+
+                override fun <T> withOrdinaryCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
+                    withProviderOwner(expected, allowPaused = false, action = action)
+
+                private fun <T> withProviderOwner(expected: SessionOwnerSnapshot.Account?, allowPaused: Boolean,
+                    action: (SessionOwnerSnapshot.Account) -> T): T? = operations.snapshot { sessionState.serialized {
+                        val current = sessionState.value
+                        if (!allowPaused && current != null && pickerFileRecoverySession === current) return@serialized null
                         val owner = sessionOwnerSnapshot() as? SessionOwnerSnapshot.Account
                         if (owner == null || (expected != null && expected != owner)) null else action(owner)
                     } }

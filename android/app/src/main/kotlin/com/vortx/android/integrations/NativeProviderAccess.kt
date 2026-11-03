@@ -14,6 +14,9 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Admission must hold the authenticated account/epoch lock through the short secure transaction. */
 internal interface NativeProviderAdmission {
     fun <T> withCurrent(expected: SessionOwnerSnapshot.Account? = null, action: (SessionOwnerSnapshot.Account) -> T): T?
+    /** Ordinary provider reads may seed the vault, unlike existing-only Restore inspection. */
+    fun <T> withOrdinaryCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
+        withCurrent(expected, action)
 }
 
 /** One encrypted record is both the credential backing and its sync intent; there is no second-store gap. */
@@ -133,7 +136,7 @@ internal object NativeProviderAccess {
             val original = checkNotNull(observation) { "Provider observation retired" }
             val binding = selected as Binding
             return checkNotNull(AccountFileProviderWriters.withWriter<T?>(null) {
-                binding.admission.withCurrent(original.owner) {
+                binding.admission.withOrdinaryCurrent(original.owner) {
                     synchronized(storeLock) {
                         check(NativeProviderAccess.binding === binding) { "Provider binding changed" }
                         binding.vault.requireCurrent(original)
@@ -147,7 +150,7 @@ internal object NativeProviderAccess {
     fun captureProspective(owner: SessionOwnerSnapshot.Account): Prospective? =
         AccountFileProviderWriters.withWriter<Prospective?>(null) {
             val selected = binding ?: return@withWriter null
-            selected.admission.withCurrent(owner) {
+            selected.admission.withOrdinaryCurrent(owner) {
                 synchronized(storeLock) {
                     check(binding === selected) { "Provider binding changed" }
                     Prospective(selected, selected.vault.observe(owner))
@@ -173,7 +176,7 @@ internal object NativeProviderAccess {
                            action: (Binding, SessionOwnerSnapshot.Account, NativeProviderCredentials) -> T): T? =
         AccountFileProviderWriters.withWriter<T?>(null) {
             val selected = binding ?: return@withWriter null
-            selected.admission.withCurrent(expected) { owner -> synchronized(storeLock) {
+            selected.admission.withOrdinaryCurrent(expected) { owner -> synchronized(storeLock) {
                 check(binding === selected) { "Provider binding changed" }
                 action(selected, owner, selected.vault.load(owner))
             } }
