@@ -148,6 +148,8 @@ require_literal "the original owner-history and Media3 gate remains active" '--i
 require_literal "shared sync gate uses actual native runtime validation" '--init-script native-sync-hosted.init.gradle' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate requires all backup revision JNI tests" '--tests com.vortx.android.sync.VortXSyncManagerBackupRevisionTest' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate requires all native account tests" '--tests com.vortx.android.sync.NativeAccountSyncTest' "$NATIVE_SYNC_HOST_SCRIPT"
+require_literal "shared sync gate requires the real detached file kernel" '--tests com.vortx.android.engine.DetachedAccountFileKernelJniTest' "$NATIVE_SYNC_HOST_SCRIPT"
+require_literal "detached file JNI inherits the verified library SHA" 'environment "VORTX_JNI_SHA256", librarySha' "$REPO_ROOT/android/native-sync-hosted.init.gradle"
 require_literal "shared sync gate requires fresh XML" 'test ! -e app/build/test-results/testPlayDebugUnitTest' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate rejects native/source changes" 'cmp --silent "$VORTX_JNI_SOURCE_MANIFEST" "$VORTX_JNI_SOURCE_MANIFEST.current"' "$NATIVE_SYNC_HOST_SCRIPT"
 require_literal "shared sync gate retains post-runtime library proof" 'postRuntimeLibrarySha256:$after' "$NATIVE_SYNC_HOST_SCRIPT"
