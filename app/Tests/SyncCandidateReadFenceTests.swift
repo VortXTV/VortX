@@ -7,10 +7,13 @@ private enum CredentialScopeRegistry { struct Capture: Equatable { let generatio
 @MainActor private final class CoreBridge {
     static let shared = CoreBridge()
     var mount = 1
+    let hasOwnerHistorySession = false
     func captureNativePlaybackTarget() -> Int { mount }
     func nativePlaybackTargetIsCurrent(_ target: Int) -> Bool { target == mount }
 }
 private typealias AddonOrderIntent = String
+// The admitted prefix never creates a playlist projection.
+private typealias NativePlaylistCandidateProjection = Never
 @MainActor private final class ReadHarness {
     let credentialAuthority = Authority()
     var isSignedIn = true
@@ -20,7 +23,13 @@ private typealias AddonOrderIntent = String
     var seeds = 0
     var afterRead: (() -> Void)?
     private var read: VersionedPull = .empty
-    func readExisting() { read = .doc(doc: ["peer": "retained"], version: 9) }
+    func readExisting() {
+#if VORTX_COMPLETE_VERSIONED_PULL
+        read = .doc(doc: ["peer": "retained"], version: 9, plaintext: Data(#"{"peer":"retained"}"#.utf8), observation: nil)
+#else
+        read = .doc(doc: ["peer": "retained"], version: 9)
+#endif
+    }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { capture == credentialAuthority.capture() }
     private func pullDocVersionedResult(credentialCapture: CredentialScopeRegistry.Capture) async -> VersionedPull {
         await Task.yield(); afterRead?(); return read
@@ -28,6 +37,10 @@ private typealias AddonOrderIntent = String
     private func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] {
         guard isCurrent(capture) else { throw NSError(domain: "superseded", code: 1) }
         seeds += 1; return ["synthetic": true]
+    }
+    private func mergeOwnerHistoryForExport(plaintext: Data, version: Int, observation: UUID,
+                                            capture: CredentialScopeRegistry.Capture, orderIntent: AddonOrderIntent?) async -> DerivedSyncDoc? {
+        preconditionFailure("Typed owner-history export is outside this fixture")
     }
     func candidate() async -> Bool { await mergeLocalIntoDoc(orderIntent: nil) != nil }
     /* PRODUCTION_READ_BOUNDARY */
