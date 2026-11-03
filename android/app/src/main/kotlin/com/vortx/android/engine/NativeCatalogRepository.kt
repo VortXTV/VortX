@@ -167,7 +167,7 @@ internal class NativeCatalogRepository(
     private val sourceIndexSource: NativeSourceIndexSource? = null,
     /** Capture before the native checkpoint. This runs on the original Session's IO lane. */
     private val captureLibraryMirrorOrigin: (VortxNativeSession, VortxNativeOwner) -> NativeLibraryMirrorOrigin? = { _, _ -> null },
-    /** Only a committed mutation with its original owner and mount may schedule the detached mirror. */
+    /** Enroll committed mirrors in checkpoint order under the original Session. Only schedule work here. */
     private val mirrorLibrary: (NativeLibraryMirrorOrigin, Boolean, MediaType, String) -> Unit = { _, _, _, _ -> },
     /** Capture on the IO read lane; publication later enters only authenticated/lifecycle metadata
      * admission, never sessionProvider/native serialization on Main. Null rejects a retired mount. */
@@ -1257,25 +1257,23 @@ internal class NativeCatalogRepository(
     private suspend fun dispatchLibraryMirror(session: VortxNativeSession, owner: VortxNativeOwner,
         command: JSONObject, added: Boolean, type: MediaType, id: String) {
         val caller = currentCoroutineContext()
-        val origin = synchronized(session) {
-            val captured = runCatching { captureLibraryMirrorOrigin(session, owner) }.getOrNull()
+        synchronized(session) {
+            val origin = runCatching { captureLibraryMirrorOrigin(session, owner) }.getOrNull()
             caller.ensureActive()
             session.dispatch(listOf(command), owner)
-            captured
-        }
-        caller.ensureActive()
-        // Normal library mutations do not advance the native owner revision. If dispatch did
-        // change ownership or the mount retired, there is no permission to adopt its successor.
-        if (origin != null) {
-            try {
-                origin.admit {
-                    caller.ensureActive()
-                    mirrorLibrary(origin, added, type, id)
-                    true
+            // The next mutation must not enroll ahead of this checkpoint. Recheck the
+            // original owner and mount before handing off the work, while still serialized.
+            if (origin != null) {
+                try {
+                    origin.admit {
+                        caller.ensureActive()
+                        mirrorLibrary(origin, added, type, id)
+                        true
+                    }
+                } catch (_: Exception) {
+                    // Optional scheduling cannot change an already-committed result.
+                    // The original caller's cancellation is checked separately below.
                 }
-            } catch (_: Exception) {
-                // Optional detached scheduling cannot change an already-committed result.
-                // The original caller's cancellation is checked separately below.
             }
         }
         caller.ensureActive()
