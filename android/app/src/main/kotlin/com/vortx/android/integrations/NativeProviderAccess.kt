@@ -214,6 +214,12 @@ internal object NativeProviderAccess {
     fun <T> capture(keys: Set<String>, read: () -> T): Pair<Guard, T>? = access { selected, owner, value ->
         Guard(owner, keys, value.events(keys), selected) to read()
     }
+    /** Existing exact-owner admission, with no unscoped retry when the original is gone. */
+    fun <T> captureForOwner(expected: SessionOwnerSnapshot.Account, keys: Set<String>, read: () -> T): Pair<Guard, T>? =
+        access(expected) { selected, owner, value ->
+            Guard(owner, keys, value.events(keys), selected) to read()
+        }
+
     fun current(guard: Guard): Boolean = guarded(guard) { true } == true
     /** Read-only reuse after a serialized peer rotation; never authorizes a credential mutation. */
     fun <T> readCurrentOwner(guard: Guard, read: () -> T): T? = access(guard.owner) { selected, _, _ ->

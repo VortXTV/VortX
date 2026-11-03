@@ -1,6 +1,7 @@
 package com.vortx.android.integrations
 
 import com.vortx.android.security.AccountFileProviderWriters
+import com.vortx.android.sync.SessionOwnerSnapshot
 
 /**
  * Orders durable credential publication against explicit sign-out.
@@ -23,6 +24,16 @@ internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>
             else runCatching { NativeProviderAccess.capture(requireNotNull(nativeKeys), read) }.getOrNull()?.let { (guard, value) ->
                 CredentialOperationSnapshot(Operation(generation, guard), value)
             } ?: CredentialOperationSnapshot(Operation(generation, null), read())
+        }
+
+    /** Credential lock precedes native provider owner admission. An unavailable original
+     * never invokes the read against a replacement owner. */
+    fun <T> snapshotForOwner(expected: SessionOwnerSnapshot.Account, read: () -> T): CredentialOperationSnapshot<T>? =
+        synchronized(mutationLock) {
+            val keys = nativeKeys ?: return@synchronized null
+            runCatching { NativeProviderAccess.captureForOwner(expected, keys, read) }.getOrNull()?.let { (guard, value) ->
+                CredentialOperationSnapshot(Operation(generation, guard), value)
+            }
         }
 
     fun invalidate(mutation: () -> Unit) {

@@ -1,5 +1,6 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.sync.SessionOwnerSnapshot
 import android.content.Context
 import android.util.Log
 import com.vortx.android.BuildConfig
@@ -117,6 +118,25 @@ object SIMKLAuth {
         get() = tokenMutations.snapshot {
             currentSessionEpoch() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
         }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
+
+    internal fun watchlistEpoch(expected: SessionOwnerSnapshot.Account): Long? {
+        if (!isConfigured) return null
+        return tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch().takeIf { it > 0 && tokenStore?.connectionState == CredentialConnectionState.CONNECTED }
+        }?.value
+    }
+
+    internal fun validWatchlistToken(expected: SessionOwnerSnapshot.Account, epoch: Long): String? {
+        val snapshot = tokenMutations.snapshotForOwner(expected) {
+            if (currentSessionEpoch() == epoch) tokenStore?.validToken() else null
+        } ?: return null
+        return snapshot.value?.takeIf { snapshot.operation.isCurrent() }
+    }
+
+    internal fun isWatchlistTokenCurrent(expected: SessionOwnerSnapshot.Account, epoch: Long, token: String): Boolean =
+        tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch() == epoch && tokenStore?.validToken() == token
+        }?.value == true
 
     /// A live access token, or throws [SIMKLException.NotSignedIn]. SIMKL tokens are long-lived and do not
     /// refresh; a recorded expiry in the past (rare) throws so the UI can re-prompt.

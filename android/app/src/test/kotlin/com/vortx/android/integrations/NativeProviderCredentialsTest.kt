@@ -287,6 +287,34 @@ class NativeProviderCredentialsTest {
         assertEquals(exported.getJSONObject("fields").getJSONObject("simklAccess").getLong("clock"), exported.getJSONObject("fields").getJSONObject("simklExpiry").getLong("clock"))
     }
 
+    @Test fun `original provider snapshot never reads successor bearer or falls back after refusal`() {
+        val original = SessionOwnerSnapshot.Account(id, 1)
+        val replacement = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000999", 2)
+        val store = NativeProviderTestStore()
+        val owner = Owner(original)
+        bind(store, owner)
+        for ((index, provider) in listOf("trakt", "simkl").withIndex()) {
+            owner.current = original
+            val oauth = NativeProviderAccess.oauthStore(provider)
+            val tokenKey = "vortx.$provider.accessToken"
+            val values = if (provider == "trakt")
+                mapOf(tokenKey to "fixture-original", "vortx.trakt.refreshToken" to "fixture-refresh",
+                    "vortx.trakt.expiresAt" to "2000000000", "vortx.trakt.createdAt" to "100")
+            else mapOf(tokenKey to "fixture-original", "vortx.simkl.expiresAt" to "0")
+            assertTrue(oauth.set(values))
+            val coordinator = CredentialMutationCoordinator(NativeProviderCredentials.GROUPS[index])
+            val capture = checkNotNull(coordinator.snapshotForOwner(original) { oauth.string(tokenKey) })
+            assertEquals("fixture-original", capture.value)
+            owner.current = replacement
+            assertTrue(oauth.set(values + (tokenKey to "fixture-successor")))
+            assertNull(coordinator.snapshotForOwner(original) { fail("Refused owner performed a token read") })
+            assertEquals("fixture-successor", checkNotNull(coordinator.snapshotForOwner(replacement) { oauth.string(tokenKey) }).value)
+            assertSame(CredentialMutationResult.Stale, capture.operation.mutate { fail("Original operation ran for successor") })
+            owner.current = original.copy(generation = 3)
+            assertNull(coordinator.snapshotForOwner(original) { fail("Same ID with a new epoch performed a token read") })
+        }
+    }
+
     @Test fun `captured OAuth operation rejects newer remote intent and same-account reopen ABA`() {
         val store = NativeProviderTestStore(); val owner = Owner(SessionOwnerSnapshot.Account(id, 1)); bind(store, owner)
         val persistence = TraktAuth.TokenPersistence(NativeProviderAccess.oauthStore("trakt")) { 100L }

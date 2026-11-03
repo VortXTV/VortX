@@ -2265,7 +2265,11 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         }
 
     /** Only the original ordinary session may replace the rows observed by this retry drain. */
-    internal fun captureProviderRetryDrainRewrite(): ((() -> Boolean) -> Boolean)? = operations.snapshot {
+    internal fun captureProviderRetryDrainRewrite(): ((() -> Boolean) -> Boolean)? =
+        captureOrdinaryProviderOwnerAdmission()
+
+    /** Same owner boundary for pre-checkpoint mirror capture and a local drain rewrite. */
+    internal fun captureOrdinaryProviderOwnerAdmission(): ((() -> Boolean) -> Boolean)? = operations.snapshot {
         if (pickerFileRecoverySession != null) return@snapshot null
         val original = captureLocalLibraryMutationAdmission() ?: return@snapshot null
         val availability = providerRetryDrainAvailability

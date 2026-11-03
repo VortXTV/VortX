@@ -5,6 +5,7 @@ import com.vortx.android.integrations.IntegrationsHttp
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.MediaType
+import com.vortx.android.sync.SessionOwnerSnapshot
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -81,6 +82,18 @@ internal object AccountWatchlistClient {
         if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
         val token = runCatching { TraktAuth.validToken() }.getOrNull() ?: return false
         if (TraktAuth.currentSessionEpoch != expectedEpoch) return false
+        return sendTraktWatchlist(add, ref, token)
+    }
+
+    suspend fun traktWatchlist(add: Boolean, ref: TitleRef, expectedEpoch: Long,
+        expectedOwner: SessionOwnerSnapshot.Account): Boolean {
+        if (!ref.hasUsableId) return false
+        val token = runCatching { TraktAuth.validWatchlistToken(expectedOwner, expectedEpoch) }.getOrNull() ?: return false
+        if (!TraktAuth.isWatchlistTokenCurrent(expectedOwner, expectedEpoch, token)) return false
+        return sendTraktWatchlist(add, ref, token)
+    }
+
+    private suspend fun sendTraktWatchlist(add: Boolean, ref: TitleRef, token: String): Boolean {
         val response = IntegrationsHttp.request(
             method = "POST",
             urlString = "${TraktAuth.API_BASE}${if (add) "/sync/watchlist" else "/sync/watchlist/remove"}",
@@ -131,6 +144,18 @@ internal object AccountWatchlistClient {
         if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
         val token = runCatching { SIMKLAuth.validToken() }.getOrNull() ?: return false
         if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
+        return sendSimklWatchlistAdd(ref, token)
+    }
+
+    suspend fun simklWatchlistAdd(ref: TitleRef, expectedEpoch: Long,
+        expectedOwner: SessionOwnerSnapshot.Account): Boolean {
+        if (!ref.hasUsableId) return false
+        val token = runCatching { SIMKLAuth.validWatchlistToken(expectedOwner, expectedEpoch) }.getOrNull() ?: return false
+        if (!SIMKLAuth.isWatchlistTokenCurrent(expectedOwner, expectedEpoch, token)) return false
+        return sendSimklWatchlistAdd(ref, token)
+    }
+
+    private suspend fun sendSimklWatchlistAdd(ref: TitleRef, token: String): Boolean {
         val item = JSONObject().apply {
             put("ids", simklIds(ref))
             put("to", "plantowatch")

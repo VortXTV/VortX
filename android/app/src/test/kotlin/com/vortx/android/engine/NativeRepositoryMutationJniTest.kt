@@ -4,6 +4,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -20,6 +21,7 @@ import org.junit.Test
 /** Real immutable JNI; every resource is an in-memory fixture, never a provider request. */
 class NativeRepositoryMutationJniTest {
     private val scope = VortxAccountScope("account.mutation-fixture", "owner")
+    private val fixtureMirrorAccount = com.vortx.android.sync.SessionOwnerSnapshot.Account("fixture-account", 1)
     private class Store : VortxCheckpointStore {
         var value: String? = null
         var commits = 0
@@ -67,11 +69,12 @@ class NativeRepositoryMutationJniTest {
                 })).toString()
         }
     }
-    private fun open(store: Store, transport: Transport, runtime: VortxRuntimeBindings = bindings()): VortxNativeSession {
+    private fun open(store: Store, transport: Transport, runtime: VortxRuntimeBindings = bindings(),
+        onMutation: () -> Unit = {}): VortxNativeSession {
         val path = System.getenv("VORTX_JNI_LIBRARY")
         assumeTrue("Reviewed JNI fixture required", System.getenv("VORTX_JNI_SYNC") == "1" && !path.isNullOrBlank())
         System.load(requireNotNull(path))
-        return VortxNativeSession.open(scope, "Owner", runtime, store, transport, true)
+        return VortxNativeSession.open(scope, "Owner", runtime, store, transport, true, onMutation = onMutation)
     }
     private fun install(session: VortxNativeSession, url: String = "https://old.invalid/manifest.json", protected: Boolean = false) {
         session.dispatch(listOf(JSONObject().put("type", "install_addon").put("profileId", "owner").put("addon", JSONObject().put("transportUrl", url)
@@ -344,12 +347,102 @@ class NativeRepositoryMutationJniTest {
         }
     }
 
+    @Test fun `successful native checkpoint cannot mirror through a replacement same-scope mount`() = runBlocking {
+        val originalStore = Store()
+        var mounted: VortxNativeSession? = null
+        var switchAfterCommit: VortxNativeSession? = null
+        open(originalStore, Transport(), onMutation = { switchAfterCommit?.let { mounted = it } }).use { original ->
+            val replacementStore = Store().also { it.value = originalStore.value }
+            open(replacementStore, Transport()).use { replacement ->
+                mounted = original
+                val baseline = originalStore.commits
+                val replacementBaseline = replacementStore.commits to replacementStore.value
+                var captures = 0
+                val repository = NativeCatalogRepository(captureLibraryMirrorOrigin = { captured, owner ->
+                    assertSame(original, captured)
+                    assertSame(original, mounted)
+                    assertEquals(baseline, originalStore.commits)
+                    captures++
+                    NativeLibraryMirrorOrigin(captured, owner, fixtureMirrorAccount, { it() },
+                        { action -> mounted === captured && action() })
+                }, mirrorLibrary = { _, _, _, _ -> fail("The retired mount handed off a provider mirror") }) {
+                    checkNotNull(mounted)
+                }
+                switchAfterCommit = replacement
+                repository.saveToLibrary(MetaItem("tt0000004", MediaType.MOVIE, "Original save")).getOrThrow()
+                assertEquals(1, captures)
+                assertEquals(baseline + 1, originalStore.commits)
+                assertTrue(checkNotNull(originalStore.value).contains("tt0000004"))
+                assertSame(replacement, mounted)
+                assertEquals(replacementBaseline, replacementStore.commits to replacementStore.value)
+            }
+        }
+    }
+
+    @Test fun `optional mirror exceptions preserve durable save and removal success`() = runBlocking {
+        val store = Store()
+        open(store, Transport()).use { session ->
+            val baseline = store.commits
+            var handoffs = 0
+            val repository = NativeCatalogRepository(captureLibraryMirrorOrigin = { original, owner ->
+                NativeLibraryMirrorOrigin(original, owner, fixtureMirrorAccount, { it() }, { it() })
+            }, mirrorLibrary = { _, added, _, _ ->
+                handoffs++
+                assertEquals(baseline + handoffs, store.commits)
+                if (added) error("Synthetic optional scheduler failure")
+                throw CancellationException("Synthetic optional child cancellation")
+            }) { session }
+            repository.saveToLibrary(MetaItem("tt0000005", MediaType.MOVIE, "Saved")).getOrThrow()
+            assertTrue(checkNotNull(store.value).contains("tt0000005"))
+            repository.removeFromLibrary("tt0000005").getOrThrow()
+            assertEquals(2, handoffs)
+            assertEquals(baseline + 2, store.commits)
+            assertTrue(repository.libraryPortableItems("fixture").getOrThrow().isEmpty())
+        }
+    }
+
+    @Test fun `actual caller cancellation after checkpoint remains cancellation`() = runBlocking {
+        for (duringAdmission in listOf(false, true)) {
+            val store = Store()
+            open(store, Transport()).use { session ->
+                val baseline = store.commits
+                var cancelCaller: () -> Unit = { error("Fixture caller was not installed") }
+                var handoffs = 0
+                val repository = NativeCatalogRepository(captureLibraryMirrorOrigin = { original, owner ->
+                    NativeLibraryMirrorOrigin(original, owner, fixtureMirrorAccount, { it() }, { action ->
+                        if (duringAdmission) cancelCaller()
+                        action()
+                    })
+                }, mirrorLibrary = { _, _, _, _ ->
+                    handoffs++
+                    assertEquals(baseline + 1, store.commits)
+                    cancelCaller()
+                    throw CancellationException("Synthetic optional failure during caller cancellation")
+                }) { session }
+                var returned = false
+                val caller = async(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                    repository.saveToLibrary(MetaItem("tt0000006", MediaType.MOVIE, "Committed before cancellation"))
+                    returned = true
+                }
+                cancelCaller = { caller.cancel(CancellationException("Synthetic original caller cancellation")) }
+                assertTrue(runCatching { caller.await() }.exceptionOrNull() is CancellationException)
+                assertFalse(returned)
+                assertEquals(if (duringAdmission) 0 else 1, handoffs)
+                assertEquals(baseline + 1, store.commits)
+                assertTrue(checkNotNull(store.value).contains("tt0000006"))
+            }
+        }
+    }
+
     @Test fun `deliberate saves and removals mirror to watchlists after the commit while plain adds never do`() = runBlocking {
         val store = Store(); val transport = Transport()
         open(store, transport).use { session ->
             install(session)
             val mirrored = mutableListOf<String>()
-            val repository = NativeCatalogRepository(mirrorLibrary = { added, type, id ->
+            val repository = NativeCatalogRepository(captureLibraryMirrorOrigin = { original, owner ->
+                assertSame(session, original)
+                NativeLibraryMirrorOrigin(original, owner, fixtureMirrorAccount, { it() }, { it() })
+            }, mirrorLibrary = { _, added, type, id ->
                 mirrored += "${if (added) "add" else "remove"}:${type.id}:$id"
             }) { session }
             repository.addToLibrary(MetaItem("tt0000001", MediaType.MOVIE, "Auto-added")).getOrThrow()

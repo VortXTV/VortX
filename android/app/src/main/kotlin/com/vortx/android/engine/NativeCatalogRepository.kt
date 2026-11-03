@@ -1,5 +1,6 @@
 package com.vortx.android.engine
 
+import com.vortx.android.sync.SessionOwnerSnapshot
 import com.vortx.android.diagnostics.DiagnosticsLog
 import com.vortx.android.data.*
 import com.vortx.android.model.*
@@ -119,6 +120,25 @@ internal value class XperienceCatalogConsumerID private constructor(val slotToke
     }
 }
 
+/**
+ * Original native mutation lifetime carried into the provider mirror. Admission is for a short
+ * local claim only. A transport must separately bind its original provider credential and call.
+ */
+internal class NativeLibraryMirrorOrigin(
+    private val session: VortxNativeSession,
+    private val owner: VortxNativeOwner,
+    val expectedAccount: SessionOwnerSnapshot.Account,
+    private val account: (() -> Boolean) -> Boolean,
+    private val mount: (() -> Boolean) -> Boolean,
+) {
+    fun admit(action: () -> Boolean): Boolean = synchronized(session) {
+        runCatching { session.accepts(owner) }.getOrDefault(false) && account { mount(action) }
+    }
+
+    /** Legacy queue drain already has its own account-only rewrite boundary. */
+    fun admitDrainRewrite(action: () -> Boolean): Boolean = account(action)
+}
+
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
  * The authenticated host provides the session; absence/unavailable/migration required is an error.
  * VortX authentication and complete legacy bootstrap are admitted only by the captured account host.
@@ -133,9 +153,10 @@ internal class NativeCatalogRepository(
     private val withReclaimLifecycle: ((() -> Boolean) -> Boolean) = { action -> action() },
     private val nzbSourceAggregator: NzbSourceAggregator? = null,
     private val sourceIndexSource: NativeSourceIndexSource? = null,
-    /** Mirrors a deliberate save or removal to Trakt/SIMKL watchlists once the native checkpoint persisted it
-     *  (Apple `ScrobbleCoordinator.addedToLibrary` / `removedFromLibrary`): added, type, id. */
-    private val mirrorLibrary: (Boolean, MediaType, String) -> Unit = { _, _, _ -> },
+    /** Capture before the native checkpoint. This runs on the original Session's IO lane. */
+    private val captureLibraryMirrorOrigin: (VortxNativeSession, VortxNativeOwner) -> NativeLibraryMirrorOrigin? = { _, _ -> null },
+    /** Only a committed mutation with its original owner and mount may schedule the detached mirror. */
+    private val mirrorLibrary: (NativeLibraryMirrorOrigin, Boolean, MediaType, String) -> Unit = { _, _, _, _ -> },
     /** Capture on the IO read lane; publication later enters only authenticated/lifecycle metadata
      * admission, never sessionProvider/native serialization on Main. Null rejects a retired mount. */
     private val captureAddonPublication: ((VortxNativeSession, Long) -> ((() -> Unit) -> Boolean)?)? = null,
@@ -1215,8 +1236,38 @@ internal class NativeCatalogRepository(
             .put("item", nativeLibraryItemPayload(item, cached))
     }
     override suspend fun addToLibrary(item: MetaItem) = attempt { val session = session(); val read = session.read(); session.dispatch(listOf(addAction(item, read)), read.owner); Unit }
-    // A dispatch returns only after the checkpoint committed, so each mirror below follows a persisted change.
-    override suspend fun saveToLibrary(item: MetaItem) = addToLibrary(item).onSuccess { mirrorLibrary(true, item.type, item.id) }
+    override suspend fun saveToLibrary(item: MetaItem) = attempt {
+        val session = session()
+        val read = session.read()
+        dispatchLibraryMirror(session, read.owner, addAction(item, read), true, item.type, item.id)
+    }
+
+    private suspend fun dispatchLibraryMirror(session: VortxNativeSession, owner: VortxNativeOwner,
+        command: JSONObject, added: Boolean, type: MediaType, id: String) {
+        val caller = currentCoroutineContext()
+        val origin = synchronized(session) {
+            val captured = runCatching { captureLibraryMirrorOrigin(session, owner) }.getOrNull()
+            caller.ensureActive()
+            session.dispatch(listOf(command), owner)
+            captured
+        }
+        caller.ensureActive()
+        // Normal library mutations do not advance the native owner revision. If dispatch did
+        // change ownership or the mount retired, there is no permission to adopt its successor.
+        if (origin != null) {
+            try {
+                origin.admit {
+                    caller.ensureActive()
+                    mirrorLibrary(origin, added, type, id)
+                    true
+                }
+            } catch (_: Exception) {
+                // Optional detached scheduling cannot change an already-committed result.
+                // The original caller's cancellation is checked separately below.
+            }
+        }
+        caller.ensureActive()
+    }
     override suspend fun removeFromLibrary(id: String) = attempt {
         DiagnosticsLog.log("library", "action=remove_saved surface=library")
         val session = session(); val read = session.read(); val saved = savedItems(read).filter { it.id == id }
@@ -1227,8 +1278,9 @@ internal class NativeCatalogRepository(
             session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "$kind:$id")), read.owner)
         } else {
             val item = saved.single()
-            session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${item.type.id}:$id")), read.owner)
-            mirrorLibrary(false, item.type, id)
+            dispatchLibraryMirror(session, read.owner,
+                action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${item.type.id}:$id"),
+                false, item.type, id)
         }
         Unit
     }
@@ -1241,8 +1293,9 @@ internal class NativeCatalogRepository(
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = attempt {
         DiagnosticsLog.log("library", "action=remove_saved surface=detail")
         val session = session(); val read = session.read()
-        session.dispatch(listOf(action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${type.id}:$id")), read.owner)
-        mirrorLibrary(false, type, id)
+        dispatchLibraryMirror(session, read.owner,
+            action("remove_library_item").put("profileId", read.owner.profileID).put("key", "${type.id}:$id"),
+            false, type, id)
         peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
     private fun requireWatchIdentity(read: VortxNativeRead, type: MediaType, id: String) {

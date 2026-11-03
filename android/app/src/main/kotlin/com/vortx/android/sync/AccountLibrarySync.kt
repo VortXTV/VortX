@@ -7,6 +7,7 @@ import com.vortx.android.VortXApplication
 import com.vortx.android.account.AccountSyncGate
 import com.vortx.android.account.AccountWatchlistClient
 import com.vortx.android.account.TitleRef
+import com.vortx.android.engine.NativeLibraryMirrorOrigin
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
@@ -65,16 +66,16 @@ object AccountLibrarySync {
     // MARK: - Public entry points (called from the engine library chokepoints)
 
     /** An account-library ADD was dispatched to the engine: mirror it to the connected watchlists. */
-    fun onLibraryAdded(context: Context, type: MediaType, id: String) =
-        mirror(context, add = true, TitleRef.from(id, type))
+    internal fun onLibraryAdded(context: Context, origin: NativeLibraryMirrorOrigin, type: MediaType, id: String) =
+        mirror(context, origin, add = true, TitleRef.from(id, type))
 
     /**
      * An account-library REMOVE was dispatched to the engine: mirror it to Trakt (SIMKL has no
      * watchlist-remove). [type] is null on the bare-id remove path; the Trakt remove then targets both
      * arrays (see [TitleRef]).
      */
-    fun onLibraryRemoved(context: Context, id: String, type: MediaType?) =
-        mirror(context, add = false, TitleRef.from(id, type))
+    internal fun onLibraryRemoved(context: Context, origin: NativeLibraryMirrorOrigin, id: String, type: MediaType?) =
+        mirror(context, origin, add = false, TitleRef.from(id, type))
 
     /**
      * Retry any queued offline pushes now. Safe to call freely (e.g. on the active-profile change effect at
@@ -89,30 +90,29 @@ object AccountLibrarySync {
 
     // MARK: - Mirror
 
-    private fun mirror(context: Context, add: Boolean, ref: TitleRef) {
-        // The native dispatch has returned. Capture drain rewrite authority here; preference,
-        // token and network work still runs on the detached worker.
+    private fun mirror(context: Context, origin: NativeLibraryMirrorOrigin, add: Boolean, ref: TitleRef) {
+        // Called after the native checkpoint under short original-origin admission.
+        // Credential and network work runs only on the detached worker.
         if (!AccountSyncGate.activeProfileSyncsAccount()) return
         if (!ref.hasUsableId) return
         val appContext = context.applicationContext
-        val rewrite = captureDrainRewrite(appContext)
         AccountFileProviderWriters.launchWriter(scope) {
+            if (!origin.admit { true }) return@launchWriter
             // Idempotent: wires the toggle store + both auth token stores so the reads below are live.
             ScrobbleService.init(appContext)
             val prefs = queuePrefs(appContext)
             // Opportunistically retry earlier offline failures before pushing the new change.
-            drain(prefs, rewrite)
-            pushTrakt(prefs, add, ref)
-            if (add) pushSimkl(prefs, ref) // SIMKL has no watchlist-remove: a remove mirrors to Trakt only.
+            drain(prefs, origin::admitDrainRewrite)
+            if (origin.admit { true }) pushTrakt(prefs, origin.expectedAccount, add, ref)
+            if (add && origin.admit { true }) pushSimkl(prefs, origin.expectedAccount, ref) // SIMKL has no watchlist-remove.
         }
     }
 
     /** Push one change to Trakt when connected + enabled; queue it on a network failure. */
-    private suspend fun pushTrakt(prefs: SharedPreferences, add: Boolean, ref: TitleRef) {
-        if (!TraktAuth.isSignedIn) return
+    private suspend fun pushTrakt(prefs: SharedPreferences, owner: SessionOwnerSnapshot.Account, add: Boolean, ref: TitleRef) {
         if (!ScrobbleService.isToggleOn(ScrobbleService.KEY_TRAKT_WATCHLIST, true)) return
-        val epoch = TraktAuth.currentSessionEpoch ?: return
-        val ok = AccountWatchlistClient.traktWatchlist(add, ref, epoch)
+        val epoch = TraktAuth.watchlistEpoch(owner) ?: return
+        val ok = AccountWatchlistClient.traktWatchlist(add, ref, epoch, owner)
         if (!ok) {
             enqueue(prefs, QueuedPush(Provider.TRAKT, add, ref, epoch))
             Log.d(TAG, "trakt watchlist ${if (add) "add" else "remove"} queued for retry")
@@ -120,11 +120,10 @@ object AccountLibrarySync {
     }
 
     /** Push one ADD to SIMKL when connected + enabled; queue it on a network failure. */
-    private suspend fun pushSimkl(prefs: SharedPreferences, ref: TitleRef) {
-        if (!SIMKLAuth.isSignedIn) return
+    private suspend fun pushSimkl(prefs: SharedPreferences, owner: SessionOwnerSnapshot.Account, ref: TitleRef) {
         if (!ScrobbleService.isToggleOn(ScrobbleService.KEY_SIMKL_WATCHLIST, true)) return
-        val epoch = SIMKLAuth.currentSessionEpoch ?: return
-        val ok = AccountWatchlistClient.simklWatchlistAdd(ref, epoch)
+        val epoch = SIMKLAuth.watchlistEpoch(owner) ?: return
+        val ok = AccountWatchlistClient.simklWatchlistAdd(ref, epoch, owner)
         if (!ok) {
             enqueue(prefs, QueuedPush(Provider.SIMKL, add = true, ref, epoch))
             Log.d(TAG, "simkl watchlist add queued for retry")

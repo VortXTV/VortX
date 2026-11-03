@@ -181,9 +181,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 }
             }
         },
-        mirrorLibrary = { added, type, id ->
-            if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, type, id)
-            else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, id, type)
+        captureLibraryMirrorOrigin = ::captureNativeLibraryMirrorOrigin,
+        mirrorLibrary = { origin, added, type, id ->
+            if (added) com.vortx.android.sync.AccountLibrarySync.onLibraryAdded(this, origin, type, id)
+            else com.vortx.android.sync.AccountLibrarySync.onLibraryRemoved(this, origin, id, type)
         },
         nzbSourceAggregator = run {
             val keys = DebridKeys(this)
@@ -403,6 +404,19 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 com.vortx.android.singularity.SourceIndexLifecycle.invalidateDeferred()
             }
         }.also(preferences::registerOnSharedPreferenceChangeListener)
+    }
+
+    /** Issue provenance before the actual repository checkpoint, with no provider credential call. */
+    private fun captureNativeLibraryMirrorOrigin(session: VortxNativeSession,
+        owner: com.vortx.android.engine.VortxNativeOwner): com.vortx.android.engine.NativeLibraryMirrorOrigin? {
+        val manager = syncManager ?: return null
+        val mounted = nativeAccounts.captureLibraryMirrorMount(session) ?: return null
+        if (com.vortx.android.integrations.NativeProviderVault.scope(mounted.account) != owner.scope.accountID) return null
+        val original = manager.captureOrdinaryProviderOwnerAdmission() ?: return null
+        // Verify persistence with the captured generation held, before the library dispatch.
+        if (!original { syncManager === manager && manager.sessionOwnerSnapshot() == mounted.account }) return null
+        return com.vortx.android.engine.NativeLibraryMirrorOrigin(session, owner, mounted.account,
+            { action -> original { syncManager === manager && action() } }, mounted::admit)
     }
 
     /** Typed native mount plus persistence-backed VortX credential epoch, captured before any query. */

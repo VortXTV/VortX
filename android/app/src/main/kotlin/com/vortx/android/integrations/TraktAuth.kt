@@ -1,5 +1,6 @@
 package com.vortx.android.integrations
 
+import com.vortx.android.sync.SessionOwnerSnapshot
 import android.content.Context
 import android.util.Log
 import com.vortx.android.BuildConfig
@@ -109,6 +110,25 @@ object TraktAuth {
         get() = tokenMutations.snapshot {
             currentSessionEpoch() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
         }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
+
+    internal fun watchlistEpoch(expected: SessionOwnerSnapshot.Account): Long? {
+        if (!isConfigured) return null
+        return tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch().takeIf { it > 0 && tokenStore?.connectionState == CredentialConnectionState.CONNECTED }
+        }?.value
+    }
+
+    internal suspend fun validWatchlistToken(expected: SessionOwnerSnapshot.Account, epoch: Long): String? {
+        val snapshot = tokenMutations.snapshotForOwner(expected) {
+            if (currentSessionEpoch() == epoch) currentStoredToken() else null
+        } ?: return null
+        return validToken(snapshot)
+    }
+
+    internal fun isWatchlistTokenCurrent(expected: SessionOwnerSnapshot.Account, epoch: Long, token: String): Boolean =
+        tokenMutations.snapshotForOwner(expected) {
+            currentSessionEpoch() == epoch && currentStoredToken()?.token?.accessToken == token
+        }?.value == true
 
     // MARK: - Step 1: request a device code
 
@@ -230,8 +250,9 @@ object TraktAuth {
 
     /// A live access token, refreshing first if the stored one is near expiry. Throws
     /// [TraktAuthException.NotSignedIn] when no token is stored.
-    suspend fun validToken(): String {
-        val snapshot = tokenMutations.snapshot(::currentStoredToken)
+    suspend fun validToken(): String = validToken(tokenMutations.snapshot(::currentStoredToken))
+
+    private suspend fun validToken(snapshot: CredentialOperationSnapshot<TokenPersistence.StoredToken?>): String {
         val storedToken = snapshot.value ?: throw TraktAuthException.NotSignedIn
         val token = storedToken.token
         if (token.isExpired) return refresh(snapshot.operation).accessToken

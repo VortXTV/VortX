@@ -928,6 +928,19 @@ internal class NativeAccountCoordinator(
     internal fun accountFor(session: VortxNativeSession): SessionOwnerSnapshot.Account? = synchronized(lifecycleLock) {
         mounted.get()?.takeIf { it.session === session }?.account
     }
+    internal class LibraryMirrorMount(val account: SessionOwnerSnapshot.Account, private val admission: (() -> Boolean) -> Boolean) {
+        fun admit(action: () -> Boolean): Boolean = admission(action)
+    }
+
+    /** Retain the exact mounted installation even when a successor uses the same account and scope. */
+    internal fun captureLibraryMirrorMount(session: VortxNativeSession): LibraryMirrorMount? {
+        check(Thread.holdsLock(session)) { "Library mirror capture must hold Session" }
+        val original = mounted.get()?.takeIf { it.session === session } ?: return null
+        return LibraryMirrorMount(original.account) { action ->
+            synchronized(lifecycleLock) { mounted.get() === original && action() }
+        }
+    }
+
     internal class ForYouMutationAdmission(val identity: Any, private val admission: (() -> Boolean) -> Boolean) {
         fun admit(action: () -> Boolean): Boolean = admission(action)
     }
