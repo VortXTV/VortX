@@ -128,25 +128,41 @@ internal object NativeSettingsFence {
         SYNC_STATE("vortx_sync_state"),
         DIRTY_SETTINGS("vortx_sync_dirty"),
         ADDON_PREFS("vortx.addon.prefs"),
+        PROVIDER_RETRY_QUEUE("vortx_account_sync_queue"),
     }
     private val restoreBackings = RestoreAuxiliaryBacking.entries.mapTo(mutableSetOf(SETTINGS)) { it.fileName }
 
     /** The Application calls this before the platform can load or normalize the first settings file.
      * Only each exact backing's first open performs a bounded number of no-follow metadata reads.
      * Ordinary later opens and the platform open/result retain their existing behavior. */
-    fun open(context: Context, name: String, mode: Int, platformOpen: () -> SharedPreferences): SharedPreferences {
-        if (name !in restoreBackings || name in openedBackings) return wrap(name, platformOpen())
+    fun open(context: Context, name: String, mode: Int, platformOpen: () -> SharedPreferences): SharedPreferences =
+        checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+
+    /** App startup only. Never let a proof preparation open or normalize old or unknown data. */
+    fun preparePristineRestoreBacking(context: Context, backing: RestoreAuxiliaryBacking, platformOpen: () -> SharedPreferences) {
+        openObserved(context, backing.fileName, Context.MODE_PRIVATE, prepareOnly = true, platformOpen = platformOpen)
+    }
+
+    private fun openObserved(context: Context, name: String, mode: Int, prepareOnly: Boolean,
+        platformOpen: () -> SharedPreferences): SharedPreferences? {
+        if (name !in restoreBackings || name in openedBackings)
+            return if (prepareOnly) null else wrap(name, platformOpen())
         return synchronized(lock) {
-            if (name in openedBackings) return@synchronized wrap(name, platformOpen())
+            if (name in openedBackings) return@synchronized if (prepareOnly) null else wrap(name, platformOpen())
             try {
                 val pristine = try {
-                    if (context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE) null
+                    val ordinaryQueueOpen = !prepareOnly && name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName
+                    if (ordinaryQueueOpen || context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE) null
                     else PristineBacking.beforeOpen(context.dataDir.toPath(), name)
+                        ?.takeIf { !prepareOnly || it.canPrepareBeforeOpen() }
                 } catch (_: Exception) { null }
+                if (prepareOnly && pristine == null) return@synchronized null
                 val backing = platformOpen()
                 val wasAlreadyWrapped = backing is Fenced || wrappers.containsKey(backing)
                 val wrapper = wrap(name, backing)
-                val bound = if (!wasAlreadyWrapped) try { pristine?.finishOpen() } catch (_: Exception) { null } else null
+                val bound = if (!wasAlreadyWrapped) try {
+                    pristine?.finishOpen()?.takeIf { !prepareOnly || it.observeMissing() != null }
+                } catch (_: Exception) { null } else null
                 if (bound != null && wrapper is Fenced && wrapper.name == name) {
                     wrapper.pristine = bound
                     originalRestoreBackings[name] = wrapper
@@ -162,6 +178,12 @@ internal object NativeSettingsFence {
      * The returned closure reads a volatile identity and is suitable for final worker currency. */
     fun capturePristineRestoreBacking(existing: SharedPreferences): (() -> Boolean)? =
         capturePristineRestoreBacking(existing, SETTINGS)
+
+    /** Existing retained wrapper only, including stores owned by a different writer component. */
+    fun capturePristineRestoreBacking(backing: RestoreAuxiliaryBacking): (() -> Boolean)? {
+        val existing = synchronized(lock) { originalRestoreBackings[backing.fileName] } ?: return null
+        return capturePristineRestoreBacking(existing, backing)
+    }
 
     fun capturePristineRestoreBacking(existing: SharedPreferences, backing: RestoreAuxiliaryBacking): (() -> Boolean)? {
         val wrapper = (existing as? Fenced)?.takeIf { it.name == backing.fileName } ?: return null
@@ -184,6 +206,10 @@ internal object NativeSettingsFence {
         data class Directory(val identity: Any, val modified: FileTime)
         private val directory = root.resolve("shared_prefs")
 
+        fun canPrepareBeforeOpen(): Boolean = if (directoryIdentity == null)
+            directoryAttributes(directory) == null && directoryAttributes(root)?.identity == appIdentity
+        else observeMissing() != null
+
         fun finishOpen(): PristineBacking? {
             val now = directoryAttributes(directory) ?: return null
             if (directoryAttributes(root)?.identity != appIdentity ||
@@ -195,7 +221,7 @@ internal object NativeSettingsFence {
         fun observeMissing(): Directory? {
             if (directoryAttributes(root)?.identity != appIdentity) return null
             val before = directoryAttributes(directory)?.takeIf { it.identity == directoryIdentity } ?: return null
-            // This bounded inventory runs only on the explicit Restore worker.
+            // Bounded first-start preparation and existing-only Restore inspection.
             Files.newDirectoryStream(directory).use { entries ->
                 var count = 0
                 for (entry in entries) {

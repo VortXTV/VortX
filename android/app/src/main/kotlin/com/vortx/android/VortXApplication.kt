@@ -213,6 +213,15 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         if (isCommunityJsBrokerProcess()) return
         // Durable, scrubbed diagnostics (always-on breadcrumb + the opt-in exportable log). Main process only.
         com.vortx.android.diagnostics.DiagnosticsLog.install(this)
+        // This existing-only provenance starts before any normal provider retry work.
+        runCatching {
+            com.vortx.android.security.AccountFileProviderWriters.withWriter(Unit) {
+                val backing = com.vortx.android.sync.NativeSettingsFence.RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE
+                com.vortx.android.sync.NativeSettingsFence.preparePristineRestoreBacking(this, backing) {
+                    super.getSharedPreferences(backing.fileName, Context.MODE_PRIVATE)
+                }
+            }
+        }.onFailure { Log.w(TAG, "Provider retry backing unavailable for account Restore") }
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }

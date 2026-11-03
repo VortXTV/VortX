@@ -2664,7 +2664,7 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                                         if (scope.accountID != "account.${lease.accountId}")
                                             throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.ACCOUNT_CHANGED)
                                         requireManagedFileRestoreAbsence(externalOwner.account) { requireIdle(original) }
-                                        val currentBackings = captureAuxiliaryRestoreBackings(externalOwner.account, addonWriter)
+                                        val currentBackings = captureAuxiliaryRestoreBackings(externalOwner.account, addonWriter, providerWriters)
                                         auxiliaryBackings.compareAndSet(null, currentBackings)
                                         requireAuxiliaryRestoreBackings(currentBackings)
                                         reservation.requireLocalAbsence(externalOwner, scope)
@@ -2718,13 +2718,24 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
 
     /** Physical probes run only on the owned transaction worker. Dispatch uses their retained scalars. */
     private fun captureAuxiliaryRestoreBackings(owner: SessionOwnerSnapshot.Account,
-        addonWriter: AddonPrefsStore.RestoreWriteExclusion): List<() -> Boolean> {
+        addonWriter: AddonPrefsStore.RestoreWriteExclusion,
+        providerWriters: AccountFileRestoreManagerExclusion.Reservation): List<() -> Boolean> {
         fun verified(backing: (() -> Boolean)?): () -> Boolean = backing
             ?: throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.LOCAL_STATE_UNVERIFIABLE)
+        fun requireProviderWriters() {
+            if (!AccountFileProviderWriters.isCurrent(providerWriters))
+                throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
+        }
+        requireProviderWriters()
+        // Legacy rows carry no VortX owner. Only positive whole-backing absence can admit them.
+        val retryQueue = verified(NativeSettingsFence.capturePristineRestoreBacking(
+            NativeSettingsFence.RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE))
+        requireProviderWriters()
         return listOf(
             verified(syncState.captureRestoreBacking()),
             verified(NativeSettingsFence.capturePristineRestoreBacking(dirtyPrefs, NativeSettingsFence.RestoreAuxiliaryBacking.DIRTY_SETTINGS)),
             verified(addonPrefs.captureRestoreBacking(owner, addonWriter)),
+            { AccountFileProviderWriters.isCurrent(providerWriters) && retryQueue() },
         )
     }
 
