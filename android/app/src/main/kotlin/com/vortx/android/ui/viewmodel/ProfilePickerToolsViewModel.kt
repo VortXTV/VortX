@@ -14,6 +14,7 @@ import com.vortx.android.backup.accountfiles.AccountBackupCopyKind
 import com.vortx.android.backup.accountfiles.AccountBackupDocuments
 import com.vortx.android.sync.AccountFileRepairFailure
 import com.vortx.android.sync.AccountFileRepairReason
+import com.vortx.android.sync.AccountFileRestoreExternalExclusion
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.profilepicker.PickerToolsAccounts
@@ -26,6 +27,11 @@ import com.vortx.android.ui.profilepicker.PickerToolsPreparedBackup
 import com.vortx.android.ui.profilepicker.PickerToolsRepairExport
 import com.vortx.android.ui.profilepicker.PickerToolsRepairInputRequest
 import com.vortx.android.ui.profilepicker.PickerToolsRepairPreparer
+import com.vortx.android.ui.profilepicker.PickerToolsRestoreActions
+import com.vortx.android.ui.profilepicker.PickerToolsRestoreCandidate
+import com.vortx.android.ui.profilepicker.PickerToolsRestoreInput
+import com.vortx.android.ui.profilepicker.PickerToolsRestoreInputRequest
+import com.vortx.android.ui.profilepicker.PickerToolsRestoreSelection
 import com.vortx.android.ui.profilepicker.PickerToolsSelectedBackup
 import com.vortx.android.ui.profilepicker.PickerToolsSaveReceipt
 import com.vortx.android.ui.profilepicker.PickerToolsWorkGate
@@ -34,6 +40,7 @@ import com.vortx.android.ui.screens.shareDiagnosticLog
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOf
+import java.util.UUID
 
 internal class ManagerPickerToolsAccounts(private val manager: VortXSyncManager) : PickerToolsAccounts {
     override val authorityRevision: Long get() = manager.pickerAuthorityRevision.value
@@ -67,6 +74,33 @@ private fun AccountFileRepairFailure.toPickerRefusal() = PickerToolsException(wh
     AccountFileRepairReason.INVALID_FILE -> PickerToolsFailure.INVALID_REPAIR_FILE
 })
 
+private class SafRestoreInput(val uri: Uri) : PickerToolsRestoreInput {
+    override fun toString() = "SafRestoreInput"
+}
+
+private class ManagerPickerToolsRestoreActions(
+    private val documents: AccountBackupDocuments,
+    private val manager: VortXSyncManager,
+    private val external: AccountFileRestoreExternalExclusion,
+) : PickerToolsRestoreActions {
+    override suspend fun status(original: PickerToolsActionGrant, isCurrent: () -> Boolean) =
+        manager.readAccountBackupFileRestoreStatus(checkNotNull(original.original), isCurrent)
+
+    override suspend fun read(original: PickerToolsActionGrant, input: PickerToolsRestoreInput,
+        isCurrent: () -> Boolean): PickerToolsRestoreCandidate {
+        val uri = checkNotNull(input as? SafRestoreInput).uri
+        val selection = PickerToolsRestoreSelection.read(documents, uri, manager, original, isCurrent)
+        return object : PickerToolsRestoreCandidate {
+            override val byteCount get() = selection.byteCount
+            override suspend fun confirm() = selection.confirm(original, external)
+            override fun close() = selection.close()
+        }
+    }
+
+    override suspend fun verify(original: PickerToolsActionGrant, operationId: UUID, isCurrent: () -> Boolean) =
+        manager.verifyAccountBackupFileRestore(checkNotNull(original.original), operationId, isCurrent)
+}
+
 /** Activity-owned, ephemeral only. It retains neither an Activity nor any SavedStateHandle/Bundle. */
 internal class ProfilePickerToolsViewModel private constructor(
     private val documents: AccountBackupDocuments?,
@@ -74,7 +108,8 @@ internal class ProfilePickerToolsViewModel private constructor(
 ) : ViewModel() {
     val controller = createController(this)
     val state get() = controller.state
-    constructor(manager: VortXSyncManager?, context: Context, workGate: PickerToolsWorkGate = PickerToolsWorkGate()) : this(
+    constructor(manager: VortXSyncManager?, context: Context, workGate: PickerToolsWorkGate = PickerToolsWorkGate(),
+        externalRestore: AccountFileRestoreExternalExclusion? = null) : this(
         AccountBackupDocuments(context.applicationContext),
         { model ->
             ProfilePickerToolsController(manager?.let(::ManagerPickerToolsAccounts) ?: UnavailablePickerToolsAccounts,
@@ -96,7 +131,9 @@ internal class ProfilePickerToolsViewModel private constructor(
                             override fun close() = operation.close()
                         }
                     }
-                })
+                }, restoreActions = if (manager != null && externalRestore != null)
+                    ManagerPickerToolsRestoreActions(checkNotNull(model.documents), manager, externalRestore)
+                else null)
         },
     )
     /** Test collaborator replaces I/O/transport only; the actual controller and route/slot logic remain. */
@@ -113,6 +150,10 @@ internal class ProfilePickerToolsViewModel private constructor(
                 override fun close() = source.close()
             }
         }
+    }
+    fun restoreInputReturned(request: PickerToolsRestoreInputRequest, uri: Uri?) {
+        if (uri == null) controller.restoreInputRefused(request)
+        else controller.restoreInputReturned(request, SafRestoreInput(uri))
     }
     fun destinationReturned(request: PickerToolsDestinationRequest, tree: Uri?) {
         if (tree == null) { controller.destinationRefused(request); return }
@@ -135,19 +176,28 @@ internal class ProfilePickerToolsViewModel private constructor(
 
 internal class PickerToolsModelHolder : ViewModel() {
     private var current: VortXSyncManager? = null
+    private var currentRestore: AccountFileRestoreExternalExclusion? = null
     private val workGate = PickerToolsWorkGate()
     private var store = ReplacingViewModelStoreOwner()
-    fun model(manager: VortXSyncManager?, applicationContext: Context): ProfilePickerToolsViewModel {
-        if (current !== manager) { store.clear(); store = ReplacingViewModelStoreOwner(); current = manager }
+    fun model(manager: VortXSyncManager?, applicationContext: Context,
+        externalRestore: AccountFileRestoreExternalExclusion? = null): ProfilePickerToolsViewModel {
+        if (current !== manager || currentRestore !== externalRestore) {
+            store.clear()
+            store = ReplacingViewModelStoreOwner()
+            current = manager
+            currentRestore = externalRestore
+        }
         return ViewModelProvider(store, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T = ProfilePickerToolsViewModel(manager, applicationContext, workGate) as T
+            override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                ProfilePickerToolsViewModel(manager, applicationContext, workGate, externalRestore) as T
         })[ProfilePickerToolsViewModel::class.java]
     }
     override fun onCleared() { store.clear(); super.onCleared() }
 }
 @Composable
-internal fun rememberPickerToolsModel(manager: VortXSyncManager?): ProfilePickerToolsViewModel {
+internal fun rememberPickerToolsModel(manager: VortXSyncManager?,
+    externalRestore: AccountFileRestoreExternalExclusion? = null): ProfilePickerToolsViewModel {
     val applicationContext = LocalContext.current.applicationContext
     val holder: PickerToolsModelHolder = viewModel(key = "pre-profile-vortx-tools-holder", factory = remember {
         object : ViewModelProvider.Factory {
@@ -155,5 +205,5 @@ internal fun rememberPickerToolsModel(manager: VortXSyncManager?): ProfilePicker
             override fun <T : ViewModel> create(modelClass: Class<T>): T = PickerToolsModelHolder() as T
         }
     })
-    return holder.model(manager, applicationContext)
+    return holder.model(manager, applicationContext, externalRestore)
 }

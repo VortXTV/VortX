@@ -3,6 +3,9 @@ package com.vortx.android.ui.profilepicker
 import com.vortx.android.backup.accountfiles.AccountBackupDocumentFailure
 import com.vortx.android.diagnostics.DiagnosticShareOutcome
 import com.vortx.android.sync.AccountBackupFile
+import com.vortx.android.sync.AccountFileRestoreJournal.State as RestoreJournalState
+import com.vortx.android.sync.AccountFileRestoreTransaction.Result as RestoreResult
+import com.vortx.android.sync.VortXSyncManager.FileRestoreStatus
 import com.vortx.android.sync.PickerAccountSnapshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -30,10 +33,15 @@ internal data class PickerToolsState(
     val destination: PickerToolsDestinationRequest? = null,
     val repairInput: PickerToolsRepairInputRequest? = null,
     val repairReview: PickerToolsRepairReview? = null,
+    val restoreInput: PickerToolsRestoreInputRequest? = null,
+    val restoreReview: PickerToolsRestoreReview? = null,
+    val restoreStatus: PickerToolsRestoreStatus? = null,
+    val cancellingFileSave: Boolean = false,
     val message: String? = null,
 ) { val busy: Boolean get() = phase != PickerToolsPhase.IDLE }
 internal enum class PickerToolsPhase {
     IDLE, DOWNLOADING, CHOOSING_REPAIR_INPUT, PREPARING_REPAIR, REVIEWING_REPAIR,
+    CHECKING_RESTORE, CHOOSING_RESTORE_INPUT, READING_RESTORE, REVIEWING_RESTORE, RESTORING, VERIFYING_RESTORE,
     AWAITING_DESTINATION, SAVING, SHARING_DIAGNOSTICS, CANCELLING,
 }
 @ConsistentCopyVisibility
@@ -48,6 +56,13 @@ internal data class PickerToolsRepairReview(
     val nativeSchema: Int,
     val byteCount: Int,
 )
+
+@ConsistentCopyVisibility
+internal data class PickerToolsRestoreInputRequest internal constructor(val routeId: String, val operationId: String)
+internal data class PickerToolsRestoreReview(val request: PickerToolsRestoreInputRequest, val byteCount: Int)
+@ConsistentCopyVisibility
+internal data class PickerToolsRestoreVerifyRequest internal constructor(val controlId: String)
+internal data class PickerToolsRestoreStatus(val message: String, val verify: PickerToolsRestoreVerifyRequest?)
 
 /** Captured when Tools renders, never acquired by a queued action at click time. */
 internal class PickerToolsActionGrant internal constructor(
@@ -92,6 +107,17 @@ internal interface PickerToolsRepairExport : Closeable {
 internal fun interface PickerToolsRepairPreparer {
     suspend fun prepare(original: PickerAccountSnapshot, bytes: ByteArray, isCurrent: () -> Boolean): PickerToolsRepairExport
 }
+internal interface PickerToolsRestoreInput
+internal interface PickerToolsRestoreCandidate : Closeable {
+    val byteCount: Int
+    suspend fun confirm(): RestoreResult
+}
+internal interface PickerToolsRestoreActions {
+    suspend fun status(original: PickerToolsActionGrant, isCurrent: () -> Boolean): FileRestoreStatus
+    suspend fun read(original: PickerToolsActionGrant, input: PickerToolsRestoreInput,
+        isCurrent: () -> Boolean): PickerToolsRestoreCandidate
+    suspend fun verify(original: PickerToolsActionGrant, operationId: UUID, isCurrent: () -> Boolean): RestoreResult
+}
 internal enum class PickerToolsFailure(val message: String) {
     SAVE_FAILED("The backup could not be saved safely. A new complete or incomplete copy may remain in the selected folder."),
     REPAIR_FAILED("The backup could not be repaired safely. Your original file was not written by this repair."),
@@ -113,11 +139,16 @@ internal class PickerToolsWorkGate {
     private var owner: Any? = null
     private val _busy = MutableStateFlow(false)
     val busy: StateFlow<Boolean> = _busy.asStateFlow()
+    @Volatile var savingFile = false
+        private set
     fun reserve(expected: Any): Boolean = synchronized(lock) {
         if (owner != null) false else { owner = expected; _busy.value = true; true }
     }
+    fun markFileSave(expected: Any) {
+        synchronized(lock) { if (owner === expected) savingFile = true }
+    }
     fun release(expected: Any) = synchronized(lock) {
-        if (owner === expected) { owner = null; _busy.value = false }
+        if (owner === expected) { owner = null; savingFile = false; _busy.value = false }
     }
 }
 
@@ -132,6 +163,7 @@ internal class ProfilePickerToolsController(
     private val scope: CoroutineScope,
     private val workGate: PickerToolsWorkGate = PickerToolsWorkGate(),
     private val repairPreparer: PickerToolsRepairPreparer? = null,
+    private val restoreActions: PickerToolsRestoreActions? = null,
 ) : Closeable {
     private val lock = Any()
     private var attachment: PickerToolsAttachment? = null
@@ -143,6 +175,44 @@ internal class ProfilePickerToolsController(
     private val _state = MutableStateFlow(PickerToolsState())
     val state: StateFlow<PickerToolsState> = _state.asStateFlow()
     val repairAvailable: Boolean get() = repairPreparer != null
+    val restoreAvailable: Boolean get() = restoreActions != null
+    private var retainedRestore: RetainedRestore? = null
+    private class RetainedRestore(val grant: PickerToolsActionGrant, val record: FileRestoreStatus.Retained) {
+        val verify = when (record.state) {
+            RestoreJournalState.PossibleSend, RestoreJournalState.DeliveryUnconfirmed, RestoreJournalState.UploadAccepted ->
+                PickerToolsRestoreVerifyRequest(UUID.randomUUID().toString())
+            RestoreJournalState.Retained, RestoreJournalState.NotSubmitted, RestoreJournalState.Conflict,
+            RestoreJournalState.ServerConfirmed -> null
+        }
+        fun presentation() = PickerToolsRestoreStatus(when (record.state) {
+            RestoreJournalState.Retained -> "A previous restore intent is retained."
+            RestoreJournalState.NotSubmitted -> "The retained restore was not submitted."
+            RestoreJournalState.PossibleSend -> "The retained restore may have been sent. Verify the cloud backup."
+            RestoreJournalState.DeliveryUnconfirmed -> "Delivery of the retained restore is unconfirmed."
+            RestoreJournalState.Conflict -> "The retained restore conflicted with the cloud backup."
+            RestoreJournalState.UploadAccepted -> "The retained restore upload was accepted and still needs verification."
+            RestoreJournalState.ServerConfirmed -> "The retained restore was verified against the cloud backup."
+        }, verify)
+    }
+    private class RestoreWork(
+        val grant: PickerToolsActionGrant,
+        val input: RestoreInput? = null,
+        val verify: RetainedRestore? = null,
+    ) {
+        // Set only by the original worker, then consumed by its guarded drain.
+        var retained: RetainedRestore? = null
+    }
+    private class RestoreInput(val request: PickerToolsRestoreInputRequest) {
+        var launched = false
+        var selectionClaimed = false
+        var confirmationClaimed = false
+        val selection = CompletableDeferred<RestoreSelection>()
+        val confirmation = CompletableDeferred<Boolean>()
+    }
+    private sealed interface RestoreSelection {
+        class Selected(val input: PickerToolsRestoreInput) : RestoreSelection
+        class Refused(val failure: PickerToolsFailure?) : RestoreSelection
+    }
     private sealed interface Destination {
         class Save(val write: suspend (PickerToolsPreparedBackup, () -> Boolean) -> PickerToolsSaveReceipt) : Destination
         class Refused(val failure: PickerToolsFailure?) : Destination
@@ -160,6 +230,7 @@ internal class ProfilePickerToolsController(
         val marker: Any,
         val diagnosticPolicy: (() -> Boolean)? = null,
         val repair: PickerToolsRepairInputRequest? = null,
+        val restore: RestoreWork? = null,
     ) {
         @Volatile var revoked = false
         @Volatile var entered = false
@@ -190,7 +261,8 @@ internal class ProfilePickerToolsController(
         workGate.busy.collect { busy ->
             synchronized(lock) {
                 if (!closed && slot == null && _state.value.open)
-                    _state.value = _state.value.copy(phase = if (busy) PickerToolsPhase.CANCELLING else PickerToolsPhase.IDLE)
+                    _state.value = _state.value.copy(phase = if (busy) PickerToolsPhase.CANCELLING else PickerToolsPhase.IDLE,
+                        cancellingFileSave = busy && workGate.savingFile)
             }
         }
     }
@@ -216,9 +288,9 @@ internal class ProfilePickerToolsController(
     private fun retireRoute(expected: RouteAuthority) {
         val cancel = synchronized(lock) {
             if (routeAuthority !== expected) return
-            routeAuthority = null; attachment = null; publicationAuthority = null
+            routeAuthority = null; attachment = null; publicationAuthority = null; retainedRestore = null
             val generation = _state.value.routeGeneration + 1L
-            _state.value = PickerToolsState(routeGeneration = generation,
+            _state.value = PickerToolsState(routeGeneration = generation, cancellingFileSave = isCancellingFileSave(),
                 phase = if (slot == null) PickerToolsPhase.IDLE else PickerToolsPhase.CANCELLING)
             slot?.takeIf { it.routeIdentity === expected }?.also { it.revoked = true }
         }
@@ -233,10 +305,13 @@ internal class ProfilePickerToolsController(
         val route = synchronized(lock) { routeAuthority?.takeIf { attachment == expected } } ?: return
         if (!routeCurrent(route)) { retireRoute(route); return }
         synchronized(lock) {
-            if (!closed && attachment == expected && routeAuthority === route)
+            if (!closed && attachment == expected && routeAuthority === route) {
+                val inheritedWork = slot == null && workGate.busy.value
                 _state.value = _state.value.copy(open = true,
                     presentationId = _state.value.presentationId ?: UUID.randomUUID().toString(),
-                    phase = if (slot == null && workGate.busy.value) PickerToolsPhase.CANCELLING else _state.value.phase)
+                    phase = if (inheritedWork) PickerToolsPhase.CANCELLING else _state.value.phase,
+                    cancellingFileSave = if (inheritedWork) workGate.savingFile else _state.value.cancellingFileSave)
+            }
         }
     }
     /** The host captures this value while rendering. No onClick calls this method or captures an account. */
@@ -258,12 +333,18 @@ internal class ProfilePickerToolsController(
         val cancel = synchronized(lock) {
             if (attachment != expected) return
             publicationAuthority = null
-            _state.value = _state.value.copy(open = false, presentationId = null, destination = null, repairInput = null, repairReview = null, message = null,
+            retainedRestore = null
+            _state.value = _state.value.copy(open = false, presentationId = null, destination = null, repairInput = null,
+                repairReview = null, restoreInput = null, restoreReview = null, restoreStatus = null, message = null,
+                cancellingFileSave = isCancellingFileSave(),
                 phase = if (slot == null) PickerToolsPhase.IDLE else PickerToolsPhase.CANCELLING)
             slot?.also { it.revoked = true }
         }
         cancel?.job?.cancel()
     }
+    private fun isCancellingFileSave(): Boolean =
+        _state.value.phase == PickerToolsPhase.SAVING || _state.value.cancellingFileSave
+
     private fun authorityCurrent(original: Slot): Boolean =
         accounts.authorityRevision == original.revision && accounts.sessionMarker == original.marker &&
             (original.original?.let(accounts::isCurrent) ?: true)
@@ -284,36 +365,59 @@ internal class ProfilePickerToolsController(
         val job = synchronized(lock) {
             if (slot !== original) return
             original.revoked = true
-            _state.value = _state.value.copy(phase = PickerToolsPhase.CANCELLING, destination = null, repairInput = null, repairReview = null, message = null)
+            retainedRestore = null
+            _state.value = _state.value.copy(phase = PickerToolsPhase.CANCELLING, destination = null, repairInput = null,
+                repairReview = null, restoreInput = null, restoreReview = null, restoreStatus = null, message = null,
+                cancellingFileSave = isCancellingFileSave())
             original.job
         }
         job?.cancel()
     }
     private fun admit(expected: PickerToolsActionGrant, diagnosticPolicy: (() -> Boolean)? = null,
-        repair: Boolean = false): Slot? {
+        repair: Boolean = false, restoreSelection: Boolean = false, restoreVerify: PickerToolsRestoreVerifyRequest? = null): Slot? {
         if (!currentGrant(expected)) return null
         return synchronized(lock) {
             if (closed || attachment != expected.attachment || routeAuthority !== expected.routeIdentity ||
                 !_state.value.open || _state.value.presentationId != expected.presentationId || slot != null) return null
             // All authority comes from the immutable rendered grant, never a new capture at click time.
             val request = PickerToolsDestinationRequest(expected.attachment.routeId, UUID.randomUUID().toString())
+            val restore = when {
+                restoreSelection -> RestoreWork(expected, RestoreInput(
+                    PickerToolsRestoreInputRequest(request.routeId, request.operationId)))
+                restoreVerify != null -> {
+                    val retained = retainedRestore?.takeIf { it.verify == restoreVerify &&
+                        _state.value.restoreStatus?.verify == restoreVerify && sameRestoreOwner(it.grant, expected) } ?: return null
+                    RestoreWork(retained.grant, verify = retained)
+                }
+                else -> null
+            }
             val candidate = Slot(request, expected.presentationId, expected.routeIdentity, expected.original,
                 expected.revision, expected.marker, diagnosticPolicy,
-                if (repair) PickerToolsRepairInputRequest(request.routeId, request.operationId) else null)
+                if (repair) PickerToolsRepairInputRequest(request.routeId, request.operationId) else null, restore)
             if (!workGate.reserve(candidate)) {
-                _state.value = _state.value.copy(phase = PickerToolsPhase.CANCELLING, message = null)
+                _state.value = _state.value.copy(phase = PickerToolsPhase.CANCELLING, message = null,
+                    cancellingFileSave = workGate.savingFile)
                 null
-            } else candidate.also { publicationAuthority = null; slot = it }
+            } else candidate.also {
+                publicationAuthority = null
+                retainedRestore = null
+                slot = it
+            }
         }
     }
     private fun phase(original: Slot, value: PickerToolsPhase, destination: PickerToolsDestinationRequest? = null,
-        repairReview: PickerToolsRepairReview? = null) {
+        repairReview: PickerToolsRepairReview? = null, restoreReview: PickerToolsRestoreReview? = null) {
         if (!current(original)) return
         synchronized(lock) {
-            if (slot === original && !original.revoked && attachment?.routeId == original.request.routeId)
+            if (slot === original && !original.revoked && attachment?.routeId == original.request.routeId) {
+                // A replacement model sees this hint until the original save really returns.
+                if (value == PickerToolsPhase.SAVING) workGate.markFileSave(original)
                 _state.value = _state.value.copy(phase = value, destination = destination,
                     repairInput = original.repair.takeIf { value == PickerToolsPhase.CHOOSING_REPAIR_INPUT },
-                    repairReview = repairReview, message = null)
+                    repairReview = repairReview, message = null, restoreStatus = null,
+                    restoreInput = original.restore?.input?.request.takeIf { value == PickerToolsPhase.CHOOSING_RESTORE_INPUT },
+                    restoreReview = restoreReview)
+            }
         }
     }
     private fun drain(original: Slot, message: String?) {
@@ -325,8 +429,10 @@ internal class ProfilePickerToolsController(
             publicationAuthority = if (publish) original.revision to original.marker else null
             slot = null
             workGate.release(original)
-            _state.value = _state.value.copy(phase = PickerToolsPhase.IDLE, destination = null, repairInput = null, repairReview = null,
-                message = if (publish && attachment?.routeId == original.request.routeId) message else null)
+            retainedRestore = if (publish) original.restore?.retained else null
+            _state.value = _state.value.copy(phase = PickerToolsPhase.IDLE, destination = null, repairInput = null,
+                repairReview = null, restoreInput = null, restoreReview = null, restoreStatus = retainedRestore?.presentation(),
+                cancellingFileSave = false, message = if (publish) message else null)
         }
     }
     private fun launch(original: Slot, work: suspend () -> String?) {
@@ -335,12 +441,19 @@ internal class ProfilePickerToolsController(
             var message: String? = null
             try { requireCurrent(original); message = work(); requireCurrent(original) }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: AccountBackupFile.Failure) { message = AccountBackupFile.Failure(failure.reason).message }
-            catch (failure: AccountBackupDocumentFailure) { message = failure.message }
-            catch (failure: PickerToolsException) { message = failure.failure.message }
-            catch (_: Exception) {
-                message = if (original.repair != null && _state.value.phase != PickerToolsPhase.SAVING)
-                    PickerToolsFailure.REPAIR_FAILED.message else PickerToolsFailure.SAVE_FAILED.message
+            catch (failure: Exception) {
+                message = when {
+                    original.restore != null -> when (_state.value.phase) {
+                        PickerToolsPhase.CHECKING_RESTORE -> restoreStatusUnavailable
+                        PickerToolsPhase.READING_RESTORE -> "The selected backup could not be read safely."
+                        else -> "Restore could not be confirmed. Check retained restore status before trying again."
+                    }
+                    failure is AccountBackupFile.Failure -> AccountBackupFile.Failure(failure.reason).message
+                    failure is AccountBackupDocumentFailure -> failure.message
+                    failure is PickerToolsException -> failure.failure.message
+                    original.repair != null && _state.value.phase != PickerToolsPhase.SAVING -> PickerToolsFailure.REPAIR_FAILED.message
+                    else -> PickerToolsFailure.SAVE_FAILED.message
+                }
             }
             finally {
                 // This runs after the actual suspend/provider invocation drained, including a
@@ -492,6 +605,146 @@ internal class ProfilePickerToolsController(
         }
     }
 
+    fun restore(expected: PickerToolsActionGrant) {
+        val actions = restoreActions ?: return
+        if (!requireFileGrant(expected, "restoring")) return
+        val original = admit(expected, restoreSelection = true) ?: return
+        val work = checkNotNull(original.restore)
+        val input = checkNotNull(work.input)
+        phase(original, PickerToolsPhase.CHECKING_RESTORE)
+        launch(original) {
+            when (val status = actions.status(work.grant) { current(original) }) {
+                FileRestoreStatus.Unavailable -> return@launch restoreStatusUnavailable
+                FileRestoreStatus.Missing -> Unit
+                is FileRestoreStatus.Retained -> {
+                    requireCurrent(original)
+                    work.retained = RetainedRestore(work.grant, status)
+                    return@launch null
+                }
+            }
+            requireCurrent(original)
+            phase(original, PickerToolsPhase.CHOOSING_RESTORE_INPUT)
+            val selected = when (val selection = input.selection.await()) {
+                is RestoreSelection.Refused -> return@launch when (selection.failure) {
+                    null -> "Restore cancelled."
+                    PickerToolsFailure.NO_FILE_PROVIDER -> PickerToolsFailure.NO_FILE_PROVIDER.message
+                    else -> "The selected backup could not be opened."
+                }
+                is RestoreSelection.Selected -> selection.input
+            }
+            requireCurrent(original)
+            phase(original, PickerToolsPhase.READING_RESTORE)
+            val candidate = actions.read(work.grant, selected) { current(original) }
+            val result = candidate.use {
+                requireCurrent(original)
+                phase(original, PickerToolsPhase.REVIEWING_RESTORE,
+                    restoreReview = PickerToolsRestoreReview(input.request, candidate.byteCount))
+                if (!input.confirmation.await()) return@launch "Restore cancelled."
+                requireCurrent(original)
+                phase(original, PickerToolsPhase.RESTORING)
+                requireCurrent(original)
+                candidate.confirm()
+            }
+            finishRestore(original, work, actions, result)
+        }
+    }
+
+    fun claimRestoreInputLaunch(request: PickerToolsRestoreInputRequest): Boolean {
+        val original = synchronized(lock) { slot?.takeIf { it.restore?.input?.request == request } } ?: return false
+        if (!current(original)) { revoke(original); return false }
+        return synchronized(lock) {
+            val input = checkNotNull(original.restore?.input)
+            if (slot !== original || original.revoked || input.launched ||
+                input.selection.isCompleted || _state.value.restoreInput != request) false
+            else { input.launched = true; true }
+        }
+    }
+
+    fun restoreInputReturned(request: PickerToolsRestoreInputRequest, input: PickerToolsRestoreInput) =
+        completeRestoreSelection(request, RestoreSelection.Selected(input))
+
+    fun restoreInputRefused(request: PickerToolsRestoreInputRequest, failure: PickerToolsFailure? = null) =
+        completeRestoreSelection(request, RestoreSelection.Refused(failure))
+
+    private fun completeRestoreSelection(request: PickerToolsRestoreInputRequest, selection: RestoreSelection) {
+        val original = synchronized(lock) { slot?.takeIf { it.restore?.input?.request == request } } ?: return
+        if (!current(original)) { revoke(original); return }
+        val completion = synchronized(lock) {
+            val input = checkNotNull(original.restore?.input)
+            if (slot !== original || original.revoked || !input.launched || input.selectionClaimed ||
+                _state.value.restoreInput != request) return
+            input.selectionClaimed = true
+            input.selection
+        }
+        // Completion can resume immediately. The original worker rechecks before provider work.
+        completion.complete(selection)
+    }
+
+    private fun sameRestoreOwner(original: PickerToolsActionGrant, expected: PickerToolsActionGrant): Boolean =
+        original.routeIdentity === expected.routeIdentity && original.presentationId == expected.presentationId &&
+            original.original === expected.original && original.revision == expected.revision && original.marker == expected.marker
+
+    fun confirmRestore(expected: PickerToolsActionGrant, request: PickerToolsRestoreInputRequest, approved: Boolean) {
+        if (!currentGrant(expected)) return
+        val completion = synchronized(lock) {
+            val original = slot ?: return
+            val work = original.restore ?: return
+            val input = work.input?.takeIf { it.request == request } ?: return
+            if (original.revoked || input.confirmationClaimed || attachment != expected.attachment ||
+                !sameRestoreOwner(work.grant, expected) || !_state.value.open ||
+                _state.value.presentationId != expected.presentationId || _state.value.restoreReview?.request != request) return
+            input.confirmationClaimed = true
+            input.confirmation
+        }
+        completion.complete(approved)
+    }
+
+    fun verifyRestore(expected: PickerToolsActionGrant, request: PickerToolsRestoreVerifyRequest) {
+        val actions = restoreActions ?: return
+        if (!requireFileGrant(expected, "verifying")) return
+        val original = admit(expected, restoreVerify = request) ?: return
+        val work = checkNotNull(original.restore)
+        val operationId = checkNotNull(work.verify).record.operationId
+        phase(original, PickerToolsPhase.VERIFYING_RESTORE)
+        launch(original) {
+            val result = actions.verify(work.grant, operationId) { current(original) }
+            finishRestore(original, work, actions, result)
+        }
+    }
+
+    private suspend fun finishRestore(original: Slot, work: RestoreWork, actions: PickerToolsRestoreActions,
+        result: RestoreResult): String {
+        requireCurrent(original)
+        val resultId = when (result) {
+            is RestoreResult.NotSubmitted -> work.verify?.record?.operationId
+            is RestoreResult.ExistingIntent -> result.operationId
+            is RestoreResult.Conflict -> result.operationId
+            is RestoreResult.DeliveryUnconfirmed -> result.operationId
+            is RestoreResult.UploadAccepted -> result.operationId
+            is RestoreResult.ServerConfirmed -> result.operationId
+        }
+        val verifyId = work.verify?.record?.operationId
+        if (resultId != null && (verifyId == null || resultId == verifyId)) {
+            val status = actions.status(work.grant) { current(original) }
+            requireCurrent(original)
+            if (status is FileRestoreStatus.Retained && status.operationId == resultId)
+                work.retained = RetainedRestore(work.grant, status)
+        }
+        return when (result) {
+            is RestoreResult.NotSubmitted -> if (work.verify == null) "This restore was not submitted."
+                else "Verification could not complete. Check retained restore status."
+            is RestoreResult.ExistingIntent -> "A previous restore intent prevented a new submission."
+            is RestoreResult.Conflict -> "The restore conflicted with the existing cloud backup."
+            is RestoreResult.DeliveryUnconfirmed -> "Restore delivery could not be confirmed."
+            is RestoreResult.UploadAccepted -> "The restore upload was accepted. Cloud verification is still pending."
+            is RestoreResult.ServerConfirmed -> "The restore was verified against the cloud backup."
+        }
+    }
+
+    private companion object {
+        const val restoreStatusUnavailable = "Retained restore status is unavailable. No file was selected."
+    }
+
     /** Rotation and repeated clicks cannot launch another selector for an already-presented request. */
     fun claimDestinationLaunch(request: PickerToolsDestinationRequest): Boolean {
         val original = synchronized(lock) { slot?.takeIf { it.request == request } } ?: return false
@@ -546,7 +799,8 @@ internal class ProfilePickerToolsController(
     }
     override fun close() {
         val cancel = synchronized(lock) {
-            closed = true; attachment = null; routeAuthority = null; publicationAuthority = null; _state.value = PickerToolsState()
+            closed = true; attachment = null; routeAuthority = null; publicationAuthority = null; retainedRestore = null
+            _state.value = PickerToolsState()
             slot?.also { it.revoked = true }
         }
         observer.cancel(); gateObserver.cancel()

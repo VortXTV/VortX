@@ -82,6 +82,16 @@ internal fun ProfilePickerToolsHost(
                         PickerToolsRepairInput(model, request, isTv)
                     }
                 },
+                onRestore = if (controller.restoreAvailable) ({ actionGrant?.let(controller::restore) }) else null,
+                onRestoreDecision = { request, approved ->
+                    actionGrant?.let { controller.confirmRestore(it, request, approved) }
+                },
+                onVerifyRestore = { request -> actionGrant?.let { controller.verifyRestore(it, request) } },
+                restoreInput = { request ->
+                    key(request.routeId, request.operationId) {
+                        PickerToolsRestoreInput(model, request, isTv)
+                    }
+                },
                 onDiagnostics = { actionGrant?.let { grant -> model.diagnostics(grant, context) { requiredPolicy() } } },
                 destination = { request ->
                     // This composition identity and callback both belong to the original request.
@@ -155,6 +165,28 @@ private fun PickerToolsRepairInput(model: ProfilePickerToolsViewModel, request: 
     }
 }
 
+/** The URI callback is bound to the retained Restore input request, including after rotation. */
+@Composable
+private fun PickerToolsRestoreInput(model: ProfilePickerToolsViewModel, request: PickerToolsRestoreInputRequest, isTv: Boolean) {
+    val registry = LocalActivityResultRegistryOwner.current?.activityResultRegistry
+    var launcher by remember(registry, request) { mutableStateOf<ActivityResultLauncher<Array<String>>?>(null) }
+    DisposableEffect(registry, request) {
+        val originalRequest = request
+        val registered = registry?.register("picker-tools-restore-input-${request.routeId}-${request.operationId}",
+            ActivityResultContracts.OpenDocument()) { uri -> model.restoreInputReturned(originalRequest, uri) }
+        launcher = registered
+        onDispose { registered?.unregister(); launcher = null }
+    }
+    PickerToolsButton("Choose backup file", isTv, true, Modifier.testTag("picker-tools-restore-input")) {
+        if (!model.controller.claimRestoreInputLaunch(request)) return@PickerToolsButton
+        val originalLauncher = launcher
+        if (originalLauncher == null) model.controller.restoreInputRefused(request, PickerToolsFailure.NO_FILE_PROVIDER)
+        else try { originalLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/plain")) }
+        catch (_: ActivityNotFoundException) { model.controller.restoreInputRefused(request, PickerToolsFailure.NO_FILE_PROVIDER) }
+        catch (_: SecurityException) { model.controller.restoreInputRefused(request, PickerToolsFailure.DESTINATION_UNAVAILABLE) }
+    }
+}
+
 @Composable
 internal fun ProfilePickerToolsSurface(
     state: PickerToolsState,
@@ -165,6 +197,10 @@ internal fun ProfilePickerToolsSurface(
     onRepair: (() -> Unit)?,
     onRepairDecision: (PickerToolsRepairInputRequest, Boolean) -> Unit,
     repairInput: @Composable (PickerToolsRepairInputRequest) -> Unit,
+    onRestore: (() -> Unit)?,
+    onRestoreDecision: (PickerToolsRestoreInputRequest, Boolean) -> Unit,
+    onVerifyRestore: (PickerToolsRestoreVerifyRequest) -> Unit,
+    restoreInput: @Composable (PickerToolsRestoreInputRequest) -> Unit,
     onDiagnostics: () -> Unit,
     destination: @Composable (PickerToolsDestinationRequest) -> Unit,
 ) {
@@ -181,6 +217,19 @@ internal fun ProfilePickerToolsSurface(
         PickerToolsButton("Download backup", isTv, !state.busy, Modifier.testTag("picker-tools-download"), onDownload)
         if (onRepair != null)
             PickerToolsButton("Repair backup", isTv, !state.busy, Modifier.testTag("picker-tools-repair"), onRepair)
+        if (onRestore != null) {
+            PickerToolsButton(if (state.restoreStatus == null) "Restore backup" else "Check restore status",
+                isTv, !state.busy, Modifier.testTag("picker-tools-restore"), onRestore)
+            state.restoreStatus?.let { status ->
+                Text(status.message, style = VortXTheme.type.body,
+                    modifier = Modifier.widthIn(max = 680.dp).semantics { liveRegion = LiveRegionMode.Polite })
+                status.verify?.let { request ->
+                    PickerToolsButton("Verify cloud backup", isTv, !state.busy, Modifier.testTag("picker-tools-restore-verify")) {
+                        onVerifyRestore(request)
+                    }
+                }
+            }
+        }
         if (diagnosticAllowed) PickerToolsButton("Save or share diagnostic log", isTv, !state.busy,
             Modifier.testTag("picker-tools-diagnostics"), onDiagnostics)
         else Text("Diagnostic sharing is unavailable while profiles are locked or their roster is unavailable.",
@@ -202,18 +251,39 @@ internal fun ProfilePickerToolsSurface(
                     onRepairDecision(review.request, false)
                 }
             }
+            PickerToolsPhase.CHECKING_RESTORE -> Text("Checking retained restore status…")
+            PickerToolsPhase.CHOOSING_RESTORE_INPUT -> {
+                Text("Choose an encrypted VortX backup for your signed-in account.")
+                state.restoreInput?.let { restoreInput(it) }
+            }
+            PickerToolsPhase.READING_RESTORE -> Text("Reading the selected backup…")
+            PickerToolsPhase.REVIEWING_RESTORE -> state.restoreReview?.let { review ->
+                Text("Restore this file to the signed-in account’s cloud backup?")
+                Text("Selected file: ${review.byteCount} bytes.")
+                Text("Restoring may replace the existing cloud backup. Your selected file and local profiles will stay in place.")
+                PickerToolsButton("Restore cloud backup", isTv, true, Modifier.testTag("picker-tools-restore-confirm")) {
+                    onRestoreDecision(review.request, true)
+                }
+                PickerToolsButton("Cancel restore", isTv, true, Modifier.testTag("picker-tools-restore-cancel")) {
+                    onRestoreDecision(review.request, false)
+                }
+            }
+            PickerToolsPhase.RESTORING -> Text("Restoring the cloud backup…")
+            PickerToolsPhase.VERIFYING_RESTORE -> Text("Verifying the retained restore against the cloud backup…")
             PickerToolsPhase.AWAITING_DESTINATION -> {
                 Text("Choose a folder for a separate new copy. Your existing files will stay in place.")
                 state.destination?.let { destination(it) }
             }
             PickerToolsPhase.SAVING -> Text("Saving and verifying the new encrypted copy…")
             PickerToolsPhase.SHARING_DIAGNOSTICS -> Text("Preparing diagnostic log…")
-            PickerToolsPhase.CANCELLING -> Text("Waiting for the previous operation to finish cancelling. A new copy may remain in its folder.")
+            PickerToolsPhase.CANCELLING -> Text(if (state.cancellingFileSave)
+                "Waiting for the previous save to finish cancelling. A new copy may remain in its folder."
+            else "Waiting for the previous operation to finish cancelling.")
             PickerToolsPhase.IDLE -> Unit
         }
         state.message?.let { Text(it, style = VortXTheme.type.body,
             modifier = Modifier.widthIn(max = 680.dp).semantics { liveRegion = LiveRegionMode.Polite }.testTag("picker-tools-status")) }
-        Text("Account-file restore is not available here yet.", style = VortXTheme.type.label,
+        if (onRestore == null) Text("Account-file restore is not available here yet.", style = VortXTheme.type.label,
             modifier = Modifier.widthIn(max = 680.dp))
     }
     LaunchedEffect(Unit) { withFrameNanos { }; runCatching { firstFocus.requestFocus() } }

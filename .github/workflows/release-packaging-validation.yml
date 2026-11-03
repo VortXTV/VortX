@@ -163,6 +163,7 @@ jobs:
           --tests com.vortx.android.sync.AccountFileAddonURLTest.decodedHostAndUntouchedConfigurationFixTheReportedIdentityMismatch
           --tests com.vortx.android.backup.accountfiles.AccountBackupDocumentsTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsControllerTest
+          --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsRestoreControllerTest
           --tests com.vortx.android.ui.profilepicker.ProfilePickerToolsManagerTest
           --tests com.vortx.android.sync.SessionRenewalPolicyTest
           --tests com.vortx.android.sync.SessionRenewalManagerTest

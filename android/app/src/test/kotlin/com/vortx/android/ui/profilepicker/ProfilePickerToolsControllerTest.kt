@@ -331,8 +331,10 @@ class ProfilePickerToolsControllerTest {
             first.close() // The real holder clears the previous manager's VM on replacement.
             val newRoute = second.attachPicker(); second.open(newRoute); second.download(checkNotNull(second.renderedActions(newRoute))); runCurrent()
             assertEquals(0, secondAccounts.gets); assertTrue(gate.busy.value)
+            assertTrue(second.state.value.cancellingFileSave)
             release.complete(Unit); runCurrent()
             assertFalse(gate.busy.value); assertEquals(PickerToolsPhase.IDLE, second.state.value.phase)
+            assertFalse(second.state.value.cancellingFileSave)
             second.download(checkNotNull(second.renderedActions(newRoute))); runCurrent(); assertEquals(1, secondAccounts.gets)
         } finally { release.complete(Unit); first.close(); second.close() }
     }

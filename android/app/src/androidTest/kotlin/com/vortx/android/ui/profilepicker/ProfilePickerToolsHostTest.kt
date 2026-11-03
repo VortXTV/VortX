@@ -1,7 +1,17 @@
 package com.vortx.android.ui.profilepicker
 
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
 import android.view.KeyEvent
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.result.ActivityResultRegistry
+import androidx.activity.result.ActivityResultRegistryOwner
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.material3.Text
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertDoesNotExist
 import androidx.compose.ui.test.assertIsDisplayed
@@ -11,8 +21,10 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.core.app.ActivityOptionsCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.vortx.android.sync.AccountFileRestoreTransaction
 import com.vortx.android.sync.PickerAccountSnapshot
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXTheme
@@ -26,6 +38,7 @@ import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.util.UUID
 
 /** Production host/controller with synthetic download/preparation. No provider, account or network I/O.
  * System Back/focus and absent-SAF UI are bounded instrumentation coverage only, authored but unrun. */
@@ -43,7 +56,7 @@ class ProfilePickerToolsHostTest {
         var gets = 0
         override suspend fun download(original: PickerAccountSnapshot): ByteArray { gets++; return byteArrayOf(1, 2, 3) }
     }
-    private class Fixture {
+    private class Fixture(restore: PickerToolsRestoreActions? = null) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         val accounts = Accounts()
         val policy = mutableStateOf(false)
@@ -52,10 +65,46 @@ class ProfilePickerToolsHostTest {
             object : PickerToolsPreparedBackup {
                 override val byteCount = 3; override val sha256 = "fixture-only"; override fun close() = Unit
             }
-        }, scope)
+        }, scope, restoreActions = restore)
         val model = ProfilePickerToolsViewModel(controller)
         fun close() { controller.close(); scope.cancel() }
     }
+    private class RestoreActions : PickerToolsRestoreActions {
+        var reads = 0
+        var confirms = 0
+        var closes = 0
+        override suspend fun status(original: PickerToolsActionGrant, isCurrent: () -> Boolean) =
+            VortXSyncManager.FileRestoreStatus.Missing
+        override suspend fun read(original: PickerToolsActionGrant, input: PickerToolsRestoreInput,
+            isCurrent: () -> Boolean): PickerToolsRestoreCandidate {
+            assertTrue(isCurrent())
+            assertEquals("SafRestoreInput", input.toString())
+            reads++
+            return object : PickerToolsRestoreCandidate {
+                override val byteCount = 27
+                override suspend fun confirm(): AccountFileRestoreTransaction.Result {
+                    confirms++
+                    return AccountFileRestoreTransaction.Result.NotSubmitted(AccountFileRestoreTransaction.Reason.UNSUPPORTED_FILE)
+                }
+                override fun close() { closes++ }
+            }
+        }
+        override suspend fun verify(original: PickerToolsActionGrant, operationId: UUID, isCurrent: () -> Boolean):
+            AccountFileRestoreTransaction.Result = error("unexpected verify")
+    }
+
+    private class RestoreRegistry(private val fail: Boolean = false) : ActivityResultRegistry(), ActivityResultRegistryOwner {
+        override val activityResultRegistry: ActivityResultRegistry get() = this
+        val launches = mutableListOf<Int>()
+        override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I,
+            options: ActivityOptionsCompat?) {
+            assertTrue(contract is androidx.activity.result.contract.ActivityResultContracts.OpenDocument)
+            assertArrayEquals(arrayOf("application/json", "application/octet-stream", "text/plain"), input as Array<*>)
+            launches += requestCode
+            if (fail) throw ActivityNotFoundException("synthetic absent document handler")
+        }
+    }
+
     @Test fun televisionToolsIsAvailableOverBusyPickerAndSystemBackReturnsFocusWithoutOpeningProfile() {
         val f = Fixture(); var pickerCompositions = 0
         try {
@@ -103,6 +152,63 @@ class ProfilePickerToolsHostTest {
             compose.onNodeWithTag("picker-tools-diagnostics").assertExists()
             compose.runOnIdle { f.policy.value = false }
             compose.onNodeWithTag("picker-tools-diagnostics").assertDoesNotExist()
+            assertEquals(0, f.accounts.gets)
+        } finally { f.close() }
+    }
+
+    @Test fun restoreMissingSafActivityShowsSafeRefusalWithoutReading() {
+        val actions = RestoreActions()
+        val registry = RestoreRegistry(fail = true)
+        val f = Fixture(actions)
+        try {
+            compose.setContent { CompositionLocalProvider(LocalActivityResultRegistryOwner provides registry) {
+                VortXTheme { ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { false }) {} }
+            } }
+            compose.onNodeWithTag("profile-picker-tools").performClick()
+            compose.onNodeWithTag("picker-tools-restore").performScrollTo().performClick()
+            compose.onNodeWithTag("picker-tools-restore-input").performScrollTo().performClick()
+            compose.onNodeWithText(PickerToolsFailure.NO_FILE_PROVIDER.message).performScrollTo().assertIsDisplayed()
+            assertEquals(1, registry.launches.size)
+            assertEquals(0, actions.reads)
+            assertEquals(0, actions.confirms)
+            assertEquals(0, f.accounts.gets)
+        } finally { f.close() }
+    }
+
+    @Test fun restoredRegistryReRegistersOriginalOpenDocumentAndOnlyExplicitDecisionSubmits() {
+        val actions = RestoreActions()
+        val original = RestoreRegistry()
+        val activeRegistry = mutableStateOf(original)
+        val f = Fixture(actions)
+        try {
+            compose.setContent { CompositionLocalProvider(LocalActivityResultRegistryOwner provides activeRegistry.value) {
+                VortXTheme { ProfilePickerToolsHost(f.model, isTv = false, diagnosticAdmission = { false }) {} }
+            } }
+            compose.onNodeWithTag("profile-picker-tools").performClick()
+            compose.onNodeWithTag("picker-tools-restore").performScrollTo().performClick()
+            compose.onNodeWithTag("picker-tools-restore-input").performScrollTo().performClick()
+            val request = checkNotNull(f.controller.state.value.restoreInput)
+            val restored = RestoreRegistry()
+            val requestCode = original.launches.single()
+            compose.runOnIdle {
+                val saved = Bundle().also { original.onSaveInstanceState(it) }
+                restored.onRestoreInstanceState(saved)
+                activeRegistry.value = restored
+            }
+            compose.onNodeWithTag("picker-tools-restore-input").performScrollTo().performClick()
+            assertTrue(restored.launches.isEmpty())
+            compose.runOnIdle {
+                val result = Intent().setData(Uri.parse("content://fixture.invalid/selected-backup"))
+                assertTrue(restored.dispatchResult(requestCode, Activity.RESULT_OK, result))
+            }
+            compose.onNodeWithTag("picker-tools-restore-confirm").performScrollTo().assertIsDisplayed()
+            assertEquals(request, f.controller.state.value.restoreReview?.request)
+            assertEquals(1, actions.reads)
+            assertEquals(0, actions.confirms)
+            compose.onNodeWithTag("picker-tools-restore-confirm").performClick()
+            compose.onNodeWithText("This restore was not submitted.").performScrollTo().assertIsDisplayed()
+            assertEquals(1, actions.confirms)
+            assertEquals(1, actions.closes)
             assertEquals(0, f.accounts.gets)
         } finally { f.close() }
     }
