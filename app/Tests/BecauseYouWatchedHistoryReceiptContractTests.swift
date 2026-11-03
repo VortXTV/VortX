@@ -246,14 +246,21 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 !bridge.contains("resetSignedOutEngineForLocalHydration") &&
                 bridge.contains("await self.loadLibraryAndAwait()"),
               "history source reads retain the exact VortX credential capture")
-        let nativeRestore = boundedBody(sync, after: "func restoreNativeCheckpoint(",
+        let nativeRestore = boundedBody(sync, after: "private func restoreNativeCheckpointWithCloudRead(",
             until: "    /// Shared account-owner epoch.")
+        let checkpointPull = boundedBody(sync, after: "private func pullNativeCheckpointCloudSource(",
+            until: "    private func hasPendingReceivedProviderApply(")
         let nativeHydration = boundedBody(sync, after: "func hydrateEngineFromOwnedAddons(",
             until: "    /// Compute the account-owned add-on descriptors")
         check(sync.contains("credentialScopeDidChangeNote") &&
                 nativeHydration.contains("_ = await ensureNativeCheckpoint(credentialCapture: suppliedCapture)") &&
                 nativeRestore.contains("guard isSignedIn, isCurrent(capture), case .account = capture.scope else") &&
-                nativeRestore.contains("pullDocVersionedResult(credentialCapture: capture)") &&
+                nativeRestore.contains("pullNativeCheckpointCloudSource(capture: capture, authority: cloudRead)") &&
+                nativeRestore.contains("guard let cloudAuthority = candidate.authority else") &&
+                checkpointPull.contains("guard let authority, authority.capture == capture, authority.isCurrent else") &&
+                checkpointPull.contains("let pulled = await pullDocVersionedResult(credentialCapture: capture)") &&
+                checkpointPull.contains("guard isCurrent(capture), account?.id == originalAccount, dataKey == originalKey,") &&
+                checkpointPull.contains("requireReceivedProviderCloudSource(pulled, authority: authority)") &&
                 nativeRestore.contains("ProfileStore.shared.activeID == selectedProfile") &&
                 !sync.contains("awaitLocalHistoryHydrationReset"),
               "VortX owner transitions hydrate only an authenticated native checkpoint for the captured account and profile")

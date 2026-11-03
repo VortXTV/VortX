@@ -67,7 +67,15 @@ function extract(root,directory){
  const manager=read(shared+'VortXSyncManager.swift');
  // Source-bound integration obligations beyond the extracted block. These assertions are NOT a
  // claim that this fixture executes normal sync/mount paths; the separate tests cover those paths.
- assert(manager.includes('guard !accountFileRestoreBusy, isCurrent(capture), nativeCheckpointGeneration == generation else {'),'post-drain checkpoint gate missing');
+ const checkpoint=select(shared+'VortXSyncManager.swift','    private func restoreNativeCheckpointWithCloudRead(');
+ const afterDrain='        let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value\n'+
+  '        guard !accountFileRestoreBusy, isCurrent(capture), suppliedCloudRead?.isCurrent ?? true,\n'+
+  '              nativeCheckpointGeneration == generation else {\n'+
+  '            DiagnosticsLog.log("native-profiles", "restore result=not_started reason=superseded")\n'+
+  '            return false\n'+
+  '        }\n';
+ const drainGate=unique(checkpoint,afterDrain),claim=unique(checkpoint,'        nativeCheckpointCapture = capture; nativeCheckpointProfile = selectedProfile');
+ assert.equal(claim,drainGate+afterDrain.length,'post-drain checkpoint gate must precede checkpoint ownership without intervening effects');
  assert(manager.includes('guard !accountFileRestoreBusy else { return false }\n        activeSyncUp = (operationID, capture)'),'post-await sync-up gate missing');
  for(const marker of ['    // @@ACTUAL_RESTORE_MANAGER_BLOCK@@','    // @@ACTUAL_HTTP_LIMITS@@'])assert.equal(seam.split(marker).length,2,'seam placeholder missing/duplicate');
  seam=seam.replace('    // @@ACTUAL_RESTORE_MANAGER_BLOCK@@',block);

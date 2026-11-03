@@ -53,8 +53,17 @@ assert(intake, 'actual makeNativeSourceCallback intake guard extracted');
 // read-lifetime/admission-fence calls that bracket every generation mutation.
 const install = installation.match(/let installGeneration = UUID\(\)\n        let installSubtitleRetirement = nativeFacadeLock\.withLock \{[\s\S]*?        nativePlaybackReadLifetime\.completeRetirement\(installSubtitleRetirement\)/)?.[0];
 assert(install, 'complete install generation/lifetime segment extracted');
-const installPublication = installation.match(/let result = nativeFacadeLock\.withLock \{ \(\) -> \(Bool, VortxNativeCoreFacade\?, CredentialPublicationOutbox\.SubtitleRetirement\?\) in[\s\S]*?            return \(true, old, retirement\)\n        \}/)?.[0];
+// The account-owned installation now calls this local function under its cloud source
+// fence. Compile its entire actual locked storage/capture/lifetime bind in the fixture.
+const installBind = installation.match(/^ {12}func bindFacade\(\) -> \(Bool, VortxNativeCoreFacade\?, CredentialPublicationOutbox\.SubtitleRetirement\?\) \{\n[\s\S]*?^ {12}\}/m)?.[0];
+const installPublication = installBind ?? (baseline
+  ? installation.match(/let result = nativeFacadeLock\.withLock \{ \(\) -> \(Bool, VortxNativeCoreFacade\?, CredentialPublicationOutbox\.SubtitleRetirement\?\) in[\s\S]*?            return \(true, old, retirement\)\n        \}/)?.[0]
+  : undefined);
 assert(installPublication, 'complete install storage/capture/lifetime bind segment extracted');
+if (installBind) {
+  assert(installation.includes('if let installationSource {\n                try installationSource.withActive { result = bindFacade() }\n            } else { result = bindFacade() }'),
+    'actual installation dispatches the locked bind under cloud authority or directly offline');
+}
 const rotation = (text, label) => {
   const result = text.match(/let subtitleRetirement = nativeFacadeLock\.withLock \{[\s\S]*?        nativePlaybackReadLifetime\.completeRetirement\(subtitleRetirement\)/)?.[0];
   assert(result, `complete ${label} retirement/generation segment extracted`);
@@ -128,6 +137,7 @@ ${lifetime}
         ${install}
         let capture = credential
         ${installPublication}
+        ${installBind ? 'let result = bindFacade()' : ''}
         if let retirement = result.2 { nativePlaybackReadLifetime.completeRetirement(retirement) }
         guard result.0 else { fatalError("synthetic install publication was superseded") }
         return installGeneration
