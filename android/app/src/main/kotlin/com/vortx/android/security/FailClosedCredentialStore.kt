@@ -23,6 +23,10 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
 import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 /** The three app-owned provider carriers have ordinary open/reopen paths outside the manager.
  * Count them from process startup, including before the process provider binding exists. */
@@ -44,6 +48,25 @@ internal object AccountFileProviderWriters {
     suspend fun <T> withEffectfulWriter(refused: T, work: suspend () -> T): T {
         if (!exclusion.enterWriter(observedEdit = false)) return refused
         return try { work() } finally { exclusion.exitWriter() }
+    }
+
+    /** Reserve before a detached producer is scheduled and release after its real child drains. */
+    fun launchWriter(scope: CoroutineScope, work: suspend CoroutineScope.() -> Unit): Job? {
+        if (!exclusion.enterWriter(observedEdit = false)) return null
+        val job = try {
+            scope.launch(start = CoroutineStart.LAZY, block = work)
+        } catch (failure: Throwable) {
+            exclusion.exitWriter()
+            throw failure
+        }
+        job.invokeOnCompletion { exclusion.exitWriter() }
+        try {
+            job.start()
+        } catch (failure: Throwable) {
+            job.cancel()
+            throw failure
+        }
+        return job
     }
 
     fun tryReserve(): AccountFileRestoreManagerExclusion.Reservation? = exclusion.tryReserve()

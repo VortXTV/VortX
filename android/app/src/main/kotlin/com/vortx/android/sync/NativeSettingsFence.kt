@@ -29,6 +29,11 @@ internal object NativeSettingsFence {
     private var revision = 0L
     @Volatile private var openedBackings = emptySet<String>()
     private val originalRestoreBackings = mutableMapOf<String, Fenced>()
+    @Volatile private var originalEmptyRetryQueue: EmptyRetryQueue? = null
+
+    private class EmptyRetryQueue(val root: Path, val observation: ExistingEmptyProviderRetryBacking.Observation) {
+        var wrapper: Fenced? = null // Only read/written under lock; terminal edits retire the volatile receipt.
+    }
     private const val SETTINGS = "vortx_settings"
     @Volatile private var flatRestore: FlatRestore? = null
     private var flatMutations = 0
@@ -135,8 +140,31 @@ internal object NativeSettingsFence {
     /** The Application calls this before the platform can load or normalize the first settings file.
      * Only each exact backing's first open performs a bounded number of no-follow metadata reads.
      * Ordinary later opens and the platform open/result retain their existing behavior. */
-    fun open(context: Context, name: String, mode: Int, platformOpen: () -> SharedPreferences): SharedPreferences =
-        checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+    fun open(context: Context, name: String, mode: Int, platformOpen: () -> SharedPreferences): SharedPreferences {
+        if (name != RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName || originalEmptyRetryQueue == null)
+            return checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+        return synchronized(lock) {
+            val original = originalEmptyRetryQueue
+            try {
+                val opened = checkNotNull(openObserved(context, name, mode, prepareOnly = false, platformOpen = platformOpen))
+                if (original != null) {
+                    val wrapper = opened as? Fenced
+                    if (context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE ||
+                        context.dataDir.toPath() != original.root || wrapper == null || wrapper.name != name ||
+                        original.wrapper?.let { it !== wrapper } == true ||
+                        wrapper.backing.all != original.observation.expectedCache) {
+                        originalEmptyRetryQueue = null
+                    } else {
+                        original.wrapper = wrapper
+                    }
+                }
+                opened
+            } catch (failure: Exception) {
+                originalEmptyRetryQueue = null
+                throw failure
+            }
+        }
+    }
 
     /** App startup only. Never let a proof preparation open or normalize old or unknown data. */
     fun preparePristineRestoreBacking(context: Context, backing: RestoreAuxiliaryBacking, platformOpen: () -> SharedPreferences) {
@@ -156,7 +184,17 @@ internal object NativeSettingsFence {
                     else PristineBacking.beforeOpen(context.dataDir.toPath(), name)
                         ?.takeIf { !prepareOnly || it.canPrepareBeforeOpen() }
                 } catch (_: Exception) { null }
-                if (prepareOnly && pristine == null) return@synchronized null
+                if (prepareOnly && pristine == null) {
+                    if (name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName) {
+                        originalEmptyRetryQueue = try {
+                            if (context.isDeviceProtectedStorage || mode != Context.MODE_PRIVATE) null else {
+                                val root = context.dataDir.toPath()
+                                ExistingEmptyProviderRetryBacking.observe(root)?.let { EmptyRetryQueue(root, it) }
+                            }
+                        } catch (_: Exception) { null }
+                    }
+                    return@synchronized null
+                }
                 val backing = platformOpen()
                 val wasAlreadyWrapped = backing is Fenced || wrappers.containsKey(backing)
                 val wrapper = wrap(name, backing)
@@ -178,6 +216,25 @@ internal object NativeSettingsFence {
      * The returned closure reads a volatile identity and is suitable for final worker currency. */
     fun capturePristineRestoreBacking(existing: SharedPreferences): (() -> Boolean)? =
         capturePristineRestoreBacking(existing, SETTINGS)
+
+    /**
+     * Restore worker only, while the provider writer reservation excludes queue producers. The
+     * original absent backing or strict-empty bytes and any actual platform cache must still agree.
+     */
+    fun captureProviderRetryRestoreBacking(): (() -> Boolean)? = synchronized(lock) {
+        val original = originalEmptyRetryQueue
+            ?: return@synchronized capturePristineRestoreBacking(RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE)
+        val stillEmpty = try {
+            val current = ExistingEmptyProviderRetryBacking.observe(original.root)
+            current == original.observation &&
+                (original.wrapper?.let { it.backing.all == original.observation.expectedCache } ?: true)
+        } catch (_: Exception) { false }
+        if (!stillEmpty || originalEmptyRetryQueue !== original) {
+            originalEmptyRetryQueue = null
+            return@synchronized null
+        }
+        return@synchronized { originalEmptyRetryQueue === original }
+    }
 
     /** Existing retained wrapper only, including stores owned by a different writer component. */
     fun capturePristineRestoreBacking(backing: RestoreAuxiliaryBacking): (() -> Boolean)? {
@@ -337,6 +394,7 @@ internal object NativeSettingsFence {
             private fun replace(commit: Boolean): Boolean {
                 if (!tracksSettingsRevision) {
                     pristine = null // Before terminal mutation, including failed and same-value attempts.
+                    if (name == RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE.fileName) originalEmptyRetryQueue = null
                     return replaceBacking(commit)
                 }
                 return synchronized(lock) {

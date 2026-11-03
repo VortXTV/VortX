@@ -2733,9 +2733,9 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
                 throw AccountFileRestoreTransaction.Refusal(AccountFileRestoreTransaction.Reason.BUSY)
         }
         requireProviderWriters()
-        // Legacy rows carry no VortX owner. Only positive whole-backing absence can admit them.
-        val retryQueue = verified(NativeSettingsFence.capturePristineRestoreBacking(
-            NativeSettingsFence.RestoreAuxiliaryBacking.PROVIDER_RETRY_QUEUE))
+        // Legacy rows carry no VortX owner. Accept only positive whole-backing absence or
+        // an originally strict-empty backing whose retained platform cache agrees.
+        val retryQueue = verified(NativeSettingsFence.captureProviderRetryRestoreBacking())
         requireProviderWriters()
         return listOf(
             verified(syncState.captureRestoreBacking()),

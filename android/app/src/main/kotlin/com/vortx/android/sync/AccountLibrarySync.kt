@@ -10,10 +10,10 @@ import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.MediaType
+import com.vortx.android.security.AccountFileProviderWriters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -80,7 +80,7 @@ object AccountLibrarySync {
     fun drainPending(context: Context) {
         if (!AccountSyncGate.activeProfileSyncsAccount()) return
         val appContext = context.applicationContext
-        scope.launch { drain(queuePrefs(appContext)) }
+        AccountFileProviderWriters.launchWriter(scope) { drain(queuePrefs(appContext)) }
     }
 
     // MARK: - Mirror
@@ -91,7 +91,7 @@ object AccountLibrarySync {
         if (!AccountSyncGate.activeProfileSyncsAccount()) return
         if (!ref.hasUsableId) return
         val appContext = context.applicationContext
-        scope.launch {
+        AccountFileProviderWriters.launchWriter(scope) {
             // Idempotent: wires the toggle store + both auth token stores so the reads below are live.
             ScrobbleService.init(appContext)
             val prefs = queuePrefs(appContext)

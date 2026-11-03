@@ -169,6 +169,8 @@ internal fun withIsolatedPristinePreferenceFence(test: () -> Unit) {
     synchronized(field("lock").get(fence)) {
         val opened = field("openedBackings")
         val revision = field("revision")
+        val retry = field("originalEmptyRetryQueue")
+        val previousRetry = retry.get(fence)
         val previousOpened = opened.get(fence)
         val previousRevision = revision.getLong(fence)
         @Suppress("UNCHECKED_CAST")
@@ -180,6 +182,7 @@ internal fun withIsolatedPristinePreferenceFence(test: () -> Unit) {
         try {
             opened.set(fence, emptySet<String>())
             revision.setLong(fence, 0L)
+            retry.set(fence, null)
             originals.clear()
             wrappers.clear()
             test()
@@ -189,6 +192,7 @@ internal fun withIsolatedPristinePreferenceFence(test: () -> Unit) {
             originals.clear()
             originals.putAll(previousOriginals)
             revision.setLong(fence, previousRevision)
+            retry.set(fence, previousRetry)
             opened.set(fence, previousOpened)
         }
     }
