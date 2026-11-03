@@ -26,6 +26,7 @@ nice -n 15 ./gradlew :app:testPlayDebugUnitTest \
   --tests com.vortx.android.engine.NativeOwnerHistoryCompatibilityTest \
   --tests com.vortx.android.engine.NativeRawHostPreferencesTest \
   --tests com.vortx.android.engine.DetachedAccountFileKernelJniTest \
+  --tests com.vortx.android.sync.AccountBackupRepairJniTest \
   --no-daemon --max-workers=1 --no-parallel --no-build-cache --no-configuration-cache --stacktrace
 # Exact methods, not a stale aggregate count. No executed receipt is written before XML validation.
 python3 - <<'PY'
@@ -112,6 +113,9 @@ expected = {
     "com.vortx.android.engine.DetachedAccountFileKernelJniTest": {
         "actualLegacyImportSeparateReplayAndColdMergeRetainOwnerAndSharedKidsPolicy",
     },
+    "com.vortx.android.sync.AccountBackupRepairJniTest": {
+        "actualConversionAndSelectedNativeReimportKeepSourceAndParentalPolicy",
+    },
     "com.vortx.android.engine.NativeRawHostPreferencesTest": {
         "ordinary edit preserves original import tokens and unknown local metadata",
         "cold raw capture and checkpoint replacement never use a serialized observation",
@@ -160,6 +164,7 @@ jni_required = {
     },
     "com.vortx.android.engine.NativeOwnerHistoryJniTest": set(expected["com.vortx.android.engine.NativeOwnerHistoryJniTest"]),
     "com.vortx.android.engine.DetachedAccountFileKernelJniTest": set(expected["com.vortx.android.engine.DetachedAccountFileKernelJniTest"]),
+    "com.vortx.android.sync.AccountBackupRepairJniTest": set(expected["com.vortx.android.sync.AccountBackupRepairJniTest"]),
 }
 assert all(names <= expected[name] for name, names in jni_required.items())
 files = sorted(root.glob("TEST-*.xml"))
