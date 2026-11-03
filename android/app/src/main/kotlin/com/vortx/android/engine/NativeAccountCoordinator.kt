@@ -105,6 +105,9 @@ internal class NativeAccountCoordinator(
     private val mutex = Mutex()
     /** Native cleanup uncertainty survives retire/sign-out in this process; never open a rival. */
     private val uncertainHistoryAccounts = mutableSetOf<String>()
+    // Guarded by lifecycleLock. Revocation never releases the original operation's writer slot.
+    private var restoreNativeExclusion: HeldRestoreNativeExclusion? = null
+    private var restoreRetirementUnconfirmed = false
     private data class PendingImport(val id: UUID, val account: SessionOwnerSnapshot.Account, val document: JSONObject,
                                      val profiles: List<UserProfile>, val isCurrent: () -> Boolean,
                                      val sources: List<NativeOwnAccountSource>, val preflight: NativeMigrationPreflight)
@@ -233,7 +236,7 @@ internal class NativeAccountCoordinator(
             target.session.updates.value == target.update
         else pendingImport?.let { it.id == target.pendingID && it.account == target.account && it.isCurrent() } == true
 
-    suspend fun retryMigration(target: MigrationTarget): Boolean = mutex.withLock {
+    suspend fun retryMigration(target: MigrationTarget): Boolean = withNativeWriter {
         val operationJob = currentCoroutineContext()[Job]
         val current = { operationJob?.isActive != false && migrationTargetCurrent(target) }
         check(current()) { "Migration target changed" }
@@ -895,7 +898,7 @@ internal class NativeAccountCoordinator(
         } } finally { operation.close(); write.close() }
     }
 
-    suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
+    suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = withNativeWriter {
         val credentials = checkNotNull(ownCredentials) { "Native streaming sign-in unavailable" }
         val admission = checkNotNull(captureOwnAccountAdmission(target.account)) { "Native account authentication changed" }
         val session = target.session
@@ -906,7 +909,7 @@ internal class NativeAccountCoordinator(
             project(session)
             check(accountCurrent(target.account) && mounted.get()?.session === session)
             changes.value += 1
-            return@withLock linked
+            return@withNativeWriter linked
         }
         val pending = checkNotNull(pendingImport)
         check(pending.id == target.pendingID && pending.account == target.account && pending.isCurrent() && accountCurrent(target.account))
@@ -956,8 +959,9 @@ internal class NativeAccountCoordinator(
         if (mounted.get()?.let { it.session === session && it.account == account } == true) action() else false
     }
     override fun retire() {
-        pendingImport = null
         val old = synchronized(lifecycleLock) {
+            restoreNativeExclusion?.revoked = true
+            pendingImport = null
             // Purge volatile register bytes before authority/retirement callbacks can expose the
             // transition. Lifecycle -> ledger matches the captured admission lock order.
             playlistReceipts.retire()
@@ -970,7 +974,7 @@ internal class NativeAccountCoordinator(
         changes.value += 1
         onRetired()
         if (old != null) {
-            dispose { old.session.close(); retired.remove(old.session) }
+            dispose { closeRetired(old.session) }
         }
     }
 
@@ -981,24 +985,120 @@ internal class NativeAccountCoordinator(
         return if (mounted.get() === current && accountCurrent(account)) NativeAccountMountToken(current, revision) else null
     }
 
-    override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean =
-        reopenCheckpoint(account, isCurrent, null)
+    internal interface RestoreNativeExclusion {
+        /** Scalar currency only. [scope] is bound by the first candidate observation. */
+        fun requireCurrent(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope? = null)
+        suspend fun inspectAbsence(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope): AccountFileLocalPresence
+        /** The file Restore transaction already owns an IO worker, including its final send gate. */
+        fun inspectAbsenceOnWorker(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope): AccountFileLocalPresence
+    }
 
-    private suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
-        onInstalled: ((Mounted) -> Unit)?): Boolean = mutex.withLock {
+    private inner class HeldRestoreNativeExclusion(
+        private val account: SessionOwnerSnapshot.Account,
+        private val accountID: String,
+        private val job: Job?,
+        private val requireOriginal: () -> Unit,
+    ) : RestoreNativeExclusion {
+        // Both fields are accessed only under lifecycleLock.
+        var revoked = false
+        private var boundScope: VortxAccountScope? = null
+
+        override fun requireCurrent(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope?) {
+            check(this.account == account) { "Original native Restore account changed" }
+            job?.ensureActive()
+            // The caller supplies the original manager guard. Never acquire auth under lifecycle.
+            requireOriginal()
+            synchronized(lifecycleLock) {
+                requireHeld()
+                check(scope == null || boundScope == scope) { "Original native Restore owner changed" }
+            }
+        }
+
+        override suspend fun inspectAbsence(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope):
+            AccountFileLocalPresence = withContext(Dispatchers.IO) { inspectAbsenceOnWorker(account, scope) }
+
+        override fun inspectAbsenceOnWorker(account: SessionOwnerSnapshot.Account, scope: VortxAccountScope):
+            AccountFileLocalPresence {
+            requireCurrent(account)
+            check(scope.accountID == accountID && UUID.fromString(scope.ownerProfileID).toString()
+                .equals(scope.ownerProfileID, ignoreCase = true)) { "Invalid native Restore scope" }
+            synchronized(lifecycleLock) {
+                requireHeld()
+                if (boundScope == null) boundScope = scope
+                check(boundScope == scope) { "Original native Restore owner changed" }
+            }
+            val evidence = checkpoints.inspectRestoreAbsence(scope, VortxAndroidCheckpointKey::readCompleteRestoreAliases,
+                VortxAndroidCheckpointKey::readExisting)
+            requireCurrent(account, scope)
+            return evidence
+        }
+
+        private fun requireHeld() {
+            check(restoreNativeExclusion === this && !revoked) { "Native Restore exclusion retired" }
+        }
+    }
+
+    /** Own the actual process writer slot. The callback never runs with either coordinator lock held. */
+    internal suspend fun <T : Any> withRestoreNativeExclusion(
+        account: SessionOwnerSnapshot.Account,
+        requireOriginal: () -> Unit,
+        operation: suspend (RestoreNativeExclusion) -> T,
+    ): T? {
+        val job = currentCoroutineContext()[Job]
+        job?.ensureActive()
+        requireOriginal()
+        val canonical = UUID.fromString(account.id).toString()
+        check(canonical.equals(account.id, ignoreCase = true)) { "Invalid native Restore account" }
+        if (!mutex.tryLock()) return null
+        val held = try {
+            synchronized(lifecycleLock) {
+                if (restoreNativeExclusion != null || mounted.get() != null || pendingImport != null ||
+                    retired.isNotEmpty() || uncertainHistoryAccounts.isNotEmpty() ||
+                    restoreRetirementUnconfirmed || playlistReceipts.freeze().isNotEmpty()) null
+                else HeldRestoreNativeExclusion(account, "account.$canonical", job, requireOriginal)
+                    .also { restoreNativeExclusion = it }
+            }
+        } finally { mutex.unlock() } ?: return null
+        return try {
+            held.requireCurrent(account)
+            operation(held)
+        } finally {
+            synchronized(lifecycleLock) {
+                check(restoreNativeExclusion === held)
+                restoreNativeExclusion = null
+            }
+        }
+    }
+
+    private suspend inline fun <T> withNativeWriter(action: () -> T): T = mutex.withLock {
+        synchronized(lifecycleLock) {
+            check(restoreNativeExclusion == null) { "Native account Restore owns the writer" }
+        }
+        try { action() }
+        catch (failure: NativeOwnerHistoryCoordinator.Uncertain) {
+            noteUnconfirmedRestoreRetirement()
+            throw failure
+        }
+    }
+
+    override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean =
+        withNativeWriter { reopenCheckpointLocked(account, isCurrent, null) }
+
+    private suspend fun reopenCheckpointLocked(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        onInstalled: ((Mounted) -> Unit)?): Boolean {
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
-        mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }?.let { return@withLock true }
+        mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }?.let { return true }
         retire()
-        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
+        while (true) { val prior = retired.peek() ?: break; closeRetired(prior) }
         val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
         val scope = checkpoints.discover(namespace) ?: run {
-            val retained = checkpoints.readPreflight(namespace) ?: return@withLock false
+            val retained = checkpoints.readPreflight(namespace) ?: return false
             if (checkpoints.readRetained(retained.scope) != null) retained.scope // State committed before locator publication.
             else {
                 restorePreflight(account, retained, isCurrent)
                 changes.value += 1
-                return@withLock false
+                return false
             }
         }
         val raw = checkNotNull(checkpoints.readRetained(scope))
@@ -1025,7 +1125,7 @@ internal class NativeAccountCoordinator(
             }
         try { withAccountAdmission(account, isCurrent) { checkpoints.remember(scope) } }
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
-        publish(account, candidate, isCurrent, onInstalled)
+        return publish(account, candidate, isCurrent, onInstalled)
     }
 
     override suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject =
@@ -1033,8 +1133,13 @@ internal class NativeAccountCoordinator(
 
     /** [sessionLifetime] is the lifetime of a session this recovery mounts; [isCurrent] fences the work. */
     private suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
-        onInstalled: ((Mounted) -> Unit)?, sessionLifetime: () -> Boolean = isCurrent): JSONObject {
-        if (reopenCheckpoint(account, isCurrent, onInstalled)) {
+        onInstalled: ((Mounted) -> Unit)?, sessionLifetime: () -> Boolean = isCurrent): JSONObject = withNativeWriter {
+        prepareEmptyAccountLocked(account, isCurrent, onInstalled, sessionLifetime)
+    }
+
+    private suspend fun prepareEmptyAccountLocked(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        onInstalled: ((Mounted) -> Unit)?, sessionLifetime: () -> Boolean): JSONObject {
+        if (reopenCheckpointLocked(account, isCurrent, onInstalled)) {
             require(!session().hasOwnerHistory()) { "Existing owner-history backup disappeared" }
             val read = session().read()
             return session().owned(read.owner) {
@@ -1052,10 +1157,8 @@ internal class NativeAccountCoordinator(
             val retained = scope.validateSnapshot(snapshot)
             val baseline = retained.getJSONObject("hostDocument")
             require(baseline.optString("nativeAccountBootstrap") == "authenticated-empty-v1") { "Existing account backup disappeared" }
-            check(mutex.withLock {
-                applyDocumentLocked(account, baseline, sessionLifetime, operationCurrent = isCurrent, onInstalled = onInstalled)
-            })
-            return prepareEmptyAccount(account, isCurrent, onInstalled, sessionLifetime)
+            check(applyDocumentLocked(account, baseline, sessionLifetime, operationCurrent = isCurrent, onInstalled = onInstalled))
+            return prepareEmptyAccountLocked(account, isCurrent, onInstalled, sessionLifetime)
         }
         checkpoints.verifyFreshAccount(scope)
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
@@ -1077,11 +1180,26 @@ internal class NativeAccountCoordinator(
         }
     }
 
+    private fun noteUnconfirmedRestoreRetirement() = synchronized(lifecycleLock) {
+        restoreRetirementUnconfirmed = true
+    }
+
+    /** Do not let a later no-op close turn an earlier unconfirmed native free into absence. */
+    private fun closeRetired(session: VortxNativeSession) = synchronized(session) {
+        try { session.close() }
+        catch (failure: Throwable) {
+            noteUnconfirmedRestoreRetirement()
+            throw failure
+        }
+        retired.remove(session)
+        Unit
+    }
+
     /** Keep the exact unpublished writer until close is confirmed, including cancellation and
      * projection failures. A failed close must not make a rival writer eligible for this account. */
     private fun retireUnpublished(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession) {
         if (!retired.contains(candidate)) retired.add(candidate)
-        try { candidate.close(); retired.remove(candidate) }
+        try { closeRetired(candidate) }
         catch (failure: Throwable) {
             uncertainHistoryAccounts.add(account.id)
             throw failure
@@ -1094,13 +1212,18 @@ internal class NativeAccountCoordinator(
         catch (error: Throwable) { retireUnpublished(account, candidate); throw error }
         val next = Mounted(account, candidate)
         // Authentication may take its own lock; never invoke it while holding lifecycleLock.
-        val current = isCurrent() && accountCurrent(account)
-        val installed = current && synchronized(lifecycleLock) {
-            onAuthorityChanged()
-            if (mounted.get() != null) false else {
-                com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
-                mounted.compareAndSet(null, next).also { if (it) onInstalled?.invoke(next) }
+        val installed = try {
+            val current = isCurrent() && accountCurrent(account)
+            current && synchronized(lifecycleLock) {
+                onAuthorityChanged()
+                if (mounted.get() != null) false else {
+                    com.vortx.android.player.PlaybackOwnerEpoch.invalidate()
+                    mounted.compareAndSet(null, next).also { if (it) onInstalled?.invoke(next) }
+                }
             }
+        } catch (failure: Throwable) {
+            if (mounted.get() !== next) noteUnconfirmedRestoreRetirement()
+            throw failure
         }
         if (!installed) {
             retireUnpublished(account, candidate); error("Native account changed")
@@ -1123,7 +1246,7 @@ internal class NativeAccountCoordinator(
         }
     }
 
-    override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+    override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = withNativeWriter {
         require(!document.has(NativeOwnerHistoryAccount.ARCHIVE) && document.optJSONObject("nativeSync")?.optInt("schemaVersion") != 6) {
             "Original authenticated account bytes required"
         }
@@ -1188,7 +1311,7 @@ internal class NativeAccountCoordinator(
         raw: ByteArray,
         captured: NativeAccountReadCapture?,
         isCurrent: () -> Boolean,
-    ): Boolean = mutex.withLock {
+    ): Boolean = withNativeWriter {
         if (captured != null) check(captured.account == account) { "Authenticated account read owner changed" }
         check(account.id !in uncertainHistoryAccounts) { "Owner history writer retirement unconfirmed" }
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
@@ -1209,7 +1332,7 @@ internal class NativeAccountCoordinator(
         val incoming = exact.raw("nativeSync")?.let { OHJson.Obj(it) }
         val schema = incoming?.let { OHJson.integer(it.raw("schemaVersion")) }
         if (schema != 6L && exact.raw(NativeOwnerHistoryAccount.ARCHIVE) == null && !localTyped)
-            return@withLock applyDocumentLocked(account, document, isCurrent,
+            return@withNativeWriter applyDocumentLocked(account, document, isCurrent,
                 originalHostPreferences = originalHostPreferences).let { applied ->
                 if (!applied) return@let false
                 // The primary sync apply has already succeeded. Baseline retention is optional and
@@ -1244,10 +1367,10 @@ internal class NativeAccountCoordinator(
             check(active() && mounted.get() === current)
             current.clearRead()
             pendingImport = null
-            return@withLock true
+            return@withNativeWriter true
         }
         retire()
-        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
+        while (true) { val prior = retired.peek() ?: break; closeRetired(prior) }
         val stored = checkpoints.captureCheckpoint(scope)
         val resources = transport()
         var candidate: VortxNativeSession? = null
@@ -1384,7 +1507,7 @@ internal class NativeAccountCoordinator(
         val materialDocument = nativeMigrationSourceDocument(archive.getJSONObject("document")).also { it.remove("profileEdits") }
         val old = mounted.get()
         val capturedRead = old?.takeIf { it.account == account && it.session.scope == scope && !it.session.requiresRecovery() }?.session?.read()
-        val capturedUpdate = capturedRead?.let { old!!.session.updates.value }
+        val capturedUpdate = capturedRead?.let { old.session.updates.value }
         val retained = capturedRead?.state
             ?: checkpoints.read(scope)?.let(scope::validateSnapshot)
         // Bound the complete immutable source union before installing even the base merge. A
@@ -1421,7 +1544,7 @@ internal class NativeAccountCoordinator(
         val migrationCurrent = {
             operationJob?.isActive != false && isCurrent() && operationCurrent() && accountCurrent(account) &&
                 (old == null || mounted.get() === old)
-                && (capturedUpdate == null || old!!.session.updates.value == capturedUpdate)
+                && (capturedUpdate == null || old.session.updates.value == capturedUpdate)
         }
         val watched = watchedProducer.prepare(scope, materialDocument, roster, sources,
             retainedStorage = NativeWatchedMigrationStorage.read(priorArchive), isCurrent = migrationCurrent)
@@ -1559,7 +1682,7 @@ internal class NativeAccountCoordinator(
         retire()
         // Close is deferred out of the auth lock to avoid lock inversion, but a replacement writer
         // must join every retired transaction before reading or replacing the same account file.
-        while (true) { val prior = retired.peek() ?: break; prior.close(); retired.remove(prior) }
+        while (true) { val prior = retired.peek() ?: break; closeRetired(prior) }
         val resources = transport()
         val hostProfiles = baselineHost
         // The captured setup target was admitted before intentional retirement. The coroutine and
@@ -1732,7 +1855,7 @@ internal class NativeAccountCoordinator(
         fun current(): Boolean = captured.withAuthentication { isCurrent() && synchronized(lifecycleLock) {
             mounted.get() === (produced.get() ?: captured.installation)
         } }
-        val applied = mutex.withLock {
+        val applied = withNativeWriter {
             require(!document.has(NativeOwnerHistoryAccount.ARCHIVE) && document.optJSONObject("nativeSync")?.optInt("schemaVersion") != 6)
             require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending"))
             // applyDocumentLocked's isCurrent is the mounted session's lifetime, which must outlive this

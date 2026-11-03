@@ -129,6 +129,13 @@ internal class NativeCheckpointRead internal constructor(
     }
 }
 
+private const val NATIVE_CHECKPOINT_KEY_PREFIX = "vortx.native.state.v1."
+private fun nativeCheckpointAlias(scope: VortxAccountScope) = NATIVE_CHECKPOINT_KEY_PREFIX + scope.digest
+private val nativeCheckpointAliasPattern = Regex("vortx[.]native[.]state[.]v1[.][0-9a-f]{64}")
+
+/** A value-free observation. Absence is positive evidence from a covered read path. */
+internal enum class AccountFileLocalPresence { ABSENT, PRESENT, UNAVAILABLE }
+
 internal interface VortxCheckpointStore {
     /** Null means absent only; decrypt/key/I/O/malformed failures must throw. */
     fun read(scope: VortxAccountScope): String?
@@ -159,6 +166,11 @@ internal interface VortxCheckpointStore {
         require(original.plaintext == null)
         verifyFreshAccount(scope)
     }
+    /** Restore-only disk evidence. Other checkpoint implementations must explicitly supply it. */
+    fun inspectRestoreAbsence(scope: VortxAccountScope,
+                              readCompleteAliases: () -> Set<String>,
+                              readExistingKey: (VortxAccountScope) -> SecretKey?): AccountFileLocalPresence =
+        AccountFileLocalPresence.UNAVAILABLE
     /** Setup-only evidence; a missing runtime is never replaced with an empty one. */
     fun readPreflight(accountID: String): NativeMigrationPreflight? = null
     fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) {
@@ -196,10 +208,11 @@ internal class VortxEncryptedCheckpointStore(
             output.toByteArray()
         }
     } catch (_: java.nio.file.NoSuchFileException) { null }
-    private fun open(scope: VortxAccountScope, bytes: ByteArray): String {
+    private fun open(scope: VortxAccountScope, bytes: ByteArray,
+                     lookup: (VortxAccountScope) -> SecretKey = key): String {
         require(bytes.size in 28..MAX_BYTES) { "Invalid native checkpoint" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(scope), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+        cipher.init(Cipher.DECRYPT_MODE, lookup(scope), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
         cipher.updateAAD(scope.authenticatedData)
         val plain = cipher.doFinal(bytes, 12, bytes.size - 12)
         val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
@@ -323,6 +336,143 @@ internal class VortxEncryptedCheckpointStore(
             "An older unindexed native checkpoint requires authenticated recovery before account creation"
         }
     }
+    /** Exact target paths, then a bounded authenticated attribution of the remaining inventory.
+     * The ordinary readers may create keys and are deliberately excluded. Foreign state is
+     * attributed by its sealed locator and never opened with a foreign checkpoint key. */
+    @Synchronized override fun inspectRestoreAbsence(scope: VortxAccountScope,
+                                                    readCompleteAliases: () -> Set<String>,
+                                                    readExistingKey: (VortxAccountScope) -> SecretKey?): AccountFileLocalPresence {
+        return try {
+            inspectRestoreInventory(scope, readCompleteAliases, readExistingKey)
+        } catch (cancelled: kotlin.coroutines.cancellation.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            AccountFileLocalPresence.UNAVAILABLE
+        }
+    }
+
+    private fun inspectRestoreInventory(scope: VortxAccountScope, readCompleteAliases: () -> Set<String>,
+                                        readExistingKey: (VortxAccountScope) -> SecretKey?): AccountFileLocalPresence {
+        requireRestoreScope(scope)
+        val path = directory.toPath()
+        val targetAccountDigest = accountDigest(scope.accountID)
+        val targetScopeDigest = scope.digest
+        val before = restoreDirectoryAttributes(path)
+        val entries = if (before == null) emptyMap() else restoreInventory(path)
+        if (entries.keys.any { targetAccountDigest in it || targetScopeDigest in it })
+            return AccountFileLocalPresence.PRESENT
+
+        // Checking three derived target names would miss a key left by interrupted creation
+        // under an earlier owner or owner-ID spelling. Account attribution requires a complete
+        // existing alias inventory and authenticated foreign descriptors, even with no files.
+        val appAliases = readCompleteAliases().toSet()
+        require(appAliases.size <= 16_384)
+        val aliases = appAliases.filterTo(hashSetOf()) {
+            it.startsWith(NATIVE_CHECKPOINT_KEY_PREFIX, ignoreCase = true)
+        }
+        require(aliases.size <= RESTORE_INVENTORY_MAX_FILES * 2 && aliases.all(nativeCheckpointAliasPattern::matches))
+        val coveredAliases = hashSetOf<String>()
+        val coveredState = hashSetOf<String>()
+        val foreignOwners = mutableMapOf<String, VortxAccountScope>()
+        var remainingBytes = RESTORE_INVENTORY_SEALED_BUDGET
+        for ((name, attributes) in entries) {
+            require(attributes.isRegularFile && attributes.size() in 28L..MAX_BYTES.toLong())
+            val locator = RESTORE_LOCATOR.matchEntire(name)
+            val preflight = RESTORE_PREFLIGHT.matchEntire(name)
+            if (locator == null && preflight == null) {
+                require(RESTORE_STATE.matches(name)) { "Unattributed native storage" }
+                continue
+            }
+            val accountHash = (locator ?: checkNotNull(preflight)).groupValues[1]
+            require(locator == null || attributes.size() <= RESTORE_LOCATOR_MAX_BYTES)
+            require(attributes.size() <= remainingBytes)
+            remainingBytes -= attributes.size()
+            val domain = VortxAccountScope(accountHash,
+                if (locator != null) "native-account-locator-v1" else "native-migration-preflight-v1")
+            val bytes = readRestoreSealed(path.resolve(name), attributes.size().toInt())
+            val plain = open(domain, bytes) { checkNotNull(readExistingKey(it)) }
+            val descriptor = NativeProfileOverlayWitness.parseDocument(plain.toByteArray(Charsets.UTF_8))
+            val keys = setOf("schemaVersion", "accountID", "ownerProfileID")
+            require(descriptor.keys().asSequence().toSet() == if (locator != null) keys else keys + "sealedPayload")
+            require((descriptor.opt("schemaVersion") as? Number)?.toString() == "1")
+            val indexed = VortxAccountScope(descriptor.get("accountID") as String, descriptor.get("ownerProfileID") as String)
+            requireRestoreScope(indexed)
+            require(indexed.accountID != scope.accountID && accountDigest(indexed.accountID) == accountHash)
+            val prior = foreignOwners.putIfAbsent(accountHash, indexed)
+            require(prior == null || prior == indexed)
+            if (prior == null) requireNotNull(readExistingKey(indexed))
+            coveredAliases.add(nativeCheckpointAlias(domain))
+            coveredAliases.add(nativeCheckpointAlias(indexed))
+            if (locator != null) {
+                val stateName = file(indexed).name
+                require(stateName in entries && coveredState.add(stateName))
+            } else {
+                // The outer authenticated descriptor already binds this opaque pending source to
+                // the foreign account. There is no reason to decrypt its inner account material.
+                val payload = descriptor.get("sealedPayload") as String
+                val sealed = java.util.Base64.getDecoder().decode(payload)
+                require(sealed.size in 28..MAX_BYTES && java.util.Base64.getEncoder().encodeToString(sealed) == payload)
+            }
+        }
+        require(entries.keys.filter(RESTORE_STATE::matches).all { it in coveredState })
+        require(aliases == coveredAliases) { "Native checkpoint key attribution unavailable" }
+        val after = restoreDirectoryAttributes(path)
+        require(sameRestoreAttributes(before, after))
+        if (after != null) {
+            val observed = restoreInventory(path)
+            require(entries.keys == observed.keys &&
+                entries.all { (name, attrs) -> sameRestoreAttributes(attrs, observed[name]) })
+        }
+        require(appAliases == readCompleteAliases())
+        return AccountFileLocalPresence.ABSENT
+    }
+
+    private fun requireRestoreScope(scope: VortxAccountScope) {
+        val account = java.util.UUID.fromString(scope.accountID.removePrefix("account.")).toString()
+        require(scope.accountID == "account.$account")
+        val owner = java.util.UUID.fromString(scope.ownerProfileID).toString()
+        require(owner.equals(scope.ownerProfileID, ignoreCase = true))
+    }
+
+    private fun restoreDirectoryAttributes(path: java.nio.file.Path): java.nio.file.attribute.BasicFileAttributes? {
+        val attributes = try { Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes::class.java, java.nio.file.LinkOption.NOFOLLOW_LINKS) }
+        catch (_: java.nio.file.NoSuchFileException) { return null }
+        require(attributes.isDirectory)
+        return attributes
+    }
+
+    private fun restoreInventory(path: java.nio.file.Path): Map<String, java.nio.file.attribute.BasicFileAttributes> =
+        Files.newDirectoryStream(path).use { stream ->
+            val entries = linkedMapOf<String, java.nio.file.attribute.BasicFileAttributes>()
+            for (child in stream) {
+                require(entries.size < RESTORE_INVENTORY_MAX_FILES)
+                val attrs = Files.readAttributes(child, java.nio.file.attribute.BasicFileAttributes::class.java, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                require(entries.put(child.fileName.toString(), attrs) == null)
+            }
+            entries
+        }
+
+    private fun sameRestoreAttributes(before: java.nio.file.attribute.BasicFileAttributes?, after: java.nio.file.attribute.BasicFileAttributes?): Boolean {
+        if (before == null || after == null) return before == after
+        return before.fileKey() == after.fileKey() && before.isDirectory == after.isDirectory &&
+            before.isRegularFile == after.isRegularFile && before.size() == after.size() &&
+            before.lastModifiedTime() == after.lastModifiedTime()
+    }
+
+    private fun readRestoreSealed(path: java.nio.file.Path, size: Int): ByteArray {
+        val bytes = ByteArray(size)
+        Files.newInputStream(path, StandardOpenOption.READ, java.nio.file.LinkOption.NOFOLLOW_LINKS).use { input ->
+            var offset = 0
+            while (offset < size) {
+                val count = input.read(bytes, offset, size - offset)
+                require(count > 0) { "Native inventory read was incomplete" }
+                offset += count
+            }
+            require(input.read() == -1) { "Native inventory changed during read" }
+        }
+        return bytes
+    }
+
     @Synchronized override fun remember(scope: VortxAccountScope) {
         val old = discover(scope.accountID)
         require(old == null || old == scope) { "Native account owner changed" }
@@ -356,13 +506,65 @@ internal class VortxEncryptedCheckpointStore(
             check(open(scope, Files.readAllBytes(target.toPath())) == snapshot) { "Native sealed readback failed" }
         } finally { Files.deleteIfExists(pending) }
     }
-    companion object { private const val MAX_BYTES = 33_554_432 }
+    companion object {
+        private const val MAX_BYTES = 33_554_432
+        private const val RESTORE_INVENTORY_MAX_FILES = 4_096
+        private const val RESTORE_LOCATOR_MAX_BYTES = 16_384L
+        private const val RESTORE_INVENTORY_SEALED_BUDGET = 67_108_864L
+        private val RESTORE_LOCATOR = Regex("native-account-v1-([0-9a-f]{64})[.]sealed")
+        private val RESTORE_PREFLIGHT = Regex("native-preflight-v1-([0-9a-f]{64})[.]sealed")
+        private val RESTORE_STATE = Regex("native-state-v1-[0-9a-f]{64}[.]sealed")
+    }
+}
+
+/** The Android 14+ Keystore2 SPI counts the application namespace independently of list batches. */
+internal fun supportsCompleteRestoreAliasInventory(sdk: Int, providerClass: String?, serviceClass: String?): Boolean =
+    sdk >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        providerClass == "android.security.keystore2.AndroidKeyStoreProvider" &&
+        serviceClass == "android.security.keystore2.AndroidKeyStoreSpi"
+
+internal fun boundedCompleteRestoreAliases(readCount: () -> Int,
+                                           enumerate: () -> java.util.Enumeration<String>): Set<String> {
+    val size = readCount()
+    require(size in 1..16_384) { "Native key inventory unavailable" }
+    val entries = hashSetOf<String>()
+    val aliases = enumerate()
+    while (aliases.hasMoreElements()) {
+        require(entries.size < size)
+        require(entries.add(aliases.nextElement()))
+    }
+    require(entries.size == size && readCount() == size) { "Native key inventory incomplete" }
+    return entries
 }
 
 /** Android Keystore holds a non-exportable AES-256 key; there is no plaintext fallback. */
 internal object VortxAndroidCheckpointKey {
+    /** A positive count and full enumeration come from separate calls in the admitted provider.
+     * An older SPI can return the size of the same truncated list and cannot prove completeness. */
+    @Synchronized fun readCompleteRestoreAliases(): Set<String> {
+        val store = restoreKeyStore()
+        return boundedCompleteRestoreAliases(store::size, store::aliases)
+    }
+
+    /** Existing-only lookup; a null result cannot certify absence without the inventory. */
+    @Synchronized fun readExisting(scope: VortxAccountScope): SecretKey? {
+        val alias = nativeCheckpointAlias(scope)
+        val store = restoreKeyStore()
+        if (!store.containsAlias(alias)) return null
+        return requireNotNull(store.getKey(alias, null) as? SecretKey)
+    }
+
+    private fun restoreKeyStore(): KeyStore {
+        val provider = requireNotNull(java.security.Security.getProvider("AndroidKeyStore"))
+        require(supportsCompleteRestoreAliasInventory(android.os.Build.VERSION.SDK_INT, provider.javaClass.name,
+            provider.getService("KeyStore", "AndroidKeyStore")?.className)) {
+            "Independent native key inventory unavailable"
+        }
+        return KeyStore.getInstance("AndroidKeyStore", provider).apply { load(null) }
+    }
+
     @Synchronized fun get(scope: VortxAccountScope): SecretKey {
-        val alias = "vortx.native.state.v1.${scope.digest}"
+        val alias = nativeCheckpointAlias(scope)
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (store.containsAlias(alias)) return requireNotNull(store.getKey(alias, null) as? SecretKey)
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
