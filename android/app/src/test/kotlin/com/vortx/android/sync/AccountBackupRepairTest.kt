@@ -241,10 +241,15 @@ class AccountBackupRepairTest {
     }
 
     @Test fun originalOperationCancellationAtEveryConversionFenceClosesAllHandles() {
-        val file = f.file(); var count = 0
-        f.context().use { context -> AccountBackupRepair.convert(file, context, AccountBackupRepairFixture.Bindings()) { count++ }.close() }
-        assertTrue(count > 20)
-        for (stop in 1..count) {
+        val file = f.file()
+        val observedFences = mutableListOf<Unit>()
+        f.context().use { context ->
+            AccountBackupRepair.convert(file, context, AccountBackupRepairFixture.Bindings()) {
+                observedFences.add(Unit)
+            }.close()
+        }
+        assertNotNull("Expected at least 21 conversion fences", observedFences.getOrNull(20))
+        for (stop in 1..observedFences.size) {
             val bindings = AccountBackupRepairFixture.Bindings()
             f.context().use { context ->
                 val cancel = cancellationAtFence(stop, "Synthetic original owner/operation retired")
@@ -275,11 +280,15 @@ class AccountBackupRepairTest {
         val selected = f.context().use { context ->
             AccountBackupRepair.convert(f.file(), context, AccountBackupRepairFixture.Bindings()) {}.use { it.fileBytes() }
         }
-        val before = selected.copyOf(); var count = 0
-        f.context().use { context -> AccountBackupRepair.validateReimport(selected, context,
-            AccountBackupRepairFixture.Bindings()) { count++ }.close() }
-        assertTrue(count > 20)
-        for (stop in 1..count) {
+        val before = selected.copyOf()
+        val observedFences = mutableListOf<Unit>()
+        f.context().use { context ->
+            AccountBackupRepair.validateReimport(selected, context, AccountBackupRepairFixture.Bindings()) {
+                observedFences.add(Unit)
+            }.close()
+        }
+        assertNotNull("Expected at least 21 reimport fences", observedFences.getOrNull(20))
+        for (stop in 1..observedFences.size) {
             val bindings = AccountBackupRepairFixture.Bindings()
             f.context().use { context ->
                 val cancel = cancellationAtFence(stop, "Synthetic original reimport retired")
