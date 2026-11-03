@@ -270,11 +270,19 @@ check(detachedSeed.contains("VortxNativeSession.detachedLegacySync")
       && !detachedSeed.contains("rememberAuthenticatedScope") && !detachedSeed.contains("installNativeSession"),
       "proven-empty seed is detached until create-only PUT and authenticated winner readback")
 let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "private func foldDocTombstones(")
-let nativeExportReturn = guardedMetadata
-    ? nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
-        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n    }")
-    : nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
-        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)\n#else")
+let nativeExportReturn: Bool
+if bridge.contains("@MainActor var hasOwnerHistorySession: Bool {") {
+    nativeExportReturn = nativePush.contains("OwnerHistoryAccountExport(completeAccountPlaintext: originalPlaintext)")
+        && nativePush.contains(".projectingGenericHost(native: merged[\"nativeSync\"]!, host: receipt.rawHost,")
+        && nativePush.contains("OwnerHistoryRawAccountPreparation.projectingLocalProvider(account: account, provider: providers)")
+        && appearsBefore("rawExport = try account.encoded()", "guard let rawExport else { return nil }", in: nativePush)
+        && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+            + "                              sourceIsCurrent: sourceIsCurrent, plaintextData: rawExport, nativeDirtySettings: exportedDirtySettings)")
+} else {
+    let legacyReturn = "return DerivedSyncDoc(document: doc, baseRevision: baseRevision, credentialCapture: capture,\n"
+        + "                              sourceIsCurrent: sourceIsCurrent, nativeDirtySettings: exportedDirtySettings)"
+    nativeExportReturn = nativePush.contains(legacyReturn + (guardedMetadata ? "\n    }" : "\n#else"))
+}
 check(nativePush.contains("let conversion = nativeLegacyConversionDecision(doc, capture: capture)")
                 && nativePush.contains("var prepared: NativeLegacyPreparation?")
                 && nativePush.contains("if conversion.convert { prepared = try await prepareNativeLegacyMaterial(doc, capture: capture) }")
