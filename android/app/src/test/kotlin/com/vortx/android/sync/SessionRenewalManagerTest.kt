@@ -139,7 +139,7 @@ class SessionRenewalManagerTest {
     @Test fun lateOldTokenResponseCannotOverwriteAlreadyConfirmedSuccessor() = runTest {
         val f = Fixture(UnconfinedTestDispatcher(testScheduler))
         try {
-            val latest = RenewalFixtures.token(RenewalFixtures.now + 121 * RenewalFixtures.day)
+            val latest = RenewalFixtures.token(RenewalFixtures.now + (121 * RenewalFixtures.day))
             f.beforeResponse = {
                 if (f.sent.size == 1) {
                     f.header = latest
