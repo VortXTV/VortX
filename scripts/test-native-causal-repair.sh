@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/native-watched-swift-inputs.sh
 source scripts/xperience-observation-swift-inputs.sh
+source scripts/native-owner-history-fixture-inputs.sh
 causal_sdk="${VORTX_SYNC_TEST_SDK:?exact accepted dd520 macOS static SDK required}"
 causal_library="$causal_sdk/libvortx_ffi.a"
 causal_headers="$causal_sdk/Headers/vortx"
@@ -21,24 +22,39 @@ node test/native-causal-repair.mjs --extract "$causal_dir"
 causal_inputs=(
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}"
-    "${xperience_observation_swift_inputs[@]}"
+    "${xperience_observation_swift_inputs[@]}" app/SourcesShared/VortxNativeOwnerHistoryIngress.swift app/SourcesShared/LegacyWatchOwnership.swift
     app/SourcesShared/VortxNativeOwnAccountProducer.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift
+    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/LibraryGenreFacts.swift app/SourcesShared/VortxNativePreviouslyWatched.swift app/SourcesShared/VortxNativeProfiles.swift
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxProfileOverlayWitness.swift
     app/SourcesShared/CatalogRowResolution.swift app/SourcesShared/VortXSyncCrypto.swift app/SourcesShared/NativeForegroundSyncPolicy.swift app/SourcesShared/SyncBackupUploadFailure.swift
     app/SourcesShared/AddonReorderMove.swift app/SourcesShared/ProfileRosterSyncPolicy.swift app/SourcesShared/PlaybackMutationOwnershipPolicy.swift
     app/SourcesShared/HomeCatalogLoadPolicy.swift app/SourcesShared/TabBarPrefs.swift
     app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift app/SourcesShared/ContinueWatchingPreferences.swift app/SourcesShared/HomeContinueWatchingSelection.swift
     app/SourcesShared/SettingsDirtyKeys.swift app/SourcesShared/SyncDocumentRevisionPolicy.swift app/SourcesShared/NativePreferenceIntentStore.swift
-    app/SourcesShared/CredentialRetryCoordinator.swift "$causal_dir/UserProfile.swift" "$causal_dir/Discovery.swift" "$causal_dir/Models.swift" "$causal_dir/CatalogConsumers.swift" "$causal_dir/HomeRails.swift" "$causal_dir/Combined.swift"
+    app/SourcesShared/CredentialRetryCoordinator.swift "$causal_dir/UserProfile.swift" "$causal_dir/Discovery.swift" "$causal_dir/Models.swift" "$causal_dir/CatalogConsumers.swift" "$causal_dir/HomeRails.swift" "$causal_dir/Combined.swift" "$causal_dir/OwnerHistoryFixtureCarriers.swift"
 )
+# Match the receive lane's real closure while preserving the isolated credential environment.
+for history_source in "${native_owner_history_fixture_swift_inputs[@]}"; do
+    case "$history_source" in
+        app/SourcesShared/Keychain.swift|app/SourcesShared/CredentialScope.swift) continue ;;
+    esac
+    for causal_source in "${causal_inputs[@]}"; do
+        if [[ "$history_source" == "$causal_source" ]]; then continue 2; fi
+    done
+    causal_inputs+=("$history_source")
+done
 for causal_source in "${causal_inputs[@]}"; do
     [[ "$causal_source" == app/SourcesShared/*.swift ]] || continue
     causal_expected=$(git -C "$PWD" show "$VORTX_RECEIVE_PRODUCTION_REF:$causal_source" | shasum -a 256 | awk '{print $1}')
     test "$(shasum -a 256 "$causal_source" | awk '{print $1}')" = "$causal_expected"
 done
 causal_hash_inputs=("$causal_library" "$causal_headers/vortx_ffi.h" "$causal_headers/module.modulemap" app/Tests/NativeCausalRepairHarness.swift.in test/native-causal-repair.mjs scripts/test-native-causal-repair.sh
-    scripts/xperience-observation-swift-inputs.sh test/xperience-harness-inputs.cjs)
+    scripts/native-watched-swift-inputs.sh scripts/xperience-observation-swift-inputs.sh
+    scripts/native-owner-history-fixture-inputs.sh test/xperience-harness-inputs.cjs
+    test/apple-sync-receive-publication.mjs app/Tests/AppleSyncReceivePublicationPeer.swift
+    app/SourcesShared/CredentialScope.swift app/SourcesShared/CoreBridge.swift app/SourcesShared/VortXSyncManager.swift
+    app/SourcesShared/TraktHomeNextEpisodeProducer.swift app/SourcesShared/TraktNextEpisodeConsumer.swift
+    app/SourcesShared/TraktPlaybackShadow.swift app/SourcesShared/SIMKLContinueWatching.swift app/SourcesShared/SIMKLContinueWatchingShadow.swift)
 for causal_source in "${causal_inputs[@]}"; do
     [[ "$causal_source" != *.swift ]] || causal_hash_inputs+=("$causal_source")
 done

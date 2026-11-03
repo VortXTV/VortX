@@ -81,6 +81,7 @@ if (process.argv[2] === '--extract') {
   }
   const storedDeclarations = [
     exactDeclaration(/^    private var nativeDocumentCommitGeneration: UInt64 = 0$/gm, 'conversion generation'),
+    exactDeclaration(/^    private var nativeCheckpointGeneration = UUID\(\)$/gm, 'native checkpoint generation'),
     exactDeclaration(/^    private var ws: URLSessionWebSocketTask\?.*$/gm, 'poll socket'),
     exactDeclaration(/^    private var wsHeardAt: Date\?.*$/gm, 'last socket frame'),
     exactDeclaration(/^    private var lastPollPullAt: Date\?.*$/gm, 'last poll pull')
@@ -100,7 +101,24 @@ if (process.argv[2] === '--extract') {
   const repairValues = await source('app/SourcesShared/VortxAccountFileRepairService.swift');
   const credentialValues = await source('app/SourcesShared/CredentialScope.swift');
   receipts.push({path:credentialValues.path,marker:'declared canonical account scope input',sourceSHA256:sha256(credentialValues.text)});
-  combined += '\n' + xperienceInputs.extractDeclaration(credentialValues.text, 'enum CredentialScope: Equatable, Hashable, Sendable {')
+  const credentialDeclarations = [
+    'enum CredentialScope: Equatable, Hashable, Sendable {',
+    'enum CredentialMutationResult: Equatable, Sendable {',
+    'enum CredentialDurableReadResult: Equatable, Sendable {',
+    'enum CredentialPublicationOutboxState: Equatable, Sendable {',
+    'enum CredentialPublicationOutbox {',
+  ].map(marker => {
+    const selected = xperienceInputs.extractDeclaration(credentialValues.text, marker);
+    receipts.push({path:credentialValues.path,marker,
+      sourceSHA256:sha256(credentialValues.text),sliceSHA256:sha256(selected)});
+    return selected;
+  });
+  const ownerHistoryCarriers = xperienceInputs.ownerHistoryCarriers(manager.text);
+  for (const { signature, bytes } of ownerHistoryCarriers.declarations) {
+    receipts.push({path:manager.path,marker:signature,
+      sourceSHA256:sha256(manager.text),sliceSHA256:sha256(bytes)});
+  }
+  combined += '\n' + credentialDeclarations.join('\n')
     + '\nenum VortxAccountFileRestore {\n'
     + member(restoreValues, '    static func hasUnacknowledgedProviderCarrier(')
     + '\n' + member(restoreValues, '    static func digest(') + '\n}\nenum VortxAccountFileRepairService {\n'
@@ -108,11 +126,11 @@ if (process.argv[2] === '--extract') {
   // This existing publication lane has no file intents; it observes the new call without
   // inventing journal success. The dedicated local-adoption suite executes the actual journal.
   combined += '\nactor VortxAccountFileRestoreJournal { static let shared=VortxAccountFileRestoreJournal()\n'
-    + 'func recordLocalAdoption(_ completed: VortXSyncManager.CompletedFileRestoreReceive) -> [UUID] { [] }\n}\n';
+    + 'func recordLocalAdoption(_ completed: VortXSyncManager.CompletedFileRestoreReceive) throws -> [UUID] { [] }\n}\n';
   combined += '\nextension VortXSyncManager {\n'
     + observation + '\n'
     + conversionMembers.join('\n') + '\n'
-    + ['    struct CompletedFileRestoreReceive: Sendable {', '    private struct NativeReceiveReceipt {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
+    + ['    struct CompletedFileRestoreReceive: Sendable {', '    private struct NativeReceiveReceipt {', '    private struct OwnerHistoryMergedAccount {', '    private enum VersionedPull ', '    private enum PushOutcome ', '    private struct PendingDebridApply:',
       '    private enum ProviderApplyService:', '    private enum ProviderApplyValue:', '    private struct PendingProviderApply:']
       .map(marker => member(manager, marker)).join('\n')
     + '\n' + managerMethods.map(marker => member(manager, marker)).join('\n')
@@ -151,8 +169,11 @@ if (process.argv[2] === '--extract') {
   }
   const coreMembers = ['func hasCertifiedNativeSession(', 'func captureNativePlaybackTarget(',
     'func nativePlaybackTargetIsCurrent(', 'private func currentNativePlaybackBinding(',
-    'private func nativePlaybackBinding(', 'func mergeNativeAccountDocument(', 'private func refreshNativeProfiles(',
-    '@MainActor func nativeWatchlist()', 'private var enginePublicationBlocked:', 'private func capturePublicationToken()',
+    'private func nativePlaybackBinding(', 'func mergeNativeAccountDocument(', 'func mergeNativeAccountDocumentReceipt(',
+    'private func refreshNativeProfiles(',
+    '@MainActor func nativeWatchlist()', 'struct NativeWatchlistTarget:', 'private func captureNativeWatchlistTarget()',
+    'struct NativeOwnerHistoryRead {', 'struct NativeSubtitleOwnerProof:', '@MainActor var hasOwnerHistorySession:',
+    '@MainActor func cancelNativeOwnerHistoryRead(', 'private var enginePublicationBlocked:', 'private func capturePublicationToken()',
     'private func publicationStillCurrent(', 'private func publicationEpochMatches(',
     'func stateData(_ field:', 'func decode<T:', 'private func playerActiveSnapshot()', 'private func recordAcceptedHistoryReceipt(',
     'private func refreshAddons()', 'private func refreshAddons(capturedPublicationToken',
@@ -160,7 +181,7 @@ if (process.argv[2] === '--extract') {
     'private func ensureCatalogOrderRangeLoaded(', 'private func widenBoardRange(',
     'private struct NativeCallbackOrigin:', 'private func nativeCallbackSourceIsCurrent(',
     'private func nativeCallbackOriginIsCurrent(', 'private func nativeLegacyReceiptIsCurrent(',
-    'private func publishNativeLegacyHistory(', 'private func publishNativeLegacyContext(',
+    'private func publishNativeLegacyHistory(', 'private func publishNativeLegacyContext(', 'private func receiveNativeLegacyHostSeed(',
     'private static func nativeLegacyFoundationValue(', 'private func recordNativeLegacyCoarseEvent(',
     'fileprivate final class NativePlaybackReadLifetime:', 'struct NativePlaybackReadCapability:',
     'func captureNativePlaybackReadCapability('];
@@ -168,12 +189,52 @@ if (process.argv[2] === '--extract') {
   combined += '\n' + lifetime + '\nextension CoreBridge {\n'
     + coreMembers.map(currentMember).join('\n')
     + '\n' + slice(core, '    @MainActor static let decoder:', '\n    }()', true)
-    + '\n' + slice(core, '    func rebuildContinueWatching()', '\n    /// Record an owner-tagged history receipt')
+    + '\n' + slice(core, '    @MainActor\n    func rebuildContinueWatching()', '\n    /// Record an owner-tagged history receipt')
     + '\n    @MainActor func refreshProfilesForFixture() throws { try refreshNativeProfiles() }\n}\n';
   const historyFixture = await source('app/Tests/AppleHistoryFixture.swift');
   combined += '\n' + historyFixture.text;
   receipts.push({path:historyFixture.path,marker:'whole explicit fixture source-event/host plumbing',
     sourceSHA256:sha256(historyFixture.text),sliceSHA256:sha256(historyFixture.text)});
+  const [traktProducer, traktConsumer, traktShadow, simklReader, simklShadow] = await Promise.all([
+    source('app/SourcesShared/TraktHomeNextEpisodeProducer.swift'),
+    source('app/SourcesShared/TraktNextEpisodeConsumer.swift'),
+    source('app/SourcesShared/TraktPlaybackShadow.swift'),
+    source('app/SourcesShared/SIMKLContinueWatching.swift'),
+    source('app/SourcesShared/SIMKLContinueWatchingShadow.swift')]);
+  function providerDeclaration(file, marker) {
+    const selected = xperienceInputs.extractDeclaration(file.text, marker);
+    receipts.push({path:file.path, marker, sourceSHA256:sha256(file.text), sliceSHA256:sha256(selected)});
+    return selected;
+  }
+  function unavailableProviderMethod(file, marker, operation) {
+    return slice(file, marker, ' {', true)
+      + `\n        fatalError(${JSON.stringify(`${operation} is outside the receive/causal fixture`)})\n    }`;
+  }
+  // The real offer method also runs on ordinary local Home reads. Preserve its owner check and
+  // entire result assembly, and refuse unexpected access at the Trakt-only cache boundary.
+  combined += '\n' + providerDeclaration(traktConsumer, 'struct TraktNextEpisodeTarget: Equatable, Sendable {')
+    + '\n' + slice(traktProducer, 'struct TraktNextEpisodeOffer: Identifiable, Sendable {', '\n\n    /// Source pages must validate') + '\n}\n'
+    + '\nextension TraktHomeNextEpisodeProducer {\n'
+    + providerDeclaration(traktProducer, '    private struct Owner: Hashable, Sendable {') + '\n'
+    + providerDeclaration(traktProducer, '    func offers(intent:') + '\n'
+    + unavailableProviderMethod(traktProducer, '    @MainActor\n    func requestRefresh(intent:', 'Trakt Home provider refresh') + '\n}\n'
+    + '\nextension TraktNextEpisodeConsumer {\n'
+    + providerDeclaration(traktConsumer, '    struct Row: Identifiable, Sendable {') + '\n'
+    + unavailableProviderMethod(traktConsumer, '    func rows(owner expectedOwner:', 'Trakt Home cache read') + '\n}\n'
+    + '\nextension TraktPlaybackShadow {\n'
+    + slice(traktShadow, '    typealias ContinueWatchingSource = ContinueWatchingService', '\n\n') + '\n'
+    + providerDeclaration(traktShadow, '    struct ContinueWatchingSelection: Sendable {') + '\n'
+    + providerDeclaration(traktShadow, '    func refreshIfStale(context:') + '\n'
+    + unavailableProviderMethod(traktShadow, '    private func refreshIfStale(context:', 'Trakt playback refresh') + '\n'
+    + unavailableProviderMethod(traktShadow, '    func continueWatchingSelection(', 'Trakt playback snapshot') + '\n}\n'
+    + '\n' + providerDeclaration(simklReader, 'struct SIMKLContinueWatchingSeed: Equatable, Sendable {')
+    + '\nactor SIMKLContinueWatchingReader {\n'
+    + providerDeclaration(simklReader, '    struct Snapshot: Sendable {') + '\n}\n'
+    + '\nenum SIMKLContinueWatchingFold {\n'
+    + providerDeclaration(simklReader, '    static func unavailableReason(') + '\n}\n'
+    + '\nextension SIMKLContinueWatchingShadow {\n'
+    + unavailableProviderMethod(simklShadow, '    func snapshot(context expected:', 'SIMKL playback snapshot') + '\n'
+    + unavailableProviderMethod(simklShadow, '    @discardableResult\n    func refresh(context expected:', 'SIMKL playback refresh') + '\n}\n';
   combined += '\nextension PlaybackMutationTarget {\n'
     + slice(target, '    static func capture(core: CoreBridge)', '\n    func stillOwnsAccountContext(') + '\n}\n';
   // Full typed projection declarations; unrelated player/source models are excluded.
@@ -181,7 +242,8 @@ if (process.argv[2] === '--extract') {
     + slice(models, 'struct CoreLibrary:', '// MARK: round-trippable requests')
     + slice(models, 'struct CoreLibraryRequest:', '// MARK: - VortX account-owned add-on')
     + slice(models, 'struct CoreCtx:', '// MARK: assembled UI row')
-    + slice(models, 'struct VortXOwnedAddon {', '// MARK: - Stremio mirror settings'));
+    + slice(models, 'struct VortXOwnedAddon {', '// MARK: - Complete decoded metadata value equivalence')
+    + slice(models, 'extension CoreCWItem: Equatable {}', 'extension CoreResourcePath: Equatable {}'));
   await writeFile(join(output, 'UserProfile.swift'), slice(profiles, 'import Foundation', '/// Process-local selection facts'));
   receipts.push({ path: discovery.path, marker: 'entire Foundation-only discovery persistence bridge', sourceSHA256: sha256(discovery.text), sliceSHA256: sha256(discovery.text) });
   await writeFile(join(output, 'Discovery.swift'), discovery.text);
@@ -193,12 +255,17 @@ if (process.argv[2] === '--extract') {
     + slice(catalog, 'struct DiscoverFilters:', '\n/// Static option catalogs'));
   receipts.push({ path: home.path, marker: 'entire Home rail preference consumer', sourceSHA256: sha256(home.text), sliceSHA256: sha256(home.text) });
   await writeFile(join(output, 'HomeRails.swift'), home.text);
+  await writeFile(join(output, 'OwnerHistoryFixtureCarriers.swift'), ownerHistoryCarriers.source, { flag: 'wx' });
   await writeFile(join(output, 'Combined.swift'), combined);
   await writeFile(join(output, 'extraction.json'), JSON.stringify({ sourceHEAD: process.env.VORTX_RECEIVE_SOURCE_HEAD, receipts, productionMatches,
+    ownerHistoryCarriersSHA256: sha256(ownerHistoryCarriers.source),
     boundaries: ['Synthetic keys and owned encrypted checkpoint directories', 'Loopback HTTP request environment',
       'ProfileStore RAM sink initializes the real mirror once and brackets roster/activeID mutations; actual scalar projector and discovery apply are extracted; real Combine publication, quarantine/admission and UI board rendering are not exercised',
       'Actual Facade/Session emit typed SourceEvent; exact original-origin/lifetime/history/context/coarse helpers execute with explicit fixture decode/generation/host plumbing. Actual05 worker/board/search and metadata pipeline do not execute; no fabricated SourceEvent initializer or engine symbols',
       'Fresh fixture sessions perform genuine deterministic empty legacy import and exact receipt replay; no real-account preparation, provider fetch or open-detail refresh exercised',
+      'Real typed ingress, exact carriers, native owner-history implementations and CoreBridge routing are compiler inputs. The fixture refuses cold app mount and typed peer mutation. Ordinary receive/causal export retain the actual manager and host-receipt declarations',
+      'The exact local Home selection and Trakt offer reader execute with actual value declarations and owner checks. Trakt detail navigation is outside the fixture, and provider refresh and cache access refuse unexpected entry',
+      'Actual subtitle credential retirement outbox, epoch fence and scalar proof type. The fixture retains its isolated credential registry and Keychain, and does not exercise subtitle mounting',
       'Explicit fixture uploader obtains an authenticated GET witness and requires exact create0/base-plus-one; it does not perform the manager upload merge'],
     combinedSHA256: sha256(combined) }, null, 2));
   process.exit(0);

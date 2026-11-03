@@ -48,6 +48,13 @@ extension CoreBridge {
         let receiver = HistoryFixtureReceiver(core: self)
         Task { @MainActor in receiver.receive(receipt, fields: fields, origin: origin, coarse: false) }
     }
+    @MainActor private func admitNativeLegacyChange(legacyFields: [String],
+        receipt: VortxNativeCoreFacade.ChangeReceipt, origin: NativeCallbackOrigin,
+        recordsCoarseEvent: Bool) {
+        precondition(!recordsCoarseEvent && Set(legacyFields).isSubset(of: ["ctx", "addon_management"]),
+                     "Only explicit host add-on seeding is exercised by this fixture")
+        publishHistoryForFixture(receipt, fields: legacyFields, origin: origin, coarse: recordsCoarseEvent)
+    }
     @MainActor private func publishHistoryForFixture(_ receipt: VortxNativeCoreFacade.ChangeReceipt,
         fields: [String], origin: NativeCallbackOrigin, coarse: Bool) {
         guard nativeCallbackOriginIsCurrent(origin), receipt.sourceID == origin.producer.sourceID else { return }
@@ -62,12 +69,15 @@ extension CoreBridge {
             continueWatchingRebuildGeneration &+= 1; generation = continueWatchingRebuildGeneration
             continueWatchingRebuildLock.unlock()
         }
-        if admitted.contains("ctx"), let context = try? receipt.values["ctx"]?.decode(CoreCtx.self) {
+        if admitted.contains("ctx"), admitted.contains("addon_management"),
+           let context = try? receipt.values["ctx"]?.decode(CoreCtx.self),
+           let managementContext = try? receipt.values["addon_management"]?.decode(CoreCtx.self) {
             var raw: [String: VortxJSON] = [:]
             for descriptor in receipt.values["ctx"]?["profile"]?["addons"]?.array ?? [] {
                 if case .string(let url) = descriptor["transportUrl"] { raw[url] = descriptor }
             }
-            publishNativeLegacyContext(context, rawAddons: raw, receipt: receipt, origin: origin)
+            publishNativeLegacyContext(context, managementContext: managementContext,
+                rawAddons: raw, receipt: receipt, origin: origin)
         }
         publishNativeLegacyHistory(library: library, continueWatching: preview,
             fields: Set(admitted), receipt: receipt, origin: origin, cwGeneration: generation)

@@ -52,21 +52,29 @@ if (process.argv[2] === '--extract') {
     assert.equal(combined.split(before).length, 2, `fixture seam not unique: ${before}`);
     combined = combined.replace(before, after); transformations.push({ beforeSHA256: hash(before), afterSHA256: hash(after) });
   }
+  replace('@MainActor final class VortXSyncManager {', 'import Combine\n\n@MainActor final class VortXSyncManager {');
   replace('    private var values: [String: Any] = [:]', '    private var values: [String: Any] = [:]\n' + section('DEFAULTS ENVIRONMENT'));
   replace('    func set(_ value: Any?, forKey key: String) { lock.withLock { values[key] = value } }',
     '    func set(_ value: Any?, forKey key: String) { lock.withLock { values[key] = value }; DispatchQueue.main.async { NotificationCenter.default.post(name: Self.didChangeNotification, object: nil) } }');
   replace('    var cwItems: [CoreCWItem] = []', '    var cwItems: [CoreCWItem] = []\n' + section('PROFILE ENVIRONMENT'));
   replace('        ProfileDiscoveryPreferencesStore.apply(active?.discovery, resetUnset: true)',
     '        VortXSyncManager.suppressHousekeeping { ProfileDiscoveryPreferencesStore.apply(self.active?.discovery, resetUnset: true) }');
-  const admissionMarker = '    private let nativePreferenceAdmissionGate =';
-  const admissionStart = source.indexOf(admissionMarker);
-  assert(admissionStart >= 0 && source.indexOf(admissionMarker, admissionStart + admissionMarker.length) === -1,
-    'missing or ambiguous production preference admission gate');
-  const admissionDeclaration = source.slice(admissionStart, source.indexOf('\n', admissionStart));
-  receipts.push({ path: 'app/SourcesShared/VortXSyncManager.swift', marker: admissionMarker,
-    firstLine: source.slice(0, admissionStart).split('\n').length, sourceSHA256: hash(source), sliceSHA256: hash(admissionDeclaration) });
+  const managerStored = [
+    '    private let nativePreferenceAdmissionGate =',
+    '    @Published private(set) var nativePlaylistCloudReceiptRevision:',
+    '    private var nativePlaylistReceiptLedger =',
+  ].map(marker => {
+    const start = source.indexOf(marker);
+    const end = source.indexOf('\n', start);
+    assert(start >= 0 && end > start && source.indexOf(marker, start + marker.length) === -1,
+      `missing or ambiguous production storage: ${marker}`);
+    const declaration = source.slice(start, end);
+    receipts.push({ path: 'app/SourcesShared/VortXSyncManager.swift', marker,
+      firstLine: source.slice(0, start).split('\n').length, sourceSHA256: hash(source), sliceSHA256: hash(declaration) });
+    return declaration;
+  });
   replace('    var isSignedIn = true; var hasAppliedAccountDoc = false; var hasPendingPush = false',
-    '    var isSignedIn = true; var hasAppliedAccountDoc = false\n' + admissionDeclaration + '\n' + section('MANAGER ENVIRONMENT'));
+    '    var isSignedIn = true; var hasAppliedAccountDoc = false\n' + managerStored.join('\n') + '\n' + section('MANAGER ENVIRONMENT'));
   replace('    var dirtySettings: [String: Double] = [:]; var appliedSettingsBaseline: Set<String> = []', '    var appliedSettingsBaseline: Set<String> = []');
   const remove = [
     '    func withRemoteApplySuppressed(_ body: () -> Void) { body() }',
@@ -103,6 +111,8 @@ if (process.argv[2] === '--extract') {
     '    private static var nativePreferenceProjectionKeys:',
     '    private func clearPushedDirtySettings(', '    func syncUp(', '    private func finishSyncUp(', '    private func mergeLocalIntoDoc(',
     '    private func pushDerivedDoc(', '    private struct DerivedSyncDoc {', '    private func ensureNativeCheckpoint(',
+    '    private func freezePlaylistAckCandidate(', '    private func acknowledgeNativePlaylistCloudReceipts(',
+    '    private func isCurrentOwner(_ owner: NativePlaylistReceiptOwner)',
     '    private struct NativePreferenceContext {', '    private func nativePreferenceContext(', '    nonisolated private static func makeNativePreferenceContext(',
     '    nonisolated private static func nativePreferenceValue(', '    nonisolated private static func nativePreferenceSnapshot(',
     '    func finishNativePreferenceIntents(', '    private func pendingNativePreferenceReceipts(', '    private func acknowledgeNativePreferenceCloud(',
@@ -111,8 +121,10 @@ if (process.argv[2] === '--extract') {
   ];
   combined += '\nextension VortXSyncManager {\n' + markers.map(marker => member(source, 'app/SourcesShared/VortXSyncManager.swift', marker)).join('\n') + '\n}\n';
   const core = await production('app/SourcesShared/CoreBridge.swift');
-  combined += '\nextension CoreBridge {\n' + member(core, 'app/SourcesShared/CoreBridge.swift', '    func settleResidentNativeSession(')
-    + '\n}\n';
+  const coreMarkers = ['    func settleResidentNativeSession(', '    func nativeWatchlistTargetIsCurrent(',
+    '    @MainActor func nativePlaylistReceiptOwnerIsCurrent('];
+  combined += '\nextension CoreBridge {\n'
+    + coreMarkers.map(marker => member(core, 'app/SourcesShared/CoreBridge.swift', marker)).join('\n') + '\n}\n';
   const backup = await production('app/SourcesShared/SettingsBackup.swift');
   const start = backup.indexOf('    private static let skipPrefixes =');
   const end = backup.indexOf('\n    }', backup.indexOf('    static func migratedKey(')) + 6;
@@ -132,6 +144,7 @@ if (process.argv[2] === '--extract') {
   await writeFile(join(output, 'causal-extraction.json'), JSON.stringify({ sourceHEAD: original.sourceHEAD, priorExtractionSHA256: hash(originalBytes), priorCombinedSHA256, priorCombinedPath: 'ReceiveBase.swift.txt', receipts, productionMatches,
     transformations, fixtureSHA256: hash(fixture), combinedSHA256: hash(combined),
     excluded: ['Profile preference edits and selection: empty real journal; sink retry/save fail on nonempty preference inputs',
+      'Playlist edit admission: real ledger starts empty; the ordinary causal push retains actual candidate freezing and ACK entry',
       'Provider authentication: empty state, inert storage; real carrier merge/mirror/ACK', 'Cold/empty-account restoration',
       'Real Foundation UserDefaults notification timing and process-death persistence', 'Realtime socket/startup lifecycle, providers, devices, installed applications'] }, null, 2));
   process.exit(0);
