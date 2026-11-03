@@ -3,6 +3,8 @@ package com.vortx.android.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.vortx.android.model.AddonOrder
+import com.vortx.android.sync.SessionOwnerSnapshot
+import java.io.Closeable
 import org.json.JSONArray
 
 /// Local add-on preferences, the Android port of two Apple stores:
@@ -51,10 +53,10 @@ class AddonPrefsStore(
     /// Persist a new applied order (the reorder screen's drop). Normalized dedupe keeps the list a
     /// valid rank map (mirrors Apple `applyInAppAddonOrder`'s normalized write); an unchanged order
     /// is a no-op write.
-    fun setAppliedOrder(transportUrls: List<String>, remote: Boolean = false): Boolean {
+    fun setAppliedOrder(transportUrls: List<String>, remote: Boolean = false): Boolean = withRestoreWrite(false) {
         val seen = mutableSetOf<String>()
         val normalizedKeep = transportUrls.filter { it.isNotBlank() && seen.add(AddonOrder.normalize(it)) }
-        if (normalizedKeep == appliedOrder()) return false
+        if (normalizedKeep == appliedOrder()) return@withRestoreWrite false
         val editor = prefs.edit().putString(scopedKey(KEY_APPLIED_ORDER), JSONArray(normalizedKeep).toString())
         if (!remote) {
             val account = activeAccountScope
@@ -65,7 +67,7 @@ class AddonPrefsStore(
             }
         }
         editor.apply()
-        return true
+        true
     }
 
     /** Snapshot the current account's local reorder acknowledgement. `null` means no unconfirmed reorder. */
@@ -74,9 +76,9 @@ class AddonPrefsStore(
     }
 
     /** Clear only the reorder carried by an accepted push; a newer drag must remain pending. */
-    fun clearPushedOrderDirty(snapshot: Long?) {
-        if (activeAccountScope == null) return
-        snapshot ?: return
+    fun clearPushedOrderDirty(snapshot: Long?) = withRestoreWrite(Unit) {
+        if (activeAccountScope == null) return@withRestoreWrite
+        snapshot ?: return@withRestoreWrite
         val key = scopedKey(KEY_ORDER_DIRTY_AT)
         if (prefs.getLong(key, 0L) == snapshot) prefs.edit().remove(key).apply()
     }
@@ -110,18 +112,56 @@ class AddonPrefsStore(
     /// Turn an add-on on/off for the ACTIVE profile only. A local overlay, never an account/engine
     /// change: the add-on stays installed and stays on for every other profile (Apple
     /// `ProfileStore.toggleAddon`).
-    fun setDisabled(transportUrl: String, disabled: Boolean) {
+    fun setDisabled(transportUrl: String, disabled: Boolean) = withRestoreWrite(Unit) {
         val key = disabledKey(activeProfileId())
         val next = disabledBases().toMutableSet()
         val base = AddonOrder.normalize(transportUrl)
         val changed = if (disabled) next.add(base) else next.remove(base)
-        if (!changed) return
+        if (!changed) return@withRestoreWrite
         // Copy-on-write set: never mutate the instance getStringSet returned (a documented
         // SharedPreferences trap -- the store can hand back its own live set).
         prefs.edit().putStringSet(key, next.toSet()).apply()
     }
 
     private fun disabledKey(profileId: String) = "$KEY_DISABLED_PREFIX$profileId"
+
+    /** The issued object is usable only while it is the actual process writer reservation. */
+    internal class RestoreWriteExclusion internal constructor(
+        private val original: SessionOwnerSnapshot.Account,
+    ) : Closeable {
+        fun requireCurrent(owner: SessionOwnerSnapshot.Account) {
+            synchronized(restoreWriterLock) {
+                check(owner == original && heldRestoreWriter === this && !restoreWriterRevoked &&
+                    activeAccountScope == owner.id && activeRestoreWrites == 0) { "Add-on Restore writer retired" }
+            }
+        }
+
+        override fun close() {
+            synchronized(restoreWriterLock) {
+                if (heldRestoreWriter === this) heldRestoreWriter = null
+            }
+        }
+    }
+
+    /** All normal instances use the same process gate. Acquisition never reads or creates prefs. */
+    internal fun tryReserveRestoreWriter(original: SessionOwnerSnapshot.Account): RestoreWriteExclusion? =
+        synchronized(restoreWriterLock) {
+            if (activeAccountScope != original.id || activeRestoreWrites != 0 || heldRestoreWriter != null) null
+            else RestoreWriteExclusion(original).also {
+                restoreWriterRevoked = false
+                heldRestoreWriter = it
+            }
+        }
+
+    private inline fun <T> withRestoreWrite(refused: T, action: () -> T): T {
+        synchronized(restoreWriterLock) {
+            if (heldRestoreWriter != null) return refused
+            activeRestoreWrites++
+        }
+        return try { action() } finally {
+            synchronized(restoreWriterLock) { activeRestoreWrites-- }
+        }
+    }
 
     companion object {
         const val DEFAULT_PROFILE = "default"
@@ -134,10 +174,17 @@ class AddonPrefsStore(
         private const val KEY_DISABLED_PREFIX = "vortx.profile.disabledAddons."
 
         @Volatile private var activeAccountScope: String? = null
+        private val restoreWriterLock = Any()
+        private var activeRestoreWrites = 0
+        private var heldRestoreWriter: RestoreWriteExclusion? = null
+        private var restoreWriterRevoked = false
 
         /** VortXSyncManager is the sole source of account ownership for the shared priority overlay. */
         fun activateAccount(accountId: String?) {
-            activeAccountScope = accountId?.takeIf { it.isNotBlank() }
+            synchronized(restoreWriterLock) {
+                if (heldRestoreWriter != null) restoreWriterRevoked = true
+                activeAccountScope = accountId?.takeIf { it.isNotBlank() }
+            }
         }
 
         private fun scopedKey(key: String): String =
