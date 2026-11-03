@@ -5,7 +5,6 @@ import com.vortx.android.engine.OHJson
 import com.vortx.android.engine.VortxRuntimeBindings
 import java.util.Date
 import java.util.concurrent.CancellationException
-import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -246,11 +245,10 @@ class AccountBackupRepairTest {
         f.context().use { context -> AccountBackupRepair.convert(file, context, AccountBackupRepairFixture.Bindings()) { count++ }.close() }
         assertTrue(count > 20)
         for (stop in 1..count) {
-            val bindings = AccountBackupRepairFixture.Bindings(); val calls = AtomicInteger()
+            val bindings = AccountBackupRepairFixture.Bindings()
             f.context().use { context ->
-                val result = runCatching { AccountBackupRepair.convert(file, context, bindings) {
-                    if (calls.incrementAndGet() == stop) throw CancellationException("Synthetic original owner/operation retired")
-                } }
+                val cancel = cancellationAtFence(stop, "Synthetic original owner/operation retired")
+                val result = runCatching { AccountBackupRepair.convert(file, context, bindings, cancel) }
                 assertTrue("Fence $stop", result.exceptionOrNull() is CancellationException)
             }
             assertEquals("Fence $stop", bindings.created, bindings.freed); assertTrue(bindings.live.isEmpty())
@@ -282,16 +280,22 @@ class AccountBackupRepairTest {
             AccountBackupRepairFixture.Bindings()) { count++ }.close() }
         assertTrue(count > 20)
         for (stop in 1..count) {
-            val bindings = AccountBackupRepairFixture.Bindings(); val checks = AtomicInteger()
+            val bindings = AccountBackupRepairFixture.Bindings()
             f.context().use { context ->
-                val attempt = runCatching { AccountBackupRepair.validateReimport(selected, context, bindings) {
-                    if (checks.incrementAndGet() == stop) throw CancellationException("Synthetic original reimport retired")
-                } }
+                val cancel = cancellationAtFence(stop, "Synthetic original reimport retired")
+                val attempt = runCatching { AccountBackupRepair.validateReimport(selected, context, bindings, cancel) }
                 assertTrue("Reimport fence $stop", attempt.exceptionOrNull() is CancellationException)
             }
             assertEquals(bindings.created, bindings.freed); assertTrue(bindings.live.isEmpty())
             assertArrayEquals(before, selected)
         }
+    }
+
+    private fun cancellationAtFence(stop: Int, message: String): () -> Unit {
+        val steps = ArrayDeque<() -> Unit>(stop)
+        repeat(stop - 1) { steps.addLast {} }
+        steps.addLast { throw CancellationException(message) }
+        return { steps.removeFirstOrNull()?.invoke() }
     }
 
     @Test fun inspectDoesNotNeedAKeyAndCiphertextBudgetsFailBeforeNativeCalls() {
