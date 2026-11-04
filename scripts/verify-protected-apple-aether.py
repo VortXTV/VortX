@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the protected arm64 Aether linkage without building or repackaging apps."""
+"""Verify protected arm64 Aether linkage and bind the Mac kit across final signing."""
 import argparse
 import hashlib
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -74,7 +75,7 @@ def identity():
     run_id = os.environ["GITHUB_RUN_ID"]
     attempt = os.environ["GITHUB_RUN_ATTEMPT"]
     require(os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch" and
-            ref == "refs/tags/v0.5.6-beta.12-candidate.2" and
+            ref == "refs/tags/v0.5.6-beta.12-candidate.3" and
             re.fullmatch(r"[0-9a-f]{40}", source) and source == workflow == run("git", "rev-parse", "HEAD") and
             all(re.fullmatch(r"[1-9][0-9]*", value) for value in (run_id, attempt)),
             "Aether evidence requires the exact candidate workflow and checkout")
@@ -143,6 +144,21 @@ def admit_provider(args, architecture, map_text):
             "upstreamSha256": sha256(upstream), "processedSha256": sha256(processed), "arm64Sha256": digests[0]}
 
 
+def inspect_link_map(args):
+    intermediate = (args.derived / "Build/Intermediates.noindex").resolve(strict=True)
+    maps = [path for path in intermediate.rglob("VortXAetherKit-LinkMap-*-arm64.txt")
+            if path.is_file() and "VortXAetherKit.build" in path.parts]
+    require(len(maps) == 1, "missing or ambiguous Aether arm64 link map")
+    link_map, = maps
+    require(link_map.resolve(strict=True) == link_map, "Aether link map must be owned by the current build")
+    map_bytes = read_bounded(link_map, LINK_MAP_LIMIT)
+    # Apple's maps can contain non-UTF-8 bytes in unrelated linker symbols.
+    map_text = map_bytes.decode("utf-8", errors="surrogateescape")
+    require(re.search(r"^# Arch: arm64$", map_text, re.MULTILINE) and not OTHER_PLAYER.search(map_text),
+            "Aether map architecture or native player isolation failed")
+    return link_map, map_bytes, map_text
+
+
 def inspect_app(args, resolved, resolution_bytes):
     architecture = "arm64"
     normalize = native_normalizer()
@@ -177,19 +193,13 @@ def inspect_app(args, resolved, resolution_bytes):
         binaries[name] = {"path": relative, "architectures": arches, "rawSha256": sha256(binary),
                           "normalizedSha256": normalized}
 
-    intermediate = (args.derived / "Build/Intermediates.noindex").resolve(strict=True)
-    maps = [path for path in intermediate.rglob("VortXAetherKit-LinkMap-*-arm64.txt")
-            if path.is_file() and "VortXAetherKit.build" in path.parts]
-    require(len(maps) == 1, "missing or ambiguous Aether arm64 link map")
-    link_map, = maps
-    require(link_map.resolve(strict=True) == link_map, "Aether link map must be owned by the current build")
-    map_bytes = read_bounded(link_map, LINK_MAP_LIMIT)
-    # Apple's maps can contain non-UTF-8 bytes in unrelated linker symbols.
-    # Preserve those bytes while matching the ASCII headings and object rows.
-    map_text = map_bytes.decode("utf-8", errors="surrogateescape")
-    require(re.search(r"^# Arch: arm64$", map_text, re.MULTILINE) and not OTHER_PLAYER.search(map_text),
-            "Aether map architecture or native player isolation failed")
-    bind_link_output(args, link_map, map_text, normalize, binaries["VortXAetherKit"]["normalizedSha256"])
+    link_map, map_bytes, map_text = inspect_link_map(args)
+    product, linked = link_output(args, link_map, map_text)
+    if args.key == "macos":
+        verify_macos_signing(args, resolution_bytes, link_map, map_bytes, product, linked, normalize,
+                             binaries["VortXAetherKit"], native["executableSha256"])
+    else:
+        bind_link_output(args, product, linked, normalize, binaries["VortXAetherKit"]["normalizedSha256"])
     provider = admit_provider(args, architecture, map_text)
     return {**identity(), "key": args.key, "architecture": architecture,
             "resolutionReceiptSha256": hashlib.sha256(resolution_bytes).hexdigest(),
@@ -199,7 +209,7 @@ def inspect_app(args, resolved, resolution_bytes):
             "provider": provider, "binaries": binaries}
 
 
-def bind_link_output(args, link_map, map_text, normalize, embedded_sha):
+def link_output(args, link_map, map_text):
     path_lines = re.findall(r"^# Path: (.+)$", map_text, re.MULTILINE)
     require(len(path_lines) == 1 and map_text.startswith(f"# Path: {path_lines[0]}\n"),
             "missing or ambiguous Aether link output path")
@@ -218,6 +228,10 @@ def bind_link_output(args, link_map, map_text, normalize, embedded_sha):
     object_output = link_map.parent / "Objects-normal/arm64/Binary/VortXAetherKit"
     require(linked in (product, object_output) and linked.is_file(),
             "Aether link output is outside the exact product or target-owned arm64 intermediate")
+    return product, linked
+
+
+def bind_link_output(args, product, linked, normalize, embedded_sha):
     compiled_sha = normalize(product)
     require(linked == product or normalize(linked) == compiled_sha,
             "Aether linked output differs from the compiled product after signature normalization")
@@ -226,7 +240,7 @@ def bind_link_output(args, link_map, map_text, normalize, embedded_sha):
 
     # The device copy phase in the protected Release workflow can remove bitcode.
     # Replay only the observed Xcode operation on an owned copy of the exact product.
-    require(args.key in DEVICE_KEYS, "Aether simulator or Mac embedding changed the normalized compiled product")
+    require(args.key in DEVICE_KEYS, "Aether simulator embedding changed the normalized compiled product")
     require(0 < product.stat().st_size <= BITCODE_BINARY_LIMIT, "compiled Aether kit exceeds the copy proof bound")
     developer = Path(os.environ["DEVELOPER_DIR"]).resolve(strict=True)
     expected_tool = developer / "Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip"
@@ -245,6 +259,112 @@ def bind_link_output(args, link_map, map_text, normalize, embedded_sha):
                 "Aether device embedding differs from the exact Xcode bitcode-strip result")
 
 
+def private_signing_proof(path):
+    temporary = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+    parent = path.parent.resolve(strict=True)
+    require(parent.parent == temporary and parent.name.startswith("aether-macos-signing.") and
+            not path.parent.is_symlink() and path.name == "receipt.json",
+            "Mac Aether signing proof must use its dedicated runner-private directory")
+    attributes = parent.stat()
+    require(stat.S_ISDIR(attributes.st_mode) and stat.S_IMODE(attributes.st_mode) == 0o700 and
+            attributes.st_uid == os.getuid(), "Mac Aether signing proof directory is not private")
+    return parent / path.name
+
+
+def macos_signing_inputs(args, resolution_bytes, link_map, map_bytes, product, linked, normalize):
+    derived = Path(__file__).resolve().parents[1] / "app/build/ci-mac"
+    app = derived / "Build/Products/Release/VortX.app"
+    require(args.derived.resolve(strict=True) == derived and args.app.resolve(strict=True) == app,
+            "Mac Aether signing requires the exact protected app and derived products")
+    kit = app / "Contents/Frameworks/VortXAetherKit.framework/Versions/A/VortXAetherKit"
+    require(kit.is_file() and kit.resolve(strict=True) == kit and
+            (kit.parents[2] / "VortXAetherKit").resolve(strict=True) == kit,
+            "Mac Aether signing requires the exact embedded versioned kit")
+    require(all(path.is_file() and 0 < path.stat().st_size <= BITCODE_BINARY_LIMIT
+                for path in (product, linked, kit)), "Mac Aether signing inputs exceed the binary proof bound")
+    product_sha = sha256(product)
+    linked_sha = product_sha if linked == product else sha256(linked)
+    compiled_normalized_sha = normalize(product)
+    require(linked == product or normalize(linked) == compiled_normalized_sha,
+            "Mac Aether linked output differs from the compiled kit after signature normalization")
+    app_attributes = app.stat()
+    return {**identity(),
+            "resolutionReceiptSha256": hashlib.sha256(resolution_bytes).hexdigest(),
+            "aetherLinkMapSha256": hashlib.sha256(map_bytes).hexdigest(),
+            "linkMapPath": str(link_map.relative_to(derived)),
+            "linkedKitPath": str(linked.relative_to(derived)),
+            "compiledKitPath": str(product.relative_to(derived)),
+            "linkedKitRawSha256": linked_sha,
+            "compiledKitRawSha256": product_sha,
+            "compiledKitNormalizedSha256": compiled_normalized_sha,
+            "appDevice": app_attributes.st_dev,
+            "appInode": app_attributes.st_ino,
+            "embeddedKitPath": kit.relative_to(app).as_posix()}, kit
+
+
+def macos_app_executable(app):
+    contents = app / "Contents"
+    executable = plistlib.loads(read_bounded(contents / "Info.plist"))["CFBundleExecutable"]
+    require(isinstance(executable, str) and re.fullmatch(r"[A-Za-z0-9._-]+", executable) and
+            executable not in (".", ".."), "invalid Mac app executable name")
+    binary = contents / "MacOS" / executable
+    require(binary.is_file() and binary.resolve(strict=True) == binary,
+            "Mac app executable must be in the exact signed bundle")
+    return binary
+
+
+def sign_macos(args, resolution_bytes):
+    proof = private_signing_proof(args.output)
+    require(not proof.exists() and not proof.is_symlink(), "Mac Aether signing proof already exists")
+    link_map, map_bytes, map_text = inspect_link_map(args)
+    product, linked = link_output(args, link_map, map_text)
+    normalize = native_normalizer()
+    before, kit = macos_signing_inputs(args, resolution_bytes, link_map, map_bytes, product, linked, normalize)
+    pre_sign_sha = sha256(kit)
+    require(normalize(kit) == before["compiledKitNormalizedSha256"],
+            "Mac embedded Aether kit differs from the compiled kit before signing")
+    app = args.app.resolve(strict=True)
+    executable = macos_app_executable(app)
+    run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", app)
+    run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
+    link_map, map_bytes, map_text = inspect_link_map(args)
+    product, linked = link_output(args, link_map, map_text)
+    after, final_kit = macos_signing_inputs(args, resolution_bytes, link_map, map_bytes, product, linked, normalize)
+    require(after == before and final_kit == kit and macos_app_executable(app) == executable,
+            "Mac Aether signing inputs changed during signing")
+    receipt = {**after, "preSigningKitRawSha256": pre_sign_sha,
+               "preSigningKitNormalizedSha256": before["compiledKitNormalizedSha256"],
+               "signedKitRawSha256": sha256(final_kit),
+               "signedKitNormalizedSha256": normalize(final_kit),
+               "signedExecutableRawSha256": sha256(executable)}
+    descriptor = os.open(proof, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(receipt, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def verify_macos_signing(args, resolution_bytes, link_map, map_bytes, product, linked, normalize,
+                         kit_record, executable_sha):
+    proof = private_signing_proof(args.macos_signing_proof)
+    attributes = proof.lstat()
+    require(stat.S_ISREG(attributes.st_mode) and stat.S_IMODE(attributes.st_mode) == 0o600 and
+            attributes.st_uid == os.getuid(), "Mac Aether signing proof is not a private regular file")
+    state, kit = macos_signing_inputs(args, resolution_bytes, link_map, map_bytes, product, linked, normalize)
+    require(kit_record["path"] == state["embeddedKitPath"] and kit_record["rawSha256"] == sha256(kit),
+            "Mac Aether signing proof does not name the accepted embedded kit")
+    receipt = json.loads(read_bounded(proof))
+    require(isinstance(receipt, dict) and isinstance(receipt.get("preSigningKitRawSha256"), str) and
+            re.fullmatch(r"[0-9a-f]{64}", receipt["preSigningKitRawSha256"]),
+            "Mac Aether signing proof lacks the original embedded kit digest")
+    require(receipt ==
+            {**state, "preSigningKitRawSha256": receipt["preSigningKitRawSha256"],
+             "preSigningKitNormalizedSha256": state["compiledKitNormalizedSha256"],
+             "signedKitRawSha256": kit_record["rawSha256"],
+             "signedKitNormalizedSha256": kit_record["normalizedSha256"],
+             "signedExecutableRawSha256": executable_sha},
+            "Mac Aether signing proof does not bind the current link output and signed app")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packages", type=Path, required=True)
@@ -255,13 +375,26 @@ def main():
     parser.add_argument("--app", type=Path)
     parser.add_argument("--derived", type=Path)
     parser.add_argument("--native-receipt", type=Path)
+    parser.add_argument("--sign-macos", action="store_true")
+    parser.add_argument("--macos-signing-proof", type=Path)
     args = parser.parse_args()
-    app_args = (args.resolution_receipt, args.key, args.app, args.derived, args.native_receipt)
-    require(all(app_args) or not any(app_args), "Aether app receipt requires all app inputs")
+    app_args = (args.resolution_receipt, args.key, args.app, args.derived)
+    if args.sign_macos:
+        require(args.key == "macos" and all(app_args) and not args.native_receipt and not args.macos_signing_proof,
+                "Mac signing requires its exact app inputs and a separate private output")
+    else:
+        app_args += (args.native_receipt,)
+        require(all(app_args) or not any(app_args), "Aether app receipt requires all app inputs")
+        require((args.key == "macos") == (args.macos_signing_proof is not None),
+                "only Mac Aether verification requires a signing proof")
     resolved = resolution(args)
     if args.key:
         resolution_bytes = read_bounded(args.resolution_receipt)
         require(json.loads(resolution_bytes) == resolved, "SwiftPM pins changed after admission")
+        if args.sign_macos:
+            sign_macos(args, resolution_bytes)
+            print("Protected Mac Aether link output sealed across final signing")
+            return
         resolved = inspect_app(args, resolved, resolution_bytes)
     with args.output.open("x") as stream:
         json.dump(resolved, stream, indent=2, sort_keys=True)

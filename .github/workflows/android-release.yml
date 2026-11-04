@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag, or the exact v0.5.6-beta.12-candidate.2 artifact-only tag
+        description: Existing draft release tag, or the exact v0.5.6-beta.12-candidate.3 artifact-only tag
         required: true
         type: string
       publish_release:
@@ -46,7 +46,7 @@ jobs:
             echo "::error::checked-out source does not match the requested release tag"
             exit 1
           fi
-          candidate="v0.5.6-beta.12-candidate.2"
+          candidate="v0.5.6-beta.12-candidate.3"
           candidate_prefix="v0.5.6-beta.12-candidate."
           if [[ "$RELEASE_TAG" == "$candidate_prefix"* || "$GITHUB_REF" == "refs/tags/$candidate_prefix"* ]]; then
             [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REPOSITORY" == VortXTV/VortX &&

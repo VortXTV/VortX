@@ -395,8 +395,8 @@ test('normal and historical native selection wiring rejects scoped workflow muta
 
 test('only the Apple build job receives the extended CI wall-clock budget', () => {
   const build = workflow.split('  build-tvos:\n')[1].split('  attach-release:\n')[0];
-  assert.match(build, /^    timeout-minutes: 150$/m);
-  assert.equal((workflow.match(/^    timeout-minutes: 150$/gm) ?? []).length, 1);
+  assert.match(build, /^    timeout-minutes: 210$/m);
+  assert.equal((workflow.match(/^    timeout-minutes: 210$/gm) ?? []).length, 1);
   assert.match(workflow.split('  attach-release:\n')[1], /^    timeout-minutes: 35$/m);
 });
 
@@ -416,6 +416,19 @@ ${script(acceptance)}`], { encoding: 'utf8', env: { ...process.env, TVOS_TEST_ON
   assert.match(result.stdout, /^codesign:--force --deep --sign - .*VortX.app\ncodesign:--verify --deep --strict .*VortX.app\naccept:/);
   assert(result.stdout.includes('--receipt out/native-macos.json'));
   assert.equal((workflow.match(/codesign --force --deep --sign -/g) ?? []).length, 1);
+  const candidate = spawnSync('/bin/bash', ['-c', `
+codesign() { return 99; }
+python3() { printf '%s\\n' "$@"; }
+${script(signing)}`], { encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/tags/v0.5.6-beta.12-candidate.3', AETHER_RELEASE_PACKAGES: '/fixture packages',
+    AETHER_RELEASE_LOCK: '/fixture lock', AETHER_RELEASE_EVIDENCE: '/fixture evidence',
+    AETHER_MACOS_SIGNING_PROOF: '/private proof/receipt.json' } });
+  assert.equal(candidate.status, 0, candidate.stderr);
+  assert.deepEqual(candidate.stdout.trimEnd().split('\n'), ['scripts/verify-protected-apple-aether.py',
+    '--sign-macos', '--key', 'macos', '--packages', '/fixture packages', '--lock', '/fixture lock',
+    '--resolution-receipt', '/fixture evidence/aether-resolved.json', '--app',
+    'app/build/ci-mac/Build/Products/Release/VortX.app', '--derived', 'app/build/ci-mac',
+    '--output', '/private proof/receipt.json']);
 }));
 
 test('recovery preserves only the verifier outside the source checkout and retains native, feed and environment gates', () => {

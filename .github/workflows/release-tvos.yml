@@ -199,7 +199,8 @@ jobs:
     # Pin the known-good arm64 lane explicitly. `macos-latest` is a moving alias, while macos-15
     # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
     runs-on: macos-26
-    timeout-minutes: 150
+    # Cold native SDK, simulator and four device-app builds can exceed 150 minutes.
+    timeout-minutes: 210
     env:
       # Push events have no dispatch inputs. The dispatch input is kept for compatibility with the
       # release tooling; an explicit false is rejected before anything is fetched or built.
@@ -833,7 +834,7 @@ jobs:
           ruby ../scripts/native-apple-swift6-policy.rb VortX.xcodeproj native
 
       - name: Resolve pinned Apple Aether release packages
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
         run: |
           set -euo pipefail
           jq -e '.inputs == {
@@ -844,6 +845,7 @@ jobs:
           test "$BUILD_SOURCE_SHA" = "$GITHUB_SHA"
           PACKAGES="$(mktemp -d "$RUNNER_TEMP/aether-protected-packages.XXXXXXXX")"
           EVIDENCE="$(mktemp -d "$RUNNER_TEMP/aether-protected-evidence.XXXXXXXX")"
+          MAC_SIGNING_PROOF="$(mktemp -d "$RUNNER_TEMP/aether-macos-signing.XXXXXXXX")/receipt.json"
           LOCK=app/VortX.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
           xcodebuild -resolvePackageDependencies -project app/VortX.xcodeproj -scheme VortXTV \
             -clonedSourcePackagesDirPath "$PACKAGES"
@@ -853,6 +855,7 @@ jobs:
             printf 'AETHER_RELEASE_PACKAGES=%s\n' "$PACKAGES"
             printf 'AETHER_RELEASE_EVIDENCE=%s\n' "$EVIDENCE"
             printf 'AETHER_RELEASE_LOCK=%s\n' "$LOCK"
+            printf 'AETHER_MACOS_SIGNING_PROOF=%s\n' "$MAC_SIGNING_PROOF"
           } >> "$GITHUB_ENV"
 
       - name: Capture exact native SDK and player inputs before app compilation
@@ -1249,8 +1252,15 @@ jobs:
           # Signing can change normalized Mach-O load commands as well as signature blobs.
           # The accepted receipt must describe this final app; no later step may re-sign it.
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
-          codesign --force --deep --sign - "$MAC_APP"
-          codesign --verify --deep --strict "$MAC_APP"
+          if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/tags/v0.5.6-beta.12-candidate.3 ]; then
+            python3 scripts/verify-protected-apple-aether.py --sign-macos --key macos \
+              --packages "$AETHER_RELEASE_PACKAGES" --lock "$AETHER_RELEASE_LOCK" \
+              --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
+              --app "$MAC_APP" --derived app/build/ci-mac --output "$AETHER_MACOS_SIGNING_PROOF"
+          else
+            codesign --force --deep --sign - "$MAC_APP"
+            codesign --verify --deep --strict "$MAC_APP"
+          fi
 
       - name: Verify exact native app selection and linked inputs
         env:
@@ -1277,20 +1287,21 @@ jobs:
           fi
 
       - name: Verify packaged Apple Aether linkage
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
         run: |
           set -euo pipefail
           check_app() {
             local key="$1" derived="$2" app="$3"
+            shift 3
             python3 scripts/verify-protected-apple-aether.py --packages "$AETHER_RELEASE_PACKAGES" \
               --lock "$AETHER_RELEASE_LOCK" --resolution-receipt "$AETHER_RELEASE_EVIDENCE/aether-resolved.json" \
               --key "$key" --app "$derived/Build/Products/$app" --derived "$derived" \
-              --native-receipt "out/native-$key.json" --output "$AETHER_RELEASE_EVIDENCE/aether-$key.json"
+              --native-receipt "out/native-$key.json" --output "$AETHER_RELEASE_EVIDENCE/aether-$key.json" "$@"
           }
           check_app tvos app/build/ci Release-appletvos/VortXTV.app
           check_app tvos-lite app/build/ci-lite Release-appletvos/VortXTVLite.app
           check_app ios app/build/ci-ios Release-iphoneos/VortXiOSNative.app
-          check_app macos app/build/ci-mac Release/VortX.app
+          check_app macos app/build/ci-mac Release/VortX.app --macos-signing-proof "$AETHER_MACOS_SIGNING_PROOF"
 
       - name: Verify tvOS device artifact metadata (fail closed)
         env:
@@ -1539,7 +1550,7 @@ jobs:
           fi
 
       - name: Upload protected Apple Aether release evidence
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.2'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/tags/v0.5.6-beta.12-candidate.3'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Apple-Aether-release-evidence

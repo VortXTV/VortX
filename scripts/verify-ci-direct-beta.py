@@ -42,7 +42,7 @@ NATIVE_BETA7_ENGINE = "2ea2e0f27dd2e53b7b28228435ca35a70f92831f"
 NATIVE_BETA11_TAG = "v0.5.6-beta.11"
 NATIVE_BETA11_BUILD_TAG = "v0.5.6-beta.11-candidate.1"
 NATIVE_BETA12_TAG = "v0.5.6-beta.12"
-NATIVE_BETA12_BUILD_TAG = "v0.5.6-beta.12-candidate.2"
+NATIVE_BETA12_BUILD_TAG = "v0.5.6-beta.12-candidate.3"
 NATIVE_BETA12_BUILD = "283"
 NATIVE_TAGS = (NATIVE_BETA7_TAG, NATIVE_BETA11_TAG, NATIVE_BETA12_TAG)
 NATIVE_TARGETS = ("VortXiOSNative", "VortXMac", "VortXTV", "VortXTopShelf", "VortXTVLite")
@@ -694,9 +694,12 @@ def beta12_aether_gate(contents, pointer, source, app_handoff):
 
 def beta12_aether_proof(pointer, source, repo_id, job, log, work, app_handoff):
     steps = {step["name"]: step for step in job["steps"]}
+    mac_sign = "Final-sign macOS before native app acceptance"
     require_step_order(steps, ("Generate the Xcode project", BETA12_AETHER_RESOLVE, "Build tvOS (Full)",
-        "Verify exact native app selection and linked inputs", BETA12_AETHER_VERIFY, "Package the IPAs",
+        mac_sign, "Verify exact native app selection and linked inputs", BETA12_AETHER_VERIFY, "Package the IPAs",
         BETA12_AETHER_EVIDENCE, "Upload the immutable app handoff"))
+    signing_marker = "Protected Mac Aether link output sealed across final signing"
+    unique_step_marker(log, steps[mac_sign], signing_marker, re.escape(signing_marker))
     names = {"aether-resolved.json"} | {f"aether-{key}.json" for key in BETA12_AETHER_APPS}
     contents, artifact = beta12_gate_zip("VortX-Apple-Aether-release-evidence", names, pointer["runId"],
         repo_id, source, steps[BETA12_AETHER_EVIDENCE], log, work)
