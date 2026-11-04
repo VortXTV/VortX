@@ -199,7 +199,8 @@ jobs:
     # Pin the known-good arm64 lane explicitly. `macos-latest` is a moving alias, while macos-15
     # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
     runs-on: macos-26
-    timeout-minutes: 150
+    # Cold native SDK, simulator and four device-app builds can exceed 150 minutes.
+    timeout-minutes: 210
     env:
       # Push events have no dispatch inputs. The dispatch input is kept for compatibility with the
       # release tooling; an explicit false is rejected before anything is fetched or built.

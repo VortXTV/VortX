@@ -50,8 +50,8 @@ class NativeRepositoryMutationJniTest {
         var release: CountDownLatch? = null
         var delayedId: String? = null
         var calls = 0
-        private val requestedAddonIds = mutableMapOf<String, MutableSet<String>>()
-        fun addonIdsFor(id: String): Set<String> = synchronized(this) { requestedAddonIds[id]?.toSet().orEmpty() }
+        private val requestedAddonUrls = mutableMapOf<String, MutableSet<String>>()
+        fun addonUrlsFor(id: String): Set<String> = synchronized(this) { requestedAddonUrls[id]?.toSet().orEmpty() }
         override fun makeCancellation() = object : VortxResourceCancellation { override fun cancel() {}; override fun close() {} }
         override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
             val input = JSONObject(requestJson); val request = input.getJSONObject("request")
@@ -60,8 +60,8 @@ class NativeRepositoryMutationJniTest {
             val content = payload(request)
             val addons = input.getJSONArray("addons")
             synchronized(this) {
-                requestedAddonIds.getOrPut(request.getString("id")) { linkedSetOf() }
-                    .addAll((0 until addons.length()).map { addons.getJSONObject(it).getString("id") })
+                requestedAddonUrls.getOrPut(request.getString("id")) { linkedSetOf() }
+                    .addAll((0 until addons.length()).map { addons.getJSONObject(it).getString("transportUrl") })
             }
             return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId")).put("generation", input.getLong("generation"))
                 .put("request", request).put("cancelled", false).put("groups", JSONArray((0 until addons.length()).map {
@@ -269,7 +269,7 @@ class NativeRepositoryMutationJniTest {
             // terminal failure so every eligible real provider leg is recorded, including batches >2.
             transport.payload = { JSONObject().put("meta", JSONObject.NULL) }
             assertTrue(repository.meta(MediaType.SERIES, "visibility-disabled").isFailure)
-            assertEquals(original.addons.filterNot { it.transportUrl == row.transportUrl }.map { it.transportUrl }.toSet(), transport.addonIdsFor("visibility-disabled"))
+            assertEquals(original.addons.filterNot { it.transportUrl == row.transportUrl }.map { it.transportUrl }.toSet(), transport.addonUrlsFor("visibility-disabled"))
             val before = store.value
             assertTrue(repository.setAddonVisibility(original, row, false).isFailure)
             assertEquals(before, store.value)
@@ -277,7 +277,7 @@ class NativeRepositoryMutationJniTest {
             assertEquals(original.addons, restored.addons)
             assertTrue(restored.publishIfCurrent {})
             assertTrue(repository.meta(MediaType.SERIES, "visibility-restored").isFailure)
-            assertEquals(original.addons.map { it.transportUrl }.toSet(), transport.addonIdsFor("visibility-restored"))
+            assertEquals(original.addons.map { it.transportUrl }.toSet(), transport.addonUrlsFor("visibility-restored"))
         }
     }
 
